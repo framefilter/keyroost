@@ -121,9 +121,16 @@ pub struct Session {
     card: Card,
     /// SM4 key derived from the customer key once auth succeeds. `None` before auth.
     sm4_key: Option<[u8; 16]>,
+    /// When true, every APDU and response is printed to stderr with its label.
+    debug: bool,
 }
 
 impl Session {
+    /// Enable per-APDU stderr tracing. Useful for hardware bring-up.
+    pub fn set_debug(&mut self, on: bool) {
+        self.debug = on;
+    }
+
     /// Find the first Molto2 reader and open a card connection.
     pub fn open() -> Result<Self, TransportError> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
@@ -139,6 +146,7 @@ impl Session {
         Ok(Self {
             card,
             sm4_key: None,
+            debug: false,
         })
     }
 
@@ -152,6 +160,7 @@ impl Session {
         Ok(Self {
             card,
             sm4_key: None,
+            debug: false,
         })
     }
 
@@ -169,8 +178,14 @@ impl Session {
     /// Send a pre-built Command and return the response payload (without the SW1/SW2 trailer).
     /// Returns an error if the device responds with anything other than `9000`.
     fn transmit(&mut self, cmd: &Command) -> Result<Vec<u8>, TransportError> {
+        if self.debug {
+            eprintln!("> {:>20} >> {}", cmd.label, hex_dump(&cmd.apdu));
+        }
         let mut buf = [0u8; 2048];
         let response = self.card.transmit(&cmd.apdu, &mut buf)?;
+        if self.debug {
+            eprintln!("< {:>20} << {}", cmd.label, hex_dump(response));
+        }
         if response.len() < 2 {
             return Err(TransportError::ShortResponse {
                 label: cmd.label,
@@ -198,8 +213,14 @@ impl Session {
     /// Send a Command but allow non-9000 status words. Returns `(data, sw1, sw2)`.
     /// Used for the probing subcommand.
     pub fn transmit_raw(&mut self, cmd: &Command) -> Result<(Vec<u8>, u8, u8), TransportError> {
+        if self.debug {
+            eprintln!("> {:>20} >> {}", cmd.label, hex_dump(&cmd.apdu));
+        }
         let mut buf = [0u8; 2048];
         let response = self.card.transmit(&cmd.apdu, &mut buf)?;
+        if self.debug {
+            eprintln!("< {:>20} << {}", cmd.label, hex_dump(response));
+        }
         if response.len() < 2 {
             return Err(TransportError::ShortResponse {
                 label: cmd.label,
@@ -320,4 +341,15 @@ impl Session {
         self.transmit(&cmd)?;
         Ok(())
     }
+}
+
+fn hex_dump(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!("{:02X}", b));
+    }
+    s
 }

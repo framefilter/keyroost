@@ -28,6 +28,9 @@ struct Cli {
     /// List available PC/SC readers and exit.
     #[arg(long, global = true)]
     list_readers: bool,
+    /// Print every outgoing APDU and incoming response to stderr.
+    #[arg(long, global = true)]
+    debug: bool,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -224,6 +227,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Some(cmd) = cli.command.as_ref() else {
         // No subcommand → show info, mirroring molto2.py's bare-invocation behavior.
         let mut session = Session::open()?;
+        session.set_debug(cli.debug);
         let info = session.read_info()?;
         print_info(&info);
         return Ok(());
@@ -268,6 +272,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err("refusing to factory-reset without --yes".into());
         }
         let mut session = Session::open()?;
+        session.set_debug(cli.debug);
         let info = session.read_info()?;
         print_info(&info);
         println!("requesting factory reset; confirm with the up-arrow button on the device");
