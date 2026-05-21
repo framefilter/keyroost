@@ -1,0 +1,15 @@
+[package]
+name = "molto2-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PC/SC transport for the Token2 Molto2 / Molto2v2 programmable TOTP token."
+
+[lints]
+workspace = true
+
+[dependencies]
+molto2-proto = { path = "../molto2-proto", version = "0.1.0" }
+pcsc = "2"
