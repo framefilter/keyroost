@@ -54,6 +54,8 @@ struct App {
     log: Vec<LogLine>,
     /// otpauth:// import dialog state.
     import_dialog: ImportDialog,
+    /// Bulk-import dialog state.
+    bulk_dialog: BulkDialog,
 }
 
 #[derive(Default)]
@@ -140,6 +142,20 @@ impl TimeoutChoice {
 struct ImportDialog {
     open: bool,
     uri: String,
+}
+
+#[derive(Default)]
+struct BulkDialog {
+    open: bool,
+    path: String,
+    /// Successfully parsed entries (cleared on each load).
+    entries: Vec<molto2_import::BulkEntry>,
+    /// Last load error message, if any.
+    error: Option<String>,
+    /// Starting slot for programming.
+    start: u8,
+    /// Display timeout applied to every entry.
+    display_timeout: TimeoutChoice,
 }
 
 struct LogLine {
@@ -385,6 +401,102 @@ impl App {
         }
     }
 
+    fn bulk_load(&mut self) {
+        let path = self.bulk_dialog.path.trim();
+        if path.is_empty() {
+            self.bulk_dialog.error = Some("enter a file path first".into());
+            return;
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.bulk_dialog.error = Some(format!("read failed: {}", e));
+                return;
+            }
+        };
+        match molto2_import::parse_bulk_any(&text) {
+            Ok(entries) => {
+                self.bulk_dialog.entries = entries;
+                self.bulk_dialog.error = None;
+                self.log(
+                    Severity::Info,
+                    format!(
+                        "loaded {} entries from {}",
+                        self.bulk_dialog.entries.len(),
+                        path
+                    ),
+                );
+            }
+            Err(e) => {
+                self.bulk_dialog.entries.clear();
+                self.bulk_dialog.error = Some(e.to_string());
+            }
+        }
+    }
+
+    fn bulk_apply(&mut self) {
+        if !self.ensure_auth() {
+            return;
+        }
+        if self.bulk_dialog.entries.is_empty() {
+            self.log(Severity::Warn, "no entries loaded");
+            return;
+        }
+        let start = self.bulk_dialog.start;
+        let n = self.bulk_dialog.entries.len();
+        let last = (start as usize).saturating_add(n);
+        if last > PROFILES as usize {
+            self.log(
+                Severity::Err,
+                format!(
+                    "{} entries starting at #{} would overflow slot 99 (would need #{})",
+                    n,
+                    start,
+                    last - 1
+                ),
+            );
+            return;
+        }
+        let timeout = self.bulk_dialog.display_timeout.to_proto();
+        let mut ok = 0;
+        let mut fail = 0;
+        for (i, entry) in self.bulk_dialog.entries.clone().into_iter().enumerate() {
+            let p = start + i as u8;
+            let title = entry.suggested_title();
+            if title.is_empty() {
+                self.log(Severity::Warn, format!("#{}: no title; skipping", p));
+                fail += 1;
+                continue;
+            }
+            let s = self.session.as_mut().expect("auth implies session");
+            if let Err(e) = s.set_seed(p, &entry.secret) {
+                self.log(Severity::Err, format!("#{} set_seed: {}", p, e));
+                fail += 1;
+                continue;
+            }
+            if let Err(e) = s.set_title(p, &title) {
+                self.log(Severity::Err, format!("#{} set_title: {}", p, e));
+                fail += 1;
+                continue;
+            }
+            if let Err(e) = s.set_config(p, &entry.to_profile_config(unix_now(), timeout)) {
+                self.log(Severity::Err, format!("#{} set_config: {}", p, e));
+                fail += 1;
+                continue;
+            }
+            ok += 1;
+        }
+        let sev = if fail == 0 {
+            Severity::Ok
+        } else {
+            Severity::Warn
+        };
+        self.log(sev, format!("bulk import: {} ok, {} failed", ok, fail));
+        if fail == 0 {
+            self.bulk_dialog.open = false;
+        }
+    }
+
     fn ensure_auth(&mut self) -> bool {
         if self.authenticated {
             return true;
@@ -595,6 +707,10 @@ impl eframe::App for App {
                 if ui.button("Import otpauth://...").clicked() {
                     self.import_dialog.open = true;
                 }
+                if ui.button("Bulk import...").clicked() {
+                    self.bulk_dialog.open = true;
+                    self.bulk_dialog.start = self.selected;
+                }
             });
 
             ui.add_space(16.0);
@@ -609,6 +725,117 @@ impl eframe::App for App {
                 }
             });
         });
+
+        if self.bulk_dialog.open {
+            let mut open = self.bulk_dialog.open;
+            let mut do_load = false;
+            let mut do_apply = false;
+            egui::Window::new("Bulk import")
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label("Plaintext file path (Aegis JSON, 2FAS JSON, or otpauth:// list):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.bulk_dialog.path)
+                            .desired_width(540.0)
+                            .hint_text("/path/to/export.json"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Load").clicked() {
+                            do_load = true;
+                        }
+                        ui.label("Start at profile:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.bulk_dialog.start)
+                                .clamp_existing_to_range(true)
+                                .range(0..=99u8),
+                        );
+                        ui.label("Display timeout:");
+                        egui::ComboBox::from_id_salt("bulk-timeout")
+                            .selected_text(match self.bulk_dialog.display_timeout {
+                                TimeoutChoice::S15 => "15s",
+                                TimeoutChoice::S30 => "30s",
+                                TimeoutChoice::S60 => "60s",
+                                TimeoutChoice::S120 => "120s",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.bulk_dialog.display_timeout,
+                                    TimeoutChoice::S15,
+                                    "15s",
+                                );
+                                ui.selectable_value(
+                                    &mut self.bulk_dialog.display_timeout,
+                                    TimeoutChoice::S30,
+                                    "30s",
+                                );
+                                ui.selectable_value(
+                                    &mut self.bulk_dialog.display_timeout,
+                                    TimeoutChoice::S60,
+                                    "60s",
+                                );
+                                ui.selectable_value(
+                                    &mut self.bulk_dialog.display_timeout,
+                                    TimeoutChoice::S120,
+                                    "120s",
+                                );
+                            });
+                    });
+
+                    if let Some(err) = &self.bulk_dialog.error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 100, 100), err);
+                    }
+
+                    if !self.bulk_dialog.entries.is_empty() {
+                        ui.separator();
+                        ui.label(format!(
+                            "{} entries — will fill slots #{:02}..#{:02}",
+                            self.bulk_dialog.entries.len(),
+                            self.bulk_dialog.start,
+                            self.bulk_dialog.start as usize + self.bulk_dialog.entries.len() - 1,
+                        ));
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for (i, e) in self.bulk_dialog.entries.iter().enumerate() {
+                                    let slot = self.bulk_dialog.start as usize + i;
+                                    ui.label(format!(
+                                        "#{:02}  {}  ({}/{:?}/{}d)",
+                                        slot,
+                                        e.suggested_title(),
+                                        match e.algorithm {
+                                            HmacAlgo::Sha1 => "SHA1",
+                                            HmacAlgo::Sha256 => "SHA256",
+                                        },
+                                        e.time_step,
+                                        e.digits as u8
+                                    ));
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            let can_apply = self.authenticated;
+                            if ui
+                                .add_enabled(can_apply, egui::Button::new("Program all"))
+                                .on_hover_text("Write seed, title, and config for every entry")
+                                .clicked()
+                            {
+                                do_apply = true;
+                            }
+                            if ui.button("Close").clicked() {
+                                self.bulk_dialog.open = false;
+                            }
+                        });
+                    }
+                });
+            self.bulk_dialog.open = open;
+            if do_load {
+                self.bulk_load();
+            }
+            if do_apply {
+                self.bulk_apply();
+            }
+        }
 
         if self.import_dialog.open {
             let mut open = self.import_dialog.open;
