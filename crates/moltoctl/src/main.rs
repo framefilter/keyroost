@@ -97,6 +97,20 @@ enum Cmd {
         /// The otpauth:// URI. Use single quotes to protect & from the shell.
         uri: String,
     },
+    /// Bulk-import a plaintext export from Aegis, 2FAS, or a list of otpauth:// URIs.
+    ImportFile {
+        /// Path to the plaintext export file. Format is auto-detected.
+        path: std::path::PathBuf,
+        /// Starting profile index. Entries fill consecutive slots from here.
+        #[arg(long, default_value_t = 0)]
+        start: u8,
+        /// Display timeout to use for every imported entry.
+        #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
+        display_timeout: TimeoutArg,
+        /// Print what would be written, but don't touch the device.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Factory-reset the device. Wipes profiles and restores default customer key.
     /// Requires physical button confirmation on the device.
     FactoryReset {
@@ -214,6 +228,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         print_info(&info);
         return Ok(());
     };
+
+    // --dry-run on bulk import doesn't need the device at all.
+    if let Cmd::ImportFile {
+        path,
+        start,
+        display_timeout: _,
+        dry_run: true,
+    } = cmd
+    {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let entries = molto2_import::parse_bulk_any(&text)?;
+        let last = (*start as usize).saturating_add(entries.len());
+        println!(
+            "found {} entries; would fill slots #{}..#{} (dry-run)",
+            entries.len(),
+            start,
+            last.saturating_sub(1)
+        );
+        for (i, entry) in entries.iter().enumerate() {
+            let p = *start as usize + i;
+            println!(
+                "  #{:02}: {:?} ({} bytes, {:?}, {} digits, {:?})",
+                p,
+                entry.suggested_title(),
+                entry.secret.len(),
+                entry.algorithm,
+                entry.digits as u8,
+                entry.time_step
+            );
+        }
+        return Ok(());
+    }
 
     // Factory reset is a plain CLA 0x80 command and needs no auth.
     if let Cmd::FactoryReset { yes } = cmd {
@@ -343,6 +390,66 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 parsed.algorithm,
                 parsed.digits as u8
             );
+        }
+        Cmd::ImportFile {
+            path,
+            start,
+            display_timeout,
+            dry_run,
+        } => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("read {}: {}", path.display(), e))?;
+            let entries = molto2_import::parse_bulk_any(&text)?;
+            let n = entries.len();
+            let last = (*start as usize).saturating_add(n);
+            if last > 100 {
+                return Err(format!(
+                    "{} entries starting at #{} would exceed slot 99 (last slot needed: #{})",
+                    n,
+                    start,
+                    last - 1
+                )
+                .into());
+            }
+            println!(
+                "found {} entries; programming slots #{}..#{}",
+                n,
+                start,
+                last - 1
+            );
+            for (i, entry) in entries.iter().enumerate() {
+                let p = start + i as u8;
+                let title = entry.suggested_title();
+                if title.is_empty() {
+                    eprintln!(
+                        "  #{}: skipping — entry has no issuer or account to use as title",
+                        p
+                    );
+                    continue;
+                }
+                println!(
+                    "  #{}: {:?} ({} bytes secret, {:?}, {} digits)",
+                    p,
+                    title,
+                    entry.secret.len(),
+                    entry.algorithm,
+                    entry.digits as u8
+                );
+                if *dry_run {
+                    continue;
+                }
+                session.set_seed(p, &entry.secret)?;
+                session.set_title(p, &title)?;
+                session.set_config(
+                    p,
+                    &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
+                )?;
+            }
+            if *dry_run {
+                println!("dry-run: nothing written");
+            } else {
+                println!("done");
+            }
         }
         Cmd::FactoryReset { .. } => unreachable!("handled above before auth"),
     }
