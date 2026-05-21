@@ -1,0 +1,15 @@
+[package]
+name = "molto2-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust protocol layer for the Token2 Molto2 / Molto2v2 programmable TOTP token."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
