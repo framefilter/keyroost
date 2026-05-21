@@ -84,6 +84,19 @@ enum Cmd {
         #[arg(long, value_name = "TEXT")]
         ascii: Option<String>,
     },
+    /// Import an otpauth:// URI to a profile: writes seed, title, and config in one go.
+    Import {
+        #[arg(short, long)]
+        profile: u8,
+        /// Override the profile title (default: derived from URI issuer/account).
+        #[arg(long)]
+        title: Option<String>,
+        /// Display timeout in seconds (otpauth:// has no equivalent field).
+        #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
+        display_timeout: TimeoutArg,
+        /// The otpauth:// URI. Use single quotes to protect & from the shell.
+        uri: String,
+    },
     /// Factory-reset the device. Wipes profiles and restores default customer key.
     /// Requires physical button confirmation on the device.
     FactoryReset {
@@ -300,6 +313,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             session.set_customer_key(&new_key)?;
             println!("customer-key rotation requested. Press the up-arrow button on the device to confirm.");
+        }
+        Cmd::Import {
+            profile,
+            title,
+            display_timeout,
+            uri,
+        } => {
+            let parsed = molto2_import::parse_otpauth(uri)?;
+            let final_title = title.clone().unwrap_or_else(|| parsed.suggested_title());
+            if final_title.is_empty() || final_title.len() > 12 {
+                return Err(format!(
+                    "derived title {:?} must be 1..=12 bytes; pass --title to override",
+                    final_title
+                )
+                .into());
+            }
+            session.set_seed(*profile, &parsed.secret)?;
+            session.set_title(*profile, &final_title)?;
+            session.set_config(
+                *profile,
+                &parsed.to_profile_config(unix_now(), display_timeout.to_proto()),
+            )?;
+            println!(
+                "imported {:?} to profile #{} ({} bytes secret, {:?}, {} digits)",
+                final_title,
+                profile,
+                parsed.secret.len(),
+                parsed.algorithm,
+                parsed.digits as u8
+            );
         }
         Cmd::FactoryReset { .. } => unreachable!("handled above before auth"),
     }

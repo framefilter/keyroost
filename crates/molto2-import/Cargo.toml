@@ -1,0 +1,21 @@
+[package]
+name = "molto2-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "otpauth:// URI parsing and bulk-import helpers for Molto2 programming."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Adds Aegis / 2FAS / Authy JSON parsers (pulls in serde + serde_json).
+bulk = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+molto2-proto = { path = "../molto2-proto", version = "0.1.0" }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }

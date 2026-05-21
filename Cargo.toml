@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/molto2-proto",
     "crates/molto2-transport",
+    "crates/molto2-import",
     "crates/moltoctl",
 ]
 
