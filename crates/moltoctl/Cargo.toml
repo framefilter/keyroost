@@ -1,0 +1,20 @@
+[package]
+name = "moltoctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line tool for programming Token2 Molto2 / Molto2v2 TOTP tokens."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "moltoctl"
+path = "src/main.rs"
+
+[dependencies]
+molto2-proto = { path = "../molto2-proto", version = "0.1.0" }
+molto2-transport = { path = "../molto2-transport", version = "0.1.0" }
+clap = { version = "4", features = ["derive"] }
