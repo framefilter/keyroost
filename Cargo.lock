@@ -1578,6 +1578,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "molto2-ctap"
+version = "0.1.0"
+dependencies = [
+ "molto2-hid",
+]
+
+[[package]]
 name = "molto2-hid"
 version = "0.1.0"
 

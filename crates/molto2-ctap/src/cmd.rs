@@ -1,0 +1,266 @@
+//! High-level CTAP2 commands.
+//!
+//! Phase 1 covers only `authenticatorGetInfo` (0x04) and
+//! `authenticatorReset` (0x07). Credential management, makeCredential,
+//! getAssertion, and PIN/UV protocols come in later phases.
+
+use std::time::Duration;
+
+use crate::cbor::{self, Value};
+use crate::hid::{CtapHidDevice, HidTransportError, CTAPHID_CBOR};
+
+pub const CTAP2_GET_INFO: u8 = 0x04;
+pub const CTAP2_RESET: u8 = 0x07;
+
+/// Reset has to land within ~10s of plug-in on most authenticators and
+/// always requires a touch — so we wait considerably longer than a normal
+/// CTAP transaction.
+const RESET_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+pub enum CtapError {
+    Hid(HidTransportError),
+    Cbor(cbor::CborError),
+    /// CTAP2 status byte in the response was non-zero. See the FIDO CTAP
+    /// spec section "Authenticator API Response Codes" for meanings; the
+    /// commonest cases are `0x2D` (CTAP2_ERR_NOT_ALLOWED — e.g. reset
+    /// outside the touch window) and `0x27` (CTAP2_ERR_USER_ACTION_TIMEOUT).
+    StatusCode(u8),
+    EmptyResponse,
+    InvalidResponseShape(&'static str),
+}
+
+impl std::fmt::Display for CtapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CtapError::Hid(e) => write!(f, "{}", e),
+            CtapError::Cbor(e) => write!(f, "{}", e),
+            CtapError::StatusCode(c) => {
+                write!(f, "authenticator returned CTAP2 status 0x{:02X}", c)
+            }
+            CtapError::EmptyResponse => write!(f, "authenticator returned an empty CBOR response"),
+            CtapError::InvalidResponseShape(s) => {
+                write!(f, "authenticator response had wrong shape: {}", s)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CtapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CtapError::Hid(e) => Some(e),
+            CtapError::Cbor(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<HidTransportError> for CtapError {
+    fn from(e: HidTransportError) -> Self {
+        CtapError::Hid(e)
+    }
+}
+
+impl From<cbor::CborError> for CtapError {
+    fn from(e: cbor::CborError) -> Self {
+        CtapError::Cbor(e)
+    }
+}
+
+/// Decoded `authenticatorGetInfo` response. Fields cover the keys that
+/// matter for Phase 1's "show what's there" GUI; other keys (algorithms,
+/// uvModality, etc.) are added on demand.
+#[derive(Debug, Clone, Default)]
+pub struct AuthenticatorInfo {
+    pub versions: Vec<String>,
+    pub extensions: Vec<String>,
+    pub aaguid: [u8; 16],
+    pub options: Vec<(String, bool)>,
+    pub max_msg_size: Option<u64>,
+    pub pin_uv_auth_protocols: Vec<u64>,
+    pub max_credential_count_in_list: Option<u64>,
+    pub max_credential_id_length: Option<u64>,
+    pub transports: Vec<String>,
+    pub firmware_version: Option<u64>,
+}
+
+impl AuthenticatorInfo {
+    /// Look up a named option flag — e.g. `"rk"` (resident keys),
+    /// `"clientPin"`, `"up"`, `"uv"`. Returns `None` when the authenticator
+    /// did not advertise the option.
+    pub fn option(&self, name: &str) -> Option<bool> {
+        self.options
+            .iter()
+            .find_map(|(k, v)| if k == name { Some(*v) } else { None })
+    }
+}
+
+/// Issue `authenticatorGetInfo` and decode the response.
+pub fn get_info(dev: &mut CtapHidDevice) -> Result<AuthenticatorInfo, CtapError> {
+    let resp = dev.transact(CTAPHID_CBOR, &[CTAP2_GET_INFO])?;
+    let (status, body) = split_status(&resp)?;
+    if status != 0 {
+        return Err(CtapError::StatusCode(status));
+    }
+    let (value, _) = cbor::decode(body)?;
+    parse_authenticator_info(&value)
+}
+
+/// Issue `authenticatorReset`. Most authenticators require this within ~10
+/// seconds of plug-in *and* a physical touch — failures with status 0x2D
+/// usually mean the touch window has closed.
+pub fn reset(dev: &mut CtapHidDevice) -> Result<(), CtapError> {
+    dev.set_timeout(RESET_TIMEOUT);
+    let resp = dev.transact(CTAPHID_CBOR, &[CTAP2_RESET])?;
+    let (status, _) = split_status(&resp)?;
+    if status != 0 {
+        return Err(CtapError::StatusCode(status));
+    }
+    Ok(())
+}
+
+fn split_status(resp: &[u8]) -> Result<(u8, &[u8]), CtapError> {
+    resp.split_first()
+        .map(|(s, rest)| (*s, rest))
+        .ok_or(CtapError::EmptyResponse)
+}
+
+fn parse_authenticator_info(v: &Value) -> Result<AuthenticatorInfo, CtapError> {
+    let map = v
+        .as_map()
+        .ok_or(CtapError::InvalidResponseShape("expected map at top level"))?;
+    let mut info = AuthenticatorInfo::default();
+    for (k, val) in map {
+        let Some(key) = k.as_uint() else { continue };
+        match key {
+            0x01 => info.versions = collect_strings(val),
+            0x02 => info.extensions = collect_strings(val),
+            0x03 => {
+                if let Some(b) = val.as_bytes() {
+                    if b.len() == 16 {
+                        info.aaguid.copy_from_slice(b);
+                    }
+                }
+            }
+            0x04 => info.options = collect_named_bools(val),
+            0x05 => info.max_msg_size = val.as_uint(),
+            0x06 => info.pin_uv_auth_protocols = collect_uints(val),
+            0x07 => info.max_credential_count_in_list = val.as_uint(),
+            0x08 => info.max_credential_id_length = val.as_uint(),
+            0x09 => info.transports = collect_strings(val),
+            0x0E => info.firmware_version = val.as_uint(),
+            _ => {}
+        }
+    }
+    Ok(info)
+}
+
+fn collect_strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_text().map(|s| s.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_uints(v: &Value) -> Vec<u64> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_uint()).collect())
+        .unwrap_or_default()
+}
+
+fn collect_named_bools(v: &Value) -> Vec<(String, bool)> {
+    v.as_map()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| match (k.as_text(), v.as_bool()) {
+                    (Some(k), Some(b)) => Some((k.to_owned(), b)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cbor::encode;
+
+    fn synth_getinfo_response() -> Vec<u8> {
+        let v = Value::Map(vec![
+            (
+                Value::UInt(1),
+                Value::Array(vec![
+                    Value::Text("U2F_V2".into()),
+                    Value::Text("FIDO_2_0".into()),
+                ]),
+            ),
+            (
+                Value::UInt(2),
+                Value::Array(vec![Value::Text("hmac-secret".into())]),
+            ),
+            (Value::UInt(3), Value::Bytes(vec![0x11; 16])),
+            (
+                Value::UInt(4),
+                Value::Map(vec![
+                    (Value::Text("rk".into()), Value::Bool(true)),
+                    (Value::Text("clientPin".into()), Value::Bool(false)),
+                    (Value::Text("up".into()), Value::Bool(true)),
+                ]),
+            ),
+            (Value::UInt(5), Value::UInt(1200)),
+            (Value::UInt(6), Value::Array(vec![Value::UInt(1)])),
+        ]);
+        let mut bytes = vec![0u8]; // status byte
+        bytes.extend(encode(&v));
+        bytes
+    }
+
+    #[test]
+    fn parse_getinfo_realistic_response() {
+        let resp = synth_getinfo_response();
+        let (status, body) = split_status(&resp).unwrap();
+        assert_eq!(status, 0);
+        let (val, _) = cbor::decode(body).unwrap();
+        let info = parse_authenticator_info(&val).unwrap();
+        assert_eq!(info.versions, vec!["U2F_V2", "FIDO_2_0"]);
+        assert_eq!(info.extensions, vec!["hmac-secret"]);
+        assert_eq!(info.aaguid, [0x11; 16]);
+        assert_eq!(info.option("rk"), Some(true));
+        assert_eq!(info.option("clientPin"), Some(false));
+        assert_eq!(info.option("unknown"), None);
+        assert_eq!(info.max_msg_size, Some(1200));
+        assert_eq!(info.pin_uv_auth_protocols, vec![1]);
+    }
+
+    #[test]
+    fn ignores_unknown_map_keys() {
+        let v = Value::Map(vec![
+            (
+                Value::UInt(1),
+                Value::Array(vec![Value::Text("FIDO_2_0".into())]),
+            ),
+            (Value::UInt(99), Value::UInt(7)),
+            (Value::Text("not_a_uint_key".into()), Value::Null),
+        ]);
+        let info = parse_authenticator_info(&v).unwrap();
+        assert_eq!(info.versions, vec!["FIDO_2_0"]);
+    }
+
+    #[test]
+    fn empty_response_errors_cleanly() {
+        let err = split_status(&[]).unwrap_err();
+        assert!(matches!(err, CtapError::EmptyResponse));
+    }
+
+    #[test]
+    fn aaguid_with_wrong_length_is_ignored() {
+        let v = Value::Map(vec![(Value::UInt(3), Value::Bytes(vec![0x11; 8]))]);
+        let info = parse_authenticator_info(&v).unwrap();
+        assert_eq!(info.aaguid, [0u8; 16]);
+    }
+}
