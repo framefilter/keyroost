@@ -86,7 +86,7 @@ This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, 
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 NN`:** the customer key on your device isn't the factory default. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). If you've forgotten it: `moltoctl factory-reset --yes` requires the customer key but will wipe everything and reset to default — confirm with the up-arrow on the device.
+**If `answer challenge` returns `63 NN`:** the customer key on your device isn't the factory default. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). If you've forgotten it: `moltoctl factory-reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command); it will wipe every profile and reset the key back to `TOKEN2MOLTO1-KEY`. The device will return `SW 90 60` and display a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 

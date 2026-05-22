@@ -266,6 +266,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Info is read-only and needs no auth — mirrors the bare-invocation path.
+    if let Cmd::Info = cmd {
+        let mut session = Session::open()?;
+        session.set_debug(cli.debug);
+        let info = session.read_info()?;
+        print_info(&info);
+        return Ok(());
+    }
+
     // Factory reset is a plain CLA 0x80 command and needs no auth.
     if let Cmd::FactoryReset { yes } = cmd {
         if !yes {
@@ -282,6 +291,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let key = customer_key_bytes(&cli)?;
     let mut session = Session::open()?;
+    session.set_debug(cli.debug);
     let info = session.read_info()?;
     print_info(&info);
     match session.authenticate(&key) {
@@ -297,7 +307,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cmd {
-        Cmd::Info => {} // already printed
+        Cmd::Info => unreachable!("handled above before auth"),
         Cmd::SetSeed {
             profile,
             hex,
