@@ -13,8 +13,10 @@
 //! Currently Linux-only; cross-platform HID backends are a later phase.
 
 pub mod cbor;
+pub mod client_pin;
 pub mod cmd;
 pub mod hid;
+pub mod pin;
 
 pub use cmd::{get_info, reset, AuthenticatorInfo, CtapError};
 pub use hid::{CtapHidDevice, InitResponse};
