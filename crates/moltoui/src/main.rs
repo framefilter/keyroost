@@ -578,7 +578,7 @@ impl eframe::App for App {
                 ui.label("Click to select. Use Write to push changes.");
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let cols = 10;
+                    let cols = 6;
                     egui::Grid::new("slot-grid")
                         .num_columns(cols)
                         .spacing([4.0, 4.0])
