@@ -570,27 +570,33 @@ impl eframe::App for App {
         });
 
         egui::SidePanel::left("slots")
-            .resizable(false)
-            .exact_width(260.0)
+            .resizable(true)
+            .default_width(220.0)
+            .width_range(120.0..=560.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.heading("Profiles");
-                ui.label("Click to select. Use Write to push changes.");
+                ui.label("Click to select. Drag the divider to resize.");
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let cols = 6;
+                    // Compute columns from the actual content width so every slot is reachable
+                    // regardless of how the user has dragged the side-panel divider.
+                    const CELL: f32 = 26.0;
+                    const GAP: f32 = 4.0;
+                    let avail = ui.available_width().max(CELL);
+                    let cols = (((avail + GAP) / (CELL + GAP)).floor() as usize).max(1);
                     egui::Grid::new("slot-grid")
                         .num_columns(cols)
-                        .spacing([4.0, 4.0])
+                        .spacing([GAP, GAP])
                         .show(ui, |ui| {
                             for p in 0..PROFILES {
                                 let selected = p == self.selected;
                                 let label = format!("{:02}", p);
                                 let btn = egui::SelectableLabel::new(selected, label);
-                                if ui.add_sized([22.0, 22.0], btn).clicked() {
+                                if ui.add_sized([CELL, CELL], btn).clicked() {
                                     self.selected = p;
                                 }
-                                if (p + 1) as usize % cols == 0 {
+                                if (p as usize + 1) % cols == 0 {
                                     ui.end_row();
                                 }
                             }

@@ -243,8 +243,25 @@ pub fn factory_reset() -> Command {
 }
 
 /// Status word helpers.
+///
+/// `9000` is plain success. `9060` is "command accepted, awaiting button
+/// confirmation on the device" — observed on `factory_reset` and
+/// `set_customer_key`. Both are non-failure outcomes from the host's
+/// perspective; the device returns the same empty body for either.
 pub fn sw_ok(sw1: u8, sw2: u8) -> bool {
+    sw1 == 0x90 && (sw2 == 0x00 || sw2 == 0x60)
+}
+
+/// True only for the unambiguous "completed" status. Returns false for
+/// `9060` (awaiting button confirmation).
+pub fn sw_completed(sw1: u8, sw2: u8) -> bool {
     sw1 == 0x90 && sw2 == 0x00
+}
+
+/// True when the device returned a status indicating it's waiting for the
+/// user to press the up-arrow button to commit the operation.
+pub fn sw_awaiting_button(sw1: u8, sw2: u8) -> bool {
+    sw1 == 0x90 && sw2 == 0x60
 }
 
 pub fn sw_auth_failed(sw1: u8) -> bool {

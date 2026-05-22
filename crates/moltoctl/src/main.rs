@@ -114,6 +114,28 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Sweep plausible read APDUs against the device and report what the firmware
+    /// recognizes. Read-only by intent — sends short read-style requests with
+    /// destructive INS bytes (set seed/title/config, factory reset, set customer
+    /// key) excluded by default.
+    Probe {
+        /// Confirm you understand this sends ~256–512 experimental APDUs.
+        #[arg(long)]
+        yes: bool,
+        /// Also probe the secure class (CLA 0x84) after authenticating. Without
+        /// this, only CLA 0x80 is scanned (no auth needed).
+        #[arg(long)]
+        authed: bool,
+        /// Override the safety filter and scan every INS byte 0x00..0xFF.
+        /// Only useful if you've already exhausted the safe sweep.
+        #[arg(long)]
+        include_destructive: bool,
+        /// Profile slot to use in P2 for `authed` scans (P2 is the profile index
+        /// for the known secure commands). Defaults to a high, presumably-unused
+        /// slot.
+        #[arg(long, default_value_t = 99)]
+        slot: u8,
+    },
     /// Factory-reset the device. Wipes profiles and restores default customer key.
     /// Requires physical button confirmation on the device.
     FactoryReset {
@@ -286,6 +308,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         print_info(&info);
         println!("requesting factory reset; confirm with the up-arrow button on the device");
         session.factory_reset()?;
+        return Ok(());
+    }
+
+    // Probe walks unauth (and optionally auth) APDU space; it doesn't fit the
+    // standard "open → auth → run command" flow because each transmission is
+    // expected to fail with a non-9000 SW.
+    if let Cmd::Probe {
+        yes,
+        authed,
+        include_destructive,
+        slot,
+    } = cmd
+    {
+        if !yes {
+            return Err("refusing to probe without --yes (see `moltoctl probe --help`)".into());
+        }
+        let mut session = Session::open()?;
+        session.set_debug(cli.debug);
+        let info = session.read_info()?;
+        print_info(&info);
+        if *authed {
+            let key = customer_key_bytes(&cli)?;
+            match session.authenticate(&key) {
+                Ok(()) => println!("authenticated"),
+                Err(TransportError::AuthFailed { tries_remaining }) => {
+                    return Err(format!(
+                        "authentication failed (wrong customer key); {} attempt(s) left",
+                        tries_remaining
+                    )
+                    .into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        run_probe(&mut session, *authed, *include_destructive, *slot);
         return Ok(());
     }
 
@@ -467,8 +524,128 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::FactoryReset { .. } => unreachable!("handled above before auth"),
+        Cmd::Probe { .. } => unreachable!("handled above before auth"),
     }
     Ok(())
+}
+
+/// INS bytes whose effect is known to be destructive or mutating.
+/// Skipped by `probe` unless `--include-destructive` is set.
+const DESTRUCTIVE_INS: &[u8] = &[
+    0xC5, // set seed
+    0xD5, // set title
+    0xD4, // set config / sync time
+    0xD7, // set customer key
+    0xCE, // answer challenge (consumes an auth attempt)
+    0x56, // factory reset
+    0xD8, // lock / unlock screen
+];
+
+fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slot: u8) {
+    use molto2_proto::apdu::{build_apdu_get, CLA_PLAIN, CLA_SECURE};
+    use molto2_proto::commands::{sw_awaiting_button, sw_completed, Command};
+
+    // Known interesting status word categories. We treat anything that's not
+    // "instruction not supported" or "class not supported" as worth surfacing.
+    fn classify(sw1: u8, sw2: u8, data_len: usize) -> Option<&'static str> {
+        if sw_completed(sw1, sw2) {
+            return Some(if data_len > 0 {
+                "✓ ok (data)"
+            } else {
+                "✓ ok (empty)"
+            });
+        }
+        if sw_awaiting_button(sw1, sw2) {
+            return Some("⏵ awaiting button (mutating!)");
+        }
+        match (sw1, sw2) {
+            (0x6D, 0x00) | (0x6E, 0x00) => None, // INS/CLA not supported — boring
+            (0x6C, _) => Some("Le wrong (retry with this length)"),
+            (0x6B, _) => Some("P1/P2 wrong (command may exist)"),
+            (0x67, _) => Some("Lc wrong"),
+            (0x69, 0x82) => Some("security: needs auth"),
+            (0x69, 0x83) => Some("security: auth blocked"),
+            (0x69, 0x85) => Some("conditions of use not satisfied"),
+            (0x6A, 0x80) => Some("wrong data"),
+            (0x6A, 0x82) => Some("file not found"),
+            (0x6A, 0x86) => Some("incorrect P1/P2"),
+            (0x6A, 0x88) => Some("referenced data not found"),
+            _ => Some("(other)"),
+        }
+    }
+
+    let probe_one = |session: &mut Session, cla: u8, ins: u8, p1: u8, p2: u8| {
+        let cmd = Command {
+            label: "probe",
+            apdu: build_apdu_get(cla, ins, p1, p2, 0x00),
+        };
+        match session.transmit_raw(&cmd) {
+            Ok((data, sw1, sw2)) => {
+                if let Some(note) = classify(sw1, sw2, data.len()) {
+                    println!(
+                        "  CLA={:02X} INS={:02X} P1={:02X} P2={:02X} Le=00  →  SW={:02X}{:02X}  ({} bytes)  {}",
+                        cla, ins, p1, p2, sw1, sw2, data.len(), note
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "  CLA={:02X} INS={:02X} P1={:02X} P2={:02X} Le=00  →  transmit error: {}",
+                cla, ins, p1, p2, e
+            ),
+        }
+    };
+
+    let safe = |ins: u8| include_destructive || !DESTRUCTIVE_INS.contains(&ins);
+
+    println!();
+    println!("── Phase 1: CLA 0x80 INS sweep, P1=00 P2=00 Le=00 ──");
+    for ins in 0u8..=0xFF {
+        if !safe(ins) {
+            continue;
+        }
+        probe_one(session, CLA_PLAIN, ins, 0x00, 0x00);
+    }
+
+    if authed {
+        println!();
+        println!(
+            "── Phase 2: CLA 0x84 INS sweep, P1=00 P2={:02X} Le=00 ──",
+            slot
+        );
+        for ins in 0u8..=0xFF {
+            if !safe(ins) {
+                continue;
+            }
+            probe_one(session, CLA_SECURE, ins, 0x00, slot);
+        }
+
+        println!();
+        println!(
+            "── Phase 3: targeted read-back guesses on slot #{} ──",
+            slot
+        );
+        // Pair each known write-INS with a plausible "read" counterpart and
+        // also try the same INS with P1 toggled (the device sometimes uses
+        // P1=00 for read, P1=01 for write or vice versa).
+        let pairs: &[(u8, u8, u8, &str)] = &[
+            (CLA_SECURE, 0xC5, 0x00, "read seed? (write is P1=01)"),
+            (CLA_SECURE, 0xD5, 0x01, "read title? (write is P1=00)"),
+            (CLA_SECURE, 0xD4, 0x00, "read config? (write is P1=01)"),
+            (CLA_PLAIN, 0xB0, 0x00, "ISO READ BINARY"),
+            (CLA_PLAIN, 0xCA, 0x00, "ISO GET DATA (even)"),
+            (CLA_PLAIN, 0xCB, 0x00, "ISO GET DATA (odd)"),
+            (CLA_PLAIN, 0xB2, 0x01, "ISO READ RECORD"),
+            (CLA_PLAIN, 0xA4, 0x00, "ISO SELECT FILE"),
+        ];
+        for (cla, ins, p1, note) in pairs {
+            print!("  [{}] ", note);
+            probe_one(session, *cla, *ins, *p1, slot);
+        }
+    }
+
+    println!();
+    println!("Done. Boring instructions (SW 6D00/6E00) are filtered out.");
+    println!("Any ✓ line is an instruction the firmware recognized and completed.");
 }
 
 fn print_info(info: &molto2_transport::DeviceInfo) {

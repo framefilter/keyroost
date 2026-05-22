@@ -132,9 +132,14 @@ with the same `D4 01 <profile>` header.
 
 | SW | Meaning |
 |---|---|
-| `9000` | Success |
+| `9000` | Success — command completed |
+| `9060` | Success — command queued, awaiting on-device button confirmation (factory reset, set customer key) |
 | `63 NN` | Auth failed; `NN` is attempts remaining before lock |
 | other `6xxx` / `9xxx` | Command-specific failure |
+
+`9060` is not an error: the device has accepted the request and is waiting for
+the user to press the up-arrow button to commit. Both `factory_reset` and
+`set_customer_key` return it. Observed on real hardware during bring-up.
 
 MoltoUI surfaces auth failures specifically (`TransportError::AuthFailed`) so
 they can be retried; everything else becomes `TransportError::Apdu { sw1, sw2 }`.
