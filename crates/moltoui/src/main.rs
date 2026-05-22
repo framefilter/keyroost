@@ -14,6 +14,8 @@ use molto2_proto::commands::{
 };
 use molto2_transport::{DeviceInfo, Session, TransportError};
 
+use molto2_ctap::client_pin::PinUvAuthToken;
+use molto2_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
 use molto2_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 use molto2_hid::HidDevice;
 
@@ -35,6 +37,25 @@ struct SecurityKeysState {
     init: Option<InitResponse>,
     /// User-facing error from the last enumeration / open / GetInfo call.
     error: Option<String>,
+    /// Live PIN entry field (cleared after submit).
+    pin_input: String,
+    /// Active unlocked session: token + cached resident credentials.
+    session: Option<UnlockedSession>,
+    /// Change-PIN modal state.
+    change_pin: ChangePinDialog,
+}
+
+struct UnlockedSession {
+    token: PinUvAuthToken,
+    metadata: CredsMetadata,
+    rps: Vec<(RelyingParty, Vec<Credential>)>,
+}
+
+#[derive(Default)]
+struct ChangePinDialog {
+    open: bool,
+    old: String,
+    new: String,
 }
 
 fn main() -> eframe::Result<()> {
@@ -626,6 +647,169 @@ impl App {
         }
     }
 
+    /// Open the selected hidraw, run the PIN exchange, and populate the
+    /// session with metadata + credential listing. Errors land in
+    /// `security_keys.error`.
+    fn try_unlock(&mut self) {
+        let Some(path) = self.selected_fido_path() else {
+            return;
+        };
+        let pin = std::mem::take(&mut self.security_keys.pin_input);
+        if pin.is_empty() {
+            self.security_keys.error = Some("PIN is empty".into());
+            return;
+        }
+        match self.open_and_unlock(&path, &pin) {
+            Ok(sess) => {
+                self.security_keys.session = Some(sess);
+                self.security_keys.error = None;
+            }
+            Err(e) => self.security_keys.error = Some(format!("unlock failed: {}", e)),
+        }
+    }
+
+    fn open_and_unlock(
+        &self,
+        path: &std::path::Path,
+        pin: &str,
+    ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
+        let (mut dev, init) = CtapHidDevice::open(path)?;
+        if !init.supports_cbor() {
+            return Err("device is U2F-only".into());
+        }
+        let info = molto2_ctap::get_info(&mut dev)?;
+        let token = molto2_ctap::client_pin::get_pin_token(&mut dev, pin)?;
+        let mut mgr = molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
+        let metadata = mgr.metadata()?;
+        let parties = mgr.list_relying_parties()?;
+        let mut rps = Vec::with_capacity(parties.len());
+        for rp in parties {
+            let creds = mgr.list_credentials(&rp.rp_id_hash).unwrap_or_default();
+            rps.push((rp, creds));
+        }
+        // Reconstruct the token we used (CredentialManager consumed it).
+        // The PIN exchange is cheap, so we re-run it for the cached session.
+        let token = molto2_ctap::client_pin::get_pin_token(&mut dev, pin)?;
+        Ok(UnlockedSession {
+            token,
+            metadata,
+            rps,
+        })
+    }
+
+    fn lock_session(&mut self) {
+        self.security_keys.session = None;
+        self.security_keys.pin_input.clear();
+    }
+
+    fn refresh_credentials(&mut self) {
+        let Some(path) = self.selected_fido_path() else {
+            return;
+        };
+        let Some(session) = self.security_keys.session.take() else {
+            return;
+        };
+        match self.refresh_with_token(&path, session.token) {
+            Ok(fresh) => self.security_keys.session = Some(fresh),
+            Err(e) => self.security_keys.error = Some(format!("refresh failed: {}", e)),
+        }
+    }
+
+    fn refresh_with_token(
+        &self,
+        path: &std::path::Path,
+        token: PinUvAuthToken,
+    ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
+        let (mut dev, _) = CtapHidDevice::open(path)?;
+        let info = molto2_ctap::get_info(&mut dev)?;
+        let token2 = PinUvAuthToken {
+            protocol: token.protocol,
+            token: token.token.clone(),
+        };
+        let mut mgr = molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token2, &info)?;
+        let metadata = mgr.metadata()?;
+        let parties = mgr.list_relying_parties()?;
+        let mut rps = Vec::with_capacity(parties.len());
+        for rp in parties {
+            let creds = mgr.list_credentials(&rp.rp_id_hash).unwrap_or_default();
+            rps.push((rp, creds));
+        }
+        Ok(UnlockedSession {
+            token,
+            metadata,
+            rps,
+        })
+    }
+
+    fn delete_credential(&mut self, cred_id: Vec<u8>) {
+        let Some(path) = self.selected_fido_path() else {
+            return;
+        };
+        let Some(session) = self.security_keys.session.as_ref() else {
+            return;
+        };
+        let token_copy = PinUvAuthToken {
+            protocol: session.token.protocol,
+            token: session.token.token.clone(),
+        };
+        match self.try_delete(&path, token_copy, &cred_id) {
+            Ok(()) => {
+                self.refresh_credentials();
+            }
+            Err(e) => self.security_keys.error = Some(format!("delete failed: {}", e)),
+        }
+    }
+
+    fn try_delete(
+        &self,
+        path: &std::path::Path,
+        token: PinUvAuthToken,
+        cred_id: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut dev, _) = CtapHidDevice::open(path)?;
+        let info = molto2_ctap::get_info(&mut dev)?;
+        let mut mgr = molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
+        mgr.delete(cred_id)?;
+        Ok(())
+    }
+
+    fn submit_change_pin(&mut self) {
+        let Some(path) = self.selected_fido_path() else {
+            return;
+        };
+        let old = std::mem::take(&mut self.security_keys.change_pin.old);
+        let new = std::mem::take(&mut self.security_keys.change_pin.new);
+        if old.is_empty() || new.is_empty() {
+            self.security_keys.error = Some("both PIN fields are required".into());
+            return;
+        }
+        match self.try_change_pin(&path, &old, &new) {
+            Ok(()) => {
+                self.security_keys.change_pin.open = false;
+                self.security_keys.error = None;
+                // Force re-unlock with the new PIN.
+                self.lock_session();
+            }
+            Err(e) => self.security_keys.error = Some(format!("change PIN failed: {}", e)),
+        }
+    }
+
+    fn try_change_pin(
+        &self,
+        path: &std::path::Path,
+        old: &str,
+        new: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut dev, _) = CtapHidDevice::open(path)?;
+        molto2_ctap::client_pin::change_pin(&mut dev, old, new)?;
+        Ok(())
+    }
+
+    fn selected_fido_path(&self) -> Option<std::path::PathBuf> {
+        let idx = self.security_keys.selected?;
+        Some(self.security_keys.devices.get(idx)?.path.clone())
+    }
+
     fn render_security_keys(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("fido-devices")
             .resizable(true)
@@ -777,11 +961,173 @@ impl App {
             }
 
             ui.add_space(12.0);
+            ui.separator();
+            self.render_credentials_section(ui);
+            ui.add_space(12.0);
             ui.colored_label(
                 ui.visuals().weak_text_color(),
                 "Reset is CLI-only for now: `moltoctl fido-reset --yes`.",
             );
         });
+
+        self.render_change_pin_dialog(ctx);
+    }
+
+    fn render_credentials_section(&mut self, ui: &mut egui::Ui) {
+        let pin_set = self
+            .security_keys
+            .info
+            .as_ref()
+            .and_then(|i| i.option("clientPin"));
+
+        ui.label(egui::RichText::new("Credentials").strong());
+
+        ui.horizontal(|ui| {
+            match pin_set {
+                Some(true) => ui.colored_label(egui::Color32::from_rgb(120, 200, 130), "PIN set"),
+                Some(false) => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 180, 80), "No PIN configured")
+                }
+                None => ui.colored_label(ui.visuals().weak_text_color(), "PIN status unknown"),
+            };
+            if ui.button("Change PIN…").clicked() {
+                self.security_keys.change_pin.open = true;
+            }
+            if self.security_keys.session.is_some() && ui.button("Lock").clicked() {
+                self.lock_session();
+            }
+        });
+
+        ui.add_space(4.0);
+
+        if self.security_keys.session.is_none() {
+            if pin_set != Some(true) {
+                ui.colored_label(
+                    ui.visuals().weak_text_color(),
+                    "Set a PIN with `moltoctl fido-pin-set` before listing credentials.",
+                );
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label("PIN:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.security_keys.pin_input)
+                        .password(true)
+                        .desired_width(180.0),
+                );
+                let submit = ui.button("Unlock").clicked();
+                if submit || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    self.try_unlock();
+                }
+            });
+            return;
+        }
+
+        // Session is active — pull the data out for rendering, then drop the
+        // borrow before we issue any further state-mutating clicks.
+        let (existing, max_remaining, rps) = {
+            let s = self.security_keys.session.as_ref().expect("just checked");
+            (
+                s.metadata.existing_count,
+                s.metadata.max_remaining,
+                s.rps.clone(),
+            )
+        };
+
+        ui.label(format!(
+            "{} resident credential(s), room for {} more",
+            existing, max_remaining
+        ));
+        ui.add_space(6.0);
+
+        let mut delete: Option<Vec<u8>> = None;
+        egui::ScrollArea::vertical()
+            .max_height(360.0)
+            .show(ui, |ui| {
+                for (rp, creds) in &rps {
+                    let header = if let Some(name) = rp.name.as_ref().filter(|s| !s.is_empty()) {
+                        format!("{}  ({})", rp.id, name)
+                    } else {
+                        rp.id.clone()
+                    };
+                    ui.collapsing(header, |ui| {
+                        if creds.is_empty() {
+                            ui.label("(no credentials)");
+                        }
+                        for c in creds {
+                            ui.horizontal(|ui| {
+                                ui.monospace(hex_short(&c.credential_id));
+                                let user_field = if let Some(d) = &c.user.display_name {
+                                    d.clone()
+                                } else if let Some(n) = &c.user.name {
+                                    n.clone()
+                                } else {
+                                    String::from_utf8_lossy(&c.user.id).into_owned()
+                                };
+                                ui.label(user_field);
+                                if let Some(alg) = c.algorithm {
+                                    ui.colored_label(
+                                        ui.visuals().weak_text_color(),
+                                        cose_algorithm_name(alg),
+                                    );
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Delete").clicked() {
+                                            delete = Some(c.credential_id.clone());
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    });
+                }
+            });
+
+        if let Some(cred_id) = delete {
+            self.delete_credential(cred_id);
+        }
+    }
+
+    fn render_change_pin_dialog(&mut self, ctx: &egui::Context) {
+        if !self.security_keys.change_pin.open {
+            return;
+        }
+        let mut still_open = self.security_keys.change_pin.open;
+        let mut submit = false;
+        egui::Window::new("Change PIN")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut still_open)
+            .show(ctx, |ui| {
+                ui.label("Old PIN:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.security_keys.change_pin.old)
+                        .password(true)
+                        .desired_width(220.0),
+                );
+                ui.label("New PIN (4–63 UTF-8 bytes):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.security_keys.change_pin.new)
+                        .password(true)
+                        .desired_width(220.0),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Change PIN").clicked() {
+                        submit = true;
+                    }
+                });
+            });
+        if !still_open {
+            self.security_keys.change_pin.open = false;
+            self.security_keys.change_pin.old.clear();
+            self.security_keys.change_pin.new.clear();
+        }
+        if submit {
+            self.submit_change_pin();
+        }
     }
 }
 
@@ -796,6 +1142,28 @@ fn short_path(p: &std::path::Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
+}
+
+fn hex_short(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes.iter().take(8) {
+        s.push_str(&format!("{:02x}", b));
+    }
+    if bytes.len() > 8 {
+        s.push('…');
+    }
+    s
+}
+
+fn cose_algorithm_name(alg: i64) -> &'static str {
+    match alg {
+        -7 => "ES256",
+        -8 => "EdDSA",
+        -35 => "ES384",
+        -36 => "ES512",
+        -257 => "RS256",
+        _ => "unknown",
+    }
 }
 
 fn format_aaguid(aaguid: &[u8; 16]) -> String {
