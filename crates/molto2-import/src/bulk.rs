@@ -129,9 +129,18 @@ pub mod aegis {
         let db: Db = match &root.db {
             serde_json::Value::Object(_) => serde_json::from_value(root.db)?,
             serde_json::Value::String(_) => {
-                return Err(BulkError::Encrypted(
-                    "Aegis export is encrypted; re-export with 'Plain' selected",
-                ));
+                #[cfg(feature = "encrypted")]
+                {
+                    return Err(BulkError::Encrypted(
+                        "Aegis export is encrypted; supply a password (CLI: --password-stdin)",
+                    ));
+                }
+                #[cfg(not(feature = "encrypted"))]
+                {
+                    return Err(BulkError::Encrypted(
+                        "Aegis export is encrypted; build with --features encrypted or re-export plaintext",
+                    ));
+                }
             }
             _ => return Err(BulkError::UnsupportedFormat("unexpected `db` shape")),
         };
@@ -155,6 +164,22 @@ pub mod aegis {
             return Err(BulkError::EmptyFile);
         }
         Ok(out)
+    }
+
+    /// Detect an encrypted Aegis vault without parsing the whole structure.
+    /// `Ok(true)` means an `encrypted` decrypt is needed; `Ok(false)` means
+    /// the file is already plaintext. Cheap and side-effect-free.
+    pub fn is_encrypted(json: &str) -> Result<bool, BulkError> {
+        let root: Root = serde_json::from_str(json)?;
+        Ok(matches!(root.db, serde_json::Value::String(_)))
+    }
+
+    /// Decrypt an Aegis encrypted vault and return the inner plaintext JSON,
+    /// which can then be passed back to `parse()`. Requires the `encrypted`
+    /// crate feature.
+    #[cfg(feature = "encrypted")]
+    pub fn decrypt(json: &str, password: &[u8]) -> Result<String, BulkError> {
+        crate::encrypted::decrypt_aegis(json, password)
     }
 }
 

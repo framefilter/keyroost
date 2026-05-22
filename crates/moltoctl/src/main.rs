@@ -100,9 +100,12 @@ enum Cmd {
         /// The otpauth:// URI. Use single quotes to protect & from the shell.
         uri: String,
     },
-    /// Bulk-import a plaintext export from Aegis, 2FAS, or a list of otpauth:// URIs.
+    /// Bulk-import a plaintext or encrypted export from Aegis, 2FAS, or a list
+    /// of otpauth:// URIs. For encrypted Aegis vaults, pass the password via
+    /// `--password-stdin` (suitable for piping from a file or password manager)
+    /// or `--password-env VAR`.
     ImportFile {
-        /// Path to the plaintext export file. Format is auto-detected.
+        /// Path to the export file. Format is auto-detected.
         path: std::path::PathBuf,
         /// Starting profile index. Entries fill consecutive slots from here.
         #[arg(long, default_value_t = 0)]
@@ -113,6 +116,12 @@ enum Cmd {
         /// Print what would be written, but don't touch the device.
         #[arg(long)]
         dry_run: bool,
+        /// Read the vault password from stdin (single line, no trailing newline).
+        #[arg(long, conflicts_with = "password_env")]
+        password_stdin: bool,
+        /// Read the vault password from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        password_env: Option<String>,
     },
     /// Sweep plausible read APDUs against the device and report what the firmware
     /// recognizes. Read-only by intent — sends short read-style requests with
@@ -236,6 +245,55 @@ fn unix_now() -> u32 {
         .unwrap_or(0)
 }
 
+/// Load a bulk-import file, transparently decrypting an Aegis encrypted
+/// vault if `--password-stdin` or `--password-env` was supplied.
+fn load_bulk_entries(
+    path: &std::path::Path,
+    password_stdin: bool,
+    password_env: Option<&str>,
+) -> Result<Vec<molto2_import::BulkEntry>, Box<dyn std::error::Error>> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+
+    // Aegis vaults are the only format we know how to decrypt. Detect first
+    // so we only consume the password when it would actually be used.
+    let aegis_encrypted = molto2_import::aegis::is_encrypted(&text).unwrap_or(false);
+
+    if aegis_encrypted {
+        let password = read_password(password_stdin, password_env)
+            .ok_or("Aegis vault is encrypted; supply --password-stdin or --password-env VAR")?;
+        let plaintext = molto2_import::aegis::decrypt(&text, password.as_bytes())?;
+        return Ok(molto2_import::aegis::parse(&plaintext)?);
+    }
+
+    if password_stdin || password_env.is_some() {
+        eprintln!("warning: password supplied but file is not an encrypted Aegis vault");
+    }
+    Ok(molto2_import::parse_bulk_any(&text)?)
+}
+
+fn read_password(stdin: bool, env_var: Option<&str>) -> Option<String> {
+    if let Some(name) = env_var {
+        return std::env::var(name).ok();
+    }
+    if stdin {
+        let mut s = String::new();
+        if std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).is_err() {
+            return None;
+        }
+        // Trim a single trailing newline (common when piping `echo`); preserve
+        // intentional whitespace elsewhere.
+        if s.ends_with('\n') {
+            s.pop();
+            if s.ends_with('\r') {
+                s.pop();
+            }
+        }
+        return Some(s);
+    }
+    None
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -261,11 +319,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         start,
         display_timeout: _,
         dry_run: true,
+        password_stdin,
+        password_env,
     } = cmd
     {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-        let entries = molto2_import::parse_bulk_any(&text)?;
+        let entries = load_bulk_entries(path, *password_stdin, password_env.as_deref())?;
         let last = (*start as usize).saturating_add(entries.len());
         println!(
             "found {} entries; would fill slots #{}..#{} (dry-run)",
@@ -468,10 +526,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             start,
             display_timeout,
             dry_run,
+            password_stdin,
+            password_env,
         } => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| format!("read {}: {}", path.display(), e))?;
-            let entries = molto2_import::parse_bulk_any(&text)?;
+            let _ = dry_run; // dry-run is handled before auth
+            let entries = load_bulk_entries(path, *password_stdin, password_env.as_deref())?;
             let n = entries.len();
             let last = (*start as usize).saturating_add(n);
             if last > 100 {

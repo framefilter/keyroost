@@ -17,5 +17,5 @@ path = "src/main.rs"
 [dependencies]
 molto2-proto = { path = "../molto2-proto", version = "0.1.0" }
 molto2-transport = { path = "../molto2-transport", version = "0.1.0" }
-molto2-import = { path = "../molto2-import", version = "0.1.0", features = ["bulk"] }
+molto2-import = { path = "../molto2-import", version = "0.1.0", features = ["bulk", "encrypted"] }
 clap = { version = "4", features = ["derive"] }

@@ -14,8 +14,9 @@ dark-themed desktop GUI (`moltoui`).
 ## Features
 
 - Program one slot from an `otpauth://` URI (`moltoctl import`)
-- Bulk-import a plaintext export from Aegis, 2FAS, or any list of `otpauth://` URIs
-  (Authy via third-party extractors)
+- Bulk-import from Aegis (plaintext or encrypted), 2FAS plaintext, or any list of
+  `otpauth://` URIs (Authy via third-party extractors). Encrypted Aegis vaults
+  are decrypted in-process via scrypt + AES-256-GCM.
 - Sync the host's UTC clock to one profile or all profiles
 - Rotate the customer key, factory reset, and the rest of the molto2.py command set
 - 100-slot grid GUI with form editor, severity-colored log, and bulk-import dialog
@@ -54,6 +55,11 @@ moltoctl import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3
 # bulk-import a plaintext Aegis or 2FAS export
 moltoctl import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate
 moltoctl import-file ~/Downloads/aegis.json --start 0             # program
+
+# encrypted Aegis vault: pipe the password in
+pass otp/aegis | moltoctl import-file ~/Downloads/aegis.json --start 0 --password-stdin
+# or via env var
+AEGIS_PW="…" moltoctl import-file ~/Downloads/aegis.json --start 0 --password-env AEGIS_PW
 
 # sync time on all profiles
 moltoctl sync-time --all

@@ -156,6 +156,10 @@ struct BulkDialog {
     start: u8,
     /// Display timeout applied to every entry.
     display_timeout: TimeoutChoice,
+    /// Password for encrypted Aegis vaults (revealed when the loader detects one).
+    password: String,
+    /// True once the loader has seen an encrypted vault at the current path.
+    needs_password: bool,
 }
 
 struct LogLine {
@@ -402,22 +406,48 @@ impl App {
     }
 
     fn bulk_load(&mut self) {
-        let path = self.bulk_dialog.path.trim();
+        let path = self.bulk_dialog.path.trim().to_owned();
         if path.is_empty() {
             self.bulk_dialog.error = Some("enter a file path first".into());
             return;
         }
-        let text = match std::fs::read_to_string(path) {
+        let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
                 self.bulk_dialog.error = Some(format!("read failed: {}", e));
                 return;
             }
         };
-        match molto2_import::parse_bulk_any(&text) {
+
+        // If this looks like an encrypted Aegis vault, ask for a password first
+        // (unless the user has already typed one).
+        let is_encrypted_aegis = molto2_import::aegis::is_encrypted(&text).unwrap_or(false);
+        let final_text = if is_encrypted_aegis {
+            self.bulk_dialog.needs_password = true;
+            if self.bulk_dialog.password.is_empty() {
+                self.bulk_dialog.entries.clear();
+                self.bulk_dialog.error =
+                    Some("encrypted Aegis vault — enter password and click Load again".into());
+                return;
+            }
+            match molto2_import::aegis::decrypt(&text, self.bulk_dialog.password.as_bytes()) {
+                Ok(plaintext) => plaintext,
+                Err(e) => {
+                    self.bulk_dialog.entries.clear();
+                    self.bulk_dialog.error = Some(format!("decrypt: {}", e));
+                    return;
+                }
+            }
+        } else {
+            self.bulk_dialog.needs_password = false;
+            text
+        };
+
+        match molto2_import::parse_bulk_any(&final_text) {
             Ok(entries) => {
                 self.bulk_dialog.entries = entries;
                 self.bulk_dialog.error = None;
+                self.bulk_dialog.password.clear();
                 self.log(
                     Severity::Info,
                     format!(
@@ -741,12 +771,20 @@ impl eframe::App for App {
                 .collapsible(false)
                 .default_width(560.0)
                 .show(ctx, |ui| {
-                    ui.label("Plaintext file path (Aegis JSON, 2FAS JSON, or otpauth:// list):");
+                    ui.label("Export file path (Aegis JSON [plain or encrypted], 2FAS JSON, or otpauth:// list):");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.bulk_dialog.path)
                             .desired_width(540.0)
                             .hint_text("/path/to/export.json"),
                     );
+                    if self.bulk_dialog.needs_password {
+                        ui.label("Aegis vault password:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.bulk_dialog.password)
+                                .password(true)
+                                .desired_width(360.0),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Load").clicked() {
                             do_load = true;
