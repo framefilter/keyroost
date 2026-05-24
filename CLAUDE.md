@@ -89,3 +89,24 @@ cargo run -p moltoui
 The repo uses descriptive commits oriented around *why*, not *what*. See
 `git log --oneline` for examples. Sign off via the standard footer the harness
 appends; don't add the model identifier (`claude-opus-4-7[1m]`) to commits.
+
+## Privacy & secrets (enforced — see `.claude/`)
+
+This is a security-key management tool. Treat PINs, credential listings, and
+host secrets as untouchable. A PreToolUse hook (`.claude/hooks/guard.sh`) plus
+`permissions.deny` rules enforce the rules below; **don't try to work around
+the guard** — if it blocks something, that's intended.
+
+- **Never run** `moltoctl fido-reset` or `moltoctl fido-creds-delete` against a
+  key the user actively uses. Both are irreversible. (Hook-blocked.)
+- **Never print or read secrets.** Don't `printenv`, don't `echo` a
+  PIN/password/token variable, don't read `.env`, `*.pem`, SSH keys, or
+  NetworkManager / `wpa_supplicant` WiFi configs. (Hook-blocked.)
+- **PIN entry is the user's job.** PINs come from `--pin-env` / `--pin-stdin`
+  the user sets in their own shell. Don't ask for the PIN, don't place it in
+  argv, don't read it back.
+- **Credential listings are private.** `fido-creds-list` reveals which services
+  the user has accounts with. Don't run it speculatively; if the user shares
+  output, don't echo usernames / RP names beyond what the task needs.
+- **Safe to run freely against any key:** `moltoctl list`, `moltoctl fido-info`,
+  `moltoctl fido-pin-retries` (read-only, no PIN, no counter change).
