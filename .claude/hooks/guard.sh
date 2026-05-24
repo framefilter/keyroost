@@ -48,10 +48,16 @@ block() {
 matches() { printf '%s' "$arg" | grep -Eiq "$1"; }
 
 # --- 1. Destructive FIDO operations -----------------------------------------
-matches 'fido-reset' \
-    && block 'fido-reset wipes a security key (all credentials + PIN).'
-matches 'fido-creds-delete' \
-    && block 'fido-creds-delete irreversibly removes a resident credential.'
+# Toggle for test/throwaway keys: in the shell that launches Claude Code,
+#   export MOLTO_ALLOW_FIDO_DESTRUCTIVE=1
+# to allow fido-reset / fido-creds-delete. Unset (the default) blocks them.
+# The secret-reading guards in sections 2-3 below stay ON regardless.
+if [ "${MOLTO_ALLOW_FIDO_DESTRUCTIVE:-0}" != "1" ]; then
+    matches 'fido-reset' \
+        && block 'fido-reset wipes a security key (all credentials + PIN). For a test key, set MOLTO_ALLOW_FIDO_DESTRUCTIVE=1 before launching Claude Code.'
+    matches 'fido-creds-delete' \
+        && block 'fido-creds-delete irreversibly removes a resident credential. For a test key, set MOLTO_ALLOW_FIDO_DESTRUCTIVE=1 before launching Claude Code.'
+fi
 
 # --- 2. Secret-dumping commands ---------------------------------------------
 matches '(^|[^[:alnum:]_])printenv([^[:alnum:]_]|$)' \
