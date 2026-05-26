@@ -5,14 +5,17 @@
 //! [`crate::pin`]; this module is the glue between those primitives and
 //! the CBOR wire format.
 //!
-//! Only PIN protocol v1 is wired in for now — every authenticator on the
-//! market supports it, and that's enough to set/change PINs and obtain the
-//! pinUvAuthToken that Phase 2's credentialManagement work needs.
-//! Protocol v2 lives in [`crate::pin`] already and gets wired through here
-//! when the first device demands it.
+//! PIN protocol v1 is used for the crypto (ECDH / AES / HMAC) — every
+//! authenticator supports it. For obtaining the pinUvAuthToken we prefer the
+//! CTAP 2.1 `getPinUvAuthTokenUsingPinWithPermissions` (0x09) when the device
+//! advertises the `pinUvAuthToken` option, because 2.1 authenticators require
+//! an explicit `cm` permission before they will honour credentialManagement;
+//! we fall back to the legacy `getPinToken` (0x05) on older keys. Protocol v2
+//! crypto lives in [`crate::pin`] already and gets wired through here when a
+//! device demands it.
 
 use crate::cbor::{self, Value};
-use crate::cmd::CtapError;
+use crate::cmd::{AuthenticatorInfo, CtapError};
 use crate::hid::{CtapHidDevice, CTAPHID_CBOR};
 use crate::pin::{
     left16_sha256, pad_pin_to_64, EphemeralKey, PinProtocol, ProtocolV1, SharedSecretV1,
@@ -28,6 +31,8 @@ const KEY_KEY_AGREEMENT: u64 = 0x03;
 const KEY_PIN_UV_AUTH_PARAM: u64 = 0x04;
 const KEY_NEW_PIN_ENC: u64 = 0x05;
 const KEY_PIN_HASH_ENC: u64 = 0x06;
+const KEY_PERMISSIONS: u64 = 0x09;
+const KEY_RP_ID: u64 = 0x0A;
 
 /// `clientPin` sub-command numbers.
 const SUB_GET_PIN_RETRIES: u8 = 0x01;
@@ -35,6 +40,10 @@ const SUB_GET_KEY_AGREEMENT: u8 = 0x02;
 const SUB_SET_PIN: u8 = 0x03;
 const SUB_CHANGE_PIN: u8 = 0x04;
 const SUB_GET_PIN_TOKEN: u8 = 0x05;
+/// `getPinUvAuthTokenUsingPinWithPermissions` — the CTAP 2.1 replacement for
+/// `getPinToken`. Unlike 0x05 it binds the returned token to an explicit
+/// permission set, which 2.1 authenticators require for credentialManagement.
+const SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN: u8 = 0x09;
 
 /// COSE_Key map keys for an EC2 P-256 public key.
 const COSE_KTY: i64 = 1;
@@ -177,6 +186,92 @@ pub fn get_pin_token(
         protocol: PIN_PROTOCOL_V1,
         token,
     })
+}
+
+/// Permission bits for [`get_pin_uv_auth_token_with_permissions`]
+/// (CTAP 2.1 §6.5.5.7.1). Combine with bitwise OR.
+pub mod permissions {
+    pub const MAKE_CREDENTIAL: u32 = 0x01;
+    pub const GET_ASSERTION: u32 = 0x02;
+    pub const CREDENTIAL_MANAGEMENT: u32 = 0x04;
+    pub const BIO_ENROLLMENT: u32 = 0x08;
+    pub const LARGE_BLOB_WRITE: u32 = 0x10;
+    pub const AUTHENTICATOR_CONFIGURATION: u32 = 0x20;
+}
+
+/// Obtain a pinUvAuthToken, negotiating the command from `getInfo`: prefer the
+/// CTAP 2.1 `getPinUvAuthTokenUsingPinWithPermissions` (0x09) when the device
+/// advertises the `pinUvAuthToken` option, otherwise fall back to legacy
+/// `getPinToken` (0x05).
+///
+/// This is the difference that makes credentialManagement work on spec-strict
+/// 2.1 authenticators (e.g. YubiKey 5): a legacy-0x05 token carries only
+/// implicit `mc`/`ga` permissions, so credentialManagement is rejected with
+/// `CTAP2_ERR_PIN_AUTH_INVALID` (0x33). Requesting `cm` via 0x09 fixes it.
+/// Legacy keys ignore the permission argument.
+pub fn get_pin_uv_auth_token(
+    dev: &mut CtapHidDevice,
+    pin: &str,
+    info: &AuthenticatorInfo,
+    permissions: u32,
+) -> Result<PinUvAuthToken, CtapError> {
+    if info.option("pinUvAuthToken") == Some(true) {
+        get_pin_uv_auth_token_with_permissions(dev, pin, permissions, None)
+    } else {
+        get_pin_token(dev, pin)
+    }
+}
+
+/// CTAP 2.1 `getPinUvAuthTokenUsingPinWithPermissions` (sub-command 0x09).
+/// Like [`get_pin_token`] but binds the returned token to `permissions` (and,
+/// when the permission set requires it, an `rp_id`).
+pub fn get_pin_uv_auth_token_with_permissions(
+    dev: &mut CtapHidDevice,
+    pin: &str,
+    permissions: u32,
+    rp_id: Option<&str>,
+) -> Result<PinUvAuthToken, CtapError> {
+    let (proto, peer) = key_agreement_v1(dev)?;
+    let our_pub = peer.our_public_cose();
+    let pin_hash_enc = proto.encrypt(&left16_sha256(pin.as_bytes()));
+
+    let extra = pin_uv_auth_token_extra(our_pub, pin_hash_enc, permissions, rp_id);
+    let req = build_request_extra(
+        PIN_PROTOCOL_V1,
+        SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN,
+        &extra,
+    );
+    let resp = dispatch(dev, &req)?;
+    let enc_token = resp
+        .pin_token_enc
+        .ok_or(CtapError::InvalidResponseShape("missing pinUvAuthToken"))?;
+    let token = proto
+        .decrypt(&enc_token)
+        .map_err(|_| CtapError::InvalidResponseShape("pinUvAuthToken decrypt failed"))?;
+    Ok(PinUvAuthToken {
+        protocol: PIN_PROTOCOL_V1,
+        token,
+    })
+}
+
+/// Build the request-map entries unique to the 0x09 sub-command (everything
+/// past `pinUvAuthProtocol` + `subCommand`). Split out so the wire shape is
+/// unit-testable without a device.
+fn pin_uv_auth_token_extra(
+    our_pub: Value,
+    pin_hash_enc: Vec<u8>,
+    permissions: u32,
+    rp_id: Option<&str>,
+) -> Vec<(Value, Value)> {
+    let mut extra = vec![
+        (Value::UInt(KEY_KEY_AGREEMENT), our_pub),
+        (Value::UInt(KEY_PIN_HASH_ENC), Value::Bytes(pin_hash_enc)),
+        (Value::UInt(KEY_PERMISSIONS), Value::UInt(permissions as u64)),
+    ];
+    if let Some(rp) = rp_id {
+        extra.push((Value::UInt(KEY_RP_ID), Value::Text(rp.to_string())));
+    }
+    extra
 }
 
 /// Bundle of negotiated v1 state used by every subsequent sub-command.
@@ -389,6 +484,61 @@ mod tests {
         assert!(validate_pin("1234").is_ok());
         assert!(validate_pin(&"x".repeat(63)).is_ok());
         assert!(validate_pin(&"x".repeat(64)).is_err());
+    }
+
+    fn find<'a>(map: &'a [(Value, Value)], key: u64) -> Option<&'a Value> {
+        map.iter()
+            .find(|(k, _)| k.as_uint() == Some(key))
+            .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn pin_uv_auth_token_request_carries_cm_permission() {
+        let our_pub = cose_p256_public(&[0x11; 32], &[0x22; 32]);
+        let extra = pin_uv_auth_token_extra(
+            our_pub,
+            vec![0xAB; 16],
+            permissions::CREDENTIAL_MANAGEMENT,
+            None,
+        );
+        let bytes = build_request_extra(
+            PIN_PROTOCOL_V1,
+            SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN,
+            &extra,
+        );
+        let (val, _) = cbor::decode(&bytes).unwrap();
+        let map = val.as_map().unwrap();
+        // protocol + subCommand + keyAgreement + pinHashEnc + permissions.
+        assert_eq!(map.len(), 5);
+        assert_eq!(find(map, KEY_PIN_PROTOCOL).and_then(Value::as_uint), Some(1));
+        assert_eq!(
+            find(map, KEY_SUB_COMMAND).and_then(Value::as_uint),
+            Some(SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN as u64)
+        );
+        assert_eq!(find(map, KEY_PERMISSIONS).and_then(Value::as_uint), Some(0x04));
+        assert!(find(map, KEY_PIN_HASH_ENC).and_then(Value::as_bytes).is_some());
+        // rpId omitted when not supplied.
+        assert!(find(map, KEY_RP_ID).is_none());
+    }
+
+    #[test]
+    fn pin_uv_auth_token_request_includes_rp_id_when_given() {
+        let our_pub = cose_p256_public(&[1; 32], &[2; 32]);
+        let extra = pin_uv_auth_token_extra(
+            our_pub,
+            vec![0; 16],
+            permissions::GET_ASSERTION,
+            Some("example.com"),
+        );
+        let bytes = build_request_extra(
+            PIN_PROTOCOL_V1,
+            SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN,
+            &extra,
+        );
+        let (val, _) = cbor::decode(&bytes).unwrap();
+        let map = val.as_map().unwrap();
+        assert_eq!(map.len(), 6);
+        assert_eq!(find(map, KEY_RP_ID).and_then(Value::as_text), Some("example.com"));
     }
 
     #[test]

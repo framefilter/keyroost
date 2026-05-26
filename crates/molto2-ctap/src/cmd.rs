@@ -35,15 +35,49 @@ impl std::fmt::Display for CtapError {
         match self {
             CtapError::Hid(e) => write!(f, "{}", e),
             CtapError::Cbor(e) => write!(f, "{}", e),
-            CtapError::StatusCode(c) => {
-                write!(f, "authenticator returned CTAP2 status 0x{:02X}", c)
-            }
+            CtapError::StatusCode(c) => match ctap_status_name(*c) {
+                Some(name) => write!(f, "authenticator returned CTAP2 status 0x{:02X} ({})", c, name),
+                None => write!(f, "authenticator returned CTAP2 status 0x{:02X}", c),
+            },
             CtapError::EmptyResponse => write!(f, "authenticator returned an empty CBOR response"),
             CtapError::InvalidResponseShape(s) => {
                 write!(f, "authenticator response had wrong shape: {}", s)
             }
         }
     }
+}
+
+/// Map the CTAP2 status bytes we're most likely to surface to their spec
+/// names. Not exhaustive — covers the PIN / credentialManagement domain plus
+/// the common generic errors. Returns `None` for unknown codes so the caller
+/// can still print the raw hex.
+fn ctap_status_name(code: u8) -> Option<&'static str> {
+    Some(match code {
+        0x00 => "CTAP2_OK",
+        0x11 => "CTAP2_ERR_CBOR_UNEXPECTED_TYPE",
+        0x12 => "CTAP2_ERR_INVALID_CBOR",
+        0x14 => "CTAP2_ERR_MISSING_PARAMETER",
+        0x19 => "CTAP2_ERR_CREDENTIAL_EXCLUDED",
+        0x2B => "CTAP2_ERR_UNSUPPORTED_OPTION",
+        0x2C => "CTAP2_ERR_INVALID_OPTION",
+        0x2D => "CTAP2_ERR_KEEPALIVE_CANCEL",
+        0x2E => "CTAP2_ERR_NO_CREDENTIALS",
+        0x2F => "CTAP2_ERR_USER_ACTION_TIMEOUT",
+        0x30 => "CTAP2_ERR_NOT_ALLOWED",
+        0x31 => "CTAP2_ERR_PIN_INVALID",
+        0x32 => "CTAP2_ERR_PIN_BLOCKED",
+        0x33 => "CTAP2_ERR_PIN_AUTH_INVALID",
+        0x34 => "CTAP2_ERR_PIN_AUTH_BLOCKED",
+        0x35 => "CTAP2_ERR_PIN_NOT_SET",
+        0x36 => "CTAP2_ERR_PUAT_REQUIRED",
+        0x37 => "CTAP2_ERR_PIN_POLICY_VIOLATION",
+        0x39 => "CTAP2_ERR_REQUEST_TOO_LARGE",
+        0x3A => "CTAP2_ERR_ACTION_TIMEOUT",
+        0x3B => "CTAP2_ERR_UP_REQUIRED",
+        0x3C => "CTAP2_ERR_UV_BLOCKED",
+        0x3F => "CTAP2_ERR_INTEGRITY_FAILURE",
+        _ => return None,
+    })
 }
 
 impl std::error::Error for CtapError {

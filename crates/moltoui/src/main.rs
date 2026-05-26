@@ -678,7 +678,12 @@ impl App {
             return Err("device is U2F-only".into());
         }
         let info = molto2_ctap::get_info(&mut dev)?;
-        let token = molto2_ctap::client_pin::get_pin_token(&mut dev, pin)?;
+        let token = molto2_ctap::client_pin::get_pin_uv_auth_token(
+            &mut dev,
+            pin,
+            &info,
+            molto2_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+        )?;
         let mut mgr = molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
         let metadata = mgr.metadata()?;
         let parties = mgr.list_relying_parties()?;
@@ -689,7 +694,12 @@ impl App {
         }
         // Reconstruct the token we used (CredentialManager consumed it).
         // The PIN exchange is cheap, so we re-run it for the cached session.
-        let token = molto2_ctap::client_pin::get_pin_token(&mut dev, pin)?;
+        let token = molto2_ctap::client_pin::get_pin_uv_auth_token(
+            &mut dev,
+            pin,
+            &info,
+            molto2_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+        )?;
         Ok(UnlockedSession {
             token,
             metadata,

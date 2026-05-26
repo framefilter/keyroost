@@ -1047,7 +1047,12 @@ where
         return Err("device is U2F-only; CTAP2 credential management not supported".into());
     }
     let info = molto2_ctap::get_info(&mut dev)?;
-    let token = molto2_ctap::client_pin::get_pin_token(&mut dev, pin)?;
+    let token = molto2_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        molto2_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
+    )?;
     let mut mgr = molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
     f(&mut mgr)
 }
