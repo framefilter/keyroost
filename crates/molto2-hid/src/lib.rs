@@ -67,6 +67,10 @@ pub struct HidDevice {
     pub usage_page: u16,
     /// Top-level HID usage from the report descriptor.
     pub usage: u16,
+    /// USB device serial number (`iSerialNumber`), if the device exposes one.
+    /// SoloKeys / Nitrokey publish a unique serial here; many YubiKeys omit it
+    /// (their serial is only reachable via the management applet over CCID).
+    pub serial_number: Option<String>,
 }
 
 impl HidDevice {
@@ -128,6 +132,8 @@ fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
     let report_desc = fs::read(sysfs.join("device/report_descriptor")).unwrap_or_default();
     let (usage_page, usage) = parse_top_usage(&report_desc).unwrap_or((0, 0));
 
+    let serial_number = read_usb_serial(&sysfs.join("device"));
+
     Ok(HidDevice {
         path: PathBuf::from(format!("/dev/{}", name)),
         vendor_id,
@@ -135,7 +141,27 @@ fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
         product_name,
         usage_page,
         usage,
+        serial_number,
     })
+}
+
+/// Read the USB device serial (`iSerialNumber`) for a hidraw node, if present.
+///
+/// Walks up the sysfs tree from the HID device to the first ancestor carrying
+/// an `idVendor` file — that's the USB device node — and returns its `serial`
+/// attribute. Returns `None` when the device exposes no serial (many YubiKeys)
+/// or on any read error. No device open required.
+fn read_usb_serial(device_link: &Path) -> Option<String> {
+    let mut dir = fs::canonicalize(device_link).ok()?;
+    loop {
+        if dir.join("idVendor").exists() {
+            // The USB device node; `serial` is optional in USB descriptors.
+            let serial = fs::read_to_string(dir.join("serial")).ok()?;
+            let serial = serial.trim();
+            return (!serial.is_empty()).then(|| serial.to_string());
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
 }
 
 fn parse_hex_u16(s: &str) -> Option<u16> {
@@ -245,6 +271,7 @@ mod tests {
             product_name: "YubiKey".into(),
             usage_page: HID_USAGE_PAGE_FIDO,
             usage: HID_USAGE_FIDO_AUTHENTICATOR,
+            serial_number: None,
         };
         let kbd = HidDevice {
             usage_page: 0x01,
