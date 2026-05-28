@@ -142,6 +142,144 @@ slot → fill in a title and base32 secret → click Write profile.
 
 The log panel at the bottom should show green "ok" lines for each step.
 
+## FIDO security-key bring-up
+
+Separate from the Molto2 / TOTP path above, MoltoUI also speaks CTAP2 to FIDO2
+security keys (HID transport, PIN protocol, credential management). This
+runbook validates that layer against real hardware. Each step is read-only or,
+where state-changing, clearly marked. Run it against a **disposable test key**,
+not your daily-driver authenticator.
+
+> **Reset to recover.** A factory reset returns a FIDO key to a fully
+> functional fresh state; nothing in this runbook can brick the device — at
+> worst you re-enter the commissioning PIN.
+
+### Prerequisites
+
+Install the bundled udev rules so a non-root user can open `/dev/hidraw*` for
+FIDO devices:
+
+```bash
+sudo cp udev/70-moltoui-fido.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+After plugging the key in, look for `+` after the permissions on the new
+hidraw node (a POSIX ACL via `uaccess`):
+
+```bash
+ls -l /dev/hidraw*
+```
+
+### Step F1: Device enumerates
+
+```bash
+moltoctl list
+```
+
+**Expected:** one line under "FIDO HID devices" per inserted authenticator,
+showing path, VID:PID, usage page `f1d0:0001`, and a model string. With
+multiple keys plugged in you'll get one line each — every subsequent
+`fido-*` subcommand accepts `--path /dev/hidrawN` to disambiguate, and
+kernel hidraw numbers **change on each replug**, so enumerate fresh.
+
+### Step F2: GetInfo round-trips
+
+```bash
+moltoctl fido-info --path /dev/hidrawN
+```
+
+**Expected** (sample from a SoloKeys Solo 2, firmware 2.3.196):
+
+```
+Channel:    0x00000001 (CTAPHID protocol v2)
+Versions:   U2F_V2, FIDO_2_0, FIDO_2_1_PRE
+Extensions: credProtect, hmac-secret
+Options:    rk=true, up=true, plat=false, credMgmt=true, clientPin=false, …
+PIN/UV protocols: 1
+```
+
+Validates HID transport, CTAPHID INIT, CTAP2 `authenticatorGetInfo`, and
+the CBOR decoder. `clientPin=false` confirms an unprovisioned (fresh or
+post-reset) key.
+
+### Step F3: Set the initial PIN
+
+First state-changing step. Use a known throwaway PIN for testing — you'll
+factory-reset before putting the key into real service.
+
+```bash
+printf 'YOUR_TEST_PIN\n' | moltoctl fido-pin-set \
+    --path /dev/hidrawN --new-pin-stdin
+```
+
+**Expected:** `PIN set.` Re-run `fido-info`: `clientPin` should now be
+`true`. `fido-pin-retries` should still show the full attempt counter —
+the initial set doesn't consume a retry.
+
+### Step F4: PIN-protected read paths
+
+```bash
+printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-metadata \
+    --path /dev/hidrawN --pin-stdin
+printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-list \
+    --path /dev/hidrawN --pin-stdin
+```
+
+**Expected on a fresh key:** `0 resident credential(s) stored, room for N
+more`, and `(no resident credentials)`. The point isn't the (empty)
+contents — it's that the `pinUvAuthToken` exchange (`clientPin` 0x09 with
+`cm` permission) succeeded. A correct PIN must **not** decrement the retry
+counter; verify with `fido-pin-retries` afterwards.
+
+### Step F5: Resident-credential round-trip (create → list → delete)
+
+Plant a discoverable credential using `ssh-keygen` as the simplest external
+RP, then exercise `fido-creds-list` and `fido-creds-delete`:
+
+```bash
+# Create — needs PIN entry + a physical touch when the key blinks.
+ssh-keygen -t ecdsa-sk -O resident -O application=ssh:moltotest \
+           -N '' -f /tmp/sk_moltotest
+
+# Read back — confirm it appears, copy the FULL id= value.
+printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-list \
+    --path /dev/hidrawN --pin-stdin
+
+# Destructive: delete by full credentialId.
+printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-delete \
+    --path /dev/hidrawN --cred-id <full hex from id=> --pin-stdin
+
+# Confirm empty.
+printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-list \
+    --path /dev/hidrawN --pin-stdin
+```
+
+The `id=` line is the value you copy — the `cred …` summary above it is
+truncated for readability and is **not** a valid `--cred-id` value.
+
+**Use `ecdsa-sk`, not `ed25519-sk`,** if your authenticator's firmware
+doesn't support Ed25519 in `makeCredential`. On Solo 2 firmware 2.3.196,
+`ed25519-sk` enrollment fails with `Key enrollment failed: invalid format`;
+`ecdsa-sk` (ES256 / P-256) works on every CTAP2 device. A firmware update
+likely adds Ed25519 support.
+
+### What this validates
+
+Running F1–F5 successfully exercises, end to end against real silicon:
+
+- HID transport + CTAPHID INIT
+- CTAP2 `authenticatorGetInfo` + CBOR codec
+- PIN protocol v1 (keyAgreement, sharedSecret, `setPIN`)
+- `pinUvAuthToken` acquisition with `cm` permission
+- `authenticatorCredentialManagement`: `getCredsMetadata`,
+  `enumerateRPsBegin/Next`, `enumerateCredentialsBegin/Next`,
+  `deleteCredential`
+
+First successful run: 2026-05-27, SoloKeys Solo 2 firmware 2.3.196, on
+Linux 6.12 / OpenSSH 10.0p2 / libfido2 1.15.0.
+
 ## What to send back if anything goes wrong
 
 Either email me, paste in the chat, or open an issue with:

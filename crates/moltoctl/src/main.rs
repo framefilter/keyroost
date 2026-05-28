@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use molto2_proto::codec::{base32_decode, hex_decode};
+use molto2_proto::codec::{base32_decode, hex_decode, hex_encode};
 use molto2_proto::commands::{
     DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep, DEFAULT_CUSTOMER_KEY,
 };
@@ -1007,6 +1007,10 @@ fn run_fido_creds_list(
                     name_field,
                     display_field,
                 );
+                // Full credentialId on its own line: this is the exact value
+                // `fido-creds-delete --cred-id` expects (the `cred …` summary
+                // above is truncated for readability and can't be copied).
+                println!("       id={}", hex_encode(&c.credential_id));
                 if let Some(alg) = c.algorithm {
                     println!("       alg={} ({})", alg, cose_algorithm_name(alg));
                 }
