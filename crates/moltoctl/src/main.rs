@@ -12,6 +12,15 @@ use molto2_proto::commands::{
 };
 use molto2_transport::{Session, TransportError};
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use molto2_keyring::{ConnectedKey, Keyring};
+
+/// The global `--name` selector, captured once in `run()` so the FIDO device
+/// resolver can honor it without threading it through every subcommand handler.
+static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
+
 #[derive(Parser)]
 #[command(
     name = "moltoctl",
@@ -31,6 +40,10 @@ struct Cli {
     /// Print every outgoing APDU and incoming response to stderr.
     #[arg(long, global = true)]
     debug: bool,
+    /// Target a security key by its friendly name (see the `key-name` command).
+    /// Resolves to the device's current path. Mutually exclusive with --path.
+    #[arg(long, global = true, value_name = "NAME")]
+    name: Option<String>,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -236,6 +249,32 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
+    /// Manage friendly names for security keys (opt-in; stored in keys.json).
+    KeyName {
+        #[command(subcommand)]
+        cmd: KeyNameCmd,
+    },
+}
+
+/// Subcommands for the `key-name` friendly-name registry.
+#[derive(Subcommand)]
+enum KeyNameCmd {
+    /// Record a friendly name for a connected key. Writes the key's serial to
+    /// keys.json on this computer (opt-in) so it's recognizable by name later.
+    Add {
+        /// Friendly label to assign, e.g. "signing-yubikey" ([a-z0-9_-]).
+        name: String,
+        /// Which connected key to name. Omit to auto-pick / choose interactively.
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// List configured key names and whether each is currently connected.
+    List,
+    /// Remove a configured key name.
+    Remove {
+        /// The friendly label to remove.
+        name: String,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -380,6 +419,9 @@ fn read_password(stdin: bool, env_var: Option<&str>) -> Option<String> {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // Capture --name once so resolve_fido_path() can honor it without threading
+    // it through every FIDO subcommand handler.
+    let _ = SELECTED_KEY_NAME.set(cli.name.clone());
 
     if cli.list_readers {
         for r in Session::list_readers()? {
@@ -442,6 +484,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // List touches neither PC/SC card state nor any HID device — just enumerates.
     if let Cmd::List { all_hid } = cmd {
         run_list(*all_hid)?;
+        return Ok(());
+    }
+
+    // Friendly-name registry management (reads HID enumeration; opt-in writes).
+    if let Cmd::KeyName { cmd } = cmd {
+        run_key_name(cmd)?;
         return Ok(());
     }
 
@@ -748,6 +796,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::FactoryReset { .. } => unreachable!("handled above before auth"),
         Cmd::Probe { .. } => unreachable!("handled above before auth"),
         Cmd::List { .. } => unreachable!("handled above before auth"),
+        Cmd::KeyName { .. } => unreachable!("handled above before auth"),
         Cmd::FidoInfo { .. }
         | Cmd::FidoReset { .. }
         | Cmd::FidoPinRetries { .. }
@@ -790,16 +839,27 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
             if filtered.is_empty() {
                 println!("  (none)");
             } else {
+                let keyring = Keyring::load_default().unwrap_or_default();
                 for d in &filtered {
                     let tag = if d.is_fido() { " [FIDO]" } else { "" };
+                    let serial = match &d.serial_number {
+                        Some(s) => format!(" serial={}", s),
+                        None => String::new(),
+                    };
+                    let name = keyring
+                        .name_for(d.serial_number.as_deref())
+                        .map(|n| format!(" name={}", n))
+                        .unwrap_or_default();
                     println!(
-                        "  {} {:04x}:{:04x} usage={:04x}:{:04x} {}{}",
+                        "  {} {:04x}:{:04x} usage={:04x}:{:04x} {}{}{}{}",
                         d.path.display(),
                         d.vendor_id,
                         d.product_id,
                         d.usage_page,
                         d.usage,
                         d.product_name,
+                        serial,
+                        name,
                         tag,
                     );
                 }
@@ -810,32 +870,205 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn resolve_fido_path(
-    explicit: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
+    if explicit.is_some() && name.is_some() {
+        return Err("pass either --path or --name, not both".into());
+    }
+    // An explicit --path is trusted as-is (preserves prior behavior).
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
     }
-    let mut fido_devices: Vec<_> = molto2_hid::enumerate()?
+
+    let devices: Vec<molto2_hid::HidDevice> = molto2_hid::enumerate()?
         .into_iter()
         .filter(|d| d.is_fido())
         .collect();
-    match fido_devices.len() {
-        0 => Err("no FIDO HID device found. Plug a security key in, or pass --path.".into()),
-        1 => Ok(fido_devices.remove(0).path),
-        n => {
-            let paths: Vec<String> = fido_devices
-                .iter()
-                .map(|d| d.path.display().to_string())
-                .collect();
-            Err(format!(
-                "{} FIDO HID devices found; pass --path to pick one: {}",
-                n,
-                paths.join(", ")
-            )
-            .into())
+
+    // Resolve by friendly name, if one was given.
+    if let Some(name) = name {
+        let keyring = Keyring::load_default()?;
+        let connected: Vec<ConnectedKey> = devices.iter().map(to_connected).collect();
+        let dev = keyring.resolve(name, &connected)?;
+        announce_target(&keyring, &dev.path, &dev.label, dev.serial.as_deref());
+        return Ok(dev.path.clone());
+    }
+
+    // No name, no path: use a lone key, else pick interactively (never auto-pick
+    // among several — that's the multi-device safety guard).
+    let keyring = Keyring::load_default().unwrap_or_default();
+    let dev = pick_from_devices(&devices, &keyring)?;
+    announce_target(&keyring, &dev.path, &dev.product_name, dev.serial_number.as_deref());
+    Ok(dev.path.clone())
+}
+
+/// Map an enumerated HID device into the keyring resolver's view.
+fn to_connected(d: &molto2_hid::HidDevice) -> ConnectedKey {
+    ConnectedKey {
+        path: d.path.clone(),
+        serial: d.serial_number.clone(),
+        label: d.product_name.clone(),
+    }
+}
+
+/// Print the resolved target to stderr so the user always sees which physical
+/// key a command is about to act on (annotated with its friendly name if set).
+fn announce_target(keyring: &Keyring, path: &Path, label: &str, serial: Option<&str>) {
+    match keyring.name_for(serial) {
+        Some(name) => eprintln!("\u{2192} {} ({}, {})", name, label, path.display()),
+        None => eprintln!("\u{2192} {} ({})", label, path.display()),
+    }
+}
+
+/// Pick one device when no `--path`/`--name` was given: a lone key is used
+/// directly; with several, an interactive picker runs on the terminal, and in a
+/// non-interactive context we refuse rather than guess.
+fn pick_from_devices<'a>(
+    devices: &'a [molto2_hid::HidDevice],
+    keyring: &Keyring,
+) -> Result<&'a molto2_hid::HidDevice, Box<dyn std::error::Error>> {
+    match devices.len() {
+        0 => Err("no FIDO HID device found. Plug a security key in, or pass --path/--name.".into()),
+        1 => Ok(&devices[0]),
+        _ => match pick_device_interactively(devices, keyring)? {
+            Some(i) => Ok(&devices[i]),
+            None => {
+                let paths: Vec<String> =
+                    devices.iter().map(|d| d.path.display().to_string()).collect();
+                Err(format!(
+                    "{} FIDO devices connected; pass --name or --path \
+                     (or run in a terminal to choose): {}",
+                    devices.len(),
+                    paths.join(", ")
+                )
+                .into())
+            }
         }
     }
+}
+
+/// Numbered device picker driven over `/dev/tty` (not stdin, which may carry a
+/// piped PIN). Returns the chosen index, or `None` when there's no controlling
+/// terminal to prompt on.
+fn pick_device_interactively(
+    devices: &[molto2_hid::HidDevice],
+    keyring: &Keyring,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    if !tty.is_terminal() {
+        return Ok(None);
+    }
+    let mut out = &tty;
+    writeln!(out, "Multiple security keys connected:")?;
+    for (i, d) in devices.iter().enumerate() {
+        let label = match keyring.name_for(d.serial_number.as_deref()) {
+            Some(name) => format!("{}  ({})", name, d.product_name),
+            None => d.product_name.clone(),
+        };
+        writeln!(out, "  {}) {:<30} {}", i + 1, label, d.path.display())?;
+    }
+    write!(out, "Select [1-{}]: ", devices.len())?;
+    out.flush()?;
+
+    let mut line = String::new();
+    std::io::BufReader::new(&tty).read_line(&mut line)?;
+    let choice: usize = line
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid selection", line.trim()))?;
+    if (1..=devices.len()).contains(&choice) {
+        Ok(Some(choice - 1))
+    } else {
+        Err(format!("selection {} out of range 1-{}", choice, devices.len()).into())
+    }
+}
+
+fn run_key_name(cmd: &KeyNameCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        KeyNameCmd::Add { name, path } => key_name_add(name, path.as_deref()),
+        KeyNameCmd::List => key_name_list(),
+        KeyNameCmd::Remove { name } => key_name_remove(name),
+    }
+}
+
+fn key_name_add(name: &str, path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    molto2_keyring::validate_name(name)?;
+    let devices: Vec<molto2_hid::HidDevice> = molto2_hid::enumerate()?
+        .into_iter()
+        .filter(|d| d.is_fido())
+        .collect();
+    let mut keyring = Keyring::load_default()?;
+    let dev = match path {
+        Some(p) => devices
+            .iter()
+            .find(|d| d.path == p)
+            .ok_or_else(|| format!("{} is not a connected FIDO device", p.display()))?,
+        None => pick_from_devices(&devices, &keyring)?,
+    };
+    let serial = dev.serial_number.clone().ok_or_else(|| {
+        format!(
+            "{} ({}) exposes no USB serial, so it can't be named yet. Reading a \
+             YubiKey-style serial over CCID is a planned follow-up.",
+            dev.path.display(),
+            dev.product_name
+        )
+    })?;
+
+    keyring.add(molto2_keyring::KeyEntry {
+        name: name.to_string(),
+        serial: serial.clone(),
+        source: molto2_keyring::IdSource::Usb,
+        vendor: None,
+        aaguid: None,
+        note: None,
+    })?;
+    // Opt-in disclosure: state plainly what is stored, and how to undo it.
+    eprintln!("Recording \"{}\" \u{2192} serial {} ({}).", name, serial, dev.product_name);
+    eprintln!(
+        "This saves the key's serial number to keys.json on this computer so the \
+         key can be recognized by name later — remove it any time with \
+         `moltoctl key-name remove {}`.",
+        name
+    );
+    let written = keyring.save_default()?;
+    println!("Saved to {}", written.display());
+    Ok(())
+}
+
+fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
+    let keyring = Keyring::load_default()?;
+    if keyring.keys.is_empty() {
+        println!("(no named keys; add one with `moltoctl key-name add <name>`)");
+        return Ok(());
+    }
+    let connected: Vec<molto2_hid::HidDevice> = molto2_hid::enumerate()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.is_fido())
+        .collect();
+    for k in &keyring.keys {
+        let here = connected
+            .iter()
+            .any(|d| d.serial_number.as_deref() == Some(k.serial.as_str()));
+        let status = if here { "connected" } else { "not connected" };
+        println!("  {:<20} serial={} [{}]", k.name, k.serial, status);
+    }
+    Ok(())
+}
+
+fn key_name_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut keyring = Keyring::load_default()?;
+    if keyring.remove(name) {
+        keyring.save_default()?;
+        println!("Removed \"{}\".", name);
+    } else {
+        println!("No key named \"{}\".", name);
+    }
+    Ok(())
 }
 
 fn format_aaguid(aaguid: &[u8; 16]) -> String {

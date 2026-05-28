@@ -19,5 +19,6 @@ molto2-proto = { path = "../molto2-proto", version = "0.1.0" }
 molto2-transport = { path = "../molto2-transport", version = "0.1.0" }
 molto2-hid = { path = "../molto2-hid", version = "0.1.0" }
 molto2-ctap = { path = "../molto2-ctap", version = "0.1.0" }
+molto2-keyring = { path = "../molto2-keyring", version = "0.1.0" }
 molto2-import = { path = "../molto2-import", version = "0.1.0", features = ["bulk", "encrypted"] }
 clap = { version = "4", features = ["derive"] }
