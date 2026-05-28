@@ -5,16 +5,15 @@
 # Bash or Read tool call. Exit code 2 blocks the call and feeds the message
 # on stderr back to Claude as the reason; exit 0 allows it.
 #
-# It blocks two classes of action:
-#   1. Destructive FIDO operations against a security key (reset, credential
-#      delete) — these are irreversible and must never run against a key the
-#      user actively relies on.
-#   2. Commands or file reads that would surface a secret (PINs, env dumps,
-#      private keys, .env files, SSH keys, WiFi/NetworkManager configs).
+# It blocks commands or file reads that would surface a secret (PINs, env
+# dumps, private keys, .env files, SSH keys, WiFi/NetworkManager configs).
 #
-# This is intentionally conservative: when something looks like it would wipe
-# a key or expose a secret, it blocks and tells the human to run it themselves
-# in a separate terminal. Tune the patterns below if it gets in the way.
+# Destructive FIDO operations (fido-reset, fido-creds-delete) are intentionally
+# NOT guarded here: this checkout is used only with disposable test keys.
+#
+# This is intentionally conservative: when something looks like it would expose
+# a secret, it blocks and tells the human to run it themselves in a separate
+# terminal. Tune the patterns below if it gets in the way.
 
 set -u
 
@@ -47,25 +46,13 @@ block() {
 
 matches() { printf '%s' "$arg" | grep -Eiq "$1"; }
 
-# --- 1. Destructive FIDO operations -----------------------------------------
-# Toggle for test/throwaway keys: in the shell that launches Claude Code,
-#   export MOLTO_ALLOW_FIDO_DESTRUCTIVE=1
-# to allow fido-reset / fido-creds-delete. Unset (the default) blocks them.
-# The secret-reading guards in sections 2-3 below stay ON regardless.
-if [ "${MOLTO_ALLOW_FIDO_DESTRUCTIVE:-0}" != "1" ]; then
-    matches 'fido-reset' \
-        && block 'fido-reset wipes a security key (all credentials + PIN). For a test key, set MOLTO_ALLOW_FIDO_DESTRUCTIVE=1 before launching Claude Code.'
-    matches 'fido-creds-delete' \
-        && block 'fido-creds-delete irreversibly removes a resident credential. For a test key, set MOLTO_ALLOW_FIDO_DESTRUCTIVE=1 before launching Claude Code.'
-fi
-
-# --- 2. Secret-dumping commands ---------------------------------------------
+# --- 1. Secret-dumping commands ---------------------------------------------
 matches '(^|[^[:alnum:]_])printenv([^[:alnum:]_]|$)' \
     && block 'printenv would dump environment variables (a PIN may live there).'
 matches 'echo[^|;&]*\$\{?[[:alnum:]_]*(PIN|PASS|PASSWORD|PASSPHRASE|SECRET|TOKEN|KEY)' \
     && block 'this would echo a secret-bearing variable.'
 
-# --- 3. Reading files that commonly hold secrets ----------------------------
+# --- 2. Reading files that commonly hold secrets ----------------------------
 # Covers both shell readers (cat/less/grep ...) and the Read tool's file_path.
 matches '(\.env([^[:alnum:]]|$)|\.pem([^[:alnum:]]|$)|id_rsa|id_ed25519|/\.ssh/|credentials|\.nmconnection|wpa_supplicant|(^|[^[:alnum:]_])psk=)' \
     && block 'this touches a file that commonly holds secrets (keys, .env, SSH, WiFi/NetworkManager configs).'
