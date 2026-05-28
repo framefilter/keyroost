@@ -1710,6 +1710,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "molto2-keyring"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "molto2-proto"
 version = "0.1.0"
 
@@ -1729,6 +1737,7 @@ dependencies = [
  "molto2-ctap",
  "molto2-hid",
  "molto2-import",
+ "molto2-keyring",
  "molto2-proto",
  "molto2-transport",
 ]
