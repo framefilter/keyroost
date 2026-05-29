@@ -5,21 +5,28 @@
 //! [`crate::pin`]; this module is the glue between those primitives and
 //! the CBOR wire format.
 //!
-//! PIN protocol v1 is used for the crypto (ECDH / AES / HMAC) — every
-//! authenticator supports it. For obtaining the pinUvAuthToken we prefer the
-//! CTAP 2.1 `getPinUvAuthTokenUsingPinWithPermissions` (0x09) when the device
-//! advertises the `pinUvAuthToken` option, because 2.1 authenticators require
-//! an explicit `cm` permission before they will honour credentialManagement;
-//! we fall back to the legacy `getPinToken` (0x05) on older keys. Protocol v2
-//! crypto lives in [`crate::pin`] already and gets wired through here when a
-//! device demands it.
+//! **PIN/UV auth protocol negotiation.** The authenticator advertises the
+//! protocols it supports in `authenticatorGetInfo`'s `pinUvAuthProtocols`, an
+//! ordered list whose first entry is the device's *preference* (the Solo 2
+//! reports `[2, 1]`). [`select_pin_protocol`] walks that list and picks the
+//! device's first-listed protocol that we implement (v1 and v2), defaulting to
+//! v1 when the list is absent, empty, or names only protocols we don't know.
+//! The chosen protocol drives the ECDH key derivation, AES/HMAC framing, and
+//! the `pinUvAuthProtocol` field on every request, and is recorded on the
+//! returned [`PinUvAuthToken`] so credentialManagement re-uses it verbatim.
+//!
+//! For obtaining the pinUvAuthToken we prefer the CTAP 2.1
+//! `getPinUvAuthTokenUsingPinWithPermissions` (0x09) when the device advertises
+//! the `pinUvAuthToken` option, because 2.1 authenticators require an explicit
+//! `cm` permission before they will honour credentialManagement; we fall back
+//! to the legacy `getPinToken` (0x05) on older keys.
 
 use crate::cbor::{self, Value};
-use crate::cmd::{AuthenticatorInfo, CtapError};
+use crate::cmd::{get_info, AuthenticatorInfo, CtapError};
 use crate::hid::{CtapHidDevice, CTAPHID_CBOR};
 use crate::pin::{
-    left16_sha256, pad_pin_to_64, EphemeralKey, PinProtocol, ProtocolV1, SharedSecretV1,
-    PIN_PROTOCOL_V1,
+    left16_sha256, pad_pin_to_64, EphemeralKey, PinProtocol, ProtocolV1, ProtocolV2,
+    PIN_PROTOCOL_V1, PIN_PROTOCOL_V2,
 };
 
 pub const CTAP2_CLIENT_PIN: u8 = 0x06;
@@ -54,6 +61,44 @@ const COSE_Y: i64 = -3;
 const COSE_KTY_EC2: u64 = 2;
 const COSE_ALG_ECDH_ES_HKDF_256: i64 = -25;
 const COSE_CRV_P256: u64 = 1;
+
+/// A PIN/UV auth protocol the host implements. Used as the result of
+/// negotiating against the device's advertised `pinUvAuthProtocols`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedPinProtocol {
+    V1,
+    V2,
+}
+
+impl SelectedPinProtocol {
+    /// Wire identifier used in the `pinUvAuthProtocol` request field.
+    pub fn version(self) -> u32 {
+        match self {
+            SelectedPinProtocol::V1 => PIN_PROTOCOL_V1,
+            SelectedPinProtocol::V2 => PIN_PROTOCOL_V2,
+        }
+    }
+}
+
+/// Negotiate the PIN/UV auth protocol against the device's advertised list.
+///
+/// `supported` is `authenticatorGetInfo`'s `pinUvAuthProtocols` verbatim: an
+/// ordered list whose first entry is the authenticator's preference. We honour
+/// that preference by picking the device's first-listed protocol we also
+/// implement. When the list is absent/empty or names only protocols we don't
+/// know, we default to v1 — the protocol every CTAP2 authenticator supports.
+pub fn select_pin_protocol(supported: &[u64]) -> SelectedPinProtocol {
+    for &p in supported {
+        if p == PIN_PROTOCOL_V2 as u64 {
+            return SelectedPinProtocol::V2;
+        }
+        if p == PIN_PROTOCOL_V1 as u64 {
+            return SelectedPinProtocol::V1;
+        }
+        // Unknown protocol id — skip and keep honouring the device's order.
+    }
+    SelectedPinProtocol::V1
+}
 
 /// PIN-related response, decoded into the fields callers actually care about.
 #[derive(Debug, Clone, Default)]
@@ -117,7 +162,8 @@ pub fn get_key_agreement(
 /// Set the initial PIN on an authenticator that doesn't have one yet.
 pub fn set_pin(dev: &mut CtapHidDevice, new_pin: &str) -> Result<(), CtapError> {
     validate_pin(new_pin)?;
-    let (proto, peer) = key_agreement_v1(dev)?;
+    let chosen = negotiate_protocol(dev)?;
+    let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let new_pin_enc = proto.encrypt(&pad_pin_to_64(new_pin));
     let pin_auth = proto.authenticate(&new_pin_enc);
@@ -127,7 +173,7 @@ pub fn set_pin(dev: &mut CtapHidDevice, new_pin: &str) -> Result<(), CtapError> 
         (Value::UInt(KEY_PIN_UV_AUTH_PARAM), Value::Bytes(pin_auth)),
         (Value::UInt(KEY_NEW_PIN_ENC), Value::Bytes(new_pin_enc)),
     ];
-    let req = build_request_extra(PIN_PROTOCOL_V1, SUB_SET_PIN, &extra);
+    let req = build_request_extra(chosen.version(), SUB_SET_PIN, &extra);
     dispatch(dev, &req)?;
     Ok(())
 }
@@ -139,7 +185,8 @@ pub fn change_pin(
     new_pin: &str,
 ) -> Result<(), CtapError> {
     validate_pin(new_pin)?;
-    let (proto, peer) = key_agreement_v1(dev)?;
+    let chosen = negotiate_protocol(dev)?;
+    let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let new_pin_enc = proto.encrypt(&pad_pin_to_64(new_pin));
     let pin_hash_enc = proto.encrypt(&left16_sha256(old_pin.as_bytes()));
@@ -154,7 +201,7 @@ pub fn change_pin(
         (Value::UInt(KEY_NEW_PIN_ENC), Value::Bytes(new_pin_enc)),
         (Value::UInt(KEY_PIN_HASH_ENC), Value::Bytes(pin_hash_enc)),
     ];
-    let req = build_request_extra(PIN_PROTOCOL_V1, SUB_CHANGE_PIN, &extra);
+    let req = build_request_extra(chosen.version(), SUB_CHANGE_PIN, &extra);
     dispatch(dev, &req)?;
     Ok(())
 }
@@ -166,7 +213,17 @@ pub fn get_pin_token(
     dev: &mut CtapHidDevice,
     pin: &str,
 ) -> Result<PinUvAuthToken, CtapError> {
-    let (proto, peer) = key_agreement_v1(dev)?;
+    let chosen = negotiate_protocol(dev)?;
+    token_legacy(dev, pin, chosen)
+}
+
+/// `getPinToken` (0x05) with the protocol already negotiated.
+fn token_legacy(
+    dev: &mut CtapHidDevice,
+    pin: &str,
+    chosen: SelectedPinProtocol,
+) -> Result<PinUvAuthToken, CtapError> {
+    let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let pin_hash_enc = proto.encrypt(&left16_sha256(pin.as_bytes()));
 
@@ -174,7 +231,7 @@ pub fn get_pin_token(
         (Value::UInt(KEY_KEY_AGREEMENT), our_pub),
         (Value::UInt(KEY_PIN_HASH_ENC), Value::Bytes(pin_hash_enc)),
     ];
-    let req = build_request_extra(PIN_PROTOCOL_V1, SUB_GET_PIN_TOKEN, &extra);
+    let req = build_request_extra(chosen.version(), SUB_GET_PIN_TOKEN, &extra);
     let resp = dispatch(dev, &req)?;
     let enc_token = resp
         .pin_token_enc
@@ -183,7 +240,7 @@ pub fn get_pin_token(
         .decrypt(&enc_token)
         .map_err(|_| CtapError::InvalidResponseShape("pinToken decrypt failed"))?;
     Ok(PinUvAuthToken {
-        protocol: PIN_PROTOCOL_V1,
+        protocol: chosen.version(),
         token,
     })
 }
@@ -215,10 +272,13 @@ pub fn get_pin_uv_auth_token(
     info: &AuthenticatorInfo,
     permissions: u32,
 ) -> Result<PinUvAuthToken, CtapError> {
+    // We already hold `getInfo`, so negotiate the protocol straight from it
+    // rather than paying for another round-trip in the helpers below.
+    let chosen = select_pin_protocol(&info.pin_uv_auth_protocols);
     if info.option("pinUvAuthToken") == Some(true) {
-        get_pin_uv_auth_token_with_permissions(dev, pin, permissions, None)
+        token_with_permissions(dev, pin, permissions, None, chosen)
     } else {
-        get_pin_token(dev, pin)
+        token_legacy(dev, pin, chosen)
     }
 }
 
@@ -231,13 +291,26 @@ pub fn get_pin_uv_auth_token_with_permissions(
     permissions: u32,
     rp_id: Option<&str>,
 ) -> Result<PinUvAuthToken, CtapError> {
-    let (proto, peer) = key_agreement_v1(dev)?;
+    let chosen = negotiate_protocol(dev)?;
+    token_with_permissions(dev, pin, permissions, rp_id, chosen)
+}
+
+/// `getPinUvAuthTokenUsingPinWithPermissions` (0x09) with the protocol already
+/// negotiated.
+fn token_with_permissions(
+    dev: &mut CtapHidDevice,
+    pin: &str,
+    permissions: u32,
+    rp_id: Option<&str>,
+    chosen: SelectedPinProtocol,
+) -> Result<PinUvAuthToken, CtapError> {
+    let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
     let pin_hash_enc = proto.encrypt(&left16_sha256(pin.as_bytes()));
 
     let extra = pin_uv_auth_token_extra(our_pub, pin_hash_enc, permissions, rp_id);
     let req = build_request_extra(
-        PIN_PROTOCOL_V1,
+        chosen.version(),
         SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN,
         &extra,
     );
@@ -249,7 +322,7 @@ pub fn get_pin_uv_auth_token_with_permissions(
         .decrypt(&enc_token)
         .map_err(|_| CtapError::InvalidResponseShape("pinUvAuthToken decrypt failed"))?;
     Ok(PinUvAuthToken {
-        protocol: PIN_PROTOCOL_V1,
+        protocol: chosen.version(),
         token,
     })
 }
@@ -288,19 +361,43 @@ impl PeerKey {
     }
 }
 
-fn key_agreement_v1(dev: &mut CtapHidDevice) -> Result<(ProtocolV1, PeerKey), CtapError> {
+/// Run the ECDH key-agreement step and build the negotiated PIN protocol.
+///
+/// `chosen` is the protocol [`select_pin_protocol`] picked for this device. The
+/// returned [`PinProtocol`] is boxed so the v1/v2 split key derivation and
+/// AES/HMAC framing stay behind one interface; callers don't branch on version.
+fn key_agreement(
+    dev: &mut CtapHidDevice,
+    chosen: SelectedPinProtocol,
+) -> Result<(Box<dyn PinProtocol>, PeerKey), CtapError> {
     let (peer_x, peer_y) = get_key_agreement(dev)?;
     let our = EphemeralKey::generate();
     let (our_x, our_y) = our.public_xy();
-    let SharedSecretV1(secret) = our
-        .shared_secret_v1(&peer_x, &peer_y)
-        .map_err(|_| CtapError::InvalidResponseShape("invalid peer keyAgreement point"))?;
-    Ok((
-        ProtocolV1 {
-            secret: SharedSecretV1(secret),
-        },
-        PeerKey { our_x, our_y },
-    ))
+    let proto: Box<dyn PinProtocol> = match chosen {
+        SelectedPinProtocol::V1 => {
+            let secret = our
+                .shared_secret_v1(&peer_x, &peer_y)
+                .map_err(|_| CtapError::InvalidResponseShape("invalid peer keyAgreement point"))?;
+            Box::new(ProtocolV1 { secret })
+        }
+        SelectedPinProtocol::V2 => {
+            let secret = our
+                .shared_secret_v2(&peer_x, &peer_y)
+                .map_err(|_| CtapError::InvalidResponseShape("invalid peer keyAgreement point"))?;
+            Box::new(ProtocolV2 { secret })
+        }
+    };
+    Ok((proto, PeerKey { our_x, our_y }))
+}
+
+/// Negotiate the protocol from the device's `getInfo` for the standalone
+/// `clientPin` flows that don't receive an [`AuthenticatorInfo`] from their
+/// caller (`set_pin`, `change_pin`, `get_pin_token`). One extra read-only
+/// `getInfo` round-trip keeps these public signatures unchanged while still
+/// honouring the device's preferred protocol.
+fn negotiate_protocol(dev: &mut CtapHidDevice) -> Result<SelectedPinProtocol, CtapError> {
+    let info = get_info(dev)?;
+    Ok(select_pin_protocol(&info.pin_uv_auth_protocols))
 }
 
 fn validate_pin(pin: &str) -> Result<(), CtapError> {
@@ -539,6 +636,70 @@ mod tests {
         let map = val.as_map().unwrap();
         assert_eq!(map.len(), 6);
         assert_eq!(find(map, KEY_RP_ID).and_then(Value::as_text), Some("example.com"));
+    }
+
+    #[test]
+    fn select_pin_protocol_prefers_device_first_listed_v2() {
+        // Solo 2 reports [2, 1]: honour its preference for v2.
+        assert_eq!(select_pin_protocol(&[2, 1]), SelectedPinProtocol::V2);
+    }
+
+    #[test]
+    fn select_pin_protocol_v1_only() {
+        assert_eq!(select_pin_protocol(&[1]), SelectedPinProtocol::V1);
+    }
+
+    #[test]
+    fn select_pin_protocol_honours_v1_first_preference() {
+        // Device lists v1 first: pick v1 even though we also support v2.
+        assert_eq!(select_pin_protocol(&[1, 2]), SelectedPinProtocol::V1);
+    }
+
+    #[test]
+    fn select_pin_protocol_defaults_to_v1_when_empty_or_missing() {
+        assert_eq!(select_pin_protocol(&[]), SelectedPinProtocol::V1);
+    }
+
+    #[test]
+    fn select_pin_protocol_defaults_to_v1_for_unknown_only_list() {
+        // A device advertising only a protocol we don't implement (e.g. 3)
+        // falls back to v1, the universally-supported baseline.
+        assert_eq!(select_pin_protocol(&[3]), SelectedPinProtocol::V1);
+    }
+
+    #[test]
+    fn select_pin_protocol_skips_unknown_then_picks_known() {
+        // Unknown leading id is skipped; the next known id (v1) wins.
+        assert_eq!(select_pin_protocol(&[3, 1]), SelectedPinProtocol::V1);
+        // ...and v2 wins if it's the first known one after an unknown.
+        assert_eq!(select_pin_protocol(&[3, 2, 1]), SelectedPinProtocol::V2);
+    }
+
+    #[test]
+    fn selected_protocol_version_maps_to_wire_ids() {
+        assert_eq!(SelectedPinProtocol::V1.version(), PIN_PROTOCOL_V1);
+        assert_eq!(SelectedPinProtocol::V2.version(), PIN_PROTOCOL_V2);
+    }
+
+    #[test]
+    fn request_carries_v2_protocol_when_selected() {
+        let bytes = build_request_extra(
+            SelectedPinProtocol::V2.version(),
+            SUB_GET_PIN_TOKEN,
+            &[],
+        );
+        let (val, _) = cbor::decode(&bytes).unwrap();
+        let map = val.as_map().unwrap();
+        assert_eq!(find(map, KEY_PIN_PROTOCOL).and_then(Value::as_uint), Some(2));
+    }
+
+    #[test]
+    fn auth_token_v2_returns_full_32() {
+        let t = PinUvAuthToken {
+            protocol: PIN_PROTOCOL_V2,
+            token: vec![0u8; 32],
+        };
+        assert_eq!(t.authenticate(b"hello").len(), 32);
     }
 
     #[test]
