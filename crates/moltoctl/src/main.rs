@@ -840,14 +840,17 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                 println!("  (none)");
             } else {
                 let keyring = Keyring::load_default().unwrap_or_default();
+                let ccid = ccid_readers_if_needed(&filtered);
                 for d in &filtered {
                     let tag = if d.is_fido() { " [FIDO]" } else { "" };
-                    let serial = match &d.serial_number {
-                        Some(s) => format!(" serial={}", s),
-                        None => String::new(),
+                    let eff = d.serial_number.clone().or_else(|| ccid_serial_for(d, &ccid));
+                    let serial = match (&d.serial_number, &eff) {
+                        (Some(s), _) => format!(" serial={}", s),
+                        (None, Some(s)) => format!(" serial={}(ccid)", s),
+                        (None, None) => String::new(),
                     };
                     let name = keyring
-                        .name_for(d.serial_number.as_deref())
+                        .name_for(eff.as_deref())
                         .map(|n| format!(" name={}", n))
                         .unwrap_or_default();
                     println!(
@@ -888,7 +891,7 @@ fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::er
     // Resolve by friendly name, if one was given.
     if let Some(name) = name {
         let keyring = Keyring::load_default()?;
-        let connected: Vec<ConnectedKey> = devices.iter().map(to_connected).collect();
+        let connected = connected_keys(&devices);
         let dev = keyring.resolve(name, &connected)?;
         announce_target(&keyring, &dev.path, &dev.label, dev.serial.as_deref());
         return Ok(dev.path.clone());
@@ -897,18 +900,115 @@ fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::er
     // No name, no path: use a lone key, else pick interactively (never auto-pick
     // among several — that's the multi-device safety guard).
     let keyring = Keyring::load_default().unwrap_or_default();
-    let dev = pick_from_devices(&devices, &keyring)?;
-    announce_target(&keyring, &dev.path, &dev.product_name, dev.serial_number.as_deref());
+    let serials = effective_serials(&devices);
+    let i = pick_from_devices(&devices, &keyring, &serials)?;
+    let dev = &devices[i];
+    announce_target(&keyring, &dev.path, &dev.product_name, serials[i].as_deref());
     Ok(dev.path.clone())
 }
 
-/// Map an enumerated HID device into the keyring resolver's view.
-fn to_connected(d: &molto2_hid::HidDevice) -> ConnectedKey {
-    ConnectedKey {
-        path: d.path.clone(),
-        serial: d.serial_number.clone(),
-        label: d.product_name.clone(),
+/// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.
+const VID_YUBICO: u16 = 0x1050;
+
+/// True when a device has no USB serial but is a YubiKey, so its serial must be
+/// read over CCID instead.
+fn needs_ccid_serial(d: &molto2_hid::HidDevice) -> bool {
+    d.serial_number.is_none() && d.vendor_id == VID_YUBICO
+}
+
+/// Effective serial for each device (USB serial, else a CCID-read YubiKey
+/// serial), parallel to `devices`. The CCID readers are enumerated once, and
+/// only if at least one device needs them — so a setup without YubiKeys never
+/// touches PC/SC.
+fn effective_serials(devices: &[molto2_hid::HidDevice]) -> Vec<Option<String>> {
+    let ccid = ccid_readers_if_needed(devices);
+    devices
+        .iter()
+        .map(|d| d.serial_number.clone().or_else(|| ccid_serial_for(d, &ccid)))
+        .collect()
+}
+
+/// Map enumerated HID devices into the keyring resolver's view, filling in a
+/// CCID-read serial for YubiKeys that expose no USB serial.
+fn connected_keys(devices: &[molto2_hid::HidDevice]) -> Vec<ConnectedKey> {
+    devices
+        .iter()
+        .zip(effective_serials(devices))
+        .map(|(d, serial)| ConnectedKey {
+            path: d.path.clone(),
+            serial,
+            label: d.product_name.clone(),
+        })
+        .collect()
+}
+
+/// Read YubiKey CCID serials once, but only if some device actually needs one.
+/// PC/SC failures (e.g. pcscd down) degrade to an empty list rather than erroring
+/// — a missing CCID serial just means that key can't be matched, which is safe.
+fn ccid_readers_if_needed(devices: &[molto2_hid::HidDevice]) -> Vec<molto2_transport::YubiKeyCcid> {
+    if devices.iter().any(needs_ccid_serial) {
+        molto2_transport::yubikey_ccid_serials().unwrap_or_default()
+    } else {
+        Vec::new()
     }
+}
+
+/// Match a YubiKey HID device to one of the CCID-read serials. Prefers an exact
+/// USB-topology match (bus + address), so two connected YubiKeys are never
+/// confused; falls back to the unambiguous single-reader case. Never guesses
+/// among several readers — returns `None` instead, which is the safe outcome.
+fn ccid_serial_for(
+    d: &molto2_hid::HidDevice,
+    readers: &[molto2_transport::YubiKeyCcid],
+) -> Option<String> {
+    if !needs_ccid_serial(d) {
+        return None;
+    }
+    let with_serial: Vec<&molto2_transport::YubiKeyCcid> =
+        readers.iter().filter(|r| r.serial.is_some()).collect();
+    if let (Some(bus), Some(addr)) = (d.usb_bus, d.usb_address) {
+        if let Some(r) = with_serial
+            .iter()
+            .find(|r| r.usb_bus == Some(bus) && r.usb_address == Some(addr))
+        {
+            return r.serial.clone();
+        }
+    }
+    match with_serial.as_slice() {
+        [only] => only.serial.clone(),
+        _ => None,
+    }
+}
+
+/// The effective serial + its source for a single device, reading the YubiKey
+/// CCID serial on demand. Used by `key-name add`, which acts on one chosen
+/// device and wants a clear error when a YubiKey serial can't be read.
+fn read_effective_serial(
+    d: &molto2_hid::HidDevice,
+) -> Result<(String, molto2_keyring::IdSource), Box<dyn std::error::Error>> {
+    if let Some(s) = &d.serial_number {
+        return Ok((s.clone(), molto2_keyring::IdSource::Usb));
+    }
+    if d.vendor_id == VID_YUBICO {
+        let readers = molto2_transport::yubikey_ccid_serials()?;
+        if let Some(s) = ccid_serial_for(d, &readers) {
+            return Ok((s, molto2_keyring::IdSource::Ccid));
+        }
+        return Err(format!(
+            "{} ({}) is a YubiKey, but its serial couldn't be read over CCID. \
+             Check that pcscd is running and that this key's CCID reader is \
+             present (`moltoctl list` shows connected readers).",
+            d.path.display(),
+            d.product_name
+        )
+        .into());
+    }
+    Err(format!(
+        "{} ({}) exposes no USB serial, so it can't be named yet.",
+        d.path.display(),
+        d.product_name
+    )
+    .into())
 }
 
 /// Print the resolved target to stderr so the user always sees which physical
@@ -922,16 +1022,18 @@ fn announce_target(keyring: &Keyring, path: &Path, label: &str, serial: Option<&
 
 /// Pick one device when no `--path`/`--name` was given: a lone key is used
 /// directly; with several, an interactive picker runs on the terminal, and in a
-/// non-interactive context we refuse rather than guess.
-fn pick_from_devices<'a>(
-    devices: &'a [molto2_hid::HidDevice],
+/// non-interactive context we refuse rather than guess. Returns the chosen index
+/// into `devices`. `serials` is parallel to `devices` (used for name display).
+fn pick_from_devices(
+    devices: &[molto2_hid::HidDevice],
     keyring: &Keyring,
-) -> Result<&'a molto2_hid::HidDevice, Box<dyn std::error::Error>> {
+    serials: &[Option<String>],
+) -> Result<usize, Box<dyn std::error::Error>> {
     match devices.len() {
         0 => Err("no FIDO HID device found. Plug a security key in, or pass --path/--name.".into()),
-        1 => Ok(&devices[0]),
-        _ => match pick_device_interactively(devices, keyring)? {
-            Some(i) => Ok(&devices[i]),
+        1 => Ok(0),
+        _ => match pick_device_interactively(devices, keyring, serials)? {
+            Some(i) => Ok(i),
             None => {
                 let paths: Vec<String> =
                     devices.iter().map(|d| d.path.display().to_string()).collect();
@@ -953,6 +1055,7 @@ fn pick_from_devices<'a>(
 fn pick_device_interactively(
     devices: &[molto2_hid::HidDevice],
     keyring: &Keyring,
+    serials: &[Option<String>],
 ) -> Result<Option<usize>, Box<dyn std::error::Error>> {
     use std::io::{BufRead, IsTerminal, Write};
     let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
@@ -965,7 +1068,8 @@ fn pick_device_interactively(
     let mut out = &tty;
     writeln!(out, "Multiple security keys connected:")?;
     for (i, d) in devices.iter().enumerate() {
-        let label = match keyring.name_for(d.serial_number.as_deref()) {
+        let serial = serials.get(i).and_then(|s| s.as_deref());
+        let label = match keyring.name_for(serial) {
             Some(name) => format!("{}  ({})", name, d.product_name),
             None => d.product_name.clone(),
         };
@@ -1007,22 +1111,19 @@ fn key_name_add(name: &str, path: Option<&Path>) -> Result<(), Box<dyn std::erro
             .iter()
             .find(|d| d.path == p)
             .ok_or_else(|| format!("{} is not a connected FIDO device", p.display()))?,
-        None => pick_from_devices(&devices, &keyring)?,
+        None => {
+            let serials = effective_serials(&devices);
+            &devices[pick_from_devices(&devices, &keyring, &serials)?]
+        }
     };
-    let serial = dev.serial_number.clone().ok_or_else(|| {
-        format!(
-            "{} ({}) exposes no USB serial, so it can't be named yet. Reading a \
-             YubiKey-style serial over CCID is a planned follow-up.",
-            dev.path.display(),
-            dev.product_name
-        )
-    })?;
+    let (serial, source) = read_effective_serial(dev)?;
+    let vendor = (dev.vendor_id == VID_YUBICO).then(|| "yubico".to_string());
 
     keyring.add(molto2_keyring::KeyEntry {
         name: name.to_string(),
         serial: serial.clone(),
-        source: molto2_keyring::IdSource::Usb,
-        vendor: None,
+        source,
+        vendor,
         aaguid: None,
         note: None,
     })?;
@@ -1045,15 +1146,16 @@ fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
         println!("(no named keys; add one with `moltoctl key-name add <name>`)");
         return Ok(());
     }
-    let connected: Vec<molto2_hid::HidDevice> = molto2_hid::enumerate()
+    let devices: Vec<molto2_hid::HidDevice> = molto2_hid::enumerate()
         .unwrap_or_default()
         .into_iter()
         .filter(|d| d.is_fido())
         .collect();
+    let connected = connected_keys(&devices);
     for k in &keyring.keys {
         let here = connected
             .iter()
-            .any(|d| d.serial_number.as_deref() == Some(k.serial.as_str()));
+            .any(|c| c.serial.as_deref() == Some(k.serial.as_str()));
         let status = if here { "connected" } else { "not connected" };
         println!("  {:<20} serial={} [{}]", k.name, k.serial, status);
     }
@@ -1482,5 +1584,73 @@ fn main() -> ExitCode {
             eprintln!("error: {}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use molto2_hid::{HidDevice, HID_USAGE_FIDO_AUTHENTICATOR, HID_USAGE_PAGE_FIDO};
+    use molto2_transport::YubiKeyCcid;
+
+    fn yubikey(path: &str, bus: Option<u8>, addr: Option<u8>) -> HidDevice {
+        HidDevice {
+            path: path.into(),
+            vendor_id: VID_YUBICO,
+            product_id: 0x0407,
+            product_name: "YubiKey".into(),
+            usage_page: HID_USAGE_PAGE_FIDO,
+            usage: HID_USAGE_FIDO_AUTHENTICATOR,
+            serial_number: None,
+            usb_bus: bus,
+            usb_address: addr,
+        }
+    }
+
+    fn reader(bus: Option<u8>, addr: Option<u8>, serial: &str) -> YubiKeyCcid {
+        YubiKeyCcid {
+            reader_name: "Yubico YubiKey OTP+FIDO+CCID".into(),
+            usb_bus: bus,
+            usb_address: addr,
+            serial: Some(serial.into()),
+        }
+    }
+
+    #[test]
+    fn topology_match_disambiguates_two_yubikeys() {
+        let readers = [reader(Some(9), Some(53), "37806840"), reader(Some(9), Some(54), "27717893")];
+        let a = yubikey("/dev/hidraw16", Some(9), Some(53));
+        let b = yubikey("/dev/hidraw18", Some(9), Some(54));
+        assert_eq!(ccid_serial_for(&a, &readers).as_deref(), Some("37806840"));
+        assert_eq!(ccid_serial_for(&b, &readers).as_deref(), Some("27717893"));
+    }
+
+    #[test]
+    fn single_reader_is_used_without_topology() {
+        let readers = [reader(None, None, "37806840")];
+        let d = yubikey("/dev/hidraw16", None, None);
+        assert_eq!(ccid_serial_for(&d, &readers).as_deref(), Some("37806840"));
+    }
+
+    #[test]
+    fn never_guesses_among_several_when_topology_unknown() {
+        // Two readers, no usable topology on either side: refuse rather than
+        // risk targeting the wrong physical key.
+        let readers = [reader(None, None, "37806840"), reader(None, None, "27717893")];
+        let d = yubikey("/dev/hidraw16", None, None);
+        assert_eq!(ccid_serial_for(&d, &readers), None);
+    }
+
+    #[test]
+    fn no_serial_for_non_yubikey_or_keys_with_usb_serial() {
+        let readers = [reader(Some(9), Some(53), "37806840")];
+        // A non-Yubico device never consults CCID.
+        let mut solo = yubikey("/dev/hidraw5", Some(9), Some(53));
+        solo.vendor_id = 0x1209;
+        assert_eq!(ccid_serial_for(&solo, &readers), None);
+        // A YubiKey that already has a USB serial isn't a CCID candidate.
+        let mut yk = yubikey("/dev/hidraw16", Some(9), Some(53));
+        yk.serial_number = Some("ABC".into());
+        assert_eq!(ccid_serial_for(&yk, &readers), None);
     }
 }

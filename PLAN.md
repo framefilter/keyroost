@@ -160,9 +160,17 @@ resolver.
 
 ### Build order
 
-1. USB-serial resolver + `keys.toml` load + `key-name add/list/remove` +
-   `--name`/picker plumbing + `list` name column + the safety guard.
-2. YubiKey CCID mgmt-serial read (unlocks the two-YubiKey case).
+1. **Done.** USB-serial resolver + `keys.json` load + `key-name add/list/remove`
+   + `--name`/picker plumbing + `list` name column + the safety guard.
+2. **Done.** YubiKey CCID mgmt-serial read (unlocks the two-YubiKey case).
+   `molto2-transport::yubikey_ccid_serials()` reads each YubiKey CCID reader's
+   management serial via the OTP applet (AID `A0 00 00 05 27 20 01 01`, API
+   request slot `0x10`) — read-only, no PIN/touch, no new deps. moltoctl matches
+   a YubiKey's `/dev/hidrawN` to its reader by USB topology (sysfs
+   `busnum`/`devnum` vs the reader's PC/SC `CHANNEL_ID`), so two connected
+   YubiKeys are never confused; it falls back to the unambiguous single-reader
+   case and otherwise refuses to guess. Verified on hardware with two YubiKeys
+   (serials `37806840` @ bus9/dev53, `27717893` @ bus9/dev54) + a Solo 2.
 
 ## Dependency posture
 
