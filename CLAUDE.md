@@ -38,7 +38,10 @@ workflow during bring-up is:
    `docs/PROTOCOL.md` and edits the offset / framing in either
    `crates/molto2-transport/src/lib.rs::read_info` or
    `crates/molto2-proto/src/commands.rs`.
-3. `cargo build --release && cp target/release/moltoctl ~/bin/` and retry.
+3. `cargo build --release` and retry. The binary is exposed on PATH via a
+   symlink (`~/.local/bin/moltoctl -> target/release/moltoctl`), so a rebuild is
+   live immediately — no copy step. (`~/bin` is intentionally not used; on this
+   Debian box `~/.cargo/bin` and `~/.local/bin` are already on PATH.)
 
 ## Known soft spots — most likely places for first-contact bugs
 
