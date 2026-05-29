@@ -75,13 +75,21 @@ for the smartcard applets.
   the 132-char keyboard OTP applet; HMAC challenge-response is folded into
   the OATH/secrets app. Revisit only if we target actual YubiKeys.
 
-**Open hardware question gating Phase 3:** the Trussed firmware *has* a CCID
-dispatcher, but `pynitrokey` drives OATH over CTAPHID because CCID "is not
-yet supported" in their library — and it's unconfirmed whether the Solo 2
-exposes a usable USB CCID/PC-SC interface (vs NFC-only). First check when
-hardware arrives: does `moltoctl list` show a PC/SC reader for the Solo 2
-over USB? If yes, the PC/SC-reuse plan holds. If NFC-only, OATH goes over
-CTAPHID vendor command `0x70` and we reuse `molto2-ctap` instead.
+**Phase 3 gating question — RESOLVED (2026-05-29, on hardware).** The PC/SC-reuse
+plan holds, and better than hoped: the Solo 2 *does* expose a usable USB CCID
+interface. `moltoctl list` shows a reader `SoloKeys Solo 2 [CCID/ICCD Interface]
+(<serial>) 01 00`, and selecting the Yubico OATH AID (`A0 00 00 05 27 21 01`)
+over that reader returns SW `9000` with a 15-byte version TLV, with `LIST`
+(INS `0xA1`) also `9000` — i.e. the Trussed secrets/OATH applet answers the
+Yubico OATH protocol over USB PC/SC. The same SELECT+LIST succeeds on the test
+YubiKey. So OATH goes over PC/SC for **both** stacks; the CTAPHID `0x70` fallback
+is not needed. (Earlier worry came from `pynitrokey` driving OATH over CTAPHID
+because *their* library lacks CCID support — not a device limitation.)
+
+The pure-Rust OATH byte layer now exists in `crates/molto2-oath` (APDU builders,
+TLV parsing, RFC-4226 truncation, known-answer tests). What remains for Phase 3
+is the transport wiring: a generic reader connect + `61xx`/`SEND_REMAINING`
+reassembly in `molto2-transport`, then `moltoctl`/`moltoui` OATH commands.
 
 ## Friendly device names (multi-key selection)
 
@@ -171,6 +179,14 @@ resolver.
    YubiKeys are never confused; it falls back to the unambiguous single-reader
    case and otherwise refuses to guess. Verified on hardware with two YubiKeys
    (serials `37806840` @ bus9/dev53, `27717893` @ bus9/dev54) + a Solo 2.
+3. **Done.** Shared-resolver extraction + GUI front-end. The CCID/topology/serial
+   logic moved out of `moltoctl` into a new `molto2-resolve` crate (depends on
+   keyring + hid + transport; pure `molto2-keyring` stays hardware-free), so both
+   front-ends are thin over one resolver. `moltoui`'s Security Keys pane now shows
+   friendly names + effective serials in the device list/header and can name /
+   un-name a key (opt-in persist), with the disclosure surfaced via a reusable
+   `helper_bubble` component — the planned cross-cutting helper-bubble. GUI
+   verified by build/clippy only (headless); still needs a visual pass.
 
 ## Dependency posture
 
@@ -191,11 +207,15 @@ compression doesn't lose it:
 
 ## Deferred follow-ups (not blocking, revisit with hardware)
 
-- **PIN protocol v2 wiring.** `pin.rs` already implements v2 (HKDF-derived
-  split keys, random IV) but `client_pin.rs` hardcodes v1 in every request.
-  Should negotiate from `getInfo.pinUvAuthProtocols` and prefer the device's
-  first-listed protocol. Solo 2 reports `[v2, v1]` — v1 works, but we ignore
-  the stated preference. Wire v2 through the command layer when convenient.
+- **PIN protocol v2 wiring — DONE (2026-05-29).** `client_pin.rs` now negotiates
+  from `getInfo.pinUvAuthProtocols`, preferring the device's first-listed
+  protocol we support (`select_pin_protocol`, defaulting to v1 when the list is
+  absent/unknown). Key agreement + every protocol-bearing request route through
+  the chosen `Box<dyn PinProtocol>`, and the issued `PinUvAuthToken` records the
+  version so `cred_mgmt` follows suit. No caller-facing API changed. Hardware
+  premise confirmed: the test YubiKey advertises `[2, 1]` (→ v2 selected) and
+  this Solo 2's firmware advertises `[1]` (→ v1); full end-to-end v2 still wants
+  a PIN-authenticated op (PIN entry is the user's job).
 - **GUI worker thread.** All CTAP calls block egui synchronously; listing
   many credentials or running Reset (30s touch window) freezes the window.
   Offload to a thread + channel.

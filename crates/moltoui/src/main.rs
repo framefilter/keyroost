@@ -18,6 +18,7 @@ use molto2_ctap::client_pin::PinUvAuthToken;
 use molto2_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
 use molto2_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 use molto2_hid::HidDevice;
+use molto2_keyring::Keyring;
 
 const PROFILES: u8 = 100;
 
@@ -31,6 +32,11 @@ enum ViewTab {
 #[derive(Default)]
 struct SecurityKeysState {
     devices: Vec<HidDevice>,
+    /// Effective serial per device (USB, else CCID for YubiKeys), parallel to
+    /// `devices`. Computed once per refresh via the shared resolver.
+    serials: Vec<Option<String>>,
+    /// Friendly-name registry, reloaded each refresh so names show in the list.
+    keyring: Keyring,
     selected: Option<usize>,
     /// CTAP info for `selected`, fetched lazily after selection.
     info: Option<AuthenticatorInfo>,
@@ -39,6 +45,10 @@ struct SecurityKeysState {
     error: Option<String>,
     /// Live PIN entry field (cleared after submit).
     pin_input: String,
+    /// "Name this key" text field (friendly name to assign to the selected key).
+    name_input: String,
+    /// Feedback line from the last name save / removal.
+    name_status: Option<String>,
     /// Active unlocked session: token + cached resident credentials.
     session: Option<UnlockedSession>,
     /// Change-PIN modal state.
@@ -595,6 +605,11 @@ impl App {
                     .security_keys
                     .selected
                     .and_then(|i| self.security_keys.devices.get(i).map(|d| d.path.clone()));
+                // Effective serials (USB, else CCID for YubiKeys) via the shared
+                // resolver, plus the friendly-name registry, so the list and
+                // header can show names. Reading is non-persisting / opt-out free.
+                self.security_keys.serials = molto2_resolve::effective_serials(&fido_only);
+                self.security_keys.keyring = Keyring::load_default().unwrap_or_default();
                 self.security_keys.devices = fido_only;
                 self.security_keys.selected = prev_path.and_then(|p| {
                     self.security_keys
@@ -606,9 +621,118 @@ impl App {
             Err(e) => {
                 self.security_keys.error = Some(format!("enumeration failed: {}", e));
                 self.security_keys.devices.clear();
+                self.security_keys.serials.clear();
                 self.security_keys.selected = None;
             }
         }
+    }
+
+    /// The friendly name registered for the device at `idx`, if any.
+    fn name_for_index(&self, idx: usize) -> Option<&str> {
+        let serial = self.security_keys.serials.get(idx)?.as_deref();
+        self.security_keys.keyring.name_for(serial)
+    }
+
+    /// Friendly-name controls for the selected key: show the current name (or
+    /// that it's unnamed) and let the user assign or remove one. Assigning
+    /// persists the key's serial to `keys.json` — an opt-in step, disclosed
+    /// inline via the helper-bubble.
+    fn render_key_naming(&mut self, ui: &mut egui::Ui, idx: usize, dev: &HidDevice) {
+        let current = self.name_for_index(idx).map(str::to_owned);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Friendly name").strong());
+            helper_bubble(
+                ui,
+                "Assigning a name saves this key's serial number to keys.json on \
+                 this computer, so the key can be recognized by name later. \
+                 Nothing is stored until you click Save; you can remove it any time.",
+            );
+        });
+
+        match &current {
+            Some(name) => {
+                ui.horizontal(|ui| {
+                    ui.label(format!("This key is named \u{201c}{name}\u{201d}."));
+                    if ui.button("Remove name").clicked() {
+                        self.remove_key_name(name);
+                    }
+                });
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.security_keys.name_input)
+                            .hint_text("e.g. test-yubikey")
+                            .desired_width(180.0),
+                    );
+                    if ui.button("Save name").clicked() {
+                        self.save_key_name(dev);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Lowercase letters, digits, '-' and '_'.")
+                        .weak()
+                        .small(),
+                );
+            }
+        }
+
+        if let Some(status) = &self.security_keys.name_status {
+            ui.colored_label(ui.visuals().weak_text_color(), status);
+        }
+    }
+
+    /// Persist a friendly name for `dev` (opt-in). Reads the effective serial
+    /// (USB, or CCID for YubiKeys), validates the name, and writes `keys.json`.
+    fn save_key_name(&mut self, dev: &HidDevice) {
+        let name = self.security_keys.name_input.trim().to_owned();
+        if name.is_empty() {
+            self.security_keys.name_status = Some("Enter a name first.".into());
+            return;
+        }
+        if let Err(e) = molto2_keyring::validate_name(&name) {
+            self.security_keys.name_status = Some(e.to_string());
+            return;
+        }
+        let (serial, source) = match molto2_resolve::read_effective_serial(dev) {
+            Ok(v) => v,
+            Err(e) => {
+                self.security_keys.name_status = Some(e);
+                return;
+            }
+        };
+        let vendor =
+            (dev.vendor_id == molto2_resolve::VID_YUBICO).then(|| "yubico".to_string());
+        let entry = molto2_keyring::KeyEntry {
+            name,
+            serial,
+            source,
+            vendor,
+            aaguid: None,
+            note: None,
+        };
+        if let Err(e) = self.security_keys.keyring.add(entry) {
+            self.security_keys.name_status = Some(e.to_string());
+            return;
+        }
+        match self.security_keys.keyring.save_default() {
+            Ok(path) => {
+                self.security_keys.name_input.clear();
+                self.security_keys.name_status = Some(format!("Saved to {}", path.display()));
+            }
+            Err(e) => self.security_keys.name_status = Some(e.to_string()),
+        }
+        // Recompute serials/keyring so the list and header pick up the new name.
+        self.refresh_security_keys();
+    }
+
+    /// Remove a friendly name and persist the change.
+    fn remove_key_name(&mut self, name: &str) {
+        if self.security_keys.keyring.remove(name) {
+            let _ = self.security_keys.keyring.save_default();
+            self.security_keys.name_status = Some(format!("Removed \u{201c}{name}\u{201d}."));
+        }
+        self.refresh_security_keys();
     }
 
     /// Open the currently-selected hidraw device, run CTAPHID_INIT and
@@ -849,12 +973,23 @@ impl App {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (i, dev) in self.security_keys.devices.iter().enumerate() {
                         let selected = self.security_keys.selected == Some(i);
+                        // Lead with the friendly name when the key is registered.
+                        let name = self
+                            .security_keys
+                            .serials
+                            .get(i)
+                            .and_then(|s| s.as_deref())
+                            .and_then(|s| self.security_keys.keyring.name_for(Some(s)));
+                        let header = match name {
+                            Some(n) => format!("{}  ({})", n, dev.product_name),
+                            None => dev.product_name.clone(),
+                        };
                         let label = format!(
                             "{}\n{:04x}:{:04x}  {}",
                             short_path(&dev.path),
                             dev.vendor_id,
                             dev.product_id,
-                            dev.product_name
+                            header
                         );
                         if ui
                             .selectable_label(selected, label)
@@ -892,6 +1027,9 @@ impl App {
                 dev.vendor_id,
                 dev.product_id
             ));
+            ui.separator();
+
+            self.render_key_naming(ui, idx, &dev);
             ui.separator();
 
             if let Some(err) = &self.security_keys.error {
@@ -1146,6 +1284,15 @@ fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
         ui.label(egui::RichText::new(format!("{key}:")).color(ui.visuals().weak_text_color()));
         ui.label(value);
     });
+}
+
+/// The reusable "helper-bubble": a small information glyph that reveals a
+/// plain-English note on hover. Used to disclose, concisely, any choice that
+/// persists data or affects security (here, that naming a key writes its serial
+/// to disk) without cluttering the layout with a wall of text.
+fn helper_bubble(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new("\u{24d8}").weak()) // ⓘ
+        .on_hover_text(text);
 }
 
 fn short_path(p: &std::path::Path) -> String {
