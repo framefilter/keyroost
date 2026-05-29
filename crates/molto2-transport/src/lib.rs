@@ -20,7 +20,7 @@ use std::fmt;
 
 use molto2_proto::commands::{self, derive_sm4_key, sw_auth_failed, sw_ok, Command, ProfileConfig};
 use molto2_proto::READER_NAME_HINT;
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{Attribute, Card, Context, Protocols, Scope, ShareMode};
 
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]
@@ -341,6 +341,125 @@ impl Session {
         self.transmit(&cmd)?;
         Ok(())
     }
+}
+
+// === YubiKey serial over CCID =============================================
+//
+// YubiKeys expose no USB `iSerialNumber`, but they carry a unique management
+// serial reachable over their CCID interface (a visible PC/SC reader). Reading
+// it lets the friendly-name resolver target a specific YubiKey by name even
+// when same-model keys share VID:PID and AAGUID. The read is read-only — no PIN,
+// no touch — and uses the OTP applet's "device serial" API request, which is
+// stable across firmware generations.
+
+/// Case-insensitive reader-name fragment identifying a YubiKey CCID interface.
+const YUBIKEY_READER_HINT: &str = "yubikey";
+/// YubiKey OTP applet AID (`A0 00 00 05 27 20 01 01`).
+const YUBIKEY_OTP_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01, 0x01];
+/// OTP applet "API request" instruction byte.
+const YK_INS_API_REQ: u8 = 0x01;
+/// OTP applet slot/command selecting the 4-byte device serial.
+const YK_SLOT_DEVICE_SERIAL: u8 = 0x10;
+
+/// A connected YubiKey CCID interface: its reader, USB topology (decoded from
+/// the reader's PC/SC `CHANNEL_ID`), and management serial if it could be read.
+///
+/// `usb_bus` / `usb_address` let a caller match this reader to the same physical
+/// key's `/dev/hidrawN` node (whose sysfs `busnum`/`devnum` carry the same
+/// numbers), which is how two connected YubiKeys are told apart.
+#[derive(Debug, Clone)]
+pub struct YubiKeyCcid {
+    pub reader_name: String,
+    pub usb_bus: Option<u8>,
+    pub usb_address: Option<u8>,
+    pub serial: Option<String>,
+}
+
+/// Enumerate connected YubiKey CCID readers and read each one's management
+/// serial. Readers that can't be opened or read are still returned (with
+/// `serial: None`) so callers can see them. An empty PC/SC reader list yields an
+/// empty vec; only PC/SC-service failures error.
+pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
+    let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+    let mut buf = [0u8; 4096];
+    let names: Vec<std::ffi::CString> = ctx
+        .list_readers(&mut buf)
+        .map_err(TransportError::PcscUnavailable)?
+        .filter(|r| r.to_string_lossy().to_ascii_lowercase().contains(YUBIKEY_READER_HINT))
+        .map(|r| r.to_owned())
+        .collect();
+
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let reader_name = name.to_string_lossy().into_owned();
+        let (mut usb_bus, mut usb_address, mut serial) = (None, None, None);
+        if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+            (usb_bus, usb_address) = read_channel_id(&card);
+            serial = read_yubikey_serial(&card).ok();
+        }
+        out.push(YubiKeyCcid { reader_name, usb_bus, usb_address, serial });
+    }
+    Ok(out)
+}
+
+/// Decode a reader's PC/SC `CHANNEL_ID` into `(usb_bus, usb_address)`. For USB
+/// readers the DWORD's high word is `0x0020` and the low word is
+/// `(bus << 8) | address`; anything else (or an unreadable attribute) is `None`.
+fn read_channel_id(card: &Card) -> (Option<u8>, Option<u8>) {
+    let mut buf = [0u8; 16];
+    match card.get_attribute(Attribute::ChannelId, &mut buf) {
+        Ok(b) if b.len() >= 4 => {
+            let dw = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if (dw >> 16) == 0x0020 {
+                (Some(((dw >> 8) & 0xff) as u8), Some((dw & 0xff) as u8))
+            } else {
+                (None, None)
+            }
+        }
+        _ => (None, None),
+    }
+}
+
+/// Read the YubiKey management serial by selecting the OTP applet and issuing
+/// its device-serial API request. Returns the serial as its decimal string.
+fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
+    // SELECT the OTP applet (case-3 APDU: header + Lc + AID).
+    let mut select = vec![0x00, 0xA4, 0x04, 0x00, YUBIKEY_OTP_AID.len() as u8];
+    select.extend_from_slice(&YUBIKEY_OTP_AID);
+    let (_, sw1, sw2) = transmit_apdu(card, &select)?;
+    if !sw_ok(sw1, sw2) {
+        return Err(TransportError::Apdu { label: "select yubikey otp applet", sw1, sw2 });
+    }
+    // API request reading the device serial (CLA INS P1 P2 Le).
+    let read = [0x00, YK_INS_API_REQ, YK_SLOT_DEVICE_SERIAL, 0x00, 0x00];
+    let (data, sw1, sw2) = transmit_apdu(card, &read)?;
+    if !sw_ok(sw1, sw2) {
+        return Err(TransportError::Apdu { label: "read yubikey serial", sw1, sw2 });
+    }
+    if data.len() < 4 {
+        return Err(TransportError::ShortResponse {
+            label: "read yubikey serial",
+            got: data.len(),
+            expected_min: 4,
+        });
+    }
+    let serial = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    Ok(serial.to_string())
+}
+
+/// Transmit one raw APDU, returning `(payload, sw1, sw2)`.
+fn transmit_apdu(card: &Card, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), TransportError> {
+    let mut buf = [0u8; 256];
+    let resp = card.transmit(apdu, &mut buf)?;
+    if resp.len() < 2 {
+        return Err(TransportError::ShortResponse {
+            label: "yubikey apdu",
+            got: resp.len(),
+            expected_min: 2,
+        });
+    }
+    let (data, sw) = resp.split_at(resp.len() - 2);
+    Ok((data.to_vec(), sw[0], sw[1]))
 }
 
 fn hex_dump(bytes: &[u8]) -> String {
