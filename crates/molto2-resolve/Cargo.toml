@@ -1,0 +1,16 @@
+[package]
+name = "molto2-resolve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared security-key identity resolution (USB + CCID serials) over the keyring."
+
+[lints]
+workspace = true
+
+[dependencies]
+molto2-keyring = { path = "../molto2-keyring", version = "0.1.0" }
+molto2-hid = { path = "../molto2-hid", version = "0.1.0" }
+molto2-transport = { path = "../molto2-transport", version = "0.1.0" }

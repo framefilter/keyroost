@@ -1718,8 +1718,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "molto2-oath"
+version = "0.1.0"
+dependencies = [
+ "molto2-proto",
+]
+
+[[package]]
 name = "molto2-proto"
 version = "0.1.0"
+
+[[package]]
+name = "molto2-resolve"
+version = "0.1.0"
+dependencies = [
+ "molto2-hid",
+ "molto2-keyring",
+ "molto2-transport",
+]
 
 [[package]]
 name = "molto2-transport"
@@ -1739,6 +1755,7 @@ dependencies = [
  "molto2-import",
  "molto2-keyring",
  "molto2-proto",
+ "molto2-resolve",
  "molto2-transport",
 ]
 
@@ -1751,7 +1768,9 @@ dependencies = [
  "molto2-ctap",
  "molto2-hid",
  "molto2-import",
+ "molto2-keyring",
  "molto2-proto",
+ "molto2-resolve",
  "molto2-transport",
 ]
 

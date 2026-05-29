@@ -6,6 +6,8 @@ members = [
     "crates/molto2-hid",
     "crates/molto2-ctap",
     "crates/molto2-keyring",
+    "crates/molto2-resolve",
+    "crates/molto2-oath",
     "crates/molto2-import",
     "crates/moltoctl",
     "crates/moltoui",
