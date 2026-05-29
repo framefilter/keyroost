@@ -71,6 +71,13 @@ pub struct HidDevice {
     /// SoloKeys / Nitrokey publish a unique serial here; many YubiKeys omit it
     /// (their serial is only reachable via the management applet over CCID).
     pub serial_number: Option<String>,
+    /// USB bus number (`busnum`) of the underlying device, if known. Together
+    /// with [`Self::usb_address`] this identifies the physical USB device, which
+    /// lets a caller match this hidraw node to the same key's CCID reader (whose
+    /// PC/SC `CHANNEL_ID` encodes the same bus/address).
+    pub usb_bus: Option<u8>,
+    /// USB device address (`devnum`) of the underlying device, if known.
+    pub usb_address: Option<u8>,
 }
 
 impl HidDevice {
@@ -132,7 +139,15 @@ fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
     let report_desc = fs::read(sysfs.join("device/report_descriptor")).unwrap_or_default();
     let (usage_page, usage) = parse_top_usage(&report_desc).unwrap_or((0, 0));
 
-    let serial_number = read_usb_serial(&sysfs.join("device"));
+    // Locate the backing USB device node once and read its serial + topology.
+    let (serial_number, usb_bus, usb_address) = match usb_device_dir(&sysfs.join("device")) {
+        Some(dir) => (
+            read_usb_serial(&dir),
+            read_sysfs_u8(&dir.join("busnum")),
+            read_sysfs_u8(&dir.join("devnum")),
+        ),
+        None => (None, None, None),
+    };
 
     Ok(HidDevice {
         path: PathBuf::from(format!("/dev/{}", name)),
@@ -142,26 +157,36 @@ fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
         usage_page,
         usage,
         serial_number,
+        usb_bus,
+        usb_address,
     })
 }
 
-/// Read the USB device serial (`iSerialNumber`) for a hidraw node, if present.
-///
-/// Walks up the sysfs tree from the HID device to the first ancestor carrying
-/// an `idVendor` file — that's the USB device node — and returns its `serial`
-/// attribute. Returns `None` when the device exposes no serial (many YubiKeys)
-/// or on any read error. No device open required.
-fn read_usb_serial(device_link: &Path) -> Option<String> {
+/// Walk up the sysfs tree from a HID device link to the first ancestor carrying
+/// an `idVendor` file — that's the backing USB device node. Returns `None` on a
+/// non-USB transport (e.g. Bluetooth) or any read error.
+fn usb_device_dir(device_link: &Path) -> Option<PathBuf> {
     let mut dir = fs::canonicalize(device_link).ok()?;
     loop {
         if dir.join("idVendor").exists() {
-            // The USB device node; `serial` is optional in USB descriptors.
-            let serial = fs::read_to_string(dir.join("serial")).ok()?;
-            let serial = serial.trim();
-            return (!serial.is_empty()).then(|| serial.to_string());
+            return Some(dir);
         }
         dir = dir.parent()?.to_path_buf();
     }
+}
+
+/// Read the USB device serial (`iSerialNumber`) from a USB device node.
+/// Returns `None` when the descriptor carries no serial (many YubiKeys) or the
+/// attribute can't be read.
+fn read_usb_serial(usb_dir: &Path) -> Option<String> {
+    let serial = fs::read_to_string(usb_dir.join("serial")).ok()?;
+    let serial = serial.trim();
+    (!serial.is_empty()).then(|| serial.to_string())
+}
+
+/// Read a small decimal sysfs attribute (e.g. `busnum`, `devnum`) as a `u8`.
+fn read_sysfs_u8(path: &Path) -> Option<u8> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn parse_hex_u16(s: &str) -> Option<u16> {
@@ -272,6 +297,8 @@ mod tests {
             usage_page: HID_USAGE_PAGE_FIDO,
             usage: HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: None,
+            usb_bus: None,
+            usb_address: None,
         };
         let kbd = HidDevice {
             usage_page: 0x01,
