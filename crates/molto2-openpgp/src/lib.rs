@@ -172,6 +172,15 @@ pub const TAG_SECURITY_SUPPORT: u16 = 0x007A;
 /// Digital signature counter (3-byte big-endian; inside [`TAG_SECURITY_SUPPORT`]).
 pub const TAG_DS_COUNTER: u16 = 0x0093;
 
+/// Public-key data object (constructed) returned by GENERATE / READ PUBLIC KEY.
+pub const TAG_PUBLIC_KEY: u16 = 0x7F49;
+/// RSA modulus *n* (inside [`TAG_PUBLIC_KEY`]).
+pub const TAG_RSA_MODULUS: u16 = 0x0081;
+/// RSA public exponent *e* (inside [`TAG_PUBLIC_KEY`]).
+pub const TAG_RSA_EXPONENT: u16 = 0x0082;
+/// EC public point (inside [`TAG_PUBLIC_KEY`]) for ECDSA/ECDH/EdDSA keys.
+pub const TAG_EC_PUBLIC_POINT: u16 = 0x0086;
+
 /// Status word: success.
 pub const SW_OK: u16 = 0x9000;
 /// High byte of the "more data available" status (`61xx`).
@@ -229,6 +238,181 @@ pub fn verify(pw_ref: u8, pin: &[u8]) -> Vec<u8> {
 #[must_use]
 pub fn get_response() -> Vec<u8> {
     build_apdu_get(0x00, Instruction::GetResponse.code(), 0x00, 0x00, 0x00)
+}
+
+/// `TERMINATE DF` (`00 E6 00 00`) — the first half of an OpenPGP applet factory
+/// reset. Case-1 APDU (no body, no Le). When the applet is unblocked this needs
+/// PW3, but once PW1 *and* PW3 are blocked (both retry counters at 0) the card
+/// accepts it unconditionally — that's how a forgotten-PIN card is reset. After
+/// this the applet is in the "terminated" state and only [`activate_file`] (or
+/// re-SELECT) is accepted.
+#[must_use]
+pub fn terminate_df() -> Vec<u8> {
+    vec![0x00, Instruction::TerminateDf.code(), 0x00, 0x00]
+}
+
+/// `ACTIVATE FILE` (`00 44 00 00`) — the second half of the reset: re-initialize
+/// the terminated applet to factory defaults (PW1 `123456`, PW3 `12345678`, all
+/// key slots empty). Case-1 APDU.
+#[must_use]
+pub fn activate_file() -> Vec<u8> {
+    vec![0x00, Instruction::ActivateFile.code(), 0x00, 0x00]
+}
+
+// ---------------------------------------------------------------------------
+// Control Reference Templates (CRT) for GENERATE ASYMMETRIC KEY PAIR
+// ---------------------------------------------------------------------------
+
+/// CRT tag selecting the *signature* key (OpenPGP Card v3.4, §7.2.14, table).
+pub const CRT_TAG_SIGN: u8 = 0xB6;
+/// CRT tag selecting the *decryption* (confidentiality) key.
+pub const CRT_TAG_DECRYPT: u8 = 0xB8;
+/// CRT tag selecting the *authentication* key.
+pub const CRT_TAG_AUTH: u8 = 0xA4;
+
+/// Selects which on-card key slot a GENERATE / READ PUBLIC KEY operation refers
+/// to. The wire form is a 2-byte Control Reference Template — the slot's CRT tag
+/// followed by an empty value (`B6 00`, `B8 00`, or `A4 00`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCrt {
+    /// Digital-signature key (CRT tag `B6`).
+    Sign,
+    /// Decryption / confidentiality key (CRT tag `B8`).
+    Decrypt,
+    /// Authentication key (CRT tag `A4`).
+    Auth,
+}
+
+impl KeyCrt {
+    /// The CRT tag byte for this key slot.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            KeyCrt::Sign => CRT_TAG_SIGN,
+            KeyCrt::Decrypt => CRT_TAG_DECRYPT,
+            KeyCrt::Auth => CRT_TAG_AUTH,
+        }
+    }
+
+    /// The 2-byte Control Reference Template (`<tag> 00`) naming this key slot.
+    #[must_use]
+    pub const fn crt(self) -> [u8; 2] {
+        [self.tag(), 0x00]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operation / write APDU builders
+// ---------------------------------------------------------------------------
+
+/// `GENERATE ASYMMETRIC KEY PAIR` with P1 = `80` (generate a fresh key pair).
+///
+/// Builds a case-4 APDU `00 47 80 00 02 <CRT> 00`, where `<CRT>` is the 2-byte
+/// Control Reference Template selecting the key slot (see [`KeyCrt::crt`]). The
+/// card answers with a `7F49` public-key object (parse it with
+/// [`parse_generated_public_key`]).
+///
+/// **This is destructive**: generating overwrites any existing key in the slot.
+///
+/// Case-4 note: [`build_apdu`] only emits case-3 (`CLA INS P1 P2 Lc data`); a
+/// GENERATE additionally needs an `Le` so the card returns the public key. We
+/// append a trailing `0x00` `Le` byte ("up to 256/extended") by hand.
+#[must_use]
+pub fn generate_key(crt: KeyCrt) -> Vec<u8> {
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::GenerateAsymmetricKeyPair.code(),
+        GENERATE_KEY,
+        0x00,
+        &crt.crt(),
+    );
+    apdu.push(0x00); // case-4 Le
+    apdu
+}
+
+/// `GENERATE ASYMMETRIC KEY PAIR` with P1 = `81` (read the *existing* public
+/// key, no generation).
+///
+/// Builds a case-4 APDU `00 47 81 00 02 <CRT> 00`. Same CRT data and same
+/// trailing-`Le` handling as [`generate_key`] (see its case-4 note); read-only.
+#[must_use]
+pub fn read_public_key(crt: KeyCrt) -> Vec<u8> {
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::GenerateAsymmetricKeyPair.code(),
+        READ_PUBLIC_KEY,
+        0x00,
+        &crt.crt(),
+    );
+    apdu.push(0x00); // case-4 Le
+    apdu
+}
+
+/// `PERFORM SECURITY OPERATION: COMPUTE DIGITAL SIGNATURE` (P1-P2 = `9E 9A`).
+///
+/// `data` is the caller-supplied input the card signs — for RSA the `DigestInfo`
+/// (a DER `AlgorithmIdentifier` + the already-computed hash), for EdDSA the raw
+/// message-hash. This layer never hashes; it just frames the bytes. Requires
+/// PW1 verified in the signing context ([`PW1_SIGN`]).
+///
+/// Builds a case-4 APDU `00 2A 9E 9A <Lc> <data> 00`; the trailing `0x00` `Le`
+/// is appended by hand (see the case-4 note on [`generate_key`]).
+#[must_use]
+pub fn pso_compute_signature(data: &[u8]) -> Vec<u8> {
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::PerformSecurityOperation.code(),
+        (PSO_COMPUTE_SIGNATURE >> 8) as u8,
+        (PSO_COMPUTE_SIGNATURE & 0xFF) as u8,
+        data,
+    );
+    apdu.push(0x00); // case-4 Le
+    apdu
+}
+
+/// `PERFORM SECURITY OPERATION: DECIPHER` (P1-P2 = `80 86`).
+///
+/// `data` is the cipher Data Object the card deciphers (its exact framing — a
+/// padding-indicator byte plus the RSA cryptogram, or an ECDH `A6` template —
+/// is the caller's; this layer only frames the bytes). Requires PW1 verified in
+/// the "other" context ([`PW1_OTHER`]).
+///
+/// Builds a case-4 APDU `00 2A 80 86 <Lc> <data> 00`; the trailing `0x00` `Le`
+/// is appended by hand (see the case-4 note on [`generate_key`]).
+#[must_use]
+pub fn pso_decipher(data: &[u8]) -> Vec<u8> {
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::PerformSecurityOperation.code(),
+        (PSO_DECIPHER >> 8) as u8,
+        (PSO_DECIPHER & 0xFF) as u8,
+        data,
+    );
+    apdu.push(0x00); // case-4 Le
+    apdu
+}
+
+/// `CHANGE REFERENCE DATA` (INS `24`) — change a PIN from `old` to `new`.
+///
+/// `pw_ref` is the password reference in P2: [`PW1_SIGN`] (`0x81`) changes PW1,
+/// [`PW3_ADMIN`] (`0x83`) changes PW3. The data field is the old PIN bytes
+/// concatenated with the new PIN bytes; the card splits them by the stored PIN
+/// length. Builds a case-3 APDU `00 24 00 <pw_ref> <Lc> <old || new>`.
+///
+/// PIN material is the caller's (see the privacy posture in `CLAUDE.md`); this
+/// builder only frames the bytes — it never sources, stores, or logs them.
+#[must_use]
+pub fn change_reference_data(pw_ref: u8, old: &[u8], new: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(old.len() + new.len());
+    data.extend_from_slice(old);
+    data.extend_from_slice(new);
+    build_apdu(
+        0x00,
+        Instruction::ChangeReferenceData.code(),
+        0x00,
+        pw_ref,
+        &data,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +735,47 @@ pub fn parse_signature_counter(buf: &[u8]) -> Result<u32, ParseError> {
     Ok((u32::from(v[0]) << 16) | (u32::from(v[1]) << 8) | u32::from(v[2]))
 }
 
+/// The RSA public key parsed from a GENERATE / READ PUBLIC KEY response.
+///
+/// The card returns a `7F49` constructed object; for an RSA key it carries the
+/// modulus *n* (tag `81`) and the public exponent *e* (tag `82`). Both are kept
+/// as raw big-endian bytes (a 2048-bit modulus is 256 bytes — note the card may
+/// or may not include a leading zero byte; we surface the value verbatim).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicKey {
+    /// RSA modulus *n* (`81`), big-endian.
+    pub modulus: Vec<u8>,
+    /// RSA public exponent *e* (`82`), big-endian (commonly `01 00 01`).
+    pub exponent: Vec<u8>,
+}
+
+/// Parse the public key from a GENERATE / READ PUBLIC KEY response.
+///
+/// `buf` may be either the raw value of the `7F49` object *or* the full `7F49`
+/// envelope; both are accepted. Only the **RSA** case is decoded: the `81`
+/// modulus and `82` exponent are pulled out (a 2048-bit modulus forces a
+/// long-form `82` length, which [`parse_tlvs`] handles).
+///
+/// An ECC key carries an `86` public point instead of `81`/`82`; that case is
+/// reported as [`ParseError::MissingTag`] for [`TAG_RSA_MODULUS`] — callers that
+/// expect ECC should read the raw `86` value via [`parse_tlvs`]/[`find_nested`]
+/// against [`TAG_EC_PUBLIC_POINT`].
+pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
+    let top = parse_tlvs(buf)?;
+    // Accept either the bare value or the wrapping 7F49 envelope.
+    let inner: &[u8] = find_tag(&top, TAG_PUBLIC_KEY).unwrap_or(buf);
+    let tlvs = parse_tlvs(inner)?;
+
+    let modulus = find_nested(&tlvs, TAG_RSA_MODULUS)
+        .ok_or(ParseError::MissingTag(TAG_RSA_MODULUS))?
+        .to_vec();
+    let exponent = find_nested(&tlvs, TAG_RSA_EXPONENT)
+        .ok_or(ParseError::MissingTag(TAG_RSA_EXPONENT))?
+        .to_vec();
+
+    Ok(PublicKey { modulus, exponent })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,6 +1083,159 @@ mod tests {
         assert_eq!(parse_signature_counter(&inner).unwrap(), 4660);
     }
 
+    // --- Operation / write builders --------------------------------------
+
+    #[test]
+    fn generate_key_sign_bytes() {
+        // GENERATE (P1=80), signature key CRT B6 00, case-4 trailing Le.
+        assert_eq!(
+            generate_key(KeyCrt::Sign),
+            vec![0x00, 0x47, 0x80, 0x00, 0x02, 0xB6, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn generate_key_all_slots() {
+        assert_eq!(
+            generate_key(KeyCrt::Decrypt),
+            vec![0x00, 0x47, 0x80, 0x00, 0x02, 0xB8, 0x00, 0x00]
+        );
+        assert_eq!(
+            generate_key(KeyCrt::Auth),
+            vec![0x00, 0x47, 0x80, 0x00, 0x02, 0xA4, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn read_public_key_auth_bytes() {
+        // READ PUBLIC KEY (P1=81), authentication key CRT A4 00, case-4 Le.
+        assert_eq!(
+            read_public_key(KeyCrt::Auth),
+            vec![0x00, 0x47, 0x81, 0x00, 0x02, 0xA4, 0x00, 0x00]
+        );
+        // And the sign/decrypt slots for completeness.
+        assert_eq!(
+            read_public_key(KeyCrt::Sign),
+            vec![0x00, 0x47, 0x81, 0x00, 0x02, 0xB6, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn key_crt_tags() {
+        assert_eq!(KeyCrt::Sign.crt(), [0xB6, 0x00]);
+        assert_eq!(KeyCrt::Decrypt.crt(), [0xB8, 0x00]);
+        assert_eq!(KeyCrt::Auth.crt(), [0xA4, 0x00]);
+    }
+
+    #[test]
+    fn pso_compute_signature_bytes() {
+        // A small fixed DigestInfo (not a real one; exercises framing only).
+        let digest_info = [0x30, 0x07, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        // 00 2A 9E 9A <Lc=09> <data...> 00
+        assert_eq!(
+            pso_compute_signature(&digest_info),
+            vec![
+                0x00, 0x2A, 0x9E, 0x9A, 0x09, 0x30, 0x07, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn pso_decipher_bytes() {
+        // Cipher DO with a leading padding-indicator byte (00) + cryptogram.
+        let cipher = [0x00, 0xAA, 0xBB, 0xCC];
+        // 00 2A 80 86 <Lc=04> <data...> 00
+        assert_eq!(
+            pso_decipher(&cipher),
+            vec![0x00, 0x2A, 0x80, 0x86, 0x04, 0x00, 0xAA, 0xBB, 0xCC, 0x00]
+        );
+    }
+
+    #[test]
+    fn change_reference_data_bytes() {
+        // Change PW1 (P2=81): old "123456" || new "654321".
+        // 00 24 00 81 <Lc=0C> 31..36 36..31
+        assert_eq!(
+            change_reference_data(PW1_SIGN, b"123456", b"654321"),
+            vec![
+                0x00, 0x24, 0x00, 0x81, 0x0C, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x36, 0x35, 0x34,
+                0x33, 0x32, 0x31
+            ]
+        );
+        // Change PW3 (admin, P2=83): old "12345678" || new "87654321".
+        assert_eq!(
+            change_reference_data(PW3_ADMIN, b"12345678", b"87654321"),
+            vec![
+                0x00, 0x24, 0x00, 0x83, 0x10, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x38,
+                0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31
+            ]
+        );
+    }
+
+    // --- Generated public key parsing ------------------------------------
+
+    #[test]
+    fn parse_generated_public_key_rsa_long_form() {
+        // Build 7F49 { 81 <256-byte modulus> 82 <01 00 01> }. The 256-byte
+        // modulus forces a long-form (0x82) length on the 81 object, and the
+        // total 7F49 length is also long-form.
+        let mut modulus = vec![0u8; 256];
+        for (i, b) in modulus.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        // Ensure a top bit set somewhere so it reads as a realistic modulus.
+        modulus[0] = 0xC0;
+        let exponent = [0x01, 0x00, 0x01];
+
+        // Inner value: 81-TLV (long form) + 82-TLV (short form).
+        let mut inner = Vec::new();
+        inner.push(0x81);
+        inner.push(0x82); // long form, 2 length bytes
+        inner.push((modulus.len() >> 8) as u8);
+        inner.push((modulus.len() & 0xFF) as u8);
+        inner.extend_from_slice(&modulus);
+        inner.push(0x82);
+        inner.push(exponent.len() as u8);
+        inner.extend_from_slice(&exponent);
+
+        // Wrap in 7F49 (2-byte tag) with long-form length.
+        let mut blob = Vec::new();
+        blob.push(0x7F);
+        blob.push(0x49);
+        blob.push(0x82);
+        blob.push((inner.len() >> 8) as u8);
+        blob.push((inner.len() & 0xFF) as u8);
+        blob.extend_from_slice(&inner);
+
+        let pk = parse_generated_public_key(&blob).expect("RSA public key parses");
+        assert_eq!(pk.modulus, modulus);
+        assert_eq!(pk.exponent, exponent.to_vec());
+
+        // Bare value (without the 7F49 envelope) also works.
+        let pk2 = parse_generated_public_key(&inner).expect("bare value parses");
+        assert_eq!(pk2.modulus, modulus);
+        assert_eq!(pk2.exponent, exponent.to_vec());
+    }
+
+    #[test]
+    fn parse_generated_public_key_ecc_reports_missing_modulus() {
+        // An ECC key carries 86 (public point) instead of 81/82.
+        let mut inner = Vec::new();
+        inner.push(0x86);
+        inner.push(0x20);
+        inner.extend_from_slice(&[0x04; 32]);
+        let mut blob = Vec::new();
+        blob.push(0x7F);
+        blob.push(0x49);
+        blob.push(inner.len() as u8);
+        blob.extend_from_slice(&inner);
+        assert_eq!(
+            parse_generated_public_key(&blob),
+            Err(ParseError::MissingTag(TAG_RSA_MODULUS))
+        );
+    }
+
     // --- Instruction / constant sanity -----------------------------------
 
     #[test]
@@ -866,6 +1244,13 @@ mod tests {
         assert_eq!(Instruction::PutData.code(), 0xDA);
         assert_eq!(Instruction::Verify.code(), 0x20);
         assert_eq!(Instruction::GetResponse.code(), 0xC0);
+        assert_eq!(Instruction::GenerateAsymmetricKeyPair.code(), 0x47);
+        assert_eq!(Instruction::PerformSecurityOperation.code(), 0x2A);
+        assert_eq!(Instruction::ChangeReferenceData.code(), 0x24);
+        assert_eq!(GENERATE_KEY, 0x80);
+        assert_eq!(READ_PUBLIC_KEY, 0x81);
+        assert_eq!(PSO_COMPUTE_SIGNATURE, 0x9E9A);
+        assert_eq!(PSO_DECIPHER, 0x8086);
         assert_eq!(PW1_SIGN, 0x81);
         assert_eq!(PW1_OTHER, 0x82);
         assert_eq!(PW3_ADMIN, 0x83);
