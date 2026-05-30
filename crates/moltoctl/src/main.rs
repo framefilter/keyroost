@@ -263,6 +263,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OathCmd,
     },
+    /// Read OpenPGP card status on a security key over PC/SC (read-only).
+    Openpgp {
+        #[command(subcommand)]
+        cmd: OpenpgpCmd,
+    },
+}
+
+/// Subcommands for the OpenPGP card applet (read-only for now).
+#[derive(Subcommand)]
+enum OpenpgpCmd {
+    /// Show card status: AID/serial, key algorithms and fingerprints, PIN retry
+    /// counters, and the signature counter. No PIN or touch required.
+    Status {
+        /// Select a reader whose name contains this substring (case-insensitive).
+        /// Omit to use the only OpenPGP card, or to list choices when several exist.
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
 }
 
 /// Subcommands for the `key-name` friendly-name registry.
@@ -717,6 +735,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // OpenPGP likewise talks to a security key's CCID applet over PC/SC.
+    if let Cmd::Openpgp { cmd } = cmd {
+        run_openpgp(cmd, cli.debug)?;
+        return Ok(());
+    }
+
     // Factory reset is a plain CLA 0x80 command and needs no auth.
     if let Cmd::FactoryReset { yes } = cmd {
         if !yes {
@@ -949,6 +973,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::List { .. } => unreachable!("handled above before auth"),
         Cmd::KeyName { .. } => unreachable!("handled above before auth"),
         Cmd::Oath { .. } => unreachable!("handled above before auth"),
+        Cmd::Openpgp { .. } => unreachable!("handled above before auth"),
         Cmd::FidoInfo { .. }
         | Cmd::FidoReset { .. }
         | Cmd::FidoPinRetries { .. }
@@ -1144,10 +1169,23 @@ fn pick_device_interactively(
 /// to guess among several. Returns the full reader name.
 fn resolve_oath_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let readers = molto2_transport::OathSession::list_oath_readers()?;
+    resolve_reader(readers, explicit, "OATH")
+}
+
+/// Pick one reader from `readers` by the same posture across applets: auto-use a
+/// lone reader, match an explicit `--reader` substring, and refuse to guess among
+/// several. `kind` ("OATH" / "OpenPGP") only shapes the messages.
+fn resolve_reader(
+    readers: Vec<String>,
+    explicit: Option<&str>,
+    kind: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     if readers.is_empty() {
-        return Err("no OATH-capable security key found (no reader's OATH applet \
-                    responded). Plug a key in, and check pcscd is running."
-            .into());
+        return Err(format!(
+            "no {kind}-capable security key found (no reader's {kind} applet \
+             responded). Plug a key in, and check pcscd is running."
+        )
+        .into());
     }
     match explicit {
         Some(substr) => {
@@ -1159,7 +1197,7 @@ fn resolve_oath_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::er
             match matches.as_slice() {
                 [one] => Ok((*one).clone()),
                 [] => Err(format!(
-                    "no OATH reader matches '{}'. Connected OATH readers: {}",
+                    "no {kind} reader matches '{}'. Connected {kind} readers: {}",
                     substr,
                     readers.join("; ")
                 )
@@ -1175,7 +1213,7 @@ fn resolve_oath_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::er
         None => match readers.as_slice() {
             [one] => Ok(one.clone()),
             _ => Err(format!(
-                "{} OATH keys connected; pass --reader <substring>: {}",
+                "{} {kind} keys connected; pass --reader <substring>: {}",
                 readers.len(),
                 readers.join("; ")
             )
@@ -1322,6 +1360,65 @@ fn oath_algo_str(a: molto2_oath::Algorithm) -> &'static str {
         molto2_oath::Algorithm::Sha1 => "SHA1",
         molto2_oath::Algorithm::Sha256 => "SHA256",
         molto2_oath::Algorithm::Sha512 => "SHA512",
+    }
+}
+
+fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        OpenpgpCmd::Status { reader } => {
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            let status = session.status()?;
+
+            println!("AID:            {}", hex_encode(&status.aid));
+            if let Some(serial) = status.serial() {
+                // Yubico prints this serial in hex; show both (it equals the
+                // YubiKey's CCID/mgmt serial used for friendly names).
+                println!("Serial:         {0} (0x{0:08X})", serial);
+            }
+            println!(
+                "Key algorithms: sig={} dec={} aut={}",
+                algo_id_str(status.sig_algo_id),
+                algo_id_str(status.dec_algo_id),
+                algo_id_str(status.aut_algo_id),
+            );
+            print_fingerprint("Signature  fpr", &status.fingerprint_sig);
+            print_fingerprint("Decryption fpr", &status.fingerprint_dec);
+            print_fingerprint("Auth       fpr", &status.fingerprint_aut);
+            println!(
+                "PIN retries:    PW1={} RC={} PW3={}",
+                status.tries_pw1, status.tries_rc, status.tries_pw3
+            );
+            match status.signature_count {
+                Some(n) => println!("Signatures:     {}", n),
+                None => println!("Signatures:     (unavailable)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map an OpenPGP algorithm id (first attribute byte) to a short label.
+fn algo_id_str(id: Option<u8>) -> &'static str {
+    match id {
+        Some(0x01) => "RSA",
+        Some(0x12) => "ECDH",
+        Some(0x13) => "ECDSA",
+        Some(0x16) => "EdDSA",
+        Some(_) => "other",
+        None => "none",
+    }
+}
+
+/// Print a key fingerprint, rendering an all-zero (no key) slot as "(none)".
+fn print_fingerprint(label: &str, fpr: &[u8; 20]) {
+    if fpr.iter().all(|&b| b == 0) {
+        println!("{}: (none)", label);
+    } else {
+        println!("{}: {}", label, hex_encode(fpr));
     }
 }
 

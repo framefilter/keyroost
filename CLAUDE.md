@@ -10,7 +10,7 @@ tool. Workspace contains:
 | Crate | Purpose | External deps |
 |---|---|---|
 | `molto2-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
-| `molto2-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH applet | `pcsc` |
+| `molto2-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets | `pcsc` |
 | `molto2-hid` | USB HID enumeration of FIDO devices via sysfs | none |
 | `molto2-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt | none |
 | `molto2-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | none |

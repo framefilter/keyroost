@@ -13,4 +13,5 @@ workspace = true
 [dependencies]
 molto2-proto = { path = "../molto2-proto", version = "0.1.0" }
 molto2-oath = { path = "../molto2-oath", version = "0.1.0" }
+molto2-openpgp = { path = "../molto2-openpgp", version = "0.1.0" }
 pcsc = "2"

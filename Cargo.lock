@@ -1749,6 +1749,7 @@ name = "molto2-transport"
 version = "0.1.0"
 dependencies = [
  "molto2-oath",
+ "molto2-openpgp",
  "molto2-proto",
  "pcsc",
 ]

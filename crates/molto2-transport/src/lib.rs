@@ -25,6 +25,9 @@ use pcsc::{Attribute, Card, Context, Protocols, Scope, ShareMode};
 mod oath;
 pub use oath::OathSession;
 
+mod openpgp;
+pub use openpgp::{OpenPgpSession, OpenPgpStatus};
+
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]
 pub enum TransportError {
@@ -54,6 +57,10 @@ pub enum TransportError {
     OathParse(molto2_oath::ParseError),
     /// The OATH applet rejected the supplied password.
     OathPasswordRejected,
+    /// An OpenPGP applet response could not be parsed.
+    OpenPgpParse(molto2_openpgp::ParseError),
+    /// No OpenPGP applet is present on the selected card (`SW 6A82`).
+    NoOpenPgpApplet,
 }
 
 impl fmt::Display for TransportError {
@@ -99,6 +106,10 @@ impl fmt::Display for TransportError {
             TransportError::OathPasswordRejected => {
                 write!(f, "OATH applet rejected the password (wrong password)")
             }
+            TransportError::OpenPgpParse(e) => write!(f, "OpenPGP response parse error: {}", e),
+            TransportError::NoOpenPgpApplet => {
+                write!(f, "no OpenPGP applet on this card")
+            }
         }
     }
 }
@@ -108,6 +119,7 @@ impl std::error::Error for TransportError {
         match self {
             TransportError::PcscUnavailable(e) | TransportError::Pcsc(e) => Some(e),
             TransportError::OathParse(e) => Some(e),
+            TransportError::OpenPgpParse(e) => Some(e),
             _ => None,
         }
     }
