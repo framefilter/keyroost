@@ -80,8 +80,16 @@ for the smartcard applets.
   C5 fingerprints object (a 4th key slot) vs the spec's 60, which the parser
   rejected; fixed to require ≥60 and locked in with a regression test built from
   the captured 315-byte ARD. The Solo 2 firmware build has **no** OpenPGP applet
-  (`SW 6A82`). Still TODO: transport wiring (the GET-RESPONSE loop + an
-  `OpenPgpSession`), PUT DATA / key generation / PSO signing, and any front-end.
+  (`SW 6A82`).
+  **Transport + CLI DONE (2026-05-30):** `molto2_transport::OpenPgpSession` drives
+  the applet over PC/SC — SELECT (mapping `6A82` to `NoOpenPgpApplet`), the
+  `61xx`/`GET RESPONSE` reassembly loop, reader discovery, and a read-only
+  `status()` assembling the Application Related Data + signature counter.
+  `moltoctl openpgp status` prints AID/serial, key algorithms + fingerprints, PIN
+  retry counters, and the signature count. Verified on a real YubiKey 5.7 (its
+  OpenPGP serial equals the CCID/mgmt serial used for friendly names); the Solo 2
+  is correctly skipped. Still TODO: PUT DATA / key generation / PSO signing / PIN
+  verify (writes), and a GUI pane.
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
@@ -285,8 +293,12 @@ compression doesn't lose it:
   access stays serialized (no overlapping card I/O from rapid clicks). Unit tests
   cover the worker round-trip, the busy-guard, and the no-worker inline path; the
   pane was also run headlessly against a live YubiKey without freezing.
-- **Reset in the GUI.** Currently CLI-only because of the touch-window
-  blocking issue above.
+- **Reset in the GUI — DONE (2026-05-30).** A red "Reset key…" button in the
+  Security Keys pane opens a confirmation modal requiring the user to type
+  `reset`; the wipe then runs on the worker thread (so the ~30s touch window no
+  longer freezes the UI) and clears the cached session + re-reads CTAP info. The
+  underlying `molto2_ctap::reset()` path was confirmed end-to-end on a real
+  YubiKey ("All credentials wiped, PIN cleared").
 - **CredentialManager double token fetch.** Unlock fetches the pinUvAuthToken
   twice because the manager consumes it; split the listing helpers off the
   manager or make the token `Clone`.

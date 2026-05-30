@@ -54,6 +54,17 @@ struct SecurityKeysState {
     session: Option<UnlockedSession>,
     /// Change-PIN modal state.
     change_pin: ChangePinDialog,
+    /// Reset-confirmation modal state.
+    reset: ResetDialog,
+}
+
+/// State for the "reset key" confirmation. Reset wipes all credentials and the
+/// PIN, so the user must type a confirmation word and then touch the key.
+#[derive(Default)]
+struct ResetDialog {
+    open: bool,
+    /// Typed confirmation (`reset` required to enable the button).
+    confirm_input: String,
 }
 
 struct UnlockedSession {
@@ -1122,6 +1133,31 @@ impl App {
         Some(self.security_keys.devices.get(idx)?.path.clone())
     }
 
+    /// Wipe the selected key (authenticatorReset). Runs on the worker thread —
+    /// the card needs a touch within ~30s, which the worker keeps off the UI
+    /// frame. On success the cached session and CTAP info are cleared.
+    fn submit_reset(&mut self) {
+        let Some(path) = self.selected_fido_path() else {
+            return;
+        };
+        self.spawn_job("Resetting key\u{2026} (touch now)", move || {
+            let result = (|| -> Result<(), String> {
+                let (mut dev, _) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                molto2_ctap::reset(&mut dev).map_err(|e| e.to_string())
+            })();
+            Box::new(move |app: &mut App| match result {
+                Ok(()) => {
+                    app.security_keys.session = None;
+                    app.security_keys.info = None;
+                    app.security_keys.error = None;
+                    // Re-read info so the PIN status reflects the wipe.
+                    app.fetch_selected_info();
+                }
+                Err(e) => app.security_keys.error = Some(format!("reset failed: {}", e)),
+            })
+        });
+    }
+
     fn render_security_keys(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("fido-devices")
             .resizable(true)
@@ -1297,6 +1333,7 @@ impl App {
         });
 
         self.render_change_pin_dialog(ctx);
+        self.render_reset_dialog(ctx);
     }
 
     fn render_credentials_section(&mut self, ui: &mut egui::Ui) {
@@ -1327,6 +1364,16 @@ impl App {
                     self.refresh_credentials();
                 }
             }
+            // Reset wipes the key; no PIN needed, but gated by a typed
+            // confirmation + touch. Offered whenever a key is selected.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let reset = egui::Button::new(
+                    egui::RichText::new("Reset key…").color(egui::Color32::from_rgb(220, 110, 110)),
+                );
+                if ui.add(reset).clicked() {
+                    self.security_keys.reset = ResetDialog { open: true, ..Default::default() };
+                }
+            });
         });
 
         ui.add_space(4.0);
@@ -1866,6 +1913,65 @@ impl App {
             }
             Some(false) => self.oath.confirm_delete = None,
             None => {}
+        }
+    }
+
+    /// Reset confirmation: wiping a key is irreversible, so require the user to
+    /// type `reset` before the button activates, then a physical touch.
+    fn render_reset_dialog(&mut self, ctx: &egui::Context) {
+        if !self.security_keys.reset.open {
+            return;
+        }
+        let label = self
+            .security_keys
+            .selected
+            .and_then(|i| self.security_keys.devices.get(i))
+            .map(|d| d.product_name.clone())
+            .unwrap_or_else(|| "this key".into());
+
+        let mut window_open = true;
+        let mut do_reset = false;
+        let mut cancel = false;
+        egui::Window::new("Reset security key?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut window_open)
+            .show(ctx, |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 110, 110),
+                    format!("This wipes ALL credentials and the PIN on {label}."),
+                );
+                ui.label("This cannot be undone. The key must be freshly plugged in,");
+                ui.label("and you'll need to touch it within ~30 seconds.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Type \u{201c}reset\u{201d} to confirm:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.security_keys.reset.confirm_input)
+                            .desired_width(120.0),
+                    );
+                });
+                ui.add_space(6.0);
+                let armed = self.security_keys.reset.confirm_input.trim() == "reset";
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(armed, egui::Button::new("Reset key"))
+                        .clicked()
+                    {
+                        do_reset = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if do_reset {
+            self.security_keys.reset = ResetDialog::default();
+            self.submit_reset();
+        } else if cancel || !window_open {
+            // Cancel button, or the window's [x] close.
+            self.security_keys.reset = ResetDialog::default();
         }
     }
 }
