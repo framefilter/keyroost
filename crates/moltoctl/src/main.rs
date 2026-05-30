@@ -335,11 +335,14 @@ enum OathCmd {
         #[command(flatten)]
         access: OathAccess,
     },
-    /// Add (provision) a TOTP credential. The base32 secret is read from stdin
-    /// or an env var — never argv.
+    /// Add (provision) a TOTP or HOTP credential. The base32 secret is read from
+    /// stdin or an env var — never argv.
     Add {
         /// Credential name to store (e.g. "issuer:account").
         name: String,
+        /// Credential type: time-based (TOTP) or counter-based (HOTP).
+        #[arg(long = "type", value_enum, default_value_t = OathTypeArg::Totp)]
+        oath_type: OathTypeArg,
         /// Read the base32 secret from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "secret_stdin")]
         secret_env: Option<String>,
@@ -352,6 +355,9 @@ enum OathCmd {
         /// OTP digit count (6, 7, or 8).
         #[arg(long, default_value_t = 6)]
         digits: u8,
+        /// Initial counter (moving factor) for HOTP credentials. Ignored for TOTP.
+        #[arg(long, default_value_t = 0)]
+        counter: u32,
         /// Require a touch on the key to compute this credential.
         #[arg(long)]
         touch: bool,
@@ -384,6 +390,20 @@ enum OathCmd {
         #[command(flatten)]
         access: OathAccess,
     },
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum OathTypeArg {
+    Totp,
+    Hotp,
+}
+impl OathTypeArg {
+    fn to_oath(self) -> molto2_oath::OathType {
+        match self {
+            OathTypeArg::Totp => molto2_oath::OathType::Totp,
+            OathTypeArg::Hotp => molto2_oath::OathType::Hotp,
+        }
+    }
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -1207,24 +1227,41 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         }
         OathCmd::Code { name, period, access } => {
             let mut session = open_oath(access, debug)?;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs();
-            let code = session.calculate_totp(name, now, *period)?;
+            // Dispatch on the stored credential type: HOTP uses the card's own
+            // counter (empty challenge), TOTP a time counter.
+            let is_hotp = session
+                .list()?
+                .iter()
+                .find(|c| c.name == *name)
+                .map(|c| matches!(c.oath_type, molto2_oath::OathType::Hotp))
+                .unwrap_or(false);
+            let code = if is_hotp {
+                session.calculate_hotp(name)?
+            } else {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_secs();
+                session.calculate_totp(name, now, *period)?
+            };
             println!("{}", code.code);
         }
         OathCmd::Add {
             name,
+            oath_type,
             secret_env,
             secret_stdin,
             algorithm,
             digits,
+            counter,
             touch,
             access,
         } => {
             if !(6..=8).contains(digits) {
                 return Err("--digits must be 6, 7, or 8".into());
+            }
+            if *counter != 0 && !matches!(oath_type, OathTypeArg::Hotp) {
+                return Err("--counter only applies to --type hotp".into());
             }
             let secret_b32 = read_secret("secret", secret_env.as_deref(), *secret_stdin)?;
             let secret = base32_decode(secret_b32.trim())
@@ -1233,14 +1270,14 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let params = molto2_oath::PutParams {
                 name,
                 secret: &secret,
-                oath_type: molto2_oath::OathType::Totp,
+                oath_type: oath_type.to_oath(),
                 algorithm: algorithm.to_oath(),
                 digits: *digits,
                 require_touch: *touch,
-                imf: 0,
+                imf: *counter,
             };
             session.put(&params)?;
-            println!("Added OATH credential {:?}.", name);
+            println!("Added OATH {} credential {:?}.", oath_type_str(oath_type.to_oath()), name);
         }
         OathCmd::Delete { name, access } => {
             let mut session = open_oath(access, debug)?;

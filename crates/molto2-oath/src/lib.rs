@@ -292,14 +292,25 @@ pub fn list() -> Vec<u8> {
 /// Build a `CALCULATE` APDU requesting a truncated OTP for `name`.
 ///
 /// `challenge` is the 8-byte big-endian counter (for TOTP,
-/// `floor(unix_time / period)`; for HOTP, the moving factor). P2 is set to
-/// [`P2_TRUNCATED`] so the card returns a `TRUNCATED_RESPONSE` (`0x76`).
+/// `floor(unix_time / period)`). P2 is set to [`P2_TRUNCATED`] so the card
+/// returns a `TRUNCATED_RESPONSE` (`0x76`).
 /// Data layout: `NAME(0x71) <name> || CHALLENGE(0x74) <8 bytes>`.
 #[must_use]
 pub fn calculate(name: &str, challenge: &[u8; 8]) -> Vec<u8> {
     let mut data = Vec::new();
     push_tlv(&mut data, Tag::Name, name.as_bytes());
     push_tlv(&mut data, Tag::Challenge, challenge);
+    build_apdu(0x00, Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
+}
+
+/// Build a `CALCULATE` APDU for a HOTP credential, which carries an **empty**
+/// challenge: the card increments and uses its own internal counter. Data
+/// layout: `NAME(0x71) <name> || CHALLENGE(0x74) <0 bytes>`.
+#[must_use]
+pub fn calculate_hotp(name: &str) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_tlv(&mut data, Tag::Name, name.as_bytes());
+    push_tlv(&mut data, Tag::Challenge, &[]);
     build_apdu(0x00, Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
 }
 
@@ -780,6 +791,16 @@ mod tests {
     fn delete_bytes() {
         let apdu = delete("ab");
         assert_eq!(apdu, vec![0x00, 0x02, 0x00, 0x00, 0x04, 0x71, 0x02, 0x61, 0x62]);
+    }
+
+    #[test]
+    fn calculate_hotp_has_empty_challenge() {
+        // NAME(0x71,2)"ab" + CHALLENGE(0x74,0). P2 = truncated (0x01).
+        let apdu = calculate_hotp("ab");
+        assert_eq!(
+            apdu,
+            vec![0x00, 0xA2, 0x00, 0x01, 0x06, 0x71, 0x02, 0x61, 0x62, 0x74, 0x00]
+        );
     }
 
     #[test]

@@ -163,6 +163,15 @@ impl OathSession {
         oath::parse_calculate(&data).map_err(TransportError::OathParse)
     }
 
+    /// Compute the next HOTP for `name`. The card advances its own internal
+    /// counter, so no challenge is supplied. A touch-required credential blocks
+    /// until the user touches the key.
+    pub fn calculate_hotp(&mut self, name: &str) -> Result<oath::OtpCode, TransportError> {
+        let (data, sw) = self.transmit_full(&oath::calculate_hotp(name))?;
+        ok_or_apdu("oath calculate (hotp)", sw)?;
+        oath::parse_calculate(&data).map_err(TransportError::OathParse)
+    }
+
     /// Provision (add) a credential.
     pub fn put(&mut self, params: &oath::PutParams<'_>) -> Result<(), TransportError> {
         let (_, sw) = self.transmit_full(&oath::put(params))?;
