@@ -69,6 +69,19 @@ for the smartcard applets.
   compatibility pass.
 - **Phase 4 — OpenPGP.** Mature (`opcard`, OpenPGP Card spec v3.4) but
   heavier: full OpenPGP Card APDU set + RSA/curve key management.
+  **Byte layer DONE (2026-05-29):** `crates/molto2-openpgp` has the APDU builders
+  (`select`, `get_data`, `get_application_related_data`, `get_pw_status`,
+  `verify`, `get_response`), a BER-TLV parser (2-byte high tags + long-form
+  lengths, with constructed-only nested `find`), and typed parsers for PW status,
+  Application Related Data (`6E`), and the signature counter — all under
+  RFC/spec known-answer tests. **Verified on a real YubiKey 5.7** (SELECT +
+  GET DATA 006E over PC/SC with the `61xx`/GET RESPONSE loop): this surfaced a
+  hardware-only bug the synthetic tests missed — the card reports an **80-byte**
+  C5 fingerprints object (a 4th key slot) vs the spec's 60, which the parser
+  rejected; fixed to require ≥60 and locked in with a regression test built from
+  the captured 315-byte ARD. The Solo 2 firmware build has **no** OpenPGP applet
+  (`SW 6A82`). Still TODO: transport wiring (the GET-RESPONSE loop + an
+  `OpenPgpSession`), PUT DATA / key generation / PSO signing, and any front-end.
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
@@ -262,9 +275,16 @@ compression doesn't lose it:
   premise confirmed: the test YubiKey advertises `[2, 1]` (→ v2 selected) and
   this Solo 2's firmware advertises `[1]` (→ v1); full end-to-end v2 still wants
   a PIN-authenticated op (PIN entry is the user's job).
-- **GUI worker thread.** All CTAP calls block egui synchronously; listing
-  many credentials or running Reset (30s touch window) freezes the window.
-  Offload to a thread + channel.
+- **GUI worker thread — DONE (2026-05-29).** All blocking device I/O in `moltoui`
+  (CTAP GetInfo/unlock/cred-list/delete/change-PIN and the OATH open/list/code/
+  add/delete) now runs on a single background `Worker` thread. A job closure runs
+  off-thread and returns an `ApplyFn` (a `Box<dyn FnOnce(&mut App)>`) applied on
+  the UI thread in `update()` via `drain_worker`; the worker calls
+  `ctx.request_repaint()` to wake the frame loop. A busy spinner + label shows in
+  the tab bar, and `spawn_job` drops a new job while one is in flight so device
+  access stays serialized (no overlapping card I/O from rapid clicks). Unit tests
+  cover the worker round-trip, the busy-guard, and the no-worker inline path; the
+  pane was also run headlessly against a live YubiKey without freezing.
 - **Reset in the GUI.** Currently CLI-only because of the touch-window
   blocking issue above.
 - **CredentialManager double token fetch.** Unlock fetches the pinUvAuthToken

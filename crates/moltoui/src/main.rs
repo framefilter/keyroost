@@ -113,6 +113,41 @@ struct OathAddDialog {
     require_touch: bool,
 }
 
+/// A unit of work applied back to the [`App`] on the UI thread once a background
+/// job finishes. Returned by the job closure and run inside `update()`.
+type ApplyFn = Box<dyn FnOnce(&mut App) + Send>;
+/// A background job: blocking device I/O that yields an [`ApplyFn`].
+type Job = Box<dyn FnOnce() -> ApplyFn + Send>;
+
+/// A single background worker thread. Device calls (CTAP / OATH over PC/SC) can
+/// block for seconds — a touch-required credential or a 30s Reset window — so we
+/// run them off the egui frame thread and apply their results back on the UI
+/// thread. One thread keeps device access serialized (no concurrent card I/O).
+struct Worker {
+    job_tx: std::sync::mpsc::Sender<Job>,
+    result_rx: std::sync::mpsc::Receiver<ApplyFn>,
+}
+
+impl Worker {
+    fn spawn(ctx: egui::Context) -> Self {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<ApplyFn>();
+        std::thread::Builder::new()
+            .name("moltoui-worker".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let apply = job();
+                    if result_tx.send(apply).is_err() {
+                        break; // UI gone
+                    }
+                    ctx.request_repaint(); // wake the frame loop to apply it
+                }
+            })
+            .expect("spawn worker thread");
+        Worker { job_tx, result_rx }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -126,7 +161,11 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(App::default()))
+            let app = App {
+                worker: Some(Worker::spawn(cc.egui_ctx.clone())),
+                ..Default::default()
+            };
+            Ok(Box::new(app))
         }),
     )
 }
@@ -159,6 +198,13 @@ struct App {
     security_keys: SecurityKeysState,
     /// OATH (TOTP) view state.
     oath: OathState,
+    /// Background worker for blocking device I/O. `None` only in tests.
+    worker: Option<Worker>,
+    /// Number of in-flight background jobs. While >0 the UI shows a spinner and
+    /// disables actions that would issue overlapping device I/O.
+    busy_jobs: u32,
+    /// Human-readable description of what the worker is currently doing.
+    busy_label: Option<String>,
 }
 
 #[derive(Default)]
@@ -290,6 +336,61 @@ impl Severity {
 }
 
 impl App {
+    /// Queue a blocking device job on the worker thread. `label` describes it for
+    /// the busy indicator; `job` runs off-thread and returns a closure applied
+    /// back to `self` on the UI thread. Falls back to running inline if there's
+    /// no worker (tests).
+    fn spawn_job<F>(&mut self, label: impl Into<String>, job: F)
+    where
+        F: FnOnce() -> ApplyFn + Send + 'static,
+    {
+        // Serialize device access: ignore a new job while one is in flight rather
+        // than queueing overlapping card I/O behind a click the user can't see
+        // landed. (A single worker thread would serialize anyway, but this also
+        // stops a growing backlog of duplicate refreshes from rapid clicks.)
+        if self.busy() {
+            return;
+        }
+        match &self.worker {
+            Some(worker) => {
+                self.busy_jobs += 1;
+                self.busy_label = Some(label.into());
+                if worker.job_tx.send(Box::new(job)).is_err() {
+                    // Worker died; undo the bookkeeping so the UI doesn't hang.
+                    self.busy_jobs -= 1;
+                    self.busy_label = None;
+                }
+            }
+            None => {
+                let apply = job();
+                apply(self);
+            }
+        }
+    }
+
+    /// Apply any finished background jobs. Called once per frame from `update()`.
+    fn drain_worker(&mut self) {
+        let applies: Vec<ApplyFn> = match &self.worker {
+            Some(w) => w.result_rx.try_iter().collect(),
+            None => Vec::new(),
+        };
+        for apply in applies {
+            // Decrement *before* applying so an apply closure that chains another
+            // job (e.g. refresh-readers → probe-lock) isn't blocked by the busy
+            // guard in `spawn_job`.
+            self.busy_jobs = self.busy_jobs.saturating_sub(1);
+            if self.busy_jobs == 0 {
+                self.busy_label = None;
+            }
+            apply(self);
+        }
+    }
+
+    /// True while any background device job is in flight.
+    fn busy(&self) -> bool {
+        self.busy_jobs > 0
+    }
+
     fn log(&mut self, severity: Severity, text: impl Into<String>) {
         self.log.push(LogLine {
             severity,
@@ -796,26 +897,38 @@ impl App {
             return;
         };
         let path = dev.path.clone();
-        match CtapHidDevice::open(&path) {
-            Ok((mut hid, init)) => {
-                self.security_keys.init = Some(init.clone());
-                if init.supports_cbor() {
-                    match molto2_ctap::get_info(&mut hid) {
-                        Ok(info) => self.security_keys.info = Some(info),
-                        Err(e) => {
-                            self.security_keys.error = Some(format!("GetInfo failed: {}", e))
-                        }
-                    }
+        self.spawn_job("Reading key info\u{2026}", move || {
+            // Off-thread: open the hidraw, run INIT + GetInfo.
+            let outcome = match CtapHidDevice::open(&path) {
+                Ok((mut hid, init)) => {
+                    let info = if init.supports_cbor() {
+                        Some(molto2_ctap::get_info(&mut hid).map_err(|e| e.to_string()))
+                    } else {
+                        None
+                    };
+                    Ok((init, info))
                 }
-            }
-            Err(e) => {
-                self.security_keys.error = Some(format!(
+                Err(e) => Err(format!(
                     "could not open {}: {} (have you installed udev/70-moltoui-fido.rules?)",
                     path.display(),
                     e
-                ));
-            }
-        }
+                )),
+            };
+            // Back on the UI thread: store the results.
+            Box::new(move |app: &mut App| match outcome {
+                Ok((init, info)) => {
+                    app.security_keys.init = Some(init);
+                    match info {
+                        Some(Ok(info)) => app.security_keys.info = Some(info),
+                        Some(Err(e)) => {
+                            app.security_keys.error = Some(format!("GetInfo failed: {}", e))
+                        }
+                        None => {}
+                    }
+                }
+                Err(e) => app.security_keys.error = Some(e),
+            })
+        });
     }
 
     /// Open the selected hidraw, run the PIN exchange, and populate the
@@ -830,17 +943,19 @@ impl App {
             self.security_keys.error = Some("PIN is empty".into());
             return;
         }
-        match self.open_and_unlock(&path, &pin) {
-            Ok(sess) => {
-                self.security_keys.session = Some(sess);
-                self.security_keys.error = None;
-            }
-            Err(e) => self.security_keys.error = Some(format!("unlock failed: {}", e)),
-        }
+        self.spawn_job("Unlocking\u{2026} (enter PIN / touch)", move || {
+            let result = Self::open_and_unlock(&path, &pin).map_err(|e| e.to_string());
+            Box::new(move |app: &mut App| match result {
+                Ok(sess) => {
+                    app.security_keys.session = Some(sess);
+                    app.security_keys.error = None;
+                }
+                Err(e) => app.security_keys.error = Some(format!("unlock failed: {}", e)),
+            })
+        });
     }
 
     fn open_and_unlock(
-        &self,
         path: &std::path::Path,
         pin: &str,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
@@ -890,14 +1005,17 @@ impl App {
         let Some(session) = self.security_keys.session.take() else {
             return;
         };
-        match self.refresh_with_token(&path, session.token) {
-            Ok(fresh) => self.security_keys.session = Some(fresh),
-            Err(e) => self.security_keys.error = Some(format!("refresh failed: {}", e)),
-        }
+        let token = session.token;
+        self.spawn_job("Refreshing credentials\u{2026}", move || {
+            let result = Self::refresh_with_token(&path, token).map_err(|e| e.to_string());
+            Box::new(move |app: &mut App| match result {
+                Ok(fresh) => app.security_keys.session = Some(fresh),
+                Err(e) => app.security_keys.error = Some(format!("refresh failed: {}", e)),
+            })
+        });
     }
 
     fn refresh_with_token(
-        &self,
         path: &std::path::Path,
         token: PinUvAuthToken,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
@@ -929,20 +1047,31 @@ impl App {
         let Some(session) = self.security_keys.session.as_ref() else {
             return;
         };
-        let token_copy = PinUvAuthToken {
+        let token = PinUvAuthToken {
             protocol: session.token.protocol,
             token: session.token.token.clone(),
         };
-        match self.try_delete(&path, token_copy, &cred_id) {
-            Ok(()) => {
-                self.refresh_credentials();
-            }
-            Err(e) => self.security_keys.error = Some(format!("delete failed: {}", e)),
-        }
+        // The refresh after delete needs its own token; clone for the chained op.
+        let token_refresh = PinUvAuthToken {
+            protocol: token.protocol,
+            token: token.token.clone(),
+        };
+        self.spawn_job("Deleting credential\u{2026}", move || {
+            // Delete, then re-list in the same job so the UI updates atomically.
+            let result = Self::try_delete(&path, token, &cred_id)
+                .and_then(|()| Self::refresh_with_token(&path, token_refresh))
+                .map_err(|e| e.to_string());
+            Box::new(move |app: &mut App| match result {
+                Ok(fresh) => {
+                    app.security_keys.session = Some(fresh);
+                    app.security_keys.error = None;
+                }
+                Err(e) => app.security_keys.error = Some(format!("delete failed: {}", e)),
+            })
+        });
     }
 
     fn try_delete(
-        &self,
         path: &std::path::Path,
         token: PinUvAuthToken,
         cred_id: &[u8],
@@ -964,19 +1093,21 @@ impl App {
             self.security_keys.error = Some("both PIN fields are required".into());
             return;
         }
-        match self.try_change_pin(&path, &old, &new) {
-            Ok(()) => {
-                self.security_keys.change_pin.open = false;
-                self.security_keys.error = None;
-                // Force re-unlock with the new PIN.
-                self.lock_session();
-            }
-            Err(e) => self.security_keys.error = Some(format!("change PIN failed: {}", e)),
-        }
+        self.spawn_job("Changing PIN\u{2026} (touch)", move || {
+            let result = Self::try_change_pin(&path, &old, &new).map_err(|e| e.to_string());
+            Box::new(move |app: &mut App| match result {
+                Ok(()) => {
+                    app.security_keys.change_pin.open = false;
+                    app.security_keys.error = None;
+                    // Force re-unlock with the new PIN.
+                    app.lock_session();
+                }
+                Err(e) => app.security_keys.error = Some(format!("change PIN failed: {}", e)),
+            })
+        });
     }
 
     fn try_change_pin(
-        &self,
         path: &std::path::Path,
         old: &str,
         new: &str,
@@ -1188,8 +1319,13 @@ impl App {
             if ui.button("Change PIN…").clicked() {
                 self.security_keys.change_pin.open = true;
             }
-            if self.security_keys.session.is_some() && ui.button("Lock").clicked() {
-                self.lock_session();
+            if self.security_keys.session.is_some() {
+                if ui.button("Lock").clicked() {
+                    self.lock_session();
+                }
+                if ui.button("Reload").clicked() {
+                    self.refresh_credentials();
+                }
             }
         });
 
@@ -1332,25 +1468,30 @@ impl App {
         self.oath.error = None;
         self.oath.creds.clear();
         self.oath.loaded = false;
-        match molto2_transport::OathSession::list_oath_readers() {
-            Ok(readers) => {
-                // Preserve the selection by name across refreshes.
-                let prev = self
-                    .oath
-                    .selected
-                    .and_then(|i| self.oath.readers.get(i).cloned());
-                self.oath.readers = readers;
-                self.oath.selected = prev
-                    .and_then(|p| self.oath.readers.iter().position(|r| *r == p))
-                    .or(if self.oath.readers.is_empty() { None } else { Some(0) });
-            }
-            Err(e) => {
-                self.oath.error = Some(format!("enumeration failed: {e}"));
-                self.oath.readers.clear();
-                self.oath.selected = None;
-            }
-        }
-        self.probe_oath_lock();
+        let prev = self
+            .oath
+            .selected
+            .and_then(|i| self.oath.readers.get(i).cloned());
+        self.spawn_job("Scanning for OATH keys\u{2026}", move || {
+            let result = molto2_transport::OathSession::list_oath_readers().map_err(|e| e.to_string());
+            Box::new(move |app: &mut App| {
+                match result {
+                    Ok(readers) => {
+                        app.oath.readers = readers;
+                        // Preserve the selection by name across refreshes.
+                        app.oath.selected = prev
+                            .and_then(|p| app.oath.readers.iter().position(|r| *r == p))
+                            .or(if app.oath.readers.is_empty() { None } else { Some(0) });
+                    }
+                    Err(e) => {
+                        app.oath.error = Some(format!("enumeration failed: {e}"));
+                        app.oath.readers.clear();
+                        app.oath.selected = None;
+                    }
+                }
+                app.probe_oath_lock();
+            })
+        });
     }
 
     /// Open the selected reader to learn whether its applet is password-locked,
@@ -1362,14 +1503,68 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        match molto2_transport::OathSession::open(&name) {
-            Ok(session) => self.oath.locked = session.password_required(),
-            Err(e) => self.oath.error = Some(format!("open failed: {e}")),
-        }
+        self.spawn_job("Opening OATH key\u{2026}", move || {
+            let result = molto2_transport::OathSession::open(&name)
+                .map(|s| s.password_required())
+                .map_err(|e| e.to_string());
+            Box::new(move |app: &mut App| match result {
+                Ok(locked) => app.oath.locked = locked,
+                Err(e) => app.oath.error = Some(format!("open failed: {e}")),
+            })
+        });
     }
 
     fn selected_oath_reader(&self) -> Option<String> {
         self.oath.readers.get(self.oath.selected?).cloned()
+    }
+
+    /// Off-thread helper: open `name` and unlock with `password` if protected.
+    fn oath_open_unlock(
+        name: &str,
+        password: &str,
+    ) -> Result<molto2_transport::OathSession, TransportError> {
+        let mut session = molto2_transport::OathSession::open(name)?;
+        if session.password_required() {
+            session.unlock(password)?;
+        }
+        Ok(session)
+    }
+
+    /// Off-thread helper: list credentials and compute each current TOTP.
+    fn oath_list_rows(session: &mut molto2_transport::OathSession) -> Result<Vec<OathRow>, TransportError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut rows = Vec::new();
+        for c in session.list()? {
+            // A touch-required credential blocks until touched; fine off-thread.
+            let code = session.calculate_totp(&c.name, now, 30).ok().map(|otp| otp.code);
+            rows.push(OathRow {
+                name: c.name,
+                detail: format!("{:?}/{:?}", c.oath_type, c.algorithm),
+                code,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Store the outcome of an op that ends by (re)listing credentials.
+    fn apply_oath_rows(app: &mut App, result: Result<Vec<OathRow>, TransportError>) {
+        match result {
+            Ok(rows) => {
+                app.oath.creds = rows;
+                app.oath.loaded = true;
+                app.oath.locked = false;
+                app.oath.password_input.clear();
+            }
+            Err(TransportError::OathPasswordRejected) => {
+                app.oath.locked = true;
+                app.oath.error = Some("wrong OATH password".into());
+                app.oath.password_input.clear();
+            }
+            Err(e) => app.oath.error = Some(e.to_string()),
+        }
     }
 
     /// List credentials on the selected key, computing each current TOTP. Unlocks
@@ -1380,65 +1575,23 @@ impl App {
             self.oath.error = Some("no OATH key selected".into());
             return;
         };
-        let result = (|| -> Result<Vec<OathRow>, TransportError> {
-            let mut session = molto2_transport::OathSession::open(&name)?;
-            if session.password_required() {
-                session.unlock(&self.oath.password_input)?;
-            }
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let mut rows = Vec::new();
-            for c in session.list()? {
-                // Compute TOTP per credential. A touch-required credential would
-                // block here; that's acceptable for a button-driven refresh.
-                let code = session
-                    .calculate_totp(&c.name, now, 30)
-                    .ok()
-                    .map(|otp| otp.code);
-                rows.push(OathRow {
-                    name: c.name,
-                    detail: format!("{:?}/{:?}", c.oath_type, c.algorithm),
-                    code,
-                });
-            }
-            Ok(rows)
-        })();
-        match result {
-            Ok(rows) => {
-                self.oath.creds = rows;
-                self.oath.loaded = true;
-                self.oath.locked = false;
-                self.oath.password_input.clear();
-            }
-            Err(TransportError::OathPasswordRejected) => {
-                self.oath.locked = true;
-                self.oath.error = Some("wrong OATH password".into());
-                self.oath.password_input.clear();
-            }
-            Err(e) => self.oath.error = Some(e.to_string()),
-        }
-    }
-
-    /// Open the selected reader, unlocking it with the entered password when the
-    /// applet is protected. Shared by provision/delete so both honor the lock.
-    fn open_unlocked_oath(&self) -> Result<molto2_transport::OathSession, TransportError> {
-        let name = self
-            .selected_oath_reader()
-            .ok_or(TransportError::MalformedResponse("no OATH key selected"))?;
-        let mut session = molto2_transport::OathSession::open(&name)?;
-        if session.password_required() {
-            session.unlock(&self.oath.password_input)?;
-        }
-        Ok(session)
+        let password = self.oath.password_input.clone();
+        self.spawn_job("Reading OATH codes\u{2026}", move || {
+            let result = Self::oath_open_unlock(&name, &password)
+                .and_then(|mut session| Self::oath_list_rows(&mut session));
+            Box::new(move |app: &mut App| Self::apply_oath_rows(app, result))
+        });
     }
 
     /// Provision the credential described by the add-dialog fields.
     fn provision_oath(&mut self) {
         self.oath.error = None;
-        let name = self.oath.add.name.trim().to_owned();
-        if name.is_empty() {
+        let Some(name) = self.selected_oath_reader() else {
+            self.oath.error = Some("no OATH key selected".into());
+            return;
+        };
+        let cred_name = self.oath.add.name.trim().to_owned();
+        if cred_name.is_empty() {
             self.oath.error = Some("credential name is required".into());
             return;
         }
@@ -1458,42 +1611,45 @@ impl App {
         } else {
             molto2_oath::OathType::Hotp
         };
-        let result = (|| -> Result<(), TransportError> {
-            let mut session = self.open_unlocked_oath()?;
-            session.put(&molto2_oath::PutParams {
-                name: &name,
-                secret: &secret,
-                oath_type,
-                algorithm: molto2_oath::Algorithm::Sha1,
-                digits: 6,
-                require_touch: self.oath.add.require_touch,
-                imf: 0,
-            })
-        })();
-        match result {
-            Ok(()) => {
-                self.oath.add = OathAddDialog::default();
-                self.load_oath_creds(); // refresh list + codes
-            }
-            Err(TransportError::OathPasswordRejected) => {
-                self.oath.locked = true;
-                self.oath.error = Some("wrong OATH password".into());
-            }
-            Err(e) => self.oath.error = Some(e.to_string()),
-        }
+        let require_touch = self.oath.add.require_touch;
+        let password = self.oath.password_input.clone();
+        // Clear the form now; on error the message is surfaced separately.
+        self.oath.add = OathAddDialog::default();
+        self.spawn_job("Adding credential\u{2026}", move || {
+            let result = (|| -> Result<Vec<OathRow>, TransportError> {
+                let mut session = Self::oath_open_unlock(&name, &password)?;
+                session.put(&molto2_oath::PutParams {
+                    name: &cred_name,
+                    secret: &secret,
+                    oath_type,
+                    algorithm: molto2_oath::Algorithm::Sha1,
+                    digits: 6,
+                    require_touch,
+                    imf: 0,
+                })?;
+                Self::oath_list_rows(&mut session)
+            })();
+            Box::new(move |app: &mut App| Self::apply_oath_rows(app, result))
+        });
     }
 
     /// Delete the named credential (already confirmed).
     fn delete_oath(&mut self, name: &str) {
         self.oath.error = None;
-        let result = (|| -> Result<(), TransportError> {
-            let mut session = self.open_unlocked_oath()?;
-            session.delete(name)
-        })();
-        match result {
-            Ok(()) => self.load_oath_creds(),
-            Err(e) => self.oath.error = Some(e.to_string()),
-        }
+        let Some(reader) = self.selected_oath_reader() else {
+            self.oath.error = Some("no OATH key selected".into());
+            return;
+        };
+        let cred_name = name.to_owned();
+        let password = self.oath.password_input.clone();
+        self.spawn_job("Deleting credential\u{2026}", move || {
+            let result = (|| -> Result<Vec<OathRow>, TransportError> {
+                let mut session = Self::oath_open_unlock(&reader, &password)?;
+                session.delete(&cred_name)?;
+                Self::oath_list_rows(&mut session)
+            })();
+            Box::new(move |app: &mut App| Self::apply_oath_rows(app, result))
+        });
     }
 
     fn render_oath(&mut self, ctx: &egui::Context) {
@@ -1778,12 +1934,23 @@ fn unix_now() -> u32 {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply any results from background device jobs before drawing.
+        self.drain_worker();
+
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, ViewTab::Molto2, "Molto2");
                 ui.selectable_value(&mut self.view, ViewTab::SecurityKeys, "Security keys");
                 ui.selectable_value(&mut self.view, ViewTab::Oath, "OATH");
+                if self.busy() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spinner();
+                        if let Some(label) = &self.busy_label {
+                            ui.label(egui::RichText::new(label.as_str()).weak());
+                        }
+                    });
+                }
             });
             ui.add_space(2.0);
         });
@@ -2161,5 +2328,63 @@ impl eframe::App for App {
                 self.import_otpauth();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A job dispatched to a real worker thread runs off-thread, and its result
+    /// applies back to the App with the busy bookkeeping cleared.
+    #[test]
+    fn worker_round_trip_applies_result_and_clears_busy() {
+        let mut app = App {
+            worker: Some(Worker::spawn(egui::Context::default())),
+            ..Default::default()
+        };
+        app.spawn_job("test", || {
+            Box::new(|app: &mut App| app.selected = 42)
+        });
+        assert!(app.busy(), "busy should be set right after dispatch");
+
+        // Wait for the worker to produce a result, then drain it.
+        let worker = app.worker.as_ref().unwrap();
+        let apply = worker
+            .result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker produced a result");
+        // Mimic drain_worker: decrement before applying.
+        app.busy_jobs -= 1;
+        apply(&mut app);
+
+        assert_eq!(app.selected, 42);
+        assert!(!app.busy(), "busy should clear once the result is applied");
+    }
+
+    /// While a job is in flight, a second dispatch is dropped (device access is
+    /// serialized; rapid clicks don't queue overlapping card I/O).
+    #[test]
+    fn spawn_job_ignored_while_busy() {
+        let mut app = App {
+            worker: Some(Worker::spawn(egui::Context::default())),
+            ..Default::default()
+        };
+        // Occupy the worker with a job whose result we don't drain.
+        app.spawn_job("first", || Box::new(|_: &mut App| {}));
+        assert_eq!(app.busy_jobs, 1);
+        app.spawn_job("second", || Box::new(|app: &mut App| app.selected = 99));
+        assert_eq!(app.busy_jobs, 1, "second dispatch must be ignored while busy");
+    }
+
+    /// With no worker (the default), a job runs inline so headless tests and any
+    /// non-GUI use still apply results.
+    #[test]
+    fn inline_when_no_worker() {
+        let mut app = App::default();
+        assert!(app.worker.is_none());
+        app.spawn_job("inline", || Box::new(|app: &mut App| app.selected = 7));
+        assert_eq!(app.selected, 7);
+        assert!(!app.busy());
     }
 }
