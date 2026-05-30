@@ -52,6 +52,8 @@ pub enum TransportError {
     MalformedResponse(&'static str),
     /// An OATH applet response could not be parsed.
     OathParse(molto2_oath::ParseError),
+    /// The OATH applet rejected the supplied password.
+    OathPasswordRejected,
 }
 
 impl fmt::Display for TransportError {
@@ -94,6 +96,9 @@ impl fmt::Display for TransportError {
             }
             TransportError::MalformedResponse(s) => write!(f, "malformed response: {}", s),
             TransportError::OathParse(e) => write!(f, "OATH response parse error: {}", e),
+            TransportError::OathPasswordRejected => {
+                write!(f, "OATH applet rejected the password (wrong password)")
+            }
         }
     }
 }

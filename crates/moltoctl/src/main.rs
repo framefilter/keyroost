@@ -286,15 +286,44 @@ enum KeyNameCmd {
     },
 }
 
+/// Reader selection plus the (optional) password for a protected OATH applet.
+/// Flattened into each OATH subcommand so they share one access surface.
+#[derive(clap::Args)]
+struct OathAccess {
+    /// Select a reader whose name contains this substring (case-insensitive).
+    /// Omit to use the only OATH key, or to list choices when several exist.
+    #[arg(long, value_name = "SUBSTR")]
+    reader: Option<String>,
+    /// Read the applet password from the named environment variable. Needed for
+    /// password-protected applets (e.g. a YubiKey with an OATH password set).
+    #[arg(long, value_name = "VAR", conflicts_with = "password_stdin")]
+    password_env: Option<String>,
+    /// Read the applet password from stdin (one line).
+    #[arg(long)]
+    password_stdin: bool,
+}
+
+impl OathAccess {
+    /// Resolve the password from its env/stdin source, if one was given.
+    fn password(&self) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        if self.password_env.is_none() && !self.password_stdin {
+            return Ok(None);
+        }
+        Ok(Some(read_secret(
+            "OATH password",
+            self.password_env.as_deref(),
+            self.password_stdin,
+        )?))
+    }
+}
+
 /// Subcommands for OATH credentials on a security key (Yubico/Trussed applet).
 #[derive(Subcommand)]
 enum OathCmd {
     /// List the credentials stored on the key.
     List {
-        /// Select a reader whose name contains this substring (case-insensitive).
-        /// Omit to use the only OATH key, or to list choices when several exist.
-        #[arg(long, value_name = "SUBSTR")]
-        reader: Option<String>,
+        #[command(flatten)]
+        access: OathAccess,
     },
     /// Print the current TOTP code for a credential.
     Code {
@@ -303,8 +332,8 @@ enum OathCmd {
         /// TOTP period in seconds.
         #[arg(long, default_value_t = 30)]
         period: u32,
-        #[arg(long, value_name = "SUBSTR")]
-        reader: Option<String>,
+        #[command(flatten)]
+        access: OathAccess,
     },
     /// Add (provision) a TOTP credential. The base32 secret is read from stdin
     /// or an env var — never argv.
@@ -326,15 +355,34 @@ enum OathCmd {
         /// Require a touch on the key to compute this credential.
         #[arg(long)]
         touch: bool,
-        #[arg(long, value_name = "SUBSTR")]
-        reader: Option<String>,
+        #[command(flatten)]
+        access: OathAccess,
     },
     /// Delete a credential by name.
     Delete {
         /// Credential name to remove.
         name: String,
-        #[arg(long, value_name = "SUBSTR")]
-        reader: Option<String>,
+        #[command(flatten)]
+        access: OathAccess,
+    },
+    /// Set (or replace) the applet password. The new password is read from an
+    /// env var or stdin — never argv. If a password is already set, supply the
+    /// current one via `--password-env`/`--password-stdin` to unlock first.
+    SetPassword {
+        /// Read the new password from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "new_password_stdin")]
+        new_password_env: Option<String>,
+        /// Read the new password from stdin (one line).
+        #[arg(long)]
+        new_password_stdin: bool,
+        #[command(flatten)]
+        access: OathAccess,
+    },
+    /// Remove the applet password. Supply the current password via
+    /// `--password-env`/`--password-stdin` to unlock first.
+    ClearPassword {
+        #[command(flatten)]
+        access: OathAccess,
     },
 }
 
@@ -1116,22 +1164,33 @@ fn resolve_oath_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::er
     }
 }
 
-/// Open an announced OATH session on the resolved reader.
+/// Open an announced OATH session on the resolved reader, unlocking it if the
+/// applet is password-protected. A protected applet without a supplied password
+/// is a clear error rather than a confusing downstream `6982`.
 fn open_oath(
-    reader: Option<&str>,
+    access: &OathAccess,
     debug: bool,
 ) -> Result<molto2_transport::OathSession, Box<dyn std::error::Error>> {
-    let name = resolve_oath_reader(reader)?;
+    let name = resolve_oath_reader(access.reader.as_deref())?;
     eprintln!("\u{2192} OATH on {}", name);
     let mut session = molto2_transport::OathSession::open(&name)?;
     session.set_debug(debug);
+    match access.password()? {
+        Some(pw) => session.unlock(&pw)?,
+        None if session.password_required() => {
+            return Err("this OATH applet is password-protected; supply it with \
+                        --password-env VAR or --password-stdin"
+                .into());
+        }
+        None => {}
+    }
     Ok(session)
 }
 
 fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        OathCmd::List { reader } => {
-            let mut session = open_oath(reader.as_deref(), debug)?;
+        OathCmd::List { access } => {
+            let mut session = open_oath(access, debug)?;
             let creds = session.list()?;
             if creds.is_empty() {
                 println!("(no OATH credentials)");
@@ -1146,8 +1205,8 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 }
             }
         }
-        OathCmd::Code { name, period, reader } => {
-            let mut session = open_oath(reader.as_deref(), debug)?;
+        OathCmd::Code { name, period, access } => {
+            let mut session = open_oath(access, debug)?;
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
@@ -1162,7 +1221,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             algorithm,
             digits,
             touch,
-            reader,
+            access,
         } => {
             if !(6..=8).contains(digits) {
                 return Err("--digits must be 6, 7, or 8".into());
@@ -1170,7 +1229,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let secret_b32 = read_secret("secret", secret_env.as_deref(), *secret_stdin)?;
             let secret = base32_decode(secret_b32.trim())
                 .map_err(|e| format!("invalid base32 secret: {}", e))?;
-            let mut session = open_oath(reader.as_deref(), debug)?;
+            let mut session = open_oath(access, debug)?;
             let params = molto2_oath::PutParams {
                 name,
                 secret: &secret,
@@ -1183,10 +1242,32 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             session.put(&params)?;
             println!("Added OATH credential {:?}.", name);
         }
-        OathCmd::Delete { name, reader } => {
-            let mut session = open_oath(reader.as_deref(), debug)?;
+        OathCmd::Delete { name, access } => {
+            let mut session = open_oath(access, debug)?;
             session.delete(name)?;
             println!("Deleted OATH credential {:?}.", name);
+        }
+        OathCmd::SetPassword {
+            new_password_env,
+            new_password_stdin,
+            access,
+        } => {
+            let new_pw = read_secret(
+                "new OATH password",
+                new_password_env.as_deref(),
+                *new_password_stdin,
+            )?;
+            if new_pw.is_empty() {
+                return Err("new password is empty; use `clear-password` to remove it".into());
+            }
+            let mut session = open_oath(access, debug)?;
+            session.set_password(&new_pw)?;
+            println!("OATH password set.");
+        }
+        OathCmd::ClearPassword { access } => {
+            let mut session = open_oath(access, debug)?;
+            session.clear_password()?;
+            println!("OATH password cleared.");
         }
     }
     Ok(())

@@ -23,6 +23,8 @@
 
 use molto2_proto::apdu::{build_apdu, build_apdu_get};
 
+pub mod crypto;
+
 /// OATH applet AID (`A0 00 00 05 27 21 01`), selected with `SELECT (00 A4 04 00)`.
 pub const AID: [u8; 7] = [0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01];
 
@@ -326,6 +328,147 @@ pub fn calculate_all(challenge: &[u8; 8]) -> Vec<u8> {
 #[must_use]
 pub fn send_remaining() -> Vec<u8> {
     build_apdu_get(0x00, Instruction::SendRemaining.code(), 0x00, 0x00, 0x00)
+}
+
+// ---------------------------------------------------------------------------
+// Password authentication (SET_CODE / VALIDATE)
+// ---------------------------------------------------------------------------
+//
+// Yubico OATH protects the applet with an optional password. The host derives a
+// 16-byte access key `PBKDF2-HMAC-SHA1(password, salt = device id, 1000, 16)`,
+// where the device id is the NAME (0x71) TLV in the SELECT response. When a
+// password is set, SELECT also returns a CHALLENGE (0x74); the host proves
+// knowledge of the key by answering with `HMAC-SHA1(key, challenge)` via
+// VALIDATE, sending its own challenge back for mutual authentication. SET_CODE
+// installs (or, with empty data, clears) the password.
+//
+// NOTE — Trussed divergence: the Trussed secrets app (Solo 2 / Nitrokey 3)
+// removed this handshake, so SET_CODE/VALIDATE target YubiKeys. Callers should
+// treat an applet that ignores these as "no password support".
+
+/// Number of PBKDF2 iterations Yubico OATH uses for the access key.
+pub const ACCESS_KEY_ITERATIONS: u32 = 1000;
+/// Length of the derived OATH access key.
+pub const ACCESS_KEY_LEN: usize = 16;
+
+/// What a SELECT response told us about the applet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectInfo {
+    /// Applet version bytes from the VERSION (`0x79`) TLV, if present.
+    pub version: Vec<u8>,
+    /// Device id from the NAME (`0x71`) TLV — the PBKDF2 salt. Empty if absent.
+    pub device_id: Vec<u8>,
+    /// CHALLENGE (`0x74`) from the SELECT response. `Some` iff a password is set;
+    /// its presence is how we know the applet requires VALIDATE.
+    pub challenge: Option<Vec<u8>>,
+}
+
+impl SelectInfo {
+    /// True when the applet is password-protected (SELECT returned a challenge).
+    #[must_use]
+    pub fn password_required(&self) -> bool {
+        self.challenge.is_some()
+    }
+}
+
+/// Parse the SELECT response TLV bag into [`SelectInfo`].
+pub fn parse_select(buf: &[u8]) -> Result<SelectInfo, ParseError> {
+    let tlvs = parse_tlvs(buf)?;
+    Ok(SelectInfo {
+        version: find_tag(&tlvs, Tag::Version).unwrap_or_default().to_vec(),
+        device_id: find_tag(&tlvs, Tag::Name).unwrap_or_default().to_vec(),
+        challenge: find_tag(&tlvs, Tag::Challenge).map(<[u8]>::to_vec),
+    })
+}
+
+/// Derive the 16-byte OATH access key from a password and the device id (salt).
+#[must_use]
+pub fn derive_access_key(password: &str, device_id: &[u8]) -> [u8; ACCESS_KEY_LEN] {
+    let dk = crypto::pbkdf2_hmac_sha1(
+        password.as_bytes(),
+        device_id,
+        ACCESS_KEY_ITERATIONS,
+        ACCESS_KEY_LEN,
+    );
+    let mut key = [0u8; ACCESS_KEY_LEN];
+    key.copy_from_slice(&dk);
+    key
+}
+
+/// The OATH response to a challenge: `HMAC-SHA1(access_key, challenge)`.
+#[must_use]
+pub fn respond(access_key: &[u8], challenge: &[u8]) -> [u8; 20] {
+    crypto::hmac_sha1(access_key, challenge)
+}
+
+/// Build a `VALIDATE` APDU answering the card's `card_challenge` and presenting
+/// our own `host_challenge` for mutual authentication.
+///
+/// Data layout: `RESPONSE(0x75) <hmac> || CHALLENGE(0x74) <host_challenge>`.
+/// The card replies with a RESPONSE TLV that should equal
+/// `HMAC-SHA1(key, host_challenge)` — verify it with [`verify_validate`].
+#[must_use]
+pub fn validate(access_key: &[u8], card_challenge: &[u8], host_challenge: &[u8]) -> Vec<u8> {
+    let resp = respond(access_key, card_challenge);
+    let mut data = Vec::new();
+    push_tlv(&mut data, Tag::Response, &resp);
+    push_tlv(&mut data, Tag::Challenge, host_challenge);
+    build_apdu(0x00, Instruction::Validate.code(), 0x00, 0x00, &data)
+}
+
+/// Check the card's `VALIDATE` reply: its RESPONSE TLV must equal
+/// `HMAC-SHA1(key, host_challenge)`, proving the card also holds the key.
+pub fn verify_validate(
+    access_key: &[u8],
+    host_challenge: &[u8],
+    reply: &[u8],
+) -> Result<bool, ParseError> {
+    let tlvs = parse_tlvs(reply)?;
+    let card_resp =
+        find_tag(&tlvs, Tag::Response).ok_or(ParseError::MissingTag(Tag::Response.code()))?;
+    let expected = respond(access_key, host_challenge);
+    Ok(ct_eq(card_resp, &expected))
+}
+
+/// Build a `SET_CODE` APDU installing `access_key` as the applet password.
+///
+/// Data layout: `KEY(0x73) <0x21 || access_key> || CHALLENGE(0x74) <challenge>
+/// || RESPONSE(0x75) <HMAC-SHA1(key, challenge)>`. The KEY prefix `0x21` is
+/// TOTP|SHA1, which Yubico OATH uses to tag the access key. `challenge` should be
+/// random; the response proves the host computed the key correctly.
+#[must_use]
+pub fn set_code(access_key: &[u8], challenge: &[u8]) -> Vec<u8> {
+    let mut key_tlv = Vec::with_capacity(1 + access_key.len());
+    key_tlv.push(prefix_byte(OathType::Totp, Algorithm::Sha1));
+    key_tlv.extend_from_slice(access_key);
+
+    let resp = respond(access_key, challenge);
+    let mut data = Vec::new();
+    push_tlv(&mut data, Tag::Key, &key_tlv);
+    push_tlv(&mut data, Tag::Challenge, challenge);
+    push_tlv(&mut data, Tag::Response, &resp);
+    build_apdu(0x00, Instruction::SetCode.code(), 0x00, 0x00, &data)
+}
+
+/// Build a `SET_CODE` APDU that clears the applet password.
+/// Data layout: a single empty `KEY(0x73)` TLV.
+#[must_use]
+pub fn clear_code() -> Vec<u8> {
+    let mut data = Vec::new();
+    push_tlv(&mut data, Tag::Key, &[]);
+    build_apdu(0x00, Instruction::SetCode.code(), 0x00, 0x00, &data)
+}
+
+/// Constant-time equality for the auth comparison (avoid leaking via timing).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Build the 8-byte big-endian TOTP challenge for `unix_seconds` and `period`.
@@ -723,5 +866,96 @@ mod tests {
         assert_eq!(prefix_byte(OathType::Totp, Algorithm::Sha1), 0x21);
         assert_eq!(prefix_byte(OathType::Hotp, Algorithm::Sha256), 0x12);
         assert_eq!(prefix_byte(OathType::Hotp, Algorithm::Sha512), 0x13);
+    }
+
+    // --- Password authentication (SET_CODE / VALIDATE) -------------------
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn access_key_and_response_known_answer() {
+        // PBKDF2-HMAC-SHA1("hunter2", salt=0102030405060708, 1000, 16) and the
+        // HMAC-SHA1 response to challenge 1122334455667788, both cross-checked
+        // against an independent reference (Python hashlib/hmac).
+        let device_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let key = derive_access_key("hunter2", &device_id);
+        assert_eq!(hex(&key), "d0c6df9806c2b3e3d1627596479f2f95");
+        let challenge = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        assert_eq!(
+            hex(&respond(&key, &challenge)),
+            "341d95a46932afd634fb9a703b6c525f9c57ad93"
+        );
+    }
+
+    #[test]
+    fn parse_select_detects_password() {
+        // VERSION 0x79, NAME 0x71 (device id), CHALLENGE 0x74 -> password set.
+        let buf = [
+            0x79, 0x03, 0x05, 0x07, 0x00, // version 5.7.0
+            0x71, 0x02, 0xAB, 0xCD, // device id
+            0x74, 0x08, 1, 2, 3, 4, 5, 6, 7, 8, // challenge
+        ];
+        let info = parse_select(&buf).unwrap();
+        assert_eq!(info.version, vec![0x05, 0x07, 0x00]);
+        assert_eq!(info.device_id, vec![0xAB, 0xCD]);
+        assert!(info.password_required());
+        assert_eq!(info.challenge.unwrap().len(), 8);
+
+        // Without a CHALLENGE TLV, no password is required.
+        let buf2 = [0x79, 0x03, 0x05, 0x07, 0x00, 0x71, 0x02, 0xAB, 0xCD];
+        assert!(!parse_select(&buf2).unwrap().password_required());
+    }
+
+    #[test]
+    fn validate_apdu_framing_and_verify() {
+        let key = [0x42u8; 16];
+        let card_chal = [0xAA; 8];
+        let host_chal = [0xBB; 8];
+        let apdu = validate(&key, &card_chal, &host_chal);
+        // 00 A3 00 00 Lc, then RESPONSE(0x75,20) <hmac> CHALLENGE(0x74,8) <host>.
+        assert_eq!(&apdu[..4], &[0x00, 0xA3, 0x00, 0x00]);
+        let lc = apdu[4] as usize;
+        assert_eq!(lc, 2 + 20 + 2 + 8);
+        let body = &apdu[5..5 + lc];
+        assert_eq!(body[0], Tag::Response.code());
+        assert_eq!(body[1], 20);
+        assert_eq!(&body[2..22], &respond(&key, &card_chal));
+        assert_eq!(body[22], Tag::Challenge.code());
+        assert_eq!(&body[24..32], &host_chal);
+
+        // A well-formed card reply (RESPONSE = HMAC(key, host_chal)) verifies;
+        // a tampered one does not.
+        let good_resp = respond(&key, &host_chal);
+        let mut reply = vec![Tag::Response.code(), 20];
+        reply.extend_from_slice(&good_resp);
+        assert!(verify_validate(&key, &host_chal, &reply).unwrap());
+        let mut bad = reply.clone();
+        bad[5] ^= 0xFF;
+        assert!(!verify_validate(&key, &host_chal, &bad).unwrap());
+    }
+
+    #[test]
+    fn set_code_and_clear_code_framing() {
+        let key = [0x11u8; 16];
+        let chal = [0x22u8; 8];
+        let apdu = set_code(&key, &chal);
+        assert_eq!(&apdu[..4], &[0x00, 0x03, 0x00, 0x00]);
+        let lc = apdu[4] as usize;
+        // KEY(0x73, 1+16) + CHALLENGE(0x74, 8) + RESPONSE(0x75, 20).
+        assert_eq!(lc, 2 + 17 + 2 + 8 + 2 + 20);
+        let body = &apdu[5..5 + lc];
+        assert_eq!(body[0], Tag::Key.code());
+        assert_eq!(body[1], 17);
+        assert_eq!(body[2], prefix_byte(OathType::Totp, Algorithm::Sha1));
+        assert_eq!(&body[3..19], &key);
+
+        // clear_code is a single empty KEY TLV.
+        let clear = clear_code();
+        assert_eq!(&clear[..4], &[0x00, 0x03, 0x00, 0x00]);
+        assert_eq!(clear[4], 2); // Lc
+        assert_eq!(clear[5], Tag::Key.code());
+        assert_eq!(clear[6], 0); // empty value
     }
 }

@@ -19,6 +19,9 @@ use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 pub struct OathSession {
     card: Card,
     debug: bool,
+    /// What the SELECT response told us — notably the device id (PBKDF2 salt) and
+    /// whether a password is set (a CHALLENGE was returned). Refreshed on SELECT.
+    select_info: oath::SelectInfo,
 }
 
 impl OathSession {
@@ -28,9 +31,71 @@ impl OathSession {
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let card = ctx.connect(&cstr, ShareMode::Shared, Protocols::ANY)?;
-        let mut session = Self { card, debug: false };
+        let mut session = Self {
+            card,
+            debug: false,
+            select_info: oath::SelectInfo {
+                version: Vec::new(),
+                device_id: Vec::new(),
+                challenge: None,
+            },
+        };
         session.select()?;
         Ok(session)
+    }
+
+    /// True when the applet is password-protected: data commands will be refused
+    /// until [`unlock`](Self::unlock) succeeds.
+    pub fn password_required(&self) -> bool {
+        self.select_info.password_required()
+    }
+
+    /// Authenticate against a password-protected applet (YubiKey OATH). Derives
+    /// the access key from the password and the device id, answers the card's
+    /// SELECT challenge with VALIDATE, and verifies the card's mutual-auth reply
+    /// so a wrong password (or a spoofed card) is rejected. No-op if no password
+    /// is set.
+    pub fn unlock(&mut self, password: &str) -> Result<(), TransportError> {
+        let Some(card_challenge) = self.select_info.challenge.clone() else {
+            return Ok(()); // not protected
+        };
+        let key = oath::derive_access_key(password, &self.select_info.device_id);
+        let host_challenge = random_challenge();
+        let (data, sw) =
+            self.transmit_full(&oath::validate(&key, &card_challenge, &host_challenge))?;
+        if sw == 0x6A80 || sw == 0x6982 {
+            // Wrong response / security status not satisfied → wrong password.
+            return Err(TransportError::OathPasswordRejected);
+        }
+        ok_or_apdu("oath validate", sw)?;
+        let ok = oath::verify_validate(&key, &host_challenge, &data)
+            .map_err(TransportError::OathParse)?;
+        if !ok {
+            return Err(TransportError::MalformedResponse(
+                "OATH card failed mutual authentication",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Set (or replace) the applet password. Requires the session to be unlocked
+    /// already if a password is currently set.
+    pub fn set_password(&mut self, password: &str) -> Result<(), TransportError> {
+        let key = oath::derive_access_key(password, &self.select_info.device_id);
+        let challenge = random_challenge();
+        let (_, sw) = self.transmit_full(&oath::set_code(&key, &challenge))?;
+        ok_or_apdu("oath set code", sw)?;
+        // A password is now set; reflect that locally.
+        self.select_info.challenge = Some(challenge.to_vec());
+        Ok(())
+    }
+
+    /// Remove the applet password. Requires the session to be unlocked already.
+    pub fn clear_password(&mut self) -> Result<(), TransportError> {
+        let (_, sw) = self.transmit_full(&oath::clear_code())?;
+        ok_or_apdu("oath clear code", sw)?;
+        self.select_info.challenge = None;
+        Ok(())
     }
 
     /// Enable per-APDU stderr tracing.
@@ -52,7 +117,15 @@ impl OathSession {
         let mut out = Vec::new();
         for name in names {
             if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
-                let mut session = OathSession { card, debug: false };
+                let mut session = OathSession {
+                    card,
+                    debug: false,
+                    select_info: oath::SelectInfo {
+                        version: Vec::new(),
+                        device_id: Vec::new(),
+                        challenge: None,
+                    },
+                };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
                 }
@@ -62,8 +135,10 @@ impl OathSession {
     }
 
     fn select(&mut self) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&oath::select())?;
-        ok_or_apdu("select oath applet", sw)
+        let (data, sw) = self.transmit_full(&oath::select())?;
+        ok_or_apdu("select oath applet", sw)?;
+        self.select_info = oath::parse_select(&data).map_err(TransportError::OathParse)?;
+        Ok(())
     }
 
     /// List provisioned credential names (with their type/algorithm).
@@ -131,6 +206,28 @@ impl OathSession {
             return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
         }
     }
+}
+
+/// An 8-byte random host challenge for OATH mutual authentication.
+///
+/// Reads `/dev/urandom` directly — this crate is already Linux/PC-SC-bound, so
+/// that avoids pulling in an RNG dependency. Falls back to a time-seeded value
+/// only if the device can't be read (a challenge needs to be unpredictable, not
+/// secret; the security of the handshake rests on the HMAC key, not this value).
+fn random_challenge() -> [u8; 8] {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok()
+    {
+        return buf;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos.to_le_bytes()
 }
 
 /// Map an OATH status word to success or a labelled APDU error.
