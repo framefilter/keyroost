@@ -87,6 +87,10 @@ struct OathState {
     error: Option<String>,
     /// True once a list has been fetched for the current selection.
     loaded: bool,
+    /// "Add credential" dialog state.
+    add: OathAddDialog,
+    /// Credential name awaiting a delete confirmation, if any.
+    confirm_delete: Option<String>,
 }
 
 /// One credential row in the OATH pane: its stored name and the last code we
@@ -95,6 +99,18 @@ struct OathRow {
     name: String,
     detail: String,
     code: Option<String>,
+}
+
+/// "Add credential" form state for the OATH pane.
+#[derive(Default)]
+struct OathAddDialog {
+    open: bool,
+    name: String,
+    /// Base32 secret (entered masked).
+    secret: String,
+    /// True = TOTP, false = HOTP.
+    totp: bool,
+    require_touch: bool,
 }
 
 fn main() -> eframe::Result<()> {
@@ -1405,6 +1421,81 @@ impl App {
         }
     }
 
+    /// Open the selected reader, unlocking it with the entered password when the
+    /// applet is protected. Shared by provision/delete so both honor the lock.
+    fn open_unlocked_oath(&self) -> Result<molto2_transport::OathSession, TransportError> {
+        let name = self
+            .selected_oath_reader()
+            .ok_or(TransportError::MalformedResponse("no OATH key selected"))?;
+        let mut session = molto2_transport::OathSession::open(&name)?;
+        if session.password_required() {
+            session.unlock(&self.oath.password_input)?;
+        }
+        Ok(session)
+    }
+
+    /// Provision the credential described by the add-dialog fields.
+    fn provision_oath(&mut self) {
+        self.oath.error = None;
+        let name = self.oath.add.name.trim().to_owned();
+        if name.is_empty() {
+            self.oath.error = Some("credential name is required".into());
+            return;
+        }
+        let secret = match molto2_proto::codec::base32_decode(self.oath.add.secret.trim()) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                self.oath.error = Some("secret is empty".into());
+                return;
+            }
+            Err(e) => {
+                self.oath.error = Some(format!("invalid base32 secret: {e}"));
+                return;
+            }
+        };
+        let oath_type = if self.oath.add.totp {
+            molto2_oath::OathType::Totp
+        } else {
+            molto2_oath::OathType::Hotp
+        };
+        let result = (|| -> Result<(), TransportError> {
+            let mut session = self.open_unlocked_oath()?;
+            session.put(&molto2_oath::PutParams {
+                name: &name,
+                secret: &secret,
+                oath_type,
+                algorithm: molto2_oath::Algorithm::Sha1,
+                digits: 6,
+                require_touch: self.oath.add.require_touch,
+                imf: 0,
+            })
+        })();
+        match result {
+            Ok(()) => {
+                self.oath.add = OathAddDialog::default();
+                self.load_oath_creds(); // refresh list + codes
+            }
+            Err(TransportError::OathPasswordRejected) => {
+                self.oath.locked = true;
+                self.oath.error = Some("wrong OATH password".into());
+            }
+            Err(e) => self.oath.error = Some(e.to_string()),
+        }
+    }
+
+    /// Delete the named credential (already confirmed).
+    fn delete_oath(&mut self, name: &str) {
+        self.oath.error = None;
+        let result = (|| -> Result<(), TransportError> {
+            let mut session = self.open_unlocked_oath()?;
+            session.delete(name)
+        })();
+        match result {
+            Ok(()) => self.load_oath_creds(),
+            Err(e) => self.oath.error = Some(e.to_string()),
+        }
+    }
+
     fn render_oath(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("oath-readers")
             .resizable(true)
@@ -1489,7 +1580,13 @@ impl App {
                     "Reads the credentials on the key and computes each current \
                      TOTP. Codes are shown for ~30s; click again to refresh.",
                 );
+                if ui.button("Add credential\u{2026}").clicked() {
+                    // Open the add form; default to TOTP.
+                    self.oath.add = OathAddDialog { open: true, totp: true, ..Default::default() };
+                }
             });
+
+            self.render_oath_add_form(ui);
             ui.separator();
 
             if !self.oath.loaded {
@@ -1501,8 +1598,10 @@ impl App {
                 return;
             }
 
+            // Collect a requested delete outside the row borrow, then act on it.
+            let mut want_delete: Option<String> = None;
             egui::Grid::new("oath-creds")
-                .num_columns(3)
+                .num_columns(4)
                 .striped(true)
                 .spacing([16.0, 6.0])
                 .show(ui, |ui| {
@@ -1517,10 +1616,101 @@ impl App {
                             }
                         }
                         ui.colored_label(ui.visuals().weak_text_color(), &row.detail);
+                        if ui.button("Delete").clicked() {
+                            want_delete = Some(row.name.clone());
+                        }
                         ui.end_row();
                     }
                 });
+            if let Some(name) = want_delete {
+                self.oath.confirm_delete = Some(name);
+            }
         });
+
+        self.render_oath_delete_confirm(ctx);
+    }
+
+    /// The inline "Add credential" form, shown when the add dialog is open.
+    fn render_oath_add_form(&mut self, ui: &mut egui::Ui) {
+        if !self.oath.add.open {
+            return;
+        }
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Add credential").strong());
+                helper_bubble(
+                    ui,
+                    "The secret is sent to the key to store the credential; it is \
+                     not written to disk by MoltoUI. Use the base32 secret from the \
+                     service's enrollment (the text behind the QR code).",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.oath.add.name)
+                        .hint_text("issuer:account")
+                        .desired_width(220.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Secret (base32):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.oath.add.secret)
+                        .password(true)
+                        .desired_width(220.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Type:");
+                ui.selectable_value(&mut self.oath.add.totp, true, "TOTP");
+                ui.selectable_value(&mut self.oath.add.totp, false, "HOTP");
+                ui.checkbox(&mut self.oath.add.require_touch, "Require touch");
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    self.provision_oath();
+                }
+                if ui.button("Cancel").clicked() {
+                    self.oath.add = OathAddDialog::default();
+                }
+            });
+        });
+    }
+
+    /// Modal confirmation before deleting a credential (irreversible).
+    fn render_oath_delete_confirm(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.oath.confirm_delete.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Delete credential?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Permanently delete \u{201c}{name}\u{201d} from this key? \
+                     This cannot be undone."
+                ));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.oath.confirm_delete = None;
+                self.delete_oath(&name);
+            }
+            Some(false) => self.oath.confirm_delete = None,
+            None => {}
+        }
     }
 }
 

@@ -1771,6 +1771,7 @@ dependencies = [
  "molto2-hid",
  "molto2-import",
  "molto2-keyring",
+ "molto2-oath",
  "molto2-proto",
  "molto2-resolve",
  "molto2-transport",

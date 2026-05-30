@@ -111,7 +111,15 @@ gained `set-password`/`clear-password` and a shared `--password-env/-stdin` on
 every subcommand (passwords never in argv); `open_oath` auto-unlocks and errors
 clearly when a protected applet has no password supplied. Hardware-verified on a
 YubiKey: set → access-refused-without → unlock-with-correct → reject-wrong →
-clear → baseline restored. Still TODO: HOTP add.
+clear → baseline restored.
+
+**HOTP add — DONE (2026-05-29).** `oath add` gained `--type totp|hotp` and a
+`--counter` (HOTP initial moving factor); HOTP computation uses a new
+`calculate_hotp` that sends an empty CHALLENGE so the card advances its own
+counter. `oath code` dispatches on the stored credential type (looked up via
+`list`). Hardware-verified on a YubiKey: a HOTP credential provisioned with the
+RFC 4226 seed produced the exact documented sequence (755224, 287082, 359152,
+969429, 338314) across five reads, then deleted; key restored to baseline.
 
 **OATH GUI pane — DONE (2026-05-29).** `moltoui` gained an "OATH" tab: a
 left-panel reader list (enumerated via `OathSession::list_oath_readers`, same
@@ -119,10 +127,14 @@ no-guess posture as the CLI), and a central panel that lists credentials and
 computes each current TOTP on demand. Password-protected applets surface an
 inline unlock field (password sent to the key only, never persisted — disclosed
 via the shared `helper_bubble`), and a wrong password is reported distinctly via
-the `OathPasswordRejected` path. Read-focused for now (list + codes + unlock);
-provisioning/delete from the GUI is deferred. Verified: workspace builds, clippy
-clean, and the pane renders without panicking against a live YubiKey (launched
-with the tab defaulted on, then reverted).
+the `OathPasswordRejected` path. An inline "Add credential" form (name, base32
+secret, TOTP/HOTP, require-touch) provisions via the shared `OathSession::put`,
+and each row has a Delete button gated by a modal confirmation (irreversible).
+Both honor a set applet password through a shared unlock helper. Verified:
+workspace builds, clippy clean, and the pane renders without panicking against a
+live YubiKey (launched with the tab defaulted on, then reverted); the underlying
+put/delete/unlock paths are the same ones hardware-verified via `moltoctl oath`.
+GUI button clicks themselves are not exercisable headlessly.
 
 ## Friendly device names (multi-key selection)
 
