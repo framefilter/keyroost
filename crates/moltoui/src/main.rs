@@ -27,6 +27,7 @@ enum ViewTab {
     #[default]
     Molto2,
     SecurityKeys,
+    Oath,
 }
 
 #[derive(Default)]
@@ -66,6 +67,34 @@ struct ChangePinDialog {
     open: bool,
     old: String,
     new: String,
+}
+
+/// State for the OATH (TOTP) pane. The applet is driven over PC/SC, so a
+/// "reader name" identifies the key rather than a hidraw path.
+#[derive(Default)]
+struct OathState {
+    /// Names of connected readers whose OATH applet responds.
+    readers: Vec<String>,
+    /// Index into `readers` of the selected key.
+    selected: Option<usize>,
+    /// Credentials listed from the selected key, with their freshly-computed code.
+    creds: Vec<OathRow>,
+    /// True when the selected applet is password-protected and not yet unlocked.
+    locked: bool,
+    /// Password entry field (cleared after an unlock attempt).
+    password_input: String,
+    /// User-facing error/status from the last OATH operation.
+    error: Option<String>,
+    /// True once a list has been fetched for the current selection.
+    loaded: bool,
+}
+
+/// One credential row in the OATH pane: its stored name and the last code we
+/// computed for it (empty until "Show code" / refresh).
+struct OathRow {
+    name: String,
+    detail: String,
+    code: Option<String>,
 }
 
 fn main() -> eframe::Result<()> {
@@ -112,6 +141,8 @@ struct App {
     view: ViewTab,
     /// FIDO security-key view state (devices, selected CTAP info, errors).
     security_keys: SecurityKeysState,
+    /// OATH (TOTP) view state.
+    oath: OathState,
 }
 
 #[derive(Default)]
@@ -1277,6 +1308,220 @@ impl App {
             self.submit_change_pin();
         }
     }
+
+    // --- OATH (TOTP) pane ------------------------------------------------
+
+    /// (Re)enumerate readers whose OATH applet responds. Resets per-key state.
+    fn refresh_oath_readers(&mut self) {
+        self.oath.error = None;
+        self.oath.creds.clear();
+        self.oath.loaded = false;
+        match molto2_transport::OathSession::list_oath_readers() {
+            Ok(readers) => {
+                // Preserve the selection by name across refreshes.
+                let prev = self
+                    .oath
+                    .selected
+                    .and_then(|i| self.oath.readers.get(i).cloned());
+                self.oath.readers = readers;
+                self.oath.selected = prev
+                    .and_then(|p| self.oath.readers.iter().position(|r| *r == p))
+                    .or(if self.oath.readers.is_empty() { None } else { Some(0) });
+            }
+            Err(e) => {
+                self.oath.error = Some(format!("enumeration failed: {e}"));
+                self.oath.readers.clear();
+                self.oath.selected = None;
+            }
+        }
+        self.probe_oath_lock();
+    }
+
+    /// Open the selected reader to learn whether its applet is password-locked,
+    /// without listing anything yet.
+    fn probe_oath_lock(&mut self) {
+        self.oath.locked = false;
+        self.oath.loaded = false;
+        self.oath.creds.clear();
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        match molto2_transport::OathSession::open(&name) {
+            Ok(session) => self.oath.locked = session.password_required(),
+            Err(e) => self.oath.error = Some(format!("open failed: {e}")),
+        }
+    }
+
+    fn selected_oath_reader(&self) -> Option<String> {
+        self.oath.readers.get(self.oath.selected?).cloned()
+    }
+
+    /// List credentials on the selected key, computing each current TOTP. Unlocks
+    /// first with the entered password when the applet is protected.
+    fn load_oath_creds(&mut self) {
+        self.oath.error = None;
+        let Some(name) = self.selected_oath_reader() else {
+            self.oath.error = Some("no OATH key selected".into());
+            return;
+        };
+        let result = (|| -> Result<Vec<OathRow>, TransportError> {
+            let mut session = molto2_transport::OathSession::open(&name)?;
+            if session.password_required() {
+                session.unlock(&self.oath.password_input)?;
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut rows = Vec::new();
+            for c in session.list()? {
+                // Compute TOTP per credential. A touch-required credential would
+                // block here; that's acceptable for a button-driven refresh.
+                let code = session
+                    .calculate_totp(&c.name, now, 30)
+                    .ok()
+                    .map(|otp| otp.code);
+                rows.push(OathRow {
+                    name: c.name,
+                    detail: format!("{:?}/{:?}", c.oath_type, c.algorithm),
+                    code,
+                });
+            }
+            Ok(rows)
+        })();
+        match result {
+            Ok(rows) => {
+                self.oath.creds = rows;
+                self.oath.loaded = true;
+                self.oath.locked = false;
+                self.oath.password_input.clear();
+            }
+            Err(TransportError::OathPasswordRejected) => {
+                self.oath.locked = true;
+                self.oath.error = Some("wrong OATH password".into());
+                self.oath.password_input.clear();
+            }
+            Err(e) => self.oath.error = Some(e.to_string()),
+        }
+    }
+
+    fn render_oath(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("oath-readers")
+            .resizable(true)
+            .default_width(280.0)
+            .width_range(180.0..=520.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.heading("OATH keys");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Refresh").clicked() {
+                            self.refresh_oath_readers();
+                        }
+                    });
+                });
+                ui.label("Security keys with an OATH applet.");
+                ui.add_space(4.0);
+
+                if self.oath.readers.is_empty() {
+                    ui.colored_label(
+                        ui.visuals().weak_text_color(),
+                        "No OATH-capable key detected. Plug one in and click Refresh.",
+                    );
+                }
+
+                let mut clicked: Option<usize> = None;
+                for (i, name) in self.oath.readers.iter().enumerate() {
+                    let selected = self.oath.selected == Some(i);
+                    if ui.selectable_label(selected, name).clicked() {
+                        clicked = Some(i);
+                    }
+                }
+                if let Some(i) = clicked {
+                    self.oath.selected = Some(i);
+                    self.oath.password_input.clear();
+                    self.probe_oath_lock();
+                }
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
+            if self.selected_oath_reader().is_none() {
+                ui.heading("No OATH key selected");
+                ui.label("Pick a key from the left panel, or click Refresh.");
+                return;
+            };
+
+            if let Some(err) = &self.oath.error {
+                ui.colored_label(egui::Color32::from_rgb(220, 110, 110), err);
+                ui.add_space(6.0);
+            }
+
+            if self.oath.locked {
+                ui.horizontal(|ui| {
+                    ui.label("This key's OATH applet is password-protected.");
+                    helper_bubble(
+                        ui,
+                        "The password is sent to the key to unlock it for this \
+                         operation only; it is never written to disk.",
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Password:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.oath.password_input)
+                            .password(true)
+                            .desired_width(200.0),
+                    );
+                    if ui.button("Unlock & list").clicked() {
+                        self.load_oath_creds();
+                    }
+                });
+                return;
+            }
+
+            ui.horizontal(|ui| {
+                if ui.button("List / refresh codes").clicked() {
+                    self.load_oath_creds();
+                }
+                helper_bubble(
+                    ui,
+                    "Reads the credentials on the key and computes each current \
+                     TOTP. Codes are shown for ~30s; click again to refresh.",
+                );
+            });
+            ui.separator();
+
+            if !self.oath.loaded {
+                ui.label("Click \u{201c}List / refresh codes\u{201d} to read this key.");
+                return;
+            }
+            if self.oath.creds.is_empty() {
+                ui.label("(no OATH credentials on this key)");
+                return;
+            }
+
+            egui::Grid::new("oath-creds")
+                .num_columns(3)
+                .striped(true)
+                .spacing([16.0, 6.0])
+                .show(ui, |ui| {
+                    for row in &self.oath.creds {
+                        ui.label(&row.name);
+                        match &row.code {
+                            Some(code) => {
+                                ui.label(egui::RichText::new(code).monospace().strong());
+                            }
+                            None => {
+                                ui.colored_label(ui.visuals().weak_text_color(), "(touch / n/a)");
+                            }
+                        }
+                        ui.colored_label(ui.visuals().weak_text_color(), &row.detail);
+                        ui.end_row();
+                    }
+                });
+        });
+    }
 }
 
 fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
@@ -1348,6 +1593,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view, ViewTab::Molto2, "Molto2");
                 ui.selectable_value(&mut self.view, ViewTab::SecurityKeys, "Security keys");
+                ui.selectable_value(&mut self.view, ViewTab::Oath, "OATH");
             });
             ui.add_space(2.0);
         });
@@ -1359,6 +1605,14 @@ impl eframe::App for App {
                 self.refresh_security_keys();
             }
             self.render_security_keys(ctx);
+            return;
+        }
+
+        if self.view == ViewTab::Oath {
+            if self.oath.readers.is_empty() && self.oath.error.is_none() {
+                self.refresh_oath_readers();
+            }
+            self.render_oath(ctx);
             return;
         }
 

@@ -96,9 +96,33 @@ reassembly loop, and `list`/`calculate_totp`/`put`/`delete`. `moltoctl oath
 posture (auto-use a lone OATH key, `--reader <substr>` to choose, refuse to guess
 among several) and the base32 secret read via stdin/env, never argv. Verified on
 hardware: a put→code→delete round-trip on a YubiKey produced a code matching
-`oathtool` for the RFC 6238 seed, and SELECT+LIST work on the Solo 2 too. Still
-TODO: OATH password auth (`SET_CODE`/`VALIDATE`, Trussed-divergent), HOTP add, and
-a `moltoui` OATH pane.
+`oathtool` for the RFC 6238 seed, and SELECT+LIST work on the Solo 2 too.
+
+**OATH password auth — DONE (2026-05-29).** `molto2-oath` gained a vendored
+HMAC-SHA1 + PBKDF2-HMAC-SHA1 (on the in-tree SHA-1; no new deps), the
+`SET_CODE`/`VALIDATE` builders, the SELECT-response parser (`SelectInfo`,
+password-required detection), and the Yubico access-key derivation
+(`PBKDF2(password, salt=device id, 1000, 16)`) — all under RFC 2202/6070/6238
+known-answer tests. `OathSession` now parses SELECT, exposes `password_required`,
+and adds `unlock` (VALIDATE with mutual-auth verification of the card's reply),
+`set_password`, and `clear_password`; a dedicated `OathPasswordRejected` error
+replaces the misleading Molto2 "wrong customer key" message. `moltoctl oath`
+gained `set-password`/`clear-password` and a shared `--password-env/-stdin` on
+every subcommand (passwords never in argv); `open_oath` auto-unlocks and errors
+clearly when a protected applet has no password supplied. Hardware-verified on a
+YubiKey: set → access-refused-without → unlock-with-correct → reject-wrong →
+clear → baseline restored. Still TODO: HOTP add.
+
+**OATH GUI pane — DONE (2026-05-29).** `moltoui` gained an "OATH" tab: a
+left-panel reader list (enumerated via `OathSession::list_oath_readers`, same
+no-guess posture as the CLI), and a central panel that lists credentials and
+computes each current TOTP on demand. Password-protected applets surface an
+inline unlock field (password sent to the key only, never persisted — disclosed
+via the shared `helper_bubble`), and a wrong password is reported distinctly via
+the `OathPasswordRejected` path. Read-focused for now (list + codes + unlock);
+provisioning/delete from the GUI is deferred. Verified: workspace builds, clippy
+clean, and the pane renders without panicking against a live YubiKey (launched
+with the tab defaulted on, then reverted).
 
 ## Friendly device names (multi-key selection)
 
