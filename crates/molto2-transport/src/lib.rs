@@ -61,6 +61,9 @@ pub enum TransportError {
     OpenPgpParse(molto2_openpgp::ParseError),
     /// No OpenPGP applet is present on the selected card (`SW 6A82`).
     NoOpenPgpApplet,
+    /// The OpenPGP applet rejected the supplied PIN. `tries_remaining` is the
+    /// count the card reported (`63 Cx`), or `None` when blocked / unknown.
+    OpenPgpPinRejected { tries_remaining: Option<u8> },
 }
 
 impl fmt::Display for TransportError {
@@ -109,6 +112,12 @@ impl fmt::Display for TransportError {
             TransportError::OpenPgpParse(e) => write!(f, "OpenPGP response parse error: {}", e),
             TransportError::NoOpenPgpApplet => {
                 write!(f, "no OpenPGP applet on this card")
+            }
+            TransportError::OpenPgpPinRejected { tries_remaining: Some(n) } => {
+                write!(f, "OpenPGP PIN rejected; {} attempt(s) remaining", n)
+            }
+            TransportError::OpenPgpPinRejected { tries_remaining: None } => {
+                write!(f, "OpenPGP PIN rejected (PIN may be blocked)")
             }
         }
     }

@@ -270,7 +270,7 @@ enum Cmd {
     },
 }
 
-/// Subcommands for the OpenPGP card applet (read-only for now).
+/// Subcommands for the OpenPGP card applet.
 #[derive(Subcommand)]
 enum OpenpgpCmd {
     /// Show card status: AID/serial, key algorithms and fingerprints, PIN retry
@@ -281,6 +281,107 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
+    /// Verify a PIN against the card (checks it's correct; changes nothing). The
+    /// PIN is read from an env var or stdin — never argv.
+    Verify {
+        /// Which PIN to check: `user` (PW1) or `admin` (PW3).
+        #[arg(long, value_enum, default_value_t = OpenpgpPinKind::User)]
+        pin: OpenpgpPinKind,
+        /// Read the PIN from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        /// Read the PIN from stdin (one line).
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Read the public key from a slot (read-only; no PIN). RSA keys print their
+    /// modulus and exponent in hex.
+    PublicKey {
+        /// Which key slot: `sign`, `decrypt`, or `auth`.
+        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        slot: OpenpgpSlot,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Factory-reset the OpenPGP applet: wipe ALL key slots and restore default
+    /// PINs (PW1 123456, PW3 12345678). DESTRUCTIVE. Requires `--yes`. Also works
+    /// to recover a card whose PINs are blocked.
+    Reset {
+        /// Confirm you really want to wipe the OpenPGP applet.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Generate a fresh key pair in a slot. DESTRUCTIVE — overwrites any existing
+    /// key in that slot. Requires the admin PIN (PW3) and `--yes`; on a YubiKey a
+    /// touch is also required.
+    GenerateKey {
+        /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
+        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        slot: OpenpgpSlot,
+        /// Confirm you really want to overwrite the slot.
+        #[arg(long)]
+        yes: bool,
+        /// Read the admin PIN (PW3) from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
+        admin_pin_env: Option<String>,
+        /// Read the admin PIN (PW3) from stdin (one line).
+        #[arg(long)]
+        admin_pin_stdin: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum OpenpgpSlot {
+    Sign,
+    Decrypt,
+    Auth,
+}
+impl OpenpgpSlot {
+    fn to_crt(self) -> molto2_openpgp::KeyCrt {
+        match self {
+            OpenpgpSlot::Sign => molto2_openpgp::KeyCrt::Sign,
+            OpenpgpSlot::Decrypt => molto2_openpgp::KeyCrt::Decrypt,
+            OpenpgpSlot::Auth => molto2_openpgp::KeyCrt::Auth,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            OpenpgpSlot::Sign => "signature",
+            OpenpgpSlot::Decrypt => "decryption",
+            OpenpgpSlot::Auth => "authentication",
+        }
+    }
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum OpenpgpPinKind {
+    /// PW1 — the user PIN (signing / decryption / authentication).
+    User,
+    /// PW3 — the admin PIN (card management).
+    Admin,
+}
+impl OpenpgpPinKind {
+    /// The VERIFY password-reference byte. For PW1 we use the "other" context
+    /// (0x82), which authorizes decryption/auth; signing uses 0x81 but a plain
+    /// "is this PIN right?" check is fine against 0x82.
+    fn pw_ref(self) -> u8 {
+        match self {
+            OpenpgpPinKind::User => molto2_openpgp::PW1_OTHER,
+            OpenpgpPinKind::Admin => molto2_openpgp::PW3_ADMIN,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            OpenpgpPinKind::User => "user (PW1)",
+            OpenpgpPinKind::Admin => "admin (PW3)",
+        }
+    }
 }
 
 /// Subcommands for the `key-name` friendly-name registry.
@@ -1396,6 +1497,77 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(n) => println!("Signatures:     {}", n),
                 None => println!("Signatures:     (unavailable)"),
             }
+        }
+        OpenpgpCmd::Verify {
+            pin,
+            pin_env,
+            pin_stdin,
+            reader,
+        } => {
+            let pin_value = read_secret("OpenPGP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            session.verify_pin(pin.pw_ref(), pin_value.as_bytes())?;
+            println!("{} PIN verified.", pin.label());
+        }
+        OpenpgpCmd::PublicKey { slot, reader } => {
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            let key = session.read_public_key(slot.to_crt())?;
+            println!("{} key (RSA):", slot.label());
+            println!("  modulus:  {}", hex_encode(&key.modulus));
+            println!("  exponent: {}", hex_encode(&key.exponent));
+        }
+        OpenpgpCmd::Reset { yes, reader } => {
+            if !yes {
+                return Err("refusing to reset without --yes (this wipes ALL OpenPGP \
+                            keys and resets PINs to defaults)"
+                    .into());
+            }
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            session.factory_reset()?;
+            println!("OpenPGP applet reset. All keys wiped; PINs restored to defaults.");
+        }
+        OpenpgpCmd::GenerateKey {
+            slot,
+            yes,
+            admin_pin_env,
+            admin_pin_stdin,
+            reader,
+        } => {
+            if !yes {
+                return Err(format!(
+                    "refusing to generate without --yes (this OVERWRITES the {} key slot)",
+                    slot.label()
+                )
+                .into());
+            }
+            let admin_pin = read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            session.verify_pin(molto2_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
+            println!("Generating {} key — touch the key if it blinks…", slot.label());
+            let key = session.generate_key(slot.to_crt())?;
+            println!("Generated {} key (RSA):", slot.label());
+            println!("  modulus:  {}", hex_encode(&key.modulus));
+            println!("  exponent: {}", hex_encode(&key.exponent));
+            eprintln!(
+                "Note: the card stores the private key; set the key's fingerprint/timestamp \
+                 with an OpenPGP tool (e.g. gpg) to make it usable for real signing."
+            );
         }
     }
     Ok(())

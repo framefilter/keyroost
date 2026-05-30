@@ -139,6 +139,123 @@ impl OpenPgpSession {
         })
     }
 
+    /// Present a PIN against the password reference `pw_ref` (one of
+    /// [`molto2_openpgp::PW1_SIGN`], [`molto2_openpgp::PW1_OTHER`],
+    /// [`molto2_openpgp::PW3_ADMIN`]). A wrong PIN is reported as
+    /// [`TransportError::OpenPgpPinRejected`] carrying the remaining-tries count.
+    /// The PIN bytes come from the caller and are never logged or stored.
+    pub fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
+        let (_, sw) = self.transmit_full(&pgp::verify(pw_ref, pin))?;
+        if sw == pgp::SW_OK {
+            return Ok(());
+        }
+        // Spec form: 63Cx = verification failed, x tries remaining.
+        if (sw & 0xFFF0) == 0x63C0 {
+            return Err(TransportError::OpenPgpPinRejected {
+                tries_remaining: Some((sw & 0x000F) as u8),
+            });
+        }
+        // YubiKey form: a failed VERIFY returns 6982/6983 without an embedded
+        // count. Read the PW status to report the actual remaining tries.
+        if sw == 0x6982 || sw == 0x6983 {
+            let tries_remaining = self.pin_tries_for(pw_ref);
+            return Err(TransportError::OpenPgpPinRejected { tries_remaining });
+        }
+        Err(TransportError::Apdu {
+            label: "openpgp verify",
+            sw1: (sw >> 8) as u8,
+            sw2: sw as u8,
+        })
+    }
+
+    /// Remaining tries for the counter behind `pw_ref`, read from the PW status
+    /// bytes (`C4`). `None` if the status can't be read/parsed.
+    fn pin_tries_for(&mut self, pw_ref: u8) -> Option<u8> {
+        let (bytes, sw) = self.transmit_full(&pgp::get_pw_status()).ok()?;
+        if sw != pgp::SW_OK {
+            return None;
+        }
+        let status = pgp::parse_pw_status(&bytes).ok()?;
+        match pw_ref {
+            pgp::PW3_ADMIN => Some(status.tries_pw3),
+            _ => Some(status.tries_pw1), // PW1_SIGN / PW1_OTHER
+        }
+    }
+
+    /// Generate a fresh asymmetric key pair in the given slot and return its
+    /// public key. **Destructive** — overwrites any existing key in that slot.
+    /// Requires the admin PIN (PW3) to have been verified first via
+    /// [`verify_pin`](Self::verify_pin); on a YubiKey it also needs a touch.
+    pub fn generate_key(&mut self, crt: pgp::KeyCrt) -> Result<pgp::PublicKey, TransportError> {
+        let (data, sw) = self.transmit_full(&pgp::generate_key(crt))?;
+        ok_or_apdu("openpgp generate key", sw)?;
+        pgp::parse_generated_public_key(&data).map_err(TransportError::OpenPgpParse)
+    }
+
+    /// Read the public key currently in `crt`'s slot. Read-only; no PIN. Returns
+    /// an `OpenPgpParse` error if the slot is empty or holds a non-RSA key.
+    pub fn read_public_key(&mut self, crt: pgp::KeyCrt) -> Result<pgp::PublicKey, TransportError> {
+        let (data, sw) = self.transmit_full(&pgp::read_public_key(crt))?;
+        ok_or_apdu("openpgp read public key", sw)?;
+        pgp::parse_generated_public_key(&data).map_err(TransportError::OpenPgpParse)
+    }
+
+    /// Compute a signature over `digest_info` (PSO:CDS). The caller supplies the
+    /// already-hashed DigestInfo. Requires PW1 (signing context, ref `0x81`)
+    /// verified first; on a YubiKey it also needs a touch. Returns the raw
+    /// signature bytes.
+    pub fn sign(&mut self, digest_info: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let (sig, sw) = self.transmit_full(&pgp::pso_compute_signature(digest_info))?;
+        ok_or_apdu("openpgp compute signature", sw)?;
+        Ok(sig)
+    }
+
+    /// Factory-reset the OpenPGP applet: wipe ALL key slots, fingerprints, and
+    /// metadata and restore the default PINs (PW1 `123456`, PW3 `12345678`).
+    /// **Destructive and irreversible.**
+    ///
+    /// TERMINATE DF requires either PW3 (admin) rights or that both PW1 and PW3
+    /// are already blocked. To work unconditionally — including the
+    /// forgotten-PIN case, and without ever needing the real PIN — this first
+    /// *blocks* PW1 and PW3 by exhausting their retry counters with deliberately
+    /// wrong guesses, then issues TERMINATE DF + ACTIVATE FILE. (This is the same
+    /// approach `ykman` uses.)
+    pub fn factory_reset(&mut self) -> Result<(), TransportError> {
+        // Read how many tries each PIN has so we exhaust exactly that many.
+        let (pw1_tries, pw3_tries) = match self.transmit_full(&pgp::get_pw_status()) {
+            Ok((bytes, sw)) if sw == pgp::SW_OK => match pgp::parse_pw_status(&bytes) {
+                Ok(s) => (s.tries_pw1, s.tries_pw3),
+                // Unknown counts: 15 is the max any OpenPGP card allows.
+                Err(_) => (15, 15),
+            },
+            _ => (15, 15),
+        };
+        // A guess that cannot be a real PIN (PINs are >= 6 / 8 digits). Looping
+        // until the card reports blocked (6983) guards against the count being
+        // stale; the trailing guesses past zero just keep returning 6983.
+        let bogus = b"00000000";
+        self.block_pin(pgp::PW1_OTHER, bogus, pw1_tries);
+        self.block_pin(pgp::PW3_ADMIN, bogus, pw3_tries);
+
+        let (_, sw) = self.transmit_full(&pgp::terminate_df())?;
+        ok_or_apdu("openpgp terminate df", sw)?;
+        let (_, sw) = self.transmit_full(&pgp::activate_file())?;
+        ok_or_apdu("openpgp activate file", sw)
+    }
+
+    /// Exhaust a PIN's retry counter with wrong guesses so it becomes blocked.
+    /// Sends up to `max_tries + 1` attempts, stopping early once the card reports
+    /// the PIN blocked (`6983`). Best-effort: transmit errors abort the loop.
+    fn block_pin(&mut self, pw_ref: u8, bogus: &[u8], max_tries: u8) {
+        for _ in 0..max_tries.saturating_add(1) {
+            match self.transmit_full(&pgp::verify(pw_ref, bogus)) {
+                Ok((_, 0x6983)) => break, // blocked
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
     /// continuations (`GET RESPONSE`), returning `(payload, sw)`.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
