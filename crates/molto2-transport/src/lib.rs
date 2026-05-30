@@ -22,6 +22,9 @@ use molto2_proto::commands::{self, derive_sm4_key, sw_auth_failed, sw_ok, Comman
 use molto2_proto::READER_NAME_HINT;
 use pcsc::{Attribute, Card, Context, Protocols, Scope, ShareMode};
 
+mod oath;
+pub use oath::OathSession;
+
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]
 pub enum TransportError {
@@ -47,6 +50,8 @@ pub enum TransportError {
     },
     /// Response payload had unexpected structure.
     MalformedResponse(&'static str),
+    /// An OATH applet response could not be parsed.
+    OathParse(molto2_oath::ParseError),
 }
 
 impl fmt::Display for TransportError {
@@ -88,6 +93,7 @@ impl fmt::Display for TransportError {
                 )
             }
             TransportError::MalformedResponse(s) => write!(f, "malformed response: {}", s),
+            TransportError::OathParse(e) => write!(f, "OATH response parse error: {}", e),
         }
     }
 }
@@ -96,6 +102,7 @@ impl std::error::Error for TransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             TransportError::PcscUnavailable(e) | TransportError::Pcsc(e) => Some(e),
+            TransportError::OathParse(e) => Some(e),
             _ => None,
         }
     }
@@ -462,7 +469,7 @@ fn transmit_apdu(card: &Card, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), Transpor
     Ok((data.to_vec(), sw[0], sw[1]))
 }
 
-fn hex_dump(bytes: &[u8]) -> String {
+pub(crate) fn hex_dump(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 3);
     for (i, b) in bytes.iter().enumerate() {
         if i > 0 {

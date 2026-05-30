@@ -258,6 +258,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: KeyNameCmd,
     },
+    /// Read or manage OATH (TOTP/HOTP) credentials on a security key over PC/SC.
+    Oath {
+        #[command(subcommand)]
+        cmd: OathCmd,
+    },
 }
 
 /// Subcommands for the `key-name` friendly-name registry.
@@ -279,6 +284,74 @@ enum KeyNameCmd {
         /// The friendly label to remove.
         name: String,
     },
+}
+
+/// Subcommands for OATH credentials on a security key (Yubico/Trussed applet).
+#[derive(Subcommand)]
+enum OathCmd {
+    /// List the credentials stored on the key.
+    List {
+        /// Select a reader whose name contains this substring (case-insensitive).
+        /// Omit to use the only OATH key, or to list choices when several exist.
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Print the current TOTP code for a credential.
+    Code {
+        /// Credential name as stored on the key (e.g. "issuer:account").
+        name: String,
+        /// TOTP period in seconds.
+        #[arg(long, default_value_t = 30)]
+        period: u32,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Add (provision) a TOTP credential. The base32 secret is read from stdin
+    /// or an env var — never argv.
+    Add {
+        /// Credential name to store (e.g. "issuer:account").
+        name: String,
+        /// Read the base32 secret from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "secret_stdin")]
+        secret_env: Option<String>,
+        /// Read the base32 secret from stdin (one line).
+        #[arg(long)]
+        secret_stdin: bool,
+        /// HMAC algorithm.
+        #[arg(long, value_enum, default_value_t = OathAlgoArg::Sha1)]
+        algorithm: OathAlgoArg,
+        /// OTP digit count (6, 7, or 8).
+        #[arg(long, default_value_t = 6)]
+        digits: u8,
+        /// Require a touch on the key to compute this credential.
+        #[arg(long)]
+        touch: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Delete a credential by name.
+    Delete {
+        /// Credential name to remove.
+        name: String,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum OathAlgoArg {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+impl OathAlgoArg {
+    fn to_oath(self) -> molto2_oath::Algorithm {
+        match self {
+            OathAlgoArg::Sha1 => molto2_oath::Algorithm::Sha1,
+            OathAlgoArg::Sha256 => molto2_oath::Algorithm::Sha256,
+            OathAlgoArg::Sha512 => molto2_oath::Algorithm::Sha512,
+        }
+    }
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -570,6 +643,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // OATH talks to a security key's CCID applet over PC/SC, not the Molto2.
+    if let Cmd::Oath { cmd } = cmd {
+        run_oath(cmd, cli.debug)?;
+        return Ok(());
+    }
+
     // Factory reset is a plain CLA 0x80 command and needs no auth.
     if let Cmd::FactoryReset { yes } = cmd {
         if !yes {
@@ -801,6 +880,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Probe { .. } => unreachable!("handled above before auth"),
         Cmd::List { .. } => unreachable!("handled above before auth"),
         Cmd::KeyName { .. } => unreachable!("handled above before auth"),
+        Cmd::Oath { .. } => unreachable!("handled above before auth"),
         Cmd::FidoInfo { .. }
         | Cmd::FidoReset { .. }
         | Cmd::FidoPinRetries { .. }
@@ -988,6 +1068,142 @@ fn pick_device_interactively(
         Ok(Some(choice - 1))
     } else {
         Err(format!("selection {} out of range 1-{}", choice, devices.len()).into())
+    }
+}
+
+/// Resolve which PC/SC reader to drive OATH on. Mirrors the FIDO picker posture:
+/// auto-use a lone OATH key, match an explicit `--reader` substring, and refuse
+/// to guess among several. Returns the full reader name.
+fn resolve_oath_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let readers = molto2_transport::OathSession::list_oath_readers()?;
+    if readers.is_empty() {
+        return Err("no OATH-capable security key found (no reader's OATH applet \
+                    responded). Plug a key in, and check pcscd is running."
+            .into());
+    }
+    match explicit {
+        Some(substr) => {
+            let needle = substr.to_ascii_lowercase();
+            let matches: Vec<&String> = readers
+                .iter()
+                .filter(|r| r.to_ascii_lowercase().contains(&needle))
+                .collect();
+            match matches.as_slice() {
+                [one] => Ok((*one).clone()),
+                [] => Err(format!(
+                    "no OATH reader matches '{}'. Connected OATH readers: {}",
+                    substr,
+                    readers.join("; ")
+                )
+                .into()),
+                _ => Err(format!(
+                    "'{}' matches several readers; be more specific: {}",
+                    substr,
+                    matches.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")
+                )
+                .into()),
+            }
+        }
+        None => match readers.as_slice() {
+            [one] => Ok(one.clone()),
+            _ => Err(format!(
+                "{} OATH keys connected; pass --reader <substring>: {}",
+                readers.len(),
+                readers.join("; ")
+            )
+            .into()),
+        },
+    }
+}
+
+/// Open an announced OATH session on the resolved reader.
+fn open_oath(
+    reader: Option<&str>,
+    debug: bool,
+) -> Result<molto2_transport::OathSession, Box<dyn std::error::Error>> {
+    let name = resolve_oath_reader(reader)?;
+    eprintln!("\u{2192} OATH on {}", name);
+    let mut session = molto2_transport::OathSession::open(&name)?;
+    session.set_debug(debug);
+    Ok(session)
+}
+
+fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        OathCmd::List { reader } => {
+            let mut session = open_oath(reader.as_deref(), debug)?;
+            let creds = session.list()?;
+            if creds.is_empty() {
+                println!("(no OATH credentials)");
+            } else {
+                for c in creds {
+                    println!(
+                        "{}  [{}/{}]",
+                        c.name,
+                        oath_type_str(c.oath_type),
+                        oath_algo_str(c.algorithm)
+                    );
+                }
+            }
+        }
+        OathCmd::Code { name, period, reader } => {
+            let mut session = open_oath(reader.as_deref(), debug)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            let code = session.calculate_totp(name, now, *period)?;
+            println!("{}", code.code);
+        }
+        OathCmd::Add {
+            name,
+            secret_env,
+            secret_stdin,
+            algorithm,
+            digits,
+            touch,
+            reader,
+        } => {
+            if !(6..=8).contains(digits) {
+                return Err("--digits must be 6, 7, or 8".into());
+            }
+            let secret_b32 = read_secret("secret", secret_env.as_deref(), *secret_stdin)?;
+            let secret = base32_decode(secret_b32.trim())
+                .map_err(|e| format!("invalid base32 secret: {}", e))?;
+            let mut session = open_oath(reader.as_deref(), debug)?;
+            let params = molto2_oath::PutParams {
+                name,
+                secret: &secret,
+                oath_type: molto2_oath::OathType::Totp,
+                algorithm: algorithm.to_oath(),
+                digits: *digits,
+                require_touch: *touch,
+                imf: 0,
+            };
+            session.put(&params)?;
+            println!("Added OATH credential {:?}.", name);
+        }
+        OathCmd::Delete { name, reader } => {
+            let mut session = open_oath(reader.as_deref(), debug)?;
+            session.delete(name)?;
+            println!("Deleted OATH credential {:?}.", name);
+        }
+    }
+    Ok(())
+}
+
+fn oath_type_str(t: molto2_oath::OathType) -> &'static str {
+    match t {
+        molto2_oath::OathType::Totp => "TOTP",
+        molto2_oath::OathType::Hotp => "HOTP",
+    }
+}
+
+fn oath_algo_str(a: molto2_oath::Algorithm) -> &'static str {
+    match a {
+        molto2_oath::Algorithm::Sha1 => "SHA1",
+        molto2_oath::Algorithm::Sha256 => "SHA256",
+        molto2_oath::Algorithm::Sha512 => "SHA512",
     }
 }
 
