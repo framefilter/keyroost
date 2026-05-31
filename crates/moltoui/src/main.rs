@@ -126,7 +126,7 @@ struct OathAddDialog {
 }
 
 /// State for the OpenPGP pane. Like OATH, the applet is driven over PC/SC, so a
-/// reader name identifies the card. Read-only status for now.
+/// reader name identifies the card.
 #[derive(Default)]
 struct OpenPgpState {
     /// Names of connected readers whose OpenPGP applet responds.
@@ -137,8 +137,48 @@ struct OpenPgpState {
     status: Option<molto2_transport::OpenPgpStatus>,
     /// User-facing error from the last operation.
     error: Option<String>,
+    /// Success/info line from the last write operation.
+    notice: Option<String>,
     /// True once a status has been fetched for the current selection.
     loaded: bool,
+    /// Admin PIN (PW3) entry, used for every write op. Cleared after use.
+    admin_pin: String,
+    /// Cardholder-name entry.
+    name_input: String,
+    /// Public-key-URL entry.
+    url_input: String,
+    /// Slot selected in the generate-key control.
+    gen_slot: OpenPgpSlotSel,
+    /// Generate-key confirmation modal state.
+    confirm_generate: bool,
+    /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
+    confirm_reset: Option<String>,
+}
+
+/// Which key slot a GUI generate targets. Mirrors the CLI's slot choice.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum OpenPgpSlotSel {
+    #[default]
+    Sign,
+    Decrypt,
+    Auth,
+}
+
+impl OpenPgpSlotSel {
+    fn to_crt(self) -> molto2_transport::KeyCrt {
+        match self {
+            OpenPgpSlotSel::Sign => molto2_transport::KeyCrt::Sign,
+            OpenPgpSlotSel::Decrypt => molto2_transport::KeyCrt::Decrypt,
+            OpenPgpSlotSel::Auth => molto2_transport::KeyCrt::Auth,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            OpenPgpSlotSel::Sign => "signature",
+            OpenPgpSlotSel::Decrypt => "decryption",
+            OpenPgpSlotSel::Auth => "authentication",
+        }
+    }
 }
 
 /// A unit of work applied back to the [`App`] on the UI thread once a background
@@ -2050,6 +2090,126 @@ impl App {
         });
     }
 
+    /// Off-thread helper: open the card and verify the admin PIN (PW3). Shared by
+    /// every write op so they all gate on PW3.
+    fn openpgp_open_admin(
+        name: &str,
+        admin_pin: &str,
+    ) -> Result<molto2_transport::OpenPgpSession, TransportError> {
+        let mut session = molto2_transport::OpenPgpSession::open(name)?;
+        session.verify_admin_pin(admin_pin.as_bytes())?;
+        Ok(session)
+    }
+
+    /// Re-read status after a write and store it, surfacing `notice` on success.
+    fn apply_openpgp_write(
+        app: &mut App,
+        result: Result<molto2_transport::OpenPgpStatus, TransportError>,
+        notice: String,
+    ) {
+        match result {
+            Ok(status) => {
+                app.openpgp.status = Some(status);
+                app.openpgp.loaded = true;
+                app.openpgp.error = None;
+                app.openpgp.notice = Some(notice);
+                app.openpgp.admin_pin.clear();
+            }
+            Err(e) => {
+                app.openpgp.error = Some(e.to_string());
+                app.openpgp.admin_pin.clear();
+            }
+        }
+    }
+
+    /// Set the cardholder name (PW3-gated), then refresh status.
+    fn set_openpgp_name(&mut self) {
+        let Some(name) = self.selected_openpgp_reader() else { return };
+        let pin = self.openpgp.admin_pin.clone();
+        let value = self.openpgp.name_input.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Setting cardholder name…", move || {
+            let result = (|| -> Result<molto2_transport::OpenPgpStatus, TransportError> {
+                let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                s.set_cardholder_name(value.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                Self::apply_openpgp_write(app, result, "Cardholder name set.".into())
+            })
+        });
+    }
+
+    /// Set the public-key URL (PW3-gated), then refresh status.
+    fn set_openpgp_url(&mut self) {
+        let Some(name) = self.selected_openpgp_reader() else { return };
+        let pin = self.openpgp.admin_pin.clone();
+        let value = self.openpgp.url_input.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Setting public-key URL…", move || {
+            let result = (|| -> Result<molto2_transport::OpenPgpStatus, TransportError> {
+                let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                s.set_url(value.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                Self::apply_openpgp_write(app, result, "Public-key URL set.".into())
+            })
+        });
+    }
+
+    /// Generate + register a key in the selected slot (PW3-gated, destructive),
+    /// then refresh status. May require a touch on the key.
+    fn generate_openpgp_key(&mut self) {
+        let Some(name) = self.selected_openpgp_reader() else { return };
+        let pin = self.openpgp.admin_pin.clone();
+        let slot = self.openpgp.gen_slot;
+        let creation_time = unix_now();
+        self.openpgp.notice = None;
+        self.spawn_job("Generating key… (touch the key if it blinks)", move || {
+            let result = (|| -> Result<(molto2_transport::OpenPgpStatus, [u8; 20]), TransportError> {
+                let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                let _ = s.generate_key(slot.to_crt())?;
+                let fpr = s.register_key(slot.to_crt(), creation_time)?;
+                Ok((s.status()?, fpr))
+            })();
+            Box::new(move |app: &mut App| match result {
+                Ok((status, fpr)) => {
+                    app.openpgp.status = Some(status);
+                    app.openpgp.loaded = true;
+                    app.openpgp.error = None;
+                    app.openpgp.notice = Some(format!("Generated {} key: {}", slot.label(), hex_lower(&fpr)));
+                    app.openpgp.admin_pin.clear();
+                }
+                Err(e) => {
+                    app.openpgp.error = Some(e.to_string());
+                    app.openpgp.admin_pin.clear();
+                }
+            })
+        });
+    }
+
+    /// Factory-reset the OpenPGP applet (destructive), then refresh status. No
+    /// PIN needed — reset blocks the PINs itself.
+    fn reset_openpgp(&mut self) {
+        let Some(name) = self.selected_openpgp_reader() else { return };
+        self.openpgp.notice = None;
+        self.spawn_job("Resetting OpenPGP applet…", move || {
+            let result = (|| -> Result<molto2_transport::OpenPgpStatus, TransportError> {
+                let mut s = molto2_transport::OpenPgpSession::open(&name)?;
+                s.factory_reset()?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                Self::apply_openpgp_write(
+                    app,
+                    result,
+                    "OpenPGP applet reset; keys wiped, PINs back to defaults.".into(),
+                )
+            })
+        });
+    }
+
     fn render_openpgp(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("openpgp-readers")
             .resizable(true)
@@ -2103,6 +2263,11 @@ impl App {
                 ui.add_space(6.0);
             }
 
+            if let Some(notice) = &self.openpgp.notice {
+                ui.colored_label(egui::Color32::from_rgb(120, 200, 130), notice);
+                ui.add_space(6.0);
+            }
+
             ui.horizontal(|ui| {
                 if ui.button("Read status").clicked() {
                     self.load_openpgp_status();
@@ -2120,40 +2285,208 @@ impl App {
                 ui.label("Click \u{201c}Read status\u{201d} to read this card.");
                 return;
             }
-            let Some(status) = &self.openpgp.status else {
-                return;
-            };
 
-            kv(ui, "AID", &hex_lower(&status.aid));
-            if let Some(serial) = status.serial() {
-                kv(ui, "Serial", &format!("{serial} (0x{serial:08X})"));
+            // Status rows, scoped so the immutable borrow of `status` ends before
+            // the mutable write controls below.
+            if let Some(status) = &self.openpgp.status {
+                kv(ui, "AID", &hex_lower(&status.aid));
+                if let Some(serial) = status.serial() {
+                    kv(ui, "Serial", &format!("{serial} (0x{serial:08X})"));
+                }
+                kv(
+                    ui,
+                    "Signature key",
+                    &format!("{}  {}", algo_id_label(status.sig_algo_id), fpr_label(&status.fingerprint_sig)),
+                );
+                kv(
+                    ui,
+                    "Decryption key",
+                    &format!("{}  {}", algo_id_label(status.dec_algo_id), fpr_label(&status.fingerprint_dec)),
+                );
+                kv(
+                    ui,
+                    "Authentication key",
+                    &format!("{}  {}", algo_id_label(status.aut_algo_id), fpr_label(&status.fingerprint_aut)),
+                );
+                kv(
+                    ui,
+                    "PIN retries",
+                    &format!("PW1={} RC={} PW3={}", status.tries_pw1, status.tries_rc, status.tries_pw3),
+                );
+                kv(
+                    ui,
+                    "Signatures made",
+                    &status.signature_count.map_or("(unavailable)".to_string(), |n| n.to_string()),
+                );
             }
-            kv(
-                ui,
-                "Signature key",
-                &format!("{}  {}", algo_id_label(status.sig_algo_id), fpr_label(&status.fingerprint_sig)),
-            );
-            kv(
-                ui,
-                "Decryption key",
-                &format!("{}  {}", algo_id_label(status.dec_algo_id), fpr_label(&status.fingerprint_dec)),
-            );
-            kv(
-                ui,
-                "Authentication key",
-                &format!("{}  {}", algo_id_label(status.aut_algo_id), fpr_label(&status.fingerprint_aut)),
-            );
-            kv(
-                ui,
-                "PIN retries",
-                &format!("PW1={} RC={} PW3={}", status.tries_pw1, status.tries_rc, status.tries_pw3),
-            );
-            kv(
-                ui,
-                "Signatures made",
-                &status.signature_count.map_or("(unavailable)".to_string(), |n| n.to_string()),
-            );
+
+            ui.add_space(8.0);
+            self.render_openpgp_manage(ui);
         });
+
+        self.render_openpgp_confirms(ctx);
+    }
+
+    /// Write-operations section: cardholder name / URL, generate key, reset.
+    /// All write ops use the admin PIN (PW3) entered here; reset is the exception
+    /// (it blocks the PINs itself). Destructive ops route through confirm modals.
+    fn render_openpgp_manage(&mut self, ui: &mut egui::Ui) {
+        ui.collapsing("Manage (write operations)", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Admin PIN (PW3):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.openpgp.admin_pin)
+                        .password(true)
+                        .desired_width(160.0),
+                );
+                helper_bubble(
+                    ui,
+                    "The admin PIN authorizes write operations. It is sent to the \
+                     card for this operation only and never written to disk.",
+                );
+            });
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.openpgp.name_input)
+                        .hint_text("Surname<<Given")
+                        .desired_width(200.0),
+                );
+                if ui.button("Set name").clicked() {
+                    self.set_openpgp_name();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.openpgp.url_input)
+                        .hint_text("https://…")
+                        .desired_width(200.0),
+                );
+                if ui.button("Set URL").clicked() {
+                    self.set_openpgp_url();
+                }
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Generate RSA key in slot:");
+                egui::ComboBox::from_id_salt("openpgp-gen-slot")
+                    .selected_text(self.openpgp.gen_slot.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.openpgp.gen_slot, OpenPgpSlotSel::Sign, "signature");
+                        ui.selectable_value(&mut self.openpgp.gen_slot, OpenPgpSlotSel::Decrypt, "decryption");
+                        ui.selectable_value(&mut self.openpgp.gen_slot, OpenPgpSlotSel::Auth, "authentication");
+                    });
+                if ui.button("Generate\u{2026}").clicked() {
+                    self.openpgp.confirm_generate = true;
+                }
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                let reset = egui::Button::new(
+                    egui::RichText::new("Reset applet\u{2026}").color(egui::Color32::from_rgb(220, 110, 110)),
+                );
+                if ui.add(reset).clicked() {
+                    self.openpgp.confirm_reset = Some(String::new());
+                }
+                helper_bubble(
+                    ui,
+                    "Wipes ALL OpenPGP keys and restores default PINs. Works even \
+                     if the PINs are forgotten (it blocks them first).",
+                );
+            });
+        });
+    }
+
+    /// The generate-key and reset confirmation modals for the OpenPGP pane.
+    fn render_openpgp_confirms(&mut self, ctx: &egui::Context) {
+        if self.openpgp.confirm_generate {
+            let slot = self.openpgp.gen_slot.label();
+            let mut do_it = false;
+            let mut cancel = false;
+            let mut window_open = true;
+            egui::Window::new("Generate key?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut window_open)
+                .show(ctx, |ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 180, 80),
+                        format!("Generate a fresh RSA key in the {slot} slot?"),
+                    );
+                    ui.label("This OVERWRITES any existing key in that slot (a slot");
+                    ui.label("can only be cleared by a full applet reset). May need a touch.");
+                    if self.openpgp.admin_pin.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 110, 110),
+                            "Enter the admin PIN (PW3) above first.",
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let armed = !self.openpgp.admin_pin.is_empty();
+                        if ui.add_enabled(armed, egui::Button::new("Generate")).clicked() {
+                            do_it = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if do_it {
+                self.openpgp.confirm_generate = false;
+                self.generate_openpgp_key();
+            } else if cancel || !window_open {
+                self.openpgp.confirm_generate = false;
+            }
+        }
+
+        if let Some(typed) = self.openpgp.confirm_reset.clone() {
+            let mut do_it = false;
+            let mut cancel = false;
+            let mut window_open = true;
+            let mut buf = typed;
+            egui::Window::new("Reset OpenPGP applet?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut window_open)
+                .show(ctx, |ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 110, 110),
+                        "This wipes ALL OpenPGP keys and resets the PINs to defaults.",
+                    );
+                    ui.label("This cannot be undone.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Type \u{201c}reset\u{201d} to confirm:");
+                        ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let armed = buf.trim() == "reset";
+                        if ui.add_enabled(armed, egui::Button::new("Reset")).clicked() {
+                            do_it = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if do_it {
+                self.openpgp.confirm_reset = None;
+                self.reset_openpgp();
+            } else if cancel || !window_open {
+                self.openpgp.confirm_reset = None;
+            } else {
+                self.openpgp.confirm_reset = Some(buf);
+            }
+        }
     }
 }
 

@@ -27,6 +27,9 @@ pub use oath::OathSession;
 
 mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
+/// Re-exported so front-ends can name a key slot without depending on
+/// `molto2-openpgp` directly (which would duplicate the crate in their graph).
+pub use molto2_openpgp::KeyCrt;
 
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]

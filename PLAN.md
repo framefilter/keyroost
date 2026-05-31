@@ -130,8 +130,18 @@ for the smartcard applets.
   to pristine afterwards. Two gotchas, both resolved: (1) needs `scdaemon`
   installed; (2) gpg's scdaemon must be told to share the reader via pcscd — a
   `scdaemon.conf` with `pcsc-shared` + `disable-ccid` (without it, scdaemon can't
-  open the reader: "No such device"). Still TODO: a GUI for the write operations
-  (pane is read-only status for now); on-card key *import* (vs generate).
+  open the reader: "No such device").
+  **Write GUI DONE (2026-05-30):** the `moltoui` OpenPGP pane gained a "Manage
+  (write operations)" section — admin-PIN (PW3) entry, set cardholder name / URL,
+  generate RSA key (slot picker, behind a confirm modal since it overwrites), and
+  reset applet (typed-`reset` confirm modal). All write ops run on the worker
+  thread (so the touch window doesn't freeze the UI) and refresh status on
+  success. To avoid duplicating `molto2-openpgp` in moltoui's dependency graph,
+  transport re-exports `KeyCrt` and adds `verify_admin_pin`, so moltoui depends
+  only on `molto2-transport` (not `molto2-openpgp` directly). The write data paths
+  are the same ones hardware-verified via the CLI; the pane renders without
+  panicking against a live YubiKey (headless), though button clicks aren't
+  exercisable headlessly. Still TODO: on-card key *import* (vs generate).
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement

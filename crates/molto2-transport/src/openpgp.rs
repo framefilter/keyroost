@@ -144,6 +144,12 @@ impl OpenPgpSession {
     /// [`molto2_openpgp::PW3_ADMIN`]). A wrong PIN is reported as
     /// [`TransportError::OpenPgpPinRejected`] carrying the remaining-tries count.
     /// The PIN bytes come from the caller and are never logged or stored.
+    /// Convenience: verify the admin PIN (PW3). Lets front-ends gate write
+    /// operations without naming the `molto2-openpgp` PW reference constants.
+    pub fn verify_admin_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
+        self.verify_pin(pgp::PW3_ADMIN, pin)
+    }
+
     pub fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
         let (_, sw) = self.transmit_full(&pgp::verify(pw_ref, pin))?;
         if sw == pgp::SW_OK {
