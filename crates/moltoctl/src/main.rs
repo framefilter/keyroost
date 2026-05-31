@@ -315,9 +315,37 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
+    /// Set the cardholder name (PUT DATA 005B). Requires the admin PIN (PW3).
+    SetName {
+        /// Cardholder name to write (UTF-8). The OpenPGP convention is
+        /// `Surname<<Given`, but it is stored verbatim.
+        name: String,
+        /// Read the admin PIN (PW3) from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
+        admin_pin_env: Option<String>,
+        /// Read the admin PIN (PW3) from stdin (one line).
+        #[arg(long)]
+        admin_pin_stdin: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Set the public-key URL (PUT DATA 5F50). Requires the admin PIN (PW3).
+    SetUrl {
+        /// URL to write.
+        url: String,
+        /// Read the admin PIN (PW3) from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
+        admin_pin_env: Option<String>,
+        /// Read the admin PIN (PW3) from stdin (one line).
+        #[arg(long)]
+        admin_pin_stdin: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
     /// Generate a fresh key pair in a slot. DESTRUCTIVE — overwrites any existing
     /// key in that slot. Requires the admin PIN (PW3) and `--yes`; on a YubiKey a
-    /// touch is also required.
+    /// touch is also required. Also writes the key's v4 fingerprint and a
+    /// generation timestamp so an OpenPGP tool (e.g. gpg) recognizes the key.
     GenerateKey {
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
         #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
@@ -1564,10 +1592,46 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             println!("Generated {} key (RSA):", slot.label());
             println!("  modulus:  {}", hex_encode(&key.modulus));
             println!("  exponent: {}", hex_encode(&key.exponent));
-            eprintln!(
-                "Note: the card stores the private key; set the key's fingerprint/timestamp \
-                 with an OpenPGP tool (e.g. gpg) to make it usable for real signing."
-            );
+            // Register the key (fingerprint + creation timestamp) so gpg and
+            // other OpenPGP tools recognize it. Use the host's current time as
+            // the key's creation time; the card stores both, so read-back is
+            // self-consistent.
+            let creation_time = unix_now();
+            let fpr = session.register_key(slot.to_crt(), creation_time)?;
+            println!("  fingerprint: {}", hex_encode(&fpr));
+            println!("  created:     {} (unix)", creation_time);
+        }
+        OpenpgpCmd::SetName {
+            name: cardholder,
+            admin_pin_env,
+            admin_pin_stdin,
+            reader,
+        } => {
+            let admin_pin = read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            session.verify_pin(molto2_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
+            session.set_cardholder_name(cardholder.as_bytes())?;
+            println!("Cardholder name set.");
+        }
+        OpenpgpCmd::SetUrl {
+            url,
+            admin_pin_env,
+            admin_pin_stdin,
+            reader,
+        } => {
+            let admin_pin = read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            session.verify_pin(molto2_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
+            session.set_url(url.as_bytes())?;
+            println!("Public-key URL set.");
         }
     }
     Ok(())

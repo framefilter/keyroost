@@ -113,9 +113,25 @@ for the smartcard applets.
   the test YubiKey, leaving the card pristine: reset → verify default admin PW3 →
   `generate-key` (RSA-2048, e=65537) → `public-key` read-back (modulus + exponent
   from the `7F49` long-form TLV) → `reset` → both slots empty (`6581`), PINs back
-  to 3/0/3. Still TODO: PUT DATA (cardholder name/URL/fingerprint-timestamp so a
-  generated key is gpg-usable) and a GUI for the write operations (the pane is
-  read-only status for now).
+  to 3/0/3.
+  **PUT DATA + gpg interop DONE (2026-05-30):** the byte layer gained `put_data`
+  and the cardholder-name/URL/fingerprint/generation-time builders, plus the
+  OpenPGP v4 key-fingerprint computation (`rsa_v4_fingerprint`, RFC 4880 §12.2 —
+  SHA-1 over `0x99||len||0x04||time||0x01||MPI(n)||MPI(e)`, locked to an
+  independent KAT). `OpenPgpSession` adds `set_cardholder_name`, `set_url`, and
+  `register_key` (reads the slot's pubkey, writes its computed fingerprint +
+  creation timestamp). `moltoctl openpgp generate-key` now auto-registers the key,
+  and `set-name`/`set-url` were added. The fingerprint computation is locked to an
+  independent Python KAT. **Verified end-to-end with GnuPG (2026-05-30):** on the
+  test YubiKey, `generate-key --slot sign` (auto-registers) wrote fingerprint
+  `01ADBF41…C6D52D28`, and `gpg --card-status` *independently* reported the
+  byte-identical Signature key fingerprint + matching serial (37806840) and
+  creation timestamp — a third-party tool recognizes the generated key. Card reset
+  to pristine afterwards. Two gotchas, both resolved: (1) needs `scdaemon`
+  installed; (2) gpg's scdaemon must be told to share the reader via pcscd — a
+  `scdaemon.conf` with `pcsc-shared` + `disable-ccid` (without it, scdaemon can't
+  open the reader: "No such device"). Still TODO: a GUI for the write operations
+  (pane is read-only status for now); on-card key *import* (vs generate).
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement

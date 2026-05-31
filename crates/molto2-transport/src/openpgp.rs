@@ -210,6 +210,44 @@ impl OpenPgpSession {
         Ok(sig)
     }
 
+    /// Write the cardholder name (`PUT DATA 005B`). Requires admin PIN (PW3)
+    /// verified first. The name is the caller's UTF-8 bytes (the OpenPGP
+    /// convention is `Surname<<Given`, but the card stores it verbatim).
+    pub fn set_cardholder_name(&mut self, name: &[u8]) -> Result<(), TransportError> {
+        let (_, sw) = self.transmit_full(&pgp::put_cardholder_name(name))?;
+        ok_or_apdu("openpgp put cardholder name", sw)
+    }
+
+    /// Write the public-key URL (`PUT DATA 5F50`). Requires admin PIN (PW3).
+    pub fn set_url(&mut self, url: &[u8]) -> Result<(), TransportError> {
+        let (_, sw) = self.transmit_full(&pgp::put_url(url))?;
+        ok_or_apdu("openpgp put url", sw)
+    }
+
+    /// Register the key in `crt`'s slot so an OpenPGP tool (e.g. gpg) recognizes
+    /// it: writes the key's v4 fingerprint and a generation timestamp via
+    /// PUT DATA. Reads the slot's public key to compute the fingerprint over the
+    /// given `creation_time` (which must match what's stored, or gpg will compute
+    /// a different fingerprint). Requires admin PIN (PW3) verified first. Returns
+    /// the fingerprint written.
+    ///
+    /// Note: on-card generation already sets these on a YubiKey, but writing them
+    /// explicitly makes the registration deterministic and works for imported
+    /// keys / cards that don't auto-populate them.
+    pub fn register_key(
+        &mut self,
+        crt: pgp::KeyCrt,
+        creation_time: u32,
+    ) -> Result<[u8; 20], TransportError> {
+        let key = self.read_public_key(crt)?;
+        let fpr = pgp::rsa_v4_fingerprint_from(&key, creation_time);
+        let (_, sw) = self.transmit_full(&pgp::put_generation_time(crt, creation_time))?;
+        ok_or_apdu("openpgp put generation time", sw)?;
+        let (_, sw) = self.transmit_full(&pgp::put_fingerprint(crt, &fpr))?;
+        ok_or_apdu("openpgp put fingerprint", sw)?;
+        Ok(fpr)
+    }
+
     /// Factory-reset the OpenPGP applet: wipe ALL key slots, fingerprints, and
     /// metadata and restore the default PINs (PW1 `123456`, PW3 `12345678`).
     /// **Destructive and irreversible.**
