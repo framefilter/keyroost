@@ -362,6 +362,30 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
+    /// Import an RSA key into a slot. DESTRUCTIVE — overwrites any existing key.
+    /// With `--generate`, a fresh RSA-2048 key is generated on the host and
+    /// imported (the only source supported for now). Requires admin PIN (PW3) and
+    /// `--yes`. The key is registered (fingerprint + timestamp) like generate-key.
+    ImportKey {
+        /// Generate a fresh RSA-2048 key on the host and import it. (Required for
+        /// now; file import is a planned follow-up.)
+        #[arg(long)]
+        generate: bool,
+        /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
+        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        slot: OpenpgpSlot,
+        /// Confirm you really want to overwrite the slot.
+        #[arg(long)]
+        yes: bool,
+        /// Read the admin PIN (PW3) from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
+        admin_pin_env: Option<String>,
+        /// Read the admin PIN (PW3) from stdin (one line).
+        #[arg(long)]
+        admin_pin_stdin: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
     /// Sign a file with the on-card signature key (PSO:CDS). Hashes the input
     /// (SHA-1), wraps it in a PKCS#1 DigestInfo, and has the card produce an RSA
     /// signature. Requires the signing PIN (PW1) and, on a YubiKey, a touch.
@@ -1621,6 +1645,61 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             println!("  fingerprint: {}", hex_encode(&fpr));
             println!("  created:     {} (unix)", creation_time);
         }
+        OpenpgpCmd::ImportKey {
+            generate,
+            slot,
+            yes,
+            admin_pin_env,
+            admin_pin_stdin,
+            reader,
+        } => {
+            if !generate {
+                return Err("only --generate is supported for now (host-generated RSA \
+                            key); file import is a planned follow-up"
+                    .into());
+            }
+            if !yes {
+                return Err(format!(
+                    "refusing to import without --yes (this OVERWRITES the {} key slot)",
+                    slot.label()
+                )
+                .into());
+            }
+            let admin_pin =
+                read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+
+            // Host-side RSA-2048 keygen via the `rsa` crate (the scoped dep
+            // exception; see Cargo.toml). The full CRT component set is
+            // extracted big-endian — the card decides which parts it wants.
+            println!("Generating an RSA-2048 key on the host…");
+            let k = generate_rsa_2048()?;
+
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            session.verify_pin(molto2_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
+            println!("Importing {} key…", slot.label());
+            let parts = molto2_transport::RsaPrivateKeyParts {
+                e: &k.e,
+                p: &k.p,
+                q: &k.q,
+                u: &k.u,
+                dp: &k.dp,
+                dq: &k.dq,
+                n: &k.n,
+            };
+            session.import_key(slot.to_crt(), &parts)?;
+            // Register so gpg recognizes it; fingerprint is over (n, e) + time.
+            let creation_time = unix_now();
+            let fpr = session.register_key(slot.to_crt(), creation_time)?;
+            println!("Imported {} key (RSA-2048):", slot.label());
+            println!("  modulus:  {}", hex_encode(&k.n));
+            println!("  exponent: {}", hex_encode(&k.e));
+            println!("  fingerprint: {}", hex_encode(&fpr));
+            println!("  created:     {} (unix)", creation_time);
+        }
         OpenpgpCmd::SetName {
             name: cardholder,
             admin_pin_env,
@@ -1701,6 +1780,60 @@ fn sha1_digest_info(data: &[u8]) -> Vec<u8> {
     di.extend_from_slice(&SHA1_PREFIX);
     di.extend_from_slice(&hash);
     di
+}
+
+/// Generate a fresh RSA-2048 key on the host and return `(e, p, q, n)` as
+/// big-endian byte vectors. Uses the `rsa` crate (the scoped dependency
+/// exception for security-critical keygen — see this crate's Cargo.toml).
+/// A host-generated RSA key, with the full CRT component set the OpenPGP card
+/// import needs (the YubiKey rejects the bare `e`/`p`/`q` triple). All fields
+/// are minimal big-endian.
+struct GeneratedRsaKey {
+    e: Vec<u8>,
+    p: Vec<u8>,
+    q: Vec<u8>,
+    /// `u = q⁻¹ mod p`.
+    u: Vec<u8>,
+    /// `dp = d mod (p−1)`.
+    dp: Vec<u8>,
+    /// `dq = d mod (q−1)`.
+    dq: Vec<u8>,
+    n: Vec<u8>,
+}
+
+fn generate_rsa_2048() -> Result<GeneratedRsaKey, Box<dyn std::error::Error>> {
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+    let mut rng = rand::thread_rng();
+    // `new` validates and precomputes the CRT values (dp, dq, qinv).
+    let key = rsa::RsaPrivateKey::new(&mut rng, 2048)
+        .map_err(|e| format!("RSA keygen failed: {e}"))?;
+    let primes = key.primes();
+    if primes.len() != 2 {
+        return Err("expected a 2-prime RSA key".into());
+    }
+    let dp = key
+        .dp()
+        .ok_or("RSA key missing precomputed dp")?
+        .to_bytes_be();
+    let dq = key
+        .dq()
+        .ok_or("RSA key missing precomputed dq")?
+        .to_bytes_be();
+    // qinv = q⁻¹ mod p is positive; take its big-endian magnitude.
+    let u = key
+        .qinv()
+        .ok_or("RSA key missing precomputed qinv")?
+        .to_bytes_be()
+        .1;
+    Ok(GeneratedRsaKey {
+        e: key.e().to_bytes_be(),
+        n: key.n().to_bytes_be(),
+        p: primes[0].to_bytes_be(),
+        q: primes[1].to_bytes_be(),
+        u,
+        dp,
+        dq,
+    })
 }
 
 /// Map an OpenPGP algorithm id (first attribute byte) to a short label.

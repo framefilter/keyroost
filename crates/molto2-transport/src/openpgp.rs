@@ -198,6 +198,43 @@ impl OpenPgpSession {
         pgp::parse_generated_public_key(&data).map_err(TransportError::OpenPgpParse)
     }
 
+    /// Import an existing RSA private key into `crt`'s slot (PUT DATA with the
+    /// `4D` Extended Header List). **Destructive** — overwrites any existing key
+    /// in that slot. Requires the admin PIN (PW3) verified first. The key parts
+    /// (big-endian) come from the caller; this layer transmits them once and
+    /// never stores them.
+    ///
+    /// The card *dictates* the import format and exponent length via its
+    /// algorithm attributes, so this first reads them (a read-only GET DATA)
+    /// and builds the Extended Header List to match — real YubiKeys (5.7)
+    /// declare the CRT format and reject the bare `e`/`p`/`q` triple with
+    /// `SW=6A80`. GnuPG branches on the same attribute byte.
+    pub fn import_key(
+        &mut self,
+        crt: pgp::KeyCrt,
+        key: &pgp::RsaPrivateKeyParts,
+    ) -> Result<(), TransportError> {
+        let attrs = self.rsa_attributes(crt)?;
+        let apdu = pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits);
+        let (_, sw) = self.transmit_full(&apdu)?;
+        ok_or_apdu("openpgp import key", sw)
+    }
+
+    /// Read and parse the RSA algorithm attributes for `crt`'s slot from the
+    /// Application Related Data (`6E`). Errors if the slot isn't RSA.
+    fn rsa_attributes(&mut self, crt: pgp::KeyCrt) -> Result<pgp::RsaAttributes, TransportError> {
+        let (ard_bytes, sw) = self.transmit_full(&pgp::get_application_related_data())?;
+        ok_or_apdu("get application related data", sw)?;
+        let ard =
+            pgp::parse_application_related_data(&ard_bytes).map_err(TransportError::OpenPgpParse)?;
+        let attr = match crt {
+            pgp::KeyCrt::Sign => &ard.algo_attr_sig,
+            pgp::KeyCrt::Decrypt => &ard.algo_attr_dec,
+            pgp::KeyCrt::Auth => &ard.algo_attr_aut,
+        };
+        pgp::parse_rsa_algorithm_attributes(attr).map_err(TransportError::OpenPgpParse)
+    }
+
     /// Read the public key currently in `crt`'s slot. Read-only; no PIN. Returns
     /// an `OpenPgpParse` error if the slot is empty or holds a non-RSA key.
     pub fn read_public_key(&mut self, crt: pgp::KeyCrt) -> Result<pgp::PublicKey, TransportError> {

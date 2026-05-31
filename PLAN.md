@@ -152,7 +152,42 @@ for the smartcard applets.
   digest (`18d11190…`). Card reset to pristine after. SHA-1 is used because it's
   the only in-tree hash; the card signs whatever DigestInfo it's handed, so the
   private-key op is proven regardless (SHA-256 signing would need a vendored
-  SHA-256). Still TODO: on-card key *import* (vs generate); SHA-256 sign.
+  SHA-256).
+  **Key import — root cause found & fixed in code; hardware re-test pending (2026-05-31).**
+  The earlier `SW=6A80` was **not** a CRT-vs-standard issue (an earlier
+  hypothesis). The real bug was the `7F48` Cardholder Private Key Template
+  *length-entry encoding*: we emitted each entry as a TLV whose **value** was the
+  length (`91 01 03`, `92 01 80`), but the template wants the field's byte length
+  to be the tag's **BER length itself, with no value** (`91 03`, `92 81 80`).
+  Confirmed against two independent references: GnuPG `scd/app-openpgp.c`
+  `build_privkey_template` (uses `add_tlv(tp, tag, len)`) and Yubico `ykman`
+  `yubikit/openpgp.py` (`Tlv(0x7F48, join(tlv[:-tlv.length]))`). The card's own
+  `C1` attribute (`01 08 00 00 11 00`) decodes to RSA-2048, **e_bits = 17**,
+  **import format = 0x00 (standard)** — and ykman imports RSA to YubiKey 5 in
+  *standard* form (`use_crt` only for the ancient NEO), so standard is correct
+  here; the fix is purely the length encoding. Implemented:
+  `molto2-openpgp::key_template_entry` now emits `tag || ber_len(field_len)`;
+  `RsaPrivateKeyParts` carries the full CRT set `{e,p,q,u,dp,dq,n}`;
+  `RsaImportFormat` + `parse_rsa_algorithm_attributes` read the card's declared
+  format & e_bits; `extended_header_list`/`import_rsa_key` take `(format, e_bits)`
+  and right-justify `e` to `(e_bits+7)/8`; `OpenPgpSession::import_key` reads the
+  slot's algorithm attributes (read-only GET DATA) and builds the matching
+  template; `moltoctl generate_rsa_2048` computes `u=q⁻¹ mod p`, `dp`, `dq` from
+  the `rsa` crate. Byte-exact KATs rewritten for the corrected encoding (standard
+  *and* CRT forms); all 199+ workspace tests + clippy green. Extended-length
+  transport retained (the card accepted the extended framing before — `6A80` was
+  a pure data error). **Verified end-to-end on the test YubiKey (2026-05-31):**
+  `import-key --generate --slot sign` now sends `00 DB 3F FF 00 01 19 4D 82 01 15
+  B6 00 7F 48 08 91 03 92 81 80 93 81 80 5F 48 82 01 03 …` and the card accepts
+  it with `9000` (was `6A80`); the read-back public key, an independent Python
+  OpenPGP-v4 fingerprint over (n, e, creation_time), and the card-stored `C7`
+  fingerprint all agree (`1FDB1D89…94F3B6AF`); a PSO:CDS signature over a test
+  file verifies with `pow(sig,e,n)` recovering a well-formed EMSA-PKCS1-v1_5/SHA-1
+  block whose digest equals `SHA1(message)`; and `gpg --card-status` independently
+  reports the byte-identical Signature key fingerprint + serial 37806840. Card
+  reset to pristine afterward (all slots empty, PINs 3/0/3). Still TODO:
+  file-based import; SHA-256 sign; a command-chaining fallback if a future card
+  refuses extended-length APDUs.
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement

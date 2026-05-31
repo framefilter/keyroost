@@ -582,6 +582,344 @@ pub fn rsa_v4_fingerprint_from(key: &PublicKey, creation_time: u32) -> [u8; 20] 
 }
 
 // ---------------------------------------------------------------------------
+// Key import (PUT DATA, Extended Header List)
+// ---------------------------------------------------------------------------
+
+/// RSA private key material needed to import a key into a card slot.
+///
+/// All fields are big-endian, unsigned, with leading zero padding already
+/// stripped by the caller. ([`extended_header_list`] also strips a single
+/// defensive leading `0x00` from each field, as DER `INTEGER` encodings of
+/// positive values often carry one.)
+///
+/// The full Chinese-Remainder-Theorem set is carried so the builder can satisfy
+/// whichever import format the card declares (see [`RsaImportFormat`]). Real
+/// YubiKeys (5.7, verified) declare the **CRT** format and reject the bare
+/// `e`/`p`/`q` triple with `SW=6A80` — they want the precomputed `u`, `dp`, `dq`
+/// too. GnuPG's `do_writekey` sends exactly these; this mirrors it. Cards that
+/// declare the *standard* format simply ignore the CRT components (and the
+/// modulus). The mapping to the OpenPGP `7F48` tags is: `91`=e, `92`=p, `93`=q,
+/// `94`=u, `95`=dp, `96`=dq, `97`=n (OpenPGP Card spec v3.4, §4.4.3.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsaPrivateKeyParts<'a> {
+    /// Public exponent `e`, big-endian (commonly `01 00 01`).
+    pub e: &'a [u8],
+    /// Prime `p`, big-endian.
+    pub p: &'a [u8],
+    /// Prime `q`, big-endian.
+    pub q: &'a [u8],
+    /// CRT coefficient `u = q⁻¹ mod p` (OpenPGP tag `94`, "PQ").
+    pub u: &'a [u8],
+    /// `dp = d mod (p−1)` (OpenPGP tag `95`, "DP1").
+    pub dp: &'a [u8],
+    /// `dq = d mod (q−1)` (OpenPGP tag `96`, "DQ1").
+    pub dq: &'a [u8],
+    /// Modulus `n` (OpenPGP tag `97`); emitted only for the `*WithModulus`
+    /// import formats, ignored otherwise.
+    pub n: &'a [u8],
+}
+
+/// The RSA private-key import format a card accepts, taken from byte 5 of its
+/// algorithm-attributes object (`C1`/`C2`/`C3`; OpenPGP Card spec v3.4 §4.4.3.10).
+///
+/// The card *dictates* this — the host must send the matching component set or
+/// the card rejects the import. (GnuPG reads the same byte and branches on it.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsaImportFormat {
+    /// `0x00` — standard: `e`, `p`, `q` only (card recomputes the rest).
+    Standard,
+    /// `0x01` — standard plus the modulus `n`.
+    StandardWithModulus,
+    /// `0x02` — CRT: `e`, `p`, `q`, `u`, `dp`, `dq`.
+    Crt,
+    /// `0x03` — CRT plus the modulus `n`.
+    CrtWithModulus,
+}
+
+impl RsaImportFormat {
+    /// Decode the import-format byte (byte 5 of the RSA algorithm attributes).
+    #[must_use]
+    pub const fn from_attr_byte(b: u8) -> Option<Self> {
+        match b {
+            0x00 => Some(Self::Standard),
+            0x01 => Some(Self::StandardWithModulus),
+            0x02 => Some(Self::Crt),
+            0x03 => Some(Self::CrtWithModulus),
+            _ => None,
+        }
+    }
+
+    /// Whether this format carries the CRT components `u`, `dp`, `dq`.
+    #[must_use]
+    pub const fn includes_crt(self) -> bool {
+        matches!(self, Self::Crt | Self::CrtWithModulus)
+    }
+
+    /// Whether this format carries the modulus `n` (tag `97`).
+    #[must_use]
+    pub const fn includes_modulus(self) -> bool {
+        matches!(self, Self::StandardWithModulus | Self::CrtWithModulus)
+    }
+}
+
+/// RSA key attributes parsed from an algorithm-attributes object (`C1`/`C2`/`C3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsaAttributes {
+    /// Modulus size in bits (e.g. 2048).
+    pub n_bits: u16,
+    /// Public-exponent field size in bits — fixes the byte length the card
+    /// expects for `e` on import (`(e_bits + 7) / 8`, right-justified).
+    pub e_bits: u16,
+    /// The import format the card accepts.
+    pub format: RsaImportFormat,
+}
+
+/// Parse the RSA algorithm attributes (`01 | n_bits | e_bits | [format]`).
+///
+/// The leading byte must be `0x01` (RSA). The format byte is optional: a 5-byte
+/// attribute (no format byte) is treated as [`RsaImportFormat::Standard`], per
+/// the spec and GnuPG. Returns [`ParseError::UnsupportedAlgorithm`] for a
+/// non-RSA object, [`ParseError::UnexpectedLength`] for a short/garbled one.
+pub fn parse_rsa_algorithm_attributes(attr: &[u8]) -> Result<RsaAttributes, ParseError> {
+    if attr.first() != Some(&0x01) {
+        return Err(ParseError::UnsupportedAlgorithm);
+    }
+    if attr.len() < 5 {
+        return Err(ParseError::UnexpectedLength);
+    }
+    let n_bits = u16::from_be_bytes([attr[1], attr[2]]);
+    let e_bits = u16::from_be_bytes([attr[3], attr[4]]);
+    let format = match attr.get(5) {
+        Some(&b) => RsaImportFormat::from_attr_byte(b).ok_or(ParseError::UnexpectedLength)?,
+        None => RsaImportFormat::Standard,
+    };
+    Ok(RsaAttributes {
+        n_bits,
+        e_bits,
+        format,
+    })
+}
+
+/// Encode `n` as a minimal big-endian byte sequence (no leading zeros).
+///
+/// `0` encodes as a single `0x00` byte. Used to build BER length octets.
+fn minimal_be(n: usize) -> Vec<u8> {
+    if n == 0 {
+        return vec![0x00];
+    }
+    let bytes = n.to_be_bytes();
+    let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+    bytes[first..].to_vec()
+}
+
+/// Encode a BER-TLV length field for a value of `len` bytes.
+///
+/// Short form (`< 0x80`) is a single byte. Long form emits `0x81` / `0x82`
+/// (the `0x80` flag OR'd with the count of following octets) followed by the
+/// minimal big-endian length. A realistic 4096-bit RSA `5F48` value (~518
+/// bytes) is the largest object here and still fits in the `0x82` form.
+fn ber_len(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        return vec![len as u8];
+    }
+    let value = minimal_be(len);
+    let mut out = Vec::with_capacity(1 + value.len());
+    out.push(0x80 | value.len() as u8);
+    out.extend_from_slice(&value);
+    out
+}
+
+/// Emit a full BER-TLV element: tag (1 or 2 bytes) + length + value.
+///
+/// A `tag` whose high byte is zero is emitted as a single byte; otherwise the
+/// two bytes are emitted big-endian (e.g. `0x7F48` -> `7F 48`).
+fn ber_tlv(tag: u16, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if tag > 0xFF {
+        out.push((tag >> 8) as u8);
+        out.push((tag & 0xFF) as u8);
+    } else {
+        out.push(tag as u8);
+    }
+    out.extend_from_slice(&ber_len(value.len()));
+    out.extend_from_slice(value);
+    out
+}
+
+/// Encode a single `7F48` Cardholder Private Key Template entry: the `tag` byte
+/// followed by the field's byte length as a **BER length** — *with no value*.
+///
+/// In the `7F48` template each tag's BER *length* directly carries the byte
+/// length of the corresponding field in `5F48`; there is no value payload (it
+/// lives in `5F48`). So a 3-byte exponent under tag `0x91` becomes `91 03`, and
+/// a 128-byte prime under `0x92` becomes `92 81 80` (long-form BER length).
+/// This matches GnuPG's `add_tlv(tp, tag, len)` and ykman's
+/// `Tlv(tag, value)[:-len]`; the earlier `91 01 03` form (a TLV whose value was
+/// the length) was malformed and the card rejected the import with `SW=6A80`.
+fn key_template_entry(tag: u8, field_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 3);
+    out.push(tag);
+    out.extend_from_slice(&ber_len(field_len));
+    out
+}
+
+/// Strip a single leading `0x00` byte if present (defensive; positive DER
+/// `INTEGER`s carry one). Never strips the value down to empty.
+fn strip_leading_zero(field: &[u8]) -> &[u8] {
+    if field.len() > 1 && field[0] == 0x00 {
+        &field[1..]
+    } else {
+        field
+    }
+}
+
+/// Right-justify the public exponent into a fixed `reqlen`-byte field,
+/// zero-padding on the left.
+///
+/// The card declares the exponent size it expects via `e_bits` in its
+/// algorithm attributes; the import must present exactly `(e_bits + 7) / 8`
+/// bytes (GnuPG does the same — see `build_privkey_template`). For the usual
+/// `e = 65537` and a card declaring `e_bits = 32` this turns `01 00 01` into
+/// `00 01 00 01`. If the (minimal) exponent is already at least `reqlen` bytes
+/// its low `reqlen` bytes are used unchanged.
+fn pad_exponent(e: &[u8], reqlen: usize) -> Vec<u8> {
+    let e = strip_leading_zero(e);
+    let mut out = vec![0u8; reqlen];
+    if e.len() >= reqlen {
+        out.copy_from_slice(&e[e.len() - reqlen..]);
+    } else {
+        out[reqlen - e.len()..].copy_from_slice(e);
+    }
+    out
+}
+
+/// Build just the `0x4D` Extended Header List object for an RSA key import
+/// (OpenPGP Card spec v3.4, §4.4.3.12). Returned *without* the APDU wrapper so
+/// it can be unit-tested directly; see [`import_rsa_key`] for the full command.
+///
+/// Layout:
+///
+/// ```text
+/// 4D <len>
+///    <CRT>                          empty control reference template: B6 00 / B8 00 / A4 00
+///    7F48 <len> 91 .. 92 .. 93 ..   Cardholder Private Key Template: lengths of e, p, q
+///    5F48 <len> <e><p><q>           Cardholder Private Key: the field bytes, same order
+/// ```
+///
+/// Unlike GENERATE (which uses the same `B6`/`B8`/`A4` tag bytes), the CRT
+/// here is *empty* (length `0x00`). Which components are emitted depends on
+/// `format`: the standard triple `e`, `p`, `q`, optionally the CRT components
+/// `u`, `dp`, `dq` and/or the modulus `n` (see [`RsaImportFormat`]). `e` is
+/// right-justified to `(e_bits + 7) / 8` bytes (see [`pad_exponent`]); the
+/// other fields keep their minimal big-endian length, and `7F48` declares each
+/// length so the card can split `5F48` correctly.
+#[must_use]
+pub fn extended_header_list(
+    crt: KeyCrt,
+    key: &RsaPrivateKeyParts,
+    format: RsaImportFormat,
+    e_bits: u16,
+) -> Vec<u8> {
+    let e = pad_exponent(key.e, e_bits.div_ceil(8) as usize);
+    let p = strip_leading_zero(key.p);
+    let q = strip_leading_zero(key.q);
+    let u = strip_leading_zero(key.u);
+    let dp = strip_leading_zero(key.dp);
+    let dq = strip_leading_zero(key.dq);
+    let n = strip_leading_zero(key.n);
+
+    // Empty CRT selecting the slot: e.g. B6 00.
+    let crt_body = [crt.tag(), 0x00];
+
+    // Cardholder Private Key Template (7F48): the byte length of each field, in
+    // the spec's tag order — 91 e, 92 p, 93 q, [94 u, 95 dp, 96 dq], [97 n].
+    let mut template = Vec::new();
+    template.extend_from_slice(&key_template_entry(0x91, e.len()));
+    template.extend_from_slice(&key_template_entry(0x92, p.len()));
+    template.extend_from_slice(&key_template_entry(0x93, q.len()));
+    if format.includes_crt() {
+        template.extend_from_slice(&key_template_entry(0x94, u.len()));
+        template.extend_from_slice(&key_template_entry(0x95, dp.len()));
+        template.extend_from_slice(&key_template_entry(0x96, dq.len()));
+    }
+    if format.includes_modulus() {
+        template.extend_from_slice(&key_template_entry(0x97, n.len()));
+    }
+
+    // Cardholder Private Key (5F48): the concatenated field bytes, same order.
+    let mut key_data = Vec::new();
+    key_data.extend_from_slice(&e);
+    key_data.extend_from_slice(p);
+    key_data.extend_from_slice(q);
+    if format.includes_crt() {
+        key_data.extend_from_slice(u);
+        key_data.extend_from_slice(dp);
+        key_data.extend_from_slice(dq);
+    }
+    if format.includes_modulus() {
+        key_data.extend_from_slice(n);
+    }
+
+    // Assemble the 4D value, then wrap the whole thing in the 4D tag/length.
+    let mut body = Vec::new();
+    body.extend_from_slice(&crt_body);
+    body.extend_from_slice(&ber_tlv(0x7F48, &template));
+    body.extend_from_slice(&ber_tlv(0x5F48, &key_data));
+
+    ber_tlv(0x4D, &body)
+}
+
+/// Build an *extended-length* command APDU: `CLA INS P1 P2 00 Lc-hi Lc-lo DATA`.
+///
+/// The standard short-form [`build_apdu`] caps `Lc` at one byte (255 bytes of
+/// data). A 2048-bit RSA import exceeds that, so we emit the 3-byte extended
+/// `Lc` (a `0x00` marker plus the 2-byte big-endian length) and no `Le`.
+///
+/// The alternative is ISO command chaining (`CLA` bit `0x10`), which YubiKeys
+/// also support; extended length is simpler and YubiKeys advertise the
+/// capability in their historical bytes, so we use it here.
+///
+/// # Panics
+/// Panics if `data.len()` exceeds `0xFFFF` (no OpenPGP import object is that
+/// large).
+fn build_apdu_extended(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Vec<u8> {
+    assert!(data.len() <= 0xFFFF, "APDU data too long for extended Lc");
+    let lc = data.len() as u16;
+    let mut out = Vec::with_capacity(7 + data.len());
+    out.extend_from_slice(&[cla, ins, p1, p2, 0x00, (lc >> 8) as u8, (lc & 0xFF) as u8]);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Build the full PUT DATA APDU that imports an RSA private key into `crt`'s
+/// slot: `00 DB 3F FF <extended Lc> <4D extended header list>` (odd PUT DATA;
+/// see [`INS_PUT_DATA_ODD`]).
+///
+/// P1-P2 = `0x3FFF` selects the Extended Header List data object (OpenPGP Card
+/// spec v3.4, §4.4.3.12). The body is always emitted as an extended-length
+/// APDU (see [`build_apdu_extended`]) — even small synthetic keys use the
+/// extended framing, matching the realistic 2048/4096-bit case.
+///
+/// The caller must have a verified PW3 (admin) session for the card to accept
+/// the import; this layer only frames the bytes.
+/// ISO 7816 "odd" PUT DATA instruction (`0xDB`). Key import addresses the
+/// Extended Header List DO (`3FFF`) via this *odd* instruction, not the normal
+/// PUT DATA (`0xDA`) — GnuPG's `do_writekey` uses `iso7816_put_data_odd` for the
+/// same reason. Using `0xDA` here makes the card reject with `SW=6B00`.
+pub const INS_PUT_DATA_ODD: u8 = 0xDB;
+
+#[must_use]
+pub fn import_rsa_key(
+    crt: KeyCrt,
+    key: &RsaPrivateKeyParts,
+    format: RsaImportFormat,
+    e_bits: u16,
+) -> Vec<u8> {
+    let header_list = extended_header_list(crt, key, format, e_bits);
+    build_apdu_extended(0x00, INS_PUT_DATA_ODD, 0x3F, 0xFF, &header_list)
+}
+
+// ---------------------------------------------------------------------------
 // BER-TLV parsing
 // ---------------------------------------------------------------------------
 
@@ -599,6 +937,9 @@ pub enum ParseError {
     UnexpectedLength,
     /// A required tag was absent from the response.
     MissingTag(u16),
+    /// An algorithm-attributes object named an algorithm we don't handle here
+    /// (e.g. a non-RSA key where RSA was required for import).
+    UnsupportedAlgorithm,
 }
 
 impl core::fmt::Display for ParseError {
@@ -608,6 +949,7 @@ impl core::fmt::Display for ParseError {
             ParseError::BadTag => write!(f, "malformed BER-TLV tag"),
             ParseError::UnexpectedLength => write!(f, "malformed or unsupported BER-TLV length"),
             ParseError::MissingTag(t) => write!(f, "expected TLV tag {t:#06x} not present"),
+            ParseError::UnsupportedAlgorithm => write!(f, "unsupported key algorithm"),
         }
     }
 }
@@ -1520,5 +1862,253 @@ mod tests {
             exponent: exponent.to_vec(),
         };
         assert_eq!(rsa_v4_fingerprint_from(&key, 0x5D2C_0B00), fpr);
+    }
+
+    // --- Key import: BER helpers -----------------------------------------
+
+    #[test]
+    fn minimal_be_strips_leading_zeros() {
+        assert_eq!(minimal_be(0), vec![0x00]);
+        assert_eq!(minimal_be(3), vec![0x03]);
+        assert_eq!(minimal_be(0x80), vec![0x80]);
+        assert_eq!(minimal_be(128), vec![0x80]);
+        assert_eq!(minimal_be(256), vec![0x01, 0x00]);
+        assert_eq!(minimal_be(259), vec![0x01, 0x03]);
+    }
+
+    #[test]
+    fn ber_len_short_and_long_form() {
+        assert_eq!(ber_len(0x00), vec![0x00]);
+        assert_eq!(ber_len(0x7F), vec![0x7F]);
+        // 0x80 crosses into long form: 0x81 + one length octet.
+        assert_eq!(ber_len(0x80), vec![0x81, 0x80]);
+        assert_eq!(ber_len(0xFF), vec![0x81, 0xFF]);
+        // Two-octet lengths use 0x82.
+        assert_eq!(ber_len(0x0100), vec![0x82, 0x01, 0x00]);
+        assert_eq!(ber_len(259), vec![0x82, 0x01, 0x03]);
+    }
+
+    #[test]
+    fn key_template_entry_minimal_lengths() {
+        // The field length is the tag's BER length, no value: e(3) -> 91 03;
+        // a 128-byte prime -> 92 81 80 (long-form BER length for 0x80).
+        assert_eq!(key_template_entry(0x91, 3), vec![0x91, 0x03]);
+        assert_eq!(key_template_entry(0x92, 128), vec![0x92, 0x81, 0x80]);
+        // A 256-byte field: 93 82 01 00.
+        assert_eq!(key_template_entry(0x93, 256), vec![0x93, 0x82, 0x01, 0x00]);
+    }
+
+    // --- Key import: extended header list (exact bytes) ------------------
+
+    // A synthetic CRT key used across the import KATs. All six components are
+    // tiny so the expected bytes can be written out by hand.
+    fn synthetic_crt_key() -> RsaPrivateKeyParts<'static> {
+        RsaPrivateKeyParts {
+            e: &[0x01, 0x00, 0x01], // 3
+            p: &[0xAA, 0xBB],       // 2
+            q: &[0xCC, 0xDD],       // 2
+            u: &[0x11, 0x22],       // 2
+            dp: &[0x33],            // 1
+            dq: &[0x44, 0x55],      // 2
+            n: &[0x99, 0x88, 0x77], // 3 (only emitted for *WithModulus)
+        }
+    }
+
+    #[test]
+    fn rsa_algorithm_attributes_parse() {
+        // 01 | n=0800 (2048) | e=0020 (32) | format=02 (CRT).
+        let attr = [0x01, 0x08, 0x00, 0x00, 0x20, 0x02];
+        let got = parse_rsa_algorithm_attributes(&attr).unwrap();
+        assert_eq!(got.n_bits, 2048);
+        assert_eq!(got.e_bits, 32);
+        assert_eq!(got.format, RsaImportFormat::Crt);
+
+        // A 5-byte attribute (no format byte) defaults to Standard.
+        let short = [0x01, 0x08, 0x00, 0x00, 0x11];
+        assert_eq!(
+            parse_rsa_algorithm_attributes(&short).unwrap().format,
+            RsaImportFormat::Standard
+        );
+        // Non-RSA (e.g. EdDSA 0x16) is rejected.
+        assert_eq!(
+            parse_rsa_algorithm_attributes(&[0x16, 0x2B]),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn extended_header_list_crt_synthetic_exact_bytes() {
+        // CRT format, e_bits = 17 -> e_reqlen = 3 (e already 3 bytes, no pad).
+        let key = synthetic_crt_key();
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17);
+
+        // 7F48 value: 91 03  92 02  93 02  94 02  95 01  96 02
+        //   (each = tag + BER length, no value) -> 6 x 2 = 12 bytes = 0x0C.
+        // 5F48 value: e||p||q||u||dp||dq = 3+2+2+2+1+2 = 12 bytes = 0x0C.
+        // 4D value: B6 00 (2) | 7F48 0C + 12 (15) | 5F48 0C + 12 (15) = 32 = 0x20.
+        let expected = vec![
+            0x4D, 0x20, // 4D, len 32
+            0xB6, 0x00, // empty CRT (sign)
+            0x7F, 0x48, 0x0C, // 7F48, len 12
+            0x91, 0x03, //   e  len = 3
+            0x92, 0x02, //   p  len = 2
+            0x93, 0x02, //   q  len = 2
+            0x94, 0x02, //   u  len = 2
+            0x95, 0x01, //   dp len = 1
+            0x96, 0x02, //   dq len = 2
+            0x5F, 0x48, 0x0C, // 5F48, len 12
+            0x01, 0x00, 0x01, //   e
+            0xAA, 0xBB, //   p
+            0xCC, 0xDD, //   q
+            0x11, 0x22, //   u
+            0x33, //   dp
+            0x44, 0x55, //   dq
+        ];
+        assert_eq!(ehl, expected);
+    }
+
+    #[test]
+    fn extended_header_list_pads_exponent_to_e_bits() {
+        // e_bits = 32 -> e_reqlen = 4; e = 01 00 01 is left-padded to 00 01 00 01.
+        let key = synthetic_crt_key();
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 32);
+        // 91 entry now declares BER length 4 (2 bytes: 91 04)...
+        assert_eq!(&ehl[7..9], &[0x91, 0x04]);
+        // ...the 7F48 value is 12 bytes (6 x 2), so 5F48 starts at offset 19.
+        assert_eq!(&ehl[19..22], &[0x5F, 0x48, 0x0D]); // 13 = 4+2+2+2+1+2
+        // ...and the 5F48 data starts with the padded exponent 00 01 00 01.
+        assert_eq!(&ehl[22..26], &[0x00, 0x01, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn extended_header_list_standard_omits_crt() {
+        // Standard format emits only e, p, q (the card derives the rest).
+        let key = synthetic_crt_key();
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
+        let expected = vec![
+            0x4D, 0x15, // 4D, len 21
+            0xB6, 0x00, //
+            0x7F, 0x48, 0x06, // 7F48, len 6
+            0x91, 0x03, //   e len = 3
+            0x92, 0x02, //   p len = 2
+            0x93, 0x02, //   q len = 2
+            0x5F, 0x48, 0x07, // 5F48, len 7
+            0x01, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD,
+        ];
+        assert_eq!(ehl, expected);
+    }
+
+    #[test]
+    fn extended_header_list_crt_with_modulus_appends_n() {
+        // CrtWithModulus adds a 97 entry for n and appends n to 5F48.
+        let key = synthetic_crt_key();
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::CrtWithModulus, 17);
+        // 7F48 gains 97 03; its value is now 14 bytes (0x0E): 6 CRT entries + 97 03.
+        assert_eq!(&ehl[4..7], &[0x7F, 0x48, 0x0E]);
+        // The 97 entry is the last template entry (after 12 bytes of entries).
+        assert_eq!(&ehl[19..21], &[0x97, 0x03]);
+        // 5F48 ends with n = 99 88 77.
+        assert_eq!(&ehl[ehl.len() - 3..], &[0x99, 0x88, 0x77]);
+    }
+
+    #[test]
+    fn extended_header_list_crt_per_slot() {
+        let key = synthetic_crt_key();
+        // The CRT is the empty template at bytes [2..4] of the 4D value.
+        let sign = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17);
+        let dec = extended_header_list(KeyCrt::Decrypt, &key, RsaImportFormat::Crt, 17);
+        let auth = extended_header_list(KeyCrt::Auth, &key, RsaImportFormat::Crt, 17);
+        assert_eq!(sign[2..4], [0xB6, 0x00]);
+        assert_eq!(dec[2..4], [0xB8, 0x00]);
+        assert_eq!(auth[2..4], [0xA4, 0x00]);
+    }
+
+    // --- Key import: full APDU -------------------------------------------
+
+    #[test]
+    fn import_rsa_key_crt_synthetic_full_apdu() {
+        let key = synthetic_crt_key();
+        let apdu = import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Crt, 17);
+
+        // 4D object = 2 (tag+len) + 32 (value) = 34 bytes = 0x22.
+        // Extended APDU: 00 DB 3F FF 00 00 22 <34 bytes> (odd PUT DATA).
+        let mut expected = vec![0x00, 0xDB, 0x3F, 0xFF, 0x00, 0x00, 0x22];
+        expected.extend_from_slice(&extended_header_list(
+            KeyCrt::Sign,
+            &key,
+            RsaImportFormat::Crt,
+            17,
+        ));
+        assert_eq!(apdu, expected);
+        assert_eq!(apdu.len(), 7 + 34);
+    }
+
+    // --- Key import: realistic 2048-bit standard case (long-form lengths) --
+    //
+    // Standard form (e, p, q) is what real YubiKey 5 cards declare and accept;
+    // ykman imports RSA to v5 keys this way. The primes are full 128-byte
+    // fields, so their 7F48 entries use the long-form BER length 81 80.
+
+    #[test]
+    fn extended_header_list_realistic_2048_standard_long_form() {
+        let e = [0x01u8, 0x00, 0x01];
+        let f = [0xAAu8; 128];
+        let key = RsaPrivateKeyParts {
+            e: &e,
+            p: &f,
+            q: &f,
+            u: &[],
+            dp: &[],
+            dq: &[],
+            n: &[],
+        };
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
+
+        // 7F48 value: 91 03  92 81 80  93 81 80 -> 2 + 3 + 3 = 8 bytes = 0x08.
+        let template = [
+            0x91u8, 0x03, // e len = 3
+            0x92, 0x81, 0x80, // p len = 128 (long-form)
+            0x93, 0x81, 0x80, // q len = 128
+        ];
+        // 5F48 value = e||p||q = 3 + 128 + 128 = 259 = 0x0103 -> 5F 48 82 01 03.
+        let key_data_len = 3 + 128 + 128;
+        assert_eq!(key_data_len, 259);
+
+        // 4D value = B6 00 (2) + (7F 48 08 + 8 = 11) + (5F 48 82 01 03 + 259 = 264)
+        //          = 2 + 11 + 264 = 277.
+        let v4d_len = 2 + (3 + template.len()) + (5 + key_data_len);
+        assert_eq!(v4d_len, 277);
+
+        // 277 = 0x0115 -> 4D 82 01 15.
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&[0x4D, 0x82, 0x01, 0x15]);
+        prefix.extend_from_slice(&[0xB6, 0x00]);
+        prefix.extend_from_slice(&[0x7F, 0x48, 0x08]);
+        prefix.extend_from_slice(&template);
+        prefix.extend_from_slice(&[0x5F, 0x48, 0x82, 0x01, 0x03]);
+        prefix.extend_from_slice(&[0x01, 0x00, 0x01]); // e
+
+        assert_eq!(&ehl[..prefix.len()], &prefix[..]);
+        // Total EHL = 4 (4D 82 01 15) + 277 = 281.
+        assert_eq!(ehl.len(), 4 + 277);
+    }
+
+    #[test]
+    fn import_rsa_key_realistic_standard_extended_lc() {
+        let e = [0x01u8, 0x00, 0x01];
+        let f = [0xAAu8; 128];
+        let key = RsaPrivateKeyParts {
+            e: &e,
+            p: &f,
+            q: &f,
+            u: &[],
+            dp: &[],
+            dq: &[],
+            n: &[],
+        };
+        let apdu = import_rsa_key(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
+        // EHL = 281 bytes = 0x0119. APDU = 00 DB 3F FF 00 01 19 <281> (odd PUT DATA).
+        assert_eq!(&apdu[..7], &[0x00, 0xDB, 0x3F, 0xFF, 0x00, 0x01, 0x19]);
+        assert_eq!(apdu.len(), 7 + 281);
     }
 }
