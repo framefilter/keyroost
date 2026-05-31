@@ -167,6 +167,19 @@ pub const TAG_FINGERPRINTS: u16 = 0x00C5;
 pub const TAG_CA_FINGERPRINTS: u16 = 0x00C6;
 /// Key generation timestamps.
 pub const TAG_GENERATION_TIMES: u16 = 0x00CD;
+
+/// Fingerprint — signature key (`C7`, 20 bytes); a standalone PUT DATA target.
+pub const TAG_FPR_SIGN: u16 = 0x00C7;
+/// Fingerprint — decryption key (`C8`, 20 bytes); a standalone PUT DATA target.
+pub const TAG_FPR_DEC: u16 = 0x00C8;
+/// Fingerprint — authentication key (`C9`, 20 bytes); a standalone PUT DATA target.
+pub const TAG_FPR_AUTH: u16 = 0x00C9;
+/// Generation timestamp — signature key (`CE`, 4-byte big-endian Unix time).
+pub const TAG_TIME_SIGN: u16 = 0x00CE;
+/// Generation timestamp — decryption key (`CF`, 4-byte big-endian Unix time).
+pub const TAG_TIME_DEC: u16 = 0x00CF;
+/// Generation timestamp — authentication key (`D0`, 4-byte big-endian Unix time).
+pub const TAG_TIME_AUTH: u16 = 0x00D0;
 /// Security support template (constructed; contains [`TAG_DS_COUNTER`]).
 pub const TAG_SECURITY_SUPPORT: u16 = 0x007A;
 /// Digital signature counter (3-byte big-endian; inside [`TAG_SECURITY_SUPPORT`]).
@@ -299,6 +312,30 @@ impl KeyCrt {
     pub const fn crt(self) -> [u8; 2] {
         [self.tag(), 0x00]
     }
+
+    /// The data-object tag of this slot's 20-byte fingerprint (`C7`/`C8`/`C9`),
+    /// the target for a [`put_fingerprint`] PUT DATA. The card *also* mirrors
+    /// these into the 60-byte [`TAG_FINGERPRINTS`] (`C5`) aggregate, but writes
+    /// address the per-slot object.
+    #[must_use]
+    pub const fn fpr_tag(self) -> u16 {
+        match self {
+            KeyCrt::Sign => TAG_FPR_SIGN,
+            KeyCrt::Decrypt => TAG_FPR_DEC,
+            KeyCrt::Auth => TAG_FPR_AUTH,
+        }
+    }
+
+    /// The data-object tag of this slot's 4-byte generation timestamp
+    /// (`CE`/`CF`/`D0`), the target for a [`put_generation_time`] PUT DATA.
+    #[must_use]
+    pub const fn time_tag(self) -> u16 {
+        match self {
+            KeyCrt::Sign => TAG_TIME_SIGN,
+            KeyCrt::Decrypt => TAG_TIME_DEC,
+            KeyCrt::Auth => TAG_TIME_AUTH,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +450,135 @@ pub fn change_reference_data(pw_ref: u8, old: &[u8], new: &[u8]) -> Vec<u8> {
         pw_ref,
         &data,
     )
+}
+
+// ---------------------------------------------------------------------------
+// PUT DATA builders
+// ---------------------------------------------------------------------------
+
+/// `PUT DATA` for the data object identified by the 2-byte `tag` (placed in
+/// P1-P2), carrying `value` as the body.
+///
+/// Builds a case-3 APDU `00 DA <p1> <p2> <Lc> <value...>` (no `Le`). The
+/// inverse of [`get_data`]: where GET DATA reads a data object, PUT DATA writes
+/// one. Requires the appropriate PIN already verified (most writable objects
+/// need PW3; see the OpenPGP Card spec v3.4, §7.2.8). This layer only frames
+/// the bytes — it does not present a PIN.
+#[must_use]
+pub fn put_data(tag: u16, value: &[u8]) -> Vec<u8> {
+    let p1 = (tag >> 8) as u8;
+    let p2 = (tag & 0xFF) as u8;
+    build_apdu(0x00, Instruction::PutData.code(), p1, p2, value)
+}
+
+/// `PUT DATA 005B` — write the cardholder name ([`TAG_NAME`]).
+///
+/// The OpenPGP Card stores the name as the value of the standalone `5B` object
+/// (not wrapped in the `65` Cardholder Related Data template on write). The
+/// spec recommends the OpenPGP "Name" convention (`Surname<<Given Names`), but
+/// the encoding is the caller's; this builder only frames the bytes.
+#[must_use]
+pub fn put_cardholder_name(name: &[u8]) -> Vec<u8> {
+    put_data(TAG_NAME, name)
+}
+
+/// `PUT DATA 5F50` — write the URL of the public key ([`TAG_URL`]).
+#[must_use]
+pub fn put_url(url: &[u8]) -> Vec<u8> {
+    put_data(TAG_URL, url)
+}
+
+/// `PUT DATA C7`/`C8`/`C9` — write the 20-byte v4 fingerprint of the key in
+/// `crt`'s slot (see [`KeyCrt::fpr_tag`]).
+///
+/// After an on-card GENERATE the applet knows the key material but not the
+/// OpenPGP v4 fingerprint (which folds in the host-chosen creation timestamp);
+/// the host computes it with [`rsa_v4_fingerprint`] and registers it here so
+/// that `gpg` and the card agree on the key's identity.
+#[must_use]
+pub fn put_fingerprint(crt: KeyCrt, fpr: &[u8; 20]) -> Vec<u8> {
+    put_data(crt.fpr_tag(), fpr)
+}
+
+/// `PUT DATA CE`/`CF`/`D0` — write the 4-byte big-endian Unix generation
+/// timestamp of the key in `crt`'s slot (see [`KeyCrt::time_tag`]).
+///
+/// This timestamp *must* match the `creation_time` fed to
+/// [`rsa_v4_fingerprint`]: the v4 fingerprint hashes the creation time, so a
+/// mismatch yields a fingerprint the card and `gpg` disagree on.
+#[must_use]
+pub fn put_generation_time(crt: KeyCrt, unix_time: u32) -> Vec<u8> {
+    put_data(crt.time_tag(), &unix_time.to_be_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// OpenPGP v4 key fingerprint (RFC 4880 §12.2)
+// ---------------------------------------------------------------------------
+
+/// OpenPGP MPI (Multiprecision Integer, RFC 4880 §3.2) encoding of the
+/// big-endian integer `bytes`.
+///
+/// An MPI is a 2-byte big-endian *bit length* followed by the minimal
+/// big-endian value bytes. Leading zero *bytes* are stripped first; the bit
+/// length then counts from the highest set bit of the first remaining byte
+/// (so the encoding never has a leading zero byte). An all-zero or empty
+/// integer encodes as bit length 0 with no value bytes.
+fn mpi(bytes: &[u8]) -> Vec<u8> {
+    // Strip leading zero bytes to reach the minimal big-endian form.
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let value = &bytes[start..];
+    if value.is_empty() {
+        return vec![0x00, 0x00];
+    }
+    // Bit length: significant bits in the (non-zero) top byte + 8 per
+    // remaining byte. `u8::leading_zeros` is 8 minus the bit position of the
+    // highest set bit, so `8 - leading_zeros` is the count we want.
+    let top_bits = 8 - value[0].leading_zeros() as usize;
+    let bit_len = top_bits + 8 * (value.len() - 1);
+    let mut out = Vec::with_capacity(2 + value.len());
+    out.push((bit_len >> 8) as u8);
+    out.push((bit_len & 0xFF) as u8);
+    out.extend_from_slice(value);
+    out
+}
+
+/// Compute the OpenPGP **v4 fingerprint** (RFC 4880 §12.2) of an RSA public
+/// key from its big-endian `modulus`, `exponent`, and the key's `creation_time`
+/// (Unix seconds).
+///
+/// The fingerprint is `SHA1(0x99 || len16 || body)`, where `body` is the
+/// public-key packet body: `04` (version) || `creation_time` (4 big-endian
+/// bytes) || `01` (RSA algorithm id) || [MPI](modulus) || [MPI](exponent), and
+/// `len16` is the 2-byte big-endian length of `body`. The `creation_time` must
+/// equal the value later written with [`put_generation_time`], or the card and
+/// `gpg` will compute different fingerprints for the same key.
+#[must_use]
+pub fn rsa_v4_fingerprint(modulus: &[u8], exponent: &[u8], creation_time: u32) -> [u8; 20] {
+    let m = mpi(modulus);
+    let e = mpi(exponent);
+    let ct = creation_time.to_be_bytes();
+    let mut body = Vec::with_capacity(1 + 4 + 1 + m.len() + e.len());
+    body.push(0x04); // packet version
+    body.extend_from_slice(&ct); // key creation time
+    body.push(0x01); // public-key algorithm: RSA
+    body.extend_from_slice(&m);
+    body.extend_from_slice(&e);
+
+    let len = body.len() as u16;
+    let mut hashed = Vec::with_capacity(3 + body.len());
+    hashed.push(0x99); // old-format CTB: public-key packet, two-octet length
+    hashed.push((len >> 8) as u8);
+    hashed.push((len & 0xFF) as u8);
+    hashed.extend_from_slice(&body);
+
+    molto2_proto::sha1::sha1(&hashed)
+}
+
+/// Convenience wrapper around [`rsa_v4_fingerprint`] taking a parsed
+/// [`PublicKey`] (e.g. straight from [`parse_generated_public_key`]).
+#[must_use]
+pub fn rsa_v4_fingerprint_from(key: &PublicKey, creation_time: u32) -> [u8; 20] {
+    rsa_v4_fingerprint(&key.modulus, &key.exponent, creation_time)
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,5 +1420,105 @@ mod tests {
         assert_eq!(PW1_SIGN, 0x81);
         assert_eq!(PW1_OTHER, 0x82);
         assert_eq!(PW3_ADMIN, 0x83);
+    }
+
+    // --- PUT DATA builders -----------------------------------------------
+
+    #[test]
+    fn key_crt_fpr_and_time_tags() {
+        assert_eq!(KeyCrt::Sign.fpr_tag(), 0x00C7);
+        assert_eq!(KeyCrt::Decrypt.fpr_tag(), 0x00C8);
+        assert_eq!(KeyCrt::Auth.fpr_tag(), 0x00C9);
+        assert_eq!(KeyCrt::Sign.time_tag(), 0x00CE);
+        assert_eq!(KeyCrt::Decrypt.time_tag(), 0x00CF);
+        assert_eq!(KeyCrt::Auth.time_tag(), 0x00D0);
+    }
+
+    #[test]
+    fn put_data_generic_bytes() {
+        // 5F50 splits across P1/P2; case-3 (no Le).
+        assert_eq!(
+            put_data(TAG_URL, &[0xAA, 0xBB]),
+            vec![0x00, 0xDA, 0x5F, 0x50, 0x02, 0xAA, 0xBB]
+        );
+    }
+
+    #[test]
+    fn put_cardholder_name_bytes() {
+        // 00 DA 00 5B <Lc=04> "Test"
+        assert_eq!(
+            put_cardholder_name(b"Test"),
+            vec![0x00, 0xDA, 0x00, 0x5B, 0x04, 0x54, 0x65, 0x73, 0x74]
+        );
+    }
+
+    #[test]
+    fn put_url_bytes() {
+        // 00 DA 5F 50 <Lc=01> "x"
+        assert_eq!(put_url(b"x"), vec![0x00, 0xDA, 0x5F, 0x50, 0x01, 0x78]);
+    }
+
+    #[test]
+    fn put_fingerprint_bytes() {
+        // Signature slot -> C7; 20-byte value of 0xAB.
+        let apdu = put_fingerprint(KeyCrt::Sign, &[0xAB; 20]);
+        let mut expected = vec![0x00, 0xDA, 0x00, 0xC7, 0x14];
+        expected.extend_from_slice(&[0xAB; 20]);
+        assert_eq!(apdu, expected);
+        assert_eq!(&apdu[..6], &[0x00, 0xDA, 0x00, 0xC7, 0x14, 0xAB]);
+    }
+
+    #[test]
+    fn put_generation_time_bytes() {
+        // Auth slot -> D0; 4-byte big-endian time 0x5D2C0B00.
+        assert_eq!(
+            put_generation_time(KeyCrt::Auth, 0x5D2C_0B00),
+            vec![0x00, 0xDA, 0x00, 0xD0, 0x04, 0x5D, 0x2C, 0x0B, 0x00]
+        );
+    }
+
+    // --- OpenPGP v4 fingerprint (MPI + SHA-1) ----------------------------
+
+    #[test]
+    fn mpi_known_answers() {
+        // 8-byte modulus, top byte 0xC1 -> 64 bits (0x40).
+        assert_eq!(
+            mpi(&[0xC1, 0xF4, 0xD2, 0xA3, 0xC1, 0xF4, 0xD2, 0xA3]),
+            vec![0x00, 0x40, 0xC1, 0xF4, 0xD2, 0xA3, 0xC1, 0xF4, 0xD2, 0xA3]
+        );
+        // exponent 01 00 01 -> 17 bits (0x11).
+        assert_eq!(mpi(&[0x01, 0x00, 0x01]), vec![0x00, 0x11, 0x01, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn mpi_edge_cases() {
+        // Leading zero bytes stripped: 00 00 01 -> 1 bit.
+        assert_eq!(mpi(&[0x00, 0x00, 0x01]), vec![0x00, 0x01, 0x01]);
+        // Top bit set in a single byte: 0x80 -> 8 bits.
+        assert_eq!(mpi(&[0x80]), vec![0x00, 0x08, 0x80]);
+        // All-zero / empty integers encode as bit length 0 with no value.
+        assert_eq!(mpi(&[0x00, 0x00]), vec![0x00, 0x00]);
+        assert_eq!(mpi(&[]), vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn rsa_v4_fingerprint_known_answer() {
+        let modulus = [0xC1, 0xF4, 0xD2, 0xA3, 0xC1, 0xF4, 0xD2, 0xA3];
+        let exponent = [0x01, 0x00, 0x01];
+        let fpr = rsa_v4_fingerprint(&modulus, &exponent, 0x5D2C_0B00);
+        assert_eq!(
+            fpr,
+            [
+                0x51, 0x64, 0x08, 0xC6, 0xA3, 0x00, 0x39, 0xCD, 0xF3, 0x70, 0x93, 0x9F, 0x06, 0x40,
+                0x99, 0x5F, 0x21, 0xF3, 0x6C, 0xA5
+            ]
+        );
+
+        // The PublicKey convenience wrapper agrees.
+        let key = PublicKey {
+            modulus: modulus.to_vec(),
+            exponent: exponent.to_vec(),
+        };
+        assert_eq!(rsa_v4_fingerprint_from(&key, 0x5D2C_0B00), fpr);
     }
 }
