@@ -141,7 +141,18 @@ for the smartcard applets.
   only on `molto2-transport` (not `molto2-openpgp` directly). The write data paths
   are the same ones hardware-verified via the CLI; the pane renders without
   panicking against a live YubiKey (headless), though button clicks aren't
-  exercisable headlessly. Still TODO: on-card key *import* (vs generate).
+  exercisable headlessly.
+  **Signing DONE (2026-05-30):** `moltoctl openpgp sign --in FILE` hashes the
+  input (SHA-1, the in-tree hash), wraps it in a PKCS#1 v1.5 DigestInfo, verifies
+  PW1 (signing ref 0x81), and has the card produce an RSA signature via PSO:CDS
+  (`OpenPgpSession::sign`); output is hex or `--out FILE` raw. **Verified
+  end-to-end on the test YubiKey**: generate sign key → sign a message →
+  independently checked with `pow(sig, e, n)` that the recovered EMSA-PKCS1-v1_5
+  block is `00 01 FF.. 00 || DigestInfo` and the embedded SHA-1 equals the message
+  digest (`18d11190…`). Card reset to pristine after. SHA-1 is used because it's
+  the only in-tree hash; the card signs whatever DigestInfo it's handed, so the
+  private-key op is proven regardless (SHA-256 signing would need a vendored
+  SHA-256). Still TODO: on-card key *import* (vs generate); SHA-256 sign.
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement

@@ -362,6 +362,26 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
+    /// Sign a file with the on-card signature key (PSO:CDS). Hashes the input
+    /// (SHA-1), wraps it in a PKCS#1 DigestInfo, and has the card produce an RSA
+    /// signature. Requires the signing PIN (PW1) and, on a YubiKey, a touch.
+    Sign {
+        /// File whose contents to sign.
+        #[arg(long, value_name = "FILE")]
+        r#in: std::path::PathBuf,
+        /// Write the raw signature bytes here. Without it, the signature is
+        /// printed as hex to stdout.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        /// Read the signing PIN (PW1) from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        /// Read the signing PIN (PW1) from stdin (one line).
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -1633,8 +1653,54 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             session.set_url(url.as_bytes())?;
             println!("Public-key URL set.");
         }
+        OpenpgpCmd::Sign {
+            r#in,
+            out,
+            pin_env,
+            pin_stdin,
+            reader,
+        } => {
+            let data = std::fs::read(r#in)
+                .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
+            // SHA-1 DigestInfo (PKCS#1 v1.5): the card pads and RSA-signs this.
+            // SHA-1 is the in-tree hash; the card signs whatever DigestInfo it's
+            // given, so this proves the private-key operation regardless.
+            let digest_info = sha1_digest_info(&data);
+            let pin = read_secret("signing PIN (PW1)", pin_env.as_deref(), *pin_stdin)?;
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            session.verify_pin(molto2_openpgp::PW1_SIGN, pin.as_bytes())?;
+            eprintln!("Signing — touch the key if it blinks…");
+            let sig = session.sign(&digest_info)?;
+            match out {
+                Some(path) => {
+                    std::fs::write(path, &sig)
+                        .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                    eprintln!("Wrote {} signature bytes to {}", sig.len(), path.display());
+                }
+                None => println!("{}", hex_encode(&sig)),
+            }
+        }
     }
     Ok(())
+}
+
+/// Build the PKCS#1 v1.5 SHA-1 DigestInfo for `data`: the fixed ASN.1 prefix for
+/// SHA-1 followed by the 20-byte digest. The OpenPGP card wraps this in the
+/// EMSA-PKCS1-v1_5 padding and applies the RSA private key.
+fn sha1_digest_info(data: &[u8]) -> Vec<u8> {
+    // DigestInfo prefix for id-sha1 (RFC 8017 §9.2 / B.1).
+    const SHA1_PREFIX: [u8; 15] = [
+        0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+    ];
+    let hash = molto2_proto::sha1::sha1(data);
+    let mut di = Vec::with_capacity(SHA1_PREFIX.len() + hash.len());
+    di.extend_from_slice(&SHA1_PREFIX);
+    di.extend_from_slice(&hash);
+    di
 }
 
 /// Map an OpenPGP algorithm id (first attribute byte) to a short label.
