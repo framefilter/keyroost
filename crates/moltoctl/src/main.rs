@@ -362,15 +362,22 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
-    /// Import an RSA key into a slot. DESTRUCTIVE — overwrites any existing key.
-    /// With `--generate`, a fresh RSA-2048 key is generated on the host and
-    /// imported (the only source supported for now). Requires admin PIN (PW3) and
-    /// `--yes`. The key is registered (fingerprint + timestamp) like generate-key.
+    /// Import an RSA-2048 key into a slot. DESTRUCTIVE — overwrites any existing
+    /// key. The key comes from either `--generate` (fresh host keygen) or `--in
+    /// <FILE>` (an existing PKCS#1/PKCS#8 PEM or DER key); exactly one is
+    /// required. Requires admin PIN (PW3) and `--yes`. The key is registered
+    /// (fingerprint + timestamp) like generate-key.
     ImportKey {
-        /// Generate a fresh RSA-2048 key on the host and import it. (Required for
-        /// now; file import is a planned follow-up.)
-        #[arg(long)]
+        /// Generate a fresh RSA-2048 key on the host and import it.
+        /// Mutually exclusive with `--in`.
+        #[arg(long, conflicts_with = "in_file", required_unless_present = "in_file")]
         generate: bool,
+        /// Import an existing RSA-2048 private key from a file (PKCS#1 or
+        /// PKCS#8, PEM or DER; auto-detected). Mutually exclusive with
+        /// `--generate`. The key is read locally and imported; it is never
+        /// logged. Prefer an unencrypted key file you can delete afterward.
+        #[arg(long = "in", value_name = "FILE", conflicts_with = "generate")]
+        in_file: Option<std::path::PathBuf>,
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
         #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
@@ -1691,17 +1698,13 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::ImportKey {
             generate,
+            in_file,
             slot,
             yes,
             admin_pin_env,
             admin_pin_stdin,
             reader,
         } => {
-            if !generate {
-                return Err("only --generate is supported for now (host-generated RSA \
-                            key); file import is a planned follow-up"
-                    .into());
-            }
             if !yes {
                 return Err(format!(
                     "refusing to import without --yes (this OVERWRITES the {} key slot)",
@@ -1712,11 +1715,20 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let admin_pin =
                 read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
 
-            // Host-side RSA-2048 keygen via the `rsa` crate (the scoped dep
-            // exception; see Cargo.toml). The full CRT component set is
-            // extracted big-endian — the card decides which parts it wants.
-            println!("Generating an RSA-2048 key on the host…");
-            let k = generate_rsa_2048()?;
+            // Obtain the RSA-2048 key parts (full CRT set, big-endian) either by
+            // host keygen or by loading a key file. Both go through the `rsa`
+            // crate (the scoped dep exception; see Cargo.toml); the card decides
+            // which parts it wants.
+            let k = if *generate {
+                println!("Generating an RSA-2048 key on the host…");
+                generate_rsa_2048()?
+            } else {
+                let path = in_file
+                    .as_deref()
+                    .ok_or("provide --generate or --in <FILE>")?;
+                println!("Loading RSA key from {}…", path.display());
+                load_rsa_key(path)?
+            };
 
             let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
             let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
@@ -1833,11 +1845,57 @@ struct GeneratedRsaKey {
 }
 
 fn generate_rsa_2048() -> Result<GeneratedRsaKey, Box<dyn std::error::Error>> {
-    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
     let mut rng = rand::thread_rng();
     // `new` validates and precomputes the CRT values (dp, dq, qinv).
     let key = rsa::RsaPrivateKey::new(&mut rng, 2048)
         .map_err(|e| format!("RSA keygen failed: {e}"))?;
+    rsa_key_parts(&key)
+}
+
+/// Load an RSA private key from `path` and extract its import parts.
+///
+/// Accepts PKCS#8 or PKCS#1, PEM or DER, auto-detected: PEM by its
+/// `-----BEGIN ... PRIVATE KEY-----` header, otherwise DER. The key must be
+/// RSA-2048 (the only size the card slot is provisioned for here). The file
+/// bytes are read locally and never logged.
+fn load_rsa_key(path: &std::path::Path) -> Result<GeneratedRsaKey, Box<dyn std::error::Error>> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::traits::PublicKeyParts;
+
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let key = if bytes.starts_with(b"-----BEGIN") {
+        let text = std::str::from_utf8(&bytes).map_err(|_| "key file is not valid PEM/UTF-8")?;
+        // PKCS#8 ("BEGIN PRIVATE KEY") vs PKCS#1 ("BEGIN RSA PRIVATE KEY").
+        rsa::RsaPrivateKey::from_pkcs8_pem(text)
+            .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(text))
+            .map_err(|e| format!("could not parse PEM RSA private key: {e}"))?
+    } else {
+        // Raw DER: try PKCS#8 then PKCS#1.
+        rsa::RsaPrivateKey::from_pkcs8_der(&bytes)
+            .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_der(&bytes))
+            .map_err(|e| format!("could not parse DER RSA private key: {e}"))?
+    };
+
+    let bits = key.n().bits();
+    if bits != 2048 {
+        return Err(format!(
+            "key is RSA-{bits}, but the card slot is RSA-2048; import only supports 2048-bit keys"
+        )
+        .into());
+    }
+    // `from_*` does not precompute the CRT values; do it so dp/dq/qinv exist.
+    let mut key = key;
+    key.precompute()
+        .map_err(|e| format!("failed to precompute RSA CRT values: {e}"))?;
+    rsa_key_parts(&key)
+}
+
+/// Extract the import parts (e, p, q, u, dp, dq, n — big-endian, the full CRT
+/// set) from an `rsa::RsaPrivateKey`. The key must already be precomputed
+/// (`RsaPrivateKey::new` does this; loaders must call `precompute` first).
+fn rsa_key_parts(key: &rsa::RsaPrivateKey) -> Result<GeneratedRsaKey, Box<dyn std::error::Error>> {
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
     let primes = key.primes();
     if primes.len() != 2 {
         return Err("expected a 2-prime RSA key".into());

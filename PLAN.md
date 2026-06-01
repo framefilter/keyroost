@@ -197,8 +197,16 @@ for the smartcard applets.
   the path for testing). KAT-locked (chunks reassemble byte-identically to the
   extended-length data field). Verified on the YubiKey by forcing the chaining
   path: two links `10 DB 3F FF FE …` + `00 DB 3F FF 1B …` both `9000`, key
-  imported and registered. Still TODO: file-based import (parse a PEM/PKCS#8 key
-  rather than only `--generate`).
+  imported and registered.
+  **File-based import DONE + hardware-verified (2026-05-31):** `import-key` gained
+  `--in <FILE>` (mutually exclusive with `--generate`) which loads an RSA-2048
+  key via the `rsa` crate's decoders — PKCS#1 or PKCS#8, PEM or DER,
+  auto-detected — and runs it through the same import path; non-2048 keys and
+  unparseable files are rejected with clear errors. Verified on the YubiKey: a
+  PKCS#8 PEM key imported, and the card's read-back modulus was byte-identical to
+  the source file's modulus (all four format variants confirmed to parse
+  offline). With this, the OpenPGP write story (status / generate / import {gen,
+  file} / sign {sha1,sha256} / reset / set-name,url / register) is complete.
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
