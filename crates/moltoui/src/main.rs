@@ -151,8 +151,24 @@ struct OpenPgpState {
     gen_slot: OpenPgpSlotSel,
     /// Generate-key confirmation modal state.
     confirm_generate: bool,
+    /// Slot selected in the import-key control.
+    import_slot: OpenPgpSlotSel,
+    /// Path to an RSA key file for import-from-file (text-entered).
+    import_path: String,
+    /// Import confirmation modal: the chosen key source (modal open iff `Some`).
+    confirm_import: Option<ImportSource>,
     /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
     confirm_reset: Option<String>,
+}
+
+/// Where an OpenPGP key import gets its key material. Mirrors the CLI's
+/// `--generate` / `--in <FILE>` choice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImportSource {
+    /// Generate a fresh RSA-2048 key on the host.
+    Generate,
+    /// Load an RSA-2048 key from a file (PKCS#1/PKCS#8, PEM or DER).
+    FromFile,
 }
 
 /// Which key slot a GUI generate targets. Mirrors the CLI's slot choice.
@@ -818,7 +834,17 @@ impl App {
         self.security_keys.init = None;
         match molto2_hid::enumerate() {
             Ok(devices) => {
+                // Note a recognized key stuck in bootloader/DFU mode (plain HID,
+                // no FIDO page) so an empty list isn't a silent dead end.
+                let bootloader = devices.iter().find_map(HidDevice::bootloader_label);
                 let fido_only: Vec<_> = devices.into_iter().filter(|d| d.is_fido()).collect();
+                if fido_only.is_empty() {
+                    if let Some(bl) = bootloader {
+                        self.security_keys.error = Some(format!(
+                            "Detected {bl} — re-plug it to return to application mode."
+                        ));
+                    }
+                }
                 let prev_path = self
                     .security_keys
                     .selected
@@ -1040,7 +1066,11 @@ impl App {
             &info,
             molto2_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
         )?;
-        let mut mgr = molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
+        // Hand the manager a clone and keep `token` for the cached session; the
+        // token stays valid for the device session, so this avoids a redundant
+        // second PIN/ECDH exchange just to rebuild it.
+        let mut mgr =
+            molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token.clone(), &info)?;
         let metadata = mgr.metadata()?;
         let parties = mgr.list_relying_parties()?;
         let mut rps = Vec::with_capacity(parties.len());
@@ -1048,14 +1078,6 @@ impl App {
             let creds = mgr.list_credentials(&rp.rp_id_hash).unwrap_or_default();
             rps.push((rp, creds));
         }
-        // Reconstruct the token we used (CredentialManager consumed it).
-        // The PIN exchange is cheap, so we re-run it for the cached session.
-        let token = molto2_ctap::client_pin::get_pin_uv_auth_token(
-            &mut dev,
-            pin,
-            &info,
-            molto2_ctap::client_pin::permissions::CREDENTIAL_MANAGEMENT,
-        )?;
         Ok(UnlockedSession {
             token,
             metadata,
@@ -1091,11 +1113,8 @@ impl App {
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
         let (mut dev, _) = CtapHidDevice::open(path)?;
         let info = molto2_ctap::get_info(&mut dev)?;
-        let token2 = PinUvAuthToken {
-            protocol: token.protocol,
-            token: token.token.clone(),
-        };
-        let mut mgr = molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token2, &info)?;
+        let mut mgr =
+            molto2_ctap::cred_mgmt::CredentialManager::new(&mut dev, token.clone(), &info)?;
         let metadata = mgr.metadata()?;
         let parties = mgr.list_relying_parties()?;
         let mut rps = Vec::with_capacity(parties.len());
@@ -1117,15 +1136,9 @@ impl App {
         let Some(session) = self.security_keys.session.as_ref() else {
             return;
         };
-        let token = PinUvAuthToken {
-            protocol: session.token.protocol,
-            token: session.token.token.clone(),
-        };
+        let token = session.token.clone();
         // The refresh after delete needs its own token; clone for the chained op.
-        let token_refresh = PinUvAuthToken {
-            protocol: token.protocol,
-            token: token.token.clone(),
-        };
+        let token_refresh = token.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             // Delete, then re-list in the same job so the UI updates atomically.
             let result = Self::try_delete(&path, token, &cred_id)
@@ -2189,6 +2202,68 @@ impl App {
         });
     }
 
+    /// Import a key into the selected slot (PW3-gated, destructive), then refresh
+    /// status. The key material comes from host keygen or a file, obtained on the
+    /// worker thread (keygen is slow). May require a touch on the key.
+    fn import_openpgp_key(&mut self, source: ImportSource) {
+        let Some(name) = self.selected_openpgp_reader() else { return };
+        let pin = self.openpgp.admin_pin.clone();
+        let slot = self.openpgp.import_slot;
+        let path = self.openpgp.import_path.clone();
+        let creation_time = unix_now();
+        self.openpgp.notice = None;
+        let label = match source {
+            ImportSource::Generate => "Generating & importing RSA-2048 key… (touch if it blinks)",
+            ImportSource::FromFile => "Importing RSA key from file… (touch if it blinks)",
+        };
+        self.spawn_job(label, move || {
+            // Obtain the key parts first (keygen / file parse on this worker
+            // thread). Map every error to a String so success and the various
+            // failure kinds (key, PIN, card) flow through one result channel.
+            let result = (|| -> Result<(molto2_transport::OpenPgpStatus, [u8; 20]), String> {
+                let k = match source {
+                    ImportSource::Generate => molto2_rsakey::generate_2048(),
+                    ImportSource::FromFile => {
+                        molto2_rsakey::load_from_file(std::path::Path::new(&path))
+                    }
+                }
+                .map_err(|e| e.to_string())?;
+
+                let mut s = Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
+                let parts = molto2_transport::RsaPrivateKeyParts {
+                    e: &k.e,
+                    p: &k.p,
+                    q: &k.q,
+                    u: &k.u,
+                    dp: &k.dp,
+                    dq: &k.dq,
+                    n: &k.n,
+                };
+                s.import_key(slot.to_crt(), &parts).map_err(|e| e.to_string())?;
+                let fpr = s
+                    .register_key(slot.to_crt(), creation_time)
+                    .map_err(|e| e.to_string())?;
+                let status = s.status().map_err(|e| e.to_string())?;
+                Ok((status, fpr))
+            })();
+            Box::new(move |app: &mut App| match result {
+                Ok((status, fpr)) => {
+                    app.openpgp.status = Some(status);
+                    app.openpgp.loaded = true;
+                    app.openpgp.error = None;
+                    app.openpgp.notice =
+                        Some(format!("Imported {} key: {}", slot.label(), hex_lower(&fpr)));
+                    app.openpgp.admin_pin.clear();
+                    app.openpgp.import_path.clear();
+                }
+                Err(e) => {
+                    app.openpgp.error = Some(e);
+                    app.openpgp.admin_pin.clear();
+                }
+            })
+        });
+    }
+
     /// Factory-reset the OpenPGP applet (destructive), then refresh status. No
     /// PIN needed — reset blocks the PINs itself.
     fn reset_openpgp(&mut self) {
@@ -2387,6 +2462,42 @@ impl App {
             ui.add_space(6.0);
 
             ui.horizontal(|ui| {
+                ui.label("Import RSA key into slot:");
+                egui::ComboBox::from_id_salt("openpgp-import-slot")
+                    .selected_text(self.openpgp.import_slot.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.openpgp.import_slot, OpenPgpSlotSel::Sign, "signature");
+                        ui.selectable_value(&mut self.openpgp.import_slot, OpenPgpSlotSel::Decrypt, "decryption");
+                        ui.selectable_value(&mut self.openpgp.import_slot, OpenPgpSlotSel::Auth, "authentication");
+                    });
+                if ui.button("Generate & import\u{2026}").clicked() {
+                    self.openpgp.confirm_import = Some(ImportSource::Generate);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("From file:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.openpgp.import_path)
+                        .hint_text("/path/to/key.pem (PKCS#1/8, PEM or DER)")
+                        .desired_width(260.0),
+                );
+                let armed = !self.openpgp.import_path.trim().is_empty();
+                if ui
+                    .add_enabled(armed, egui::Button::new("Import file\u{2026}"))
+                    .clicked()
+                {
+                    self.openpgp.confirm_import = Some(ImportSource::FromFile);
+                }
+            });
+            helper_bubble(
+                ui,
+                "Imports an RSA-2048 private key into the slot. \u{201c}Generate & import\u{201d} \
+                 makes a fresh key on this host; \u{201c}From file\u{201d} loads a PKCS#1/PKCS#8 \
+                 key (PEM or DER). Like generate, this OVERWRITES the slot and needs the admin PIN.",
+            );
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
                 let reset = egui::Button::new(
                     egui::RichText::new("Reset applet\u{2026}").color(egui::Color32::from_rgb(220, 110, 110)),
                 );
@@ -2443,6 +2554,54 @@ impl App {
                 self.generate_openpgp_key();
             } else if cancel || !window_open {
                 self.openpgp.confirm_generate = false;
+            }
+        }
+
+        if let Some(source) = self.openpgp.confirm_import {
+            let slot = self.openpgp.import_slot.label();
+            let mut do_it = false;
+            let mut cancel = false;
+            let mut window_open = true;
+            egui::Window::new("Import key?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut window_open)
+                .show(ctx, |ui| {
+                    let what = match source {
+                        ImportSource::Generate => "a fresh host-generated RSA-2048 key".to_string(),
+                        ImportSource::FromFile => {
+                            format!("the RSA key from {}", self.openpgp.import_path.trim())
+                        }
+                    };
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 180, 80),
+                        format!("Import {what} into the {slot} slot?"),
+                    );
+                    ui.label("This OVERWRITES any existing key in that slot (a slot");
+                    ui.label("can only be cleared by a full applet reset). May need a touch.");
+                    if self.openpgp.admin_pin.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 110, 110),
+                            "Enter the admin PIN (PW3) above first.",
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let armed = !self.openpgp.admin_pin.is_empty();
+                        if ui.add_enabled(armed, egui::Button::new("Import")).clicked() {
+                            do_it = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if do_it {
+                self.openpgp.confirm_import = None;
+                self.import_openpgp_key(source);
+            } else if cancel || !window_open {
+                self.openpgp.confirm_import = None;
             }
         }
 

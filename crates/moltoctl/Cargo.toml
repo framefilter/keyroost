@@ -24,11 +24,8 @@ molto2-resolve = { path = "../molto2-resolve", version = "0.1.0" }
 molto2-oath = { path = "../molto2-oath", version = "0.1.0" }
 molto2-openpgp = { path = "../molto2-openpgp", version = "0.1.0" }
 molto2-import = { path = "../molto2-import", version = "0.1.0", features = ["bulk", "encrypted"] }
+# Host-side RSA keygen / key-file loading for OpenPGP on-card import. Shared with
+# moltoui; owns the workspace's scoped `rsa` dependency exception so the protocol
+# crates stay dependency-free (see that crate's Cargo.toml).
+molto2-rsakey = { path = "../molto2-rsakey", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
-# OpenPGP on-card key import: host-side RSA keygen. A deliberate, scoped
-# exception to the workspace's "vendor over depend" rule — RSA key generation is
-# security-critical and not something to hand-roll. Confined to this front-end
-# binary; the protocol crates stay dependency-free. `rsa` also re-exports
-# pkcs1/pkcs8 traits we use to pull the key components.
-rsa = "0.9"
-rand = "0.8"

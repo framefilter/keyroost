@@ -207,6 +207,39 @@ for the smartcard applets.
   the source file's modulus (all four format variants confirmed to parse
   offline). With this, the OpenPGP write story (status / generate / import {gen,
   file} / sign {sha1,sha256} / reset / set-name,url / register) is complete.
+  **PSO:DECIPHER wired — code-complete, hardware verification pending (2026-06-01):**
+  `molto2-openpgp::pso_decipher` now auto-selects short vs. *extended*-length
+  framing (an RSA-2048 cipher DO is 257 bytes — `0x00` padding indicator + 256
+  cryptogram — over the short-APDU limit) and a new `pso_decipher_chained`
+  provides the ISO command-chaining fallback (CLA `10` links + final CLA `00`
+  with a case-4 `Le`, 254-byte chunks). `OpenPgpSession::decrypt` prepends the
+  padding-indicator byte, tries extended length, and falls back to chaining on
+  `6700`/`6883` (same `MOLTO_OPENPGP_FORCE_CHAINING` hook as import);
+  `transmit_chain` now returns the final link's response payload. CLI: `moltoctl
+  openpgp decrypt --in <FILE>` verifies PW1 in the decipher context (ref 0x82),
+  runs PSO:DECIPHER, and writes plaintext (`--out`) or hex. KAT-locked (extended
+  framing + chaining reassembly); builds green; the command parses and reaches
+  reader resolution offline. **Extended-length path hardware-verified
+  (2026-06-01):** on the test YubiKey (37806840), a decryption-slot key was
+  generated, a host-side PKCS#1 v1.5 cryptogram built under its public modulus,
+  and `openpgp decrypt` returned the byte-identical plaintext
+  (`6d6f…7374` = "molto2 decipher test"); card reset to pristine afterward
+  (slots empty, PINs 3/0/3). The command-chaining decrypt fallback
+  (`MOLTO_OPENPGP_FORCE_CHAINING`) remains KAT-only — not yet forced on hardware
+  (the import chaining path *was* hardware-confirmed earlier, same builder shape).
+  **GUI import parity — code-complete, hardware verification pending (2026-06-01):**
+  the `moltoui` OpenPGP pane gained "Generate & import" and "From file" controls
+  (slot selector + path field), a confirmation modal, and `import_openpgp_key`
+  which obtains the key on the worker thread then imports + registers. The
+  host-side RSA key material (keygen + PKCS#1/PKCS#8 PEM/DER loading) moved out of
+  `moltoctl` into a new shared **`molto2-rsakey`** crate (`generate_2048`,
+  `load_from_file`, `RsaKeyParts`), which now owns the workspace's scoped `rsa`
+  dependency so both front-ends share one key path; `moltoctl` was refactored onto
+  it. Unit-tested (keygen shapes, DER round-trip, size/garbage rejection); both
+  binaries build; the refactored CLI import path was re-confirmed to parse all
+  four key formats offline. The GUI calls the same `OpenPgpSession::import_key` +
+  `molto2-rsakey` path the CLI import already hardware-verified, so only the GUI
+  UI wiring itself is **not yet click-tested on hardware**.
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
@@ -416,11 +449,21 @@ compression doesn't lose it:
   longer freezes the UI) and clears the cached session + re-reads CTAP info. The
   underlying `molto2_ctap::reset()` path was confirmed end-to-end on a real
   YubiKey ("All credentials wiped, PIN cleared").
-- **CredentialManager double token fetch.** Unlock fetches the pinUvAuthToken
-  twice because the manager consumes it; split the listing helpers off the
-  manager or make the token `Clone`.
-- **Bootloader-mode detection.** A Solo 2 in DFU enumerates as `1209:b000`
-  and won't speak FIDO; detect and message clearly rather than hang on INIT.
+- **CredentialManager double token fetch — DONE (2026-06-01).** `PinUvAuthToken`
+  now derives `Clone`; `moltoui`'s `open_and_unlock` hands the manager a clone and
+  keeps the original for the cached session, dropping the second redundant
+  PIN/ECDH exchange. The hand-rolled token reconstructions in `refresh_with_token`
+  / `delete_credential` collapsed to `.clone()`. (Verified valid by the existing
+  token-reuse across delete+refresh; builds + tests green.)
+- **Bootloader-mode detection — DONE (2026-06-01).** `molto2-hid` gained a
+  `KNOWN_BOOTLOADERS` table (Solo 2 / Nitrokey 3 DFU = `1209:b000`),
+  `HidDevice::bootloader_label()`, and `bootloader_device_present()`. A device in
+  DFU enumerates as plain HID (no FIDO page) and so vanishes from FIDO lists;
+  now `moltoctl list` tags it `[bootloader]` and notes it when the FIDO list is
+  empty, `resolve_fido_path`'s "no FIDO device" error names it, and the `moltoui`
+  Security Keys pane surfaces "re-plug it to return to application mode" instead of
+  a silent empty list. Unit-tested; no hardware DFU device on hand to confirm the
+  live VID:PID, but the path is purely ID-table driven.
 
 ## Hardware compatibility notes
 

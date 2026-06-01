@@ -80,11 +80,41 @@ pub struct HidDevice {
     pub usb_address: Option<u8>,
 }
 
+/// Known USB `(vendor, product, description)` IDs of security keys sitting in
+/// bootloader / DFU mode. Such a device enumerates as plain HID with no FIDO
+/// usage page and cannot speak CTAP, so it would otherwise silently vanish from
+/// FIDO lists. Solo 2 / Nitrokey 3 share the Trussed bootloader (`1209:b000`).
+const KNOWN_BOOTLOADERS: &[(u16, u16, &str)] =
+    &[(0x1209, 0xb000, "Solo 2 / Nitrokey 3 in bootloader/DFU mode")];
+
 impl HidDevice {
     /// True when the device advertises the FIDO usage page (`0xF1D0`).
     pub fn is_fido(&self) -> bool {
         self.usage_page == HID_USAGE_PAGE_FIDO
     }
+
+    /// If this device is a recognized security key in bootloader / DFU mode,
+    /// returns a human-readable description. Such a device can't speak FIDO/CTAP
+    /// until it's returned to application mode (typically by re-plugging), so
+    /// callers can message this clearly instead of hanging on a CTAPHID INIT or
+    /// reporting "no FIDO devices" with no explanation.
+    pub fn bootloader_label(&self) -> Option<&'static str> {
+        KNOWN_BOOTLOADERS
+            .iter()
+            .find(|(vid, pid, _)| *vid == self.vendor_id && *pid == self.product_id)
+            .map(|(_, _, label)| *label)
+    }
+}
+
+/// Scan all connected HID devices for any recognized security key in
+/// bootloader / DFU mode, returning the first match's description. A front-end
+/// that finds no FIDO devices can call this to explain why (e.g. a Solo 2 stuck
+/// in DFU) rather than just reporting an empty list.
+pub fn bootloader_device_present() -> Option<&'static str> {
+    enumerate()
+        .ok()?
+        .iter()
+        .find_map(HidDevice::bootloader_label)
 }
 
 /// List all `/dev/hidraw*` devices visible to the current user via sysfs.
@@ -306,5 +336,30 @@ mod tests {
         };
         assert!(fido.is_fido());
         assert!(!kbd.is_fido());
+    }
+
+    #[test]
+    fn bootloader_label_matches_known_dfu_id() {
+        let fido = HidDevice {
+            path: PathBuf::from("/dev/hidraw0"),
+            vendor_id: 0x1050,
+            product_id: 0x0407,
+            product_name: "YubiKey".into(),
+            usage_page: HID_USAGE_PAGE_FIDO,
+            usage: HID_USAGE_FIDO_AUTHENTICATOR,
+            serial_number: None,
+            usb_bus: None,
+            usb_address: None,
+        };
+        // A normal FIDO key is not a bootloader.
+        assert!(fido.bootloader_label().is_none());
+        // Solo 2 / Nitrokey 3 in DFU mode (1209:b000) is recognized.
+        let dfu = HidDevice {
+            vendor_id: 0x1209,
+            product_id: 0xb000,
+            usage_page: 0x01,
+            ..fido
+        };
+        assert!(dfu.bootloader_label().is_some());
     }
 }

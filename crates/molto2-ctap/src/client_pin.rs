@@ -115,6 +115,12 @@ pub struct PinResponse {
 /// PIN/UV auth token obtained from `getPinToken`. The token itself is
 /// opaque (16 or 32 random bytes); the bundled shared secret remembers the
 /// HMAC key callers need to authenticate later requests.
+///
+/// `Clone` so a caller can keep a copy for a cached session while handing one
+/// to a [`CredentialManager`](crate::cred_mgmt::CredentialManager) (which takes
+/// the token by value). The same token stays valid for the device session, so
+/// cloning avoids a redundant second PIN/ECDH exchange.
+#[derive(Clone)]
 pub struct PinUvAuthToken {
     pub protocol: u32,
     /// Random 16-or-32-byte value the authenticator generates per session.

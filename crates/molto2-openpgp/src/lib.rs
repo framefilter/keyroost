@@ -414,19 +414,74 @@ pub fn pso_compute_signature(data: &[u8]) -> Vec<u8> {
 /// is the caller's; this layer only frames the bytes). Requires PW1 verified in
 /// the "other" context ([`PW1_OTHER`]).
 ///
-/// Builds a case-4 APDU `00 2A 80 86 <Lc> <data> 00`; the trailing `0x00` `Le`
-/// is appended by hand (see the case-4 note on [`generate_key`]).
+/// For a short body (`<= 255` bytes) builds a case-4 short APDU
+/// `00 2A 80 86 <Lc> <data> 00`. For a longer body — an RSA-2048 cryptogram is
+/// 256 bytes, so with the padding-indicator the DO is 257 — it builds a case-4
+/// *extended* APDU `00 2A 80 86 00 <Lc-hi> <Lc-lo> <data> 00 00` (3-byte
+/// extended `Lc`, 2-byte extended `Le`). Readers that won't pass an extended
+/// `Lc` are handled by the command-chaining variant
+/// ([`pso_decipher_chained`]); the transport layer falls back to it on `6700` /
+/// `6883`, mirroring the key-import path.
 #[must_use]
 pub fn pso_decipher(data: &[u8]) -> Vec<u8> {
-    let mut apdu = build_apdu(
-        0x00,
-        Instruction::PerformSecurityOperation.code(),
-        (PSO_DECIPHER >> 8) as u8,
-        (PSO_DECIPHER & 0xFF) as u8,
-        data,
+    let ins = Instruction::PerformSecurityOperation.code();
+    let p1 = (PSO_DECIPHER >> 8) as u8;
+    let p2 = (PSO_DECIPHER & 0xFF) as u8;
+    if data.len() <= 255 {
+        let mut apdu = build_apdu(0x00, ins, p1, p2, data);
+        apdu.push(0x00); // case-4 short Le
+        apdu
+    } else {
+        // Extended case 4: extended Lc from build_apdu_extended, then a 2-byte
+        // extended Le (`00 00` = up to 65536 bytes returned).
+        let mut apdu = build_apdu_extended(0x00, ins, p1, p2, data);
+        apdu.extend_from_slice(&[0x00, 0x00]);
+        apdu
+    }
+}
+
+/// Build PSO:DECIPHER as an ISO 7816 **command-chaining** sequence — the
+/// fallback for readers/cards that won't accept a single extended-`Lc` APDU.
+///
+/// `data` is the full RSA cipher DO (the `0x00` padding-indicator byte followed
+/// by the cryptogram). It is split into chunks of at most `max_chunk` bytes;
+/// every chunk but the last carries the chaining class bit (CLA `0x10`), and the
+/// final chunk uses CLA `0x00` with a trailing case-4 `Le` (`0x00`) so the card
+/// returns the recovered plaintext. The card reassembles the chunks into one
+/// logical command, so the concatenated bodies equal the extended-length APDU's
+/// data field. GnuPG chains PSO operations in 254-byte links; pass
+/// `max_chunk = 254` to match.
+///
+/// # Panics
+/// Panics if `max_chunk` is 0 or greater than 255.
+#[must_use]
+pub fn pso_decipher_chained(data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
+    assert!(
+        (1..=255).contains(&max_chunk),
+        "command-chaining chunk size must be 1..=255"
     );
-    apdu.push(0x00); // case-4 Le
-    apdu
+    let ins = Instruction::PerformSecurityOperation.code();
+    let p1 = (PSO_DECIPHER >> 8) as u8;
+    let p2 = (PSO_DECIPHER & 0xFF) as u8;
+    if data.is_empty() {
+        return vec![vec![0x00, ins, p1, p2, 0x00, 0x00]];
+    }
+    let chunks: Vec<&[u8]> = data.chunks(max_chunk).collect();
+    let last = chunks.len() - 1;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let cla = if i < last { 0x10 } else { 0x00 };
+            let mut apdu = Vec::with_capacity(6 + chunk.len());
+            apdu.extend_from_slice(&[cla, ins, p1, p2, chunk.len() as u8]);
+            apdu.extend_from_slice(chunk);
+            if i == last {
+                apdu.push(0x00); // case-4 Le on the final link
+            }
+            apdu
+        })
+        .collect()
 }
 
 /// `CHANGE REFERENCE DATA` (INS `24`) — change a PIN from `old` to `new`.
@@ -1711,6 +1766,41 @@ mod tests {
             pso_decipher(&cipher),
             vec![0x00, 0x2A, 0x80, 0x86, 0x04, 0x00, 0xAA, 0xBB, 0xCC, 0x00]
         );
+    }
+
+    #[test]
+    fn pso_decipher_extended_for_rsa_2048() {
+        // Real RSA-2048 case: 0x00 indicator + 256-byte cryptogram = 257 bytes,
+        // over the short-APDU limit, so it must use extended Lc + extended Le.
+        let mut data = vec![0x00];
+        data.extend(std::iter::repeat(0xAB).take(256));
+        let apdu = pso_decipher(&data);
+        // Header + extended Lc (00 01 01) + 257 body + extended Le (00 00).
+        assert_eq!(&apdu[..7], &[0x00, 0x2A, 0x80, 0x86, 0x00, 0x01, 0x01]);
+        assert_eq!(&apdu[7..7 + 257], &data[..]);
+        assert_eq!(&apdu[7 + 257..], &[0x00, 0x00]);
+        assert_eq!(apdu.len(), 7 + 257 + 2);
+    }
+
+    #[test]
+    fn pso_decipher_chained_links() {
+        // 257 bytes in 254-byte chunks => two links: 254 (CLA 10) + 3 (CLA 00, +Le).
+        let mut data = vec![0x00];
+        data.extend(std::iter::repeat(0xAB).take(256));
+        let chunks = pso_decipher_chained(&data, 254);
+        assert_eq!(chunks.len(), 2);
+        // First link: chaining bit set, no trailing Le.
+        assert_eq!(&chunks[0][..5], &[0x10, 0x2A, 0x80, 0x86, 0xFE]);
+        assert_eq!(chunks[0].len(), 5 + 254);
+        // Last link: CLA 00, 3-byte body, trailing case-4 Le.
+        assert_eq!(&chunks[1][..5], &[0x00, 0x2A, 0x80, 0x86, 0x03]);
+        assert_eq!(*chunks[1].last().unwrap(), 0x00);
+        assert_eq!(chunks[1].len(), 5 + 3 + 1);
+        // Reassembled bodies (drop 5-byte header from each link, and the final
+        // link's trailing Le) equal the original cipher DO.
+        let mut body = chunks[0][5..].to_vec();
+        body.extend_from_slice(&chunks[1][5..chunks[1].len() - 1]);
+        assert_eq!(body, data);
     }
 
     #[test]

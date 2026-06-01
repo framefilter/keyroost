@@ -418,6 +418,28 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
+    /// Decrypt a file with the on-card decryption key (PSO:DECIPHER). The input
+    /// is a raw RSA cryptogram — for RSA-2048, the 256-byte value produced by
+    /// RSA-encrypting a PKCS#1 v1.5 block under the decryption slot's public
+    /// key. The card applies the private key, strips the padding, and returns
+    /// the plaintext. Requires the user PIN (PW1) and, on a YubiKey, a touch.
+    Decrypt {
+        /// File holding the raw RSA cryptogram to decrypt.
+        #[arg(long, value_name = "FILE")]
+        r#in: std::path::PathBuf,
+        /// Write the recovered plaintext here. Without it, the plaintext is
+        /// printed as hex to stdout.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        /// Read the user PIN (PW1) from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        /// Read the user PIN (PW1) from stdin (one line).
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -1239,11 +1261,20 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             if filtered.is_empty() {
                 println!("  (none)");
+                if let Some(bl) = molto2_hid::bootloader_device_present() {
+                    println!("  note: detected {bl} — re-plug it to return to application mode.");
+                }
             } else {
                 let keyring = Keyring::load_default().unwrap_or_default();
                 let ccid = ccid_readers_if_needed(&filtered);
                 for d in &filtered {
-                    let tag = if d.is_fido() { " [FIDO]" } else { "" };
+                    let tag = if d.is_fido() {
+                        " [FIDO]"
+                    } else if d.bootloader_label().is_some() {
+                        " [bootloader]"
+                    } else {
+                        ""
+                    };
                     let eff = d.serial_number.clone().or_else(|| ccid_serial_for(d, &ccid));
                     let serial = match (&d.serial_number, &eff) {
                         (Some(s), _) => format!(" serial={}", s),
@@ -1308,6 +1339,20 @@ fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::er
     Ok(dev.path.clone())
 }
 
+/// The "no FIDO device" error, with a clear hint when a known security key is
+/// present but stuck in bootloader / DFU mode (it enumerates as plain HID and
+/// can't speak CTAP until re-plugged into application mode).
+fn no_fido_device_error() -> Box<dyn std::error::Error> {
+    let mut msg =
+        String::from("no FIDO HID device found. Plug a security key in, or pass --path/--name.");
+    if let Some(bl) = molto2_hid::bootloader_device_present() {
+        msg.push_str(&format!(
+            " (Detected {bl} — re-plug it to return to application mode.)"
+        ));
+    }
+    msg.into()
+}
+
 /// Print the resolved target to stderr so the user always sees which physical
 /// key a command is about to act on (annotated with its friendly name if set).
 fn announce_target(keyring: &Keyring, path: &Path, label: &str, serial: Option<&str>) {
@@ -1327,7 +1372,7 @@ fn pick_from_devices(
     serials: &[Option<String>],
 ) -> Result<usize, Box<dyn std::error::Error>> {
     match devices.len() {
-        0 => Err("no FIDO HID device found. Plug a security key in, or pass --path/--name.".into()),
+        0 => Err(no_fido_device_error()),
         1 => Ok(0),
         _ => match pick_device_interactively(devices, keyring, serials)? {
             Some(i) => Ok(i),
@@ -1716,18 +1761,18 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
 
             // Obtain the RSA-2048 key parts (full CRT set, big-endian) either by
-            // host keygen or by loading a key file. Both go through the `rsa`
-            // crate (the scoped dep exception; see Cargo.toml); the card decides
-            // which parts it wants.
+            // host keygen or by loading a key file. Both go through the shared
+            // `molto2-rsakey` crate (which owns the scoped `rsa` dep); the card
+            // decides which parts it wants.
             let k = if *generate {
                 println!("Generating an RSA-2048 key on the host…");
-                generate_rsa_2048()?
+                molto2_rsakey::generate_2048()?
             } else {
                 let path = in_file
                     .as_deref()
                     .ok_or("provide --generate or --in <FILE>")?;
                 println!("Loading RSA key from {}…", path.display());
-                load_rsa_key(path)?
+                molto2_rsakey::load_from_file(path)?
             };
 
             let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
@@ -1820,110 +1865,39 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 None => println!("{}", hex_encode(&sig)),
             }
         }
+        OpenpgpCmd::Decrypt {
+            r#in,
+            out,
+            pin_env,
+            pin_stdin,
+            reader,
+        } => {
+            let cryptogram = std::fs::read(r#in)
+                .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
+            let pin = read_secret("user PIN (PW1)", pin_env.as_deref(), *pin_stdin)?;
+            let readers = molto2_transport::OpenPgpSession::list_openpgp_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
+            eprintln!("\u{2192} OpenPGP on {}", name);
+            let mut session = molto2_transport::OpenPgpSession::open(&name)?;
+            session.set_debug(debug);
+            // Decryption authorizes under PW1 in the "other"/decipher context
+            // (ref 0x82), not the signing context (0x81).
+            session.verify_pin(molto2_openpgp::PW1_OTHER, pin.as_bytes())?;
+            eprintln!("Decrypting — touch the key if it blinks…");
+            let plain = session.decrypt(&cryptogram)?;
+            match out {
+                Some(path) => {
+                    std::fs::write(path, &plain)
+                        .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                    eprintln!("Wrote {} plaintext bytes to {}", plain.len(), path.display());
+                }
+                None => println!("{}", hex_encode(&plain)),
+            }
+        }
     }
     Ok(())
 }
 
-
-/// Generate a fresh RSA-2048 key on the host and return `(e, p, q, n)` as
-/// big-endian byte vectors. Uses the `rsa` crate (the scoped dependency
-/// exception for security-critical keygen — see this crate's Cargo.toml).
-/// A host-generated RSA key, with the full CRT component set the OpenPGP card
-/// import needs (the YubiKey rejects the bare `e`/`p`/`q` triple). All fields
-/// are minimal big-endian.
-struct GeneratedRsaKey {
-    e: Vec<u8>,
-    p: Vec<u8>,
-    q: Vec<u8>,
-    /// `u = q⁻¹ mod p`.
-    u: Vec<u8>,
-    /// `dp = d mod (p−1)`.
-    dp: Vec<u8>,
-    /// `dq = d mod (q−1)`.
-    dq: Vec<u8>,
-    n: Vec<u8>,
-}
-
-fn generate_rsa_2048() -> Result<GeneratedRsaKey, Box<dyn std::error::Error>> {
-    let mut rng = rand::thread_rng();
-    // `new` validates and precomputes the CRT values (dp, dq, qinv).
-    let key = rsa::RsaPrivateKey::new(&mut rng, 2048)
-        .map_err(|e| format!("RSA keygen failed: {e}"))?;
-    rsa_key_parts(&key)
-}
-
-/// Load an RSA private key from `path` and extract its import parts.
-///
-/// Accepts PKCS#8 or PKCS#1, PEM or DER, auto-detected: PEM by its
-/// `-----BEGIN ... PRIVATE KEY-----` header, otherwise DER. The key must be
-/// RSA-2048 (the only size the card slot is provisioned for here). The file
-/// bytes are read locally and never logged.
-fn load_rsa_key(path: &std::path::Path) -> Result<GeneratedRsaKey, Box<dyn std::error::Error>> {
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
-    use rsa::traits::PublicKeyParts;
-
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let key = if bytes.starts_with(b"-----BEGIN") {
-        let text = std::str::from_utf8(&bytes).map_err(|_| "key file is not valid PEM/UTF-8")?;
-        // PKCS#8 ("BEGIN PRIVATE KEY") vs PKCS#1 ("BEGIN RSA PRIVATE KEY").
-        rsa::RsaPrivateKey::from_pkcs8_pem(text)
-            .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(text))
-            .map_err(|e| format!("could not parse PEM RSA private key: {e}"))?
-    } else {
-        // Raw DER: try PKCS#8 then PKCS#1.
-        rsa::RsaPrivateKey::from_pkcs8_der(&bytes)
-            .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_der(&bytes))
-            .map_err(|e| format!("could not parse DER RSA private key: {e}"))?
-    };
-
-    let bits = key.n().bits();
-    if bits != 2048 {
-        return Err(format!(
-            "key is RSA-{bits}, but the card slot is RSA-2048; import only supports 2048-bit keys"
-        )
-        .into());
-    }
-    // `from_*` does not precompute the CRT values; do it so dp/dq/qinv exist.
-    let mut key = key;
-    key.precompute()
-        .map_err(|e| format!("failed to precompute RSA CRT values: {e}"))?;
-    rsa_key_parts(&key)
-}
-
-/// Extract the import parts (e, p, q, u, dp, dq, n — big-endian, the full CRT
-/// set) from an `rsa::RsaPrivateKey`. The key must already be precomputed
-/// (`RsaPrivateKey::new` does this; loaders must call `precompute` first).
-fn rsa_key_parts(key: &rsa::RsaPrivateKey) -> Result<GeneratedRsaKey, Box<dyn std::error::Error>> {
-    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-    let primes = key.primes();
-    if primes.len() != 2 {
-        return Err("expected a 2-prime RSA key".into());
-    }
-    let dp = key
-        .dp()
-        .ok_or("RSA key missing precomputed dp")?
-        .to_bytes_be();
-    let dq = key
-        .dq()
-        .ok_or("RSA key missing precomputed dq")?
-        .to_bytes_be();
-    // qinv = q⁻¹ mod p is positive; take its big-endian magnitude.
-    let u = key
-        .qinv()
-        .ok_or("RSA key missing precomputed qinv")?
-        .to_bytes_be()
-        .1;
-    Ok(GeneratedRsaKey {
-        e: key.e().to_bytes_be(),
-        n: key.n().to_bytes_be(),
-        p: primes[0].to_bytes_be(),
-        q: primes[1].to_bytes_be(),
-        u,
-        dp,
-        dq,
-    })
-}
 
 /// Map an OpenPGP algorithm id (first attribute byte) to a short label.
 fn algo_id_str(id: Option<u8>) -> &'static str {

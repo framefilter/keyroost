@@ -23,5 +23,8 @@ molto2-keyring = { path = "../molto2-keyring", version = "0.1.0" }
 molto2-resolve = { path = "../molto2-resolve", version = "0.1.0" }
 molto2-oath = { path = "../molto2-oath", version = "0.1.0" }
 molto2-import = { path = "../molto2-import", version = "0.1.0", features = ["bulk", "encrypted"] }
+# Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
+# moltoctl). Owns the scoped `rsa` dependency exception.
+molto2-rsakey = { path = "../molto2-rsakey", version = "0.1.0" }
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.29"

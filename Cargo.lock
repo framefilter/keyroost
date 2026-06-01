@@ -1762,6 +1762,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "molto2-rsakey"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "rsa",
+]
+
+[[package]]
 name = "molto2-transport"
 version = "0.1.0"
 dependencies = [
@@ -1784,9 +1792,8 @@ dependencies = [
  "molto2-openpgp",
  "molto2-proto",
  "molto2-resolve",
+ "molto2-rsakey",
  "molto2-transport",
- "rand",
- "rsa",
 ]
 
 [[package]]
@@ -1802,6 +1809,7 @@ dependencies = [
  "molto2-oath",
  "molto2-proto",
  "molto2-resolve",
+ "molto2-rsakey",
  "molto2-transport",
 ]
 

@@ -243,22 +243,25 @@ impl OpenPgpSession {
         }
 
         let chunks = pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254);
-        self.transmit_chain("openpgp import key", &chunks)
+        self.transmit_chain("openpgp import key", &chunks).map(|_| ())
     }
 
-    /// Transmit an ISO 7816 command-chaining sequence: each chunk must be
-    /// accepted with `9000`; the final chunk's status word is the command
-    /// result. Used by [`import_key`](Self::import_key)'s chaining fallback.
+    /// Transmit an ISO 7816 command-chaining sequence: each intermediate chunk
+    /// must be accepted with `9000`; the final chunk's status word is the
+    /// command result, and its (reassembled) response payload is returned. Used
+    /// by the chaining fallbacks of [`import_key`](Self::import_key) (which
+    /// discards the empty payload) and [`decrypt`](Self::decrypt).
     fn transmit_chain(
         &mut self,
         label: &'static str,
         chunks: &[Vec<u8>],
-    ) -> Result<(), TransportError> {
+    ) -> Result<Vec<u8>, TransportError> {
         let last = chunks.len().saturating_sub(1);
         for (i, chunk) in chunks.iter().enumerate() {
-            let (_, sw) = self.transmit_full(chunk)?;
+            let (data, sw) = self.transmit_full(chunk)?;
             if i == last {
-                return ok_or_apdu(label, sw);
+                ok_or_apdu(label, sw)?;
+                return Ok(data);
             }
             // An intermediate chain link the card didn't accept (anything but
             // 9000) aborts the chain.
@@ -270,7 +273,7 @@ impl OpenPgpSession {
                 });
             }
         }
-        Ok(()) // unreachable for a non-empty chunk list
+        Ok(Vec::new()) // unreachable for a non-empty chunk list
     }
 
     /// Read and parse the RSA algorithm attributes for `crt`'s slot from the
@@ -304,6 +307,50 @@ impl OpenPgpSession {
         let (sig, sw) = self.transmit_full(&pgp::pso_compute_signature(digest_info))?;
         ok_or_apdu("openpgp compute signature", sw)?;
         Ok(sig)
+    }
+
+    /// Decrypt an RSA `cryptogram` with the on-card decryption key
+    /// (PSO:DECIPHER) and return the recovered plaintext. `cryptogram` is the
+    /// raw RSA-encrypted value (for RSA-2048, 256 bytes — e.g. a PKCS#1 v1.5
+    /// type-2 block raised to the public exponent under the slot's modulus); the
+    /// card applies the private key and strips the PKCS#1 padding. Requires PW1
+    /// verified in the "other"/decipher context ([`molto2_openpgp::PW1_OTHER`]);
+    /// on a YubiKey it also needs a touch.
+    ///
+    /// The RSA cipher DO is a `0x00` padding-indicator byte followed by the
+    /// cryptogram (257 bytes for RSA-2048), which exceeds the short-APDU limit,
+    /// so this sends an extended-length APDU and falls back to ISO command
+    /// chaining on `6700` / `6883` — the same strategy as
+    /// [`import_key`](Self::import_key). `MOLTO_OPENPGP_FORCE_CHAINING` forces
+    /// the chaining path for testing.
+    pub fn decrypt(&mut self, cryptogram: &[u8]) -> Result<Vec<u8>, TransportError> {
+        // RSA cipher DO: 0x00 padding-indicator byte + the cryptogram.
+        let mut data = Vec::with_capacity(1 + cryptogram.len());
+        data.push(0x00);
+        data.extend_from_slice(cryptogram);
+
+        if std::env::var_os("MOLTO_OPENPGP_FORCE_CHAINING").is_none() {
+            let (plain, sw) = self.transmit_full(&pgp::pso_decipher(&data))?;
+            if sw == pgp::SW_OK {
+                return Ok(plain);
+            }
+            // Only a length/chaining rejection warrants the fallback; any other
+            // SW (e.g. 6982 no PW1, 6A80 bad cryptogram) is a real error.
+            if sw != 0x6700 && sw != 0x6883 {
+                ok_or_apdu("openpgp decipher", sw)?;
+            }
+            if self.debug {
+                eprintln!(
+                    "! openpgp decipher: extended length rejected (SW={sw:04X}); \
+                     retrying with command chaining"
+                );
+            }
+        } else if self.debug {
+            eprintln!("! openpgp decipher: forcing command chaining (env override)");
+        }
+
+        let chunks = pgp::pso_decipher_chained(&data, 254);
+        self.transmit_chain("openpgp decipher", &chunks)
     }
 
     /// Write the cardholder name (`PUT DATA 005B`). Requires admin PIN (PW3)

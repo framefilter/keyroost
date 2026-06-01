@@ -9,6 +9,7 @@ members = [
     "crates/molto2-resolve",
     "crates/molto2-oath",
     "crates/molto2-openpgp",
+    "crates/molto2-rsakey",
     "crates/molto2-import",
     "crates/moltoctl",
     "crates/moltoui",
