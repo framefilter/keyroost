@@ -149,11 +149,14 @@ for the smartcard applets.
   end-to-end on the test YubiKey**: generate sign key → sign a message →
   independently checked with `pow(sig, e, n)` that the recovered EMSA-PKCS1-v1_5
   block is `00 01 FF.. 00 || DigestInfo` and the embedded SHA-1 equals the message
-  digest (`18d11190…`). Card reset to pristine after. SHA-1 is used because it's
-  the only in-tree hash; the card signs whatever DigestInfo it's handed, so the
-  private-key op is proven regardless (SHA-256 signing would need a vendored
-  SHA-256).
-  **Key import — root cause found & fixed in code; hardware re-test pending (2026-05-31).**
+  digest (`18d11190…`). Card reset to pristine after.
+  **SHA-256 signing DONE + hardware-verified (2026-05-31):** vendored a pure-Rust
+  `molto2_proto::sha256` (FIPS 180-4, NIST KATs incl. the 1e6-`a` vector), and
+  `openpgp sign` gained `--hash sha1|sha256` (default **sha256**) building the
+  matching PKCS#1 DigestInfo. Verified on the YubiKey: a `--hash sha256` signature
+  recovers (via `pow(sig,e,n)`) a well-formed SHA-256 DigestInfo whose digest
+  equals `sha256(message)`. SHA-1 stays available for old-verifier interop.
+  **Key import — DONE + hardware-verified (2026-05-31).**
   The earlier `SW=6A80` was **not** a CRT-vs-standard issue (an earlier
   hypothesis). The real bug was the `7F48` Cardholder Private Key Template
   *length-entry encoding*: we emitted each entry as a TLV whose **value** was the
@@ -185,9 +188,17 @@ for the smartcard applets.
   file verifies with `pow(sig,e,n)` recovering a well-formed EMSA-PKCS1-v1_5/SHA-1
   block whose digest equals `SHA1(message)`; and `gpg --card-status` independently
   reports the byte-identical Signature key fingerprint + serial 37806840. Card
-  reset to pristine afterward (all slots empty, PINs 3/0/3). Still TODO:
-  file-based import; SHA-256 sign; a command-chaining fallback if a future card
-  refuses extended-length APDUs.
+  reset to pristine afterward (all slots empty, PINs 3/0/3).
+  **Command-chaining fallback DONE + hardware-verified (2026-05-31):**
+  `molto2-openpgp` gained `put_data_odd_chained` / `import_rsa_key_chained` (ISO
+  command chaining: CLA `10` links + a final CLA `00`, 254-byte chunks matching
+  GnuPG); `OpenPgpSession::import_key` tries extended length first and falls back
+  to chaining on `6700`/`6883` (a `MOLTO_OPENPGP_FORCE_CHAINING` env hook forces
+  the path for testing). KAT-locked (chunks reassemble byte-identically to the
+  extended-length data field). Verified on the YubiKey by forcing the chaining
+  path: two links `10 DB 3F FF FE …` + `00 DB 3F FF 1B …` both `9000`, key
+  imported and registered. Still TODO: file-based import (parse a PEM/PKCS#8 key
+  rather than only `--generate`).
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement

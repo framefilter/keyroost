@@ -215,9 +215,62 @@ impl OpenPgpSession {
         key: &pgp::RsaPrivateKeyParts,
     ) -> Result<(), TransportError> {
         let attrs = self.rsa_attributes(crt)?;
-        let apdu = pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits);
-        let (_, sw) = self.transmit_full(&apdu)?;
-        ok_or_apdu("openpgp import key", sw)
+
+        // Setting MOLTO_OPENPGP_FORCE_CHAINING forces the command-chaining path
+        // (so the fallback can be exercised on a card that also accepts extended
+        // length, e.g. for verification). Otherwise: extended length first.
+        if std::env::var_os("MOLTO_OPENPGP_FORCE_CHAINING").is_none() {
+            let apdu = pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits);
+            let (_, sw) = self.transmit_full(&apdu)?;
+            if sw == pgp::SW_OK {
+                return Ok(());
+            }
+            // `6700` (wrong length) / `6883` (last command of chain expected)
+            // mean the card/reader won't take a single extended-`Lc` APDU — fall
+            // back to ISO command chaining. Any other SW is a genuine error
+            // (e.g. `6A80` bad data, `6982` no PW3) and is surfaced as-is.
+            if sw != 0x6700 && sw != 0x6883 {
+                return ok_or_apdu("openpgp import key", sw);
+            }
+            if self.debug {
+                eprintln!(
+                    "! openpgp import: extended length rejected (SW={sw:04X}); \
+                     retrying with command chaining"
+                );
+            }
+        } else if self.debug {
+            eprintln!("! openpgp import: forcing command chaining (env override)");
+        }
+
+        let chunks = pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254);
+        self.transmit_chain("openpgp import key", &chunks)
+    }
+
+    /// Transmit an ISO 7816 command-chaining sequence: each chunk must be
+    /// accepted with `9000`; the final chunk's status word is the command
+    /// result. Used by [`import_key`](Self::import_key)'s chaining fallback.
+    fn transmit_chain(
+        &mut self,
+        label: &'static str,
+        chunks: &[Vec<u8>],
+    ) -> Result<(), TransportError> {
+        let last = chunks.len().saturating_sub(1);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let (_, sw) = self.transmit_full(chunk)?;
+            if i == last {
+                return ok_or_apdu(label, sw);
+            }
+            // An intermediate chain link the card didn't accept (anything but
+            // 9000) aborts the chain.
+            if sw != pgp::SW_OK {
+                return Err(TransportError::Apdu {
+                    label,
+                    sw1: (sw >> 8) as u8,
+                    sw2: sw as u8,
+                });
+            }
+        }
+        Ok(()) // unreachable for a non-empty chunk list
     }
 
     /// Read and parse the RSA algorithm attributes for `crt`'s slot from the

@@ -919,6 +919,59 @@ pub fn import_rsa_key(
     build_apdu_extended(0x00, INS_PUT_DATA_ODD, 0x3F, 0xFF, &header_list)
 }
 
+/// Build an "odd" PUT DATA (`0xDB`) as an **ISO 7816 command-chaining**
+/// sequence: split `data` into chunks of at most `max_chunk` bytes, every chunk
+/// but the last carrying the chaining class bit (CLA `0x10`) and the final one
+/// CLA `0x00`. Each chunk is a case-3 APDU `CLA DB <p1> <p2> <Lc> <chunk>`.
+///
+/// This is the fallback to the single extended-length APDU ([`import_rsa_key`])
+/// for cards/readers that don't accept an extended `Lc`. GnuPG uses 254-byte
+/// chunks here (`exmode = -254`); pass `max_chunk = 254` to match. The card
+/// reassembles the chunks into one logical command, so the reassembled bodies
+/// are byte-identical to the extended-length APDU's data field.
+///
+/// # Panics
+/// Panics if `max_chunk` is 0 or greater than 255 (a single-byte `Lc` can't
+/// exceed 255).
+#[must_use]
+pub fn put_data_odd_chained(p1: u8, p2: u8, data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
+    assert!(
+        (1..=255).contains(&max_chunk),
+        "command-chaining chunk size must be 1..=255"
+    );
+    if data.is_empty() {
+        return vec![vec![0x00, INS_PUT_DATA_ODD, p1, p2, 0x00]];
+    }
+    let chunks: Vec<&[u8]> = data.chunks(max_chunk).collect();
+    let last = chunks.len() - 1;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let cla = if i < last { 0x10 } else { 0x00 };
+            let mut apdu = Vec::with_capacity(5 + chunk.len());
+            apdu.extend_from_slice(&[cla, INS_PUT_DATA_ODD, p1, p2, chunk.len() as u8]);
+            apdu.extend_from_slice(chunk);
+            apdu
+        })
+        .collect()
+}
+
+/// Command-chaining form of [`import_rsa_key`]: the same `4D` Extended Header
+/// List, but emitted as a sequence of chained `0xDB` PUT DATA APDUs (see
+/// [`put_data_odd_chained`]) instead of one extended-length APDU.
+#[must_use]
+pub fn import_rsa_key_chained(
+    crt: KeyCrt,
+    key: &RsaPrivateKeyParts,
+    format: RsaImportFormat,
+    e_bits: u16,
+    max_chunk: usize,
+) -> Vec<Vec<u8>> {
+    let header_list = extended_header_list(crt, key, format, e_bits);
+    put_data_odd_chained(0x3F, 0xFF, &header_list, max_chunk)
+}
+
 // ---------------------------------------------------------------------------
 // BER-TLV parsing
 // ---------------------------------------------------------------------------
@@ -2110,5 +2163,61 @@ mod tests {
         // EHL = 281 bytes = 0x0119. APDU = 00 DB 3F FF 00 01 19 <281> (odd PUT DATA).
         assert_eq!(&apdu[..7], &[0x00, 0xDB, 0x3F, 0xFF, 0x00, 0x01, 0x19]);
         assert_eq!(apdu.len(), 7 + 281);
+    }
+
+    // --- Key import: command-chaining fallback ---------------------------
+
+    #[test]
+    fn put_data_odd_chained_multi_chunk() {
+        // 300 bytes, 254-byte chunks -> two chunks (254 + 46).
+        let data: Vec<u8> = (0..300u16).map(|i| i as u8).collect();
+        let chunks = put_data_odd_chained(0x3F, 0xFF, &data, 254);
+        assert_eq!(chunks.len(), 2);
+        // Non-final chunk: chaining class bit (CLA 0x10), Lc 0xFE (254).
+        assert_eq!(&chunks[0][..5], &[0x10, 0xDB, 0x3F, 0xFF, 0xFE]);
+        assert_eq!(chunks[0].len(), 5 + 254);
+        // Final chunk: CLA 0x00, Lc 0x2E (46 = 300 - 254).
+        assert_eq!(&chunks[1][..5], &[0x00, 0xDB, 0x3F, 0xFF, 0x2E]);
+        assert_eq!(chunks[1].len(), 5 + 46);
+        // Reassembled chunk bodies equal the original data.
+        let body: Vec<u8> = chunks.iter().flat_map(|c| c[5..].iter().copied()).collect();
+        assert_eq!(body, data);
+    }
+
+    #[test]
+    fn put_data_odd_chained_single_chunk_clears_chain_bit() {
+        let data = [0xAAu8; 10];
+        let chunks = put_data_odd_chained(0x3F, 0xFF, &data, 254);
+        assert_eq!(chunks.len(), 1);
+        // A lone chunk is the final chunk: CLA 0x00, no chaining bit.
+        assert_eq!(&chunks[0][..5], &[0x00, 0xDB, 0x3F, 0xFF, 0x0A]);
+        assert_eq!(&chunks[0][5..], &data);
+    }
+
+    #[test]
+    fn import_chained_reassembles_to_extended_body() {
+        // The chained chunks' bodies must reassemble to exactly the
+        // extended-length APDU's data field (the 4D Extended Header List), so
+        // the two transport paths present the card byte-identical key material.
+        let e = [0x01u8, 0x00, 0x01];
+        let f = [0xAAu8; 128];
+        let key = RsaPrivateKeyParts {
+            e: &e,
+            p: &f,
+            q: &f,
+            u: &[],
+            dp: &[],
+            dq: &[],
+            n: &[],
+        };
+        let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
+        let chunks =
+            import_rsa_key_chained(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17, 254);
+        // EHL is 281 bytes -> 254 + 27 = two chunks.
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0][0], 0x10); // chaining bit set on the non-final link
+        assert_eq!(chunks[1][0], 0x00); // cleared on the final link
+        let body: Vec<u8> = chunks.iter().flat_map(|c| c[5..].iter().copied()).collect();
+        assert_eq!(body, ehl);
     }
 }
