@@ -22,10 +22,12 @@ See `docs/PROTOCOL.md` and `CLAUDE.md` for the existing protocol layer.
 
 ## Naming policy
 
-`molto2-*` crate names and `moltoctl` / `moltoui` binary names stay for
-now. A rename to something neutral (e.g. `keytool-*`) happens once the
-FIDO2 work is far enough along that the new identity is obvious — not
-before.
+The rename trigger ("once the FIDO2 work is far enough along that the new
+identity is obvious") is now **met** — Phases 0–4 (FIDO2, OATH, OpenPGP) plus
+friendly-name selection are all done, so the project is no longer a Molto2-only
+tool. The chosen name is **`keyroost`**. See **Phase 5 — Rename to keyroost**
+below for the planned scope; until that lands, the existing `molto2-*` crate
+names and `moltoctl` / `moltoui` binary names remain in place.
 
 ## Phases
 
@@ -245,6 +247,29 @@ for the smartcard applets.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
   the 132-char keyboard OTP applet; HMAC challenge-response is folded into
   the OATH/secrets app. Revisit only if we target actual YubiKeys.
+- **Phase 5 — Rename to `keyroost` (planned).** The tool has outgrown its
+  Molto2-only origin (it now manages FIDO2, OATH, and OpenPGP across YubiKey /
+  Solo 2 / Nitrokey 3), so the project takes the neutral name **`keyroost`**.
+  This is a mechanical-but-wide rename; do it on its own branch as the last step
+  before broadening scope further, so the churn doesn't tangle with feature work.
+  Scope to cover:
+  - **Repo / project:** `framefilter/MoltoUI` → `framefilter/keyroost` (GitHub
+    rename keeps a redirect from the old URL); update the workspace `repository`
+    field and the `MoltoUI` references in `CLAUDE.md` and `docs/`.
+  - **Binaries:** `moltoctl` / `moltoui` → new names. *Decision needed* — leading
+    proposal: `keyroost` (GUI) + `keyroostctl` (CLI), or keep a `-gui`/`-cli`
+    split. Update `[[bin]]` names and the `~/.local/bin` PATH symlink.
+  - **Crates:** the general-purpose crates (`molto2-hid`, `-ctap`, `-oath`,
+    `-openpgp`, `-keyring`, `-resolve`, `-rsakey`, `-import`) move to a
+    `keyroost-*` prefix. *Decision needed* — the genuinely device-specific crates
+    (`molto2-proto`, `molto2-transport`: the Molto2 wire protocol + session) may
+    *keep* the `molto2-` name since they really are about the Molto2 device, or
+    move too for uniformity. Renaming a package means updating its `name`, every
+    path-dependency reference, and all `use molto2_*` / `molto2_*::` call sites.
+  - **Mechanics:** rename per crate, fix `Cargo.toml` package names + path deps,
+    sweep `use`/path references, rebuild, keep the 217-test suite + clippy green
+    at each step. Keep host/env specifics out of commit messages (per `CLAUDE.md`).
+  - **Not in scope:** behavior changes — this is rename-only.
 
 **Phase 3 gating question — RESOLVED (2026-05-29, on hardware).** The PC/SC-reuse
 plan holds, and better than hoped: the Solo 2 *does* expose a usable USB CCID
@@ -419,8 +444,10 @@ compression doesn't lose it:
 ## Non-goals (for now)
 
 - Cross-platform support (macOS/Windows) before the Linux story works.
-- Renaming the project off the `molto2-*` prefix.
 - A web UI or background daemon.
+
+(The earlier non-goal "renaming the project off the `molto2-*` prefix" is now a
+planned task — see **Phase 5 — Rename to keyroost**.)
 
 ## Deferred follow-ups (not blocking, revisit with hardware)
 
