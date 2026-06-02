@@ -1,8 +1,8 @@
-# MoltoUI
+# keyroost
 
 An independent, open-source toolchain for programming the Token2 Molto2 / Molto2v2
-programmable TOTP hardware token. Ships a Rust library, a CLI (`moltoctl`), and a
-dark-themed desktop GUI (`moltoui`).
+programmable TOTP hardware token. Ships a Rust library, a CLI (`keyroostctl`), and a
+dark-themed desktop GUI (`keyroost`).
 
 > **Not affiliated with or endorsed by Token2 Sàrl.** This project is an independent
 > implementation. The wire protocol was determined from observation of the device
@@ -13,7 +13,7 @@ dark-themed desktop GUI (`moltoui`).
 
 ## Features
 
-- Program one slot from an `otpauth://` URI (`moltoctl import`)
+- Program one slot from an `otpauth://` URI (`keyroostctl import`)
 - Bulk-import from Aegis (plaintext or encrypted), 2FAS plaintext, or any list of
   `otpauth://` URIs (Authy via third-party extractors). Encrypted Aegis vaults
   are decrypted in-process via scrypt + AES-256-GCM.
@@ -26,10 +26,10 @@ dark-themed desktop GUI (`moltoui`).
 ## Install
 
 ```bash
-cargo install --git https://github.com/framefilter/moltoui moltoctl moltoui
+cargo install --git https://github.com/framefilter/keyroost keyroostctl keyroost
 ```
 
-(Once published to crates.io: `cargo install moltoctl moltoui`.)
+(Once published to crates.io: `cargo install keyroostctl keyroost`.)
 
 ### Linux prerequisite
 
@@ -47,36 +47,36 @@ macOS and Windows have PC/SC built into the OS; nothing to install.
 
 ```bash
 # show device info (no auth needed)
-moltoctl info
+keyroostctl info
 
 # program a single slot from a URI
-moltoctl import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3PXP'
+keyroostctl import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3PXP'
 
 # bulk-import a plaintext Aegis or 2FAS export
-moltoctl import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate
-moltoctl import-file ~/Downloads/aegis.json --start 0             # program
+keyroostctl import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate
+keyroostctl import-file ~/Downloads/aegis.json --start 0             # program
 
 # encrypted Aegis vault: pipe the password in
-pass otp/aegis | moltoctl import-file ~/Downloads/aegis.json --start 0 --password-stdin
+pass otp/aegis | keyroostctl import-file ~/Downloads/aegis.json --start 0 --password-stdin
 # or via env var
-AEGIS_PW="…" moltoctl import-file ~/Downloads/aegis.json --start 0 --password-env AEGIS_PW
+AEGIS_PW="…" keyroostctl import-file ~/Downloads/aegis.json --start 0 --password-env AEGIS_PW
 
 # sync time on all profiles
-moltoctl sync-time --all
+keyroostctl sync-time --all
 
 # launch the GUI
-moltoui
+keyroost
 ```
 
 ## Workspace layout
 
 | Crate | Description | External deps |
 |---|---|---|
-| `molto2-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
-| `molto2-transport` | PC/SC reader discovery, session, auth handshake | `pcsc` |
-| `molto2-import` | `otpauth://` parser, plus optional Aegis/2FAS bulk parsers | `serde`, `serde_json` (behind `bulk` feature) |
-| `moltoctl` | Drop-in CLI replacement for `molto2.py` | `clap` |
-| `moltoui` | Desktop GUI | `eframe`, `egui` |
+| `keyroost-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
+| `keyroost-transport` | PC/SC reader discovery, session, auth handshake | `pcsc` |
+| `keyroost-import` | `otpauth://` parser, plus optional Aegis/2FAS bulk parsers | `serde`, `serde_json` (behind `bulk` feature) |
+| `keyroostctl` | Drop-in CLI replacement for `molto2.py` | `clap` |
+| `keyroost` | Desktop GUI | `eframe`, `egui` |
 
 ## Protocol
 

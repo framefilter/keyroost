@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/molto2-proto",
-    "crates/molto2-transport",
-    "crates/molto2-hid",
-    "crates/molto2-ctap",
-    "crates/molto2-keyring",
-    "crates/molto2-resolve",
-    "crates/molto2-oath",
-    "crates/molto2-openpgp",
-    "crates/molto2-rsakey",
-    "crates/molto2-import",
-    "crates/moltoctl",
-    "crates/moltoui",
+    "crates/keyroost-proto",
+    "crates/keyroost-transport",
+    "crates/keyroost-hid",
+    "crates/keyroost-ctap",
+    "crates/keyroost-keyring",
+    "crates/keyroost-resolve",
+    "crates/keyroost-oath",
+    "crates/keyroost-openpgp",
+    "crates/keyroost-rsakey",
+    "crates/keyroost-import",
+    "crates/keyroostctl",
+    "crates/keyroost",
 ]
 
 [workspace.package]
@@ -20,7 +20,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/framefilter/moltoui"
+repository = "https://github.com/framefilter/keyroost"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

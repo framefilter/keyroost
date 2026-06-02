@@ -1,4 +1,4 @@
-# Context for Claude Code agents working on MoltoUI
+# Context for Claude Code agents working on keyroost
 
 ## What this repository is
 
@@ -9,17 +9,17 @@ tool. Workspace contains:
 
 | Crate | Purpose | External deps |
 |---|---|---|
-| `molto2-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
-| `molto2-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets | `pcsc` |
-| `molto2-hid` | USB HID enumeration of FIDO devices via sysfs | none |
-| `molto2-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt | none |
-| `molto2-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | none |
-| `molto2-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
-| `molto2-keyring` | Friendly-name registry (`keys.json`); serial matching, no hardware | `serde`, `serde_json` |
-| `molto2-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
-| `molto2-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers | `serde`, `serde_json` (behind `bulk` feature) |
-| `moltoctl` | CLI binary | `clap` |
-| `moltoui` | egui desktop GUI | `eframe`, `egui` |
+| `keyroost-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
+| `keyroost-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets | `pcsc` |
+| `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs | none |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt | none |
+| `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | none |
+| `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
+| `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching, no hardware | `serde`, `serde_json` |
+| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
+| `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers | `serde`, `serde_json` (behind `bulk` feature) |
+| `keyroostctl` | CLI binary | `clap` |
+| `keyroost` | egui desktop GUI | `eframe`, `egui` |
 
 ## Where to start reading
 
@@ -29,7 +29,7 @@ tool. Workspace contains:
 2. **`docs/BRINGUP.md`** — step-by-step plan for first-time hardware bring-up.
    This is the runbook the user wants to execute. Steps 1–4 are read-only or
    write to slot #99 only; steps 5+ are progressively riskier.
-3. **`crates/molto2-proto/src/`** — the protocol layer is the cleanest place
+3. **`crates/keyroost-proto/src/`** — the protocol layer is the cleanest place
    to understand command construction. Start with `commands.rs`.
 
 ## The user's immediate goal
@@ -38,20 +38,20 @@ Program their Molto2 from a machine they control, with Claude Code running
 locally so debug output and APDU hex traces can be diagnosed in-context. The
 workflow during bring-up is:
 
-1. User runs `moltoctl --debug <subcommand>`.
+1. User runs `keyroostctl --debug <subcommand>`.
 2. If something looks wrong (status word other than `9000`, garbled response,
    wrong on-device behavior), agent diffs the captured hex against
    `docs/PROTOCOL.md` and edits the offset / framing in either
-   `crates/molto2-transport/src/lib.rs::read_info` or
-   `crates/molto2-proto/src/commands.rs`.
+   `crates/keyroost-transport/src/lib.rs::read_info` or
+   `crates/keyroost-proto/src/commands.rs`.
 3. `cargo build --release` and retry. The binary is exposed on PATH via a
-   symlink (`~/.local/bin/moltoctl -> target/release/moltoctl`), so a rebuild is
+   symlink (`~/.local/bin/keyroostctl -> target/release/keyroostctl`), so a rebuild is
    live immediately — no copy step. (`~/bin` is intentionally not used; on this
    Debian box `~/.cargo/bin` and `~/.local/bin` are already on PATH.)
 
 ## Known soft spots — most likely places for first-contact bugs
 
-- **`read_info()` response parsing** in `molto2-transport/src/lib.rs`. The
+- **`read_info()` response parsing** in `keyroost-transport/src/lib.rs`. The
   3-byte preamble and 2-byte separator are taken on faith from the reference
   Python script; the real bytes might be structured differently.
 - **`get info` length field.** We treat `info[3]` as the serial-string length.
@@ -73,7 +73,7 @@ workflow during bring-up is:
 - **No documentation files unless explicitly asked.** The two files in `docs/`
   exist for legal posture and bring-up; don't add more without asking.
 - **Tests first when changing the protocol layer.** The known-answer suite in
-  `crates/molto2-proto/tests/known_answer_vs_python.rs` locks in byte-level
+  `crates/keyroost-proto/tests/known_answer_vs_python.rs` locks in byte-level
   agreement with an independent third-party SM4 implementation. Any change to
   command construction must keep those tests green or be paired with a written
   justification for the new expected bytes.
@@ -86,11 +86,11 @@ workflow during bring-up is:
 cargo test --workspace --offline
 
 # CLI
-cargo run -p moltoctl -- --help
-cargo run -p moltoctl -- --debug info
+cargo run -p keyroostctl -- --help
+cargo run -p keyroostctl -- --debug info
 
 # GUI
-cargo run -p moltoui
+cargo run -p keyroost
 ```
 
 ## Commit style
@@ -106,7 +106,7 @@ host secrets as untouchable. A PreToolUse hook (`.claude/hooks/guard.sh`)
 enforces the rules below; **don't try to work around the guard** — if it
 blocks something, that's intended.
 
-- **Destructive FIDO ops** (`moltoctl fido-reset`, `fido-creds-delete`) are
+- **Destructive FIDO ops** (`keyroostctl fido-reset`, `fido-creds-delete`) are
   irreversible. This checkout is used only with disposable **test keys**, so
   the guard no longer blocks them — still treat them with care and never point
   them at a security key in real use.
@@ -119,5 +119,5 @@ blocks something, that's intended.
 - **Credential listings are private.** `fido-creds-list` reveals which services
   the user has accounts with. Don't run it speculatively; if the user shares
   output, don't echo usernames / RP names beyond what the task needs.
-- **Safe to run freely against any key:** `moltoctl list`, `moltoctl fido-info`,
-  `moltoctl fido-pin-retries` (read-only, no PIN, no counter change).
+- **Safe to run freely against any key:** `keyroostctl list`, `keyroostctl fido-info`,
+  `keyroostctl fido-pin-retries` (read-only, no PIN, no counter change).

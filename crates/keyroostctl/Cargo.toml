@@ -1,0 +1,31 @@
+[package]
+name = "keyroostctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line tool for programming Token2 Molto2 / Molto2v2 TOTP tokens."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "keyroostctl"
+path = "src/main.rs"
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.1.0" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.1.0" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.1.0" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.1.0" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.1.0" }
+keyroost-resolve = { path = "../keyroost-resolve", version = "0.1.0" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.1.0" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.1.0" }
+keyroost-import = { path = "../keyroost-import", version = "0.1.0", features = ["bulk", "encrypted"] }
+# Host-side RSA keygen / key-file loading for OpenPGP on-card import. Shared with
+# keyroost; owns the workspace's scoped `rsa` dependency exception so the protocol
+# crates stay dependency-free (see that crate's Cargo.toml).
+keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.1.0" }
+clap = { version = "4", features = ["derive"] }

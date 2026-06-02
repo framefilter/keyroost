@@ -2,11 +2,11 @@
 
 This document describes the wire protocol the Molto2 device speaks, as observed
 from the running hardware. It is provided so that contributors can work on
-MoltoUI without reading any third-party source code. All facts here describe
+keyroost without reading any third-party source code. All facts here describe
 behaviour of the Token2 device itself; none of it is copyrighted by anyone.
 
 > **Status:** the algorithm and APDU layouts below are confirmed by byte-for-byte
-> agreement between MoltoUI's protocol layer and an independent third-party SM4
+> agreement between keyroost's protocol layer and an independent third-party SM4
 > implementation (`gmssl`). Hardware confirmation is still pending for response
 > layouts (notably `get info`).
 
@@ -141,7 +141,7 @@ with the same `D4 01 <profile>` header.
 the user to press the up-arrow button to commit. Both `factory_reset` and
 `set_customer_key` return it. Observed on real hardware during bring-up.
 
-MoltoUI surfaces auth failures specifically (`TransportError::AuthFailed`) so
+keyroost surfaces auth failures specifically (`TransportError::AuthFailed`) so
 they can be retried; everything else becomes `TransportError::Apdu { sw1, sw2 }`.
 
 ## Known unknowns
@@ -149,7 +149,7 @@ they can be retried; everything else becomes `TransportError::Apdu { sw1, sw2 }`
 1. **Slot read-back.** No `0x80` plain command is known to return a profile's
    seed or settings. The customer-key-protected read APDU (if it exists) hasn't
    been confirmed. Until we have hardware traces from Token2's Windows tool,
-   MoltoUI treats slots as write-only and tracks state in a local sidecar.
+   keyroost treats slots as write-only and tracks state in a local sidecar.
 2. **Screen lock / unlock.** Token2's reference Python script attempts these
    via `INS 0xD8 P1=0x0C P2=0x02`, but the unlock case there is mis-framed and
    probably doesn't work as written. Skipped until verified.
@@ -161,4 +161,4 @@ they can be retried; everything else becomes `TransportError::Apdu { sw1, sw2 }`
    for it and no UI for it.
 
 Contributions adding hardware traces / probing results are welcome — see the
-`moltoctl probe` work item in the README roadmap.
+`keyroostctl probe` work item in the README roadmap.

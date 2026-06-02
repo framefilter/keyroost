@@ -1541,6 +1541,122 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "keyroost-ctap",
+ "keyroost-hid",
+ "keyroost-import",
+ "keyroost-keyring",
+ "keyroost-oath",
+ "keyroost-proto",
+ "keyroost-resolve",
+ "keyroost-rsakey",
+ "keyroost-transport",
+]
+
+[[package]]
+name = "keyroost-ctap"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "hmac",
+ "keyroost-hid",
+ "p256",
+ "rand_core",
+ "sha2",
+]
+
+[[package]]
+name = "keyroost-hid"
+version = "0.1.0"
+
+[[package]]
+name = "keyroost-import"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "base64",
+ "keyroost-proto",
+ "scrypt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "keyroost-keyring"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "keyroost-oath"
+version = "0.1.0"
+dependencies = [
+ "keyroost-proto",
+]
+
+[[package]]
+name = "keyroost-openpgp"
+version = "0.1.0"
+dependencies = [
+ "keyroost-proto",
+]
+
+[[package]]
+name = "keyroost-proto"
+version = "0.1.0"
+
+[[package]]
+name = "keyroost-resolve"
+version = "0.1.0"
+dependencies = [
+ "keyroost-hid",
+ "keyroost-keyring",
+ "keyroost-transport",
+]
+
+[[package]]
+name = "keyroost-rsakey"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "rsa",
+]
+
+[[package]]
+name = "keyroost-transport"
+version = "0.1.0"
+dependencies = [
+ "keyroost-oath",
+ "keyroost-openpgp",
+ "keyroost-proto",
+ "pcsc",
+]
+
+[[package]]
+name = "keyroostctl"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "keyroost-ctap",
+ "keyroost-hid",
+ "keyroost-import",
+ "keyroost-keyring",
+ "keyroost-oath",
+ "keyroost-openpgp",
+ "keyroost-proto",
+ "keyroost-resolve",
+ "keyroost-rsakey",
+ "keyroost-transport",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1695,122 +1811,6 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
-]
-
-[[package]]
-name = "molto2-ctap"
-version = "0.1.0"
-dependencies = [
- "aes",
- "cbc",
- "hmac",
- "molto2-hid",
- "p256",
- "rand_core",
- "sha2",
-]
-
-[[package]]
-name = "molto2-hid"
-version = "0.1.0"
-
-[[package]]
-name = "molto2-import"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "base64",
- "molto2-proto",
- "scrypt",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "molto2-keyring"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "molto2-oath"
-version = "0.1.0"
-dependencies = [
- "molto2-proto",
-]
-
-[[package]]
-name = "molto2-openpgp"
-version = "0.1.0"
-dependencies = [
- "molto2-proto",
-]
-
-[[package]]
-name = "molto2-proto"
-version = "0.1.0"
-
-[[package]]
-name = "molto2-resolve"
-version = "0.1.0"
-dependencies = [
- "molto2-hid",
- "molto2-keyring",
- "molto2-transport",
-]
-
-[[package]]
-name = "molto2-rsakey"
-version = "0.1.0"
-dependencies = [
- "rand",
- "rsa",
-]
-
-[[package]]
-name = "molto2-transport"
-version = "0.1.0"
-dependencies = [
- "molto2-oath",
- "molto2-openpgp",
- "molto2-proto",
- "pcsc",
-]
-
-[[package]]
-name = "moltoctl"
-version = "0.1.0"
-dependencies = [
- "clap",
- "molto2-ctap",
- "molto2-hid",
- "molto2-import",
- "molto2-keyring",
- "molto2-oath",
- "molto2-openpgp",
- "molto2-proto",
- "molto2-resolve",
- "molto2-rsakey",
- "molto2-transport",
-]
-
-[[package]]
-name = "moltoui"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "egui",
- "molto2-ctap",
- "molto2-hid",
- "molto2-import",
- "molto2-keyring",
- "molto2-oath",
- "molto2-proto",
- "molto2-resolve",
- "molto2-rsakey",
- "molto2-transport",
 ]
 
 [[package]]

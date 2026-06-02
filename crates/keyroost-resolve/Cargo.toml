@@ -1,0 +1,16 @@
+[package]
+name = "keyroost-resolve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared security-key identity resolution (USB + CCID serials) over the keyring."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.1.0" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.1.0" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.1.0" }

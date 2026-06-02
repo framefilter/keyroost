@@ -1,0 +1,26 @@
+[package]
+name = "keyroost-ctap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CTAP HID transport, CBOR codec, and high-level CTAP2 commands for FIDO authenticators."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-hid = { path = "../keyroost-hid", version = "0.1.0" }
+# Phase 2 crypto: PIN protocol uses P-256 ECDH, AES-256-CBC, HMAC-SHA-256.
+# Vendoring all of this would be ~1500 LOC of unaudited primitives; sha2 is
+# already pulled in transitively by p256, so adding the rest explicitly costs
+# only `hmac`/`aes`/`cbc` (each <1000 LOC, all RustCrypto-audited).
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
+# OsRng for ephemeral keypair + AES IVs. p256 re-exports rand_core but the
+# OsRng inside it is gated behind rand_core's `getrandom` feature.
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }

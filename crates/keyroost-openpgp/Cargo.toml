@@ -1,0 +1,14 @@
+[package]
+name = "keyroost-openpgp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenPGP Card (v3.4) APDU command/response layer."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.1.0" }

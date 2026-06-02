@@ -1,0 +1,14 @@
+[package]
+name = "keyroost-oath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Yubico/Trussed OATH (TOTP/HOTP) applet protocol over APDU."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.1.0" }

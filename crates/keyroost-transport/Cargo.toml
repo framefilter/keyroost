@@ -1,0 +1,17 @@
+[package]
+name = "keyroost-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PC/SC transport for the Token2 Molto2 / Molto2v2 programmable TOTP token."
+
+[lints]
+workspace = true
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.1.0" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.1.0" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.1.0" }
+pcsc = "2"

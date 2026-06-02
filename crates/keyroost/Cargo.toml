@@ -1,0 +1,30 @@
+[package]
+name = "keyroost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop GUI for programming Token2 Molto2 / Molto2v2 TOTP tokens."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "keyroost"
+path = "src/main.rs"
+
+[dependencies]
+keyroost-proto = { path = "../keyroost-proto", version = "0.1.0" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.1.0" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.1.0" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.1.0" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.1.0" }
+keyroost-resolve = { path = "../keyroost-resolve", version = "0.1.0" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.1.0" }
+keyroost-import = { path = "../keyroost-import", version = "0.1.0", features = ["bulk", "encrypted"] }
+# Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
+# keyroostctl). Owns the scoped `rsa` dependency exception.
+keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.1.0" }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"

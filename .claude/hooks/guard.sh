@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PreToolUse guard for MoltoUI.
+# PreToolUse guard for keyroost.
 #
 # A deterministic, enforced backstop that runs BEFORE Claude Code executes a
 # Bash or Read tool call. Exit code 2 blocks the call and feeds the message

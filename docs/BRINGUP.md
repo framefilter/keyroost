@@ -1,6 +1,6 @@
 # Hardware bring-up plan for a real Molto2 / Molto2v2
 
-This document is for the first time you connect a real Molto2 to MoltoUI. The
+This document is for the first time you connect a real Molto2 to keyroost. The
 goal is to surface any wire-format mismatch quickly and with actionable output.
 Run each step in order; the riskier writes come last and target an isolated
 slot (#99).
@@ -26,7 +26,7 @@ Then build:
 cargo build --release
 ```
 
-The `moltoctl` binary will be at `target/release/moltoctl`. Either copy it
+The `keyroostctl` binary will be at `target/release/keyroostctl`. Either copy it
 onto your `$PATH` or invoke it from there.
 
 ## Step 1: PC/SC sees the device
@@ -34,7 +34,7 @@ onto your `$PATH` or invoke it from there.
 Plug the Molto2 in, then:
 
 ```bash
-moltoctl --list-readers
+keyroostctl --list-readers
 ```
 
 **Expected:** one line containing "TOKEN2" (case may vary, e.g. `TOKEN2 Molto2 [CCID Interface] 00 00`).
@@ -42,12 +42,12 @@ moltoctl --list-readers
 **If it fails:**
 - *"PC/SC service is unavailable"* — start the service (`sudo systemctl start pcscd` on Linux). On macOS this shouldn't happen.
 - *No reader matching "TOKEN2"* but other readers shown — paste the full output. We can widen the matcher.
-- *Empty list* — confirm with `pcsc_scan` (Linux) that PC/SC sees any reader at all. If not, it's a system-level USB / udev problem, not a MoltoUI one.
+- *Empty list* — confirm with `pcsc_scan` (Linux) that PC/SC sees any reader at all. If not, it's a system-level USB / udev problem, not a keyroost one.
 
 ## Step 2: Read serial and time (no auth required)
 
 ```bash
-moltoctl --debug info
+keyroostctl --debug info
 ```
 
 **Expected stderr** (something like — the actual hex is device-dependent):
@@ -69,14 +69,14 @@ device UTC:    1699999284 (epoch)
 2. The 4th byte (the length field) should be reasonable — typically `08`.
 3. The UTC time on stdout should be roughly the device's clock (compare to a watch; close enough for a write-only device).
 
-**If the parsed serial looks garbled or the time is nonsensical** the response layout in `read_info()` is wrong. Paste the full `--debug` line and the parsed output and we'll fix the offsets in `crates/molto2-transport/src/lib.rs`.
+**If the parsed serial looks garbled or the time is nonsensical** the response layout in `read_info()` is wrong. Paste the full `--debug` line and the parsed output and we'll fix the offsets in `crates/keyroost-transport/src/lib.rs`.
 
 ## Step 3: Authenticate with the default customer key
 
 Factory-fresh devices use `TOKEN2MOLTO1-KEY`.
 
 ```bash
-moltoctl --debug --key-ascii TOKEN2MOLTO1-KEY set-title --profile 99 "MOLTO_TEST"
+keyroostctl --debug --key-ascii TOKEN2MOLTO1-KEY set-title --profile 99 "MOLTO_TEST"
 ```
 
 This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, `answer challenge`, then `set title` — and end with "title set on profile #99".
@@ -86,7 +86,7 @@ This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, 
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 NN`:** the customer key on your device isn't the factory default. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). If you've forgotten it: `moltoctl factory-reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command); it will wipe every profile and reset the key back to `TOKEN2MOLTO1-KEY`. The device will return `SW 90 60` and display a confirmation prompt — press the up-arrow on the device to commit the reset.
+**If `answer challenge` returns `63 NN`:** the customer key on your device isn't the factory default. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). If you've forgotten it: `keyroostctl factory-reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command); it will wipe every profile and reset the key back to `TOKEN2MOLTO1-KEY`. The device will return `SW 90 60` and display a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 
@@ -98,7 +98,7 @@ should see "MOLTO_TEST" as the title.
 ## Step 5: Write a known TOTP seed and verify the codes match
 
 ```bash
-moltoctl --debug --key-ascii TOKEN2MOLTO1-KEY \
+keyroostctl --debug --key-ascii TOKEN2MOLTO1-KEY \
   import --profile 99 \
   --title MOLTO_TEST \
   'otpauth://totp/MoltoTest?secret=JBSWY3DPEHPK3PXPJBSWY3DP&algorithm=SHA1&digits=6&period=30'
@@ -112,7 +112,7 @@ compare. Within ±1 step (30 seconds) both should show the same 6 digits. If
 they don't, the device's clock is off — fix with:
 
 ```bash
-moltoctl --key-ascii TOKEN2MOLTO1-KEY sync-time --profile 99
+keyroostctl --key-ascii TOKEN2MOLTO1-KEY sync-time --profile 99
 ```
 
 …and try again on the next 30-second boundary.
@@ -123,7 +123,7 @@ Drop a small plaintext Aegis or 2FAS export (1–3 entries) into `/tmp/test.json
 and:
 
 ```bash
-moltoctl --debug --key-ascii TOKEN2MOLTO1-KEY \
+keyroostctl --debug --key-ascii TOKEN2MOLTO1-KEY \
   import-file /tmp/test.json --start 95 --dry-run
 ```
 
@@ -133,7 +133,7 @@ drop `--dry-run` and let it write.
 ## Step 7: GUI smoke test
 
 ```bash
-moltoui
+keyroost
 ```
 
 Click Connect → confirm device info appears in the top bar → enter the
@@ -144,7 +144,7 @@ The log panel at the bottom should show green "ok" lines for each step.
 
 ## FIDO security-key bring-up
 
-Separate from the Molto2 / TOTP path above, MoltoUI also speaks CTAP2 to FIDO2
+Separate from the Molto2 / TOTP path above, keyroost also speaks CTAP2 to FIDO2
 security keys (HID transport, PIN protocol, credential management). This
 runbook validates that layer against real hardware. Each step is read-only or,
 where state-changing, clearly marked. Run it against a **disposable test key**,
@@ -160,7 +160,7 @@ Install the bundled udev rules so a non-root user can open `/dev/hidraw*` for
 FIDO devices:
 
 ```bash
-sudo cp udev/70-moltoui-fido.rules /etc/udev/rules.d/
+sudo cp udev/70-keyroost-fido.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
@@ -175,7 +175,7 @@ ls -l /dev/hidraw*
 ### Step F1: Device enumerates
 
 ```bash
-moltoctl list
+keyroostctl list
 ```
 
 **Expected:** one line under "FIDO HID devices" per inserted authenticator,
@@ -187,7 +187,7 @@ kernel hidraw numbers **change on each replug**, so enumerate fresh.
 ### Step F2: GetInfo round-trips
 
 ```bash
-moltoctl fido-info --path /dev/hidrawN
+keyroostctl fido-info --path /dev/hidrawN
 ```
 
 **Expected** (sample from a SoloKeys Solo 2, firmware 2.3.196):
@@ -210,7 +210,7 @@ First state-changing step. Use a known throwaway PIN for testing — you'll
 factory-reset before putting the key into real service.
 
 ```bash
-printf 'YOUR_TEST_PIN\n' | moltoctl fido-pin-set \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido-pin-set \
     --path /dev/hidrawN --new-pin-stdin
 ```
 
@@ -221,9 +221,9 @@ the initial set doesn't consume a retry.
 ### Step F4: PIN-protected read paths
 
 ```bash
-printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-metadata \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-metadata \
     --path /dev/hidrawN --pin-stdin
-printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-list \
     --path /dev/hidrawN --pin-stdin
 ```
 
@@ -244,15 +244,15 @@ ssh-keygen -t ecdsa-sk -O resident -O application=ssh:moltotest \
            -N '' -f /tmp/sk_moltotest
 
 # Read back — confirm it appears, copy the FULL id= value.
-printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-list \
     --path /dev/hidrawN --pin-stdin
 
 # Destructive: delete by full credentialId.
-printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-delete \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-delete \
     --path /dev/hidrawN --cred-id <full hex from id=> --pin-stdin
 
 # Confirm empty.
-printf 'YOUR_TEST_PIN\n' | moltoctl fido-creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-list \
     --path /dev/hidrawN --pin-stdin
 ```
 

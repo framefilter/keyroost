@@ -1,0 +1,13 @@
+[package]
+name = "keyroost-hid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "USB HID enumeration for FIDO / security-key devices on Linux."
+
+[lints]
+workspace = true
+
+[dependencies]

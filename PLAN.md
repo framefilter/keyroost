@@ -1,8 +1,8 @@
-# MoltoUI: extension plan toward a general security-key manager
+# keyroost: extension plan toward a general security-key manager
 
 ## Goal
 
-Extend MoltoUI from its current single-purpose role (programming Token2
+Extend keyroost from its current single-purpose role (programming Token2
 Molto2 TOTP tokens over PC/SC) into a general-purpose security-key
 manager. The long-term feature target is rough parity with Yubico's
 `ykman` GUI: FIDO2/U2F first, then OATH, PIV, OpenPGP, and OTP.
@@ -12,22 +12,22 @@ and grow from there.
 
 ## Current state (as of this branch)
 
-- `molto2-proto` — pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC).
-- `molto2-transport` — PC/SC reader discovery and Molto2 session.
-- `molto2-import` — Aegis / 2FAS / otpauth-list bulk import.
-- `moltoctl` — CLI binary.
-- `moltoui` — egui desktop GUI.
+- `keyroost-proto` — pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC).
+- `keyroost-transport` — PC/SC reader discovery and Molto2 session.
+- `keyroost-import` — Aegis / 2FAS / otpauth-list bulk import.
+- `keyroostctl` — CLI binary.
+- `keyroost` — egui desktop GUI.
 
 See `docs/PROTOCOL.md` and `CLAUDE.md` for the existing protocol layer.
 
 ## Naming policy
 
-The rename trigger ("once the FIDO2 work is far enough along that the new
-identity is obvious") is now **met** — Phases 0–4 (FIDO2, OATH, OpenPGP) plus
-friendly-name selection are all done, so the project is no longer a Molto2-only
-tool. The chosen name is **`keyroost`**. See **Phase 5 — Rename to keyroost**
-below for the planned scope; until that lands, the existing `molto2-*` crate
-names and `moltoctl` / `moltoui` binary names remain in place.
+The project is named **`keyroost`**: crates are `keyroost-*`, the CLI is
+`keyroostctl`, the GUI is `keyroost`. The rename from the original `molto2-*` /
+`moltoctl` / `moltoui` names landed once Phases 0–4 (FIDO2, OATH, OpenPGP) plus
+friendly-name selection were done and the tool was no longer Molto2-only — see
+**Phase 5 — Rename to keyroost** below. The physical device keeps its real name
+(`Molto2` / `Molto2v2`).
 
 ## Phases
 
@@ -36,7 +36,7 @@ half-finished features carried across phase boundaries.
 
 ### Phase 0 — Device discovery
 USB HID enumeration of FIDO devices via `/dev/hidraw*`. udev rules so an
-unprivileged user can talk to FIDO keys. `moltoctl list` learns to show
+unprivileged user can talk to FIDO keys. `keyroostctl list` learns to show
 both PC/SC readers and HID FIDO devices side-by-side.
 
 Linux only at this stage; macOS/Windows are separate later phases.
@@ -45,7 +45,7 @@ Linux only at this stage; macOS/Windows are separate later phases.
 CTAP HID transport layer (frame assembly, channel `INIT`, channel
 allocation), plus a minimal CBOR encoder/decoder. Implement
 `authenticatorGetInfo` and `authenticatorReset`. Wire a "Security Keys"
-pane into `moltoui` that lists connected keys and shows their CTAP info.
+pane into `keyroost` that lists connected keys and shows their CTAP info.
 
 ### Phase 2 — FIDO2 credential management
 List / add / delete resident credentials (`credentialManagement`
@@ -56,7 +56,7 @@ subcommands). PIN set / change / verify.
 Revised ordering after surveying the Nitrokey 3 / Trussed firmware (the
 same stack the user's Solo 2A+ runs). Key insight: OATH, OpenPGP, and PIV
 are all **CCID/APDU smartcard applets** on these devices, so our existing
-`molto2-transport` PC/SC layer is reusable — each applet just needs generic
+`keyroost-transport` PC/SC layer is reusable — each applet just needs generic
 APDU framing plus an `AID SELECT`. We do not need a second transport stack
 for the smartcard applets.
 
@@ -71,7 +71,7 @@ for the smartcard applets.
   compatibility pass.
 - **Phase 4 — OpenPGP.** Mature (`opcard`, OpenPGP Card spec v3.4) but
   heavier: full OpenPGP Card APDU set + RSA/curve key management.
-  **Byte layer DONE (2026-05-29):** `crates/molto2-openpgp` has the APDU builders
+  **Byte layer DONE (2026-05-29):** `crates/keyroost-openpgp` has the APDU builders
   (`select`, `get_data`, `get_application_related_data`, `get_pw_status`,
   `verify`, `get_response`), a BER-TLV parser (2-byte high tags + long-form
   lengths, with constructed-only nested `find`), and typed parsers for PW status,
@@ -83,15 +83,15 @@ for the smartcard applets.
   rejected; fixed to require ≥60 and locked in with a regression test built from
   the captured 315-byte ARD. The Solo 2 firmware build has **no** OpenPGP applet
   (`SW 6A82`).
-  **Transport + CLI DONE (2026-05-30):** `molto2_transport::OpenPgpSession` drives
+  **Transport + CLI DONE (2026-05-30):** `keyroost_transport::OpenPgpSession` drives
   the applet over PC/SC — SELECT (mapping `6A82` to `NoOpenPgpApplet`), the
   `61xx`/`GET RESPONSE` reassembly loop, reader discovery, and a read-only
   `status()` assembling the Application Related Data + signature counter.
-  `moltoctl openpgp status` prints AID/serial, key algorithms + fingerprints, PIN
+  `keyroostctl openpgp status` prints AID/serial, key algorithms + fingerprints, PIN
   retry counters, and the signature count. Verified on a real YubiKey 5.7 (its
   OpenPGP serial equals the CCID/mgmt serial used for friendly names); the Solo 2
   is correctly skipped.
-  **GUI pane DONE (2026-05-30):** an "OpenPGP" tab in `moltoui` with a reader list
+  **GUI pane DONE (2026-05-30):** an "OpenPGP" tab in `keyroost` with a reader list
   (same no-guess posture) and a read-only status view (AID/serial, per-key
   algorithm + fingerprint, PIN retry counters, signature count) driven through the
   worker thread. Verified it renders headlessly against a live YubiKey.
@@ -100,7 +100,7 @@ for the smartcard applets.
   `change_reference_data`) + an RSA public-key parser, all under byte-exact KAT
   tests. `OpenPgpSession` adds `verify_pin` (decodes both the spec `63Cx` form and
   the YubiKey `6982` form — for the latter it reads PW status to report real
-  remaining tries), `read_public_key`, `generate_key`, and `sign`. `moltoctl
+  remaining tries), `read_public_key`, `generate_key`, and `sign`. `keyroostctl
   openpgp` gains `verify`, `public-key`, and `generate-key` (PINs via env/stdin
   only, never argv; generate gated by `--yes` + admin PIN). Hardware-verified on a
   YubiKey: status, public-key on an empty slot (`6581`), and PIN verify incl.
@@ -122,7 +122,7 @@ for the smartcard applets.
   SHA-1 over `0x99||len||0x04||time||0x01||MPI(n)||MPI(e)`, locked to an
   independent KAT). `OpenPgpSession` adds `set_cardholder_name`, `set_url`, and
   `register_key` (reads the slot's pubkey, writes its computed fingerprint +
-  creation timestamp). `moltoctl openpgp generate-key` now auto-registers the key,
+  creation timestamp). `keyroostctl openpgp generate-key` now auto-registers the key,
   and `set-name`/`set-url` were added. The fingerprint computation is locked to an
   independent Python KAT. **Verified end-to-end with GnuPG (2026-05-30):** on the
   test YubiKey, `generate-key --slot sign` (auto-registers) wrote fingerprint
@@ -133,18 +133,18 @@ for the smartcard applets.
   installed; (2) gpg's scdaemon must be told to share the reader via pcscd — a
   `scdaemon.conf` with `pcsc-shared` + `disable-ccid` (without it, scdaemon can't
   open the reader: "No such device").
-  **Write GUI DONE (2026-05-30):** the `moltoui` OpenPGP pane gained a "Manage
+  **Write GUI DONE (2026-05-30):** the `keyroost` OpenPGP pane gained a "Manage
   (write operations)" section — admin-PIN (PW3) entry, set cardholder name / URL,
   generate RSA key (slot picker, behind a confirm modal since it overwrites), and
   reset applet (typed-`reset` confirm modal). All write ops run on the worker
   thread (so the touch window doesn't freeze the UI) and refresh status on
-  success. To avoid duplicating `molto2-openpgp` in moltoui's dependency graph,
-  transport re-exports `KeyCrt` and adds `verify_admin_pin`, so moltoui depends
-  only on `molto2-transport` (not `molto2-openpgp` directly). The write data paths
+  success. To avoid duplicating `keyroost-openpgp` in keyroost's dependency graph,
+  transport re-exports `KeyCrt` and adds `verify_admin_pin`, so keyroost depends
+  only on `keyroost-transport` (not `keyroost-openpgp` directly). The write data paths
   are the same ones hardware-verified via the CLI; the pane renders without
   panicking against a live YubiKey (headless), though button clicks aren't
   exercisable headlessly.
-  **Signing DONE (2026-05-30):** `moltoctl openpgp sign --in FILE` hashes the
+  **Signing DONE (2026-05-30):** `keyroostctl openpgp sign --in FILE` hashes the
   input (SHA-1, the in-tree hash), wraps it in a PKCS#1 v1.5 DigestInfo, verifies
   PW1 (signing ref 0x81), and has the card produce an RSA signature via PSO:CDS
   (`OpenPgpSession::sign`); output is hex or `--out FILE` raw. **Verified
@@ -153,7 +153,7 @@ for the smartcard applets.
   block is `00 01 FF.. 00 || DigestInfo` and the embedded SHA-1 equals the message
   digest (`18d11190…`). Card reset to pristine after.
   **SHA-256 signing DONE + hardware-verified (2026-05-31):** vendored a pure-Rust
-  `molto2_proto::sha256` (FIPS 180-4, NIST KATs incl. the 1e6-`a` vector), and
+  `keyroost_proto::sha256` (FIPS 180-4, NIST KATs incl. the 1e6-`a` vector), and
   `openpgp sign` gained `--hash sha1|sha256` (default **sha256**) building the
   matching PKCS#1 DigestInfo. Verified on the YubiKey: a `--hash sha256` signature
   recovers (via `pow(sig,e,n)`) a well-formed SHA-256 DigestInfo whose digest
@@ -171,13 +171,13 @@ for the smartcard applets.
   **import format = 0x00 (standard)** — and ykman imports RSA to YubiKey 5 in
   *standard* form (`use_crt` only for the ancient NEO), so standard is correct
   here; the fix is purely the length encoding. Implemented:
-  `molto2-openpgp::key_template_entry` now emits `tag || ber_len(field_len)`;
+  `keyroost-openpgp::key_template_entry` now emits `tag || ber_len(field_len)`;
   `RsaPrivateKeyParts` carries the full CRT set `{e,p,q,u,dp,dq,n}`;
   `RsaImportFormat` + `parse_rsa_algorithm_attributes` read the card's declared
   format & e_bits; `extended_header_list`/`import_rsa_key` take `(format, e_bits)`
   and right-justify `e` to `(e_bits+7)/8`; `OpenPgpSession::import_key` reads the
   slot's algorithm attributes (read-only GET DATA) and builds the matching
-  template; `moltoctl generate_rsa_2048` computes `u=q⁻¹ mod p`, `dp`, `dq` from
+  template; `keyroostctl generate_rsa_2048` computes `u=q⁻¹ mod p`, `dp`, `dq` from
   the `rsa` crate. Byte-exact KATs rewritten for the corrected encoding (standard
   *and* CRT forms); all 199+ workspace tests + clippy green. Extended-length
   transport retained (the card accepted the extended framing before — `6A80` was
@@ -192,7 +192,7 @@ for the smartcard applets.
   reports the byte-identical Signature key fingerprint + serial 37806840. Card
   reset to pristine afterward (all slots empty, PINs 3/0/3).
   **Command-chaining fallback DONE + hardware-verified (2026-05-31):**
-  `molto2-openpgp` gained `put_data_odd_chained` / `import_rsa_key_chained` (ISO
+  `keyroost-openpgp` gained `put_data_odd_chained` / `import_rsa_key_chained` (ISO
   command chaining: CLA `10` links + a final CLA `00`, 254-byte chunks matching
   GnuPG); `OpenPgpSession::import_key` tries extended length first and falls back
   to chaining on `6700`/`6883` (a `MOLTO_OPENPGP_FORCE_CHAINING` env hook forces
@@ -210,14 +210,14 @@ for the smartcard applets.
   offline). With this, the OpenPGP write story (status / generate / import {gen,
   file} / sign {sha1,sha256} / reset / set-name,url / register) is complete.
   **PSO:DECIPHER wired — code-complete, hardware verification pending (2026-06-01):**
-  `molto2-openpgp::pso_decipher` now auto-selects short vs. *extended*-length
+  `keyroost-openpgp::pso_decipher` now auto-selects short vs. *extended*-length
   framing (an RSA-2048 cipher DO is 257 bytes — `0x00` padding indicator + 256
   cryptogram — over the short-APDU limit) and a new `pso_decipher_chained`
   provides the ISO command-chaining fallback (CLA `10` links + final CLA `00`
   with a case-4 `Le`, 254-byte chunks). `OpenPgpSession::decrypt` prepends the
   padding-indicator byte, tries extended length, and falls back to chaining on
   `6700`/`6883` (same `MOLTO_OPENPGP_FORCE_CHAINING` hook as import);
-  `transmit_chain` now returns the final link's response payload. CLI: `moltoctl
+  `transmit_chain` now returns the final link's response payload. CLI: `keyroostctl
   openpgp decrypt --in <FILE>` verifies PW1 in the decipher context (ref 0x82),
   runs PSO:DECIPHER, and writes plaintext (`--out`) or hex. KAT-locked (extended
   framing + chaining reassembly); builds green; the command parses and reaches
@@ -230,50 +230,50 @@ for the smartcard applets.
   (`MOLTO_OPENPGP_FORCE_CHAINING`) remains KAT-only — not yet forced on hardware
   (the import chaining path *was* hardware-confirmed earlier, same builder shape).
   **GUI import parity — code-complete, hardware verification pending (2026-06-01):**
-  the `moltoui` OpenPGP pane gained "Generate & import" and "From file" controls
+  the `keyroost` OpenPGP pane gained "Generate & import" and "From file" controls
   (slot selector + path field), a confirmation modal, and `import_openpgp_key`
   which obtains the key on the worker thread then imports + registers. The
   host-side RSA key material (keygen + PKCS#1/PKCS#8 PEM/DER loading) moved out of
-  `moltoctl` into a new shared **`molto2-rsakey`** crate (`generate_2048`,
+  `keyroostctl` into a new shared **`keyroost-rsakey`** crate (`generate_2048`,
   `load_from_file`, `RsaKeyParts`), which now owns the workspace's scoped `rsa`
-  dependency so both front-ends share one key path; `moltoctl` was refactored onto
+  dependency so both front-ends share one key path; `keyroostctl` was refactored onto
   it. Unit-tested (keygen shapes, DER round-trip, size/garbage rejection); both
   binaries build; the refactored CLI import path was re-confirmed to parse all
   four key formats offline. The GUI calls the same `OpenPgpSession::import_key` +
-  `molto2-rsakey` path the CLI import already hardware-verified, so only the GUI
+  `keyroost-rsakey` path the CLI import already hardware-verified, so only the GUI
   UI wiring itself is **not yet click-tested on hardware**.
 - **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
   (2025-03); fine as a spec reference but not a priority target.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
   the 132-char keyboard OTP applet; HMAC challenge-response is folded into
   the OATH/secrets app. Revisit only if we target actual YubiKeys.
-- **Phase 5 — Rename to `keyroost` (planned).** The tool has outgrown its
+- **Phase 5 — Rename to `keyroost` — DONE (2026-06-01).** The tool outgrew its
   Molto2-only origin (it now manages FIDO2, OATH, and OpenPGP across YubiKey /
-  Solo 2 / Nitrokey 3), so the project takes the neutral name **`keyroost`**.
-  This is a mechanical-but-wide rename; do it on its own branch as the last step
-  before broadening scope further, so the churn doesn't tangle with feature work.
-  Scope to cover:
-  - **Repo / project:** `framefilter/MoltoUI` → `framefilter/keyroost` (GitHub
-    rename keeps a redirect from the old URL); update the workspace `repository`
-    field and the `MoltoUI` references in `CLAUDE.md` and `docs/`.
-  - **Binaries:** `moltoctl` / `moltoui` → new names. *Decision needed* — leading
-    proposal: `keyroost` (GUI) + `keyroostctl` (CLI), or keep a `-gui`/`-cli`
-    split. Update `[[bin]]` names and the `~/.local/bin` PATH symlink.
-  - **Crates:** the general-purpose crates (`molto2-hid`, `-ctap`, `-oath`,
-    `-openpgp`, `-keyring`, `-resolve`, `-rsakey`, `-import`) move to a
-    `keyroost-*` prefix. *Decision needed* — the genuinely device-specific crates
-    (`molto2-proto`, `molto2-transport`: the Molto2 wire protocol + session) may
-    *keep* the `molto2-` name since they really are about the Molto2 device, or
-    move too for uniformity. Renaming a package means updating its `name`, every
-    path-dependency reference, and all `use molto2_*` / `molto2_*::` call sites.
-  - **Mechanics:** rename per crate, fix `Cargo.toml` package names + path deps,
-    sweep `use`/path references, rebuild, keep the 217-test suite + clippy green
-    at each step. Keep host/env specifics out of commit messages (per `CLAUDE.md`).
-  - **Not in scope:** behavior changes — this is rename-only.
+  Solo 2 / Nitrokey 3), so the project took the neutral name **`keyroost`**. A
+  rename-only, mechanical sweep on its own branch:
+  - **Crates:** all ten lib crates moved to the `keyroost-*` prefix —
+    *uniformly*, including the device-specific `keyroost-proto` /
+    `keyroost-transport` (their docs still describe the Molto2 wire protocol; only
+    the package identity changed). Package names, crate directories, path
+    dependencies, workspace members, and every `use keyroost_*` / `keyroost_*::`
+    call site were updated.
+  - **Binaries:** `keyroost` (the GUI — the headline app) and `keyroostctl` (the
+    CLI). The `-ctl` suffix reads as "control utility" (cf. `kubectl`); no
+    companion daemon is implied or planned.
+  - **Project / repo:** the workspace `repository` field, `CLAUDE.md`, `README.md`,
+    and `docs/` now say `keyroost`. The physical device name **`Molto2` /
+    `Molto2v2`** was deliberately preserved everywhere (it still names the
+    hardware), as was the ephemeral `moltoui-test` scratch-dir token.
+  - **Verified:** workspace builds, **217 tests pass**, clippy clean, no stray
+    `molto2-*` / `moltoctl` / `moltoui` crate tokens remain.
+  - **Out-of-tree follow-ups (the user's to do):** rename the GitHub repo
+    `framefilter/MoltoUI` → `framefilter/keyroost` (keeps a redirect), and
+    recreate the `~/.local/bin` PATH symlink to point at
+    `target/release/keyroostctl` (the old `moltoctl` symlink now dangles).
 
 **Phase 3 gating question — RESOLVED (2026-05-29, on hardware).** The PC/SC-reuse
 plan holds, and better than hoped: the Solo 2 *does* expose a usable USB CCID
-interface. `moltoctl list` shows a reader `SoloKeys Solo 2 [CCID/ICCD Interface]
+interface. `keyroostctl list` shows a reader `SoloKeys Solo 2 [CCID/ICCD Interface]
 (<serial>) 01 00`, and selecting the Yubico OATH AID (`A0 00 00 05 27 21 01`)
 over that reader returns SW `9000` with a 15-byte version TLV, with `LIST`
 (INS `0xA1`) also `9000` — i.e. the Trussed secrets/OATH applet answers the
@@ -282,19 +282,19 @@ YubiKey. So OATH goes over PC/SC for **both** stacks; the CTAPHID `0x70` fallbac
 is not needed. (Earlier worry came from `pynitrokey` driving OATH over CTAPHID
 because *their* library lacks CCID support — not a device limitation.)
 
-The pure-Rust OATH byte layer lives in `crates/molto2-oath` (APDU builders,
+The pure-Rust OATH byte layer lives in `crates/keyroost-oath` (APDU builders,
 TLV parsing, RFC-4226 truncation, known-answer tests).
 
-**Phase 3 transport + CLI — DONE (2026-05-29).** `molto2_transport::OathSession`
+**Phase 3 transport + CLI — DONE (2026-05-29).** `keyroost_transport::OathSession`
 drives the applet over PC/SC: reader connect, SELECT, the `61xx`/`SEND_REMAINING`
-reassembly loop, and `list`/`calculate_totp`/`put`/`delete`. `moltoctl oath
+reassembly loop, and `list`/`calculate_totp`/`put`/`delete`. `keyroostctl oath
 {list,code,add,delete}` wraps it, with reader selection mirroring the FIDO picker
 posture (auto-use a lone OATH key, `--reader <substr>` to choose, refuse to guess
 among several) and the base32 secret read via stdin/env, never argv. Verified on
 hardware: a put→code→delete round-trip on a YubiKey produced a code matching
 `oathtool` for the RFC 6238 seed, and SELECT+LIST work on the Solo 2 too.
 
-**OATH password auth — DONE (2026-05-29).** `molto2-oath` gained a vendored
+**OATH password auth — DONE (2026-05-29).** `keyroost-oath` gained a vendored
 HMAC-SHA1 + PBKDF2-HMAC-SHA1 (on the in-tree SHA-1; no new deps), the
 `SET_CODE`/`VALIDATE` builders, the SELECT-response parser (`SelectInfo`,
 password-required detection), and the Yubico access-key derivation
@@ -302,7 +302,7 @@ password-required detection), and the Yubico access-key derivation
 known-answer tests. `OathSession` now parses SELECT, exposes `password_required`,
 and adds `unlock` (VALIDATE with mutual-auth verification of the card's reply),
 `set_password`, and `clear_password`; a dedicated `OathPasswordRejected` error
-replaces the misleading Molto2 "wrong customer key" message. `moltoctl oath`
+replaces the misleading Molto2 "wrong customer key" message. `keyroostctl oath`
 gained `set-password`/`clear-password` and a shared `--password-env/-stdin` on
 every subcommand (passwords never in argv); `open_oath` auto-unlocks and errors
 clearly when a protected applet has no password supplied. Hardware-verified on a
@@ -317,7 +317,7 @@ counter. `oath code` dispatches on the stored credential type (looked up via
 RFC 4226 seed produced the exact documented sequence (755224, 287082, 359152,
 969429, 338314) across five reads, then deleted; key restored to baseline.
 
-**OATH GUI pane — DONE (2026-05-29).** `moltoui` gained an "OATH" tab: a
+**OATH GUI pane — DONE (2026-05-29).** `keyroost` gained an "OATH" tab: a
 left-panel reader list (enumerated via `OathSession::list_oath_readers`, same
 no-guess posture as the CLI), and a central panel that lists credentials and
 computes each current TOTP on demand. Password-protected applets surface an
@@ -329,7 +329,7 @@ and each row has a Delete button gated by a modal confirmation (irreversible).
 Both honor a set applet password through a shared unlock helper. Verified:
 workspace builds, clippy clean, and the pane renders without panicking against a
 live YubiKey (launched with the tab defaulted on, then reverted); the underlying
-put/delete/unlock paths are the same ones hardware-verified via `moltoctl oath`.
+put/delete/unlock paths are the same ones hardware-verified via `keyroostctl oath`.
 GUI button clicks themselves are not exercisable headlessly.
 
 ## Friendly device names (multi-key selection)
@@ -359,13 +359,13 @@ No single mechanism identifies every key — layered resolver:
    no device interaction.
 2. **Vendor serial over CCID**: YubiKeys expose **no** USB serial but carry a
    unique 8-digit decimal mgmt serial, read via the management/OTP applet over
-   PC/SC (the YubiKey's CCID interface is a visible reader; moltoctl already
+   PC/SC (the YubiKey's CCID interface is a visible reader; keyroostctl already
    speaks PC/SC — dependency-free, no `ykman`). Required for the two-YubiKeys
    case, which (1) cannot solve.
 3. **AAGUID** from `authenticatorGetInfo`: model-level display only, not
    per-device identity.
 
-### Config — `~/.config/moltoui/keys.toml`
+### Config — `~/.config/keyroost/keys.toml`
 
 Array-of-tables, matched on `serial`; `name` is the unique label
 (charset `[a-z0-9_-]`):
@@ -378,7 +378,7 @@ Array-of-tables, matched on `serial`; `name` is the unique label
     aaguid = "…"          # optional
     note   = "…"          # optional
 
-Tool-managed via `moltoctl key-name add <name> --path <dev>` /
+Tool-managed via `keyroostctl key-name add <name> --path <dev>` /
 `key-name list` / `key-name remove <name>`; hand-editing stays possible.
 
 ### Selection UX — hybrid (flags + interactive picker)
@@ -390,7 +390,7 @@ Tool-managed via `moltoctl key-name add <name> --path <dev>` /
   stdin, which `--pin-stdin` already consumes). Hand-rolled, no prompt crate.
 - No flag + not a TTY + >1 key → error requiring `--name`/`--path`.
 - Exactly one key → use it, printing the resolved target.
-- `moltoctl list` shows the friendly name for any connected, configured key.
+- `keyroostctl list` shows the friendly name for any connected, configured key.
 
 ### Safety
 
@@ -404,7 +404,7 @@ Tool-managed via `moltoctl key-name add <name> --path <dev>` /
 ### Architecture
 
 Device identity + resolution lives in a **shared library**, so the CLI (flags +
-picker) and the later `moltoui` GUI (dropdown) are thin front-ends over one
+picker) and the later `keyroost` GUI (dropdown) are thin front-ends over one
 resolver.
 
 ### Build order
@@ -412,9 +412,9 @@ resolver.
 1. **Done.** USB-serial resolver + `keys.json` load + `key-name add/list/remove`
    + `--name`/picker plumbing + `list` name column + the safety guard.
 2. **Done.** YubiKey CCID mgmt-serial read (unlocks the two-YubiKey case).
-   `molto2-transport::yubikey_ccid_serials()` reads each YubiKey CCID reader's
+   `keyroost-transport::yubikey_ccid_serials()` reads each YubiKey CCID reader's
    management serial via the OTP applet (AID `A0 00 00 05 27 20 01 01`, API
-   request slot `0x10`) — read-only, no PIN/touch, no new deps. moltoctl matches
+   request slot `0x10`) — read-only, no PIN/touch, no new deps. keyroostctl matches
    a YubiKey's `/dev/hidrawN` to its reader by USB topology (sysfs
    `busnum`/`devnum` vs the reader's PC/SC `CHANNEL_ID`), so two connected
    YubiKeys are never confused; it falls back to the unambiguous single-reader
@@ -422,9 +422,9 @@ resolver.
    on the same USB bus (distinct device addresses, distinct CCID serials) + a
    Solo 2.
 3. **Done.** Shared-resolver extraction + GUI front-end. The CCID/topology/serial
-   logic moved out of `moltoctl` into a new `molto2-resolve` crate (depends on
-   keyring + hid + transport; pure `molto2-keyring` stays hardware-free), so both
-   front-ends are thin over one resolver. `moltoui`'s Security Keys pane now shows
+   logic moved out of `keyroostctl` into a new `keyroost-resolve` crate (depends on
+   keyring + hid + transport; pure `keyroost-keyring` stays hardware-free), so both
+   front-ends are thin over one resolver. `keyroost`'s Security Keys pane now shows
    friendly names + effective serials in the device list/header and can name /
    un-name a key (opt-in persist), with the disclosure surfaced via a reusable
    `helper_bubble` component — the planned cross-cutting helper-bubble. GUI
@@ -446,8 +446,8 @@ compression doesn't lose it:
 - Cross-platform support (macOS/Windows) before the Linux story works.
 - A web UI or background daemon.
 
-(The earlier non-goal "renaming the project off the `molto2-*` prefix" is now a
-planned task — see **Phase 5 — Rename to keyroost**.)
+(Renaming the project off the original `molto2-*` prefix was once a non-goal; it
+is now **done** — see **Phase 5 — Rename to keyroost**.)
 
 ## Deferred follow-ups (not blocking, revisit with hardware)
 
@@ -460,7 +460,7 @@ planned task — see **Phase 5 — Rename to keyroost**.)
   premise confirmed: the test YubiKey advertises `[2, 1]` (→ v2 selected) and
   this Solo 2's firmware advertises `[1]` (→ v1); full end-to-end v2 still wants
   a PIN-authenticated op (PIN entry is the user's job).
-- **GUI worker thread — DONE (2026-05-29).** All blocking device I/O in `moltoui`
+- **GUI worker thread — DONE (2026-05-29).** All blocking device I/O in `keyroost`
   (CTAP GetInfo/unlock/cred-list/delete/change-PIN and the OATH open/list/code/
   add/delete) now runs on a single background `Worker` thread. A job closure runs
   off-thread and returns an `ApplyFn` (a `Box<dyn FnOnce(&mut App)>`) applied on
@@ -474,20 +474,20 @@ planned task — see **Phase 5 — Rename to keyroost**.)
   Security Keys pane opens a confirmation modal requiring the user to type
   `reset`; the wipe then runs on the worker thread (so the ~30s touch window no
   longer freezes the UI) and clears the cached session + re-reads CTAP info. The
-  underlying `molto2_ctap::reset()` path was confirmed end-to-end on a real
+  underlying `keyroost_ctap::reset()` path was confirmed end-to-end on a real
   YubiKey ("All credentials wiped, PIN cleared").
 - **CredentialManager double token fetch — DONE (2026-06-01).** `PinUvAuthToken`
-  now derives `Clone`; `moltoui`'s `open_and_unlock` hands the manager a clone and
+  now derives `Clone`; `keyroost`'s `open_and_unlock` hands the manager a clone and
   keeps the original for the cached session, dropping the second redundant
   PIN/ECDH exchange. The hand-rolled token reconstructions in `refresh_with_token`
   / `delete_credential` collapsed to `.clone()`. (Verified valid by the existing
   token-reuse across delete+refresh; builds + tests green.)
-- **Bootloader-mode detection — DONE (2026-06-01).** `molto2-hid` gained a
+- **Bootloader-mode detection — DONE (2026-06-01).** `keyroost-hid` gained a
   `KNOWN_BOOTLOADERS` table (Solo 2 / Nitrokey 3 DFU = `1209:b000`),
   `HidDevice::bootloader_label()`, and `bootloader_device_present()`. A device in
   DFU enumerates as plain HID (no FIDO page) and so vanishes from FIDO lists;
-  now `moltoctl list` tags it `[bootloader]` and notes it when the FIDO list is
-  empty, `resolve_fido_path`'s "no FIDO device" error names it, and the `moltoui`
+  now `keyroostctl list` tags it `[bootloader]` and notes it when the FIDO list is
+  empty, `resolve_fido_path`'s "no FIDO device" error names it, and the `keyroost`
   Security Keys pane surfaces "re-plug it to return to application mode" instead of
   a silent empty list. Unit-tested; no hardware DFU device on hand to confirm the
   live VID:PID, but the path is purely ID-table driven.
