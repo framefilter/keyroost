@@ -27,6 +27,9 @@ pub use oath::OathSession;
 
 mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
+
+mod piv;
+pub use piv::{PivSession, PivSlotStatus, PivStatus};
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{KeyCrt, RsaPrivateKeyParts};
@@ -67,6 +70,10 @@ pub enum TransportError {
     /// The OpenPGP applet rejected the supplied PIN. `tries_remaining` is the
     /// count the card reported (`63 Cx`), or `None` when blocked / unknown.
     OpenPgpPinRejected { tries_remaining: Option<u8> },
+    /// A PIV applet response could not be parsed.
+    PivParse(keyroost_piv::ParseError),
+    /// No PIV applet is present on the selected card (`SW 6A82` on SELECT).
+    NoPivApplet,
 }
 
 impl fmt::Display for TransportError {
@@ -122,6 +129,8 @@ impl fmt::Display for TransportError {
             TransportError::OpenPgpPinRejected { tries_remaining: None } => {
                 write!(f, "OpenPGP PIN rejected (PIN may be blocked)")
             }
+            TransportError::PivParse(e) => write!(f, "PIV response parse error: {}", e),
+            TransportError::NoPivApplet => write!(f, "no PIV applet on this card"),
         }
     }
 }
@@ -132,6 +141,7 @@ impl std::error::Error for TransportError {
             TransportError::PcscUnavailable(e) | TransportError::Pcsc(e) => Some(e),
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
+            TransportError::PivParse(e) => Some(e),
             _ => None,
         }
     }

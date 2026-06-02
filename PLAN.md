@@ -29,6 +29,29 @@ friendly-name selection were done and the tool was no longer Molto2-only — see
 **Phase 5 — Rename to keyroost** below. The physical device keeps its real name
 (`Molto2` / `Molto2v2`).
 
+## Next up (prioritized backlog)
+
+The planned applet roadmap (FIDO2, OATH, OpenPGP) is complete and the project was
+renamed to keyroost. With OATH password-auth done and a hardware-verified PIV
+read foundation landed, the agreed next items, in priority order:
+
+1. **Release readiness (CI + first tag).** Highest leverage now that it's public
+   FOSS. Add a GitHub Actions workflow running the test suite + clippy on every
+   push/PR and building release binaries; close the small verification gaps
+   (live click-test the GUI panes; force the OpenPGP decrypt command-chaining
+   path on hardware); add a CHANGELOG; document the udev-rules install in the
+   README; then tag `v0.1.0`.
+2. **Cross-platform.** macOS/Windows — the HID layer (`keyroost-hid`) is
+   Linux-sysfs only and parts of the PC/SC plumbing assume Linux. Broadens reach
+   but touches the lowest transport layers.
+3. **UI/UX design pass.** The GUI grew pane-by-pane (Molto2 profiles, Security
+   Keys, OATH, OpenPGP) without a holistic design pass. Revisit information
+   architecture, consistency across panes, empty/error states, and the
+   multi-key selection flow; add a PIV pane once PIV writes exist.
+
+Further out: finish the **PIV write/auth** surface (see the PIV entry under
+Phase 3+), and the YubiKey-OATH/other deferred compatibility notes below.
+
 ## Phases
 
 Sequenced smallest-to-largest. Each phase ends in a working binary; no
@@ -66,9 +89,10 @@ for the smartcard applets.
   codes (`Put`/`Delete`/`List`/`Calculate`/`SendRemaining`), so one command
   set targets NK3 *and* future YubiKey OATH. Caveat: the Trussed impl
   removed Yubico's `SetCode`/`Validate` authorization handshake, so
-  provisioning/list/delete interoperate but OATH password-auth diverges —
-  code to the Trussed variant first, treat YubiKey OATH-auth as a later
-  compatibility pass.
+  provisioning/list/delete interoperate but OATH password-auth diverges. (Both
+  paths are now done: provisioning/list/calculate work on Trussed and YubiKey,
+  and the Yubico `SET_CODE`/`VALIDATE` password handshake is implemented and
+  hardware-verified — see "OATH password auth — DONE" below.)
 - **Phase 4 — OpenPGP.** Mature (`opcard`, OpenPGP Card spec v3.4) but
   heavier: full OpenPGP Card APDU set + RSA/curve key management.
   **Byte layer DONE (2026-05-29):** `crates/keyroost-openpgp` has the APDU builders
@@ -242,8 +266,25 @@ for the smartcard applets.
   four key formats offline. The GUI calls the same `OpenPgpSession::import_key` +
   `keyroost-rsakey` path the CLI import already hardware-verified, so only the GUI
   UI wiring itself is **not yet click-tested on hardware**.
-- **PIV — demoted.** Upstream `piv-authenticator` was archived read-only
-  (2025-03); fine as a spec reference but not a priority target.
+- **PIV (SP 800-73-4) — read foundation DONE + hardware-verified (2026-06-02).**
+  New `keyroost-piv` byte-layer crate (pure-Rust, I/O-free, like the OATH/OpenPGP
+  layers): SELECT (5-byte AID prefix), GET DATA for the certificate / CHUID data
+  objects, VERIFY (PIN + empty-body retry query), the Yubico GET VERSION / GET
+  SERIAL extensions, the `Slot` model (9A/9C/9D/9E + their `5F C1 0x` cert tags),
+  and BER-TLV helpers — under 10 byte-exact KATs. `keyroost_transport::PivSession`
+  adds the card transmit + `61xx`/GET RESPONSE loop, reader discovery
+  (`list_piv_readers`, `NoPivApplet` on `6A82`), and a read-only `status()`
+  (version, serial, PIN retries, per-slot cert presence). `keyroostctl piv status`
+  prints it. **Hardware-verified on the test YubiKey:** version `5.7.4`, serial
+  `37806840` (matches the OpenPGP/CCID serial), PIN retries `3`, all four slots
+  empty — read-only, no PIN/touch.
+  **Remaining PIV scope (write/auth — future):** GENERAL AUTHENTICATE (sign /
+  decrypt / key agreement with the slot keys), GENERATE ASYMMETRIC KEY PAIR,
+  certificate import (PUT DATA), PIN/PUK management (CHANGE REFERENCE DATA, RESET
+  RETRY COUNTER), and management-key authentication (3DES/AES challenge-response).
+  X.509 cert parsing beyond presence/length is also out of scope for now.
+  (Supersedes the earlier "PIV — demoted" note: upstream `piv-authenticator` is
+  archived but remains a fine spec reference.)
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
   the 132-char keyboard OTP applet; HMAC challenge-response is folded into
   the OATH/secrets app. Revisit only if we target actual YubiKeys.

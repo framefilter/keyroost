@@ -24,6 +24,8 @@ vendor SDKs, no Python, and no Qt.
 - **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
   keygen or a PKCS#1/PKCS#8 PEM/DER file); sign (SHA-256 or SHA-1); decrypt; set
   cardholder name / URL; register a key for GnuPG; factory-reset the applet.
+- **PIV (SP 800-73-4)** — read-only status so far: applet/firmware version,
+  serial, PIN retries, and which key slots (9A/9C/9D/9E) hold a certificate.
 - **Token2 Molto2 / Molto2v2** — program a slot from an `otpauth://` URI;
   bulk-import from Aegis (plaintext or encrypted), 2FAS, or a list of `otpauth://`
   URIs; sync the host clock; rotate the customer key; factory reset.
@@ -117,6 +119,9 @@ keyroostctl oath code <name> --reader yubikey
 keyroostctl openpgp status --reader yubikey
 keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey
 
+# --- PIV (read-only status) ---
+keyroostctl piv status --reader yubikey
+
 # --- Token2 Molto2 (TOTP programming) ---
 keyroostctl info
 keyroostctl import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3PXP'
@@ -139,6 +144,7 @@ keyroost
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management | none |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | none |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
+| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; read path (status / GET DATA) | none |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand` |

@@ -9,6 +9,7 @@ members = [
     "crates/keyroost-resolve",
     "crates/keyroost-oath",
     "crates/keyroost-openpgp",
+    "crates/keyroost-piv",
     "crates/keyroost-rsakey",
     "crates/keyroost-import",
     "crates/keyroostctl",

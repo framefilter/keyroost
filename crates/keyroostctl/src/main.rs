@@ -269,6 +269,22 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OpenpgpCmd,
     },
+    /// Read PIV (smartcard) status on a security key over PC/SC (read-only).
+    Piv {
+        #[command(subcommand)]
+        cmd: PivCmd,
+    },
+}
+
+/// PIV subcommands. Read-only for now (see PLAN.md for the write/auth roadmap).
+#[derive(Subcommand)]
+enum PivCmd {
+    /// Show PIV status: version, serial, PIN retries, and which key slots hold a
+    /// certificate. No PIN or touch required.
+    Status {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
 }
 
 /// Subcommands for the OpenPGP card applet.
@@ -988,6 +1004,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // PIV is another CCID applet reached over PC/SC.
+    if let Cmd::Piv { cmd } = cmd {
+        run_piv(cmd, cli.debug)?;
+        return Ok(());
+    }
+
     // Factory reset is a plain CLA 0x80 command and needs no auth.
     if let Cmd::FactoryReset { yes } = cmd {
         if !yes {
@@ -1221,6 +1243,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::KeyName { .. } => unreachable!("handled above before auth"),
         Cmd::Oath { .. } => unreachable!("handled above before auth"),
         Cmd::Openpgp { .. } => unreachable!("handled above before auth"),
+        Cmd::Piv { .. } => unreachable!("handled above before auth"),
         Cmd::FidoInfo { .. }
         | Cmd::FidoReset { .. }
         | Cmd::FidoPinRetries { .. }
@@ -1899,6 +1922,41 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        PivCmd::Status { reader } => {
+            let readers = keyroost_transport::PivSession::list_piv_readers()?;
+            let name = resolve_reader(readers, reader.as_deref(), "PIV")?;
+            eprintln!("\u{2192} PIV on {}", name);
+            let mut session = keyroost_transport::PivSession::open(&name)?;
+            session.set_debug(debug);
+            let status = session.status()?;
+
+            match status.version {
+                Some((a, b, c)) => println!("Version:     {}.{}.{}", a, b, c),
+                None => println!("Version:     (unavailable)"),
+            }
+            match status.serial {
+                Some(s) => println!("Serial:      {0} (0x{0:08X})", s),
+                None => println!("Serial:      (unavailable)"),
+            }
+            match status.pin_retries {
+                Some(0) => println!("PIN retries: 0 (blocked)"),
+                Some(n) => println!("PIN retries: {}", n),
+                None => println!("PIN retries: (unavailable)"),
+            }
+            println!("Slots:");
+            for s in &status.slots {
+                if s.cert_present {
+                    println!("  {:<26} cert present ({} bytes)", s.slot.label(), s.cert_len);
+                } else {
+                    println!("  {:<26} empty", s.slot.label());
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Map an OpenPGP algorithm id (first attribute byte) to a short label.
 fn algo_id_str(id: Option<u8>) -> &'static str {

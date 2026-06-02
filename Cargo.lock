@@ -1609,6 +1609,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost-piv"
+version = "0.1.0"
+dependencies = [
+ "keyroost-proto",
+]
+
+[[package]]
 name = "keyroost-proto"
 version = "0.1.0"
 
@@ -1635,6 +1642,7 @@ version = "0.1.0"
 dependencies = [
  "keyroost-oath",
  "keyroost-openpgp",
+ "keyroost-piv",
  "keyroost-proto",
  "pcsc",
 ]
