@@ -6,9 +6,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The first release line. keyroost grew from a Token2 Molto2 TOTP programmer into a
-multi-vendor hardware-security-key manager, then took its neutral name. Highlights
-so far:
+## [0.1.0] - 2026-06-02
+
+The first release. keyroost grew from a Token2 Molto2 TOTP programmer into a
+multi-vendor hardware-security-key manager, then took its neutral name. Highlights:
 
 ### Added
 - **FIDO2 / CTAP2** — authenticator enumeration, `authenticatorGetInfo`, resident
@@ -35,4 +36,5 @@ so far:
   external dependencies are `pcsc`, `clap`, `eframe`/`egui`, `serde`, and
   (for RSA keygen/parsing) `rsa`/`rand`.
 
-[Unreleased]: https://github.com/framefilter/keyroost/commits/main
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/framefilter/keyroost/releases/tag/v0.1.0
