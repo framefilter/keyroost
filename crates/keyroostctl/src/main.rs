@@ -263,7 +263,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OathCmd,
     },
-    /// Read OpenPGP card status on a security key over PC/SC (read-only).
+    /// Manage the OpenPGP card applet on a security key over PC/SC: status,
+    /// key generate/import, sign, decrypt, reset, and cardholder metadata.
     Openpgp {
         #[command(subcommand)]
         cmd: OpenpgpCmd,
