@@ -216,10 +216,10 @@ impl OpenPgpSession {
     ) -> Result<(), TransportError> {
         let attrs = self.rsa_attributes(crt)?;
 
-        // Setting MOLTO_OPENPGP_FORCE_CHAINING forces the command-chaining path
+        // Setting KEYROOST_OPENPGP_FORCE_CHAINING forces the command-chaining path
         // (so the fallback can be exercised on a card that also accepts extended
         // length, e.g. for verification). Otherwise: extended length first.
-        if std::env::var_os("MOLTO_OPENPGP_FORCE_CHAINING").is_none() {
+        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
             let apdu = pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits);
             let (_, sw) = self.transmit_full(&apdu)?;
             if sw == pgp::SW_OK {
@@ -321,7 +321,7 @@ impl OpenPgpSession {
     /// cryptogram (257 bytes for RSA-2048), which exceeds the short-APDU limit,
     /// so this sends an extended-length APDU and falls back to ISO command
     /// chaining on `6700` / `6883` — the same strategy as
-    /// [`import_key`](Self::import_key). `MOLTO_OPENPGP_FORCE_CHAINING` forces
+    /// [`import_key`](Self::import_key). `KEYROOST_OPENPGP_FORCE_CHAINING` forces
     /// the chaining path for testing.
     pub fn decrypt(&mut self, cryptogram: &[u8]) -> Result<Vec<u8>, TransportError> {
         // RSA cipher DO: 0x00 padding-indicator byte + the cryptogram.
@@ -329,7 +329,7 @@ impl OpenPgpSession {
         data.push(0x00);
         data.extend_from_slice(cryptogram);
 
-        if std::env::var_os("MOLTO_OPENPGP_FORCE_CHAINING").is_none() {
+        if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
             let (plain, sw) = self.transmit_full(&pgp::pso_decipher(&data))?;
             if sw == pgp::SW_OK {
                 return Ok(plain);

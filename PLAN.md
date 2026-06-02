@@ -219,7 +219,7 @@ for the smartcard applets.
   `keyroost-openpgp` gained `put_data_odd_chained` / `import_rsa_key_chained` (ISO
   command chaining: CLA `10` links + a final CLA `00`, 254-byte chunks matching
   GnuPG); `OpenPgpSession::import_key` tries extended length first and falls back
-  to chaining on `6700`/`6883` (a `MOLTO_OPENPGP_FORCE_CHAINING` env hook forces
+  to chaining on `6700`/`6883` (a `KEYROOST_OPENPGP_FORCE_CHAINING` env hook forces
   the path for testing). KAT-locked (chunks reassemble byte-identically to the
   extended-length data field). Verified on the YubiKey by forcing the chaining
   path: two links `10 DB 3F FF FE …` + `00 DB 3F FF 1B …` both `9000`, key
@@ -240,7 +240,7 @@ for the smartcard applets.
   provides the ISO command-chaining fallback (CLA `10` links + final CLA `00`
   with a case-4 `Le`, 254-byte chunks). `OpenPgpSession::decrypt` prepends the
   padding-indicator byte, tries extended length, and falls back to chaining on
-  `6700`/`6883` (same `MOLTO_OPENPGP_FORCE_CHAINING` hook as import);
+  `6700`/`6883` (same `KEYROOST_OPENPGP_FORCE_CHAINING` hook as import);
   `transmit_chain` now returns the final link's response payload. CLI: `keyroostctl
   openpgp decrypt --in <FILE>` verifies PW1 in the decipher context (ref 0x82),
   runs PSO:DECIPHER, and writes plaintext (`--out`) or hex. KAT-locked (extended
@@ -251,7 +251,7 @@ for the smartcard applets.
   and `openpgp decrypt` returned the byte-identical plaintext
   (`6d6f…7374` = "molto2 decipher test"); card reset to pristine afterward
   (slots empty, PINs 3/0/3). The command-chaining decrypt fallback
-  (`MOLTO_OPENPGP_FORCE_CHAINING`) remains KAT-only — not yet forced on hardware
+  (`KEYROOST_OPENPGP_FORCE_CHAINING`) remains KAT-only — not yet forced on hardware
   (the import chaining path *was* hardware-confirmed earlier, same builder shape).
   **GUI import parity — code-complete, hardware verification pending (2026-06-01):**
   the `keyroost` OpenPGP pane gained "Generate & import" and "From file" controls
