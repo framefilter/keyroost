@@ -100,6 +100,25 @@ sudo systemctl enable --now pcscd
 macOS and Windows have PC/SC built in. (HID enumeration is currently Linux-only;
 cross-platform support is planned.)
 
+### FIDO HID access (Linux udev rules)
+
+The OATH, OpenPGP, and PIV applets are reached over PC/SC and need no special
+permissions. Talking to a key's **FIDO interface** (`fido-*` commands, and the
+Security Keys GUI pane), though, opens a `/dev/hidraw*` node, which is
+root-only by default. Install the bundled udev rules to grant the logged-in user
+access:
+
+```bash
+sudo cp udev/70-keyroost-fido.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+The rules use `uaccess` (and a `plugdev` fallback), are keyed by vendor/USB so
+they apply before the hidraw node is created, and cover the common FIDO vendors
+(Yubico, SoloKeys, Nitrokey, Feitian, Token2, and others). Re-plug the key after
+installing them.
+
 ## Quick start
 
 ```bash

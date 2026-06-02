@@ -1,0 +1,54 @@
+name: Release binaries
+
+# Builds the CLI + GUI release binaries when a version tag is pushed (e.g.
+# `git tag v0.1.0 && git push origin v0.1.0`) and attaches them to the workflow
+# run. Publishing a public GitHub Release is left as an explicit opt-in (see the
+# commented step at the end) so a tag push never auto-publishes on its own.
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpcsclite-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p keyroostctl -p keyroost
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/keyroost-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" \
+            -C target/release keyroostctl keyroost
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyroost-linux-x86_64
+          path: dist/*.tar.gz
+
+      # To publish a public GitHub Release on tag, uncomment this step. It uses
+      # the built-in token (no third-party action). GITHUB_REF_NAME is the tag.
+      # - name: Publish GitHub Release
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz --generate-notes
