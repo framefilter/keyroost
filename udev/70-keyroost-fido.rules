@@ -1,7 +1,7 @@
-# MoltoUI: udev rules granting unprivileged access to USB FIDO authenticators.
+# keyroost: udev rules granting unprivileged access to USB FIDO authenticators.
 #
 # Install with:
-#   sudo cp udev/70-moltoui-fido.rules /etc/udev/rules.d/
+#   sudo cp udev/70-keyroost-fido.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
 #   sudo udevadm trigger
 #
