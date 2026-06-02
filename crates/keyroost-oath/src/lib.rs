@@ -15,11 +15,12 @@
 //! # What is and isn't here
 //!
 //! This is the *byte layer*: it turns intentions into APDU byte vectors and
-//! turns response byte slices into typed structures. It performs **no I/O**.
-//! Card transmit, the `61xx` / `SEND_REMAINING` reassembly loop, and password
-//! authentication (`SET_CODE` / `VALIDATE`) are deliberately left for the
-//! transport phase; see the `TODO(transport)` notes on [`send_remaining`] and
-//! [`Instruction`].
+//! turns response byte slices into typed structures. It performs **no I/O** —
+//! card transmit and the `61xx` / `SEND_REMAINING` reassembly loop live in the
+//! transport phase (`keyroost-transport`'s `OathSession`). The password
+//! handshake is fully here, though: [`set_code`], [`clear_code`], [`validate`],
+//! [`verify_validate`], and [`derive_access_key`] build/parse the Yubico
+//! `SET_CODE` / `VALIDATE` exchange (the transport layer only transmits them).
 
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
 
@@ -41,10 +42,8 @@ pub enum Instruction {
     Put = 0x01,
     /// Remove a credential by name.
     Delete = 0x02,
-    /// Set/clear the applet access password.
-    ///
-    /// TODO(transport): not modelled — the Trussed variant diverges from Yubico
-    /// here, and exercising it needs the `VALIDATE` challenge from `SELECT`.
+    /// Set/clear the applet access password (Yubico OATH). Built by [`set_code`]
+    /// / [`clear_code`]. The Trussed variant (Solo 2 / NK3) omits this handshake.
     SetCode = 0x03,
     /// Wipe all credentials and access settings.
     Reset = 0x04,
@@ -54,9 +53,8 @@ pub enum Instruction {
     List = 0xA1,
     /// Compute one OTP for a named credential.
     Calculate = 0xA2,
-    /// Answer the access-password challenge.
-    ///
-    /// TODO(transport): paired with [`Instruction::SetCode`]; not modelled.
+    /// Answer the access-password challenge (mutual auth). Built by [`validate`]
+    /// and checked with [`verify_validate`].
     Validate = 0xA3,
     /// Compute OTPs for all credentials at once.
     CalculateAll = 0xA4,
@@ -334,8 +332,8 @@ pub fn calculate_all(challenge: &[u8; 8]) -> Vec<u8> {
 /// The reader then issues `SEND_REMAINING` repeatedly, concatenating each
 /// response body, until the status word is `9000`.
 ///
-/// TODO(transport): the reassembly loop itself (transmit, inspect `SW`, repeat)
-/// belongs in `keyroost-transport`; this builder only emits the request APDU.
+/// The reassembly loop itself (transmit, inspect `SW`, repeat) lives in
+/// `keyroost-transport`; this builder only emits the request APDU.
 #[must_use]
 pub fn send_remaining() -> Vec<u8> {
     build_apdu_get(0x00, Instruction::SendRemaining.code(), 0x00, 0x00, 0x00)

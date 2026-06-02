@@ -8,8 +8,10 @@
 //!
 //! This layer adds what the byte layer deliberately left out: the actual card
 //! transmit, the `61xx` / `SEND_REMAINING` reassembly loop, and reader
-//! selection. Password-protected OATH (`SET_CODE` / `VALIDATE`) is still TODO —
-//! the Trussed variant diverges from Yubico there.
+//! selection. Password-protected OATH (Yubico `SET_CODE` / `VALIDATE`) is
+//! supported — [`unlock`](OathSession::unlock), [`set_password`](OathSession::set_password),
+//! and [`clear_password`](OathSession::clear_password) — though Trussed devices
+//! (Solo 2 / Nitrokey 3) omit that handshake.
 
 use crate::{hex_dump, TransportError};
 use keyroost_oath as oath;
