@@ -175,7 +175,10 @@ impl<'a> CredentialManager<'a> {
     /// returned by [`Self::list_credentials`]).
     pub fn delete(&mut self, credential_id: &[u8]) -> Result<(), CtapError> {
         let cred_desc = Value::Map(vec![
-            (Value::Text("id".into()), Value::Bytes(credential_id.to_vec())),
+            (
+                Value::Text("id".into()),
+                Value::Bytes(credential_id.to_vec()),
+            ),
             (Value::Text("type".into()), Value::Text("public-key".into())),
         ]);
         let params = Value::Map(vec![(Value::UInt(PARAM_CREDENTIAL_ID), cred_desc)]);
@@ -345,7 +348,12 @@ mod tests {
         info
     }
 
-    fn build_request_via(mgr_cmd: u8, token: PinUvAuthToken, sub: u8, params: Option<Value>) -> Vec<u8> {
+    fn build_request_via(
+        mgr_cmd: u8,
+        token: PinUvAuthToken,
+        sub: u8,
+        params: Option<Value>,
+    ) -> Vec<u8> {
         // Construct a CredentialManager-equivalent helper for assertion
         // purposes without needing a real CtapHidDevice.
         let mut auth_input = Vec::new();
@@ -391,13 +399,22 @@ mod tests {
     #[test]
     fn request_includes_pin_uv_auth_param_for_subcommand_byte() {
         let token = fake_token();
-        let bytes = build_request_via(CTAP2_CREDENTIAL_MANAGEMENT, token, SUB_GET_CREDS_METADATA, None);
+        let bytes = build_request_via(
+            CTAP2_CREDENTIAL_MANAGEMENT,
+            token,
+            SUB_GET_CREDS_METADATA,
+            None,
+        );
         // First byte is the command code; rest is CBOR.
         assert_eq!(bytes[0], CTAP2_CREDENTIAL_MANAGEMENT);
         let (val, _) = cbor::decode(&bytes[1..]).unwrap();
         let map = val.as_map().unwrap();
-        assert!(map.iter().any(|(k, _)| k.as_uint() == Some(KEY_PIN_UV_AUTH_PROTOCOL)));
-        assert!(map.iter().any(|(k, _)| k.as_uint() == Some(KEY_PIN_UV_AUTH_PARAM)));
+        assert!(map
+            .iter()
+            .any(|(k, _)| k.as_uint() == Some(KEY_PIN_UV_AUTH_PROTOCOL)));
+        assert!(map
+            .iter()
+            .any(|(k, _)| k.as_uint() == Some(KEY_PIN_UV_AUTH_PARAM)));
     }
 
     #[test]
@@ -409,14 +426,28 @@ mod tests {
             (Value::Text("type".into()), Value::Text("public-key".into())),
         ]);
         let params = Value::Map(vec![(Value::UInt(PARAM_CREDENTIAL_ID), cred_desc)]);
-        let bytes = build_request_via(CTAP2_CREDENTIAL_MANAGEMENT, token, SUB_DELETE_CREDENTIAL, Some(params));
+        let bytes = build_request_via(
+            CTAP2_CREDENTIAL_MANAGEMENT,
+            token,
+            SUB_DELETE_CREDENTIAL,
+            Some(params),
+        );
         let (val, _) = cbor::decode(&bytes[1..]).unwrap();
         let params_val = val.get_uint_key(KEY_SUB_COMMAND_PARAMS).unwrap();
         let inner = params_val.get_uint_key(PARAM_CREDENTIAL_ID).unwrap();
         // The credential descriptor is keyed by string "id".
-        let id_val = inner.as_map().unwrap().iter().find_map(|(k, v)| {
-            if k.as_text() == Some("id") { Some(v) } else { None }
-        }).unwrap();
+        let id_val = inner
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("id") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         assert_eq!(id_val.as_bytes(), Some(&cred_id[..]));
     }
 
@@ -427,7 +458,10 @@ mod tests {
                 Value::UInt(RESP_RP),
                 Value::Map(vec![
                     (Value::Text("id".into()), Value::Text("example.com".into())),
-                    (Value::Text("name".into()), Value::Text("Example, Inc.".into())),
+                    (
+                        Value::Text("name".into()),
+                        Value::Text("Example, Inc.".into()),
+                    ),
                 ]),
             ),
             (Value::UInt(RESP_RP_ID_HASH), Value::Bytes(vec![0x77; 32])),
@@ -446,7 +480,10 @@ mod tests {
                 Value::Map(vec![
                     (Value::Text("id".into()), Value::Bytes(vec![1, 2, 3])),
                     (Value::Text("name".into()), Value::Text("alice".into())),
-                    (Value::Text("displayName".into()), Value::Text("Alice Liddell".into())),
+                    (
+                        Value::Text("displayName".into()),
+                        Value::Text("Alice Liddell".into()),
+                    ),
                 ]),
             ),
             (

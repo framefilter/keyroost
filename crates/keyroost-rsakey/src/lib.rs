@@ -73,8 +73,8 @@ impl From<std::io::Error> for RsaKeyError {
 /// (dp, dq, qinv), so the full component set is available immediately.
 pub fn generate_2048() -> Result<RsaKeyParts, RsaKeyError> {
     let mut rng = rand::thread_rng();
-    let key = rsa::RsaPrivateKey::new(&mut rng, 2048)
-        .map_err(|e| RsaKeyError::Crypto(e.to_string()))?;
+    let key =
+        rsa::RsaPrivateKey::new(&mut rng, 2048).map_err(|e| RsaKeyError::Crypto(e.to_string()))?;
     parts_from_key(key)
 }
 

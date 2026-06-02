@@ -986,8 +986,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } = cmd
     {
         let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-        let cred_id_bytes = hex_decode(cred_id)
-            .map_err(|e| format!("--cred-id is not valid hex: {}", e))?;
+        let cred_id_bytes =
+            hex_decode(cred_id).map_err(|e| format!("--cred-id is not valid hex: {}", e))?;
         run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
         return Ok(());
     }
@@ -1299,7 +1299,10 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         ""
                     };
-                    let eff = d.serial_number.clone().or_else(|| ccid_serial_for(d, &ccid));
+                    let eff = d
+                        .serial_number
+                        .clone()
+                        .or_else(|| ccid_serial_for(d, &ccid));
                     let serial = match (&d.serial_number, &eff) {
                         (Some(s), _) => format!(" serial={}", s),
                         (None, Some(s)) => format!(" serial={}(ccid)", s),
@@ -1359,7 +1362,12 @@ fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::er
     let serials = effective_serials(&devices);
     let i = pick_from_devices(&devices, &keyring, &serials)?;
     let dev = &devices[i];
-    announce_target(&keyring, &dev.path, &dev.product_name, serials[i].as_deref());
+    announce_target(
+        &keyring,
+        &dev.path,
+        &dev.product_name,
+        serials[i].as_deref(),
+    );
     Ok(dev.path.clone())
 }
 
@@ -1401,8 +1409,10 @@ fn pick_from_devices(
         _ => match pick_device_interactively(devices, keyring, serials)? {
             Some(i) => Ok(i),
             None => {
-                let paths: Vec<String> =
-                    devices.iter().map(|d| d.path.display().to_string()).collect();
+                let paths: Vec<String> = devices
+                    .iter()
+                    .map(|d| d.path.display().to_string())
+                    .collect();
                 Err(format!(
                     "{} FIDO devices connected; pass --name or --path \
                      (or run in a terminal to choose): {}",
@@ -1411,7 +1421,7 @@ fn pick_from_devices(
                 )
                 .into())
             }
-        }
+        },
     }
 }
 
@@ -1424,7 +1434,11 @@ fn pick_device_interactively(
     serials: &[Option<String>],
 ) -> Result<Option<usize>, Box<dyn std::error::Error>> {
     use std::io::{BufRead, IsTerminal, Write};
-    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+    let tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
         Ok(f) => f,
         Err(_) => return Ok(None),
     };
@@ -1498,7 +1512,11 @@ fn resolve_reader(
                 _ => Err(format!(
                     "'{}' matches several readers; be more specific: {}",
                     substr,
-                    matches.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")
+                    matches
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 )
                 .into()),
             }
@@ -1556,7 +1574,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 }
             }
         }
-        OathCmd::Code { name, period, access } => {
+        OathCmd::Code {
+            name,
+            period,
+            access,
+        } => {
             let mut session = open_oath(access, debug)?;
             // Dispatch on the stored credential type: HOTP uses the card's own
             // counter (empty challenge), TOTP a time counter.
@@ -1608,7 +1630,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 imf: *counter,
             };
             session.put(&params)?;
-            println!("Added OATH {} credential {:?}.", oath_type_str(oath_type.to_oath()), name);
+            println!(
+                "Added OATH {} credential {:?}.",
+                oath_type_str(oath_type.to_oath()),
+                name
+            );
         }
         OathCmd::Delete { name, access } => {
             let mut session = open_oath(access, debug)?;
@@ -1744,14 +1770,21 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 )
                 .into());
             }
-            let admin_pin = read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+            let admin_pin = read_secret(
+                "admin PIN (PW3)",
+                admin_pin_env.as_deref(),
+                *admin_pin_stdin,
+            )?;
             let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
             let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
             eprintln!("\u{2192} OpenPGP on {}", name);
             let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
             session.set_debug(debug);
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
-            println!("Generating {} key — touch the key if it blinks…", slot.label());
+            println!(
+                "Generating {} key — touch the key if it blinks…",
+                slot.label()
+            );
             let key = session.generate_key(slot.to_crt())?;
             println!("Generated {} key (RSA):", slot.label());
             println!("  modulus:  {}", hex_encode(&key.modulus));
@@ -1781,8 +1814,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 )
                 .into());
             }
-            let admin_pin =
-                read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+            let admin_pin = read_secret(
+                "admin PIN (PW3)",
+                admin_pin_env.as_deref(),
+                *admin_pin_stdin,
+            )?;
 
             // Obtain the RSA-2048 key parts (full CRT set, big-endian) either by
             // host keygen or by loading a key file. Both go through the shared
@@ -1831,7 +1867,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             admin_pin_stdin,
             reader,
         } => {
-            let admin_pin = read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+            let admin_pin = read_secret(
+                "admin PIN (PW3)",
+                admin_pin_env.as_deref(),
+                *admin_pin_stdin,
+            )?;
             let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
             let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
             eprintln!("\u{2192} OpenPGP on {}", name);
@@ -1847,7 +1887,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             admin_pin_stdin,
             reader,
         } => {
-            let admin_pin = read_secret("admin PIN (PW3)", admin_pin_env.as_deref(), *admin_pin_stdin)?;
+            let admin_pin = read_secret(
+                "admin PIN (PW3)",
+                admin_pin_env.as_deref(),
+                *admin_pin_stdin,
+            )?;
             let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
             let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
             eprintln!("\u{2192} OpenPGP on {}", name);
@@ -1913,7 +1957,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(path) => {
                     std::fs::write(path, &plain)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!("Wrote {} plaintext bytes to {}", plain.len(), path.display());
+                    eprintln!(
+                        "Wrote {} plaintext bytes to {}",
+                        plain.len(),
+                        path.display()
+                    );
                 }
                 None => println!("{}", hex_encode(&plain)),
             }
@@ -1948,7 +1996,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             println!("Slots:");
             for s in &status.slots {
                 if s.cert_present {
-                    println!("  {:<26} cert present ({} bytes)", s.slot.label(), s.cert_len);
+                    println!(
+                        "  {:<26} cert present ({} bytes)",
+                        s.slot.label(),
+                        s.cert_len
+                    );
                 } else {
                     println!("  {:<26} empty", s.slot.label());
                 }
@@ -2016,7 +2068,10 @@ fn key_name_add(name: &str, path: Option<&Path>) -> Result<(), Box<dyn std::erro
         note: None,
     })?;
     // Opt-in disclosure: state plainly what is stored, and how to undo it.
-    eprintln!("Recording \"{}\" \u{2192} serial {} ({}).", name, serial, dev.product_name);
+    eprintln!(
+        "Recording \"{}\" \u{2192} serial {} ({}).",
+        name, serial, dev.product_name
+    );
     eprintln!(
         "This saves the key's serial number to keys.json on this computer so the \
          key can be recognized by name later — remove it any time with \
@@ -2095,7 +2150,11 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
     if init.supports_u2f() {
         caps.push("U2F");
     }
-    println!("Caps:      {} (raw 0x{:02X})", caps.join("+"), init.capabilities);
+    println!(
+        "Caps:      {} (raw 0x{:02X})",
+        caps.join("+"),
+        init.capabilities
+    );
 
     if !init.supports_cbor() {
         println!();

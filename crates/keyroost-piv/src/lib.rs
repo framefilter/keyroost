@@ -184,7 +184,13 @@ pub fn get_data(tag: &[u8]) -> Vec<u8> {
     selector.push(TAG_OBJECT_SELECTOR);
     selector.push(tag.len() as u8);
     selector.extend_from_slice(tag);
-    let mut apdu = build_apdu(0x00, Instruction::GetData.code(), GET_DATA_P1, GET_DATA_P2, &selector);
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::GetData.code(),
+        GET_DATA_P1,
+        GET_DATA_P2,
+        &selector,
+    );
     apdu.push(0x00); // case-4 Le
     apdu
 }
@@ -315,7 +321,10 @@ mod tests {
         assert_eq!(Slot::KeyManagement.key_ref(), 0x9D);
         assert_eq!(Slot::CardAuthentication.key_ref(), 0x9E);
         assert_eq!(Slot::Signature.cert_object_tag(), [0x5F, 0xC1, 0x0A]);
-        assert_eq!(Slot::CardAuthentication.cert_object_tag(), [0x5F, 0xC1, 0x01]);
+        assert_eq!(
+            Slot::CardAuthentication.cert_object_tag(),
+            [0x5F, 0xC1, 0x01]
+        );
     }
 
     #[test]
@@ -359,8 +368,14 @@ mod tests {
 
     #[test]
     fn unwrap_rejects_non_template_and_truncation() {
-        assert_eq!(unwrap_data_object(&[0x70, 0x01, 0x00]), Err(ParseError::NotDataObject));
-        assert_eq!(unwrap_data_object(&[0x53, 0x05, 0x00]), Err(ParseError::Truncated));
+        assert_eq!(
+            unwrap_data_object(&[0x70, 0x01, 0x00]),
+            Err(ParseError::NotDataObject)
+        );
+        assert_eq!(
+            unwrap_data_object(&[0x53, 0x05, 0x00]),
+            Err(ParseError::Truncated)
+        );
     }
 
     #[test]

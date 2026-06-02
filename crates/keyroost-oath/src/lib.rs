@@ -202,7 +202,10 @@ pub const fn prefix_byte(oath_type: OathType, algorithm: Algorithm) -> u8 {
 /// Panics if `value` is longer than 255 bytes, which no OATH command we build
 /// can produce (names, keys, and challenges are all small).
 fn push_tlv(out: &mut Vec<u8>, tag: Tag, value: &[u8]) {
-    assert!(value.len() <= 255, "OATH TLV value exceeds short-form length");
+    assert!(
+        value.len() <= 255,
+        "OATH TLV value exceeds short-form length"
+    );
     out.push(tag.code());
     out.push(value.len() as u8);
     out.extend_from_slice(value);
@@ -298,7 +301,13 @@ pub fn calculate(name: &str, challenge: &[u8; 8]) -> Vec<u8> {
     let mut data = Vec::new();
     push_tlv(&mut data, Tag::Name, name.as_bytes());
     push_tlv(&mut data, Tag::Challenge, challenge);
-    build_apdu(0x00, Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
+    build_apdu(
+        0x00,
+        Instruction::Calculate.code(),
+        0x00,
+        P2_TRUNCATED,
+        &data,
+    )
 }
 
 /// Build a `CALCULATE` APDU for a HOTP credential, which carries an **empty**
@@ -309,7 +318,13 @@ pub fn calculate_hotp(name: &str) -> Vec<u8> {
     let mut data = Vec::new();
     push_tlv(&mut data, Tag::Name, name.as_bytes());
     push_tlv(&mut data, Tag::Challenge, &[]);
-    build_apdu(0x00, Instruction::Calculate.code(), 0x00, P2_TRUNCATED, &data)
+    build_apdu(
+        0x00,
+        Instruction::Calculate.code(),
+        0x00,
+        P2_TRUNCATED,
+        &data,
+    )
 }
 
 /// Build a `CALCULATE_ALL` APDU (truncated). Data layout: `CHALLENGE(0x74) <8 bytes>`.
@@ -595,8 +610,7 @@ pub fn parse_list(buf: &[u8]) -> Result<Vec<CredentialInfo>, ParseError> {
         let prefix = *value.first().ok_or(ParseError::Truncated)?;
         let oath_type = OathType::from_prefix(prefix).ok_or(ParseError::BadPrefix(prefix))?;
         let algorithm = Algorithm::from_prefix(prefix).ok_or(ParseError::BadPrefix(prefix))?;
-        let name =
-            core::str::from_utf8(&value[1..]).map_err(|_| ParseError::InvalidUtf8)?;
+        let name = core::str::from_utf8(&value[1..]).map_err(|_| ParseError::InvalidUtf8)?;
         out.push(CredentialInfo {
             name: name.to_owned(),
             oath_type,
@@ -761,8 +775,7 @@ mod tests {
         let expected = vec![
             0x00, 0x01, 0x00, 0x00,
             // Lc: NAME(71 01 78)=3 + KEY(73 03 12 08 AA)=5 + PROP(78 01 02)=3 + IMF(7A 04 00000001)=6 = 17 = 0x11
-            0x11,
-            0x71, 0x01, 0x78, // NAME "x"
+            0x11, 0x71, 0x01, 0x78, // NAME "x"
             0x73, 0x03, 0x12, 0x08, 0xAA, // KEY: prefix 0x10|0x02=0x12, digits 8
             0x78, 0x01, 0x02, // PROPERTY require-touch
             0x7A, 0x04, 0x00, 0x00, 0x00, 0x01, // IMF = 1
@@ -778,9 +791,8 @@ mod tests {
         // NAME(71) 02 "ab", CHALLENGE(74) 08 <8 bytes>
         // Lc = 4 + 10 = 14 = 0x0E
         let expected = vec![
-            0x00, 0xA2, 0x00, 0x01, 0x0E,
-            0x71, 0x02, 0x61, 0x62,
-            0x74, 0x08, 0x00, 0x00, 0x00, 0x00, 0x03, 0x4F, 0x09, 0x6D,
+            0x00, 0xA2, 0x00, 0x01, 0x0E, 0x71, 0x02, 0x61, 0x62, 0x74, 0x08, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x4F, 0x09, 0x6D,
         ];
         assert_eq!(apdu, expected);
     }
@@ -788,7 +800,10 @@ mod tests {
     #[test]
     fn delete_bytes() {
         let apdu = delete("ab");
-        assert_eq!(apdu, vec![0x00, 0x02, 0x00, 0x00, 0x04, 0x71, 0x02, 0x61, 0x62]);
+        assert_eq!(
+            apdu,
+            vec![0x00, 0x02, 0x00, 0x00, 0x04, 0x71, 0x02, 0x61, 0x62]
+        );
     }
 
     #[test]
@@ -851,7 +866,10 @@ mod tests {
     #[test]
     fn parse_tlvs_detects_truncation() {
         // tag 71, claims length 5 but only 2 bytes follow.
-        assert_eq!(parse_tlvs(&[0x71, 0x05, 0x61, 0x62]), Err(ParseError::Truncated));
+        assert_eq!(
+            parse_tlvs(&[0x71, 0x05, 0x61, 0x62]),
+            Err(ParseError::Truncated)
+        );
     }
 
     #[test]

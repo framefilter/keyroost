@@ -76,7 +76,10 @@ pub enum KeyringError {
     Parse(String),
     NoConfigDir,
     DuplicateName(String),
-    DuplicateSerial { serial: String, existing_name: String },
+    DuplicateSerial {
+        serial: String,
+        existing_name: String,
+    },
     InvalidName(String),
 }
 
@@ -86,10 +89,16 @@ impl fmt::Display for KeyringError {
             KeyringError::Io(e) => write!(f, "keyring I/O error: {}", e),
             KeyringError::Parse(s) => write!(f, "keyring config parse error: {}", s),
             KeyringError::NoConfigDir => {
-                write!(f, "could not determine config dir (set HOME or XDG_CONFIG_HOME)")
+                write!(
+                    f,
+                    "could not determine config dir (set HOME or XDG_CONFIG_HOME)"
+                )
             }
             KeyringError::DuplicateName(n) => write!(f, "a key named '{}' already exists", n),
-            KeyringError::DuplicateSerial { serial, existing_name } => {
+            KeyringError::DuplicateSerial {
+                serial,
+                existing_name,
+            } => {
                 write!(f, "serial {} is already named '{}'", serial, existing_name)
             }
             KeyringError::InvalidName(n) => {
@@ -130,7 +139,12 @@ impl fmt::Display for ResolveError {
                 name
             ),
             ResolveError::UnknownName { name, known } => {
-                write!(f, "no key named '{}'. Known names: {}", name, known.join(", "))
+                write!(
+                    f,
+                    "no key named '{}'. Known names: {}",
+                    name,
+                    known.join(", ")
+                )
             }
             ResolveError::NotConnected { name, serial } => {
                 write!(f, "key '{}' (serial {}) is not connected", name, serial)
@@ -167,7 +181,12 @@ pub fn config_path() -> Option<PathBuf> {
     if home.is_empty() {
         return None;
     }
-    Some(PathBuf::from(home).join(".config").join("keyroost").join("keys.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("keyroost")
+            .join("keys.json"),
+    )
 }
 
 impl Keyring {
@@ -200,7 +219,8 @@ impl Keyring {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(|e| KeyringError::Parse(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| KeyringError::Parse(e.to_string()))?;
         fs::write(path, json + "\n")?;
         Ok(())
     }
@@ -249,10 +269,12 @@ impl Keyring {
         name: &str,
         connected: &'a [ConnectedKey],
     ) -> Result<&'a ConnectedKey, ResolveError> {
-        let entry = self.by_name(name).ok_or_else(|| ResolveError::UnknownName {
-            name: name.to_string(),
-            known: self.keys.iter().map(|k| k.name.clone()).collect(),
-        })?;
+        let entry = self
+            .by_name(name)
+            .ok_or_else(|| ResolveError::UnknownName {
+                name: name.to_string(),
+                known: self.keys.iter().map(|k| k.name.clone()).collect(),
+            })?;
         connected
             .iter()
             .find(|d| d.serial.as_deref() == Some(entry.serial.as_str()))
@@ -291,7 +313,10 @@ mod tests {
     fn add_rejects_duplicates() {
         let mut k = Keyring::default();
         k.add(entry("a", "111")).unwrap();
-        assert!(matches!(k.add(entry("a", "222")), Err(KeyringError::DuplicateName(_))));
+        assert!(matches!(
+            k.add(entry("a", "222")),
+            Err(KeyringError::DuplicateName(_))
+        ));
         assert!(matches!(
             k.add(entry("b", "111")),
             Err(KeyringError::DuplicateSerial { .. })
@@ -317,12 +342,29 @@ mod tests {
         let mut k = Keyring::default();
         k.add(entry("solo", "ABC")).unwrap();
         let connected = vec![
-            ConnectedKey { path: "/dev/hidraw5".into(), serial: Some("ABC".into()), label: "Solo 2".into() },
-            ConnectedKey { path: "/dev/hidraw9".into(), serial: None, label: "YubiKey".into() },
+            ConnectedKey {
+                path: "/dev/hidraw5".into(),
+                serial: Some("ABC".into()),
+                label: "Solo 2".into(),
+            },
+            ConnectedKey {
+                path: "/dev/hidraw9".into(),
+                serial: None,
+                label: "YubiKey".into(),
+            },
         ];
-        assert_eq!(k.resolve("solo", &connected).unwrap().path, PathBuf::from("/dev/hidraw5"));
-        assert!(matches!(k.resolve("nope", &connected), Err(ResolveError::UnknownName { .. })));
-        assert!(matches!(k.resolve("solo", &[]), Err(ResolveError::NotConnected { .. })));
+        assert_eq!(
+            k.resolve("solo", &connected).unwrap().path,
+            PathBuf::from("/dev/hidraw5")
+        );
+        assert!(matches!(
+            k.resolve("nope", &connected),
+            Err(ResolveError::UnknownName { .. })
+        ));
+        assert!(matches!(
+            k.resolve("solo", &[]),
+            Err(ResolveError::NotConnected { .. })
+        ));
     }
 
     #[test]
@@ -344,7 +386,8 @@ mod tests {
         assert_eq!(back.keys[0].vendor.as_deref(), Some("yubico"));
 
         // `source` defaults to Usb when absent in JSON.
-        let minimal: Keyring = serde_json::from_str(r#"{"keys":[{"name":"x","serial":"S1"}]}"#).unwrap();
+        let minimal: Keyring =
+            serde_json::from_str(r#"{"keys":[{"name":"x","serial":"S1"}]}"#).unwrap();
         assert_eq!(minimal.keys[0].source, IdSource::Usb);
     }
 

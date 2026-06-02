@@ -32,7 +32,11 @@ pub fn effective_serials(devices: &[HidDevice]) -> Vec<Option<String>> {
     let ccid = ccid_readers_if_needed(devices);
     devices
         .iter()
-        .map(|d| d.serial_number.clone().or_else(|| ccid_serial_for(d, &ccid)))
+        .map(|d| {
+            d.serial_number
+                .clone()
+                .or_else(|| ccid_serial_for(d, &ccid))
+        })
         .collect()
 }
 
@@ -142,7 +146,10 @@ mod tests {
 
     #[test]
     fn topology_match_disambiguates_two_yubikeys() {
-        let readers = [reader(Some(9), Some(53), "37806840"), reader(Some(9), Some(54), "27717893")];
+        let readers = [
+            reader(Some(9), Some(53), "37806840"),
+            reader(Some(9), Some(54), "27717893"),
+        ];
         let a = yubikey("/dev/hidraw16", Some(9), Some(53));
         let b = yubikey("/dev/hidraw18", Some(9), Some(54));
         assert_eq!(ccid_serial_for(&a, &readers).as_deref(), Some("37806840"));
@@ -160,7 +167,10 @@ mod tests {
     fn never_guesses_among_several_when_topology_unknown() {
         // Two readers, no usable topology on either side: refuse rather than
         // risk targeting the wrong physical key.
-        let readers = [reader(None, None, "37806840"), reader(None, None, "27717893")];
+        let readers = [
+            reader(None, None, "37806840"),
+            reader(None, None, "27717893"),
+        ];
         let d = yubikey("/dev/hidraw16", None, None);
         assert_eq!(ccid_serial_for(&d, &readers), None);
     }

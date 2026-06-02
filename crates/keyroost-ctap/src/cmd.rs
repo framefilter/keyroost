@@ -36,7 +36,11 @@ impl std::fmt::Display for CtapError {
             CtapError::Hid(e) => write!(f, "{}", e),
             CtapError::Cbor(e) => write!(f, "{}", e),
             CtapError::StatusCode(c) => match ctap_status_name(*c) {
-                Some(name) => write!(f, "authenticator returned CTAP2 status 0x{:02X} ({})", c, name),
+                Some(name) => write!(
+                    f,
+                    "authenticator returned CTAP2 status 0x{:02X} ({})",
+                    c, name
+                ),
                 None => write!(f, "authenticator returned CTAP2 status 0x{:02X}", c),
             },
             CtapError::EmptyResponse => write!(f, "authenticator returned an empty CBOR response"),

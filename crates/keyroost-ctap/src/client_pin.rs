@@ -135,8 +135,8 @@ impl PinUvAuthToken {
     pub fn authenticate(&self, data: &[u8]) -> Vec<u8> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
-        let mut mac =
-            <Hmac<Sha256> as Mac>::new_from_slice(&self.token).expect("HMAC accepts any key length");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.token)
+            .expect("HMAC accepts any key length");
         mac.update(data);
         let full = mac.finalize().into_bytes();
         if self.protocol == PIN_PROTOCOL_V1 {
@@ -156,9 +156,7 @@ pub fn get_pin_retries(dev: &mut CtapHidDevice) -> Result<u32, CtapError> {
 }
 
 /// Fetch the authenticator's ephemeral P-256 public key for ECDH.
-pub fn get_key_agreement(
-    dev: &mut CtapHidDevice,
-) -> Result<([u8; 32], [u8; 32]), CtapError> {
+pub fn get_key_agreement(dev: &mut CtapHidDevice) -> Result<([u8; 32], [u8; 32]), CtapError> {
     let req = build_request(PIN_PROTOCOL_V1, SUB_GET_KEY_AGREEMENT, &[]);
     let resp = dispatch(dev, &req)?;
     resp.key_agreement
@@ -185,11 +183,7 @@ pub fn set_pin(dev: &mut CtapHidDevice, new_pin: &str) -> Result<(), CtapError> 
 }
 
 /// Change an existing PIN.
-pub fn change_pin(
-    dev: &mut CtapHidDevice,
-    old_pin: &str,
-    new_pin: &str,
-) -> Result<(), CtapError> {
+pub fn change_pin(dev: &mut CtapHidDevice, old_pin: &str, new_pin: &str) -> Result<(), CtapError> {
     validate_pin(new_pin)?;
     let chosen = negotiate_protocol(dev)?;
     let (proto, peer) = key_agreement(dev, chosen)?;
@@ -215,10 +209,7 @@ pub fn change_pin(
 /// Obtain a pinUvAuthToken bound to the current PIN. The returned token is
 /// usable as an HMAC key for credential management and similar commands
 /// until the authenticator power-cycles.
-pub fn get_pin_token(
-    dev: &mut CtapHidDevice,
-    pin: &str,
-) -> Result<PinUvAuthToken, CtapError> {
+pub fn get_pin_token(dev: &mut CtapHidDevice, pin: &str) -> Result<PinUvAuthToken, CtapError> {
     let chosen = negotiate_protocol(dev)?;
     token_legacy(dev, pin, chosen)
 }
@@ -345,7 +336,10 @@ fn pin_uv_auth_token_extra(
     let mut extra = vec![
         (Value::UInt(KEY_KEY_AGREEMENT), our_pub),
         (Value::UInt(KEY_PIN_HASH_ENC), Value::Bytes(pin_hash_enc)),
-        (Value::UInt(KEY_PERMISSIONS), Value::UInt(permissions as u64)),
+        (
+            Value::UInt(KEY_PERMISSIONS),
+            Value::UInt(permissions as u64),
+        ),
     ];
     if let Some(rp) = rp_id {
         extra.push((Value::UInt(KEY_RP_ID), Value::Text(rp.to_string())));
@@ -422,9 +416,7 @@ fn dispatch(dev: &mut CtapHidDevice, req: &[u8]) -> Result<PinResponse, CtapErro
     payload.push(CTAP2_CLIENT_PIN);
     payload.extend_from_slice(req);
     let resp = dev.transact(CTAPHID_CBOR, &payload)?;
-    let (status, body) = resp
-        .split_first()
-        .ok_or(CtapError::EmptyResponse)?;
+    let (status, body) = resp.split_first().ok_or(CtapError::EmptyResponse)?;
     if *status != 0 {
         return Err(CtapError::StatusCode(*status));
     }
@@ -578,7 +570,10 @@ mod tests {
             Value::Bytes(vec![0xAA, 0xBB, 0xCC, 0xDD]),
         )]);
         let p = parse_pin_response(&resp).unwrap();
-        assert_eq!(p.pin_token_enc.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+        assert_eq!(
+            p.pin_token_enc.as_deref(),
+            Some(&[0xAA, 0xBB, 0xCC, 0xDD][..])
+        );
     }
 
     #[test]
@@ -604,22 +599,27 @@ mod tests {
             permissions::CREDENTIAL_MANAGEMENT,
             None,
         );
-        let bytes = build_request_extra(
-            PIN_PROTOCOL_V1,
-            SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN,
-            &extra,
-        );
+        let bytes =
+            build_request_extra(PIN_PROTOCOL_V1, SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN, &extra);
         let (val, _) = cbor::decode(&bytes).unwrap();
         let map = val.as_map().unwrap();
         // protocol + subCommand + keyAgreement + pinHashEnc + permissions.
         assert_eq!(map.len(), 5);
-        assert_eq!(find(map, KEY_PIN_PROTOCOL).and_then(Value::as_uint), Some(1));
+        assert_eq!(
+            find(map, KEY_PIN_PROTOCOL).and_then(Value::as_uint),
+            Some(1)
+        );
         assert_eq!(
             find(map, KEY_SUB_COMMAND).and_then(Value::as_uint),
             Some(SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN as u64)
         );
-        assert_eq!(find(map, KEY_PERMISSIONS).and_then(Value::as_uint), Some(0x04));
-        assert!(find(map, KEY_PIN_HASH_ENC).and_then(Value::as_bytes).is_some());
+        assert_eq!(
+            find(map, KEY_PERMISSIONS).and_then(Value::as_uint),
+            Some(0x04)
+        );
+        assert!(find(map, KEY_PIN_HASH_ENC)
+            .and_then(Value::as_bytes)
+            .is_some());
         // rpId omitted when not supplied.
         assert!(find(map, KEY_RP_ID).is_none());
     }
@@ -633,15 +633,15 @@ mod tests {
             permissions::GET_ASSERTION,
             Some("example.com"),
         );
-        let bytes = build_request_extra(
-            PIN_PROTOCOL_V1,
-            SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN,
-            &extra,
-        );
+        let bytes =
+            build_request_extra(PIN_PROTOCOL_V1, SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN, &extra);
         let (val, _) = cbor::decode(&bytes).unwrap();
         let map = val.as_map().unwrap();
         assert_eq!(map.len(), 6);
-        assert_eq!(find(map, KEY_RP_ID).and_then(Value::as_text), Some("example.com"));
+        assert_eq!(
+            find(map, KEY_RP_ID).and_then(Value::as_text),
+            Some("example.com")
+        );
     }
 
     #[test]
@@ -689,14 +689,13 @@ mod tests {
 
     #[test]
     fn request_carries_v2_protocol_when_selected() {
-        let bytes = build_request_extra(
-            SelectedPinProtocol::V2.version(),
-            SUB_GET_PIN_TOKEN,
-            &[],
-        );
+        let bytes = build_request_extra(SelectedPinProtocol::V2.version(), SUB_GET_PIN_TOKEN, &[]);
         let (val, _) = cbor::decode(&bytes).unwrap();
         let map = val.as_map().unwrap();
-        assert_eq!(find(map, KEY_PIN_PROTOCOL).and_then(Value::as_uint), Some(2));
+        assert_eq!(
+            find(map, KEY_PIN_PROTOCOL).and_then(Value::as_uint),
+            Some(2)
+        );
     }
 
     #[test]

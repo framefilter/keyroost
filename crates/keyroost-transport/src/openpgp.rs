@@ -114,8 +114,8 @@ impl OpenPgpSession {
     pub fn status(&mut self) -> Result<OpenPgpStatus, TransportError> {
         let (ard_bytes, sw) = self.transmit_full(&pgp::get_application_related_data())?;
         ok_or_apdu("get application related data", sw)?;
-        let ard =
-            pgp::parse_application_related_data(&ard_bytes).map_err(TransportError::OpenPgpParse)?;
+        let ard = pgp::parse_application_related_data(&ard_bytes)
+            .map_err(TransportError::OpenPgpParse)?;
 
         // The signature counter lives in the Security Support Template (007A).
         // It's optional; absence or a parse miss just leaves the count unknown.
@@ -243,7 +243,8 @@ impl OpenPgpSession {
         }
 
         let chunks = pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254);
-        self.transmit_chain("openpgp import key", &chunks).map(|_| ())
+        self.transmit_chain("openpgp import key", &chunks)
+            .map(|_| ())
     }
 
     /// Transmit an ISO 7816 command-chaining sequence: each intermediate chunk
@@ -281,8 +282,8 @@ impl OpenPgpSession {
     fn rsa_attributes(&mut self, crt: pgp::KeyCrt) -> Result<pgp::RsaAttributes, TransportError> {
         let (ard_bytes, sw) = self.transmit_full(&pgp::get_application_related_data())?;
         ok_or_apdu("get application related data", sw)?;
-        let ard =
-            pgp::parse_application_related_data(&ard_bytes).map_err(TransportError::OpenPgpParse)?;
+        let ard = pgp::parse_application_related_data(&ard_bytes)
+            .map_err(TransportError::OpenPgpParse)?;
         let attr = match crt {
             pgp::KeyCrt::Sign => &ard.algo_attr_sig,
             pgp::KeyCrt::Decrypt => &ard.algo_attr_dec,

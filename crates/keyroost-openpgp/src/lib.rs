@@ -763,7 +763,10 @@ fn minimal_be(n: usize) -> Vec<u8> {
         return vec![0x00];
     }
     let bytes = n.to_be_bytes();
-    let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+    let first = bytes
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(bytes.len() - 1);
     bytes[first..].to_vec()
 }
 
@@ -1312,8 +1315,8 @@ pub fn parse_application_related_data(buf: &[u8]) -> Result<AppRelatedData, Pars
     // report more — a YubiKey 5.7 returns 80 bytes (a fourth, "attestation" key
     // slot). Require at least the three standard fingerprints and read those;
     // ignore any trailing slots we don't model.
-    let fpr = find_nested(&tlvs, TAG_FINGERPRINTS)
-        .ok_or(ParseError::MissingTag(TAG_FINGERPRINTS))?;
+    let fpr =
+        find_nested(&tlvs, TAG_FINGERPRINTS).ok_or(ParseError::MissingTag(TAG_FINGERPRINTS))?;
     if fpr.len() < 60 {
         return Err(ParseError::UnexpectedLength);
     }
@@ -1414,7 +1417,10 @@ mod tests {
         );
         assert_eq!(get_pw_status(), vec![0x00, 0xCA, 0x00, 0xC4, 0x00]);
         // A 2-byte tag splits across P1/P2: 5F52 -> P1=5F P2=52.
-        assert_eq!(get_data(TAG_HISTORICAL_BYTES), vec![0x00, 0xCA, 0x5F, 0x52, 0x00]);
+        assert_eq!(
+            get_data(TAG_HISTORICAL_BYTES),
+            vec![0x00, 0xCA, 0x5F, 0x52, 0x00]
+        );
     }
 
     #[test]
@@ -1478,13 +1484,19 @@ mod tests {
     #[test]
     fn rejects_indefinite_and_wide_length() {
         assert_eq!(parse_tlvs(&[0xC4, 0x80]), Err(ParseError::UnexpectedLength));
-        assert_eq!(parse_tlvs(&[0xC4, 0x83, 0, 0, 1]), Err(ParseError::UnexpectedLength));
+        assert_eq!(
+            parse_tlvs(&[0xC4, 0x83, 0, 0, 1]),
+            Err(ParseError::UnexpectedLength)
+        );
     }
 
     #[test]
     fn detects_truncation() {
         // tag C4, claims length 5 but only 2 bytes follow.
-        assert_eq!(parse_tlvs(&[0xC4, 0x05, 0xAA, 0xBB]), Err(ParseError::Truncated));
+        assert_eq!(
+            parse_tlvs(&[0xC4, 0x05, 0xAA, 0xBB]),
+            Err(ParseError::Truncated)
+        );
         // high tag with no second byte.
         assert_eq!(parse_tlvs(&[0x5F]), Err(ParseError::Truncated));
     }
@@ -1598,7 +1610,9 @@ mod tests {
         let hist = [0x00, 0x73, 0x00, 0x80, 0x05, 0x90, 0x00];
         // RSA (01), ECDH (12), EdDSA (16) algorithm ids in the first byte.
         let c1 = [0x01, 0x08, 0x00, 0x00, 0x20, 0x00];
-        let c2 = [0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01];
+        let c2 = [
+            0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+        ];
         let c3 = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
         let c4 = [0x01, 0x7F, 0x7F, 0x7F, 0x03, 0x00, 0x03];
         let mut c5 = [0u8; 60];
@@ -1608,7 +1622,11 @@ mod tests {
         let c6 = [0u8; 60];
 
         let mut disc = Vec::new(); // 73 value
-        push(&mut disc, 0xC0, &[0x7F, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
+        push(
+            &mut disc,
+            0xC0,
+            &[0x7F, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF],
+        );
         push(&mut disc, 0xC1, &c1);
         push(&mut disc, 0xC2, &c2);
         push(&mut disc, 0xC3, &c3);
@@ -2119,7 +2137,7 @@ mod tests {
         assert_eq!(&ehl[7..9], &[0x91, 0x04]);
         // ...the 7F48 value is 12 bytes (6 x 2), so 5F48 starts at offset 19.
         assert_eq!(&ehl[19..22], &[0x5F, 0x48, 0x0D]); // 13 = 4+2+2+2+1+2
-        // ...and the 5F48 data starts with the padded exponent 00 01 00 01.
+                                                       // ...and the 5F48 data starts with the padded exponent 00 01 00 01.
         assert_eq!(&ehl[22..26], &[0x00, 0x01, 0x00, 0x01]);
     }
 
@@ -2301,8 +2319,7 @@ mod tests {
             n: &[],
         };
         let ehl = extended_header_list(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17);
-        let chunks =
-            import_rsa_key_chained(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17, 254);
+        let chunks = import_rsa_key_chained(KeyCrt::Sign, &key, RsaImportFormat::Standard, 17, 254);
         // EHL is 281 bytes -> 254 + 27 = two chunks.
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0][0], 0x10); // chaining bit set on the non-final link

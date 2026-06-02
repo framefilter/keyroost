@@ -45,7 +45,9 @@ pub enum PinError {
 impl std::fmt::Display for PinError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PinError::InvalidPublicKey => write!(f, "authenticator returned an invalid P-256 point"),
+            PinError::InvalidPublicKey => {
+                write!(f, "authenticator returned an invalid P-256 point")
+            }
             PinError::InvalidCiphertextLength => {
                 write!(f, "PIN protocol ciphertext was not block-aligned")
             }
@@ -214,7 +216,11 @@ fn aes256_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8
     out
 }
 
-fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>, PinError> {
+fn aes256_cbc_decrypt(
+    key: &[u8; 32],
+    iv: &[u8; 16],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, PinError> {
     if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return Err(PinError::InvalidCiphertextLength);
     }
@@ -273,7 +279,10 @@ pub fn left16_sha256(input: &[u8]) -> [u8; 16] {
 /// length (4–63 UTF-8 bytes per CTAP).
 pub fn pad_pin_to_64(pin: &str) -> [u8; 64] {
     let bytes = pin.as_bytes();
-    assert!(bytes.len() < 64, "pin must be < 64 bytes (caller validates)");
+    assert!(
+        bytes.len() < 64,
+        "pin must be < 64 bytes (caller validates)"
+    );
     let mut out = [0u8; 64];
     out[..bytes.len()].copy_from_slice(bytes);
     out

@@ -18,7 +18,9 @@
 
 use std::fmt;
 
-use keyroost_proto::commands::{self, derive_sm4_key, sw_auth_failed, sw_ok, Command, ProfileConfig};
+use keyroost_proto::commands::{
+    self, derive_sm4_key, sw_auth_failed, sw_ok, Command, ProfileConfig,
+};
 use keyroost_proto::READER_NAME_HINT;
 use pcsc::{Attribute, Card, Context, Protocols, Scope, ShareMode};
 
@@ -29,10 +31,10 @@ mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
 mod piv;
-pub use piv::{PivSession, PivSlotStatus, PivStatus};
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{KeyCrt, RsaPrivateKeyParts};
+pub use piv::{PivSession, PivSlotStatus, PivStatus};
 
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]
@@ -123,10 +125,14 @@ impl fmt::Display for TransportError {
             TransportError::NoOpenPgpApplet => {
                 write!(f, "no OpenPGP applet on this card")
             }
-            TransportError::OpenPgpPinRejected { tries_remaining: Some(n) } => {
+            TransportError::OpenPgpPinRejected {
+                tries_remaining: Some(n),
+            } => {
                 write!(f, "OpenPGP PIN rejected; {} attempt(s) remaining", n)
             }
-            TransportError::OpenPgpPinRejected { tries_remaining: None } => {
+            TransportError::OpenPgpPinRejected {
+                tries_remaining: None,
+            } => {
                 write!(f, "OpenPGP PIN rejected (PIN may be blocked)")
             }
             TransportError::PivParse(e) => write!(f, "PIV response parse error: {}", e),
@@ -431,7 +437,11 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
     let names: Vec<std::ffi::CString> = ctx
         .list_readers(&mut buf)
         .map_err(TransportError::PcscUnavailable)?
-        .filter(|r| r.to_string_lossy().to_ascii_lowercase().contains(YUBIKEY_READER_HINT))
+        .filter(|r| {
+            r.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains(YUBIKEY_READER_HINT)
+        })
         .map(|r| r.to_owned())
         .collect();
 
@@ -443,7 +453,12 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
             (usb_bus, usb_address) = read_channel_id(&card);
             serial = read_yubikey_serial(&card).ok();
         }
-        out.push(YubiKeyCcid { reader_name, usb_bus, usb_address, serial });
+        out.push(YubiKeyCcid {
+            reader_name,
+            usb_bus,
+            usb_address,
+            serial,
+        });
     }
     Ok(out)
 }
@@ -474,13 +489,21 @@ fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
     select.extend_from_slice(&YUBIKEY_OTP_AID);
     let (_, sw1, sw2) = transmit_apdu(card, &select)?;
     if !sw_ok(sw1, sw2) {
-        return Err(TransportError::Apdu { label: "select yubikey otp applet", sw1, sw2 });
+        return Err(TransportError::Apdu {
+            label: "select yubikey otp applet",
+            sw1,
+            sw2,
+        });
     }
     // API request reading the device serial (CLA INS P1 P2 Le).
     let read = [0x00, YK_INS_API_REQ, YK_SLOT_DEVICE_SERIAL, 0x00, 0x00];
     let (data, sw1, sw2) = transmit_apdu(card, &read)?;
     if !sw_ok(sw1, sw2) {
-        return Err(TransportError::Apdu { label: "read yubikey serial", sw1, sw2 });
+        return Err(TransportError::Apdu {
+            label: "read yubikey serial",
+            sw1,
+            sw2,
+        });
     }
     if data.len() < 4 {
         return Err(TransportError::ShortResponse {

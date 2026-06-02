@@ -136,7 +136,9 @@ pub fn enumerate() -> Result<Vec<HidDevice>, HidError> {
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
-        let Some(name_str) = name.to_str() else { continue };
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
         if !name_str.starts_with("hidraw") {
             continue;
         }

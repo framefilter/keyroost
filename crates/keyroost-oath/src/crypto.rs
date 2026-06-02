@@ -98,7 +98,10 @@ mod tests {
         // independently-computed value (RFC 2202 case 5 uses key = 0xaa*80).
         let key = [0xaa; 80];
         assert_eq!(
-            hex(&hmac_sha1(&key, b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            hex(&hmac_sha1(
+                &key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
             "aa4ae5e15272d00e95705637ce8a3b55ed402112"
         );
     }

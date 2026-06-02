@@ -855,12 +855,8 @@ impl App {
                 self.security_keys.serials = keyroost_resolve::effective_serials(&fido_only);
                 self.security_keys.keyring = Keyring::load_default().unwrap_or_default();
                 self.security_keys.devices = fido_only;
-                self.security_keys.selected = prev_path.and_then(|p| {
-                    self.security_keys
-                        .devices
-                        .iter()
-                        .position(|d| d.path == p)
-                });
+                self.security_keys.selected = prev_path
+                    .and_then(|p| self.security_keys.devices.iter().position(|d| d.path == p));
             }
             Err(e) => {
                 self.security_keys.error = Some(format!("enumeration failed: {}", e));
@@ -945,8 +941,7 @@ impl App {
                 return;
             }
         };
-        let vendor =
-            (dev.vendor_id == keyroost_resolve::VID_YUBICO).then(|| "yubico".to_string());
+        let vendor = (dev.vendor_id == keyroost_resolve::VID_YUBICO).then(|| "yubico".to_string());
         let entry = keyroost_keyring::KeyEntry {
             name,
             serial,
@@ -1277,10 +1272,7 @@ impl App {
                             dev.product_id,
                             header
                         );
-                        if ui
-                            .selectable_label(selected, label)
-                            .clicked()
-                        {
+                        if ui.selectable_label(selected, label).clicked() {
                             click = Some(i);
                         }
                     }
@@ -1328,12 +1320,18 @@ impl App {
                 kv(
                     ui,
                     "Protocol",
-                    &format!("v{} (capabilities 0x{:02X})", init.protocol_version, init.capabilities),
+                    &format!(
+                        "v{} (capabilities 0x{:02X})",
+                        init.protocol_version, init.capabilities
+                    ),
                 );
                 kv(
                     ui,
                     "HID firmware",
-                    &format!("{}.{}.{}", init.device_major, init.device_minor, init.device_build),
+                    &format!(
+                        "{}.{}.{}",
+                        init.device_major, init.device_minor, init.device_build
+                    ),
                 );
                 let mut caps = Vec::new();
                 if init.supports_wink() {
@@ -1443,7 +1441,10 @@ impl App {
                     egui::RichText::new("Reset key…").color(egui::Color32::from_rgb(220, 110, 110)),
                 );
                 if ui.add(reset).clicked() {
-                    self.security_keys.reset = ResetDialog { open: true, ..Default::default() };
+                    self.security_keys.reset = ResetDialog {
+                        open: true,
+                        ..Default::default()
+                    };
                 }
             });
         });
@@ -1592,7 +1593,8 @@ impl App {
             .selected
             .and_then(|i| self.oath.readers.get(i).cloned());
         self.spawn_job("Scanning for OATH keys\u{2026}", move || {
-            let result = keyroost_transport::OathSession::list_oath_readers().map_err(|e| e.to_string());
+            let result =
+                keyroost_transport::OathSession::list_oath_readers().map_err(|e| e.to_string());
             Box::new(move |app: &mut App| {
                 match result {
                     Ok(readers) => {
@@ -1600,7 +1602,11 @@ impl App {
                         // Preserve the selection by name across refreshes.
                         app.oath.selected = prev
                             .and_then(|p| app.oath.readers.iter().position(|r| *r == p))
-                            .or(if app.oath.readers.is_empty() { None } else { Some(0) });
+                            .or(if app.oath.readers.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            });
                     }
                     Err(e) => {
                         app.oath.error = Some(format!("enumeration failed: {e}"));
@@ -1650,7 +1656,9 @@ impl App {
     }
 
     /// Off-thread helper: list credentials and compute each current TOTP.
-    fn oath_list_rows(session: &mut keyroost_transport::OathSession) -> Result<Vec<OathRow>, TransportError> {
+    fn oath_list_rows(
+        session: &mut keyroost_transport::OathSession,
+    ) -> Result<Vec<OathRow>, TransportError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1658,7 +1666,10 @@ impl App {
         let mut rows = Vec::new();
         for c in session.list()? {
             // A touch-required credential blocks until touched; fine off-thread.
-            let code = session.calculate_totp(&c.name, now, 30).ok().map(|otp| otp.code);
+            let code = session
+                .calculate_totp(&c.name, now, 30)
+                .ok()
+                .map(|otp| otp.code);
             rows.push(OathRow {
                 name: c.name,
                 detail: format!("{:?}/{:?}", c.oath_type, c.algorithm),
@@ -1857,7 +1868,11 @@ impl App {
                 );
                 if ui.button("Add credential\u{2026}").clicked() {
                     // Open the add form; default to TOTP.
-                    self.oath.add = OathAddDialog { open: true, totp: true, ..Default::default() };
+                    self.oath.add = OathAddDialog {
+                        open: true,
+                        totp: true,
+                        ..Default::default()
+                    };
                 }
             });
 
@@ -2059,14 +2074,18 @@ impl App {
             .selected
             .and_then(|i| self.openpgp.readers.get(i).cloned());
         self.spawn_job("Scanning for OpenPGP cards\u{2026}", move || {
-            let result =
-                keyroost_transport::OpenPgpSession::list_openpgp_readers().map_err(|e| e.to_string());
+            let result = keyroost_transport::OpenPgpSession::list_openpgp_readers()
+                .map_err(|e| e.to_string());
             Box::new(move |app: &mut App| match result {
                 Ok(readers) => {
                     app.openpgp.readers = readers;
                     app.openpgp.selected = prev
                         .and_then(|p| app.openpgp.readers.iter().position(|r| *r == p))
-                        .or(if app.openpgp.readers.is_empty() { None } else { Some(0) });
+                        .or(if app.openpgp.readers.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
                 }
                 Err(e) => {
                     app.openpgp.error = Some(format!("enumeration failed: {e}"));
@@ -2137,7 +2156,9 @@ impl App {
 
     /// Set the cardholder name (PW3-gated), then refresh status.
     fn set_openpgp_name(&mut self) {
-        let Some(name) = self.selected_openpgp_reader() else { return };
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
         let pin = self.openpgp.admin_pin.clone();
         let value = self.openpgp.name_input.clone();
         self.openpgp.notice = None;
@@ -2155,7 +2176,9 @@ impl App {
 
     /// Set the public-key URL (PW3-gated), then refresh status.
     fn set_openpgp_url(&mut self) {
-        let Some(name) = self.selected_openpgp_reader() else { return };
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
         let pin = self.openpgp.admin_pin.clone();
         let value = self.openpgp.url_input.clone();
         self.openpgp.notice = None;
@@ -2174,7 +2197,9 @@ impl App {
     /// Generate + register a key in the selected slot (PW3-gated, destructive),
     /// then refresh status. May require a touch on the key.
     fn generate_openpgp_key(&mut self) {
-        let Some(name) = self.selected_openpgp_reader() else { return };
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
         let pin = self.openpgp.admin_pin.clone();
         let slot = self.openpgp.gen_slot;
         let creation_time = unix_now();
@@ -2206,7 +2231,9 @@ impl App {
     /// status. The key material comes from host keygen or a file, obtained on the
     /// worker thread (keygen is slow). May require a touch on the key.
     fn import_openpgp_key(&mut self, source: ImportSource) {
-        let Some(name) = self.selected_openpgp_reader() else { return };
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
         let pin = self.openpgp.admin_pin.clone();
         let slot = self.openpgp.import_slot;
         let path = self.openpgp.import_path.clone();
@@ -2239,7 +2266,8 @@ impl App {
                     dq: &k.dq,
                     n: &k.n,
                 };
-                s.import_key(slot.to_crt(), &parts).map_err(|e| e.to_string())?;
+                s.import_key(slot.to_crt(), &parts)
+                    .map_err(|e| e.to_string())?;
                 let fpr = s
                     .register_key(slot.to_crt(), creation_time)
                     .map_err(|e| e.to_string())?;
@@ -2251,8 +2279,11 @@ impl App {
                     app.openpgp.status = Some(status);
                     app.openpgp.loaded = true;
                     app.openpgp.error = None;
-                    app.openpgp.notice =
-                        Some(format!("Imported {} key: {}", slot.label(), hex_lower(&fpr)));
+                    app.openpgp.notice = Some(format!(
+                        "Imported {} key: {}",
+                        slot.label(),
+                        hex_lower(&fpr)
+                    ));
                     app.openpgp.admin_pin.clear();
                     app.openpgp.import_path.clear();
                 }
@@ -2267,7 +2298,9 @@ impl App {
     /// Factory-reset the OpenPGP applet (destructive), then refresh status. No
     /// PIN needed — reset blocks the PINs itself.
     fn reset_openpgp(&mut self) {
-        let Some(name) = self.selected_openpgp_reader() else { return };
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
         self.openpgp.notice = None;
         self.spawn_job("Resetting OpenPGP applet…", move || {
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
@@ -2371,27 +2404,44 @@ impl App {
                 kv(
                     ui,
                     "Signature key",
-                    &format!("{}  {}", algo_id_label(status.sig_algo_id), fpr_label(&status.fingerprint_sig)),
+                    &format!(
+                        "{}  {}",
+                        algo_id_label(status.sig_algo_id),
+                        fpr_label(&status.fingerprint_sig)
+                    ),
                 );
                 kv(
                     ui,
                     "Decryption key",
-                    &format!("{}  {}", algo_id_label(status.dec_algo_id), fpr_label(&status.fingerprint_dec)),
+                    &format!(
+                        "{}  {}",
+                        algo_id_label(status.dec_algo_id),
+                        fpr_label(&status.fingerprint_dec)
+                    ),
                 );
                 kv(
                     ui,
                     "Authentication key",
-                    &format!("{}  {}", algo_id_label(status.aut_algo_id), fpr_label(&status.fingerprint_aut)),
+                    &format!(
+                        "{}  {}",
+                        algo_id_label(status.aut_algo_id),
+                        fpr_label(&status.fingerprint_aut)
+                    ),
                 );
                 kv(
                     ui,
                     "PIN retries",
-                    &format!("PW1={} RC={} PW3={}", status.tries_pw1, status.tries_rc, status.tries_pw3),
+                    &format!(
+                        "PW1={} RC={} PW3={}",
+                        status.tries_pw1, status.tries_rc, status.tries_pw3
+                    ),
                 );
                 kv(
                     ui,
                     "Signatures made",
-                    &status.signature_count.map_or("(unavailable)".to_string(), |n| n.to_string()),
+                    &status
+                        .signature_count
+                        .map_or("(unavailable)".to_string(), |n| n.to_string()),
                 );
             }
 
@@ -2541,7 +2591,10 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         let armed = !self.openpgp.admin_pin.is_empty();
-                        if ui.add_enabled(armed, egui::Button::new("Generate")).clicked() {
+                        if ui
+                            .add_enabled(armed, egui::Button::new("Generate"))
+                            .clicked()
+                        {
                             do_it = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -3161,9 +3214,7 @@ mod tests {
             worker: Some(Worker::spawn(egui::Context::default())),
             ..Default::default()
         };
-        app.spawn_job("test", || {
-            Box::new(|app: &mut App| app.selected = 42)
-        });
+        app.spawn_job("test", || Box::new(|app: &mut App| app.selected = 42));
         assert!(app.busy(), "busy should be set right after dispatch");
 
         // Wait for the worker to produce a result, then drain it.
@@ -3192,7 +3243,10 @@ mod tests {
         app.spawn_job("first", || Box::new(|_: &mut App| {}));
         assert_eq!(app.busy_jobs, 1);
         app.spawn_job("second", || Box::new(|app: &mut App| app.selected = 99));
-        assert_eq!(app.busy_jobs, 1, "second dispatch must be ignored while busy");
+        assert_eq!(
+            app.busy_jobs, 1,
+            "second dispatch must be ignored while busy"
+        );
     }
 
     /// With no worker (the default), a job runs inline so headless tests and any
