@@ -250,9 +250,11 @@ for the smartcard applets.
   generated, a host-side PKCS#1 v1.5 cryptogram built under its public modulus,
   and `openpgp decrypt` returned the byte-identical plaintext
   (`6d6f…7374` = "molto2 decipher test"); card reset to pristine afterward
-  (slots empty, PINs 3/0/3). The command-chaining decrypt fallback
-  (`KEYROOST_OPENPGP_FORCE_CHAINING`) remains KAT-only — not yet forced on hardware
-  (the import chaining path *was* hardware-confirmed earlier, same builder shape).
+  (slots empty, PINs 3/0/3). **Command-chaining decrypt also hardware-verified
+  (2026-06-02):** forcing `KEYROOST_OPENPGP_FORCE_CHAINING=1`, a 257-byte cipher
+  DO went out as two chained links (`10 2A 80 86 FE …` + `00 2A 80 86 03 …`) and
+  the card returned the byte-identical plaintext — so both the extended-length
+  and chaining decrypt paths are confirmed on hardware.
   **GUI import parity — code-complete, hardware verification pending (2026-06-01):**
   the `keyroost` OpenPGP pane gained "Generate & import" and "From file" controls
   (slot selector + path field), a confirmation modal, and `import_openpgp_key`
