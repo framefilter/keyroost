@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resetting a hardware key safely — keyroost</title>
+<meta name="description" content="What a factory reset does to each applet (FIDO2, OATH, OpenPGP, PIV, Molto2), why it's irreversible, and the checklist to follow before you wipe a key.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · resetting</p>
+    <h1>Resetting a key, safely</h1>
+    <p class="kr-lede">A reset gives you a clean slate — and is irreversible. Here's what each
+      applet's reset actually erases, and the checklist to run first.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What a reset does</h2>
+    <p>Each applet resets independently — wiping the FIDO function doesn't touch OATH, and so
+      on. In every case the point is the same: keys and credentials are <strong>destroyed,
+      not recoverable</strong>. Because the secrets only ever lived on the device, there is
+      no backup to restore from unless <em>you</em> made one.</p>
+    <ul>
+      <li><strong>FIDO2</strong> — erases all resident credentials/passkeys and clears the
+        PIN. Any account relying solely on this key for sign-in is locked out until you
+        register a replacement. <a href="fido2.html">FIDO2 →</a></li>
+      <li><strong>OATH</strong> — removes all stored TOTP/HOTP seeds. You'll need each
+        service's setup secret/QR again. <a href="oath.html">OATH →</a></li>
+      <li><strong>OpenPGP</strong> — destroys the on-card sign/encrypt/auth keys and resets
+        PINs. Anything encrypted to the card's encryption key becomes undecryptable.
+        <a href="openpgp.html">OpenPGP →</a></li>
+      <li><strong>PIV</strong> — clears slots, certificates, PIN/PUK, and management key.
+        <a href="piv.html">PIV →</a></li>
+      <li><strong>Token2 Molto2</strong> — factory reset wipes loaded slots and customer-key
+        state. <a href="molto2.html#customer-key">Molto2 →</a></li>
+    </ul>
+  </section>
+
+  <section class="kr-section">
+    <h2>Before you reset — the checklist</h2>
+    <ol>
+      <li><strong>Have another way in.</strong> A second registered key, or current recovery
+        codes, for every account this key unlocks. Verify it works <em>before</em> wiping.</li>
+      <li><strong>Re-derive what you'll re-add.</strong> Make sure you can re-enroll OATH
+        seeds and regenerate or re-import OpenPGP/PIV keys.</li>
+      <li><strong>Decryption keys are special.</strong> Data encrypted to an OpenPGP
+        encryption key or PIV key-management slot can't be read after the key is gone —
+        decrypt or re-key it first.</li>
+      <li><strong>Then reset</strong>, set a fresh PIN, and re-register before relying on it.</li>
+    </ol>
+    <div class="kr-callout danger">
+      <div class="kr-callout-title danger">There is no undo</div>
+      <p>A reset can't be reversed and the destroyed keys can't be regenerated from the
+        device. When in doubt, stop and confirm your recovery path first.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>How keyroost treats resets</h2>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>Destructive operations always resolve to an <strong>explicit target</strong>, never
+        a default device — so a reset can't land on the wrong key by accident. Reset support
+        spans the FIDO, OATH, OpenPGP, PIV, and Molto2 applets; read-only inspection
+        (<code>list</code>, <code>fido-info</code>, <code>piv status</code>) never changes
+        anything and never needs a PIN.</p>
+    </div>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/passkeys/"><span class="who">FIDO Alliance</span>Passkeys &amp; account recovery</a>
+      <a href="https://gnupg.org/documentation/manuals/gnupg/OpenPGP-Card.html"><span class="who">GnuPG</span>OpenPGP card management</a>
+      <a href="https://developers.yubico.com/PIV/"><span class="who">Yubico</span>PIV reset &amp; PIN/PUK</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="index.html">← Back to overview</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

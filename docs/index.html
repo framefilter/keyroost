@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>So you bought a hardware security key… now what? — keyroost</title>
+<meta name="description" content="A short, vendor-neutral guide to what a hardware security key actually does — FIDO2 passkeys, TOTP, smart-card (PIV), and OpenPGP — how to set one up, and where to read the real standards.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home">
+      <span class="kr-mark mono">k</span><span>keyroost</span>
+    </a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">keyroost · learn</p>
+    <h1>So you bought a hardware security key… <span class="q">now what?</span></h1>
+    <p class="kr-lede">A short, vendor-neutral primer on what that little USB or NFC fob
+      actually <em>does</em>, how to set it up, and where to read the real standards —
+      no marketing, just the protocols and their authoritative docs.</p>
+    <p class="kr-meta">~5-minute read. Jump to
+      <a href="#do">what it does</a> ·
+      <a href="#topics">the four applets</a> ·
+      <a href="#faq">FAQ</a> ·
+      <a href="#resources">authoritative links</a>.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section" id="what">
+    <h2><span class="num">01</span>What is it, really?</h2>
+    <p>A hardware security key is a tiny tamper-resistant computer. Its one job is to
+      hold <strong>secrets that never leave the chip</strong> and to perform crypto
+      operations with them on demand — so even malware on your laptop can borrow the
+      key's <em>powers</em> while it's plugged in, but can never copy the <em>keys</em>
+      themselves.</p>
+    <p>Most modern keys (YubiKey, SoloKey, Nitrokey, Token2, and others) are really
+      several independent "applets" sharing one piece of plastic. Each speaks a
+      different open standard, and you can use as many or as few as you like.</p>
+  </section>
+
+  <section class="kr-section" id="do">
+    <h2><span class="num">02</span>What can I actually do with it today?</h2>
+    <p>In rough order of "most people start here":</p>
+    <ul>
+      <li><strong>Protect your important accounts.</strong> Add the key as a security
+        key / passkey on Google, Microsoft, Apple, GitHub, your password manager, etc.
+        This is the single highest-value step, and it defeats phishing in a way that
+        SMS and app codes don't.</li>
+      <li><strong>Replace passwords entirely (passkeys).</strong> On sites that support
+        it, the key <em>is</em> your login — no password to steal or reuse.</li>
+      <li><strong>Carry your TOTP codes on hardware</strong> for sites that only offer
+        "authenticator app" 2FA.</li>
+      <li><strong>Log into SSH servers</strong> with a key that requires a physical
+        touch — via FIDO, PIV, or OpenPGP.</li>
+      <li><strong>Sign your git commits and releases</strong>, and <strong>encrypt or
+        sign email</strong> (OpenPGP), or do smart-card login to a workstation or VPN
+        (PIV).</li>
+    </ul>
+    <div class="kr-callout tip">
+      <div class="kr-callout-title tip">Start small</div>
+      <p>You don't have to use every applet. Putting one key on your email and one other
+        critical account, plus a backup key in a drawer, already puts you ahead of the
+        overwhelming majority of attacks.</p>
+    </div>
+  </section>
+
+  <section class="kr-section" id="topics">
+    <h2><span class="num">03</span>The four things a key can be</h2>
+    <p class="kr-muted">Each links to a short page on what it is and what keyroost can do with it.</p>
+    <div class="kr-cards">
+      <a class="kr-card" href="fido2.html">
+        <span class="kr-label">FIDO2 / WebAuthn</span>
+        <h3>Passwordless &amp; phishing-proof login</h3>
+        <p>Sign in to websites with a touch — as a second factor or a full passkey,
+          bound to the real site's domain so it can't be phished.</p>
+        <p class="kr-more">Learn FIDO2 →</p>
+      </a>
+      <a class="kr-card" href="oath.html">
+        <span class="kr-label">OATH · TOTP / HOTP</span>
+        <h3>Your 2FA codes, off your phone</h3>
+        <p>The 6-digit "authenticator app" codes, stored on the key instead of an app
+          that syncs to the cloud.</p>
+        <p class="kr-more">Learn OATH →</p>
+      </a>
+      <a class="kr-card" href="piv.html">
+        <span class="kr-label">PIV · smart card</span>
+        <h3>Certificates, SSH &amp; login</h3>
+        <p>Holds X.509 client certs and keys for SSH, VPN, workstation login, and
+          document signing.</p>
+        <p class="kr-more">Learn PIV →</p>
+      </a>
+      <a class="kr-card" href="openpgp.html">
+        <span class="kr-label">OpenPGP card</span>
+        <h3>Sign &amp; encrypt mail, git, files</h3>
+        <p>An on-card PGP keypair for encrypted email, signed git commits, and SSH —
+          the private key never touches disk.</p>
+        <p class="kr-more">Learn OpenPGP →</p>
+      </a>
+    </div>
+    <p class="kr-muted" style="margin-top:16px">Have a programmable TOTP token instead of a
+      multi-applet key? See <a href="molto2.html">Token2 Molto2</a>. Starting over with a
+      key? See <a href="reset.html">resetting safely</a>.</p>
+  </section>
+
+  <section class="kr-section" id="setup">
+    <h2><span class="num">04</span>The 10-minute first-day checklist</h2>
+    <ul>
+      <li><strong>Buy two keys, not one.</strong> Register both everywhere; the second
+        lives somewhere safe as your recovery key. (This is the step people skip and
+        regret.)</li>
+      <li><strong>Set a PIN.</strong> The FIDO2 / PIV / OpenPGP applets each take a PIN
+        that gates their use — it unlocks the <em>key</em>, not a website, and the key
+        locks or wipes itself after a handful of wrong tries. <a href="fido2.html#pin">More on PINs →</a></li>
+      <li><strong>Register the key with one account and test it</strong> — including
+        signing out and back in — before you rely on it.</li>
+      <li><strong>Record your recovery codes</strong> for each account offline.</li>
+      <li><strong>Then roll it out</strong> to the rest of your important accounts.</li>
+    </ul>
+  </section>
+
+  <section class="kr-section kr-faq" id="faq">
+    <h2><span class="num">05</span>FAQ</h2>
+
+    <details>
+      <summary>Is a security key better than my authenticator app?</summary>
+      <div class="kr-answer">
+        <p>For phishing — the threat most people face — yes, meaningfully. A FIDO2 key
+          cryptographically checks the website's real domain before it responds, so a
+          look-alike phishing page gets nothing. TOTP codes can be typed into a fake site
+          and replayed within the 30-second window. TOTP still beats SMS or nothing;
+          FIDO2 is the gold standard. <a href="https://www.cisa.gov/resources-tools/resources/implementing-phishing-resistant-mfa">CISA on phishing-resistant MFA →</a></p>
+      </div>
+    </details>
+
+    <details>
+      <summary>What happens if I lose it?</summary>
+      <div class="kr-answer">
+        <p>This is exactly why you register a <strong>second key</strong> and keep
+          <strong>recovery codes</strong>. Sign in with your backup, remove the lost key
+          from each account, and register a replacement. Because the secrets never leave
+          the chip, whoever finds your key still needs your PIN — and it locks itself
+          after too many wrong guesses.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary>Can someone copy my key, or read the secrets off it?</summary>
+      <div class="kr-answer">
+        <p>No — that's the whole point. Private keys are generated on the chip and are
+          designed to be non-exportable. Operations happen <em>inside</em> the key; only
+          the result (a signature, an assertion) comes out. There's no "export key" button.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary>Is the PIN the same as a password?</summary>
+      <div class="kr-answer">
+        <p>No. A website password is checked by a server and can be stolen in a breach.
+          A key's PIN is checked <em>by the key, offline</em>, just to authorize local
+          use — and the key enforces a small retry limit, so even a short PIN resists
+          brute force. You never type it into a web form. <a href="fido2.html#pin">More →</a></p>
+      </div>
+    </details>
+
+    <details>
+      <summary>What's a "passkey," and is it the same thing?</summary>
+      <div class="kr-answer">
+        <p>A passkey is a FIDO2 credential used <em>instead</em> of a password rather than
+          alongside one. A hardware key can store passkeys (a "device-bound passkey"); the
+          phones-and-cloud kind syncs across devices. Same standard, different storage and
+          recovery trade-offs. <a href="fido2.html#passkeys">More →</a></p>
+      </div>
+    </details>
+
+    <details>
+      <summary>Do I need keyroost to use my key?</summary>
+      <div class="kr-answer">
+        <p>Not for everyday logins — registering a key with a website happens in your
+          browser, no extra software required. keyroost is for <em>managing the key
+          itself</em>: inspecting it, setting PINs, loading TOTP secrets, generating
+          OpenPGP/PIV keys, and programming Token2 Molto2 tokens — over an open, auditable
+          toolchain with no vendor SDKs. It's optional power tooling, not a requirement.</p>
+      </div>
+    </details>
+  </section>
+
+  <section class="kr-section kr-glossary" id="glossary">
+    <h2><span class="num">06</span>Mini-glossary</h2>
+    <dl>
+      <dt>FIDO2 / WebAuthn / CTAP</dt>
+      <dd>The modern passwordless standard. WebAuthn is the browser-to-website half; CTAP
+        is the browser-to-key half; "FIDO2" is the two together.</dd>
+      <dt>U2F</dt>
+      <dd>The original second-factor-only predecessor to FIDO2. Still works; FIDO2 is the
+        superset.</dd>
+      <dt>TOTP / HOTP (OATH)</dt>
+      <dd>Time- and counter-based one-time passwords — the 6-digit codes, defined in
+        RFC&nbsp;6238 and RFC&nbsp;4226.</dd>
+      <dt>PIV</dt>
+      <dd>A US-government smart-card standard (NIST SP&nbsp;800-73) for certificates and
+        keys; widely used for SSH, login, and signing.</dd>
+      <dt>OpenPGP card</dt>
+      <dd>A standard for an on-card PGP keypair — sign/encrypt email, files, git, and SSH.</dd>
+      <dt>Attestation</dt>
+      <dd>A signed statement a key can make about what model it is, so an organization can
+        require approved hardware.</dd>
+    </dl>
+  </section>
+
+  <section class="kr-section kr-res-section" id="resources">
+    <h2><span class="num">07</span>Authoritative resources</h2>
+    <p class="kr-muted">Primary sources — standards bodies and the people who wrote the specs.</p>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/passkeys/"><span class="who">FIDO Alliance</span>Passkeys &amp; FIDO2 explained</a>
+      <a href="https://www.w3.org/TR/webauthn-2/"><span class="who">W3C</span>Web Authentication (WebAuthn) spec</a>
+      <a href="https://datatracker.ietf.org/doc/html/rfc6238"><span class="who">IETF</span>RFC 6238 — TOTP</a>
+      <a href="https://datatracker.ietf.org/doc/html/rfc4226"><span class="who">IETF</span>RFC 4226 — HOTP</a>
+      <a href="https://pages.nist.gov/800-63-3/sp800-63b.html"><span class="who">NIST</span>SP 800-63B — Authentication &amp; AAL</a>
+      <a href="https://csrc.nist.gov/pubs/sp/800/73/4/upd1/final"><span class="who">NIST</span>SP 800-73-4 — PIV interfaces</a>
+      <a href="https://www.cisa.gov/resources-tools/resources/implementing-phishing-resistant-mfa"><span class="who">CISA</span>Implementing phishing-resistant MFA</a>
+      <a href="https://gnupg.org/documentation/manuals/gnupg/OpenPGP-Card.html"><span class="who">GnuPG</span>Using an OpenPGP card</a>
+      <a href="https://2fa.directory/"><span class="who">Community</span>2FA Directory — who supports keys</a>
+      <a href="https://developers.yubico.com/"><span class="who">Yubico</span>Developer &amp; protocol documentation</a>
+    </div>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;An independent, open-source
+      Rust toolchain for hardware security keys — FIDO2, OATH, OpenPGP, PIV, and Token2
+      Molto2 — implemented from public standards, with no vendor SDKs.
+      <a href="https://github.com/framefilter/keyroost">Source on GitHub →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor named here; product
+      names are used descriptively and remain their owners' trademarks. This guide is
+      general information, not security advice for any specific threat model.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

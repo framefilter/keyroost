@@ -1,0 +1,183 @@
+/* ============================================================================
+   Keyroost — web theme tokens (Learn / docs site)
+   ----------------------------------------------------------------------------
+   Drop-in palette from the Keyroost desktop app, framework-agnostic. Dark is
+   the primary identity and the default; light is opt-in via
+   <html data-theme="light"> (toggled by assets/site.js).
+
+   Fonts are SELF-HOSTED (IBM Plex Sans + JetBrains Mono, latin subset, variable
+   woff2) under assets/fonts/ — no third-party requests, in keeping with the
+   project's privacy/independence posture. Both are SIL OFL licensed.
+   ========================================================================== */
+
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400 700;       /* variable axis */
+  font-display: swap;
+  src: url('fonts/ibm-plex-sans.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 700;       /* variable axis */
+  font-display: swap;
+  src: url('fonts/jetbrains-mono.woff2') format('woff2');
+}
+
+/* ---------- DARK (default — matches the app's primary look) ---------- */
+:root {
+  --kr-stage:   #0f1115;  /* page backdrop / behind cards   */
+  --kr-surface: #181b21;  /* main surface                   */
+  --kr-bar:     #13161b;  /* top bar / header                */
+  --kr-side:    #15181d;  /* sidebars / secondary nav        */
+  --kr-panel:   #1c2026;  /* cards                           */
+  --kr-raised:  #232830;  /* inputs / subtle raised fills    */
+  --kr-raised2: #2a313a;  /* chips / hover fills             */
+  --kr-pop:     #2c333d;  /* popovers / tooltips / callouts  */
+  --kr-line:    #2b323c;  /* borders                         */
+  --kr-line-soft:#222831; /* hairline dividers               */
+
+  --kr-txt:     #e8eaee;  /* primary text                    */
+  --kr-txt-2:   #9aa2ad;  /* secondary text                  */
+  --kr-txt-3:   #646c78;  /* muted / labels                  */
+
+  --kr-accent:      #4f90ff;                      /* interactive / links     */
+  --kr-accent-ink:  #ffffff;                      /* text on accent          */
+  --kr-accent-soft: rgba(79,144,255,0.15);        /* tinted fill             */
+  --kr-accent-line: rgba(79,144,255,0.45);        /* tinted border           */
+  --kr-brand:       #f08c3c;                       /* logo / Molto2 token     */
+  --kr-brand-soft:  rgba(240,140,60,0.15);
+
+  --kr-ok:   #5fcf83;  --kr-ok-soft:   rgba(95,207,131,0.14);
+  --kr-warn: #e3b552;  --kr-warn-soft: rgba(227,181,82,0.15);
+  --kr-err:  #e76d6d;  --kr-err-soft:  rgba(231,109,109,0.14);
+
+  /* radii */
+  --kr-r-pill: 999px;
+  --kr-r-card: 14px;
+  --kr-r-ctrl: 8px;     /* buttons / inputs */
+  --kr-r-pop:  13px;
+
+  /* shadows */
+  --kr-shadow-pop:  0 16px 44px rgba(0,0,0,.45), 0 2px 8px rgba(0,0,0,.3);
+  --kr-shadow-card: 0 1px 3px rgba(0,0,0,.30);
+
+  /* type */
+  --kr-sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --kr-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  color-scheme: dark;
+}
+
+/* ---------- LIGHT (opt-in: <html data-theme="light">) ---------- */
+:root[data-theme="light"] {
+  --kr-stage:   #dadde3;
+  --kr-surface: #f6f7f9;
+  --kr-bar:     #eceef2;
+  --kr-side:    #eef0f4;
+  --kr-panel:   #ffffff;
+  --kr-raised:  #f1f3f7;
+  --kr-raised2: #e7eaf0;
+  --kr-pop:     #ffffff;
+  --kr-line:    #dde1e8;
+  --kr-line-soft:#e9ecf1;
+
+  --kr-txt:     #1b1f26;
+  --kr-txt-2:   #5a626d;
+  --kr-txt-3:   #949ba6;
+
+  --kr-accent:      #2f6cea;
+  --kr-accent-ink:  #ffffff;
+  --kr-accent-soft: rgba(47,108,234,0.10);
+  --kr-accent-line: rgba(47,108,234,0.40);
+  --kr-brand:       #e0801c;
+  --kr-brand-soft:  rgba(224,128,28,0.12);
+
+  --kr-ok:   #1f9b54;  --kr-ok-soft:   rgba(31,155,84,0.12);
+  --kr-warn: #c0850f;  --kr-warn-soft: rgba(192,133,15,0.13);
+  --kr-err:  #d34536;  --kr-err-soft:  rgba(211,69,54,0.10);
+
+  --kr-shadow-pop:  0 16px 44px rgba(20,30,50,.18), 0 2px 8px rgba(20,30,50,.10);
+  --kr-shadow-card: 0 1px 3px rgba(20,30,50,.08);
+
+  color-scheme: light;
+}
+
+/* ============================================================================
+   Base + component recipes
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--kr-stage);
+  color: var(--kr-txt);
+  font-family: var(--kr-sans);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* type scale */
+h1 { font-size: 2rem;     font-weight: 700; letter-spacing: -0.6px; line-height: 1.15; }
+h2 { font-size: 1.5rem;   font-weight: 700; letter-spacing: -0.3px; line-height: 1.2; }
+h3 { font-size: 1.125rem; font-weight: 700; letter-spacing: -0.1px; }
+small, .kr-small { font-size: 0.8125rem; color: var(--kr-txt-2); }
+.kr-label { font-size: 0.6875rem; font-weight: 700; letter-spacing: 1px;
+  text-transform: uppercase; color: var(--kr-txt-3); }
+
+a { color: var(--kr-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, pre, kbd, .mono { font-family: var(--kr-mono); }
+:not(pre) > code {
+  font-size: 0.875em; padding: 0.12em 0.4em; border-radius: 6px;
+  background: var(--kr-raised); color: var(--kr-txt);
+}
+pre {
+  background: var(--kr-panel); border: 1px solid var(--kr-line);
+  border-radius: var(--kr-r-card); padding: 16px 18px; overflow: auto;
+  font-size: 0.875rem; line-height: 1.55;
+}
+
+/* card */
+.kr-card {
+  background: var(--kr-panel); border: 1px solid var(--kr-line);
+  border-radius: var(--kr-r-card); padding: 18px;
+}
+
+/* buttons */
+.kr-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: inherit; font-size: 0.875rem; font-weight: 600;
+  padding: 9px 15px; border-radius: var(--kr-r-ctrl); cursor: pointer;
+  border: 1px solid transparent; text-decoration: none;
+}
+.kr-btn:hover { text-decoration: none; }
+.kr-btn-primary { background: var(--kr-accent); color: var(--kr-accent-ink); }
+.kr-btn-default { background: var(--kr-raised2); color: var(--kr-txt); border-color: var(--kr-line); }
+.kr-btn-ghost   { background: transparent;       color: var(--kr-txt-2); border-color: var(--kr-line); }
+
+/* pill / badge */
+.kr-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.2px;
+  padding: 2px 8px; border-radius: var(--kr-r-pill);
+  color: var(--kr-txt-2); background: var(--kr-raised2);
+}
+.kr-pill-accent { color: var(--kr-accent); background: var(--kr-accent-soft); }
+.kr-pill-ok     { color: var(--kr-ok);     background: var(--kr-ok-soft); }
+.kr-pill-warn   { color: var(--kr-warn);   background: var(--kr-warn-soft); }
+.kr-pill-brand  { color: var(--kr-brand);  background: var(--kr-brand-soft); }
+
+/* callout / note (mirrors the in-app help popover surface) */
+.kr-callout {
+  background: var(--kr-pop); border: 1px solid var(--kr-line);
+  border-radius: var(--kr-r-pop); padding: 15px 17px;
+  box-shadow: var(--kr-shadow-card);
+}
+.kr-callout-title { display: flex; align-items: center; gap: 8px;
+  font-weight: 700; margin-bottom: 6px; }

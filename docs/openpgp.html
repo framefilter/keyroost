@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenPGP card — sign, encrypt &amp; authenticate — keyroost</title>
+<meta name="description" content="What the OpenPGP card is, the three on-card keys (sign / encrypt / authenticate), generating vs importing keys, and what keyroost can do over PC/SC.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · OpenPGP</p>
+    <h1>OpenPGP card</h1>
+    <p class="kr-lede">An on-card PGP keypair for signing and encrypting email and files,
+      signing git commits, and SSH — with the private key sealed inside the device.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>The OpenPGP Card (v3.4) is a smart-card application that holds up to three private
+      keys and performs operations with them on-device:</p>
+    <ul>
+      <li><strong>Signature key</strong> — sign email, files, and git commits/tags.</li>
+      <li><strong>Encryption key</strong> — decrypt messages and files addressed to you.</li>
+      <li><strong>Authentication key</strong> — commonly used for SSH login.</li>
+    </ul>
+    <p>Because the private keys never leave the card, a compromised laptop can ask the card
+      to sign or decrypt while it's present, but can't walk away with the keys themselves.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Generate on-card vs. import</h2>
+    <ul>
+      <li><strong>Generate on-card</strong> — the key is born inside the device and is never
+        exportable. Best for new keys; nothing to leak.</li>
+      <li><strong>Import an existing key</strong> — load a key you already use. Convenient,
+        but the private key existed off-card first, so its earlier exposure still counts.</li>
+    </ul>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">PINs</div>
+      <p>The card uses a user PIN (day-to-day) and an admin PIN (management), each with its
+        own retry counter that locks the function after too many wrong tries.
+        <a href="fido2.html#pin">How key PINs work →</a></p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>What keyroost does with OpenPGP</h2>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>Read card status; <strong>generate</strong> or <strong>import</strong> RSA-2048 keys
+        (host keygen, or a PKCS#1/PKCS#8 PEM/DER file); <strong>sign</strong> (SHA-256 or
+        SHA-1) and <strong>decrypt</strong>; set cardholder name / URL; register a key for
+        GnuPG; and factory-reset the applet.</p>
+    </div>
+<pre><code>keyroostctl openpgp status --reader yubikey
+keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey</code></pre>
+    <p class="kr-muted">The card byte layer is a pure-Rust, in-tree implementation of the
+      OpenPGP Card spec (APDU + BER-TLV); RSA keygen/parsing is the one scoped host-side
+      dependency.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://gnupg.org/documentation/manuals/gnupg/OpenPGP-Card.html"><span class="who">GnuPG</span>Using an OpenPGP card</a>
+      <a href="https://datatracker.ietf.org/doc/html/rfc4880"><span class="who">IETF</span>RFC 4880 — OpenPGP message format</a>
+      <a href="https://gnupg.org/ftp/specs/"><span class="who">GnuPG</span>OpenPGP card specifications</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="piv.html">Next: PIV →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
