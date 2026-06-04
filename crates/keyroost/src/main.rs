@@ -1112,7 +1112,18 @@ impl App {
                     // Re-read info so the PIN status reflects the wipe.
                     app.fetch_selected_info();
                 }
-                Err(e) => app.security_keys.error = Some(format!("reset failed: {}", e)),
+                Err(e) => {
+                    let msg = if e.contains("NOT_ALLOWED") || e.contains("0x30") {
+                        "This key refused the reset. Most security keys (YubiKey \
+                         included) only allow a FIDO reset within about 10 seconds \
+                         of being plugged in. Unplug the key, plug it back in, then \
+                         click \u{201C}Reset key\u{201D} again right away."
+                            .to_string()
+                    } else {
+                        format!("reset failed: {e}")
+                    };
+                    app.security_keys.error = Some(msg);
+                }
             })
         });
     }
