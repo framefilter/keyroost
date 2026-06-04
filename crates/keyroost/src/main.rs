@@ -61,9 +61,12 @@ struct UnlockedSession {
 
 #[derive(Default)]
 struct ChangePinDialog {
+    /// Whether the inline PIN form is expanded.
     open: bool,
     old: String,
     new: String,
+    /// Confirmation field, used only when *setting* a first-time PIN.
+    confirm: String,
 }
 
 /// State for the OATH (TOTP) pane. The applet is driven over PC/SC, so a
@@ -325,6 +328,8 @@ struct App {
     oath_tried: bool,
     /// Same guard for the PIV pane's auto-read.
     piv_tried: bool,
+    /// True while the Molto2 factory-reset confirmation is showing.
+    molto_reset_confirm: bool,
     /// Background worker for blocking device I/O. `None` only in tests.
     worker: Option<Worker>,
     /// Number of in-flight background jobs. While >0 the UI shows a spinner and
@@ -1050,6 +1055,39 @@ impl App {
         Ok(())
     }
 
+    /// Set a first-time PIN on a key that has none (CTAP setPIN). Validates that
+    /// the two entries match and meet the 4-char minimum, then re-reads info so
+    /// the status flips to "PIN set".
+    fn submit_set_pin(&mut self) {
+        let Some(path) = self.selected_fido_path() else {
+            return;
+        };
+        let new = std::mem::take(&mut self.security_keys.change_pin.new);
+        let confirm = std::mem::take(&mut self.security_keys.change_pin.confirm);
+        if new.chars().count() < 4 {
+            self.security_keys.error = Some("PIN must be at least 4 characters".into());
+            return;
+        }
+        if new != confirm {
+            self.security_keys.error = Some("the two PINs don't match".into());
+            return;
+        }
+        self.spawn_job("Setting PIN\u{2026} (touch the key)", move || {
+            let result = (|| -> Result<(), String> {
+                let (mut dev, _) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                keyroost_ctap::client_pin::set_pin(&mut dev, &new).map_err(|e| e.to_string())
+            })();
+            Box::new(move |app: &mut App| match result {
+                Ok(()) => {
+                    app.security_keys.change_pin = ChangePinDialog::default();
+                    app.security_keys.error = None;
+                    app.fetch_selected_info();
+                }
+                Err(e) => app.security_keys.error = Some(format!("set PIN failed: {e}")),
+            })
+        });
+    }
+
     fn selected_fido_path(&self) -> Option<std::path::PathBuf> {
         self.selected_device().and_then(|d| d.hid_path.clone())
     }
@@ -1077,181 +1115,6 @@ impl App {
                 Err(e) => app.security_keys.error = Some(format!("reset failed: {}", e)),
             })
         });
-    }
-
-    fn render_credentials_section(&mut self, ui: &mut egui::Ui) {
-        let pin_set = self
-            .security_keys
-            .info
-            .as_ref()
-            .and_then(|i| i.option("clientPin"));
-
-        ui.label(egui::RichText::new("Credentials").strong());
-
-        ui.horizontal(|ui| {
-            match pin_set {
-                Some(true) => ui.colored_label(egui::Color32::from_rgb(120, 200, 130), "PIN set"),
-                Some(false) => {
-                    ui.colored_label(egui::Color32::from_rgb(220, 180, 80), "No PIN configured")
-                }
-                None => ui.colored_label(ui.visuals().weak_text_color(), "PIN status unknown"),
-            };
-            if ui.button("Change PIN…").clicked() {
-                self.security_keys.change_pin.open = true;
-            }
-            if self.security_keys.session.is_some() {
-                if ui.button("Lock").clicked() {
-                    self.lock_session();
-                }
-                if ui.button("Reload").clicked() {
-                    self.refresh_credentials();
-                }
-            }
-            // Reset wipes the key; no PIN needed, but gated by a typed
-            // confirmation + touch. Offered whenever a key is selected.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let reset = egui::Button::new(
-                    egui::RichText::new("Reset key…").color(egui::Color32::from_rgb(220, 110, 110)),
-                );
-                if ui.add(reset).clicked() {
-                    self.security_keys.reset = ResetDialog {
-                        open: true,
-                        ..Default::default()
-                    };
-                }
-            });
-        });
-
-        ui.add_space(4.0);
-
-        if self.security_keys.session.is_none() {
-            if pin_set != Some(true) {
-                ui.colored_label(
-                    ui.visuals().weak_text_color(),
-                    "Set a PIN with `keyroostctl fido-pin-set` before listing credentials.",
-                );
-                return;
-            }
-            ui.horizontal(|ui| {
-                ui.label("PIN:");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.security_keys.pin_input)
-                        .password(true)
-                        .desired_width(180.0),
-                );
-                let submit = ui.button("Unlock").clicked();
-                if submit || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                    self.try_unlock();
-                }
-            });
-            return;
-        }
-
-        // Session is active — pull the data out for rendering, then drop the
-        // borrow before we issue any further state-mutating clicks.
-        let (existing, max_remaining, rps) = {
-            let s = self.security_keys.session.as_ref().expect("just checked");
-            (
-                s.metadata.existing_count,
-                s.metadata.max_remaining,
-                s.rps.clone(),
-            )
-        };
-
-        ui.label(format!(
-            "{} resident credential(s), room for {} more",
-            existing, max_remaining
-        ));
-        ui.add_space(6.0);
-
-        let mut delete: Option<Vec<u8>> = None;
-        egui::ScrollArea::vertical()
-            .max_height(360.0)
-            .show(ui, |ui| {
-                for (rp, creds) in &rps {
-                    let header = if let Some(name) = rp.name.as_ref().filter(|s| !s.is_empty()) {
-                        format!("{}  ({})", rp.id, name)
-                    } else {
-                        rp.id.clone()
-                    };
-                    ui.collapsing(header, |ui| {
-                        if creds.is_empty() {
-                            ui.label("(no credentials)");
-                        }
-                        for c in creds {
-                            ui.horizontal(|ui| {
-                                ui.monospace(hex_short(&c.credential_id));
-                                let user_field = if let Some(d) = &c.user.display_name {
-                                    d.clone()
-                                } else if let Some(n) = &c.user.name {
-                                    n.clone()
-                                } else {
-                                    String::from_utf8_lossy(&c.user.id).into_owned()
-                                };
-                                ui.label(user_field);
-                                if let Some(alg) = c.algorithm {
-                                    ui.colored_label(
-                                        ui.visuals().weak_text_color(),
-                                        cose_algorithm_name(alg),
-                                    );
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("Delete").clicked() {
-                                            delete = Some(c.credential_id.clone());
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                    });
-                }
-            });
-
-        if let Some(cred_id) = delete {
-            self.delete_credential(cred_id);
-        }
-    }
-
-    fn render_change_pin_dialog(&mut self, ctx: &egui::Context) {
-        if !self.security_keys.change_pin.open {
-            return;
-        }
-        let mut still_open = self.security_keys.change_pin.open;
-        let mut submit = false;
-        egui::Window::new("Change PIN")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut still_open)
-            .show(ctx, |ui| {
-                ui.label("Old PIN:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.security_keys.change_pin.old)
-                        .password(true)
-                        .desired_width(220.0),
-                );
-                ui.label("New PIN (4–63 UTF-8 bytes):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.security_keys.change_pin.new)
-                        .password(true)
-                        .desired_width(220.0),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Change PIN").clicked() {
-                        submit = true;
-                    }
-                });
-            });
-        if !still_open {
-            self.security_keys.change_pin.open = false;
-            self.security_keys.change_pin.old.clear();
-            self.security_keys.change_pin.new.clear();
-        }
-        if submit {
-            self.submit_change_pin();
-        }
     }
 
     fn selected_oath_reader(&self) -> Option<String> {
@@ -2067,17 +1930,6 @@ fn hex_short(bytes: &[u8]) -> String {
     s
 }
 
-fn cose_algorithm_name(alg: i64) -> &'static str {
-    match alg {
-        -7 => "ES256",
-        -8 => "EdDSA",
-        -35 => "ES384",
-        -36 => "ES512",
-        -257 => "RS256",
-        _ => "unknown",
-    }
-}
-
 fn unix_now() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2291,6 +2143,18 @@ fn cap_tab_label(t: CapTab) -> &'static str {
     }
 }
 
+/// A labelled password field row for the inline PIN form.
+fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 22.0],
+            egui::Label::new(egui::RichText::new(label).font(theme::f_reg(13.0)).color(p.txt2)),
+        );
+        ui.add(egui::TextEdit::singleline(buf).password(true).desired_width(200.0));
+    });
+    ui.add_space(4.0);
+}
+
 /// Paint a rounded glyph tile at `rect` with the painter (no widget allocation,
 /// so it never steals clicks from a surrounding row). `ch = None` draws a clock.
 fn paint_glyph_tile(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32, fg: egui::Color32, ch: Option<char>) {
@@ -2435,7 +2299,6 @@ impl eframe::App for App {
         self.central(ctx, &p);
 
         // Modal dialogs (reused from the per-applet logic) + Molto2 import dialogs.
-        self.render_change_pin_dialog(ctx);
         self.render_reset_dialog(ctx);
         self.render_oath_delete_confirm(ctx);
         self.render_openpgp_confirms(ctx);
@@ -2971,15 +2834,229 @@ impl App {
 
     /// FIDO2 / Passkeys tab — reuses the existing PIN + credentials section.
     fn cap_fido2(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let pin_set = self.security_keys.info.as_ref().and_then(|i| i.option("clientPin"));
+
+        // --- PIN & sign-in card (inline Set / Change PIN; no floating modal) ---
+        let mut go_set = false;
+        let mut go_change = false;
+        let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Passkeys (FIDO2)").font(theme::f_sb(14.5)).color(p.txt));
+                ui.label(egui::RichText::new("PIN & sign-in").font(theme::f_sb(14.5)).color(p.txt));
                 ui.add_space(6.0);
-                self.help_dot(ui, p, "fido2");
+                self.help_dot(ui, p, "pin");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match pin_set {
+                    Some(true) => {
+                        if theme::button(ui, p, BtnKind::Default, "Change PIN").clicked() {
+                            let open = !self.security_keys.change_pin.open;
+                            self.security_keys.change_pin = ChangePinDialog { open, ..Default::default() };
+                            self.security_keys.error = None;
+                        }
+                    }
+                    Some(false) => {
+                        if theme::button(ui, p, BtnKind::Primary, "Set a PIN").clicked() {
+                            let open = !self.security_keys.change_pin.open;
+                            self.security_keys.change_pin = ChangePinDialog { open, ..Default::default() };
+                            self.security_keys.error = None;
+                        }
+                    }
+                    None => {}
+                });
             });
             ui.add_space(8.0);
-            self.render_credentials_section(ui);
+            match pin_set {
+                Some(true) => {
+                    ui.horizontal(|ui| {
+                        theme::pill(ui, "PIN set", p.ok, p.ok_soft());
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("This key has a PIN. Unlock below to manage passkeys.").font(theme::f_reg(13.0)).color(p.txt2));
+                    });
+                }
+                Some(false) => {
+                    ui.horizontal(|ui| {
+                        theme::pill(ui, "No PIN yet", p.warn, p.warn_soft());
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Set a PIN to protect this key and turn on passkeys.").font(theme::f_reg(13.0)).color(p.txt2));
+                    });
+                }
+                None => {
+                    let msg = if self.security_keys.error.is_some() { "Couldn't read this key." } else { "Reading key\u{2026}" };
+                    ui.label(egui::RichText::new(msg).font(theme::f_reg(13.0)).color(p.txt3));
+                }
+            }
+
+            if self.security_keys.change_pin.open {
+                let setting = pin_set == Some(false);
+                ui.add_space(10.0);
+                egui::Frame::none()
+                    .fill(p.raised)
+                    .inner_margin(egui::Margin::same(12.0))
+                    .rounding(egui::Rounding::same(8.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(if setting { "Create a PIN" } else { "Change PIN" }).font(theme::f_sb(13.0)).color(p.txt));
+                        ui.add_space(8.0);
+                        if setting {
+                            pin_field(ui, p, "New PIN", &mut self.security_keys.change_pin.new);
+                            pin_field(ui, p, "Confirm", &mut self.security_keys.change_pin.confirm);
+                        } else {
+                            pin_field(ui, p, "Current PIN", &mut self.security_keys.change_pin.old);
+                            pin_field(ui, p, "New PIN", &mut self.security_keys.change_pin.new);
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if theme::button(ui, p, BtnKind::Primary, if setting { "Set PIN" } else { "Change PIN" }).clicked() {
+                                if setting {
+                                    go_set = true;
+                                } else {
+                                    go_change = true;
+                                }
+                            }
+                            ui.add_space(6.0);
+                            if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("4\u{2013}63 characters. You'll touch the key to confirm.").font(theme::f_reg(11.5)).color(p.txt3));
+                    });
+            }
+
+            if let Some(err) = &self.security_keys.error {
+                ui.add_space(6.0);
+                ui.colored_label(p.err, err);
+            }
         });
+        if cancel {
+            self.security_keys.change_pin = ChangePinDialog::default();
+        }
+        if go_set {
+            self.submit_set_pin();
+        }
+        if go_change {
+            self.submit_change_pin();
+        }
+
+        // --- Resident passkeys (only meaningful once a PIN exists) ---
+        if pin_set == Some(true) {
+            ui.add_space(14.0);
+            let mut lock = false;
+            let mut reload = false;
+            let mut unlock = false;
+            let mut delete: Option<Vec<u8>> = None;
+            theme::card_frame(p).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Resident passkeys").font(theme::f_sb(14.5)).color(p.txt));
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "passkeys");
+                    if self.security_keys.session.is_some() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button(ui, p, BtnKind::Ghost, "Lock").clicked() {
+                                lock = true;
+                            }
+                            ui.add_space(6.0);
+                            if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
+                                reload = true;
+                            }
+                        });
+                    }
+                });
+                ui.add_space(8.0);
+                if self.security_keys.session.is_none() {
+                    ui.horizontal(|ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.security_keys.pin_input)
+                                .password(true)
+                                .hint_text("Enter PIN to view passkeys")
+                                .desired_width(220.0),
+                        );
+                        let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                        if submit || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                            unlock = true;
+                        }
+                    });
+                } else {
+                    let (existing, max_remaining, rps) = {
+                        let s = self.security_keys.session.as_ref().expect("checked");
+                        (s.metadata.existing_count, s.metadata.max_remaining, s.rps.clone())
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{existing} stored \u{00B7} room for {max_remaining} more"))
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                    );
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        for (rp, creds) in &rps {
+                            let header = if let Some(name) = rp.name.as_ref().filter(|s| !s.is_empty()) {
+                                format!("{}  ({})", rp.id, name)
+                            } else {
+                                rp.id.clone()
+                            };
+                            ui.collapsing(header, |ui| {
+                                if creds.is_empty() {
+                                    ui.label("(no credentials)");
+                                }
+                                for c in creds {
+                                    ui.horizontal(|ui| {
+                                        ui.monospace(hex_short(&c.credential_id));
+                                        let user_field = c
+                                            .user
+                                            .display_name
+                                            .clone()
+                                            .or_else(|| c.user.name.clone())
+                                            .unwrap_or_else(|| String::from_utf8_lossy(&c.user.id).into_owned());
+                                        ui.label(user_field);
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if theme::button(ui, p, BtnKind::Ghost, "Remove").clicked() {
+                                                delete = Some(c.credential_id.clone());
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+            if lock {
+                self.lock_session();
+            }
+            if reload {
+                self.refresh_credentials();
+            }
+            if unlock {
+                self.try_unlock();
+            }
+            if let Some(id) = delete {
+                self.delete_credential(id);
+            }
+        }
+
+        // --- Danger: reset key (typed-confirm modal stays) ---
+        ui.add_space(14.0);
+        let mut arm_reset = false;
+        theme::card_frame(p)
+            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Reset this key").font(theme::f_sb(14.5)).color(p.err));
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "reset");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Reset key\u{2026}").clicked() {
+                            arm_reset = true;
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new("Wipes every passkey and the PIN on this key. Cannot be undone.")
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                );
+            });
+        if arm_reset {
+            self.security_keys.reset = ResetDialog { open: true, ..Default::default() };
+        }
     }
 
     /// Authenticator / OATH tab — live codes with countdown rings + copy.
@@ -3348,9 +3425,36 @@ impl App {
                             }
                             ui.add_space(6.0);
                             if theme::button(ui, p, BtnKind::Danger, "Factory reset\u{2026}").clicked() {
-                                self.factory_reset();
+                                self.molto_reset_confirm = true;
                             }
                         });
+                        if self.molto_reset_confirm {
+                            ui.add_space(10.0);
+                            egui::Frame::none()
+                                .fill(p.err_soft())
+                                .inner_margin(egui::Margin::same(12.0))
+                                .rounding(egui::Rounding::same(8.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Factory-reset the token? This wipes all slots, then asks you to confirm with the \u{25B2} button on the device itself.",
+                                        )
+                                        .font(theme::f_reg(12.5))
+                                        .color(p.txt),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if theme::button(ui, p, BtnKind::Danger, "Yes, factory reset").clicked() {
+                                            self.molto_reset_confirm = false;
+                                            self.factory_reset();
+                                        }
+                                        ui.add_space(6.0);
+                                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                                            self.molto_reset_confirm = false;
+                                        }
+                                    });
+                                });
+                        }
                     });
                 });
             });
