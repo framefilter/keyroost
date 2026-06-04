@@ -22,18 +22,12 @@ use keyroost_ctap::client_pin::PinUvAuthToken;
 use keyroost_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
 use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 use keyroost_hid::HidDevice;
-use keyroost_keyring::Keyring;
 
 const PROFILES: u8 = 100;
 
 #[derive(Default)]
 struct SecurityKeysState {
     devices: Vec<HidDevice>,
-    /// Effective serial per device (USB, else CCID for YubiKeys), parallel to
-    /// `devices`. Computed once per refresh via the shared resolver.
-    serials: Vec<Option<String>>,
-    /// Friendly-name registry, reloaded each refresh so names show in the list.
-    keyring: Keyring,
     selected: Option<usize>,
     /// CTAP info for `selected`, fetched lazily after selection.
     info: Option<AuthenticatorInfo>,
@@ -42,10 +36,6 @@ struct SecurityKeysState {
     error: Option<String>,
     /// Live PIN entry field (cleared after submit).
     pin_input: String,
-    /// "Name this key" text field (friendly name to assign to the selected key).
-    name_input: String,
-    /// Feedback line from the last name save / removal.
-    name_status: Option<String>,
     /// Active unlocked session: token + cached resident credentials.
     session: Option<UnlockedSession>,
     /// Change-PIN modal state.
@@ -80,10 +70,6 @@ struct ChangePinDialog {
 /// "reader name" identifies the key rather than a hidraw path.
 #[derive(Default)]
 struct OathState {
-    /// Names of connected readers whose OATH applet responds.
-    readers: Vec<String>,
-    /// Index into `readers` of the selected key.
-    selected: Option<usize>,
     /// Credentials listed from the selected key, with their freshly-computed code.
     creds: Vec<OathRow>,
     /// True when the selected applet is password-protected and not yet unlocked.
@@ -104,7 +90,6 @@ struct OathState {
 /// computed for it (empty until "Show code" / refresh).
 struct OathRow {
     name: String,
-    detail: String,
     code: Option<String>,
 }
 
@@ -124,10 +109,6 @@ struct OathAddDialog {
 /// reader name identifies the card.
 #[derive(Default)]
 struct OpenPgpState {
-    /// Names of connected readers whose OpenPGP applet responds.
-    readers: Vec<String>,
-    /// Index into `readers` of the selected card.
-    selected: Option<usize>,
     /// Last status read from the selected card.
     status: Option<keyroost_transport::OpenPgpStatus>,
     /// User-facing error from the last operation.
@@ -470,17 +451,6 @@ enum Severity {
     Err,
 }
 
-impl Severity {
-    fn color(self, visuals: &egui::Visuals) -> egui::Color32 {
-        match self {
-            Severity::Info => visuals.weak_text_color(),
-            Severity::Ok => egui::Color32::from_rgb(120, 200, 130),
-            Severity::Warn => egui::Color32::from_rgb(220, 180, 80),
-            Severity::Err => egui::Color32::from_rgb(220, 100, 100),
-        }
-    }
-}
-
 impl App {
     /// Queue a blocking device job on the worker thread. `label` describes it for
     /// the busy indicator; `job` runs off-thread and returns a closure applied
@@ -559,31 +529,6 @@ impl App {
         } else {
             Ok(self.customer_key_input.as_bytes().to_vec())
         }
-    }
-
-    fn connect(&mut self) {
-        match Session::open() {
-            Ok(mut s) => match s.read_info() {
-                Ok(info) => {
-                    self.log(
-                        Severity::Ok,
-                        format!("connected to {} (utc={})", info.serial, info.utc_time),
-                    );
-                    self.info = Some(info);
-                    self.session = Some(s);
-                    self.authenticated = false;
-                }
-                Err(e) => self.log(Severity::Err, format!("read_info failed: {}", e)),
-            },
-            Err(e) => self.log(Severity::Err, format!("connect failed: {}", e)),
-        }
-    }
-
-    fn disconnect(&mut self) {
-        self.session = None;
-        self.info = None;
-        self.authenticated = false;
-        self.log(Severity::Info, "disconnected");
     }
 
     fn authenticate(&mut self) {
@@ -888,152 +833,6 @@ impl App {
         false
     }
 
-    fn refresh_security_keys(&mut self) {
-        self.security_keys.error = None;
-        self.security_keys.info = None;
-        self.security_keys.init = None;
-        match keyroost_hid::enumerate() {
-            Ok(devices) => {
-                // Note a recognized key stuck in bootloader/DFU mode (plain HID,
-                // no FIDO page) so an empty list isn't a silent dead end.
-                let bootloader = devices.iter().find_map(HidDevice::bootloader_label);
-                let fido_only: Vec<_> = devices.into_iter().filter(|d| d.is_fido()).collect();
-                if fido_only.is_empty() {
-                    if let Some(bl) = bootloader {
-                        self.security_keys.error = Some(format!(
-                            "Detected {bl} — re-plug it to return to application mode."
-                        ));
-                    }
-                }
-                let prev_path = self
-                    .security_keys
-                    .selected
-                    .and_then(|i| self.security_keys.devices.get(i).map(|d| d.path.clone()));
-                // Effective serials (USB, else CCID for YubiKeys) via the shared
-                // resolver, plus the friendly-name registry, so the list and
-                // header can show names. Reading is non-persisting / opt-out free.
-                self.security_keys.serials = keyroost_resolve::effective_serials(&fido_only);
-                self.security_keys.keyring = Keyring::load_default().unwrap_or_default();
-                self.security_keys.devices = fido_only;
-                self.security_keys.selected = prev_path
-                    .and_then(|p| self.security_keys.devices.iter().position(|d| d.path == p));
-            }
-            Err(e) => {
-                self.security_keys.error = Some(format!("enumeration failed: {}", e));
-                self.security_keys.devices.clear();
-                self.security_keys.serials.clear();
-                self.security_keys.selected = None;
-            }
-        }
-    }
-
-    /// The friendly name registered for the device at `idx`, if any.
-    fn name_for_index(&self, idx: usize) -> Option<&str> {
-        let serial = self.security_keys.serials.get(idx)?.as_deref();
-        self.security_keys.keyring.name_for(serial)
-    }
-
-    /// Friendly-name controls for the selected key: show the current name (or
-    /// that it's unnamed) and let the user assign or remove one. Assigning
-    /// persists the key's serial to `keys.json` — an opt-in step, disclosed
-    /// inline via the helper-bubble.
-    fn render_key_naming(&mut self, ui: &mut egui::Ui, idx: usize, dev: &HidDevice) {
-        let current = self.name_for_index(idx).map(str::to_owned);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Friendly name").strong());
-            helper_bubble(
-                ui,
-                "Assigning a name saves this key's serial number to keys.json on \
-                 this computer, so the key can be recognized by name later. \
-                 Nothing is stored until you click Save; you can remove it any time.",
-            );
-        });
-
-        match &current {
-            Some(name) => {
-                ui.horizontal(|ui| {
-                    ui.label(format!("This key is named \u{201c}{name}\u{201d}."));
-                    if ui.button("Remove name").clicked() {
-                        self.remove_key_name(name);
-                    }
-                });
-            }
-            None => {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.security_keys.name_input)
-                            .hint_text("e.g. test-yubikey")
-                            .desired_width(180.0),
-                    );
-                    if ui.button("Save name").clicked() {
-                        self.save_key_name(dev);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("Lowercase letters, digits, '-' and '_'.")
-                        .weak()
-                        .small(),
-                );
-            }
-        }
-
-        if let Some(status) = &self.security_keys.name_status {
-            ui.colored_label(ui.visuals().weak_text_color(), status);
-        }
-    }
-
-    /// Persist a friendly name for `dev` (opt-in). Reads the effective serial
-    /// (USB, or CCID for YubiKeys), validates the name, and writes `keys.json`.
-    fn save_key_name(&mut self, dev: &HidDevice) {
-        let name = self.security_keys.name_input.trim().to_owned();
-        if name.is_empty() {
-            self.security_keys.name_status = Some("Enter a name first.".into());
-            return;
-        }
-        if let Err(e) = keyroost_keyring::validate_name(&name) {
-            self.security_keys.name_status = Some(e.to_string());
-            return;
-        }
-        let (serial, source) = match keyroost_resolve::read_effective_serial(dev) {
-            Ok(v) => v,
-            Err(e) => {
-                self.security_keys.name_status = Some(e);
-                return;
-            }
-        };
-        let vendor = (dev.vendor_id == keyroost_resolve::VID_YUBICO).then(|| "yubico".to_string());
-        let entry = keyroost_keyring::KeyEntry {
-            name,
-            serial,
-            source,
-            vendor,
-            aaguid: None,
-            note: None,
-        };
-        if let Err(e) = self.security_keys.keyring.add(entry) {
-            self.security_keys.name_status = Some(e.to_string());
-            return;
-        }
-        match self.security_keys.keyring.save_default() {
-            Ok(path) => {
-                self.security_keys.name_input.clear();
-                self.security_keys.name_status = Some(format!("Saved to {}", path.display()));
-            }
-            Err(e) => self.security_keys.name_status = Some(e.to_string()),
-        }
-        // Recompute serials/keyring so the list and header pick up the new name.
-        self.refresh_security_keys();
-    }
-
-    /// Remove a friendly name and persist the change.
-    fn remove_key_name(&mut self, name: &str) {
-        if self.security_keys.keyring.remove(name) {
-            let _ = self.security_keys.keyring.save_default();
-            self.security_keys.name_status = Some(format!("Removed \u{201c}{name}\u{201d}."));
-        }
-        self.refresh_security_keys();
-    }
-
     /// Open the currently-selected hidraw device, run CTAPHID_INIT and
     /// authenticatorGetInfo, and cache the result. Blocks the UI briefly —
     /// CTAP GetInfo typically completes in a few milliseconds.
@@ -1280,187 +1079,6 @@ impl App {
         });
     }
 
-    fn render_security_keys(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("fido-devices")
-            .resizable(true)
-            .default_width(280.0)
-            .width_range(180.0..=520.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.heading("Security keys");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_security_keys();
-                        }
-                    });
-                });
-                ui.label("FIDO HID devices currently visible.");
-                ui.add_space(4.0);
-
-                if self.security_keys.devices.is_empty() {
-                    ui.colored_label(
-                        ui.visuals().weak_text_color(),
-                        "No FIDO keys detected. Plug one in and click Refresh.",
-                    );
-                }
-
-                let mut click: Option<usize> = None;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (i, dev) in self.security_keys.devices.iter().enumerate() {
-                        let selected = self.security_keys.selected == Some(i);
-                        // Lead with the friendly name when the key is registered.
-                        let name = self
-                            .security_keys
-                            .serials
-                            .get(i)
-                            .and_then(|s| s.as_deref())
-                            .and_then(|s| self.security_keys.keyring.name_for(Some(s)));
-                        let header = match name {
-                            Some(n) => format!("{}  ({})", n, dev.product_name),
-                            None => dev.product_name.clone(),
-                        };
-                        let label = format!(
-                            "{}\n{:04x}:{:04x}  {}",
-                            short_path(&dev.path),
-                            dev.vendor_id,
-                            dev.product_id,
-                            header
-                        );
-                        if ui.selectable_label(selected, label).clicked() {
-                            click = Some(i);
-                        }
-                    }
-                });
-                if let Some(i) = click {
-                    self.security_keys.selected = Some(i);
-                    self.fetch_selected_info();
-                }
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            let Some(idx) = self.security_keys.selected else {
-                ui.heading("No key selected");
-                ui.label("Pick a device from the left panel, or click Refresh.");
-                return;
-            };
-            let Some(dev) = self.security_keys.devices.get(idx).cloned() else {
-                return;
-            };
-
-            ui.heading(if dev.product_name.is_empty() {
-                format!("{}", dev.path.display())
-            } else {
-                dev.product_name.clone()
-            });
-            ui.label(format!(
-                "{}    vendor 0x{:04x}    product 0x{:04x}",
-                dev.path.display(),
-                dev.vendor_id,
-                dev.product_id
-            ));
-            ui.separator();
-
-            self.render_key_naming(ui, idx, &dev);
-            ui.separator();
-
-            if let Some(err) = &self.security_keys.error {
-                ui.colored_label(egui::Color32::from_rgb(220, 110, 110), err);
-                ui.add_space(8.0);
-            }
-
-            if let Some(init) = &self.security_keys.init {
-                kv(ui, "CTAPHID channel", &format!("{:#010x}", init.channel_id));
-                kv(
-                    ui,
-                    "Protocol",
-                    &format!(
-                        "v{} (capabilities 0x{:02X})",
-                        init.protocol_version, init.capabilities
-                    ),
-                );
-                kv(
-                    ui,
-                    "HID firmware",
-                    &format!(
-                        "{}.{}.{}",
-                        init.device_major, init.device_minor, init.device_build
-                    ),
-                );
-                let mut caps = Vec::new();
-                if init.supports_wink() {
-                    caps.push("WINK");
-                }
-                if init.supports_cbor() {
-                    caps.push("CBOR");
-                }
-                if init.supports_u2f() {
-                    caps.push("U2F");
-                }
-                kv(ui, "Supports", &caps.join(" + "));
-            }
-
-            if let Some(info) = &self.security_keys.info {
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("authenticatorGetInfo").strong());
-                kv(ui, "Versions", &info.versions.join(", "));
-                if !info.extensions.is_empty() {
-                    kv(ui, "Extensions", &info.extensions.join(", "));
-                }
-                kv(ui, "AAGUID", &format_aaguid(&info.aaguid));
-                if !info.options.is_empty() {
-                    let s: Vec<String> = info
-                        .options
-                        .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
-                        .collect();
-                    kv(ui, "Options", &s.join(", "));
-                }
-                if let Some(n) = info.max_msg_size {
-                    kv(ui, "MaxMsgSize", &n.to_string());
-                }
-                if !info.pin_uv_auth_protocols.is_empty() {
-                    let s: Vec<String> = info
-                        .pin_uv_auth_protocols
-                        .iter()
-                        .map(|n| n.to_string())
-                        .collect();
-                    kv(ui, "PIN/UV protocols", &s.join(", "));
-                }
-                if !info.transports.is_empty() {
-                    kv(ui, "Transports", &info.transports.join(", "));
-                }
-                if let Some(v) = info.firmware_version {
-                    kv(ui, "CTAP firmware", &v.to_string());
-                }
-            } else if self
-                .security_keys
-                .init
-                .as_ref()
-                .is_some_and(|i| !i.supports_cbor())
-            {
-                ui.add_space(8.0);
-                ui.colored_label(
-                    ui.visuals().weak_text_color(),
-                    "Device is U2F-only — CTAP2 GetInfo not available.",
-                );
-            }
-
-            ui.add_space(12.0);
-            ui.separator();
-            self.render_credentials_section(ui);
-            ui.add_space(12.0);
-            ui.colored_label(
-                ui.visuals().weak_text_color(),
-                "Reset is CLI-only for now: `keyroostctl fido-reset --yes`.",
-            );
-        });
-
-        self.render_change_pin_dialog(ctx);
-        self.render_reset_dialog(ctx);
-    }
-
     fn render_credentials_section(&mut self, ui: &mut egui::Ui) {
         let pin_set = self
             .security_keys
@@ -1636,64 +1254,6 @@ impl App {
         }
     }
 
-    // --- OATH (TOTP) pane ------------------------------------------------
-
-    /// (Re)enumerate readers whose OATH applet responds. Resets per-key state.
-    fn refresh_oath_readers(&mut self) {
-        self.oath.error = None;
-        self.oath.creds.clear();
-        self.oath.loaded = false;
-        let prev = self
-            .oath
-            .selected
-            .and_then(|i| self.oath.readers.get(i).cloned());
-        self.spawn_job("Scanning for OATH keys\u{2026}", move || {
-            let result =
-                keyroost_transport::OathSession::list_oath_readers().map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| {
-                match result {
-                    Ok(readers) => {
-                        app.oath.readers = readers;
-                        // Preserve the selection by name across refreshes.
-                        app.oath.selected = prev
-                            .and_then(|p| app.oath.readers.iter().position(|r| *r == p))
-                            .or(if app.oath.readers.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            });
-                    }
-                    Err(e) => {
-                        app.oath.error = Some(format!("enumeration failed: {e}"));
-                        app.oath.readers.clear();
-                        app.oath.selected = None;
-                    }
-                }
-                app.probe_oath_lock();
-            })
-        });
-    }
-
-    /// Open the selected reader to learn whether its applet is password-locked,
-    /// without listing anything yet.
-    fn probe_oath_lock(&mut self) {
-        self.oath.locked = false;
-        self.oath.loaded = false;
-        self.oath.creds.clear();
-        let Some(name) = self.selected_oath_reader() else {
-            return;
-        };
-        self.spawn_job("Opening OATH key\u{2026}", move || {
-            let result = keyroost_transport::OathSession::open(&name)
-                .map(|s| s.password_required())
-                .map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| match result {
-                Ok(locked) => app.oath.locked = locked,
-                Err(e) => app.oath.error = Some(format!("open failed: {e}")),
-            })
-        });
-    }
-
     fn selected_oath_reader(&self) -> Option<String> {
         self.selected_device().and_then(|d| d.reader.clone())
     }
@@ -1727,7 +1287,6 @@ impl App {
                 .map(|otp| otp.code);
             rows.push(OathRow {
                 name: c.name,
-                detail: format!("{:?}/{:?}", c.oath_type, c.algorithm),
                 code,
             });
         }
@@ -1835,144 +1394,6 @@ impl App {
             })();
             Box::new(move |app: &mut App| Self::apply_oath_rows(app, result))
         });
-    }
-
-    fn render_oath(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("oath-readers")
-            .resizable(true)
-            .default_width(280.0)
-            .width_range(180.0..=520.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.heading("OATH keys");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_oath_readers();
-                        }
-                    });
-                });
-                ui.label("Security keys with an OATH applet.");
-                ui.add_space(4.0);
-
-                if self.oath.readers.is_empty() {
-                    ui.colored_label(
-                        ui.visuals().weak_text_color(),
-                        "No OATH-capable key detected. Plug one in and click Refresh.",
-                    );
-                }
-
-                let mut clicked: Option<usize> = None;
-                for (i, name) in self.oath.readers.iter().enumerate() {
-                    let selected = self.oath.selected == Some(i);
-                    if ui.selectable_label(selected, name).clicked() {
-                        clicked = Some(i);
-                    }
-                }
-                if let Some(i) = clicked {
-                    self.oath.selected = Some(i);
-                    self.oath.password_input.clear();
-                    self.probe_oath_lock();
-                }
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            if self.selected_oath_reader().is_none() {
-                ui.heading("No OATH key selected");
-                ui.label("Pick a key from the left panel, or click Refresh.");
-                return;
-            };
-
-            if let Some(err) = &self.oath.error {
-                ui.colored_label(egui::Color32::from_rgb(220, 110, 110), err);
-                ui.add_space(6.0);
-            }
-
-            if self.oath.locked {
-                ui.horizontal(|ui| {
-                    ui.label("This key's OATH applet is password-protected.");
-                    helper_bubble(
-                        ui,
-                        "The password is sent to the key to unlock it for this \
-                         operation only; it is never written to disk.",
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Password:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.oath.password_input)
-                            .password(true)
-                            .desired_width(200.0),
-                    );
-                    if ui.button("Unlock & list").clicked() {
-                        self.load_oath_creds();
-                    }
-                });
-                return;
-            }
-
-            ui.horizontal(|ui| {
-                if ui.button("List / refresh codes").clicked() {
-                    self.load_oath_creds();
-                }
-                helper_bubble(
-                    ui,
-                    "Reads the credentials on the key and computes each current \
-                     TOTP. Codes are shown for ~30s; click again to refresh.",
-                );
-                if ui.button("Add credential\u{2026}").clicked() {
-                    // Open the add form; default to TOTP.
-                    self.oath.add = OathAddDialog {
-                        open: true,
-                        totp: true,
-                        ..Default::default()
-                    };
-                }
-            });
-
-            self.render_oath_add_form(ui);
-            ui.separator();
-
-            if !self.oath.loaded {
-                ui.label("Click \u{201c}List / refresh codes\u{201d} to read this key.");
-                return;
-            }
-            if self.oath.creds.is_empty() {
-                ui.label("(no OATH credentials on this key)");
-                return;
-            }
-
-            // Collect a requested delete outside the row borrow, then act on it.
-            let mut want_delete: Option<String> = None;
-            egui::Grid::new("oath-creds")
-                .num_columns(4)
-                .striped(true)
-                .spacing([16.0, 6.0])
-                .show(ui, |ui| {
-                    for row in &self.oath.creds {
-                        ui.label(&row.name);
-                        match &row.code {
-                            Some(code) => {
-                                ui.label(egui::RichText::new(code).monospace().strong());
-                            }
-                            None => {
-                                ui.colored_label(ui.visuals().weak_text_color(), "(touch / n/a)");
-                            }
-                        }
-                        ui.colored_label(ui.visuals().weak_text_color(), &row.detail);
-                        if ui.button("Delete").clicked() {
-                            want_delete = Some(row.name.clone());
-                        }
-                        ui.end_row();
-                    }
-                });
-            if let Some(name) = want_delete {
-                self.oath.confirm_delete = Some(name);
-            }
-        });
-
-        self.render_oath_delete_confirm(ctx);
     }
 
     /// The inline "Add credential" form, shown when the add dialog is open.
@@ -2115,40 +1536,6 @@ impl App {
             // Cancel button, or the window's [x] close.
             self.security_keys.reset = ResetDialog::default();
         }
-    }
-
-    // --- OpenPGP pane ----------------------------------------------------
-
-    /// (Re)enumerate readers whose OpenPGP applet responds. Resets per-card state.
-    fn refresh_openpgp_readers(&mut self) {
-        self.openpgp.error = None;
-        self.openpgp.status = None;
-        self.openpgp.loaded = false;
-        let prev = self
-            .openpgp
-            .selected
-            .and_then(|i| self.openpgp.readers.get(i).cloned());
-        self.spawn_job("Scanning for OpenPGP cards\u{2026}", move || {
-            let result = keyroost_transport::OpenPgpSession::list_openpgp_readers()
-                .map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| match result {
-                Ok(readers) => {
-                    app.openpgp.readers = readers;
-                    app.openpgp.selected = prev
-                        .and_then(|p| app.openpgp.readers.iter().position(|r| *r == p))
-                        .or(if app.openpgp.readers.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        });
-                }
-                Err(e) => {
-                    app.openpgp.error = Some(format!("enumeration failed: {e}"));
-                    app.openpgp.readers.clear();
-                    app.openpgp.selected = None;
-                }
-            })
-        });
     }
 
     fn selected_openpgp_reader(&self) -> Option<String> {
@@ -2371,140 +1758,6 @@ impl App {
                 )
             })
         });
-    }
-
-    fn render_openpgp(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("openpgp-readers")
-            .resizable(true)
-            .default_width(280.0)
-            .width_range(180.0..=520.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.heading("OpenPGP cards");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Refresh").clicked() {
-                            self.refresh_openpgp_readers();
-                        }
-                    });
-                });
-                ui.label("Security keys with an OpenPGP applet.");
-                ui.add_space(4.0);
-
-                if self.openpgp.readers.is_empty() {
-                    ui.colored_label(
-                        ui.visuals().weak_text_color(),
-                        "No OpenPGP-capable card detected. Plug one in and click Refresh.",
-                    );
-                }
-
-                let mut clicked: Option<usize> = None;
-                for (i, name) in self.openpgp.readers.iter().enumerate() {
-                    let selected = self.openpgp.selected == Some(i);
-                    if ui.selectable_label(selected, name).clicked() {
-                        clicked = Some(i);
-                    }
-                }
-                if let Some(i) = clicked {
-                    self.openpgp.selected = Some(i);
-                    self.openpgp.status = None;
-                    self.openpgp.loaded = false;
-                    self.openpgp.error = None;
-                }
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            if self.selected_openpgp_reader().is_none() {
-                ui.heading("No OpenPGP card selected");
-                ui.label("Pick a card from the left panel, or click Refresh.");
-                return;
-            }
-
-            if let Some(err) = &self.openpgp.error {
-                ui.colored_label(egui::Color32::from_rgb(220, 110, 110), err);
-                ui.add_space(6.0);
-            }
-
-            if let Some(notice) = &self.openpgp.notice {
-                ui.colored_label(egui::Color32::from_rgb(120, 200, 130), notice);
-                ui.add_space(6.0);
-            }
-
-            ui.horizontal(|ui| {
-                if ui.button("Read status").clicked() {
-                    self.load_openpgp_status();
-                }
-                helper_bubble(
-                    ui,
-                    "Reads the card's public status (AID/serial, key algorithms \
-                     and fingerprints, PIN retry counters, signature count). \
-                     Read-only — no PIN or touch required.",
-                );
-            });
-            ui.separator();
-
-            if !self.openpgp.loaded {
-                ui.label("Click \u{201c}Read status\u{201d} to read this card.");
-                return;
-            }
-
-            // Status rows, scoped so the immutable borrow of `status` ends before
-            // the mutable write controls below.
-            if let Some(status) = &self.openpgp.status {
-                kv(ui, "AID", &hex_lower(&status.aid));
-                if let Some(serial) = status.serial() {
-                    kv(ui, "Serial", &format!("{serial} (0x{serial:08X})"));
-                }
-                kv(
-                    ui,
-                    "Signature key",
-                    &format!(
-                        "{}  {}",
-                        algo_id_label(status.sig_algo_id),
-                        fpr_label(&status.fingerprint_sig)
-                    ),
-                );
-                kv(
-                    ui,
-                    "Decryption key",
-                    &format!(
-                        "{}  {}",
-                        algo_id_label(status.dec_algo_id),
-                        fpr_label(&status.fingerprint_dec)
-                    ),
-                );
-                kv(
-                    ui,
-                    "Authentication key",
-                    &format!(
-                        "{}  {}",
-                        algo_id_label(status.aut_algo_id),
-                        fpr_label(&status.fingerprint_aut)
-                    ),
-                );
-                kv(
-                    ui,
-                    "PIN retries",
-                    &format!(
-                        "PW1={} RC={} PW3={}",
-                        status.tries_pw1, status.tries_rc, status.tries_pw3
-                    ),
-                );
-                kv(
-                    ui,
-                    "Signatures made",
-                    &status
-                        .signature_count
-                        .map_or("(unavailable)".to_string(), |n| n.to_string()),
-                );
-            }
-
-            ui.add_space(8.0);
-            self.render_openpgp_manage(ui);
-        });
-
-        self.render_openpgp_confirms(ctx);
     }
 
     /// Write-operations section: cardholder name / URL, generate key, reset.
@@ -2803,12 +2056,6 @@ fn helper_bubble(ui: &mut egui::Ui, text: &str) {
         .on_hover_text(text);
 }
 
-fn short_path(p: &std::path::Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.display().to_string())
-}
-
 fn hex_short(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes.iter().take(8) {
@@ -2829,17 +2076,6 @@ fn cose_algorithm_name(alg: i64) -> &'static str {
         -257 => "RS256",
         _ => "unknown",
     }
-}
-
-fn format_aaguid(aaguid: &[u8; 16]) -> String {
-    let mut s = String::with_capacity(36);
-    for (i, b) in aaguid.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            s.push('-');
-        }
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
 }
 
 fn unix_now() -> u32 {
@@ -3055,10 +2291,45 @@ fn cap_tab_label(t: CapTab) -> &'static str {
     }
 }
 
-/// Paint one selectable device row; returns true if it was clicked this frame.
+/// Paint a rounded glyph tile at `rect` with the painter (no widget allocation,
+/// so it never steals clicks from a surrounding row). `ch = None` draws a clock.
+fn paint_glyph_tile(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32, fg: egui::Color32, ch: Option<char>) {
+    ui.painter().rect_filled(rect, egui::Rounding::same(rect.width() * 0.28), fill);
+    match ch {
+        Some(c) => {
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, c, theme::f_bold(rect.width() * 0.5), fg);
+        }
+        None => {
+            let c = rect.center();
+            let r = rect.width() * 0.26;
+            ui.painter().circle_stroke(c, r, egui::Stroke::new(1.6, fg));
+            ui.painter().line_segment([c, c + egui::vec2(0.0, -r * 0.72)], egui::Stroke::new(1.6, fg));
+            ui.painter().line_segment([c, c + egui::vec2(r * 0.55, 0.0)], egui::Stroke::new(1.6, fg));
+        }
+    }
+}
+
+/// Paint a small rounded pill at `left_top` with the painter; returns its width
+/// so the caller can advance a cursor.
+fn paint_pill(ui: &egui::Ui, left_top: egui::Pos2, text: &str, fg: egui::Color32, bg: egui::Color32) -> f32 {
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), theme::f_sb(11.0), fg));
+    let pad_x = 8.0;
+    let h = 18.0;
+    let w = galley.size().x + pad_x * 2.0;
+    let rect = egui::Rect::from_min_size(left_top, egui::vec2(w, h));
+    ui.painter().rect_filled(rect, egui::Rounding::same(999.0), bg);
+    let pos = egui::pos2(left_top.x + pad_x, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, fg);
+    w
+}
+
+/// Paint one selectable device row. The whole row is a single painter-drawn
+/// click target (no nested widgets), so clicking anywhere in it selects the
+/// device — fixing the "only the gaps are clickable" inconsistency.
 fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &UiDevice, selected: bool) -> bool {
     let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 64.0), egui::Sense::click());
+    let h = 68.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
     let bg = if selected {
         p.raised
     } else if resp.hovered() {
@@ -3074,57 +2345,59 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &UiDevice, selected: bool) ->
     );
     if selected {
         ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(0.0, 12.0),
-                egui::vec2(3.0, rect.height() - 24.0),
-            ),
+            egui::Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 13.0), egui::vec2(3.0, h - 26.0)),
             egui::Rounding::same(3.0),
             p.accent,
         );
     }
+
     let token = dev.kind == DeviceKind::Token;
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(12.0, 9.0))), |ui| {
-        ui.horizontal(|ui| {
-            if token {
-                glyph_tile(ui, 36.0, p.brand_soft(), p.brand, None);
-            } else {
-                glyph_tile(
-                    ui,
-                    36.0,
-                    p.raised2,
-                    p.txt2,
-                    Some(dev.vendor.chars().next().unwrap_or('?').to_ascii_uppercase()),
-                );
-            }
-            ui.add_space(10.0);
-            ui.vertical(|ui| {
-                ui.add_space(1.0);
-                ui.label(egui::RichText::new(&dev.vendor).font(theme::f_sb(11.0)).color(p.txt3));
-                ui.label(egui::RichText::new(dev.title()).font(theme::f_sb(13.5)).color(p.txt));
-                ui.add_space(3.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    if token {
-                        theme::pill(ui, "TOTP token", p.brand, p.brand_soft());
-                    } else {
-                        for (cap, label) in [
-                            (Caps::FIDO2, "FIDO2"),
-                            (Caps::OATH, "OATH"),
-                            (Caps::PGP, "PGP"),
-                            (Caps::PIV, "PIV"),
-                        ] {
-                            if dev.caps.has(cap) {
-                                theme::pill(ui, label, p.txt2, p.raised2);
-                            }
-                        }
-                    }
-                });
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                theme::status_dot(ui, p.ok, 7.0);
-            });
-        });
+    let tile = egui::Rect::from_min_size(rect.left_top() + egui::vec2(14.0, (h - 38.0) / 2.0), egui::vec2(38.0, 38.0));
+    if token {
+        paint_glyph_tile(ui, tile, p.brand_soft(), p.brand, None);
+    } else {
+        paint_glyph_tile(ui, tile, p.raised2, p.txt2, Some(dev.vendor.chars().next().unwrap_or('?').to_ascii_uppercase()));
+    }
+
+    let tx = tile.right() + 11.0;
+    let right_pad = 16.0;
+    // status dot, top-right
+    ui.painter().circle_filled(egui::pos2(rect.right() - right_pad, rect.top() + 18.0), 3.5, p.ok);
+    // vendor eyebrow
+    ui.painter().text(egui::pos2(tx, rect.top() + 13.0), egui::Align2::LEFT_TOP, &dev.vendor, theme::f_sb(11.0), p.txt3);
+    // model, truncated to the available width
+    let avail = (rect.right() - right_pad - 8.0) - tx;
+    let galley = ui.fonts(|f| {
+        let mut job = egui::text::LayoutJob::single_section(
+            dev.title().to_string(),
+            egui::TextFormat { font_id: theme::f_sb(13.5), color: p.txt, ..Default::default() },
+        );
+        job.wrap = egui::text::TextWrapping {
+            max_width: avail.max(0.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('\u{2026}'),
+        };
+        f.layout_job(job)
     });
+    ui.painter().galley(egui::pos2(tx, rect.top() + 26.0), galley, p.txt);
+    // capability pills
+    let py = rect.top() + 46.0;
+    if token {
+        paint_pill(ui, egui::pos2(tx, py), "TOTP token", p.brand, p.brand_soft());
+    } else {
+        let mut px = tx;
+        for (cap, label) in [
+            (Caps::FIDO2, "FIDO2"),
+            (Caps::OATH, "OATH"),
+            (Caps::PGP, "PGP"),
+            (Caps::PIV, "PIV"),
+        ] {
+            if dev.caps.has(cap) {
+                px += paint_pill(ui, egui::pos2(px, py), label, p.txt2, p.raised2) + 5.0;
+            }
+        }
+    }
     resp.clicked()
 }
 
@@ -3176,7 +2449,14 @@ impl eframe::App for App {
         }
 
         // Keep OATH rings / Molto2 time ticking while a device is selected.
-        if self.selected_device.is_some() {
+        // Only keep ticking when something actually animates (OATH countdown
+        // rings, the Molto2 view, or the "copied" flash) — not on every static
+        // pane, which would burn frames and feel sluggish.
+        let animating = self.copied.is_some()
+            || matches!(self.cap_tab, CapTab::Oath)
+            || (matches!(self.cap_tab, CapTab::Overview) && self.oath.loaded && !self.oath.creds.is_empty())
+            || self.selected_device().map_or(false, |d| d.kind == DeviceKind::Token);
+        if animating {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
@@ -3417,8 +2697,9 @@ impl App {
 
     /// Welcoming first-run state shown when nothing is plugged in.
     fn empty_state(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let steps_w = 360.0;
         ui.vertical_centered(|ui| {
-            ui.add_space(120.0);
+            ui.add_space(96.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
             ui.painter()
                 .rect_stroke(rect, egui::Rounding::same(16.0), egui::Stroke::new(1.5, p.line));
@@ -3429,32 +2710,46 @@ impl App {
                 theme::f_reg(26.0),
                 p.txt3,
             );
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new("Plug in a security key to begin").font(theme::f_bold(19.0)).color(p.txt));
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(
-                    "keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens. Connect one over USB and it shows up in the list on the left.",
-                )
-                .font(theme::f_reg(13.0))
-                .color(p.txt2),
-            );
             ui.add_space(18.0);
-            for (n, step) in [
-                "Insert your key into a USB port",
-                "It appears in the Devices list automatically",
-                "Select it to view and manage everything it can do",
-            ]
-            .iter()
-            .enumerate()
-            {
-                ui.horizontal(|ui| {
-                    theme::pill(ui, &format!("{}", n + 1), p.accent, p.accent_soft());
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(*step).font(theme::f_reg(13.0)).color(p.txt));
-                });
-                ui.add_space(6.0);
-            }
+            ui.label(egui::RichText::new("Plug in a security key to begin").font(theme::f_bold(19.0)).color(p.txt));
+            ui.add_space(8.0);
+            // Body paragraph, wrapped to a readable column rather than full width.
+            ui.allocate_ui_with_layout(egui::vec2(440.0, 0.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens. Connect one over USB and it shows up in the list on the left.",
+                    )
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+                );
+            });
+            ui.add_space(22.0);
+            // Numbered steps, left-aligned as a centered block (aligned left edges).
+            ui.allocate_ui_with_layout(egui::vec2(steps_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                for (n, step) in [
+                    "Insert your key into a USB port",
+                    "It appears in the Devices list automatically",
+                    "Select it to view and manage everything it can do",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    ui.horizontal(|ui| {
+                        let (badge, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                        ui.painter().circle_filled(badge.center(), 11.0, p.accent_soft());
+                        ui.painter().text(
+                            badge.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", n + 1),
+                            theme::f_sb(12.0),
+                            p.accent,
+                        );
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(*step).font(theme::f_reg(13.0)).color(p.txt));
+                    });
+                    ui.add_space(10.0);
+                }
+            });
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if theme::button(ui, p, BtnKind::Primary, "Scan for devices").clicked() {
@@ -3889,7 +3184,7 @@ impl App {
             .inner_margin(egui::Margin::symmetric(26.0, 10.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("\u{1F512} Customer key").font(theme::f_sb(12.5)).color(p.txt2));
+                    ui.label(egui::RichText::new("Customer key").font(theme::f_sb(12.5)).color(p.txt2));
                     ui.add_space(2.0);
                     self.help_dot(ui, p, "custkey");
                     ui.add_space(8.0);
@@ -4038,6 +3333,14 @@ impl App {
                             if theme::button(ui, p, BtnKind::Default, "Bulk import\u{2026}").clicked() {
                                 self.bulk_dialog.open = true;
                                 self.bulk_dialog.start = self.slot;
+                            }
+                            ui.add_space(6.0);
+                            if theme::button(ui, p, BtnKind::Default, "Sync time").clicked() {
+                                self.sync_time_selected();
+                            }
+                            ui.add_space(6.0);
+                            if theme::button(ui, p, BtnKind::Danger, "Factory reset\u{2026}").clicked() {
+                                self.factory_reset();
                             }
                         });
                     });

@@ -136,18 +136,60 @@ fn vendor_name(vid: u16) -> &'static str {
     }
 }
 
-/// A friendlier model string than the raw PC/SC reader name. PC/SC names look
-/// like `Yubico YubiKey OTP+FIDO+CCID 00 00`; trim the trailing slot indices and
-/// the interface soup so the row reads cleanly.
-fn model_from_reader(reader: &str) -> String {
-    // Drop a trailing " NN NN" slot/index suffix that pcscd appends.
-    let trimmed = reader
-        .trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ')
-        .trim();
-    if trimmed.is_empty() {
-        reader.to_string()
+/// Turn a raw device string (a PC/SC reader name like
+/// `SoloKeys Solo 2 [CCID/ICCD Interface] (07A9…) 00 00`, or a USB product name
+/// like `YubiKey OTP+FIDO+CCID`) into a clean model label like `Solo 2` /
+/// `YubiKey`. The `vendor` is shown in its own column, so a leading vendor word
+/// is stripped to avoid `Yubico  Yubico YubiKey`.
+fn clean_model(raw: &str, vendor: &str) -> String {
+    // 1. Drop bracketed/parenthesised groups (`[CCID/ICCD Interface]`, `(serial)`).
+    let mut s = String::with_capacity(raw.len());
+    let mut depth = 0i32;
+    for ch in raw.chars() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = (depth - 1).max(0),
+            _ if depth == 0 => s.push(ch),
+            _ => {}
+        }
+    }
+    // 2. Strip transport/interface noise tokens.
+    for junk in [
+        "CCID/ICCD Interface",
+        "OTP+FIDO+CCID",
+        "FIDO+CCID",
+        "OTP+FIDO",
+        "U2F+CCID",
+        "+CCID",
+        "ICCD",
+        "CCID",
+        "Interface",
+        "Smartcard",
+        "Smart Card",
+    ] {
+        s = s.replace(junk, " ");
+    }
+    // 3. Strip a leading vendor word (shown in its own column).
+    let lead = s.trim_start();
+    if !vendor.is_empty() && lead.to_ascii_lowercase().starts_with(&vendor.to_ascii_lowercase()) {
+        s = lead[vendor.len()..].to_string();
+    }
+    // 4. Collapse whitespace, then drop trailing two-digit pcsc index groups
+    //    (`… 00 00`) without eating real model numbers like `Solo 2` / `5C`.
+    let mut parts: Vec<&str> = s.split_whitespace().collect();
+    while parts.len() > 1 {
+        let last = parts[parts.len() - 1];
+        if last.len() == 2 && last.chars().all(|c| c.is_ascii_digit()) {
+            parts.pop();
+        } else {
+            break;
+        }
+    }
+    let out = parts.join(" ");
+    if out.is_empty() {
+        vendor.to_string()
     } else {
-        trimmed.to_string()
+        out
     }
 }
 
@@ -258,11 +300,12 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
             // manufacturer (e.g. "Nitrokey", "Yubico").
             name.split_whitespace().next().unwrap_or("Key").to_string()
         };
+        let model = clean_model(name, &vendor);
         devices.push(UiDevice {
             id,
             name: keyring.name_for(Some(&serial)).map(str::to_owned),
             vendor,
-            model: model_from_reader(name),
+            model,
             serial,
             transport: "USB · PC/SC".into(),
             firmware: String::new(),
@@ -343,11 +386,7 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
                 id,
                 name: keyring.name_for(Some(&serial)).map(str::to_owned),
                 vendor: vendor_name(hid.vendor_id).to_string(),
-                model: if hid.product_name.is_empty() {
-                    vendor_name(hid.vendor_id).to_string()
-                } else {
-                    hid.product_name.clone()
-                },
+                model: clean_model(&hid.product_name, vendor_name(hid.vendor_id)),
                 serial,
                 transport: "USB · FIDO HID".into(),
                 firmware: String::new(),
