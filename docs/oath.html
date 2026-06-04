@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OATH — TOTP &amp; HOTP on a hardware key — keyroost</title>
+<meta name="description" content="What OATH TOTP/HOTP is, how storing your 6-digit 2FA codes on a hardware key compares to an authenticator app, and what keyroost can do over PC/SC.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · OATH</p>
+    <h1>OATH — TOTP &amp; HOTP</h1>
+    <p class="kr-lede">The familiar 6-digit "authenticator app" codes — but generated on a
+      hardware key instead of an app that can be backed up to the cloud.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>OATH is the open family of one-time-password algorithms behind authenticator apps:
+      <strong>TOTP</strong> (time-based, RFC&nbsp;6238) and <strong>HOTP</strong>
+      (counter-based, RFC&nbsp;4226). Each account shares a secret seed with the service
+      once, at setup; afterward both sides independently compute the same short code from
+      that seed plus the current time (or a counter). Nothing is transmitted but the code
+      you read off.</p>
+    <p>Storing those seeds on a hardware key (via the Yubico/Trussed OATH applet, reached
+      over PC/SC) keeps them off a phone that syncs to the cloud and out of an app that can
+      be cloned. The seeds don't leave the key; codes are computed on-device when asked.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>How it compares</h2>
+    <ul>
+      <li><strong>vs. SMS:</strong> far better — no SIM-swap or interception risk.</li>
+      <li><strong>vs. an authenticator app:</strong> seeds live on tamper-resistant hardware
+        rather than a phone backup, and some keys require a physical touch to release a code.</li>
+      <li><strong>vs. FIDO2:</strong> TOTP is <em>not</em> phishing-resistant — a code can be
+        typed into a fake site and replayed within its ~30-second window. Use
+        <a href="fido2.html">FIDO2</a> where the site supports it; use OATH where it only
+        offers "authenticator app."</li>
+    </ul>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Optional applet password</div>
+      <p>The OATH applet can be protected by a password that must be presented before codes
+        can be listed or computed — a useful extra gate if the key is shared or lost.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>What keyroost does with OATH</h2>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>Over PC/SC: <strong>list</strong> credentials, <strong>add</strong> and
+        <strong>delete</strong> them, <strong>compute codes</strong>, and set / clear /
+        unlock the applet password — all with an in-tree, pure-Rust OATH byte layer.</p>
+    </div>
+<pre><code>keyroostctl oath list --reader yubikey
+keyroostctl oath code &lt;name&gt; --reader yubikey</code></pre>
+    <p class="kr-muted">Credentials can be added from an <code>otpauth://</code> URI (the same
+      format behind setup QR codes).</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://datatracker.ietf.org/doc/html/rfc6238"><span class="who">IETF</span>RFC 6238 — TOTP</a>
+      <a href="https://datatracker.ietf.org/doc/html/rfc4226"><span class="who">IETF</span>RFC 4226 — HOTP</a>
+      <a href="https://developers.yubico.com/OATH/"><span class="who">Yubico</span>YKOATH protocol</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="openpgp.html">Next: OpenPGP →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

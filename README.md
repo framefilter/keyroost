@@ -14,6 +14,10 @@ vendor SDKs, no Python, and no Qt.
 > giving back to what made it possible. Absent outside contributors it will stay
 > AI-authored — issues and review are warmly welcome.
 
+**New to hardware keys?** Read the companion guide —
+[*"So you bought a hardware security key… now what?"*](https://framefilter.github.io/keyroost/) —
+a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
+
 ## What it does
 
 - **FIDO2 / CTAP2** — enumerate authenticators, read `authenticatorGetInfo`,

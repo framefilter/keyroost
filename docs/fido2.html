@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FIDO2, WebAuthn &amp; passkeys — keyroost</title>
+<meta name="description" content="What FIDO2/WebAuthn is, how phishing-resistant login works, the difference between a second factor and a passkey, and what the key's PIN actually does.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · FIDO2</p>
+    <h1>FIDO2, WebAuthn &amp; passkeys</h1>
+    <p class="kr-lede">The modern, phishing-resistant way to sign in — as a second factor or
+      as a full replacement for passwords.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>How it works (and why it can't be phished)</h2>
+    <p>When you register a key with a site, the key generates a fresh keypair just for that
+      site and hands over only the public half. To log in, the site sends a challenge; the
+      key signs it — but only after checking that the request really came from the
+      <em>origin</em> it registered with. A look-alike phishing domain produces a different
+      origin, so the key simply won't sign. There's no shared secret to steal, type into a
+      fake page, or leak in a breach.</p>
+    <p class="kr-muted">The pieces: <strong>WebAuthn</strong> is the browser ↔ website API,
+      <strong>CTAP</strong> is the browser ↔ key protocol, and <strong>FIDO2</strong> is the
+      two together. <strong>U2F</strong> is the older second-factor-only predecessor.</p>
+  </section>
+
+  <section class="kr-section" id="passkeys">
+    <h2>Second factor vs. passkey</h2>
+    <p>The same key can play two roles:</p>
+    <ul>
+      <li><strong>Second factor</strong> — you still enter a password, and the key proves
+        possession as the second step. Big upgrade over SMS/app codes because it's
+        phishing-resistant.</li>
+      <li><strong>Passkey (discoverable credential)</strong> — the key <em>is</em> the login.
+        No password at all; the key stores enough to identify your account by itself.</li>
+    </ul>
+    <p>A passkey stored on a hardware key is a <em>device-bound</em> passkey: it stays on the
+      fob and doesn't sync. The phones-and-cloud passkeys you've seen sync across your
+      devices for convenience. Same WebAuthn standard — different storage and recovery
+      trade-offs. A key holds a limited number of discoverable credentials, so it's normal
+      to mix passkeys for a few high-value accounts with second-factor use elsewhere.</p>
+    <div class="kr-callout tip">
+      <div class="kr-callout-title tip">Tip</div>
+      <p>Register <em>two</em> keys on every account that matters, and save the site's
+        recovery codes offline. A passkey is wonderful right up until you're at a login box
+        without the key.</p>
+    </div>
+  </section>
+
+  <section class="kr-section" id="pin">
+    <h2>The FIDO2 PIN</h2>
+    <p>Many operations (especially passkeys) require a PIN you set on the key. It's worth
+      being clear about what it is and isn't:</p>
+    <ul>
+      <li>It's checked <strong>by the key itself, offline</strong> — never sent to a website.
+        It authorizes <em>local</em> use of the key.</li>
+      <li>The key enforces a <strong>retry limit</strong>. After a handful of wrong attempts
+        it locks for the session, and after the hard limit (often ~8) it blocks the FIDO
+        function until reset — so even a short numeric PIN resists brute force.</li>
+      <li>It is <em>not</em> a recovery secret. Forgetting it means resetting the FIDO
+        applet, which erases its credentials. <a href="reset.html">See resetting →</a></li>
+      <li>keyroost supports both <strong>PIN protocol v1 and v2</strong>.</li>
+    </ul>
+    <div class="kr-callout danger">
+      <div class="kr-callout-title danger">Don't put your PIN in a command line</div>
+      <p>With keyroost, PINs come from <code>--pin-stdin</code> or <code>--pin-env</code> that
+        you control — never as a plain argument, and the tool never prints or stores them.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>What keyroost does with FIDO2</h2>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>Enumerate authenticators and read <code>authenticatorGetInfo</code>; check PIN
+        retries; <strong>set / change / verify the PIN</strong>; list, inspect, and delete
+        resident credentials; and <strong>reset</strong> a key. Read-only inspection needs
+        no PIN.</p>
+    </div>
+<pre><code>keyroostctl fido-info
+keyroostctl fido-pin-retries
+keyroostctl fido-creds-list --pin-stdin   # PIN read from stdin, never argv</code></pre>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Privacy</div>
+      <p>A credential listing reveals which services you have accounts with — treat it as
+        private and don't run it speculatively.</p>
+    </div>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/passkeys/"><span class="who">FIDO Alliance</span>Passkeys explained</a>
+      <a href="https://www.w3.org/TR/webauthn-2/"><span class="who">W3C</span>WebAuthn specification</a>
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html"><span class="who">FIDO Alliance</span>CTAP 2.1 specification</a>
+      <a href="https://www.cisa.gov/resources-tools/resources/implementing-phishing-resistant-mfa"><span class="who">CISA</span>Phishing-resistant MFA</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="oath.html">Next: OATH →</a> <a class="kr-btn kr-btn-ghost" href="reset.html">Resetting a key</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

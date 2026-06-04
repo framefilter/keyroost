@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PIV — smart-card certificates &amp; keys — keyroost</title>
+<meta name="description" content="What PIV (NIST SP 800-73) is, the four common key slots (9A/9C/9D/9E), how it's used for SSH/VPN/login/signing, and what keyroost currently reads.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · PIV</p>
+    <h1>PIV — smart-card certificates</h1>
+    <p class="kr-lede">A smart-card standard for holding X.509 certificates and their keys —
+      the backbone of certificate-based SSH, VPN, workstation login, and document signing.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>PIV (Personal Identity Verification, <strong>NIST SP&nbsp;800-73-4</strong>) began as a
+      US-government employee-credential standard and is now widely supported on
+      general-purpose security keys. It stores certificates and private keys in numbered
+      <em>slots</em>, each with an intended purpose, and performs signing/auth with them
+      on-device — gated by a PIN, with the slots' use governed by a management key.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>The common key slots</h2>
+    <ul>
+      <li><code>9A</code> — <strong>PIV Authentication.</strong> Login / network auth (and a
+        popular choice for SSH).</li>
+      <li><code>9C</code> — <strong>Digital Signature.</strong> Signing documents and email;
+        typically requires a PIN per use.</li>
+      <li><code>9D</code> — <strong>Key Management.</strong> Encryption / key exchange.</li>
+      <li><code>9E</code> — <strong>Card Authentication.</strong> Often used without a PIN,
+        e.g. physical-access scenarios.</li>
+    </ul>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">PIN &amp; PUK</div>
+      <p>PIV has a user PIN plus a PUK that can reset a blocked PIN. Exhaust both retry
+        counters and the card must be reset, erasing its keys and certs.
+        <a href="reset.html">See resetting →</a></p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>What keyroost does with PIV</h2>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p><strong>Read-only today.</strong> keyroost reports the PIV applet/firmware version,
+        serial, PIN retry count, and which of the <code>9A/9C/9D/9E</code> slots currently
+        hold a certificate — a safe, no-PIN status view. Write operations aren't implemented.</p>
+    </div>
+<pre><code>keyroostctl piv status --reader yubikey</code></pre>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://csrc.nist.gov/pubs/sp/800/73/4/upd1/final"><span class="who">NIST</span>SP 800-73-4 — PIV card interfaces</a>
+      <a href="https://csrc.nist.gov/pubs/fips/201-3/final"><span class="who">NIST</span>FIPS 201-3 — PIV of federal employees</a>
+      <a href="https://developers.yubico.com/PIV/"><span class="who">Yubico</span>PIV technical documentation</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="molto2.html">Next: Token2 Molto2 →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

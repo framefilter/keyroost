@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardware security keys — what they are — keyroost</title>
+<meta name="description" content="What a hardware security key is, the form factors and transports (USB-A/C, NFC, Lightning), how to choose one, and the open standards it implements.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · security keys</p>
+    <h1>Hardware security keys</h1>
+    <p class="kr-lede">The small, tamper-resistant device that holds your secrets and proves
+      who you are — without ever letting those secrets leave the chip.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>A hardware security key is a dedicated little computer with one purpose: store
+      cryptographic secrets and use them on demand, while making it physically and
+      logically hard to extract those secrets. Private keys are generated <em>on</em> the
+      device and are designed to be non-exportable — software asks the key to sign or
+      authenticate, and only the <em>result</em> comes back out.</p>
+    <p>That single property is what makes a key resistant to remote attacks: malware can
+      use the key while you're plugged in and unlocked, but it can't steal the key to use
+      later, and a server breach can't leak something that was never on the server.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>One device, several "applets"</h2>
+    <p>Most general-purpose keys expose multiple independent functions over USB (and
+      sometimes NFC). You can use any subset:</p>
+    <div class="kr-cards">
+      <a class="kr-card" href="fido2.html"><span class="kr-label">FIDO2 / WebAuthn</span><h3>Web login &amp; passkeys</h3><p>Phishing-resistant sign-in for websites and apps.</p><p class="kr-more">→</p></a>
+      <a class="kr-card" href="oath.html"><span class="kr-label">OATH</span><h3>TOTP / HOTP codes</h3><p>The 6-digit codes, stored on hardware.</p><p class="kr-more">→</p></a>
+      <a class="kr-card" href="piv.html"><span class="kr-label">PIV</span><h3>Smart-card certs</h3><p>X.509 certs for SSH, VPN, login, signing.</p><p class="kr-more">→</p></a>
+      <a class="kr-card" href="openpgp.html"><span class="kr-label">OpenPGP</span><h3>Mail, git &amp; files</h3><p>On-card PGP for sign / encrypt / auth.</p><p class="kr-more">→</p></a>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Form factors &amp; transports</h2>
+    <ul>
+      <li><strong>USB-A / USB-C</strong> — pick the connector your computer (and phone) use.</li>
+      <li><strong>NFC</strong> — tap to the back of a phone for mobile use; great as a backup transport.</li>
+      <li><strong>Lightning</strong> — for older iPhones without USB-C.</li>
+      <li><strong>Biometric variants</strong> — some keys add a fingerprint sensor so the
+        on-key check is a touch of <em>your</em> finger rather than a PIN.</li>
+    </ul>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Before you buy</div>
+      <p>Check the connector against every device you'll use it on, and confirm the
+        specific service supports security keys on the platforms you care about (desktop
+        vs. mobile can differ).</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Choosing well</h2>
+    <ul>
+      <li><strong>Buy two.</strong> One to carry, one backup registered everywhere. Losing
+        your only key with no backup is the most common painful mistake.</li>
+      <li><strong>Match the applets to your goals.</strong> Everyday account security needs
+        only FIDO2. SSH/PGP/enterprise login pull in PIV or OpenPGP.</li>
+      <li><strong>Prefer open standards over lock-in.</strong> FIDO2, OATH, PIV, and OpenPGP
+        are all open — a key implementing them works with many tools, including this one.</li>
+    </ul>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p><strong>With keyroost:</strong> <code>keyroostctl list</code> discovers connected
+        readers and FIDO authenticators so you can see exactly what's plugged in and which
+        applets each device exposes — read-only, no PIN required.</p>
+    </div>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/"><span class="who">FIDO Alliance</span>Standards &amp; certified products</a>
+      <a href="https://pages.nist.gov/800-63-3/sp800-63b.html"><span class="who">NIST</span>SP 800-63B — authenticator assurance</a>
+      <a href="https://2fa.directory/"><span class="who">Community</span>2FA Directory — who supports keys</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="fido2.html">Next: FIDO2 →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
