@@ -2697,70 +2697,78 @@ impl App {
 
     /// Welcoming first-run state shown when nothing is plugged in.
     fn empty_state(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let steps_w = 360.0;
-        ui.vertical_centered(|ui| {
-            ui.add_space(96.0);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
-            ui.painter()
-                .rect_stroke(rect, egui::Rounding::same(16.0), egui::Stroke::new(1.5, p.line));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "\u{1F511}",
-                theme::f_reg(26.0),
-                p.txt3,
-            );
-            ui.add_space(18.0);
-            ui.label(egui::RichText::new("Plug in a security key to begin").font(theme::f_bold(19.0)).color(p.txt));
-            ui.add_space(8.0);
-            // Body paragraph, wrapped to a readable column rather than full width.
-            ui.allocate_ui_with_layout(egui::vec2(440.0, 0.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens. Connect one over USB and it shows up in the list on the left.",
-                    )
-                    .font(theme::f_reg(13.0))
-                    .color(p.txt2),
-                );
-            });
-            ui.add_space(22.0);
-            // Numbered steps, left-aligned as a centered block (aligned left edges).
-            ui.allocate_ui_with_layout(egui::vec2(steps_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                for (n, step) in [
-                    "Insert your key into a USB port",
-                    "It appears in the Devices list automatically",
-                    "Select it to view and manage everything it can do",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    ui.horizontal(|ui| {
-                        let (badge, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                        ui.painter().circle_filled(badge.center(), 11.0, p.accent_soft());
-                        ui.painter().text(
-                            badge.center(),
-                            egui::Align2::CENTER_CENTER,
-                            format!("{}", n + 1),
-                            theme::f_sb(12.0),
-                            p.accent,
-                        );
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new(*step).font(theme::f_reg(13.0)).color(p.txt));
+        // Manually center a fixed-width column. `vertical_centered` doesn't
+        // reliably center nested rows (a `horizontal` fills full width and
+        // left-aligns), which is what jammed the buttons against the divider.
+        let col_w = 440.0_f32;
+        let pad = ((ui.available_width() - col_w) * 0.5).max(12.0);
+        ui.add_space(90.0);
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.allocate_ui_with_layout(
+                egui::vec2(col_w, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_stroke(rect, egui::Rounding::same(16.0), egui::Stroke::new(1.5, p.line));
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{1F511}",
+                        theme::f_reg(26.0),
+                        p.txt3,
+                    );
+                    ui.add_space(18.0);
+                    ui.label(egui::RichText::new("Plug in a security key to begin").font(theme::f_bold(19.0)).color(p.txt));
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens. Connect one over USB and it shows up in the list on the left.",
+                        )
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt2),
+                    );
+                    ui.add_space(22.0);
+                    // Numbered steps: left-aligned within the centered column.
+                    ui.allocate_ui_with_layout(egui::vec2(360.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        for (n, step) in [
+                            "Insert your key into a USB port",
+                            "It appears in the Devices list automatically",
+                            "Select it to view and manage everything it can do",
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            ui.horizontal(|ui| {
+                                let (badge, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                                ui.painter().circle_filled(badge.center(), 11.0, p.accent_soft());
+                                ui.painter().text(
+                                    badge.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}", n + 1),
+                                    theme::f_sb(12.0),
+                                    p.accent,
+                                );
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new(*step).font(theme::f_reg(13.0)).color(p.txt));
+                            });
+                            ui.add_space(10.0);
+                        }
                     });
-                    ui.add_space(10.0);
-                }
-            });
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Primary, "Scan for devices").clicked() {
-                    self.refresh_devices();
-                }
-                ui.add_space(8.0);
-                ui.hyperlink_to(
-                    egui::RichText::new("Supported devices \u{2197}").font(theme::f_sb(12.5)).color(p.accent),
-                    ui::help::learn_url("/devices"),
-                );
-            });
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if theme::button(ui, p, BtnKind::Primary, "Scan for devices").clicked() {
+                            self.refresh_devices();
+                        }
+                        ui.add_space(8.0);
+                        ui.hyperlink_to(
+                            egui::RichText::new("Supported devices \u{2197}").font(theme::f_sb(12.5)).color(p.accent),
+                            ui::help::learn_url("/devices"),
+                        );
+                    });
+                },
+            );
         });
     }
 
