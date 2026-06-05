@@ -155,8 +155,15 @@ impl CtapHidDevice {
 
     /// Send a CTAPHID command and read the response.
     pub fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, HidTransportError> {
+        if ctap_trace_enabled() {
+            eprintln!("CTAP > cmd=0x{cmd:02x} len={} {}", payload.len(), hexline(payload));
+        }
         self.send(self.channel_id, cmd, payload)?;
-        self.recv(self.channel_id, cmd)
+        let resp = self.recv(self.channel_id, cmd)?;
+        if ctap_trace_enabled() {
+            eprintln!("CTAP < len={} {}", resp.len(), hexline(&resp));
+        }
+        Ok(resp)
     }
 
     fn do_init(&mut self) -> Result<InitResponse, HidTransportError> {
@@ -274,6 +281,21 @@ impl CtapHidDevice {
             return Ok(payload);
         }
     }
+}
+
+/// True when `KEYROOST_CTAP_DEBUG` is set, enabling a stderr hex trace of every
+/// CTAP-HID transaction. Diagnostics only — never on by default.
+fn ctap_trace_enabled() -> bool {
+    std::env::var_os("KEYROOST_CTAP_DEBUG").is_some()
+}
+
+/// Lowercase hex of a byte slice, for the debug trace.
+fn hexline(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Cheap host-only nonce for `CTAPHID_INIT`. Doesn't need to be
