@@ -32,6 +32,11 @@ const SUB_ENUMERATE_CREDS_BEGIN: u8 = 0x04;
 const SUB_ENUMERATE_CREDS_NEXT: u8 = 0x05;
 const SUB_DELETE_CREDENTIAL: u8 = 0x06;
 
+/// `CTAP2_ERR_NO_CREDENTIALS`. enumerate*Begin returns this status (rather than
+/// a `total = 0` count) when the authenticator holds no discoverable
+/// credentials — a normal "empty" signal, not a failure.
+const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
+
 /// Sub-command parameter keys (CTAP §6.8.2).
 const PARAM_RP_ID_HASH: u64 = 0x01;
 const PARAM_CREDENTIAL_ID: u64 = 0x02;
@@ -132,7 +137,14 @@ impl<'a> CredentialManager<'a> {
 
     /// List every relying party that owns at least one resident credential.
     pub fn list_relying_parties(&mut self) -> Result<Vec<RelyingParty>, CtapError> {
-        let first = self.dispatch(SUB_ENUMERATE_RPS_BEGIN, None)?;
+        // A key with no resident credentials answers enumerateRPsBegin with
+        // CTAP2_ERR_NO_CREDENTIALS instead of totalRPs=0; that means "empty",
+        // not an error (e.g. a key that just had its PIN set but no passkeys).
+        let first = match self.dispatch(SUB_ENUMERATE_RPS_BEGIN, None) {
+            Ok(v) => v,
+            Err(CtapError::StatusCode(CTAP2_ERR_NO_CREDENTIALS)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let total = field_uint(&first, RESP_TOTAL_RPS).unwrap_or(0) as usize;
         if total == 0 {
             return Ok(Vec::new());
@@ -157,7 +169,11 @@ impl<'a> CredentialManager<'a> {
             Value::UInt(PARAM_RP_ID_HASH),
             Value::Bytes(rp_id_hash.to_vec()),
         )]);
-        let first = self.dispatch(SUB_ENUMERATE_CREDS_BEGIN, Some(params))?;
+        let first = match self.dispatch(SUB_ENUMERATE_CREDS_BEGIN, Some(params)) {
+            Ok(v) => v,
+            Err(CtapError::StatusCode(CTAP2_ERR_NO_CREDENTIALS)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let total = field_uint(&first, RESP_TOTAL_CREDS).unwrap_or(0) as usize;
         if total == 0 {
             return Ok(Vec::new());

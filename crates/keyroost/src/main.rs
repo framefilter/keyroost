@@ -2996,6 +2996,13 @@ impl App {
                             .color(p.txt2),
                     );
                     ui.add_space(6.0);
+                    if rps.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No passkeys stored on this key yet.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    }
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         for (rp, creds) in &rps {
                             let header = if let Some(name) = rp.name.as_ref().filter(|s| !s.is_empty()) {
