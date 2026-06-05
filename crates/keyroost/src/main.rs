@@ -3452,6 +3452,12 @@ impl App {
     /// The Molto2 token's dedicated amber view: hero band · customer-key strip ·
     /// 100-slot rail + editor.
     fn molto_view(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &UiDevice) {
+        // Make brand-orange the accent throughout the Molto2 view, so its help
+        // dots, links, selection highlights and primary action are all one
+        // orange rather than mixing the app's blue accent into the token's
+        // identity. Green stays for status, red for danger.
+        let mp = Palette { accent: p.brand, ..*p };
+        let p = &mp;
         let mut open_rename = false;
         let mut do_save = false;
         let mut do_cancel = false;
@@ -3482,7 +3488,7 @@ impl App {
                             } else {
                                 ui.label(egui::RichText::new(dev.title()).font(theme::f_bold(21.0)).color(p.txt));
                                 ui.add_space(6.0);
-                                theme::pill(ui, "Programmable TOTP token", p.brand, p.panel);
+                                theme::pill(ui, "Programmable TOTP token", p.brand, p.brand_soft());
                                 ui.add_space(4.0);
                                 self.help_dot(ui, p, "molto");
                                 ui.add_space(6.0);
@@ -3669,17 +3675,22 @@ impl App {
                             ui.label(egui::RichText::new(format!("SLOT {:02}", self.slot)).font(theme::f_bold(11.0)).color(p.brand));
                             ui.add_space(10.0);
                             editor_row(ui, p, "Title", |ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(300.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(360.0));
                             });
                             editor_row(ui, p, "Secret", |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.draft.secret_base32)
                                         .password(true)
                                         .hint_text("base32 secret")
-                                        .desired_width(300.0),
+                                        .desired_width(360.0),
                                 );
                             });
-                            editor_row(ui, p, "Algorithm", |ui| {
+                            // Two columns for the short choices, to use the width.
+                            let field_label = |ui: &mut egui::Ui, w: f32, text: &str| {
+                                ui.add_sized([w, 22.0], egui::Label::new(egui::RichText::new(text).font(theme::f_reg(13.0)).color(p.txt2)));
+                            };
+                            ui.horizontal(|ui| {
+                                field_label(ui, 92.0, "Algorithm");
                                 let cur = match self.draft.algorithm {
                                     AlgoChoice::Sha1 => "SHA1",
                                     AlgoChoice::Sha256 => "SHA256",
@@ -3687,8 +3698,8 @@ impl App {
                                 if let Some(v) = theme::segmented(ui, p, &["SHA1", "SHA256"], cur, p.brand) {
                                     self.draft.algorithm = if v == "SHA256" { AlgoChoice::Sha256 } else { AlgoChoice::Sha1 };
                                 }
-                            });
-                            editor_row(ui, p, "Digits", |ui| {
+                                ui.add_space(30.0);
+                                field_label(ui, 50.0, "Digits");
                                 let cur = match self.draft.digits {
                                     DigitsChoice::Four => "4",
                                     DigitsChoice::Six => "6",
@@ -3704,7 +3715,9 @@ impl App {
                                     };
                                 }
                             });
-                            editor_row(ui, p, "Time step", |ui| {
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                field_label(ui, 92.0, "Time step");
                                 let cur = match self.draft.time_step {
                                     StepChoice::S30 => "30s",
                                     StepChoice::S60 => "60s",
@@ -3712,8 +3725,8 @@ impl App {
                                 if let Some(v) = theme::segmented(ui, p, &["30s", "60s"], cur, p.brand) {
                                     self.draft.time_step = if v == "60s" { StepChoice::S60 } else { StepChoice::S30 };
                                 }
-                            });
-                            editor_row(ui, p, "Display", |ui| {
+                                ui.add_space(30.0);
+                                field_label(ui, 50.0, "Display");
                                 let cur = match self.draft.display_timeout {
                                     TimeoutChoice::S15 => "15s",
                                     TimeoutChoice::S30 => "30s",
