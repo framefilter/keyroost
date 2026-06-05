@@ -1926,8 +1926,19 @@ fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
 /// persists data or affects security (here, that naming a key writes its serial
 /// to disk) without cluttering the layout with a wall of text.
 fn helper_bubble(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new("\u{24d8}").weak()) // ⓘ
-        .on_hover_text(text);
+    let d = 15.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::hover());
+    let c = ui.visuals().weak_text_color();
+    ui.painter()
+        .circle_stroke(rect.center(), d / 2.0 - 1.0, egui::Stroke::new(1.0, c));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "?",
+        egui::FontId::proportional(10.0),
+        c,
+    );
+    resp.on_hover_text(text);
 }
 
 fn hex_short(bytes: &[u8]) -> String {
@@ -2198,6 +2209,63 @@ fn paint_pill(ui: &egui::Ui, left_top: egui::Pos2, text: &str, fg: egui::Color32
     w
 }
 
+// ---- small vector icons, painted so they render regardless of font coverage
+// (IBM Plex Sans lacks ⓘ / ◐ / ↻ / ⧉ / ✓ / ✕, which otherwise show as tofu) ----
+
+/// Half-filled circle — the light/dark theme toggle.
+fn paint_theme_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Color32) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    ui.painter().circle_stroke(center, r, egui::Stroke::new(1.3, color));
+    let n = 20;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = FRAC_PI_2 + PI * (i as f32 / n as f32);
+            center + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
+
+/// Circular arrow — refresh / rescan.
+fn paint_refresh_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.4, color);
+    let (a0, a1) = (-0.6_f32, 3.9_f32);
+    let n = 22;
+    let pts: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let a = a0 + (a1 - a0) * (i as f32 / n as f32);
+            center + r * egui::vec2(a.cos(), a.sin())
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(pts, stroke));
+    let tip = center + r * egui::vec2(a0.cos(), a0.sin());
+    ui.painter().line_segment([tip, tip + egui::vec2(-3.5, -1.5)], stroke);
+    ui.painter().line_segment([tip, tip + egui::vec2(1.0, -4.0)], stroke);
+}
+
+/// Two stacked sheets — copy.
+fn paint_copy_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.3, color);
+    let back = egui::Rect::from_min_size(center + egui::vec2(-1.0, -5.0), egui::vec2(7.0, 8.0));
+    let front = egui::Rect::from_min_size(center + egui::vec2(-5.0, -1.0), egui::vec2(7.0, 8.0));
+    ui.painter().rect_stroke(back, egui::Rounding::same(1.5), s);
+    ui.painter().rect_stroke(front, egui::Rounding::same(1.5), s);
+}
+
+/// Checkmark — copied / confirmed.
+fn paint_check_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.7, color);
+    ui.painter().line_segment([center + egui::vec2(-4.0, 0.0), center + egui::vec2(-1.0, 3.0)], s);
+    ui.painter().line_segment([center + egui::vec2(-1.0, 3.0), center + egui::vec2(4.0, -3.5)], s);
+}
+
+/// Cross — delete / dismiss.
+fn paint_x_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.4, color);
+    ui.painter().line_segment([center + egui::vec2(-3.5, -3.5), center + egui::vec2(3.5, 3.5)], s);
+    ui.painter().line_segment([center + egui::vec2(-3.5, 3.5), center + egui::vec2(3.5, -3.5)], s);
+}
+
 /// Paint one selectable device row. The whole row is a single painter-drawn
 /// click target (no nested widgets), so clicking anywhere in it selects the
 /// device — fixing the "only the gaps are clickable" inconsistency.
@@ -2396,14 +2464,10 @@ impl App {
                             ui::help::LEARN_BASE,
                         );
                         ui.add_space(10.0);
-                        if ui
-                            .add(
-                                egui::Label::new(egui::RichText::new("\u{25D0}").font(theme::f_reg(15.0)).color(p.txt2))
-                                    .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text("Toggle light / dark")
-                            .clicked()
-                        {
+                        let (trect, tresp) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        paint_theme_icon(ui, trect.center(), 7.0, p.txt2);
+                        if tresp.on_hover_text("Toggle light / dark").clicked() {
                             self.mode = match self.mode {
                                 Mode::Dark => Mode::Light,
                                 Mode::Light => Mode::Dark,
@@ -2441,14 +2505,10 @@ impl App {
                     ui.add_space(6.0);
                     theme::pill(ui, &self.devices.len().to_string(), p.txt2, p.raised2);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Label::new(egui::RichText::new("\u{21BB}").font(theme::f_reg(15.0)).color(p.txt2))
-                                    .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text("Rescan")
-                            .clicked()
-                        {
+                        let (rrect, rresp) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        paint_refresh_icon(ui, rrect.center(), 6.5, p.txt2);
+                        if rresp.on_hover_text("Rescan").clicked() {
                             self.refresh_devices();
                         }
                     });
@@ -3661,25 +3721,20 @@ fn oath_row(
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if with_delete {
-                if ui
-                    .add(
-                        egui::Label::new(egui::RichText::new("\u{2715}").font(theme::f_reg(13.0)).color(p.txt3))
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("Delete")
-                    .clicked()
-                {
+                let (xr, xresp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                paint_x_icon(ui, xr.center(), p.txt3);
+                if xresp.on_hover_text("Delete").clicked() {
                     delete = true;
                 }
                 ui.add_space(8.0);
             }
-            let glyph = if is_copied { "\u{2713}" } else { "\u{29C9}" };
-            let gcolor = if is_copied { p.ok } else { p.txt3 };
-            if ui
-                .add(egui::Label::new(egui::RichText::new(glyph).font(theme::f_reg(15.0)).color(gcolor)).sense(egui::Sense::click()))
-                .on_hover_text("Copy code")
-                .clicked()
-            {
+            let (cr, cresp) = ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::click());
+            if is_copied {
+                paint_check_icon(ui, cr.center(), p.ok);
+            } else {
+                paint_copy_icon(ui, cr.center(), p.txt3);
+            }
+            if cresp.on_hover_text("Copy code").clicked() {
                 if let Some(c) = code {
                     copy = Some(c.to_string());
                 }
