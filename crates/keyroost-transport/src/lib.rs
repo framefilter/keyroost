@@ -463,6 +463,96 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
     Ok(out)
 }
 
+/// One PC/SC reader, probed in a single connection: which applets it answers,
+/// plus YubiKey serial/topology when it is a YubiKey. Molto2 readers are flagged
+/// but deliberately *not* connected.
+#[derive(Debug, Clone)]
+pub struct ReaderProbe {
+    pub reader_name: String,
+    /// True when the reader name matches the Token2 Molto2 hint. Such readers
+    /// are never connected here (see [`probe_readers`]).
+    pub is_molto2: bool,
+    pub has_oath: bool,
+    pub has_openpgp: bool,
+    pub has_piv: bool,
+    /// YubiKey management serial, read on the same connection when the reader is
+    /// a YubiKey.
+    pub yubikey_serial: Option<String>,
+    pub usb_bus: Option<u8>,
+    pub usb_address: Option<u8>,
+}
+
+/// Probe every connected PC/SC reader in a single pass: one context, the reader
+/// list once, and **at most one card connection per reader**, on which all
+/// applet SELECTs are issued in sequence.
+///
+/// Molto2 (Token2) readers are detected by name and **never connected** —
+/// selecting foreign applets on a Molto2 resets its card and invalidates a held
+/// [`Session`], which is what produced spurious "the smart card has been reset"
+/// failures when a refresh ran between opening the token and authenticating.
+/// The connections we do make are released with `LeaveCard` so they don't reset
+/// other cards either.
+///
+/// PC/SC service failure errors; an individual reader that can't be connected is
+/// returned with all-false capabilities rather than failing the whole scan.
+pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
+    let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+    let mut buf = [0u8; 4096];
+    let names: Vec<std::ffi::CString> = ctx
+        .list_readers(&mut buf)
+        .map_err(TransportError::PcscUnavailable)?
+        .map(|r| r.to_owned())
+        .collect();
+
+    let molto_hint = READER_NAME_HINT.to_ascii_lowercase();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let reader_name = name.to_string_lossy().into_owned();
+        let lower = reader_name.to_ascii_lowercase();
+
+        // Molto2: record it, but never connect (a foreign SELECT would reset it).
+        if lower.contains(&molto_hint) {
+            out.push(ReaderProbe {
+                reader_name,
+                is_molto2: true,
+                has_oath: false,
+                has_openpgp: false,
+                has_piv: false,
+                yubikey_serial: None,
+                usb_bus: None,
+                usb_address: None,
+            });
+            continue;
+        }
+
+        let mut probe = ReaderProbe {
+            reader_name,
+            is_molto2: false,
+            has_oath: false,
+            has_openpgp: false,
+            has_piv: false,
+            yubikey_serial: None,
+            usb_bus: None,
+            usb_address: None,
+        };
+        if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+            (probe.usb_bus, probe.usb_address) = read_channel_id(&card);
+            let answers = |apdu: Vec<u8>| matches!(transmit_apdu(&card, &apdu), Ok((_, s1, s2)) if sw_ok(s1, s2));
+            probe.has_oath = answers(keyroost_oath::select());
+            probe.has_openpgp = answers(keyroost_openpgp::select());
+            probe.has_piv = answers(keyroost_piv::select());
+            if lower.contains(YUBIKEY_READER_HINT) {
+                probe.yubikey_serial = read_yubikey_serial(&card).ok();
+            }
+            // Release without resetting, so a card another session holds is left
+            // alone.
+            let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+        }
+        out.push(probe);
+    }
+    Ok(out)
+}
+
 /// Decode a reader's PC/SC `CHANNEL_ID` into `(usb_bus, usb_address)`. For USB
 /// readers the DWORD's high word is `0x0020` and the low word is
 /// `(bus << 8) | address`; anything else (or an unreadable attribute) is `None`.

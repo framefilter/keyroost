@@ -2087,6 +2087,19 @@ impl App {
             Box::new(move |app: &mut App| match result {
                 Ok((s, info)) => {
                     app.log(Severity::Ok, format!("opened Molto2 {}", info.serial));
+                    // Enumeration never connects to the Molto2, so fill its
+                    // serial + friendly name now that we've read it.
+                    if let Some(id) = app.selected_device.clone() {
+                        let named = keyroost_keyring::Keyring::load_default()
+                            .ok()
+                            .and_then(|k| k.name_for(Some(&info.serial)).map(str::to_owned));
+                        if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
+                            dev.serial = info.serial.clone();
+                            if dev.name.is_none() {
+                                dev.name = named;
+                            }
+                        }
+                    }
                     app.session = Some(s);
                     app.info = Some(info);
                     app.authenticated = false;

@@ -193,73 +193,63 @@ fn clean_model(raw: &str, vendor: &str) -> String {
     }
 }
 
-/// True when a PC/SC reader name looks like a Token2 Molto2 token. Mirrors the
-/// transport layer's own reader hint so the model and `Session::open` agree.
-fn is_molto_reader(reader: &str) -> bool {
-    reader
-        .to_ascii_uppercase()
-        .contains(keyroost_proto::READER_NAME_HINT)
-}
-
 /// Build the unified device list. Blocking: probes PC/SC applets. Returns a
 /// user-facing error string on hard enumeration failure (HID layer), but PC/SC
 /// problems degrade gracefully to "no smart-card capabilities" rather than
 /// failing the whole list — a key with only FIDO still shows up.
 pub fn enumerate() -> Result<Vec<UiDevice>, String> {
-    use keyroost_transport::{OathSession, OpenPgpSession, PivSession, Session};
+    use keyroost_transport::YubiKeyCcid;
 
-    // --- FIDO HID side -----------------------------------------------------
+    // --- FIDO HID side (no PC/SC) ------------------------------------------
     let hids: Vec<HidDevice> = keyroost_hid::enumerate()
         .map_err(|e| format!("HID enumeration failed: {e}"))?
         .into_iter()
         .filter(HidDevice::is_fido)
         .collect();
-    let serials = keyroost_resolve::effective_serials(&hids);
-    // Reader names + topology for YubiKeys (lets us attach a YubiKey's HID node
-    // to the same physical key as its OATH/PGP/PIV reader).
-    let yk_ccid = keyroost_transport::yubikey_ccid_serials().unwrap_or_default();
     let keyring = Keyring::load_default().unwrap_or_default();
 
-    // --- PC/SC side: which readers answer which applet --------------------
-    let oath = OathSession::list_oath_readers().unwrap_or_default();
-    let pgp = OpenPgpSession::list_openpgp_readers().unwrap_or_default();
-    let piv = PivSession::list_piv_readers().unwrap_or_default();
-    let all_readers = Session::list_readers().unwrap_or_default();
+    // --- PC/SC side: ONE pass, one connection per reader, Molto2 untouched -
+    // probe_readers() lists readers once and probes each with a single
+    // connection (Molto2 readers are never connected). This replaces the old
+    // per-applet scans that reconnected to every card ~4x and reset them.
+    let probes = keyroost_transport::probe_readers().unwrap_or_default();
 
-    let reader_caps = |name: &str| {
-        let mut c = Caps::default();
-        if oath.iter().any(|r| r == name) {
-            c.insert(Caps::OATH);
-        }
-        if pgp.iter().any(|r| r == name) {
-            c.insert(Caps::PGP);
-        }
-        if piv.iter().any(|r| r == name) {
-            c.insert(Caps::PIV);
-        }
-        c
-    };
+    // YubiKey topology + serial for HID<->CCID matching, taken from the probe
+    // pass (no extra PC/SC traffic, no card resets).
+    let yk_readers: Vec<YubiKeyCcid> = probes
+        .iter()
+        .filter(|p| !p.is_molto2)
+        .map(|p| YubiKeyCcid {
+            reader_name: p.reader_name.clone(),
+            usb_bus: p.usb_bus,
+            usb_address: p.usb_address,
+            serial: p.yubikey_serial.clone(),
+        })
+        .collect();
+
+    // Effective serial per HID node: USB iSerial, else the YubiKey CCID serial
+    // matched by USB topology (keyroost-resolve's tested logic, fed our probes).
+    let serials: Vec<Option<String>> = hids
+        .iter()
+        .map(|h| {
+            h.serial_number
+                .clone()
+                .or_else(|| keyroost_resolve::ccid_serial_for(h, &yk_readers))
+        })
+        .collect();
 
     let mut devices: Vec<UiDevice> = Vec::new();
 
-    // --- 1. Molto2 tokens (their own kind; never merged with a key) --------
-    for name in all_readers.iter().filter(|r| is_molto_reader(r)) {
-        // Read the serial best-effort; a Molto2 with a busy reader still lists.
-        let serial = Session::open_named(name)
-            .and_then(|mut s| s.read_info())
-            .map(|info| info.serial)
-            .unwrap_or_default();
-        let id = if serial.is_empty() {
-            name.clone()
-        } else {
-            format!("molto:{serial}")
-        };
+    // --- 1. Molto2 tokens: listed from the probe by name, NEVER connected
+    //        during enumeration, so a held/authenticated session survives a
+    //        refresh. The serial is read lazily when the token is selected.
+    for p in probes.iter().filter(|p| p.is_molto2) {
         devices.push(UiDevice {
-            id,
-            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            id: format!("molto:{}", p.reader_name),
+            name: None,
             vendor: "Token2".into(),
             model: "Molto2".into(),
-            serial,
+            serial: String::new(),
             transport: "USB · PC/SC".into(),
             firmware: String::new(),
             caps: {
@@ -269,38 +259,41 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
             },
             kind: DeviceKind::Token,
             hid_path: None,
-            reader: Some(name.clone()),
+            reader: Some(p.reader_name.clone()),
         });
     }
 
-    // --- 2. Smart-card keys, one per non-Molto PC/SC reader ---------------
-    // Track which readers we've turned into devices so the FIDO merge step can
-    // find them (and so a reader isn't double-counted).
-    for name in all_readers.iter().filter(|r| !is_molto_reader(r)) {
-        let caps = reader_caps(name);
+    // --- 2. Smart-card keys, one per non-Molto reader that answers an applet
+    for p in probes.iter().filter(|p| !p.is_molto2) {
+        let mut caps = Caps::default();
+        if p.has_oath {
+            caps.insert(Caps::OATH);
+        }
+        if p.has_openpgp {
+            caps.insert(Caps::PGP);
+        }
+        if p.has_piv {
+            caps.insert(Caps::PIV);
+        }
         if caps.is_empty() {
-            // A reader with no key applet we manage (and not a Molto2). It may
-            // still be a FIDO key's CCID interface with nothing provisioned, or
-            // an unrelated reader; the FIDO merge step picks it up if it matches
-            // a HID node. Skip creating a standalone entry for it here.
+            // No key applet we manage — likely a FIDO-only key's CCID interface.
+            // The HID merge step below picks it up if it matches a HID node.
             continue;
         }
-        // YubiKey readers carry a CCID-read serial we can show immediately.
-        let yk = yk_ccid.iter().find(|c| &c.reader_name == name);
-        let serial = yk.and_then(|c| c.serial.clone()).unwrap_or_default();
+        let serial = p.yubikey_serial.clone().unwrap_or_default();
         let id = if serial.is_empty() {
-            format!("reader:{name}")
+            format!("reader:{}", p.reader_name)
         } else {
             format!("serial:{serial}")
         };
-        let vendor = if yk.is_some() {
+        let vendor = if p.yubikey_serial.is_some() {
             "Yubico".to_string()
         } else {
             // First whitespace-delimited token of the reader name is usually the
             // manufacturer (e.g. "Nitrokey", "Yubico").
-            name.split_whitespace().next().unwrap_or("Key").to_string()
+            p.reader_name.split_whitespace().next().unwrap_or("Key").to_string()
         };
-        let model = clean_model(name, &vendor);
+        let model = clean_model(&p.reader_name, &vendor);
         devices.push(UiDevice {
             id,
             name: keyring.name_for(Some(&serial)).map(str::to_owned),
@@ -312,7 +305,7 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
             caps,
             kind: DeviceKind::Key,
             hid_path: None,
-            reader: Some(name.clone()),
+            reader: Some(p.reader_name.clone()),
         });
     }
 
@@ -323,7 +316,7 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
         // The PC/SC reader name this HID node shares a physical key with, if any.
         // YubiKeys: match the CCID reader by USB topology (resolve's job).
         let reader_name: Option<String> = if hid.vendor_id == keyroost_resolve::VID_YUBICO {
-            yk_ccid
+            yk_readers
                 .iter()
                 .find(|c| {
                     c.usb_bus == hid.usb_bus
@@ -332,7 +325,7 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
                 })
                 .or_else(|| {
                     // Single YubiKey reader, no usable topology: unambiguous.
-                    let only: Vec<_> = yk_ccid.iter().collect();
+                    let only: Vec<_> = yk_readers.iter().collect();
                     if only.len() == 1 {
                         Some(only[0])
                     } else {
@@ -345,13 +338,14 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
             // name (e.g. a Nitrokey HID node ↔ "Nitrokey 3 ..." reader). Only
             // merge on an unambiguous single match.
             let vt = vendor_name(hid.vendor_id);
-            let matches: Vec<&String> = all_readers
+            let matches: Vec<&str> = probes
                 .iter()
-                .filter(|r| !is_molto_reader(r))
+                .filter(|p| !p.is_molto2)
+                .map(|p| p.reader_name.as_str())
                 .filter(|r| r.to_ascii_lowercase().contains(&vt.to_ascii_lowercase()))
                 .collect();
             match matches.as_slice() {
-                [only] => Some((*only).clone()),
+                [only] => Some((*only).to_string()),
                 _ => None,
             }
         };
