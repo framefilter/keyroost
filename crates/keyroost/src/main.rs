@@ -3517,9 +3517,9 @@ impl App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
-                            self.sync_time_all();
-                        }
+                        ui.label(egui::RichText::new("Connected").font(theme::f_sb(12.5)).color(p.txt2));
+                        ui.add_space(5.0);
+                        theme::status_dot(ui, p.ok, 8.0);
                     });
                 });
             });
@@ -3535,197 +3535,212 @@ impl App {
             self.save_device_name();
         }
 
-        // Customer-key strip.
+        // --- Device-wide settings (apply to the whole token) ---
         egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(26.0, 10.0))
+            .inner_margin(egui::Margin::symmetric(26.0, 14.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Customer key").font(theme::f_sb(12.5)).color(p.txt2));
-                    ui.add_space(2.0);
-                    self.help_dot(ui, p, "custkey");
-                    ui.add_space(8.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.customer_key_input)
-                            .password(true)
-                            .hint_text("default if empty")
-                            .desired_width(180.0),
+                theme::card_frame(p).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Device").font(theme::f_sb(14.5)).color(p.txt));
+                        ui.add_space(6.0);
+                        self.help_dot(ui, p, "molto");
+                    });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [104.0, 22.0],
+                            egui::Label::new(egui::RichText::new("Customer key").font(theme::f_reg(13.0)).color(p.txt2)),
+                        );
+                        self.help_dot(ui, p, "custkey");
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.customer_key_input)
+                                .password(true)
+                                .hint_text("default if empty")
+                                .desired_width(200.0),
+                        );
+                        ui.checkbox(&mut self.customer_key_hex, "hex");
+                        if theme::button(ui, p, BtnKind::Default, "Authenticate").clicked() {
+                            self.authenticate();
+                        }
+                        if self.authenticated {
+                            theme::pill(ui, "authed", p.ok, p.ok_soft());
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Programming any slot first needs the token's customer key (blank = factory default).")
+                            .font(theme::f_reg(11.5))
+                            .color(p.txt3),
                     );
-                    ui.checkbox(&mut self.customer_key_hex, "hex");
-                    if theme::button(ui, p, BtnKind::Default, "Authenticate").clicked() {
-                        self.authenticate();
-                    }
-                    if self.authenticated {
-                        theme::pill(ui, "authed", p.ok, p.ok_soft());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
+                            self.sync_time_all();
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Default, "Bulk import\u{2026}").clicked() {
+                            self.bulk_dialog.open = true;
+                            self.bulk_dialog.start = self.slot;
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Danger, "Factory reset\u{2026}").clicked() {
+                            self.molto_reset_confirm = true;
+                        }
+                    });
+                    if self.molto_reset_confirm {
+                        ui.add_space(10.0);
+                        egui::Frame::none()
+                            .fill(p.err_soft())
+                            .inner_margin(egui::Margin::same(12.0))
+                            .rounding(egui::Rounding::same(8.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Factory-reset the token? This wipes all slots, then asks you to confirm with the \u{25B2} button on the device itself.")
+                                        .font(theme::f_reg(12.5))
+                                        .color(p.txt),
+                                );
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    if theme::button(ui, p, BtnKind::Danger, "Yes, factory reset").clicked() {
+                                        self.molto_reset_confirm = false;
+                                        self.factory_reset();
+                                    }
+                                    ui.add_space(6.0);
+                                    if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                                        self.molto_reset_confirm = false;
+                                    }
+                                });
+                            });
                     }
                 });
             });
 
-        // Body: slot rail + editor.
+        // --- Per-slot programming (applies only to the selected slot) ---
         egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(26.0, 8.0))
+            .inner_margin(egui::Margin::symmetric(26.0, 4.0))
             .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width(200.0);
-                        ui.label(egui::RichText::new(format!("SLOTS \u{00B7} {}", PROFILES)).font(theme::f_bold(11.0)).color(p.txt3));
-                        ui.add_space(6.0);
-                        let mut pick = None;
-                        egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(440.0).show(ui, |ui| {
-                            for s in 0..PROFILES {
-                                let selected = s == self.slot;
-                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
-                                let bg = if selected {
-                                    p.brand_soft()
-                                } else if resp.hovered() {
-                                    p.line_soft
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                ui.painter().rect(rect, egui::Rounding::same(8.0), bg, egui::Stroke::NONE);
-                                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(10.0, 4.0))), |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("{:02}", s))
-                                                .font(theme::f_mono(12.0))
-                                                .color(if selected { p.brand } else { p.txt3 }),
-                                        );
-                                        ui.add_space(8.0);
-                                        let (text, color) = if selected && !self.draft.title.trim().is_empty() {
-                                            (self.draft.title.clone(), p.txt)
-                                        } else {
-                                            ("empty".to_string(), p.txt3)
-                                        };
-                                        ui.label(egui::RichText::new(text).font(theme::f_reg(12.5)).color(color));
-                                    });
-                                });
-                                if resp.clicked() {
-                                    pick = Some(s);
-                                }
-                            }
-                        });
-                        if let Some(s) = pick {
-                            self.slot = s;
-                        }
-                    });
-
-                    ui.add_space(22.0);
-
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("SLOT {:02}", self.slot)).font(theme::f_bold(11.0)).color(p.txt3));
-                        });
-                        ui.add_space(10.0);
-                        editor_row(ui, p, "Title", |ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(300.0));
-                        });
-                        editor_row(ui, p, "Secret", |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.draft.secret_base32)
-                                    .password(true)
-                                    .hint_text("base32 secret")
-                                    .desired_width(300.0),
-                            );
-                        });
-                        editor_row(ui, p, "Algorithm", |ui| {
-                            let cur = match self.draft.algorithm {
-                                AlgoChoice::Sha1 => "SHA1",
-                                AlgoChoice::Sha256 => "SHA256",
-                            };
-                            if let Some(v) = theme::segmented(ui, p, &["SHA1", "SHA256"], cur, p.brand) {
-                                self.draft.algorithm = if v == "SHA256" { AlgoChoice::Sha256 } else { AlgoChoice::Sha1 };
-                            }
-                        });
-                        editor_row(ui, p, "Digits", |ui| {
-                            let cur = match self.draft.digits {
-                                DigitsChoice::Four => "4",
-                                DigitsChoice::Six => "6",
-                                DigitsChoice::Eight => "8",
-                                DigitsChoice::Ten => "10",
-                            };
-                            if let Some(v) = theme::segmented(ui, p, &["4", "6", "8", "10"], cur, p.brand) {
-                                self.draft.digits = match v.as_str() {
-                                    "4" => DigitsChoice::Four,
-                                    "8" => DigitsChoice::Eight,
-                                    "10" => DigitsChoice::Ten,
-                                    _ => DigitsChoice::Six,
-                                };
-                            }
-                        });
-                        editor_row(ui, p, "Time step", |ui| {
-                            let cur = match self.draft.time_step {
-                                StepChoice::S30 => "30s",
-                                StepChoice::S60 => "60s",
-                            };
-                            if let Some(v) = theme::segmented(ui, p, &["30s", "60s"], cur, p.brand) {
-                                self.draft.time_step = if v == "60s" { StepChoice::S60 } else { StepChoice::S30 };
-                            }
-                        });
-                        editor_row(ui, p, "Display", |ui| {
-                            let cur = match self.draft.display_timeout {
-                                TimeoutChoice::S15 => "15s",
-                                TimeoutChoice::S30 => "30s",
-                                TimeoutChoice::S60 => "60s",
-                                TimeoutChoice::S120 => "120s",
-                            };
-                            if let Some(v) = theme::segmented(ui, p, &["15s", "30s", "60s", "120s"], cur, p.brand) {
-                                self.draft.display_timeout = match v.as_str() {
-                                    "15s" => TimeoutChoice::S15,
-                                    "60s" => TimeoutChoice::S60,
-                                    "120s" => TimeoutChoice::S120,
-                                    _ => TimeoutChoice::S30,
-                                };
-                            }
-                        });
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if theme::button(ui, p, BtnKind::Primary, "Write to slot").clicked() {
-                                self.apply_draft();
-                            }
-                            ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Default, "Import otpauth\u{2026}").clicked() {
-                                self.import_dialog.open = true;
-                            }
-                            ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Default, "Bulk import\u{2026}").clicked() {
-                                self.bulk_dialog.open = true;
-                                self.bulk_dialog.start = self.slot;
-                            }
-                            ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Default, "Sync time").clicked() {
-                                self.sync_time_selected();
-                            }
-                            ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Danger, "Factory reset\u{2026}").clicked() {
-                                self.molto_reset_confirm = true;
-                            }
-                        });
-                        if self.molto_reset_confirm {
-                            ui.add_space(10.0);
-                            egui::Frame::none()
-                                .fill(p.err_soft())
-                                .inner_margin(egui::Margin::same(12.0))
-                                .rounding(egui::Rounding::same(8.0))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Factory-reset the token? This wipes all slots, then asks you to confirm with the \u{25B2} button on the device itself.",
-                                        )
-                                        .font(theme::f_reg(12.5))
-                                        .color(p.txt),
+                theme::card_frame(p).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Program a slot").font(theme::f_sb(14.5)).color(p.txt));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("The token is write-only: pick a slot and program it. The Molto2 shows codes on its own screen \u{2014} they can't be read back here.")
+                            .font(theme::f_reg(11.5))
+                            .color(p.txt3),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(150.0);
+                            let mut pick = None;
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(360.0).show(ui, |ui| {
+                                for s in 0..PROFILES {
+                                    let selected = s == self.slot;
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+                                    let bg = if selected {
+                                        p.brand_soft()
+                                    } else if resp.hovered() {
+                                        p.line_soft
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    ui.painter().rect(rect, egui::Rounding::same(8.0), bg, egui::Stroke::NONE);
+                                    ui.painter().text(
+                                        rect.left_center() + egui::vec2(12.0, 0.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        format!("Slot {s:02}"),
+                                        theme::f_mono(12.5),
+                                        if selected { p.brand } else { p.txt2 },
                                     );
-                                    ui.add_space(8.0);
-                                    ui.horizontal(|ui| {
-                                        if theme::button(ui, p, BtnKind::Danger, "Yes, factory reset").clicked() {
-                                            self.molto_reset_confirm = false;
-                                            self.factory_reset();
-                                        }
-                                        ui.add_space(6.0);
-                                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
-                                            self.molto_reset_confirm = false;
-                                        }
-                                    });
-                                });
-                        }
+                                    if resp.clicked() {
+                                        pick = Some(s);
+                                    }
+                                }
+                            });
+                            if let Some(s) = pick {
+                                self.slot = s;
+                            }
+                        });
+                        ui.add_space(24.0);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(format!("SLOT {:02}", self.slot)).font(theme::f_bold(11.0)).color(p.brand));
+                            ui.add_space(10.0);
+                            editor_row(ui, p, "Title", |ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(300.0));
+                            });
+                            editor_row(ui, p, "Secret", |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.draft.secret_base32)
+                                        .password(true)
+                                        .hint_text("base32 secret")
+                                        .desired_width(300.0),
+                                );
+                            });
+                            editor_row(ui, p, "Algorithm", |ui| {
+                                let cur = match self.draft.algorithm {
+                                    AlgoChoice::Sha1 => "SHA1",
+                                    AlgoChoice::Sha256 => "SHA256",
+                                };
+                                if let Some(v) = theme::segmented(ui, p, &["SHA1", "SHA256"], cur, p.brand) {
+                                    self.draft.algorithm = if v == "SHA256" { AlgoChoice::Sha256 } else { AlgoChoice::Sha1 };
+                                }
+                            });
+                            editor_row(ui, p, "Digits", |ui| {
+                                let cur = match self.draft.digits {
+                                    DigitsChoice::Four => "4",
+                                    DigitsChoice::Six => "6",
+                                    DigitsChoice::Eight => "8",
+                                    DigitsChoice::Ten => "10",
+                                };
+                                if let Some(v) = theme::segmented(ui, p, &["4", "6", "8", "10"], cur, p.brand) {
+                                    self.draft.digits = match v.as_str() {
+                                        "4" => DigitsChoice::Four,
+                                        "8" => DigitsChoice::Eight,
+                                        "10" => DigitsChoice::Ten,
+                                        _ => DigitsChoice::Six,
+                                    };
+                                }
+                            });
+                            editor_row(ui, p, "Time step", |ui| {
+                                let cur = match self.draft.time_step {
+                                    StepChoice::S30 => "30s",
+                                    StepChoice::S60 => "60s",
+                                };
+                                if let Some(v) = theme::segmented(ui, p, &["30s", "60s"], cur, p.brand) {
+                                    self.draft.time_step = if v == "60s" { StepChoice::S60 } else { StepChoice::S30 };
+                                }
+                            });
+                            editor_row(ui, p, "Display", |ui| {
+                                let cur = match self.draft.display_timeout {
+                                    TimeoutChoice::S15 => "15s",
+                                    TimeoutChoice::S30 => "30s",
+                                    TimeoutChoice::S60 => "60s",
+                                    TimeoutChoice::S120 => "120s",
+                                };
+                                if let Some(v) = theme::segmented(ui, p, &["15s", "30s", "60s", "120s"], cur, p.brand) {
+                                    self.draft.display_timeout = match v.as_str() {
+                                        "15s" => TimeoutChoice::S15,
+                                        "60s" => TimeoutChoice::S60,
+                                        "120s" => TimeoutChoice::S120,
+                                        _ => TimeoutChoice::S30,
+                                    };
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if theme::button(ui, p, BtnKind::Primary, "Write to slot").clicked() {
+                                    self.apply_draft();
+                                }
+                                ui.add_space(6.0);
+                                if theme::button(ui, p, BtnKind::Default, "Import otpauth\u{2026}").clicked() {
+                                    self.import_dialog.open = true;
+                                }
+                                ui.add_space(6.0);
+                                if theme::button(ui, p, BtnKind::Default, "Sync time").clicked() {
+                                    self.sync_time_selected();
+                                }
+                            });
+                        });
                     });
                 });
             });
