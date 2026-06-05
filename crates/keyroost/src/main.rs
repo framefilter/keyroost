@@ -2310,11 +2310,12 @@ fn paint_theme_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Colo
     ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
-/// Circular arrow — refresh / rescan.
+/// Circular arrow — refresh / rescan. Clockwise, with a filled arrowhead at the
+/// leading end (egui's y-down space makes increasing angle clockwise).
 fn paint_refresh_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.4, color);
-    let (a0, a1) = (-0.6_f32, 3.9_f32);
-    let n = 22;
+    let (a0, a1) = (0.5_f32, 5.6_f32);
+    let n = 24;
     let pts: Vec<egui::Pos2> = (0..=n)
         .map(|i| {
             let a = a0 + (a1 - a0) * (i as f32 / n as f32);
@@ -2322,9 +2323,15 @@ fn paint_refresh_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Co
         })
         .collect();
     ui.painter().add(egui::Shape::line(pts, stroke));
-    let tip = center + r * egui::vec2(a0.cos(), a0.sin());
-    ui.painter().line_segment([tip, tip + egui::vec2(-3.5, -1.5)], stroke);
-    ui.painter().line_segment([tip, tip + egui::vec2(1.0, -4.0)], stroke);
+    // Filled arrowhead at the leading (clockwise) end, pointing along the motion.
+    let end = center + r * egui::vec2(a1.cos(), a1.sin());
+    let tangent = egui::vec2(-a1.sin(), a1.cos());
+    let radial = egui::vec2(a1.cos(), a1.sin());
+    let tip = end + tangent * 3.5;
+    let b1 = end + radial * 2.6 - tangent * 0.8;
+    let b2 = end - radial * 2.6 - tangent * 0.8;
+    ui.painter()
+        .add(egui::Shape::convex_polygon(vec![tip, b1, b2], color, egui::Stroke::NONE));
 }
 
 /// Two stacked sheets — copy.
@@ -3445,6 +3452,9 @@ impl App {
     /// The Molto2 token's dedicated amber view: hero band · customer-key strip ·
     /// 100-slot rail + editor.
     fn molto_view(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &UiDevice) {
+        let mut open_rename = false;
+        let mut do_save = false;
+        let mut do_cancel = false;
         // Amber hero band.
         egui::Frame::none()
             .fill(p.brand_soft())
@@ -3455,12 +3465,49 @@ impl App {
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(dev.title()).font(theme::f_bold(21.0)).color(p.txt));
-                            ui.add_space(6.0);
-                            theme::pill(ui, "Programmable TOTP token", p.brand, p.panel);
-                            ui.add_space(4.0);
-                            self.help_dot(ui, p, "molto");
+                            if self.rename_open {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.rename_input)
+                                        .hint_text("friendly-name")
+                                        .desired_width(200.0),
+                                );
+                                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter {
+                                    do_save = true;
+                                }
+                                ui.add_space(4.0);
+                                if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                                    do_cancel = true;
+                                }
+                            } else {
+                                ui.label(egui::RichText::new(dev.title()).font(theme::f_bold(21.0)).color(p.txt));
+                                ui.add_space(6.0);
+                                theme::pill(ui, "Programmable TOTP token", p.brand, p.panel);
+                                ui.add_space(4.0);
+                                self.help_dot(ui, p, "molto");
+                                ui.add_space(6.0);
+                                let label = if dev.name.is_some() { "Rename" } else { "Name this token" };
+                                if ui
+                                    .add(
+                                        egui::Label::new(egui::RichText::new(label).font(theme::f_sb(12.0)).color(p.accent))
+                                            .sense(egui::Sense::click()),
+                                    )
+                                    .clicked()
+                                {
+                                    open_rename = true;
+                                }
+                            }
                         });
+                        if self.rename_open {
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Saves this token's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine.",
+                                )
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                            );
+                        }
                         ui.add_space(2.0);
                         let serial = if dev.serial.is_empty() { "\u{2014}".to_string() } else { dev.serial.clone() };
                         ui.label(
@@ -3476,6 +3523,17 @@ impl App {
                     });
                 });
             });
+        if open_rename {
+            self.rename_open = true;
+            self.rename_input = dev.name.clone().unwrap_or_default();
+        }
+        if do_cancel {
+            self.rename_open = false;
+            self.rename_input.clear();
+        }
+        if do_save {
+            self.save_device_name();
+        }
 
         // Customer-key strip.
         egui::Frame::none()
