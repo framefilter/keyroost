@@ -387,6 +387,13 @@ struct App {
     /// While `Some`, a FIDO reset is armed and waiting for the key to be
     /// unplugged and plugged back in (see [`ResetArm`]).
     reset_arm: Option<ResetArm>,
+    /// Remaining scans in the current burst. A single scan races slow-to-
+    /// register readers (the Molto2's CCID interface appears in pcscd a beat
+    /// after the USB device), so startup and every hotplug schedule several
+    /// staggered rescans instead of one.
+    pending_scans: u8,
+    /// When the next burst scan is due.
+    next_scan_at: Option<std::time::Instant>,
     /// Background PC/SC hotplug watcher. `None` in tests / if it can't start.
     /// Held only to keep the thread alive; dropped on app exit.
     #[allow(dead_code)]
@@ -2150,6 +2157,14 @@ impl App {
     }
 
     /// (Re)build the unified device list off-thread, then re-resolve selection.
+    /// Queue a burst of staggered rescans (see `pending_scans`). The first runs
+    /// as soon as the worker is free; the rest follow over the next few seconds
+    /// so a slow-registering reader is caught without the user touching Refresh.
+    fn schedule_scan_burst(&mut self) {
+        self.pending_scans = 4;
+        self.next_scan_at = None; // first scan is due immediately
+    }
+
     fn refresh_devices(&mut self) {
         self.scanned = true;
         self.spawn_job("Scanning for devices\u{2026}", move || {
@@ -2779,7 +2794,8 @@ impl eframe::App for App {
         // First frame: scan for devices automatically so the user isn't staring
         // at an empty pane wondering whether the app is broken.
         if !self.scanned {
-            self.refresh_devices();
+            self.scanned = true;
+            self.schedule_scan_burst();
         }
 
         // Armed FIDO reset: poll the live key list so we can fire the reset the
@@ -2791,18 +2807,31 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
-        // Reader hotplug: the watcher set this flag (and woke us). Re-enumerate,
-        // but only when idle — if a job is in flight we leave the flag set and
-        // pick it up after the job finishes (the worker requests a repaint),
-        // rather than dropping the rescan against the busy guard. Suppressed
-        // while a reset is armed so the rescan job can't steal the worker slot.
+        // Reader hotplug: the watcher set this flag (and woke us). Start a
+        // rescan burst (suppressed while a reset is armed, so its job can't
+        // steal the worker slot).
         if self.reset_arm.is_none()
-            && !self.busy()
             && self
                 .devices_dirty
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            self.refresh_devices();
+            self.schedule_scan_burst();
+        }
+
+        // Drive the rescan burst: run a scan when one is due and the worker is
+        // free, then schedule the next. Spacing gives a slow reader (Molto2)
+        // time to register with pcscd between attempts.
+        if self.reset_arm.is_none() && self.pending_scans > 0 {
+            let now = std::time::Instant::now();
+            let due = self.next_scan_at.map_or(true, |t| now >= t);
+            if due && !self.busy() {
+                self.refresh_devices();
+                self.pending_scans -= 1;
+                self.next_scan_at = Some(now + std::time::Duration::from_millis(1500));
+            }
+            if self.pending_scans > 0 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
         }
 
         self.top_bar(ctx, &p);
@@ -2893,7 +2922,7 @@ impl App {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
-                            self.refresh_devices();
+                            self.schedule_scan_burst();
                         }
                         ui.add_space(4.0);
                         let log_color = if self.log_open { p.accent } else { p.txt2 };
@@ -3000,7 +3029,7 @@ impl App {
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
-                            self.refresh_devices();
+                            self.schedule_scan_burst();
                         }
                     });
                 });
@@ -3213,7 +3242,7 @@ impl App {
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         if theme::button(ui, p, BtnKind::Primary, "Scan for devices").clicked() {
-                            self.refresh_devices();
+                            self.schedule_scan_burst();
                         }
                         ui.add_space(8.0);
                         ui.hyperlink_to(
