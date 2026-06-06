@@ -117,11 +117,21 @@ pub fn bootloader_device_present() -> Option<&'static str> {
         .find_map(HidDevice::bootloader_label)
 }
 
+/// Whether this platform has a HID backend. Today only Linux (sysfs) is
+/// implemented; macOS (IOKit) and Windows (hid.dll) backends are pending. When
+/// this is `false`, [`enumerate`] returns an empty list and FIDO/CTAP is
+/// unavailable — front-ends should say so explicitly rather than reporting "no
+/// FIDO devices", which would imply none are plugged in.
+#[must_use]
+pub fn hid_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// List all `/dev/hidraw*` devices visible to the current user via sysfs.
 ///
 /// Devices the caller lacks permission to *open* are still returned —
-/// enumeration reads sysfs only. Returns an empty list on non-Linux
-/// platforms.
+/// enumeration reads sysfs only. Returns an empty list on platforms without a
+/// HID backend (see [`hid_supported`]).
 pub fn enumerate() -> Result<Vec<HidDevice>, HidError> {
     if !cfg!(target_os = "linux") {
         return Ok(Vec::new());

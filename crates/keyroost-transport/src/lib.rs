@@ -42,7 +42,7 @@ pub use piv::{PivSession, PivSlotStatus, PivStatus};
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]
 pub enum TransportError {
-    /// PC/SC service unavailable (pcscd not running on Linux, or service stopped).
+    /// PC/SC service unavailable (the smart-card service is not running).
     PcscUnavailable(pcsc::Error),
     /// No connected reader matches the Molto2 name hint.
     NoMolto2Reader,
@@ -87,7 +87,7 @@ impl fmt::Display for TransportError {
             TransportError::PcscUnavailable(e) => {
                 write!(
                     f,
-                    "PC/SC service is unavailable ({}). On Linux make sure pcscd is running.",
+                    "PC/SC service is unavailable ({}). Make sure the smart-card service is running (pcscd on Linux/macOS; the Smart Card service on Windows).",
                     e
                 )
             }

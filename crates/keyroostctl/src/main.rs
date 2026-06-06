@@ -1490,7 +1490,7 @@ fn resolve_reader(
     if readers.is_empty() {
         return Err(format!(
             "no {kind}-capable security key found (no reader's {kind} applet \
-             responded). Plug a key in, and check pcscd is running."
+             responded). Plug a key in, and check the smart-card (PC/SC) service is running."
         )
         .into());
     }

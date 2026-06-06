@@ -53,12 +53,21 @@ pub const CAPABILITY_NMSG: u8 = 0x08;
 pub enum HidTransportError {
     Io(io::Error),
     Timeout,
-    UnexpectedCommand { expected: u8, got: u8 },
+    UnexpectedCommand {
+        expected: u8,
+        got: u8,
+    },
     InitResponseTooShort,
     PayloadTooLarge(usize),
-    OutOfSequence { expected: u8, got: u8 },
+    OutOfSequence {
+        expected: u8,
+        got: u8,
+    },
     DeviceError(u8),
     NonceMismatch,
+    /// This platform has no HID I/O backend yet (macOS / Windows pending). Only
+    /// Linux (hidraw) is implemented; see `keyroost_hid::hid_supported`.
+    Unsupported,
 }
 
 impl std::fmt::Display for HidTransportError {
@@ -85,6 +94,12 @@ impl std::fmt::Display for HidTransportError {
             }
             HidTransportError::NonceMismatch => {
                 write!(f, "CTAPHID_INIT response carried the wrong nonce")
+            }
+            HidTransportError::Unsupported => {
+                write!(
+                    f,
+                    "FIDO HID is not supported on this platform yet (only Linux/hidraw)"
+                )
             }
         }
     }
@@ -131,6 +146,12 @@ pub struct CtapHidDevice {
 impl CtapHidDevice {
     /// Open a hidraw device and allocate a CTAPHID channel.
     pub fn open(path: &Path) -> Result<(Self, InitResponse), HidTransportError> {
+        // hidraw read/write is the Linux backend; macOS/Windows need IOKit /
+        // hid.dll, which aren't wired yet. Fail clearly rather than with a
+        // confusing "no such file" on a path that can't exist off Linux.
+        if !cfg!(target_os = "linux") {
+            return Err(HidTransportError::Unsupported);
+        }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut dev = Self {
             file,
