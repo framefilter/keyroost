@@ -3613,7 +3613,7 @@ impl App {
                                         self.factory_reset();
                                     }
                                     ui.add_space(6.0);
-                                    if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                                    if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
                                         self.molto_reset_confirm = false;
                                     }
                                 });

@@ -22,6 +22,8 @@ pub enum Mode {
 
 #[derive(Clone, Copy)]
 pub struct Palette {
+    // part of the palette API; not yet used
+    #[allow(dead_code)]
     pub stage: Color32,     // window backdrop / behind cards
     pub surface: Color32,   // main + central panel fill
     pub bar: Color32,       // top bar / log drawer
@@ -109,6 +111,8 @@ impl Palette {
     pub fn accent_soft(&self) -> Color32 {
         tint(self.accent, 38)
     }
+    // part of the palette API; not yet used
+    #[allow(dead_code)]
     pub fn accent_line(&self) -> Color32 {
         tint(self.accent, 115)
     }
@@ -247,7 +251,7 @@ pub fn button(ui: &mut egui::Ui, p: &Palette, kind: BtnKind, label: &str) -> Res
         BtnKind::Primary => (p.accent, p.accent_ink, Stroke::NONE),
         BtnKind::Default => (p.raised2, p.txt, Stroke::new(1.0, p.line)),
         BtnKind::Ghost => (Color32::TRANSPARENT, p.txt2, Stroke::new(1.0, p.line)),
-        BtnKind::Danger => (p.err_soft(), p.err, Stroke::new(1.0, tint(p.err, 100))),
+        BtnKind::Danger => (p.err, p.accent_ink, Stroke::NONE),
     };
     ui.add(
         egui::Button::new(egui::RichText::new(label).font(f_sb(13.0)).color(fg))
