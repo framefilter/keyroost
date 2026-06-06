@@ -2095,8 +2095,8 @@ impl App {
             Box::new(move |app: &mut App| match result {
                 Ok((s, info)) => {
                     app.log(Severity::Ok, format!("opened Molto2 {}", info.serial));
-                    // Enumeration never connects to the Molto2, so fill its
-                    // serial + friendly name now that we've read it.
+                    // Enumeration's gentle probe usually fills these already;
+                    // refresh them here as a fallback in case that read failed.
                     if let Some(id) = app.selected_device.clone() {
                         let named = keyroost_keyring::Keyring::load_default()
                             .ok()

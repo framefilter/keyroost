@@ -470,8 +470,14 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
 pub struct ReaderProbe {
     pub reader_name: String,
     /// True when the reader name matches the Token2 Molto2 hint. Such readers
-    /// are never connected here (see [`probe_readers`]).
+    /// are connected only with the device's own (no-auth) `get info` command and
+    /// released with `LeaveCard` — never with a foreign applet SELECT, which
+    /// would reset the card (see [`probe_readers`]).
     pub is_molto2: bool,
+    /// Molto2 serial, read on the gentle probe connection. `None` if the reader
+    /// could not be connected or did not answer `get info`. (Security keys carry
+    /// their serial in [`ReaderProbe::yubikey_serial`] instead.)
+    pub serial: Option<String>,
     pub has_oath: bool,
     pub has_openpgp: bool,
     pub has_piv: bool,
@@ -510,24 +516,36 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         let reader_name = name.to_string_lossy().into_owned();
         let lower = reader_name.to_ascii_lowercase();
 
-        // Molto2: record it, but never connect (a foreign SELECT would reset it).
+        // Molto2: connect gently. We issue ONLY the device's own no-auth
+        // `get info` (never a foreign applet SELECT) and release with
+        // `LeaveCard`, so a held [`Session`] is not reset. The connection also
+        // wakes USB3 host controllers that otherwise enumerate the reader
+        // unreliably.
         if lower.contains(&molto_hint) {
-            out.push(ReaderProbe {
+            let mut probe = ReaderProbe {
                 reader_name,
                 is_molto2: true,
+                serial: None,
                 has_oath: false,
                 has_openpgp: false,
                 has_piv: false,
                 yubikey_serial: None,
                 usb_bus: None,
                 usb_address: None,
-            });
+            };
+            if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
+                (probe.usb_bus, probe.usb_address) = read_channel_id(&card);
+                probe.serial = read_molto2_serial(&card);
+                let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+            }
+            out.push(probe);
             continue;
         }
 
         let mut probe = ReaderProbe {
             reader_name,
             is_molto2: false,
+            serial: None,
             has_oath: false,
             has_openpgp: false,
             has_piv: false,
@@ -551,6 +569,21 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         out.push(probe);
     }
     Ok(out)
+}
+
+/// Read a Molto2 serial from a gently-connected card using the device's own
+/// no-auth `get info` command. Best-effort: any transport error, a non-`9000`
+/// status, or a too-short response yields `None`. Parses the same layout as
+/// [`Session::read_info`] (`data[3]` = serial length, `data[4..]` = serial).
+fn read_molto2_serial(card: &Card) -> Option<String> {
+    let cmd = commands::get_info();
+    let (data, sw1, sw2) = transmit_apdu(card, &cmd.apdu).ok()?;
+    if !sw_ok(sw1, sw2) {
+        return None;
+    }
+    let serial_len = *data.get(3)? as usize;
+    let serial = data.get(4..4 + serial_len)?;
+    Some(String::from_utf8_lossy(serial).into_owned())
 }
 
 /// Decode a reader's PC/SC `CHANNEL_ID` into `(usb_bus, usb_address)`. For USB

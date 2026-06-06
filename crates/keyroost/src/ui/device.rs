@@ -244,16 +244,17 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
 
     let mut devices: Vec<UiDevice> = Vec::new();
 
-    // --- 1. Molto2 tokens: listed from the probe by name, NEVER connected
-    //        during enumeration, so a held/authenticated session survives a
-    //        refresh. The serial is read lazily when the token is selected.
+    // --- 1. Molto2 tokens: the probe connects gently (device-native `get info`
+    //        only, released with `LeaveCard`), so a held/authenticated session
+    //        survives a refresh while we still read the serial up front.
     for p in probes.iter().filter(|p| p.is_molto2) {
+        let serial = p.serial.clone().unwrap_or_default();
         devices.push(UiDevice {
             id: format!("molto:{}", p.reader_name),
-            name: None,
+            name: keyring.name_for(Some(&serial)).map(str::to_owned),
             vendor: "Token2".into(),
             model: "Molto2".into(),
-            serial: String::new(),
+            serial,
             transport: "USB · PC/SC".into(),
             firmware: String::new(),
             caps: {
