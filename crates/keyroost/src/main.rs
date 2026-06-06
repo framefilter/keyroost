@@ -3462,6 +3462,19 @@ impl App {
                             ui::help::learn_url("/devices"),
                         );
                     });
+                    // Be honest on platforms without a HID backend yet: a plugged-in
+                    // FIDO key simply won't appear, so say why rather than letting
+                    // the user think it's broken.
+                    if !keyroost_hid::hid_supported() {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Note: FIDO / passkey security keys aren't supported on this platform yet. Smart-card features (OATH, OpenPGP, PIV, Token2 Molto2) work over PC/SC.",
+                            )
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt3),
+                        );
+                    }
                 },
             );
         });
