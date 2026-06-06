@@ -11,7 +11,7 @@ description = "CTAP HID transport, CBOR codec, and high-level CTAP2 commands for
 workspace = true
 
 [dependencies]
-keyroost-hid = { path = "../keyroost-hid", version = "0.1.0" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.2.0" }
 # Phase 2 crypto: PIN protocol uses P-256 ECDH, AES-256-CBC, HMAC-SHA-256.
 # Vendoring all of this would be ~1500 LOC of unaudited primitives; sha2 is
 # already pulled in transitively by p256, so adding the rest explicitly costs
