@@ -258,11 +258,25 @@ fn main() -> eframe::Result<()> {
                 })
                 .unwrap_or((Mode::Dark, 0, false));
             Palette::new(mode, Palette::ACCENTS[accent_idx], colorblind).apply(&cc.egui_ctx, mode);
+            // Watch for reader hotplug so already-plugged-in or newly-inserted
+            // devices appear without a manual Refresh. The watcher only flags a
+            // shared bit and wakes the frame loop; `update()` does the rescan.
+            let devices_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader_watch = {
+                let dirty = devices_dirty.clone();
+                let egui_ctx = cc.egui_ctx.clone();
+                keyroost_transport::ReaderWatcher::spawn(move || {
+                    dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                    egui_ctx.request_repaint();
+                })
+            };
             let app = App {
                 mode,
                 accent_idx,
                 colorblind,
                 worker: Some(Worker::spawn(cc.egui_ctx.clone())),
+                devices_dirty,
+                reader_watch: Some(reader_watch),
                 ..Default::default()
             };
             Ok(Box::new(app))
@@ -345,6 +359,13 @@ struct App {
     busy_jobs: u32,
     /// Human-readable description of what the worker is currently doing.
     busy_label: Option<String>,
+    /// Set by the reader watcher on a PC/SC hotplug; consumed in `update()` to
+    /// trigger a re-enumeration. Shared with the watcher thread.
+    devices_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Background PC/SC hotplug watcher. `None` in tests / if it can't start.
+    /// Held only to keep the thread alive; dropped on app exit.
+    #[allow(dead_code)]
+    reader_watch: Option<keyroost_transport::ReaderWatcher>,
 }
 
 #[derive(Default)]
@@ -2629,6 +2650,18 @@ impl eframe::App for App {
         // First frame: scan for devices automatically so the user isn't staring
         // at an empty pane wondering whether the app is broken.
         if !self.scanned {
+            self.refresh_devices();
+        }
+
+        // Reader hotplug: the watcher set this flag (and woke us). Re-enumerate,
+        // but only when idle — if a job is in flight we leave the flag set and
+        // pick it up after the job finishes (the worker requests a repaint),
+        // rather than dropping the rescan against the busy guard.
+        if !self.busy()
+            && self
+                .devices_dirty
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             self.refresh_devices();
         }
 

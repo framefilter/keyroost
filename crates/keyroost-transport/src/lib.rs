@@ -22,7 +22,10 @@ use keyroost_proto::commands::{
     self, derive_sm4_key, sw_auth_failed, sw_ok, Command, ProfileConfig,
 };
 use keyroost_proto::READER_NAME_HINT;
-use pcsc::{Attribute, Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{
+    Attribute, Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State,
+    PNP_NOTIFICATION,
+};
 
 mod oath;
 pub use oath::OathSession;
@@ -569,6 +572,89 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         out.push(probe);
     }
     Ok(out)
+}
+
+/// A background thread that fires a callback whenever a PC/SC reader is added
+/// or removed, so a GUI can re-enumerate on hotplug instead of only on a manual
+/// refresh. Built on the `\\?PnP?\Notification` pseudo-reader, which reports
+/// reader insertions/removals (not card events) without ever connecting to a
+/// card — so it never disturbs a held [`Session`].
+///
+/// Best-effort: if the PC/SC service is unavailable the thread idles and retries,
+/// and the app simply falls back to manual rescans. The watcher stops and joins
+/// its thread when dropped.
+pub struct ReaderWatcher {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReaderWatcher {
+    /// Spawn the watcher. `on_change` is invoked once shortly after start (so an
+    /// already-present reader missed by a startup scan is still picked up) and
+    /// again on every subsequent reader insertion/removal. It runs on the
+    /// watcher thread, so it must be cheap and thread-safe — typically just
+    /// setting a flag and requesting a UI repaint.
+    pub fn spawn<F>(on_change: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        // A finite wait so the stop flag is observed promptly on shutdown; the
+        // call still blocks in the kernel until a real change or this timeout,
+        // so idle cost is negligible.
+        const WAIT: Duration = Duration::from_millis(750);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("keyroost-reader-watch".into())
+            .spawn(move || {
+                // Outer loop re-establishes the context if the PC/SC service
+                // drops (e.g. pcscd restart).
+                while !stop_thread.load(Ordering::Relaxed) {
+                    let Ok(ctx) = Context::establish(Scope::User) else {
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    };
+                    let mut states = [ReaderState::new(PNP_NOTIFICATION(), State::UNAWARE)];
+                    while !stop_thread.load(Ordering::Relaxed) {
+                        match ctx.get_status_change(WAIT, &mut states) {
+                            Ok(()) => {
+                                let st = states[0].event_state();
+                                if st.contains(State::CHANGED) {
+                                    on_change();
+                                }
+                                states[0].sync_current_state();
+                                // Some platforms don't support PnP notification
+                                // and report the pseudo-reader as unknown; avoid
+                                // spinning if so.
+                                if st.intersects(State::UNKNOWN | State::IGNORE) {
+                                    std::thread::sleep(Duration::from_secs(2));
+                                }
+                            }
+                            Err(PcscError::Timeout) => {}
+                            // Context likely invalidated; break to re-establish.
+                            Err(_) => break,
+                        }
+                    }
+                }
+            })
+            .expect("spawn reader-watch thread");
+        ReaderWatcher {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for ReaderWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Read a Molto2 serial from a gently-connected card using the device's own
