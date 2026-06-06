@@ -188,6 +188,66 @@ impl OpenPgpSession {
         }
     }
 
+    /// Map a non-OK status word from a PIN-presenting command to a
+    /// tries-remaining [`TransportError::OpenPgpPinRejected`] when it signals a
+    /// wrong PIN (`63Cx`, or `6982`/`6983` followed by a PW-status read), else a
+    /// generic APDU error labelled `label`.
+    fn pin_rejected(&mut self, sw: u16, pw_ref: u8, label: &'static str) -> TransportError {
+        if (sw & 0xFFF0) == 0x63C0 {
+            return TransportError::OpenPgpPinRejected {
+                tries_remaining: Some((sw & 0x000F) as u8),
+            };
+        }
+        if sw == 0x6982 || sw == 0x6983 {
+            return TransportError::OpenPgpPinRejected {
+                tries_remaining: self.pin_tries_for(pw_ref),
+            };
+        }
+        TransportError::Apdu {
+            label,
+            sw1: (sw >> 8) as u8,
+            sw2: sw as u8,
+        }
+    }
+
+    /// Change the PIN behind `pw_ref` (PW1 `0x81` for the user PIN, PW3 `0x83`
+    /// for the admin PIN) from `old` to `new`. A wrong `old` is reported as a
+    /// tries-remaining error. No prior VERIFY is required — CHANGE REFERENCE
+    /// DATA carries the old PIN itself. PINs come from the caller and are never
+    /// stored or logged.
+    pub fn change_pin(&mut self, pw_ref: u8, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
+        let (_, sw) = self.transmit_full(&pgp::change_reference_data(pw_ref, old, new))?;
+        if sw == pgp::SW_OK {
+            return Ok(());
+        }
+        Err(self.pin_rejected(sw, pw_ref, "openpgp change pin"))
+    }
+
+    /// Change the user PIN (PW1) from `old` to `new`.
+    pub fn change_user_pin(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
+        self.change_pin(pgp::PW1_SIGN, old, new)
+    }
+
+    /// Change the admin PIN (PW3) from `old` to `new`.
+    pub fn change_admin_pin(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
+        self.change_pin(pgp::PW3_ADMIN, old, new)
+    }
+
+    /// Unblock the user PIN (PW1) and set it to `new_user_pin`, authorised by the
+    /// admin PIN (PW3). Verifies PW3 first (a wrong admin PIN is reported as a
+    /// tries-remaining error), then issues RESET RETRY COUNTER. Recovers a card
+    /// whose user PIN is blocked without a factory reset. PINs come from the
+    /// caller and are never stored or logged.
+    pub fn reset_retry_counter(
+        &mut self,
+        admin_pin: &[u8],
+        new_user_pin: &[u8],
+    ) -> Result<(), TransportError> {
+        self.verify_pin(pgp::PW3_ADMIN, admin_pin)?;
+        let (_, sw) = self.transmit_full(&pgp::reset_retry_counter(new_user_pin))?;
+        ok_or_apdu("openpgp reset retry counter", sw)
+    }
+
     /// Generate a fresh asymmetric key pair in the given slot and return its
     /// public key. **Destructive** — overwrites any existing key in that slot.
     /// Requires the admin PIN (PW3) to have been verified first via

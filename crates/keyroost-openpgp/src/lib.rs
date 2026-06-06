@@ -51,47 +51,33 @@ pub enum Instruction {
     Select = 0xA4,
     /// `GET DATA` — read a data object by its (1- or 2-byte) tag in P1-P2.
     GetData = 0xCA,
-    /// `PUT DATA` — write a data object.
-    ///
-    /// TODO(transport): the PUT DATA *builders* (cardholder name, URL, PW status
-    /// flags, key import) are intentionally not modelled in this byte layer yet;
-    /// they need the host-side key encoding decided in the transport phase.
+    /// `PUT DATA` — write a data object (see [`put_data`], [`put_cardholder_name`],
+    /// [`put_url`], and the key-import builders).
     PutData = 0xDA,
-    /// `VERIFY` — present a PIN (PW1/PW3) referenced by P2.
+    /// `VERIFY` — present a PIN (PW1/PW3) referenced by P2 (see [`verify`]).
     Verify = 0x20,
-    /// `CHANGE REFERENCE DATA` — change a PIN.
-    ///
-    /// TODO(transport): builder not provided yet (PIN material is the user's;
-    /// see the privacy posture in `CLAUDE.md`).
+    /// `CHANGE REFERENCE DATA` — change a PIN (see [`change_reference_data`]).
     ChangeReferenceData = 0x24,
-    /// `RESET RETRY COUNTER` — unblock PW1 using PW3 or the resetting code.
-    ///
-    /// TODO(transport): builder not provided yet.
+    /// `RESET RETRY COUNTER` — unblock PW1 using PW3 (see [`reset_retry_counter`])
+    /// or the resetting code (not modelled).
     ResetRetryCounter = 0x2C,
-    /// `PERFORM SECURITY OPERATION` — compute signature (P1P2 `9E9A`) or
-    /// decipher (P1P2 `8086`).
-    ///
-    /// TODO(transport): builder not provided yet; needs the host-side hash /
-    /// cipher framing decided in the transport phase.
+    /// `PERFORM SECURITY OPERATION` — compute signature (P1P2 `9E9A`, see
+    /// [`pso_compute_signature`]) or decipher (P1P2 `8086`, see [`pso_decipher`]).
     PerformSecurityOperation = 0x2A,
     /// `INTERNAL AUTHENTICATE` — client/SSH authentication signature.
     ///
     /// TODO(transport): builder not provided yet.
     InternalAuthenticate = 0x88,
-    /// `GENERATE ASYMMETRIC KEY PAIR` — P1 `80` generate, `81` read public key.
-    ///
-    /// TODO(transport): builder not provided yet; on-card key generation is a
-    /// destructive, hardware-only operation gated for the transport phase.
+    /// `GENERATE ASYMMETRIC KEY PAIR` — P1 `80` generate, `81` read public key
+    /// (see [`generate_key`], [`read_public_key`]).
     GenerateAsymmetricKeyPair = 0x47,
     /// `GET RESPONSE` — continue reading a response the card split across `61xx`.
     GetResponse = 0xC0,
-    /// `ACTIVATE FILE` — paired with [`Instruction::TerminateDf`] for factory reset.
-    ///
-    /// TODO(transport): builder not provided yet (destructive; hardware-only).
+    /// `ACTIVATE FILE` — paired with [`Instruction::TerminateDf`] for factory
+    /// reset (see [`activate_file`]).
     ActivateFile = 0x44,
-    /// `TERMINATE DF` — paired with [`Instruction::ActivateFile`] for factory reset.
-    ///
-    /// TODO(transport): builder not provided yet (destructive; hardware-only).
+    /// `TERMINATE DF` — paired with [`Instruction::ActivateFile`] for factory
+    /// reset (see [`terminate_df`]).
     TerminateDf = 0xE6,
 }
 
@@ -504,6 +490,30 @@ pub fn change_reference_data(pw_ref: u8, old: &[u8], new: &[u8]) -> Vec<u8> {
         0x00,
         pw_ref,
         &data,
+    )
+}
+
+/// `RESET RETRY COUNTER` P1: reset PW1 after PW3 (admin) has been verified; the
+/// body carries the new PW1 only. (The resetting-code variant, P1 `0x00`, which
+/// carries `resetting_code || new_pw1`, is not modelled — the admin path is what
+/// the transport layer uses.)
+pub const RESET_RC_BY_ADMIN: u8 = 0x02;
+
+/// `RESET RETRY COUNTER` (`00 2C 02 81`) — unblock the user PIN (PW1) and set it
+/// to `new_pw1`, after PW3 (admin) has been verified in the same session. This
+/// is how a card whose user PIN is blocked (retry counter at 0) is recovered
+/// without a factory reset. Builds a case-3 APDU `00 2C 02 81 <Lc> <new_pw1>`.
+///
+/// PIN material is the caller's (see the privacy posture in `CLAUDE.md`); this
+/// builder only frames the bytes — it never sources, stores, or logs them.
+#[must_use]
+pub fn reset_retry_counter(new_pw1: &[u8]) -> Vec<u8> {
+    build_apdu(
+        0x00,
+        Instruction::ResetRetryCounter.code(),
+        RESET_RC_BY_ADMIN,
+        0x81, // P2 = PW1
+        new_pw1,
     )
 }
 
@@ -1839,6 +1849,16 @@ mod tests {
                 0x00, 0x24, 0x00, 0x83, 0x10, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x38,
                 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31
             ]
+        );
+    }
+
+    #[test]
+    fn reset_retry_counter_bytes() {
+        // Admin-mode unblock, new PW1 "246810":
+        // 00 2C 02 81 <Lc=06> 32 34 36 38 31 30
+        assert_eq!(
+            reset_retry_counter(b"246810"),
+            vec![0x00, 0x2C, 0x02, 0x81, 0x06, 0x32, 0x34, 0x36, 0x38, 0x31, 0x30]
         );
     }
 
