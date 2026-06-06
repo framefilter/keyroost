@@ -160,6 +160,15 @@ struct OpenPgpState {
     confirm_import: Option<ImportSource>,
     /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
     confirm_reset: Option<String>,
+    /// Change-user-PIN (PW1) old/new entries. Cleared after use.
+    user_pin_old: String,
+    user_pin_new: String,
+    /// Change-admin-PIN (PW3) old/new entries. Cleared after use.
+    admin_pin_old: String,
+    admin_pin_new: String,
+    /// New user PIN for the unblock flow (reset retry counter); authorised by
+    /// `admin_pin`. Cleared after use.
+    unblock_new: String,
 }
 
 /// Where an OpenPGP key import gets its key material. Mirrors the CLI's
@@ -194,6 +203,13 @@ impl OpenPgpSlotSel {
             OpenPgpSlotSel::Sign => "signature",
             OpenPgpSlotSel::Decrypt => "decryption",
             OpenPgpSlotSel::Auth => "authentication",
+        }
+    }
+    fn from_label(s: &str) -> Self {
+        match s {
+            "decryption" => OpenPgpSlotSel::Decrypt,
+            "authentication" => OpenPgpSlotSel::Auth,
+            _ => OpenPgpSlotSel::Sign,
         }
     }
 }
@@ -1814,115 +1830,290 @@ impl App {
         });
     }
 
+    /// Change the user PIN (PW1) from old to new, then refresh status. No admin
+    /// PIN needed — CHANGE REFERENCE DATA carries the old PIN itself.
+    fn change_openpgp_user_pin(&mut self) {
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
+        let old = self.openpgp.user_pin_old.clone();
+        let new = self.openpgp.user_pin_new.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Changing user PIN\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
+                s.change_user_pin(old.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.openpgp.user_pin_old.clear();
+                app.openpgp.user_pin_new.clear();
+                Self::apply_openpgp_write(app, result, "User PIN (PW1) changed.".into());
+            })
+        });
+    }
+
+    /// Change the admin PIN (PW3) from old to new, then refresh status.
+    fn change_openpgp_admin_pin(&mut self) {
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
+        let old = self.openpgp.admin_pin_old.clone();
+        let new = self.openpgp.admin_pin_new.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Changing admin PIN\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
+                s.change_admin_pin(old.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.openpgp.admin_pin_old.clear();
+                app.openpgp.admin_pin_new.clear();
+                Self::apply_openpgp_write(app, result, "Admin PIN (PW3) changed.".into());
+            })
+        });
+    }
+
+    /// Unblock the user PIN (PW1): set it to a new value, authorised by the admin
+    /// PIN (PW3). Recovers a card whose user PIN is blocked without a reset.
+    fn unblock_openpgp_user_pin(&mut self) {
+        let Some(name) = self.selected_openpgp_reader() else {
+            return;
+        };
+        let admin = self.openpgp.admin_pin.clone();
+        let new = self.openpgp.unblock_new.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Unblocking user PIN\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                let mut s = keyroost_transport::OpenPgpSession::open(&name)?;
+                s.reset_retry_counter(admin.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.openpgp.unblock_new.clear();
+                Self::apply_openpgp_write(app, result, "User PIN (PW1) unblocked.".into());
+            })
+        });
+    }
+
     /// Write-operations section: cardholder name / URL, generate key, reset.
     /// All write ops use the admin PIN (PW3) entered here; reset is the exception
     /// (it blocks the PINs itself). Destructive ops route through confirm modals.
-    fn render_openpgp_manage(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("Manage (write operations)", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Admin PIN (PW3):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.openpgp.admin_pin)
-                        .password(true)
-                        .desired_width(160.0),
-                );
-                helper_bubble(
-                    ui,
-                    "The admin PIN authorizes write operations. It is sent to the \
-                     card for this operation only and never written to disk.",
-                );
-            });
-            ui.add_space(4.0);
+    fn render_openpgp_manage(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // Intents collected inside the UI closures and applied afterwards, so a
+        // submit method's `&mut self` never overlaps the card's borrow.
+        let mut go_name = false;
+        let mut go_url = false;
+        let mut arm_generate = false;
+        let mut arm_import: Option<ImportSource> = None;
+        let mut go_change_user = false;
+        let mut go_change_admin = false;
+        let mut go_unblock = false;
+        let mut arm_reset = false;
 
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.openpgp.name_input)
-                        .hint_text("Surname<<Given")
-                        .desired_width(200.0),
-                );
-                if ui.button("Set name").clicked() {
-                    self.set_openpgp_name();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("URL:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.openpgp.url_input)
-                        .hint_text("https://…")
-                        .desired_width(200.0),
-                );
-                if ui.button("Set URL").clicked() {
-                    self.set_openpgp_url();
-                }
-            });
-            ui.add_space(6.0);
+        let head = |ui: &mut egui::Ui, t: &str| {
+            ui.label(egui::RichText::new(t).font(theme::f_sb(14.0)).color(p.txt));
+        };
+        let sub = |ui: &mut egui::Ui, t: &str| {
+            ui.label(egui::RichText::new(t).font(theme::f_sb(12.5)).color(p.txt2));
+        };
+        let note = |ui: &mut egui::Ui, t: &str| {
+            ui.label(
+                egui::RichText::new(t)
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt3),
+            );
+        };
 
-            ui.horizontal(|ui| {
-                ui.label("Generate RSA key in slot:");
-                egui::ComboBox::from_id_salt("openpgp-gen-slot")
-                    .selected_text(self.openpgp.gen_slot.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.openpgp.gen_slot, OpenPgpSlotSel::Sign, "signature");
-                        ui.selectable_value(&mut self.openpgp.gen_slot, OpenPgpSlotSel::Decrypt, "decryption");
-                        ui.selectable_value(&mut self.openpgp.gen_slot, OpenPgpSlotSel::Auth, "authentication");
-                    });
-                if ui.button("Generate\u{2026}").clicked() {
-                    self.openpgp.confirm_generate = true;
-                }
-            });
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Import RSA key into slot:");
-                egui::ComboBox::from_id_salt("openpgp-import-slot")
-                    .selected_text(self.openpgp.import_slot.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.openpgp.import_slot, OpenPgpSlotSel::Sign, "signature");
-                        ui.selectable_value(&mut self.openpgp.import_slot, OpenPgpSlotSel::Decrypt, "decryption");
-                        ui.selectable_value(&mut self.openpgp.import_slot, OpenPgpSlotSel::Auth, "authentication");
-                    });
-                if ui.button("Generate & import\u{2026}").clicked() {
-                    self.openpgp.confirm_import = Some(ImportSource::Generate);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("From file:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.openpgp.import_path)
-                        .hint_text("/path/to/key.pem (PKCS#1/8, PEM or DER)")
-                        .desired_width(260.0),
-                );
-                let armed = !self.openpgp.import_path.trim().is_empty();
-                if ui
-                    .add_enabled(armed, egui::Button::new("Import file\u{2026}"))
-                    .clicked()
-                {
-                    self.openpgp.confirm_import = Some(ImportSource::FromFile);
-                }
-            });
-            helper_bubble(
+        // --- Admin PIN: shared by the card-detail and key writes (PW3) ---
+        theme::card_frame(p).show(ui, |ui| {
+            head(ui, "Admin PIN (PW3)");
+            note(
                 ui,
-                "Imports an RSA-2048 private key into the slot. \u{201c}Generate & import\u{201d} \
-                 makes a fresh key on this host; \u{201c}From file\u{201d} loads a PKCS#1/PKCS#8 \
-                 key (PEM or DER). Like generate, this OVERWRITES the slot and needs the admin PIN.",
+                "Authorizes the card-detail and key writes below. Sent for the \
+                 operation only; never stored.",
             );
             ui.add_space(6.0);
+            pin_field(ui, p, "Admin PIN", &mut self.openpgp.admin_pin);
+        });
+        ui.add_space(10.0);
 
+        // --- Card details: cardholder name + public-key URL ---
+        theme::card_frame(p).show(ui, |ui| {
+            head(ui, "Card details");
+            ui.add_space(6.0);
+            text_field(
+                ui,
+                p,
+                "Name",
+                &mut self.openpgp.name_input,
+                "Surname<<Given",
+                200.0,
+            );
             ui.horizontal(|ui| {
-                let reset = egui::Button::new(
-                    egui::RichText::new("Reset applet\u{2026}").color(egui::Color32::from_rgb(220, 110, 110)),
-                );
-                if ui.add(reset).clicked() {
-                    self.openpgp.confirm_reset = Some(String::new());
+                if theme::button(ui, p, BtnKind::Default, "Set name").clicked() {
+                    go_name = true;
                 }
-                helper_bubble(
-                    ui,
-                    "Wipes ALL OpenPGP keys and restores default PINs. Works even \
-                     if the PINs are forgotten (it blocks them first).",
-                );
+            });
+            ui.add_space(6.0);
+            text_field(
+                ui,
+                p,
+                "URL",
+                &mut self.openpgp.url_input,
+                "https://\u{2026}",
+                240.0,
+            );
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Default, "Set URL").clicked() {
+                    go_url = true;
+                }
             });
         });
+        ui.add_space(10.0);
+
+        // --- Keys: generate on-card / import per slot (both overwrite) ---
+        theme::card_frame(p).show(ui, |ui| {
+            head(ui, "Keys");
+            note(
+                ui,
+                "Generating or importing OVERWRITES that slot (clearable only by a \
+                 full reset). Needs the admin PIN; may need a touch.",
+            );
+            ui.add_space(8.0);
+            sub(ui, "Generate on-card");
+            if let Some(s) = theme::segmented(
+                ui,
+                p,
+                &["signature", "decryption", "authentication"],
+                self.openpgp.gen_slot.label(),
+                p.accent,
+            ) {
+                self.openpgp.gen_slot = OpenPgpSlotSel::from_label(&s);
+            }
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
+                    arm_generate = true;
+                }
+            });
+            ui.add_space(10.0);
+            sub(ui, "Import RSA-2048");
+            if let Some(s) = theme::segmented(
+                ui,
+                p,
+                &["signature", "decryption", "authentication"],
+                self.openpgp.import_slot.label(),
+                p.accent,
+            ) {
+                self.openpgp.import_slot = OpenPgpSlotSel::from_label(&s);
+            }
+            text_field(
+                ui,
+                p,
+                "From file",
+                &mut self.openpgp.import_path,
+                "/path/to/key.pem (PKCS#1/8, PEM or DER)",
+                260.0,
+            );
+            let have_path = !self.openpgp.import_path.trim().is_empty();
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Default, "Generate & import\u{2026}").clicked() {
+                    arm_import = Some(ImportSource::Generate);
+                }
+                if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked()
+                    && have_path
+                {
+                    arm_import = Some(ImportSource::FromFile);
+                }
+            });
+        });
+        ui.add_space(10.0);
+
+        // --- PINs: change user / admin, unblock user ---
+        theme::card_frame(p).show(ui, |ui| {
+            head(ui, "PINs");
+            ui.add_space(6.0);
+            sub(ui, "Change user PIN (PW1)");
+            pin_field(ui, p, "Current", &mut self.openpgp.user_pin_old);
+            pin_field(ui, p, "New", &mut self.openpgp.user_pin_new);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Default, "Change user PIN").clicked() {
+                    go_change_user = true;
+                }
+            });
+            ui.add_space(10.0);
+            sub(ui, "Change admin PIN (PW3)");
+            pin_field(ui, p, "Current", &mut self.openpgp.admin_pin_old);
+            pin_field(ui, p, "New", &mut self.openpgp.admin_pin_new);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Default, "Change admin PIN").clicked() {
+                    go_change_admin = true;
+                }
+            });
+            ui.add_space(10.0);
+            sub(ui, "Unblock user PIN");
+            note(ui, "Sets a new user PIN using the admin PIN entered above.");
+            pin_field(ui, p, "New user PIN", &mut self.openpgp.unblock_new);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Default, "Unblock user PIN").clicked() {
+                    go_unblock = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+
+        // --- Danger: factory reset ---
+        theme::card_frame(p)
+            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Reset applet")
+                            .font(theme::f_sb(14.0))
+                            .color(p.err),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                            arm_reset = true;
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Wipes ALL OpenPGP keys and restores default PINs. Works even if the PINs are forgotten.",
+                    )
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt2),
+                );
+            });
+
+        // Apply collected intents now that the card borrows have ended.
+        if go_name {
+            self.set_openpgp_name();
+        }
+        if go_url {
+            self.set_openpgp_url();
+        }
+        if arm_generate {
+            self.openpgp.confirm_generate = true;
+        }
+        if let Some(src) = arm_import {
+            self.openpgp.confirm_import = Some(src);
+        }
+        if go_change_user {
+            self.change_openpgp_user_pin();
+        }
+        if go_change_admin {
+            self.change_openpgp_admin_pin();
+        }
+        if go_unblock {
+            self.unblock_openpgp_user_pin();
+        }
+        if arm_reset {
+            self.openpgp.confirm_reset = Some(String::new());
+        }
     }
 
     /// The generate-key and reset confirmation modals for the OpenPGP pane.
@@ -2465,6 +2656,27 @@ fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
             egui::TextEdit::singleline(buf)
                 .password(true)
                 .desired_width(200.0),
+        );
+    });
+    ui.add_space(4.0);
+}
+
+/// A themed single-line text input with a fixed-width label — the non-password
+/// sibling of [`pin_field`], for cardholder name / URL / file path.
+fn text_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hint: &str, w: f32) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 22.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            ),
+        );
+        ui.add(
+            egui::TextEdit::singleline(buf)
+                .hint_text(hint)
+                .desired_width(w),
         );
     });
     ui.add_space(4.0);
@@ -4077,7 +4289,7 @@ impl App {
             );
         }
         ui.add_space(10.0);
-        self.render_openpgp_manage(ui);
+        self.render_openpgp_manage(ui, p);
     }
 
     /// PIV tab — read-only status snapshot (auto-read on first view).
