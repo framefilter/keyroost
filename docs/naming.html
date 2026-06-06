@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Give your keys names — keyroost</title>
+<meta name="description" content="When you own several hardware security keys, keyroost can attach a friendly name to each one — matched by the key's stable serial number — so the GUI and keyroostctl recognize it by name instead of a path that changes on every replug.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Naming your keys</p>
+    <h1>Give your keys names</h1>
+    <p class="kr-lede">Own more than one security key? Attach a memorable label to each — a
+      "signing-yubikey", a "backup", a "work" key — so keyroost recognizes it by name
+      instead of a cryptic device path that changes every time you unplug and replug it.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>Why name a key?</h2>
+    <p>If you keep two or three keys plugged in — or rotate a primary and a backup — they all
+      look alike to the operating system, and the path the OS assigns each one
+      (<code>/dev/hidraw3</code> today, <code>/dev/hidraw5</code> tomorrow) shifts on every
+      replug. A friendly name fixes that: keyroost matches it to the key's <strong>stable
+      serial number</strong>, so "signing-yubikey" always means the same physical key no
+      matter which port it's in.</p>
+    <p>This makes the device list easier to read at a glance, and it lets you target a
+      specific key on the command line with <code>--name</code> instead of hunting for the
+      right path.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>How keyroost identifies a key</h2>
+    <p>A name is bound to the key's serial number, not to a port or a slot:</p>
+    <ul>
+      <li>For most keys (SoloKeys, Nitrokey, and similar) the serial is the USB
+        <code>iSerialNumber</code> the key reports to the operating system.</li>
+      <li>For keys that don't expose a USB serial (such as YubiKeys), keyroost reads the
+        serial from a vendor management applet over the smart-card (CCID) interface instead.</li>
+    </ul>
+    <p>Either way, matching is a plain string comparison against that serial — so a named key
+      is recognized the moment it's connected, in any port, and is shown as "not connected"
+      when it's absent.</p>
+    <div class="kr-callout tip">
+      <div class="kr-callout-title tip">Naming is opt-in and stays on your computer</div>
+      <p>Nothing is written to disk until you explicitly add a name. When you do, keyroost
+        saves an entry to a local <code>keys.json</code> file on this computer — the friendly
+        label plus the key's serial number — so the key can be recognized later. Merely
+        viewing or matching keys records nothing, and you can remove an entry at any time.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Naming a key in the app</h2>
+    <p>In the keyroost desktop app, select the key you want to label and use the
+      <strong>Name this key</strong> action next to its title (it reads <strong>Rename</strong>
+      once a name is already set). Type a short label and confirm — the key then appears under
+      that name in the device list, and keeps it across replugs.</p>
+  </section>
+
+  <section class="kr-section" id="cli">
+    <h2>Naming a key from the command line</h2>
+    <p>The same registry is available from <code>keyroostctl</code> through the
+      <code>key-name</code> command, which has three subcommands:</p>
+    <ul>
+      <li><strong><code>add</code></strong> — record a friendly name for a connected key.
+        Pass the label as the first argument; keyroost reads the connected key's serial and
+        writes it to <code>keys.json</code>. If several keys are plugged in it asks which one
+        to name (or pass <code>--path</code> to point at a specific device).</li>
+      <li><strong><code>list</code></strong> — show every configured name, its serial, and
+        whether that key is currently connected.</li>
+      <li><strong><code>remove</code></strong> — delete a configured name by its label.</li>
+    </ul>
+<pre><code>keyroostctl key-name add signing-yubikey
+keyroostctl key-name list
+keyroostctl key-name remove signing-yubikey</code></pre>
+    <p>Once a key is named, commands that target a single key accept
+      <code>--name signing-yubikey</code> to pick it out, instead of a device path that
+      changes between plugs.</p>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Label rules</div>
+      <p>A label is 1–64 characters of lowercase letters, digits, hyphens, and underscores
+        (<code>[a-z0-9_-]</code>). Names must be unique, and each serial can carry only one
+        name — keyroost refuses a duplicate name or a second name for the same key.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>What keyroost stores</h2>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>A small <code>keys.json</code> registry on this computer: for each named key, the
+        <strong>label</strong>, the <strong>serial number</strong>, and how that serial was
+        obtained (USB or CCID). Naming is pure local config and matching — keyroost never
+        enumerates or contacts a server to do it, and removing a name deletes the entry. No
+        secrets, PINs, or credentials are ever part of a name.</p>
+    </div>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Related</h2>
+    <p class="kr-muted">Naming works alongside everything else a key can do:</p>
+    <div class="kr-res">
+      <a href="security-keys.html"><span class="who">keyroost</span>What a security key is</a>
+      <a href="fido2.html"><span class="who">keyroost</span>FIDO2 &amp; passkeys</a>
+      <a href="reset.html"><span class="who">keyroost</span>Resetting a key safely</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="index.html">← Back to Learn</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Friendly names are stored only on your own computer; keyroost is independent and not affiliated with or endorsed by any vendor named here. Product names are used descriptively.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
