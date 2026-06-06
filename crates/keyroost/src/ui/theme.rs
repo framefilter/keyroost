@@ -51,7 +51,7 @@ pub fn tint(c: Color32, a: u8) -> Color32 {
 }
 
 impl Palette {
-    pub fn new(mode: Mode, accent: Color32) -> Self {
+    pub fn new(mode: Mode, accent: Color32, colorblind: bool) -> Self {
         let mut p = match mode {
             Mode::Dark => Palette {
                 stage: Color32::from_rgb(0x0f, 0x11, 0x15),
@@ -97,6 +97,23 @@ impl Palette {
             },
         };
         p.accent = accent;
+        if colorblind {
+            // Color Universal Design (Okabe & Ito; Wong, Nature Methods 2011):
+            // the common deficiency is red-green, so replace the green<->red
+            // success/error pair with a blue<->vermillion pair that stays
+            // distinguishable under deuteran, protan and tritan vision. Warn
+            // (amber), backgrounds, accent and brand are left as-is.
+            match mode {
+                Mode::Dark => {
+                    p.ok = Color32::from_rgb(0x56, 0xb4, 0xe9); // sky blue
+                    p.err = Color32::from_rgb(0xe8, 0x59, 0x0c); // vermillion
+                }
+                Mode::Light => {
+                    p.ok = Color32::from_rgb(0x00, 0x72, 0xb2); // blue
+                    p.err = Color32::from_rgb(0xd5, 0x5e, 0x00); // vermillion
+                }
+            }
+        }
         p
     }
 

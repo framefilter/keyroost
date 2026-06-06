@@ -240,7 +240,7 @@ fn main() -> eframe::Result<()> {
             theme::install_fonts(&cc.egui_ctx);
             // Restore the persisted theme (mode + accent), defaulting to the
             // refined dark + blue accent the prototype ships with.
-            let (mode, accent_idx) = cc
+            let (mode, accent_idx, colorblind) = cc
                 .storage
                 .map(|s| {
                     let mode = if s.get_string("mode").as_deref() == Some("light") {
@@ -253,13 +253,15 @@ fn main() -> eframe::Result<()> {
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(0)
                         .min(Palette::ACCENTS.len() - 1);
-                    (mode, accent_idx)
+                    let colorblind = s.get_string("colorblind").as_deref() == Some("1");
+                    (mode, accent_idx, colorblind)
                 })
-                .unwrap_or((Mode::Dark, 0));
-            Palette::new(mode, Palette::ACCENTS[accent_idx]).apply(&cc.egui_ctx, mode);
+                .unwrap_or((Mode::Dark, 0, false));
+            Palette::new(mode, Palette::ACCENTS[accent_idx], colorblind).apply(&cc.egui_ctx, mode);
             let app = App {
                 mode,
                 accent_idx,
+                colorblind,
                 worker: Some(Worker::spawn(cc.egui_ctx.clone())),
                 ..Default::default()
             };
@@ -315,6 +317,8 @@ struct App {
     mode: Mode,
     /// Accent index into `Palette::ACCENTS` (persisted).
     accent_idx: usize,
+    /// Colorblind-safe palette (blue/vermillion status colors) — persisted.
+    colorblind: bool,
     /// Whether the activity-log drawer is open.
     log_open: bool,
     /// Open help topic id, or `None` when the popover is closed.
@@ -1985,7 +1989,7 @@ fn unix_now() -> u32 {
 impl App {
     /// The palette for the current theme + accent.
     fn palette(&self) -> Palette {
-        Palette::new(self.mode, Palette::ACCENTS[self.accent_idx])
+        Palette::new(self.mode, Palette::ACCENTS[self.accent_idx], self.colorblind)
     }
 
     /// The currently selected device, if the id still resolves to a present one.
@@ -2310,6 +2314,24 @@ fn paint_theme_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Colo
     ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
 }
 
+/// An eye (two lids + a pupil) — the colorblind-mode toggle.
+fn paint_eye_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3, color);
+    let (w, h) = (8.0_f32, 4.6_f32);
+    let n = 14;
+    let lid = |sign: f32| -> Vec<egui::Pos2> {
+        (0..=n)
+            .map(|i| {
+                let t = -1.0 + 2.0 * (i as f32 / n as f32);
+                egui::pos2(center.x + t * w, center.y + sign * h * (1.0 - t * t))
+            })
+            .collect()
+    };
+    ui.painter().add(egui::Shape::line(lid(-1.0), stroke));
+    ui.painter().add(egui::Shape::line(lid(1.0), stroke));
+    ui.painter().circle_filled(center, 2.2, color);
+}
+
 /// Circular arrow — refresh / rescan. Clockwise, with a filled arrowhead at the
 /// leading end (egui's y-down space makes increasing angle clockwise).
 fn paint_refresh_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Color32) {
@@ -2447,6 +2469,7 @@ impl eframe::App for App {
             .to_string(),
         );
         storage.set_string("accent", self.accent_idx.to_string());
+        storage.set_string("colorblind", if self.colorblind { "1" } else { "0" }.to_string());
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2563,6 +2586,13 @@ impl App {
                                 Mode::Dark => Mode::Light,
                                 Mode::Light => Mode::Dark,
                             };
+                        }
+                        ui.add_space(10.0);
+                        let (erect, eresp) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        paint_eye_icon(ui, erect.center(), if self.colorblind { p.accent } else { p.txt2 });
+                        if eresp.on_hover_text("Colorblind-safe colors").clicked() {
+                            self.colorblind = !self.colorblind;
                         }
                         ui.add_space(10.0);
                         for (i, c) in Palette::ACCENTS.iter().enumerate().rev() {
