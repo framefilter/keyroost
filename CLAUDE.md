@@ -1,5 +1,24 @@
 # Context for Claude Code agents working on keyroost
 
+## ⚠️ FIRST: sync with GitHub before doing any local work
+
+Claude Code Web is making passes on this repo and **pushing commits to GitHub**,
+so the GitHub remote is now the source of truth and the local checkout is
+frequently behind. **Before starting any local work (and before committing),
+check the remote and integrate it:**
+
+```bash
+git fetch origin
+git log --oneline HEAD..origin/main   # what landed on the remote that we don't have
+git status                            # branch + divergence
+```
+
+If `origin/main` (or the branch you're on) has moved ahead, **pull/rebase onto
+it before writing code or committing** — do not build on a stale local tree, and
+do not push a branch that diverged without reconciling first (we hit exactly
+this and had to untangle a rejected push). When in doubt, stop and surface the
+divergence to the user rather than committing on top of stale state.
+
 ## What this repository is
 
 Independent, MIT/Apache-2.0 dual-licensed Rust toolchain for programming the
