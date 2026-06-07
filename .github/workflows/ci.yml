@@ -63,3 +63,48 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  # Build + test inside Fedora and Arch containers so the README's per-distro
+  # package lists are verified, not assumed, and a distro-specific build break is
+  # caught here. Linux is distro-neutral (sysfs/hidraw + PC/SC), so this is a
+  # smoke build, not a second clippy pass — the os matrix above already enforces
+  # lints. Distro toolchains (both well past our 1.75 MSRV) stand in for rustup.
+  linux-distros:
+    name: build + test (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: fedora
+            image: fedora:latest
+          - distro: arch
+            image: archlinux:latest
+    steps:
+      # Deps don't need the repo, so install them (incl. git for checkout and the
+      # distro Rust) before checking out.
+      - name: Install dependencies (Fedora)
+        if: matrix.distro == 'fedora'
+        run: |
+          dnf install -y git gcc pkgconf-pkg-config \
+            pcsc-lite-devel \
+            libxkbcommon-devel libxkbcommon-x11-devel wayland-devel \
+            libxcb-devel mesa-libGL-devel \
+            rust cargo
+
+      - name: Install dependencies (Arch)
+        if: matrix.distro == 'arch'
+        run: |
+          pacman -Sy --noconfirm --needed git gcc pkgconf \
+            pcsclite ccid \
+            libxkbcommon libxcb wayland mesa \
+            rust
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked

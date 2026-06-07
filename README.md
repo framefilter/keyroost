@@ -93,16 +93,37 @@ cargo install --git https://github.com/framefilter/keyroost keyroostctl keyroost
 
 ### Linux prerequisite
 
-PC/SC needs the system library and daemon:
+keyroost is distro-neutral — it talks to the kernel's `hidraw`/`sysfs` and to
+PC/SC, both of which every mainstream distribution provides. Only the package
+names differ. The CLI needs the PC/SC library + daemon; the GUI additionally
+needs the X11/Wayland/GL libraries that `eframe`/`egui` link against.
 
 ```bash
-sudo apt install libpcsclite-dev pcscd      # Debian / Ubuntu
-sudo dnf install pcsc-lite-devel pcsc-lite  # Fedora
+# Debian / Ubuntu
+sudo apt install libpcsclite-dev pcscd \
+  libxkbcommon-dev libwayland-dev libxcb1-dev libgl1-mesa-dev
+
+# Fedora / RHEL
+sudo dnf install pcsc-lite-devel pcsc-lite pkgconf-pkg-config gcc \
+  libxkbcommon-devel libxkbcommon-x11-devel wayland-devel libxcb-devel \
+  mesa-libGL-devel
+
+# Arch
+sudo pacman -S pcsclite ccid pkgconf gcc \
+  libxkbcommon libxcb wayland mesa
+
 sudo systemctl enable --now pcscd
 ```
 
-macOS and Windows have PC/SC built in. (HID enumeration is currently Linux-only;
-cross-platform support is planned.)
+(For the **CLI only** you can drop the `libxkbcommon`/`wayland`/`xcb`/`mesa`
+packages — those are just for the GUI.) macOS and Windows have PC/SC built in,
+and the FIDO HID backend uses `hidapi` (IOKit / hid.dll) automatically — no extra
+packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
+
+> **Prebuilt binaries:** the release artifacts are built on Ubuntu and linked
+> against its glibc, so they run on glibc-current distros (Arch, recent Fedora)
+> but may fail on older ones (e.g. RHEL 9) with a `GLIBC_…` error. When in doubt,
+> build from source with the commands above — `cargo install` handles the rest.
 
 ### FIDO HID access (Linux udev rules)
 
