@@ -14,16 +14,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # One source tree, compiled and tested three ways. This matrix is what keeps
+  # the macOS/Windows code (the cfg-gated hidapi HID backend) from rotting: a
+  # Linux-only change that breaks another platform fails the PR here, so we never
+  # need separate per-OS branches. `fail-fast: false` so one platform failing
+  # still lets the others report.
   test:
-    name: clippy + test (Linux, stable)
-    runs-on: ubuntu-latest
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
-      # System libraries the workspace links against:
-      #  - libpcsclite-dev: the `pcsc` crate (keyroost-transport).
+      # Linux links against system libraries the other platforms provide natively:
+      #  - libpcsclite-dev: the `pcsc` crate (keyroost-transport). macOS uses the
+      #    PCSC framework and Windows uses WinSCard, both already present.
       #  - the X11/Wayland/XKB/GL set: eframe/egui/winit/glow (the `keyroost` GUI).
-      - name: Install system dependencies
+      #    macOS (Cocoa) and Windows (Win32) need no extra packages.
+      # The Linux build uses the dependency-free sysfs HID backend, so no libudev.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -38,9 +51,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Formatting is platform-independent; check it once on Linux.
       - name: Format check
+        if: runner.os == 'Linux'
         run: cargo fmt --all --check
 
+      # On macOS/Windows this compiles the cfg(not(target_os = "linux")) hidapi
+      # backend for real — the coverage the `hidapi-backend` feature only fakes.
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

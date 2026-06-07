@@ -87,7 +87,7 @@ impl fmt::Display for TransportError {
             TransportError::PcscUnavailable(e) => {
                 write!(
                     f,
-                    "PC/SC service is unavailable ({}). Make sure the smart-card service is running (pcscd on Linux/macOS; the Smart Card service on Windows).",
+                    "PC/SC service is unavailable ({}). Make sure the smart-card service is running (pcscd on Linux; built in on macOS; the Smart Card service on Windows).",
                     e
                 )
             }

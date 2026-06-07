@@ -11,8 +11,11 @@ description = "CTAP HID transport, CBOR codec, and high-level CTAP2 commands for
 workspace = true
 
 [features]
-# Force the hidapi I/O backend on (also auto-selected on non-Linux). Lets the
-# cross-platform CTAP transport be built and smoke-tested on Linux.
+# Test/dev hook ONLY — never enable this for a Linux release. It forces the
+# hidapi I/O backend on so the cross-platform CTAP transport can be built and
+# smoke-tested on Linux; real macOS/Windows coverage comes from the CI matrix,
+# not this flag. Building it on Linux needs `libudev-dev` (see keyroost-hid).
+# The default Linux build never touches it and stays dependency-free.
 hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend"]
 
 [dependencies]
