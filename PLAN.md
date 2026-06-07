@@ -41,9 +41,10 @@ read foundation landed, the agreed next items, in priority order:
    (live click-test the GUI panes; force the OpenPGP decrypt command-chaining
    path on hardware); add a CHANGELOG; document the udev-rules install in the
    README; then tag `v0.1.0`.
-2. **Cross-platform.** macOS/Windows — the HID layer (`keyroost-hid`) is
-   Linux-sysfs only and parts of the PC/SC plumbing assume Linux. Broadens reach
-   but touches the lowest transport layers.
+2. **Cross-platform.** macOS/Windows — **in progress.** The hidapi HID backend
+   has landed behind `cfg(not(target_os = "linux"))` and the PC/SC wording is
+   platform-neutral; what remains is CI/release coverage and hardware sign-off.
+   See the **Cross-platform roadmap** section below for the agreed plan.
 3. **UI/UX design pass.** The GUI grew pane-by-pane (Molto2 profiles, Security
    Keys, OATH, OpenPGP) without a holistic design pass. Revisit information
    architecture, consistency across panes, empty/error states, and the
@@ -51,6 +52,51 @@ read foundation landed, the agreed next items, in priority order:
 
 Further out: finish the **PIV write/auth** surface (see the PIV entry under
 Phase 3+), and the YubiKey-OATH/other deferred compatibility notes below.
+
+## Cross-platform roadmap (Linux / macOS / Windows)
+
+Decisions agreed for extending keyroost beyond Linux:
+
+- **One `main`, not per-OS branches.** A single source tree with `cfg`-gated
+  backends (`HidIo`, `enumerate_*`). Three long-lived platform branches would
+  force every fix to be cherry-picked 3× and would drift; the shared 90%
+  (protocol, CBOR, OATH/OpenPGP/PIV, GUI) is identical, and only the thin
+  HID/PC-SC backend differs. The **CI matrix is the cross-platform guarantee** —
+  the same commit compiled and tested on all three OSes — not branch isolation.
+- **HID backend: hybrid (hidapi now, native later).** macOS (IOKit) and Windows
+  (hid.dll) use the `hidapi` crate, auto-selected off Linux. This is the one
+  accepted C dependency for this scope (cf. `keyroost-rsakey`'s scoped
+  exception); a hand-vendored IOKit/SetupAPI backend behind the same seam stays
+  a future option, taken only if hidapi becomes a liability. **The Linux release
+  never links hidapi** — it keeps the dependency-free sysfs/hidraw backend. The
+  `hidapi-backend` feature is a Linux-only test hook (needs `libudev-dev`) and
+  must never be enabled in a Linux release build.
+- **Support tiers.** Linux is **tier-1** (fully supported, hardware-verified).
+  macOS/Windows are **tier-2** (best-effort, community-tested); until the
+  hardware sign-off below, they are *experimental/unverified* in user docs.
+
+Phases:
+
+- **A — Honesty pass (done).** Corrected the misleading `hidapi-backend`
+  smoke-test comments (libudev prereq, never-in-release), and the macOS PC/SC
+  error wording (macOS has no user-run pcscd).
+- **B — CI matrix (done).** `ci.yml` builds + clippy + tests on
+  `ubuntu-latest`, `macos-latest`, and `windows-latest` (`fail-fast: false`).
+  This compiles the real hidapi backend on macOS/Windows — coverage the
+  `hidapi-backend` feature only faked — so the non-Linux path can't rot uncaught.
+- **C — Release matrix.** Extend `release.yml` to produce macOS (arm64 +
+  x86_64) and Windows x86_64 artifacts (`.zip` on Windows). GUI niceties:
+  `#![windows_subsystem = "windows"]` so the Windows GUI spawns no console.
+- **D — Functional parity gaps.** Document the macOS/Windows degradation in the
+  HID↔CCID topology correlation (`keyroost-resolve::ccid_serial_for`): hidapi
+  exposes no USB bus/address, so two serial-less YubiKeys can't be
+  disambiguated and naming falls back to the single-reader case.
+- **E — Hardware sign-off (gates the tier-2 claim).** One real run each on a Mac
+  and a Windows box with a YubiKey: enumerate → `getInfo` → an OATH/OpenPGP op
+  over PC/SC. Until this passes, user docs say "experimental," not "tier-2."
+- **F — Native HID backend (deferred, not scheduled).** Spike hand-written
+  IOKit + SetupAPI backends behind the existing `HidIo`/`enumerate_*` seam only
+  if hidapi proves a liability; would need an `unsafe_code` scoped exception.
 
 ## Phases
 

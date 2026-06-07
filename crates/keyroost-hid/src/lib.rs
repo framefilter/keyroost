@@ -1,18 +1,22 @@
 //! USB HID enumeration for FIDO / security-key devices.
 //!
-//! Phase 0 of extending keyroost toward FIDO2/U2F support. This crate
-//! enumerates `/dev/hidraw*` device nodes by reading sysfs metadata — no
-//! external dependencies, no ioctls, no device-open required. That keeps
-//! enumeration root-free and means it works even when the user has not yet
-//! installed the udev rules in `udev/70-keyroost-fido.rules`.
+//! On **Linux** this enumerates `/dev/hidraw*` device nodes by reading sysfs
+//! metadata — no external dependencies, no ioctls, no device-open required.
+//! That keeps enumeration root-free and means it works even when the user has
+//! not yet installed the udev rules in `udev/70-keyroost-fido.rules`.
 //!
-//! On non-Linux targets [`enumerate`] returns an empty list. macOS and
-//! Windows backends are deferred to a later phase.
+//! On **macOS and Windows** it uses the `hidapi` crate (IOKit / hid.dll),
+//! selected automatically off Linux. The `hidapi-backend` feature forces that
+//! path on for building/testing the cross-platform backend on Linux too. USB
+//! topology (`usb_bus`/`usb_address`) is only available via the sysfs backend.
 
 use std::fmt;
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// HID usage page assigned to FIDO U2F / CTAP HID by usb.org.
 pub const HID_USAGE_PAGE_FIDO: u16 = 0xF1D0;
@@ -26,6 +30,8 @@ pub enum HidError {
     Io(io::Error),
     /// A sysfs file existed but was structured unexpectedly.
     Parse(&'static str),
+    /// The platform HID backend (hidapi, on macOS/Windows) reported an error.
+    Backend(String),
 }
 
 impl fmt::Display for HidError {
@@ -33,6 +39,7 @@ impl fmt::Display for HidError {
         match self {
             HidError::Io(e) => write!(f, "HID I/O error: {}", e),
             HidError::Parse(s) => write!(f, "HID parse error: {}", s),
+            HidError::Backend(s) => write!(f, "HID backend error: {}", s),
         }
     }
 }
@@ -41,7 +48,7 @@ impl std::error::Error for HidError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             HidError::Io(e) => Some(e),
-            HidError::Parse(_) => None,
+            HidError::Parse(_) | HidError::Backend(_) => None,
         }
     }
 }
@@ -117,15 +124,67 @@ pub fn bootloader_device_present() -> Option<&'static str> {
         .find_map(HidDevice::bootloader_label)
 }
 
+/// Whether this platform has a HID backend: Linux (sysfs), macOS (IOKit via
+/// hidapi), and Windows (hid.dll via hidapi). When `false`, [`enumerate`]
+/// returns an empty list and FIDO/CTAP is unavailable — front-ends should say
+/// so explicitly rather than reporting "no FIDO devices", which would imply none
+/// are plugged in.
+#[must_use]
+pub fn hid_supported() -> bool {
+    cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))
+}
+
 /// List all `/dev/hidraw*` devices visible to the current user via sysfs.
 ///
 /// Devices the caller lacks permission to *open* are still returned —
-/// enumeration reads sysfs only. Returns an empty list on non-Linux
-/// platforms.
+/// enumeration reads sysfs only. Returns an empty list on platforms without a
+/// HID backend (see [`hid_supported`]).
 pub fn enumerate() -> Result<Vec<HidDevice>, HidError> {
-    if !cfg!(target_os = "linux") {
-        return Ok(Vec::new());
+    // Linux uses the dependency-free sysfs backend; macOS/Windows use hidapi.
+    // The `hidapi-backend` feature forces hidapi on (for building/testing the
+    // cross-platform path on Linux too).
+    #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+    {
+        enumerate_hidapi()
     }
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    {
+        enumerate_sysfs()
+    }
+}
+
+/// hidapi-backed enumeration for macOS / Windows (and Linux under the
+/// `hidapi-backend` feature). USB topology (`usb_bus` / `usb_address`) isn't
+/// exposed portably by hidapi, so it's left `None` — the HID↔CCID correlation
+/// that uses it degrades gracefully to serial/identity matching.
+#[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+fn enumerate_hidapi() -> Result<Vec<HidDevice>, HidError> {
+    let api = hidapi::HidApi::new().map_err(|e| HidError::Backend(e.to_string()))?;
+    let mut devices: Vec<HidDevice> = api
+        .device_list()
+        .map(|info| HidDevice {
+            path: PathBuf::from(info.path().to_string_lossy().into_owned()),
+            vendor_id: info.vendor_id(),
+            product_id: info.product_id(),
+            product_name: info.product_string().unwrap_or_default().to_string(),
+            usage_page: info.usage_page(),
+            usage: info.usage(),
+            serial_number: info.serial_number().map(str::to_owned),
+            usb_bus: None,
+            usb_address: None,
+        })
+        .collect();
+    devices.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(devices)
+}
+
+/// Dependency-free Linux backend: enumerate `/dev/hidraw*` via sysfs metadata.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+fn enumerate_sysfs() -> Result<Vec<HidDevice>, HidError> {
     let entries = match fs::read_dir("/sys/class/hidraw") {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -150,6 +209,7 @@ pub fn enumerate() -> Result<Vec<HidDevice>, HidError> {
     Ok(devices)
 }
 
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
     let uevent = fs::read_to_string(sysfs.join("device/uevent"))?;
     let mut vendor_id: u16 = 0;
@@ -197,6 +257,7 @@ fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
 /// Walk up the sysfs tree from a HID device link to the first ancestor carrying
 /// an `idVendor` file — that's the backing USB device node. Returns `None` on a
 /// non-USB transport (e.g. Bluetooth) or any read error.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 fn usb_device_dir(device_link: &Path) -> Option<PathBuf> {
     let mut dir = fs::canonicalize(device_link).ok()?;
     loop {
@@ -210,6 +271,7 @@ fn usb_device_dir(device_link: &Path) -> Option<PathBuf> {
 /// Read the USB device serial (`iSerialNumber`) from a USB device node.
 /// Returns `None` when the descriptor carries no serial (many YubiKeys) or the
 /// attribute can't be read.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 fn read_usb_serial(usb_dir: &Path) -> Option<String> {
     let serial = fs::read_to_string(usb_dir.join("serial")).ok()?;
     let serial = serial.trim();
@@ -217,10 +279,16 @@ fn read_usb_serial(usb_dir: &Path) -> Option<String> {
 }
 
 /// Read a small decimal sysfs attribute (e.g. `busnum`, `devnum`) as a `u8`.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 fn read_sysfs_u8(path: &Path) -> Option<u8> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+// Used by the sysfs backend and the tests; dead on the hidapi-only build.
+#[cfg_attr(
+    any(not(target_os = "linux"), feature = "hidapi-backend"),
+    allow(dead_code)
+)]
 fn parse_hex_u16(s: &str) -> Option<u16> {
     // Sysfs HID_ID fields are 8 hex chars wide; only the low 16 bits are the VID/PID.
     let v = u32::from_str_radix(s.trim(), 16).ok()?;
@@ -230,6 +298,11 @@ fn parse_hex_u16(s: &str) -> Option<u16> {
 /// Walk a HID report descriptor and return the first
 /// `(usage_page, usage)` pair, which describes the device's top-level
 /// application collection.
+// Used by the sysfs backend and the tests; dead on the hidapi-only build.
+#[cfg_attr(
+    any(not(target_os = "linux"), feature = "hidapi-backend"),
+    allow(dead_code)
+)]
 fn parse_top_usage(desc: &[u8]) -> Option<(u16, u16)> {
     let mut i = 0;
     let mut usage_page: Option<u16> = None;

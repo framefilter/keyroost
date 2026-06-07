@@ -103,7 +103,7 @@ pub fn read_effective_serial(d: &HidDevice) -> Result<(String, IdSource), String
         }
         return Err(format!(
             "{} ({}) is a YubiKey, but its serial couldn't be read over CCID. \
-             Check that pcscd is running and that this key's CCID reader is \
+             Check that the smart-card (PC/SC) service is running and that this key's CCID reader is \
              present (`keyroostctl list` shows connected readers).",
             d.path.display(),
             d.product_name

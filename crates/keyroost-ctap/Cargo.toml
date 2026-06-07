@@ -10,8 +10,23 @@ description = "CTAP HID transport, CBOR codec, and high-level CTAP2 commands for
 [lints]
 workspace = true
 
+[features]
+# Test/dev hook ONLY — never enable this for a Linux release. It forces the
+# hidapi I/O backend on so the cross-platform CTAP transport can be built and
+# smoke-tested on Linux; real macOS/Windows coverage comes from the CI matrix,
+# not this flag. Building it on Linux needs `libudev-dev` (see keyroost-hid).
+# The default Linux build never touches it and stays dependency-free.
+hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend"]
+
 [dependencies]
 keyroost-hid = { path = "../keyroost-hid", version = "0.2.0" }
+# Optional so a default Linux build pulls nothing (the hidraw File backend is
+# dependency-free); enabled by `hidapi-backend` for testing.
+hidapi = { version = "2.6", optional = true, default-features = false, features = [
+    "linux-static-hidraw",
+    "macos-shared-device",
+    "windows-native",
+] }
 # Phase 2 crypto: PIN protocol uses P-256 ECDH, AES-256-CBC, HMAC-SHA-256.
 # Vendoring all of this would be ~1500 LOC of unaudited primitives; sha2 is
 # already pulled in transitively by p256, so adding the rest explicitly costs
@@ -24,3 +39,11 @@ p256 = { version = "0.13", default-features = false, features = ["arithmetic", "
 # OsRng for ephemeral keypair + AES IVs. p256 re-exports rand_core but the
 # OsRng inside it is gated behind rand_core's `getrandom` feature.
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+
+# Auto-select the hidapi I/O backend on macOS / Windows (Linux keeps the
+# dependency-free hidraw File backend).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = [
+    "macos-shared-device",
+    "windows-native",
+] }

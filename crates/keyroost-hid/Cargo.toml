@@ -10,4 +10,28 @@ description = "USB HID enumeration for FIDO / security-key devices on Linux."
 [lints]
 workspace = true
 
+[features]
+# Test/dev hook ONLY — never enable this for a Linux release. It forces the
+# hidapi backend on so the cross-platform path can be built and smoke-tested on
+# Linux; real macOS/Windows coverage comes from the CI matrix, not this flag.
+# Building it on Linux needs `libudev-dev` (hidapi's Linux build links libudev
+# even with `linux-static-hidraw`). The default Linux build never touches it and
+# stays dependency-free.
+hidapi-backend = ["dep:hidapi"]
+
 [dependencies]
+# Optional so a default Linux build pulls nothing (the vendored sysfs backend
+# stays dependency-free); enabled by the `hidapi-backend` feature for testing.
+hidapi = { version = "2.6", optional = true, default-features = false, features = [
+    "linux-static-hidraw",
+    "macos-shared-device",
+    "windows-native",
+] }
+
+# Auto-select the hidapi backend on macOS / Windows (Linux keeps the vendored
+# sysfs backend with no dependency).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = [
+    "macos-shared-device",
+    "windows-native",
+] }

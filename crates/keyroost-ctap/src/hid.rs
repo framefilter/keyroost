@@ -1,4 +1,7 @@
-//! CTAP HID transport over a Linux `/dev/hidraw*` device.
+//! CTAP HID transport. Linux uses a dependency-free `/dev/hidraw*` `File`
+//! backend; macOS and Windows use hidapi (IOKit / hid.dll) behind the same
+//! `write_report` / `read_report` interface. The `hidapi-backend` feature forces
+//! the hidapi path on for building/testing it on Linux too.
 //!
 //! Implements the wire framing from the FIDO CTAP HID spec: 64-byte reports,
 //! init frame with a 7-byte header (CID + CMD + BCNT), continuation frames
@@ -13,8 +16,11 @@
 //! KEEPALIVE frames, so a true hang only happens for an unplugged or broken
 //! device.
 
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -53,12 +59,22 @@ pub const CAPABILITY_NMSG: u8 = 0x08;
 pub enum HidTransportError {
     Io(io::Error),
     Timeout,
-    UnexpectedCommand { expected: u8, got: u8 },
+    UnexpectedCommand {
+        expected: u8,
+        got: u8,
+    },
     InitResponseTooShort,
     PayloadTooLarge(usize),
-    OutOfSequence { expected: u8, got: u8 },
+    OutOfSequence {
+        expected: u8,
+        got: u8,
+    },
     DeviceError(u8),
     NonceMismatch,
+    /// The hidapi I/O backend (macOS / Windows, or Linux under the
+    /// `hidapi-backend` feature) reported an error opening or talking to the
+    /// device.
+    Backend(String),
 }
 
 impl std::fmt::Display for HidTransportError {
@@ -86,6 +102,7 @@ impl std::fmt::Display for HidTransportError {
             HidTransportError::NonceMismatch => {
                 write!(f, "CTAPHID_INIT response carried the wrong nonce")
             }
+            HidTransportError::Backend(s) => write!(f, "HID backend error: {}", s),
         }
     }
 }
@@ -121,25 +138,83 @@ impl InitResponse {
     }
 }
 
+/// Platform HID I/O backend. Linux uses the dependency-free hidraw `File`;
+/// macOS/Windows (and Linux under `hidapi-backend`) use hidapi. Exactly one
+/// variant exists per build.
+enum HidIo {
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    Hidraw(File),
+    #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+    Hidapi(hidapi::HidDevice),
+}
+
 /// An open CTAP HID channel ready to dispatch commands.
 pub struct CtapHidDevice {
-    file: File,
+    io: HidIo,
     channel_id: u32,
     timeout: Duration,
 }
 
 impl CtapHidDevice {
-    /// Open a hidraw device and allocate a CTAPHID channel.
+    /// Open a HID device by path and allocate a CTAPHID channel.
     pub fn open(path: &Path) -> Result<(Self, InitResponse), HidTransportError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let io = Self::open_io(path)?;
         let mut dev = Self {
-            file,
+            io,
             channel_id: CTAPHID_BROADCAST_CID,
             timeout: Duration::from_secs(2),
         };
         let init = dev.do_init()?;
         dev.channel_id = init.channel_id;
         Ok((dev, init))
+    }
+
+    /// Linux backend: open the `/dev/hidraw*` node read/write.
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    fn open_io(path: &Path) -> Result<HidIo, HidTransportError> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Ok(HidIo::Hidraw(file))
+    }
+
+    /// hidapi backend (macOS / Windows): open by the platform device path.
+    #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+    fn open_io(path: &Path) -> Result<HidIo, HidTransportError> {
+        let api = hidapi::HidApi::new().map_err(|e| HidTransportError::Backend(e.to_string()))?;
+        let cpath = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| HidTransportError::Backend("device path contained a NUL byte".into()))?;
+        let dev = api
+            .open_path(&cpath)
+            .map_err(|e| HidTransportError::Backend(e.to_string()))?;
+        Ok(HidIo::Hidapi(dev))
+    }
+
+    /// Write one 65-byte output report (leading 0x00 report ID) to the device.
+    fn write_report(&mut self, frame: &[u8]) -> Result<(), HidTransportError> {
+        match &mut self.io {
+            #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+            HidIo::Hidraw(f) => f.write_all(frame)?,
+            #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+            HidIo::Hidapi(d) => {
+                d.write(frame)
+                    .map_err(|e| HidTransportError::Backend(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read one 64-byte input report into `buf`.
+    fn read_report(&mut self, buf: &mut [u8]) -> Result<(), HidTransportError> {
+        match &mut self.io {
+            #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+            HidIo::Hidraw(f) => f.read_exact(buf)?,
+            #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
+            HidIo::Hidapi(d) => {
+                buf.fill(0);
+                d.read(buf)
+                    .map_err(|e| HidTransportError::Backend(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn channel_id(&self) -> u32 {
@@ -205,7 +280,7 @@ impl CtapHidDevice {
         frame[7] = (payload.len() & 0xFF) as u8;
         let first_chunk = payload.len().min(INIT_FRAME_DATA);
         frame[8..8 + first_chunk].copy_from_slice(&payload[..first_chunk]);
-        self.file.write_all(&frame)?;
+        self.write_report(&frame)?;
 
         // Continuation frames.
         let mut offset = first_chunk;
@@ -217,7 +292,7 @@ impl CtapHidDevice {
             frame[1..5].copy_from_slice(&cid_be);
             frame[5] = seq & 0x7F;
             frame[6..6 + chunk].copy_from_slice(&payload[offset..offset + chunk]);
-            self.file.write_all(&frame)?;
+            self.write_report(&frame)?;
             offset += chunk;
             seq = seq.wrapping_add(1);
         }
@@ -229,7 +304,7 @@ impl CtapHidDevice {
         let mut buf = [0u8; CTAPHID_REPORT_SIZE];
 
         loop {
-            self.file.read_exact(&mut buf)?;
+            self.read_report(&mut buf)?;
             let cid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             let cmd = buf[4];
             if cid != expected_cid {
@@ -259,7 +334,7 @@ impl CtapHidDevice {
 
             let mut seq: u8 = 0;
             while payload.len() < bcnt {
-                self.file.read_exact(&mut buf)?;
+                self.read_report(&mut buf)?;
                 let cid2 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 if cid2 != expected_cid {
                     continue;
