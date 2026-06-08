@@ -1,11 +1,11 @@
 name: Release binaries
 
 # Builds the CLI + GUI release binaries for Linux, macOS, and Windows when a
-# version tag is pushed (e.g. `git tag v0.3.0 && git push origin v0.3.0`) and
-# attaches them to the workflow run. `workflow_dispatch` lets you run the same
-# build manually (off a branch) to smoke-test packaging without cutting a tag.
-# Publishing a public GitHub Release is left as an explicit opt-in (see the
-# commented step in the `publish` job) so a tag push never auto-publishes.
+# version tag is pushed (e.g. `git tag v0.3.0 && git push origin v0.3.0`), then
+# publishes a public GitHub Release with the three archives attached.
+# `workflow_dispatch` runs the same build manually (off a branch) to smoke-test
+# packaging without cutting a tag — it builds and collects but never publishes,
+# since the publish step is guarded on a tag ref.
 
 on:
   push:
@@ -116,9 +116,12 @@ jobs:
           path: dist/*.zip
 
   publish:
-    name: Collect artifacts
+    name: Collect & publish
     needs: [linux-x86_64, macos-universal2, windows-x86_64]
     runs-on: ubuntu-latest
+    # `gh release create` writes a Release, so the default token needs write.
+    permissions:
+      contents: write
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -129,11 +132,12 @@ jobs:
       - name: List artifacts
         run: ls -lR dist
 
-      # To publish a public GitHub Release on tag, uncomment this step. It uses
-      # the built-in token (no third-party action). Runs only on a tag push, so
-      # a manual workflow_dispatch never publishes. GITHUB_REF_NAME is the tag.
-      # - name: Publish GitHub Release
-      #   if: startsWith(github.ref, 'refs/tags/')
-      #   env:
-      #     GH_TOKEN: ${{ github.token }}
-      #   run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
+      # Publish a public GitHub Release with the three archives attached. Guarded
+      # on a tag ref, so a manual workflow_dispatch still builds + collects but
+      # never publishes. Uses the built-in token (no third-party action);
+      # --generate-notes writes the notes from commits/PRs since the last tag.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip --generate-notes
