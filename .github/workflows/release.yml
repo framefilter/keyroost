@@ -1,13 +1,16 @@
 name: Release binaries
 
-# Builds the CLI + GUI release binaries when a version tag is pushed (e.g.
-# `git tag v0.1.0 && git push origin v0.1.0`) and attaches them to the workflow
-# run. Publishing a public GitHub Release is left as an explicit opt-in (see the
-# commented step at the end) so a tag push never auto-publishes on its own.
+# Builds the CLI + GUI release binaries for Linux, macOS, and Windows when a
+# version tag is pushed (e.g. `git tag v0.3.0 && git push origin v0.3.0`) and
+# attaches them to the workflow run. `workflow_dispatch` lets you run the same
+# build manually (off a branch) to smoke-test packaging without cutting a tag.
+# Publishing a public GitHub Release is left as an explicit opt-in (see the
+# commented step in the `publish` job) so a tag push never auto-publishes.
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,8 +39,9 @@ jobs:
 
       - name: Package
         run: |
+          ref="${GITHUB_REF_NAME//\//-}"   # sanitize branch slashes for dispatch
           mkdir -p dist
-          tar -czf "dist/keyroost-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" \
+          tar -czf "dist/keyroost-${ref}-linux-x86_64.tar.gz" \
             -C target/release keyroostctl keyroost
 
       - name: Upload build artifact
@@ -46,9 +50,90 @@ jobs:
           name: keyroost-linux-x86_64
           path: dist/*.tar.gz
 
+  macos-universal2:
+    name: macOS universal2
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PC/SC (PCSC.framework) and the FIDO HID backend (IOKit via hidapi) come
+      # from the system SDK — no extra packages. Build both arches and lipo them
+      # into one universal2 binary that runs on Apple Silicon and Intel.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries (both arches)
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin -p keyroostctl -p keyroost
+          cargo build --release --locked --target x86_64-apple-darwin  -p keyroostctl -p keyroost
+
+      - name: Combine into universal2 + package
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          mkdir -p dist bin
+          for b in keyroostctl keyroost; do
+            lipo -create -output "bin/$b" \
+              "target/aarch64-apple-darwin/release/$b" \
+              "target/x86_64-apple-darwin/release/$b"
+          done
+          tar -czf "dist/keyroost-${ref}-macos-universal2.tar.gz" -C bin keyroostctl keyroost
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyroost-macos-universal2
+          path: dist/*.tar.gz
+
+  windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PC/SC (WinSCard) and the FIDO HID backend (hid.dll via hidapi) are part
+      # of Windows — no extra packages. The GUI is built with the windows
+      # subsystem (see keyroost/src/main.rs) so it opens no console window.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p keyroostctl -p keyroost
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ref = $Env:GITHUB_REF_NAME -replace '/','-'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/keyroostctl.exe, target/release/keyroost.exe `
+            -DestinationPath "dist/keyroost-$ref-windows-x86_64.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keyroost-windows-x86_64
+          path: dist/*.zip
+
+  publish:
+    name: Collect artifacts
+    needs: [linux-x86_64, macos-universal2, windows-x86_64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lR dist
+
       # To publish a public GitHub Release on tag, uncomment this step. It uses
-      # the built-in token (no third-party action). GITHUB_REF_NAME is the tag.
+      # the built-in token (no third-party action). Runs only on a tag push, so
+      # a manual workflow_dispatch never publishes. GITHUB_REF_NAME is the tag.
       # - name: Publish GitHub Release
+      #   if: startsWith(github.ref, 'refs/tags/')
       #   env:
       #     GH_TOKEN: ${{ github.token }}
-      #   run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz --generate-notes
+      #   run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
