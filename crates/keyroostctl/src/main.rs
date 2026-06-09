@@ -67,6 +67,15 @@ struct Cli {
 enum Cmd {
     /// Print device serial number and on-device UTC time.
     Info,
+    /// Print shell completions to stdout (e.g. `keyroostctl completions bash
+    /// > /etc/bash_completion.d/keyroostctl`).
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Print a man page (troff) to stdout (e.g. `keyroostctl manpage >
+    /// keyroostctl.1`).
+    Manpage,
     /// Write a TOTP seed to a profile slot. The seed can come from argv
     /// (--hex/--base32 — visible in `ps` and shell history), an environment
     /// variable, or stdin; supply exactly one source.
@@ -921,6 +930,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
+    // Pure-output subcommands: no device, no session.
+    if let Cmd::Completions { shell } = cmd {
+        use clap::CommandFactory;
+        let mut c = Cli::command();
+        clap_complete::generate(*shell, &mut c, "keyroostctl", &mut std::io::stdout());
+        return Ok(());
+    }
+    if let Cmd::Manpage = cmd {
+        use clap::CommandFactory;
+        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        return Ok(());
+    }
+
     // --dry-run on bulk import doesn't need the device at all.
     if let Cmd::ImportFile {
         path,
@@ -1150,6 +1172,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cmd {
         Cmd::Info => unreachable!("handled above before auth"),
+        Cmd::Completions { .. } | Cmd::Manpage => unreachable!("handled above before auth"),
         Cmd::SetSeed {
             profile,
             hex,

@@ -29,6 +29,11 @@ keyroost-import = { path = "../keyroost-import", version = "0.3.0", features = [
 # crates stay dependency-free (see that crate's Cargo.toml).
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.3.0" }
 clap = { version = "4", features = ["derive"] }
+# Same project family as clap; generate shell completions / a man page at
+# runtime (`completions` / `manpage` subcommands) instead of via build.rs —
+# the workspace deliberately has no build scripts.
+clap_complete = "4"
+clap_mangen = "0.2"
 # Already in the workspace tree (via rsa and p256); wraps PINs/seeds read from
 # env/stdin so they're scrubbed from memory on drop.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
