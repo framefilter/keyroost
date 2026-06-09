@@ -66,13 +66,17 @@ anyone with the Linux build prerequisites from the README.
 
 ## Deferred — decisions or external work needed
 
-- [ ] **QR code import** — requires an image-decoding + QR dependency, which
-      collides with the vendor-over-depend policy. Decide policy first.
-- [ ] **Packaging** (AUR, Homebrew, winget; Flatpak unlikely due to
-      pcscd/hidraw sandboxing) — external repos, separate effort.
+- [x] **QR code import** — done: keyroost-qr crate (rqrr/png/jpeg-decoder
+      exception), PNG+JPEG screenshots, Google Authenticator migration
+      batches, CLI `import --qr` / `import-file <image>`, GUI drag-drop,
+      fuzz targets, end-to-end fixtures.
+- [ ] **Packaging** — crates.io readiness verified (runbook above) and
+      cargo-binstall metadata shipped; AUR/Homebrew-tap/winget manifests
+      pending the automation decision. Flatpak ruled out (pcscd/hidraw
+      sandboxing).
 - [ ] **Branch/tag protection** — repo settings, must be done in the GitHub
       UI by an admin: protect `main` (require PR + green CI), protect `v*`
       tags (maintainers only; tag push is release authority).
-- [ ] **Clipboard conditional clear** — proper "only clear if we still own
-      the clipboard" needs a clipboard-reading dependency (arboard). The
-      Phase 2 implementation clears unconditionally; revisit if that annoys.
+- [x] **Clipboard conditional clear** — done via arboard (already in the
+      tree through eframe): clears only when the clipboard still holds the
+      copied code; fails open if unreadable.
