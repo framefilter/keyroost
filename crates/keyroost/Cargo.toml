@@ -33,3 +33,22 @@ egui = "0.29"
 # use lets the OTP auto-clear check the clipboard still holds *our* code
 # before wiping it, instead of clobbering whatever the user copied since.
 arboard = { version = "3", default-features = false }
+
+# cargo-binstall support: `cargo binstall` fetches the existing attested
+# GitHub release archives (same artifacts, same SHA256SUMS/provenance)
+# instead of compiling. Targets without a prebuilt archive fall back to a
+# source build automatically.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-linux-x86_64{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-macos-universal2{ archive-suffix }"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-macos-universal2{ archive-suffix }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-windows-x86_64{ archive-suffix }"
+pkg-fmt = "zip"
