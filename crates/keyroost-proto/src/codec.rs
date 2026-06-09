@@ -52,18 +52,29 @@ fn hex_nibble(c: u8) -> Result<u8, DecodeError> {
     }
 }
 
-/// RFC 4648 base32 decode. Tolerates lowercase, padding, spaces, and dashes.
-/// Required: otpauth:// secrets are base32.
+/// RFC 4648 base32 decode. Tolerates lowercase, trailing padding, spaces, and
+/// dashes. Required: otpauth:// secrets are base32.
+///
+/// Strict where it matters for key material: `=` is only accepted at the end
+/// (data after padding errors), and leftover bits past the last full byte
+/// must be zero — a truncated or mistyped secret should fail here, not decode
+/// "successfully" into a different seed that yields wrong OTPs.
 pub fn base32_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
     let mut buf: u64 = 0;
     let mut bits: u32 = 0;
     let mut out = Vec::with_capacity(s.len() * 5 / 8 + 1);
+    let mut padded = false;
     for c in s.chars() {
         let v = match c {
+            ' ' | '-' | '\t' | '\n' | '\r' => continue,
+            '=' => {
+                padded = true;
+                continue;
+            }
+            _ if padded => return Err(DecodeError::InvalidChar),
             'A'..='Z' => c as u8 - b'A',
             'a'..='z' => c as u8 - b'a',
             '2'..='7' => c as u8 - b'2' + 26,
-            '=' | ' ' | '-' | '\t' | '\n' | '\r' => continue,
             _ => return Err(DecodeError::InvalidChar),
         };
         buf = (buf << 5) | v as u64;
@@ -72,6 +83,9 @@ pub fn base32_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
             bits -= 8;
             out.push(((buf >> bits) & 0xff) as u8);
         }
+    }
+    if bits > 0 && (buf & ((1u64 << bits) - 1)) != 0 {
+        return Err(DecodeError::InvalidLength);
     }
     Ok(out)
 }
@@ -129,5 +143,20 @@ mod tests {
             base32_decode("jbswy3dp").unwrap(),
             base32_decode("JBSWY3DP").unwrap()
         );
+    }
+
+    #[test]
+    fn base32_rejects_data_after_padding() {
+        assert_eq!(base32_decode("MY==MZ"), Err(DecodeError::InvalidChar));
+        // Trailing whitespace after padding is still fine.
+        assert_eq!(base32_decode("MY====== \n").unwrap(), b"f");
+    }
+
+    #[test]
+    fn base32_rejects_nonzero_trailing_bits() {
+        // "MZ" carries 10 bits: one full byte plus residual 01 — a truncated
+        // encoding, not a canonical one ("MY" is 'f' with residual 00).
+        assert_eq!(base32_decode("MZ"), Err(DecodeError::InvalidLength));
+        assert_eq!(base32_decode("MY").unwrap(), b"f");
     }
 }
