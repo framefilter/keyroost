@@ -793,7 +793,9 @@ mod redaction_tests {
     #[test]
     fn sensitive_cmd_hides_body_keeps_header() {
         // OpenPGP VERIFY PW1 with PIN "123456".
-        let apdu = [0x00, 0x20, 0x00, 0x81, 0x06, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36];
+        let apdu = [
+            0x00, 0x20, 0x00, 0x81, 0x06, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+        ];
         let dumped = dump_cmd(&apdu, true);
         assert_eq!(dumped, "00 20 00 81 06 [6 data bytes redacted]");
         assert!(!dumped.contains("31 32"));

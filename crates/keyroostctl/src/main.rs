@@ -831,7 +831,8 @@ fn customer_key_bytes(cli: &Cli) -> Result<Vec<u8>, String> {
     } else if let Some(s) = &cli.key_ascii {
         Ok(s.as_bytes().to_vec())
     } else if let Some(var) = &cli.key_env {
-        let h = std::env::var(var).map_err(|_| format!("env var {} (--key-env) is not set", var))?;
+        let h =
+            std::env::var(var).map_err(|_| format!("env var {} (--key-env) is not set", var))?;
         hex_decode(&h).map_err(|e| format!("invalid hex in --key-env {}: {}", var, e))
     } else if let Some(var) = &cli.key_ascii_env {
         std::env::var(var)
@@ -2481,11 +2482,19 @@ fn gather_secret(
     let (encoding, source) = supplied.into_iter().next().unwrap();
     let raw = match source {
         SecretSource::Literal(s) => s.to_owned(),
-        SecretSource::Env(var) => std::env::var(var)
-            .map_err(|_| format!("env var {} (for {}) is not set", var, cmd))?,
+        SecretSource::Env(var) => {
+            std::env::var(var).map_err(|_| format!("env var {} (for {}) is not set", var, cmd))?
+        }
         SecretSource::Stdin => {
-            use std::io::BufRead;
+            use std::io::{BufRead, IsTerminal};
             let stdin = std::io::stdin();
+            if stdin.is_terminal() {
+                eprintln!(
+                    "warning: reading the {} secret from a terminal — input will be \
+                     visible; prefer piping (e.g. from a password manager)",
+                    cmd
+                );
+            }
             let mut line = String::new();
             stdin.lock().read_line(&mut line)?;
             line.trim_end_matches(['\r', '\n']).to_owned()
@@ -2508,8 +2517,18 @@ fn read_secret(
             .map_err(|_| format!("env var {} (for {}) is not set", var, label).into());
     }
     if from_stdin {
-        use std::io::BufRead;
+        use std::io::{BufRead, IsTerminal};
         let stdin = std::io::stdin();
+        // The --*-stdin flags are meant for piping. Typed at a terminal the
+        // value echoes (and lands in scrollback); warn rather than refuse so
+        // one-off interactive use still works.
+        if stdin.is_terminal() {
+            eprintln!(
+                "warning: reading {} from a terminal — input will be visible; \
+                 prefer piping (e.g. from a password manager)",
+                label
+            );
+        }
         let mut line = String::new();
         stdin.lock().read_line(&mut line)?;
         return Ok(line.trim_end_matches(['\r', '\n']).to_owned());

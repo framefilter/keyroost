@@ -25,3 +25,10 @@ repository = "https://github.com/framefilter/keyroost"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# This workspace spends its time parsing device- and file-supplied bytes;
+# a length-arithmetic bug should panic loudly in release builds, not wrap
+# silently into an exploitable miscalculation. The cost is negligible for
+# a tool that is I/O-bound on a smart card.
+[profile.release]
+overflow-checks = true

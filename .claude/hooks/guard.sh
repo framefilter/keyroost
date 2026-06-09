@@ -78,7 +78,16 @@ test_key_dir="${XDG_RUNTIME_DIR:-}/moltoui-test/"
 # bypassing the scan and exposing a real key. In either unsafe case we fail
 # closed and scan the full, unstripped command, so traversal can never reach a
 # real secret.
-if [ -n "${XDG_RUNTIME_DIR:-}" ] && ! printf '%s' "$arg" | grep -q '\.\.'; then
+# The exemption additionally requires XDG_RUNTIME_DIR to consist only of
+# plain path characters: the value is interpolated into the sed pattern
+# below, where a regex metacharacter or the `@` delimiter would corrupt the
+# expression (and with it, what gets stripped from the scan). Fail closed —
+# scan the full command — on anything unusual rather than try to escape it.
+case "${XDG_RUNTIME_DIR:-}" in
+    ""|*[!A-Za-z0-9/_-]*) xdg_safe=0 ;;
+    *) xdg_safe=1 ;;
+esac
+if [ "$xdg_safe" = 1 ] && ! printf '%s' "$arg" | grep -q '\.\.'; then
     scan="$(printf '%s' "$arg" | sed -E "s@${test_key_dir}[^[:space:]]*@@g")"
 else
     scan="$arg"

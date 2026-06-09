@@ -506,14 +506,21 @@ impl OpenPgpSession {
         // keys. PSO:DECIPHER (2A 80 86) *responses* are the recovered
         // plaintext — and so are the GET RESPONSE chunks that follow, hence
         // the sticky flag for the whole reassembly loop.
-        let cmd_sensitive = matches!(apdu.get(1), Some(0x20) | Some(0x24) | Some(0x2C) | Some(0xDB));
+        let cmd_sensitive = matches!(
+            apdu.get(1),
+            Some(0x20) | Some(0x24) | Some(0x2C) | Some(0xDB)
+        );
         let resp_sensitive = apdu.get(1..4) == Some(&[0x2A, 0x80, 0x86]);
         let mut acc = Vec::new();
         let mut to_send = apdu.to_vec();
         let mut chunks = 0usize;
         loop {
             if self.debug {
-                eprintln!("> {:>14} >> {}", "openpgp", dump_cmd(&to_send, cmd_sensitive));
+                eprintln!(
+                    "> {:>14} >> {}",
+                    "openpgp",
+                    dump_cmd(&to_send, cmd_sensitive)
+                );
             }
             let mut buf = [0u8; 4096];
             let resp = self.card.transmit(&to_send, &mut buf)?;
