@@ -76,6 +76,9 @@ enum Cmd {
     /// Print a man page (troff) to stdout (e.g. `keyroostctl manpage >
     /// keyroostctl.1`).
     Manpage,
+    /// Diagnose the local environment: PC/SC service, readers, FIDO HID
+    /// access, udev rules, registry permissions. Read-only, touches no key.
+    Doctor,
     /// Write a TOTP seed to a profile slot. The seed can come from argv
     /// (--hex/--base32 — visible in `ps` and shell history), an environment
     /// variable, or stdin; supply exactly one source.
@@ -942,6 +945,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
         return Ok(());
     }
+    if let Cmd::Doctor = cmd {
+        run_doctor();
+        return Ok(());
+    }
 
     // --dry-run on bulk import doesn't need the device at all.
     if let Cmd::ImportFile {
@@ -1172,7 +1179,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cmd {
         Cmd::Info => unreachable!("handled above before auth"),
-        Cmd::Completions { .. } | Cmd::Manpage => unreachable!("handled above before auth"),
+        Cmd::Completions { .. } | Cmd::Manpage | Cmd::Doctor => {
+            unreachable!("handled above before auth")
+        }
         Cmd::SetSeed {
             profile,
             hex,
@@ -1406,6 +1415,127 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Environment diagnosis: each check prints one ✓/✗/– line with the fix
+/// inline. Never touches card state and always exits 0 — it's a flashlight,
+/// not a gate.
+fn run_doctor() {
+    println!("keyroost doctor — environment check\n");
+
+    // PC/SC service + readers.
+    match Session::list_readers() {
+        Ok(readers) => {
+            println!("✓ PC/SC service reachable");
+            if readers.is_empty() {
+                println!("– no smart-card readers present (plug in a key/token to test further)");
+            } else {
+                println!("✓ {} reader(s):", readers.len());
+                let hint = keyroost_proto::READER_NAME_HINT.to_ascii_lowercase();
+                for r in &readers {
+                    let tag = if r.to_ascii_lowercase().contains(&hint) {
+                        "  (Molto2)"
+                    } else {
+                        ""
+                    };
+                    println!("    {}{}", r, tag);
+                }
+            }
+        }
+        Err(e) => {
+            println!("✗ PC/SC unavailable: {}", e);
+        }
+    }
+    println!();
+
+    // FIDO HID devices + node access.
+    if !keyroost_hid::hid_supported() {
+        println!("– FIDO HID enumeration not supported on this platform/backend");
+    } else {
+        match keyroost_hid::enumerate() {
+            Ok(devices) => {
+                let fido: Vec<_> = devices.iter().filter(|d| d.is_fido()).collect();
+                if fido.is_empty() {
+                    println!("– no FIDO HID devices present");
+                    for d in &devices {
+                        if let Some(label) = d.bootloader_label() {
+                            println!("  note: {} at {} — re-plug it", label, d.path.display());
+                        }
+                    }
+                } else {
+                    for d in fido {
+                        // RW open is exactly what CTAP needs; this is the
+                        // udev-rules litmus test.
+                        match std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&d.path)
+                        {
+                            Ok(_) => println!(
+                                "✓ {} ({}) is accessible",
+                                d.product_name,
+                                d.path.display()
+                            ),
+                            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                                println!(
+                                    "✗ {} ({}) permission denied — install the udev rules \
+                                     (see README) and re-plug the key",
+                                    d.product_name,
+                                    d.path.display()
+                                );
+                            }
+                            Err(e) => println!(
+                                "✗ {} ({}) open failed: {}",
+                                d.product_name,
+                                d.path.display(),
+                                e
+                            ),
+                        }
+                    }
+                }
+            }
+            Err(e) => println!("✗ HID enumeration failed: {}", e),
+        }
+    }
+    println!();
+
+    // udev rules (Linux only; elsewhere access is the OS's department).
+    #[cfg(target_os = "linux")]
+    {
+        let rules = std::path::Path::new("/etc/udev/rules.d/70-keyroost-fido.rules");
+        if rules.exists() {
+            println!("✓ udev rules installed ({})", rules.display());
+        } else {
+            println!(
+                "– udev rules not found at {} — FIDO commands will need them; \
+                 PC/SC features work without (see README)",
+                rules.display()
+            );
+        }
+        println!();
+    }
+
+    // Registry file permissions.
+    match keyroost_keyring::config_path() {
+        Some(path) if path.exists() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                match std::fs::metadata(&path) {
+                    Ok(m) if m.permissions().mode() & 0o077 != 0 => println!(
+                        "– {} is readable by other users (next save tightens it to 0600)",
+                        path.display()
+                    ),
+                    Ok(_) => println!("✓ {} is owner-only", path.display()),
+                    Err(e) => println!("✗ cannot stat {}: {}", path.display(), e),
+                }
+            }
+            #[cfg(not(unix))]
+            println!("✓ registry present at {}", path.display());
+        }
+        Some(path) => println!("– no registry yet ({}) — created on first key-name", path.display()),
+        None => println!("– no config dir resolvable (HOME/XDG unset?)"),
+    }
 }
 
 fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
