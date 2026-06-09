@@ -1011,7 +1011,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Cmd::FidoReset { yes, path } = cmd {
         if !*yes {
-            return Err("refusing to reset FIDO key without --yes (this wipes credentials)".into());
+            return Err(format!(
+                "refusing to reset FIDO key without --yes (this wipes credentials){}",
+                fido_target_hint(path.as_deref())
+            )
+            .into());
         }
         run_fido_reset(path.as_deref())?;
         return Ok(());
@@ -1095,15 +1099,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Factory reset is a plain CLA 0x80 command and needs no auth.
+    // Factory reset is a plain CLA 0x80 command and needs no auth. Read the
+    // (read-only) device info before the --yes gate so even the refusal names
+    // exactly which device would be wiped.
     if let Cmd::FactoryReset { yes } = cmd {
-        if !yes {
-            return Err("refusing to factory-reset without --yes".into());
-        }
         let mut session = Session::open()?;
         session.set_debug(cli.debug);
         let info = session.read_info()?;
         print_info(&info);
+        if !yes {
+            return Err(format!(
+                "refusing to factory-reset device serial {} without --yes",
+                info.serial
+            )
+            .into());
+        }
         println!("requesting factory reset; confirm with the up-arrow button on the device");
         session.factory_reset()?;
         return Ok(());
@@ -1533,7 +1543,10 @@ fn run_doctor() {
             #[cfg(not(unix))]
             println!("✓ registry present at {}", path.display());
         }
-        Some(path) => println!("– no registry yet ({}) — created on first key-name", path.display()),
+        Some(path) => println!(
+            "– no registry yet ({}) — created on first key-name",
+            path.display()
+        ),
         None => println!("– no config dir resolvable (HOME/XDG unset?)"),
     }
 }
@@ -1610,6 +1623,42 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("  (unavailable: {})", e),
     }
     Ok(())
+}
+
+/// Best-effort, non-interactive identification of the key a destructive FIDO
+/// command would hit — so a `--yes` refusal tells the user *which* device
+/// they're about to confirm against. Never prompts; empty when nothing
+/// useful can be said.
+fn fido_target_hint(path: Option<&Path>) -> String {
+    if let Some(p) = path {
+        return format!(" — target: {}", p.display());
+    }
+    let Ok(devices) = keyroost_hid::enumerate() else {
+        return String::new();
+    };
+    let devices: Vec<_> = devices.into_iter().filter(|d| d.is_fido()).collect();
+    let keyring = Keyring::load_default().unwrap_or_default();
+    if let Some(name) = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref()) {
+        let connected = connected_keys(&devices);
+        if let Ok(dev) = keyring.resolve(name, &connected) {
+            return format!(" — target: {} at {}", dev.label, dev.path.display());
+        }
+        return String::new();
+    }
+    match devices.as_slice() {
+        [d] => {
+            let serials = effective_serials(&devices);
+            let label = keyring
+                .name_for(serials[0].as_deref())
+                .unwrap_or(&d.product_name);
+            format!(" — target: {} at {}", label, d.path.display())
+        }
+        [] => String::new(),
+        many => format!(
+            " — {} FIDO keys connected; pass --name or --path to choose",
+            many.len()
+        ),
+    }
 }
 
 fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
