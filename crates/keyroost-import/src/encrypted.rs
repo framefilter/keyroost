@@ -24,6 +24,20 @@ use serde::Deserialize;
 
 use crate::bulk::BulkError;
 
+/// Caps on attacker-controlled scrypt parameters. The vault file dictates
+/// n/r/p and the KDF must run before a wrong password can be detected, so
+/// without these an adversarial "backup" can demand terabytes of memory or
+/// hours of CPU per slot. Aegis itself uses n=2^15, r=8, p=1; the caps leave
+/// generous headroom above that while bounding scrypt memory (128*n*r) at
+/// 256 MiB.
+const SCRYPT_MAX_N: u64 = 1 << 22;
+const SCRYPT_MAX_R: u32 = 64;
+const SCRYPT_MAX_P: u32 = 8;
+const SCRYPT_MAX_MEM_BYTES: u64 = 256 * 1024 * 1024;
+/// A vault only needs a handful of password slots; trying every slot in an
+/// adversarial file multiplies the KDF cost arbitrarily.
+const MAX_PASSWORD_SLOTS: usize = 8;
+
 #[derive(Deserialize)]
 struct Root {
     header: Header,
@@ -73,7 +87,7 @@ pub fn decrypt_aegis(json: &str, password: &[u8]) -> Result<String, BulkError> {
     }
 
     let mut last_err: Option<BulkError> = None;
-    for slot in password_slots {
+    for slot in password_slots.into_iter().take(MAX_PASSWORD_SLOTS) {
         match try_unlock_slot(slot, password, &root.header.params, &root.db) {
             Ok(plaintext) => return Ok(plaintext),
             Err(e) => last_err = Some(e),
@@ -104,14 +118,23 @@ fn try_unlock_slot(
         .p
         .ok_or(BulkError::UnsupportedFormat("slot missing p"))?;
 
-    // scrypt's `log_n` parameter is log2 of N.
-    let log_n = (n as f64).log2();
-    if log_n.fract().abs() > 1e-9 || !(1.0..=63.0).contains(&log_n) {
+    if !n.is_power_of_two() || n < 2 {
         return Err(BulkError::UnsupportedFormat(
             "slot n is not a valid power of 2",
         ));
     }
-    let params = scrypt::Params::new(log_n as u8, r, p, 32)
+    if n > SCRYPT_MAX_N
+        || r > SCRYPT_MAX_R
+        || p > SCRYPT_MAX_P
+        || 128 * n * u64::from(r) > SCRYPT_MAX_MEM_BYTES
+    {
+        return Err(BulkError::UnsupportedFormat(
+            "slot scrypt parameters exceed sanity caps",
+        ));
+    }
+    // scrypt's `log_n` parameter is log2 of N.
+    let log_n = n.trailing_zeros() as u8;
+    let params = scrypt::Params::new(log_n, r, p, 32)
         .map_err(|_| BulkError::UnsupportedFormat("invalid scrypt params"))?;
 
     let mut kek = [0u8; 32];

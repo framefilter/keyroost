@@ -118,6 +118,58 @@ fn wrong_password_fails_cleanly() {
     );
 }
 
+/// A vault whose slot demands the given scrypt parameters. The ciphertext is
+/// garbage — rejection must happen before the KDF ever runs, or the test
+/// would itself OOM/hang on the hostile parameters.
+fn vault_with_params(n: u64, r: u32, p: u32) -> String {
+    serde_json::to_string(&json!({
+        "version": 1,
+        "header": {
+            "slots": [{
+                "type": 1,
+                "key": hex(&[0u8; 48]),
+                "key_params": { "nonce": hex(&[0u8; 12]), "tag": hex(&[0u8; 16]) },
+                "n": n,
+                "r": r,
+                "p": p,
+                "salt": hex(&[0u8; 32]),
+            }],
+            "params": { "nonce": hex(&[0u8; 12]), "tag": hex(&[0u8; 16]) }
+        },
+        "db": "",
+    }))
+    .unwrap()
+}
+
+#[test]
+fn hostile_scrypt_params_rejected_before_kdf() {
+    // 1 TiB memory demand (n=2^30, r=8), huge parallelism, and the
+    // memory-product cap with individually-legal n and r.
+    for (n, r, p) in [
+        (1u64 << 30, 8u32, 1u32),
+        (1 << 15, 8, 1 << 20),
+        (1 << 22, 64, 1),
+    ] {
+        let err = keyroost_import::aegis::decrypt(&vault_with_params(n, r, p), b"pw").unwrap_err();
+        assert!(
+            err.to_string().contains("sanity caps"),
+            "n={n} r={r} p={p}: got {err}"
+        );
+    }
+}
+
+#[test]
+fn non_power_of_two_n_rejected() {
+    // Includes 2^53+1, which the old f64-based check rounded to a power of 2.
+    for n in [0u64, 3, (1 << 53) + 1] {
+        let err = keyroost_import::aegis::decrypt(&vault_with_params(n, 8, 1), b"pw").unwrap_err();
+        assert!(
+            err.to_string().contains("power of 2") || err.to_string().contains("sanity caps"),
+            "n={n}: got {err}"
+        );
+    }
+}
+
 #[test]
 fn is_encrypted_detects_correctly() {
     let plaintext =
