@@ -6,6 +6,48 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-08
+
+keyroost goes cross-platform: macOS and Windows join Linux, with a HID backend
+that works on all three, a three-OS CI matrix, and a release pipeline that
+attaches ready-to-run binaries for each.
+
+### Added
+- **macOS and Windows support** — a `hidapi`-based HID backend covers FIDO
+  enumeration on macOS (IOKit) and Windows (hid.dll) alongside the existing
+  Linux sysfs/hidraw path; PC/SC (OATH / OpenPGP / PIV / Molto2) was already
+  cross-platform. `keyroost_hid::hid_supported()` lets front-ends tell "no FIDO
+  devices plugged in" apart from "no HID backend on this platform".
+- **Pre-built release binaries for all three OSes** — pushing a `vX.Y.Z` tag now
+  cuts a public GitHub Release with a Linux x86_64 tarball, a macOS `universal2`
+  tarball (`lipo`'d aarch64 + x86_64, one artifact for Apple Silicon and Intel),
+  and a Windows zip, with auto-generated notes. A `workflow_dispatch` trigger
+  builds the same archives off a branch for smoke-testing without tagging.
+- **Three-OS CI matrix plus Fedora/Arch build verification** — Linux, macOS, and
+  Windows build/test on every push, and `fedora:latest` / `archlinux:latest`
+  container builds verify the documented per-distro package lists rather than
+  assuming them.
+
+### Changed
+- The GUI empty state now states explicitly when FIDO keys aren't supported on
+  the current platform (and notes that the smart-card features still work), so a
+  missing-backend case doesn't read as a bug.
+- User-facing "is pcscd running?" messages across transport / resolve / CLI are
+  reworded to platform-neutral smart-card-service language.
+- `CtapHidDevice::open` returns a clear `HidTransportError::Unsupported` on
+  platforms without a HID backend instead of an opaque file-open failure.
+
+### Docs
+- README gains full Debian / Fedora-RHEL / Arch prerequisite blocks split into
+  CLI vs GUI dependencies, corrects the stale "HID is Linux-only" note, and warns
+  that the Ubuntu-built release binaries may not run on older-glibc distros
+  (build from source there).
+
+### Notes
+- The macOS and Windows release jobs are exercised by `workflow_dispatch`; run
+  the release workflow manually once before tagging if the build environment has
+  changed.
+
 ## [0.2.0] - 2026-06-06
 
 A device-centric GUI redesign, reliable hotplug, a FIDO reset that actually
@@ -78,6 +120,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
   external dependencies are `pcsc`, `clap`, `eframe`/`egui`, `serde`, and
   (for RSA keygen/parsing) `rsa`/`rand`.
 
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/framefilter/keyroost/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/framefilter/keyroost/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/framefilter/keyroost/releases/tag/v0.1.0

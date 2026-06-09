@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-ctap"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes",
  "cbc",
@@ -1586,14 +1586,14 @@ dependencies = [
 
 [[package]]
 name = "keyroost-hid"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hidapi",
 ]
 
 [[package]]
 name = "keyroost-import"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-keyring"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1613,32 +1613,32 @@ dependencies = [
 
 [[package]]
 name = "keyroost-oath"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "keyroost-proto",
 ]
 
 [[package]]
 name = "keyroost-openpgp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "keyroost-proto",
 ]
 
 [[package]]
 name = "keyroost-piv"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "keyroost-proto",
 ]
 
 [[package]]
 name = "keyroost-proto"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "keyroost-resolve"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "keyroost-hid",
  "keyroost-keyring",
@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-rsakey"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rand",
  "rsa",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "keyroost-oath",
  "keyroost-openpgp",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "keyroostctl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "keyroost-ctap",

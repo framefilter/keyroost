@@ -11,4 +11,4 @@ description = "OpenPGP Card (v3.4) APDU command/response layer."
 workspace = true
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.2.0" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.3.0" }

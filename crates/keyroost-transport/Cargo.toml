@@ -11,8 +11,8 @@ description = "PC/SC transport for the Token2 Molto2 / Molto2v2 programmable TOT
 workspace = true
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.2.0" }
-keyroost-oath = { path = "../keyroost-oath", version = "0.2.0" }
-keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.2.0" }
-keyroost-piv = { path = "../keyroost-piv", version = "0.2.0" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.3.0" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.3.0" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.3.0" }
+keyroost-piv = { path = "../keyroost-piv", version = "0.3.0" }
 pcsc = "2"
