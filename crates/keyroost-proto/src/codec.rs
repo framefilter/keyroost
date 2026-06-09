@@ -90,6 +90,44 @@ pub fn base32_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
     Ok(out)
 }
 
+/// RFC 4648 base64 decode, accepting both the standard (`+/`) and URL-safe
+/// (`-_`) alphabets — Google Authenticator migration payloads arrive in
+/// either depending on what percent-decoded them. Same strictness rules as
+/// [`base32_decode`]: whitespace tolerated, `=` only at the end, nonzero
+/// residual bits rejected. Required: otpauth-migration:// payloads.
+pub fn base64_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::with_capacity(s.len() * 3 / 4 + 1);
+    let mut padded = false;
+    for c in s.chars() {
+        let v = match c {
+            ' ' | '\t' | '\n' | '\r' => continue,
+            '=' => {
+                padded = true;
+                continue;
+            }
+            _ if padded => return Err(DecodeError::InvalidChar),
+            'A'..='Z' => c as u8 - b'A',
+            'a'..='z' => c as u8 - b'a' + 26,
+            '0'..='9' => c as u8 - b'0' + 52,
+            '+' | '-' => 62,
+            '/' | '_' => 63,
+            _ => return Err(DecodeError::InvalidChar),
+        };
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    if bits > 0 && (buf & ((1u32 << bits) - 1)) != 0 {
+        return Err(DecodeError::InvalidLength);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +188,27 @@ mod tests {
         assert_eq!(base32_decode("MY==MZ"), Err(DecodeError::InvalidChar));
         // Trailing whitespace after padding is still fine.
         assert_eq!(base32_decode("MY====== \n").unwrap(), b"f");
+    }
+
+    #[test]
+    fn base64_rfc_vectors_and_strictness() {
+        // RFC 4648 §10
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
+        // URL-safe alphabet maps to the same values.
+        assert_eq!(
+            base64_decode("-_-_").unwrap(),
+            base64_decode("+/+/").unwrap()
+        );
+        // Data after padding and nonzero residual bits are rejected.
+        assert_eq!(base64_decode("Zg==Zg"), Err(DecodeError::InvalidChar));
+        assert_eq!(base64_decode("Zh"), Err(DecodeError::InvalidLength));
+        assert_eq!(base64_decode("Z!"), Err(DecodeError::InvalidChar));
     }
 
     #[test]

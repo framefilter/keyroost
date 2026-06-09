@@ -14,5 +14,11 @@ pub use bulk::{
     aegis, parse_any as parse_bulk_any, parse_otpauth_list, twofas, BulkEntry, BulkError,
 };
 
+/// Google Authenticator `otpauth-migration://` export parsing. Lives under
+/// the `bulk` feature because its output is `BulkEntry` batches; the
+/// protobuf wire reader is vendored (~60 lines), no new dependencies.
+#[cfg(feature = "bulk")]
+pub mod migration;
+
 #[cfg(feature = "encrypted")]
 mod encrypted;

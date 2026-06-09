@@ -172,10 +172,15 @@ enum Cmd {
         /// Display timeout in seconds (otpauth:// has no equivalent field).
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
+        /// Decode the otpauth:// URI from a QR code in a PNG/JPEG screenshot
+        /// instead of passing it as text. For Google Authenticator export
+        /// QRs (multiple accounts), use `import-file` with the image path.
+        #[arg(long, value_name = "IMAGE", conflicts_with = "uri")]
+        qr: Option<std::path::PathBuf>,
         /// The otpauth:// URI. Use single quotes to protect & from the shell.
         /// Argv is visible in `ps` and shell history (the URI embeds the
-        /// secret); pass `-` to read the URI from stdin instead.
-        uri: String,
+        /// secret); pass `-` to read the URI from stdin, or use --qr.
+        uri: Option<String>,
     },
     /// Bulk-import a plaintext or encrypted export from Aegis, 2FAS, or a list
     /// of otpauth:// URIs. For encrypted Aegis vaults, pass the password via
@@ -869,8 +874,33 @@ fn load_bulk_entries(
     password_stdin: bool,
     password_env: Option<&str>,
 ) -> Result<Vec<keyroost_import::BulkEntry>, Box<dyn std::error::Error>> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+
+    // Screenshot import: a PNG/JPEG (by magic bytes) goes through QR decode,
+    // accepting both a single otpauth:// enrollment code and a Google
+    // Authenticator export batch.
+    if keyroost_qr::looks_like_image(&bytes) {
+        let import = keyroost_qr::entries_from_image(&bytes)?;
+        for s in &import.skipped {
+            eprintln!("skipped {:?}: {}", s.label, s.reason);
+        }
+        if let Some((i, n)) = import.batch {
+            eprintln!(
+                "note: this is QR {} of {} in the export — import the other images too",
+                i + 1,
+                n
+            );
+        }
+        eprintln!("remember to delete the screenshot after a successful import");
+        return Ok(import.entries);
+    }
+
+    let text = String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "{}: neither a text export nor a PNG/JPEG image",
+            path.display()
+        )
+    })?;
 
     // Aegis vaults are the only format we know how to decrypt. Detect first
     // so we only consume the password when it would actually be used.
@@ -1309,20 +1339,54 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             profile,
             title,
             display_timeout,
+            qr,
             uri,
         } => {
-            // `-` reads the URI (whose secret= parameter is the seed) from
-            // stdin so it stays out of /proc/*/cmdline and shell history.
-            let uri = if uri == "-" {
-                use std::io::BufRead;
-                let mut line = String::new();
-                std::io::stdin().lock().read_line(&mut line)?;
-                line.trim_end_matches(['\r', '\n']).to_owned()
+            let entry: keyroost_import::BulkEntry = if let Some(image_path) = qr {
+                // Screenshot import: decode the QR, route through the same
+                // hardened parsers as text input.
+                let bytes = std::fs::read(image_path)
+                    .map_err(|e| format!("read {}: {}", image_path.display(), e))?;
+                let import = keyroost_qr::entries_from_image(&bytes)?;
+                for s in &import.skipped {
+                    eprintln!("skipped {:?}: {}", s.label, s.reason);
+                }
+                match import.entries.len() {
+                    1 => import.entries.into_iter().next().unwrap(),
+                    n => {
+                        return Err(format!(
+                            "QR contains {} accounts — use `import-file {}` to program them \
+                             into consecutive slots",
+                            n,
+                            image_path.display()
+                        )
+                        .into())
+                    }
+                }
             } else {
-                uri.clone()
+                let uri = match uri.as_deref() {
+                    // `-` reads the URI (whose secret= parameter is the seed)
+                    // from stdin so it stays out of /proc/*/cmdline and history.
+                    Some("-") => {
+                        use std::io::BufRead;
+                        let mut line = String::new();
+                        std::io::stdin().lock().read_line(&mut line)?;
+                        line.trim_end_matches(['\r', '\n']).to_owned()
+                    }
+                    Some(u) => u.to_owned(),
+                    None => return Err("import requires an otpauth:// URI or --qr <image>".into()),
+                };
+                let p = keyroost_import::parse_otpauth(&uri)?;
+                keyroost_import::BulkEntry {
+                    issuer: p.issuer,
+                    account: p.account,
+                    secret: p.secret,
+                    algorithm: p.algorithm,
+                    digits: p.digits,
+                    time_step: p.time_step,
+                }
             };
-            let parsed = keyroost_import::parse_otpauth(&uri)?;
-            let final_title = title.clone().unwrap_or_else(|| parsed.suggested_title());
+            let final_title = title.clone().unwrap_or_else(|| entry.suggested_title());
             if final_title.is_empty() || final_title.len() > 12 {
                 return Err(format!(
                     "derived title {:?} must be 1..=12 bytes; pass --title to override",
@@ -1330,20 +1394,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
-            session.set_seed(*profile, &parsed.secret)?;
+            session.set_seed(*profile, &entry.secret)?;
             session.set_title(*profile, &final_title)?;
             session.set_config(
                 *profile,
-                &parsed.to_profile_config(unix_now(), display_timeout.to_proto()),
+                &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
             )?;
             println!(
                 "imported {:?} to profile #{} ({} bytes secret, {:?}, {} digits)",
                 final_title,
                 profile,
-                parsed.secret.len(),
-                parsed.algorithm,
-                parsed.digits as u8
+                entry.secret.len(),
+                entry.algorithm,
+                entry.digits as u8
             );
+            if qr.is_some() {
+                println!(
+                    "remember to delete the screenshot (and any phone/cloud copies) — it \
+                     contains the secret"
+                );
+            }
         }
         Cmd::ImportFile {
             path,

@@ -797,10 +797,61 @@ impl App {
             self.bulk_dialog.error = Some("enter a file path first".into());
             return;
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
             Err(e) => {
                 self.bulk_dialog.error = Some(format!("read failed: {}", e));
+                return;
+            }
+        };
+
+        // Screenshot import: a PNG/JPEG (by magic bytes) goes through QR
+        // decode — handles both standard otpauth:// enrollment codes and
+        // Google Authenticator export batches.
+        if keyroost_qr::looks_like_image(&bytes) {
+            match keyroost_qr::entries_from_image(&bytes) {
+                Ok(import) => {
+                    self.bulk_dialog.error = None;
+                    self.bulk_dialog.needs_password = false;
+                    for s in &import.skipped {
+                        self.log(
+                            Severity::Err,
+                            format!("skipped {:?}: {}", s.label, s.reason),
+                        );
+                    }
+                    if let Some((i, n)) = import.batch {
+                        self.log(
+                            Severity::Info,
+                            format!(
+                                "this is QR {} of {} in the export — load the others too",
+                                i + 1,
+                                n
+                            ),
+                        );
+                    }
+                    self.log(
+                        Severity::Info,
+                        format!(
+                            "loaded {} entries from QR image — delete the screenshot after a \
+                             successful import",
+                            import.entries.len()
+                        ),
+                    );
+                    self.bulk_dialog.entries = import.entries;
+                }
+                Err(e) => {
+                    self.bulk_dialog.entries.clear();
+                    self.bulk_dialog.error = Some(e.to_string());
+                }
+            }
+            return;
+        }
+
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => {
+                self.bulk_dialog.error =
+                    Some("file is neither a text export nor a PNG/JPEG image".into());
                 return;
             }
         };
@@ -3027,6 +3078,21 @@ impl eframe::App for App {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.1)));
             }
         }
+        // Dropping a file on the window routes it to the bulk-import dialog —
+        // the natural gesture for "import this screenshot/export".
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .first()
+                .and_then(|f| f.path.as_ref())
+                .map(|p| p.display().to_string())
+        });
+        if let Some(path) = dropped {
+            self.bulk_dialog.open = true;
+            self.bulk_dialog.path = path;
+            self.bulk_load();
+        }
+
         // Apply any results from background device jobs before drawing.
         self.drain_worker();
         let p = self.palette();

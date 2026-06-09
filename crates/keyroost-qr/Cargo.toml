@@ -1,0 +1,23 @@
+[package]
+name = "keyroost-qr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "QR-code import (PNG/JPEG screenshots) of otpauth:// and Google Authenticator migration payloads."
+
+[lints]
+workspace = true
+
+# This crate owns the workspace's QR/image dependency exception (the same
+# pattern as keyroost-rsakey owning `rsa`): image decoding and QR detection
+# are not worth hand-rolling, and confining them here keeps every other
+# crate dependency-free. rqrr is pure Rust (default features off: we feed it
+# grayscale directly, no `image` crate); png was already in the tree via the
+# GUI stack; jpeg-decoder runs single-threaded (rayon feature off).
+[dependencies]
+jpeg-decoder = { version = "0.3.2", default-features = false }
+keyroost-import = { path = "../keyroost-import", version = "0.3.0", features = ["bulk"] }
+png = "0.18.1"
+rqrr = { version = "0.10.1", default-features = false }

@@ -18,6 +18,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 keyroost-proto = { path = "../crates/keyroost-proto" }
 keyroost-import = { path = "../crates/keyroost-import", features = ["bulk"] }
+keyroost-qr = { path = "../crates/keyroost-qr" }
 keyroost-ctap = { path = "../crates/keyroost-ctap" }
 keyroost-oath = { path = "../crates/keyroost-oath" }
 keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
@@ -70,6 +71,20 @@ bench = false
 [[bin]]
 name = "piv_parse"
 path = "fuzz_targets/piv_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "migration"
+path = "fuzz_targets/migration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qr_image"
+path = "fuzz_targets/qr_image.rs"
 test = false
 doc = false
 bench = false

@@ -22,6 +22,7 @@ keyroost-ctap = { path = "../keyroost-ctap", version = "0.3.0" }
 keyroost-keyring = { path = "../keyroost-keyring", version = "0.3.0" }
 keyroost-resolve = { path = "../keyroost-resolve", version = "0.3.0" }
 keyroost-oath = { path = "../keyroost-oath", version = "0.3.0" }
+keyroost-qr = { path = "../keyroost-qr", version = "0.3.0" }
 keyroost-import = { path = "../keyroost-import", version = "0.3.0", features = ["bulk", "encrypted"] }
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
 # keyroostctl). Owns the scoped `rsa` dependency exception.
