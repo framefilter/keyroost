@@ -1116,6 +1116,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let key = customer_key_bytes(&cli)?;
+    // Wire confidentiality for seeds is SM4 keyed off the customer key, and
+    // the factory default is public (it ships in every unit and in this
+    // source). Programming real seeds under it means anyone holding a USB
+    // capture can decrypt them — nudge, don't block.
+    if key.as_slice() == DEFAULT_CUSTOMER_KEY
+        && matches!(
+            cmd,
+            Cmd::SetSeed { .. } | Cmd::Import { .. } | Cmd::ImportFile { .. }
+        )
+    {
+        eprintln!(
+            "warning: using the factory-default customer key — seeds sent to the \
+             device are decryptable by anyone who captures the USB traffic. \
+             Rotate it first: keyroostctl set-customer-key (see --help)."
+        );
+    }
     let mut session = Session::open()?;
     session.set_debug(cli.debug);
     let info = session.read_info()?;
@@ -2696,6 +2712,18 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
 fn print_info(info: &keyroost_transport::DeviceInfo) {
     println!("device serial: {}", info.serial);
     println!("device UTC:    {} (epoch)", info.utc_time);
+    // TOTP tolerates small drift (one 30s step either way at most verifiers);
+    // beyond that, codes get rejected in ways users misdiagnose as a bad
+    // seed. Surface it here where it's cheap to see.
+    let drift = i64::from(info.utc_time) - i64::from(unix_now());
+    if drift.abs() > 30 {
+        eprintln!(
+            "warning: device clock is {} seconds {} the host clock — codes may be \
+             rejected. Run `keyroostctl sync-time --all` to fix.",
+            drift.abs(),
+            if drift > 0 { "ahead of" } else { "behind" }
+        );
+    }
 }
 
 fn main() -> ExitCode {

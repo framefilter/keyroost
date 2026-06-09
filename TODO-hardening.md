@@ -33,8 +33,8 @@ done and committed on this branch.
 
 - [ ] `completions` subcommand (shell completions via clap_complete)
 - [ ] `manpage` subcommand (troff output via clap_mangen)
-- [ ] `import-file --dry-run`: print the slot/title/config plan without
-      touching the device
+- [x] `import-file --dry-run`: print the slot/title/config plan without
+      touching the device — *already existed upstream; verified working*
 - [ ] `doctor` subcommand: diagnose pcscd, readers, udev rules, hidraw
       access, keys.json permissions
 - [ ] Destructive commands (`fido-reset`, `fido-creds-delete`,

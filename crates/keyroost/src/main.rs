@@ -353,6 +353,9 @@ struct App {
     cap_tab: CapTab,
     /// Error from the last device enumeration, surfaced in the sidebar.
     devices_error: Option<String>,
+    /// When set, overwrite the OS clipboard at this time (now_secs_f64
+    /// epoch): OTP codes shouldn't sit in clipboard-manager history forever.
+    clipboard_clear_at: Option<f64>,
     /// True once the first automatic device scan has been kicked off.
     scanned: bool,
     /// Sidebar filter text (filters the visible device list by vendor/model).
@@ -687,6 +690,10 @@ impl App {
             self.log(Severity::Err, format!("set_config #{}: {}", p, e));
             return;
         }
+        // The seed now lives on the device; keeping it in the (masked) field
+        // for the app's lifetime is pure liability. Title/config drafts stay —
+        // they're convenient for programming a run of similar slots.
+        self.draft.secret_base32.clear();
         self.log(Severity::Ok, format!("profile #{} written", p));
     }
 
@@ -2998,6 +3005,23 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Clipboard hygiene: ~45s after an OTP code was copied, overwrite the
+        // clipboard so the code doesn't live on in clipboard-manager history.
+        // eframe only pushes *non-empty* copied_text to the OS clipboard, so
+        // "clearing" writes a single space. Unconditional by design — checking
+        // whether we still own the clipboard would need a clipboard-reading
+        // dependency (arboard), and a 45s-old OTP is expired anyway.
+        if let Some(t) = self.clipboard_clear_at {
+            let now = now_secs_f64();
+            if now >= t {
+                ctx.output_mut(|o| o.copied_text = " ".to_owned());
+                self.clipboard_clear_at = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                    (t - now).max(0.1),
+                ));
+            }
+        }
         // Apply any results from background device jobs before drawing.
         self.drain_worker();
         let p = self.palette();
@@ -3338,6 +3362,9 @@ impl App {
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             ui.output_mut(|o| o.copied_text = all);
+                            // The user copied non-secret log text over the
+                            // code; a pending auto-clear would clobber it.
+                            self.clipboard_clear_at = None;
                         }
                     });
                 });
@@ -3705,6 +3732,7 @@ impl App {
                             if let Some((name, code)) = copy {
                                 ui.output_mut(|o| o.copied_text = code);
                                 self.copied = Some((name, now_secs_f64() + 1.2));
+                                self.clipboard_clear_at = Some(now_secs_f64() + 45.0);
                             }
                         } else {
                             ui.label(
@@ -4214,6 +4242,7 @@ impl App {
         if let Some((name, code)) = copy {
             ui.output_mut(|o| o.copied_text = code);
             self.copied = Some((name, now_secs_f64() + 1.2));
+            self.clipboard_clear_at = Some(now_secs_f64() + 45.0);
         }
         if let Some(name) = delete {
             self.oath.confirm_delete = Some(name);
