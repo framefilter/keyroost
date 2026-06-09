@@ -15,12 +15,24 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read-only by default; only the publish job below escalates to
+# contents: write. Build jobs compile third-party code (proc-macros run at
+# build time) and must never hold a write-capable token.
+permissions:
+  contents: read
+
+# These jobs produce the binaries users run against real security keys, so
+# all third-party actions are pinned to commit SHAs (a hijacked upstream tag
+# would otherwise ship trojaned artifacts), and no shared build cache is
+# restored — tag builds fall back to default-branch caches, which would let
+# poisoned cache entries feed release binaries. Clean builds are cheap
+# insurance at release cadence.
 jobs:
   linux-x86_64:
     name: Linux x86_64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install system dependencies
         run: |
@@ -31,8 +43,9 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libgl1-mesa-dev libssl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
 
       - name: Build release binaries
         run: cargo build --release --locked -p keyroostctl -p keyroost
@@ -45,7 +58,7 @@ jobs:
             -C target/release keyroostctl keyroost
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: keyroost-linux-x86_64
           path: dist/*.tar.gz
@@ -54,15 +67,15 @@ jobs:
     name: macOS universal2
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # PC/SC (PCSC.framework) and the FIDO HID backend (IOKit via hidapi) come
       # from the system SDK — no extra packages. Build both arches and lipo them
       # into one universal2 binary that runs on Apple Silicon and Intel.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries (both arches)
         run: |
@@ -81,7 +94,7 @@ jobs:
           tar -czf "dist/keyroost-${ref}-macos-universal2.tar.gz" -C bin keyroostctl keyroost
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: keyroost-macos-universal2
           path: dist/*.tar.gz
@@ -90,13 +103,14 @@ jobs:
     name: Windows x86_64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # PC/SC (WinSCard) and the FIDO HID backend (hid.dll via hidapi) are part
       # of Windows — no extra packages. The GUI is built with the windows
       # subsystem (see keyroost/src/main.rs) so it opens no console window.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
 
       - name: Build release binaries
         run: cargo build --release --locked -p keyroostctl -p keyroost
@@ -110,7 +124,7 @@ jobs:
             -DestinationPath "dist/keyroost-$ref-windows-x86_64.zip"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: keyroost-windows-x86_64
           path: dist/*.zip
@@ -124,7 +138,7 @@ jobs:
       contents: write
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

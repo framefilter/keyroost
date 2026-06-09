@@ -1,0 +1,9 @@
+# Keeps the SHA-pinned actions in .github/workflows fresh: Dependabot
+# understands `uses: owner/repo@<sha> # vX.Y.Z` lines and PRs bumps with the
+# comment updated, so pinning doesn't mean freezing.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

@@ -10,6 +10,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# CI only reads the repo; never hand build steps (or the proc-macros they
+# compile) a write-capable token.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -27,7 +32,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Linux links against system libraries the other platforms provide natively:
       #  - libpcsclite-dev: the `pcsc` crate (keyroost-transport). macOS uses the
@@ -45,11 +50,16 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libgl1-mesa-dev libssl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions are pinned to commit SHAs: a hijacked tag or branch
+      # in either upstream repo would otherwise run arbitrary code here. When
+      # pinned by SHA, dtolnay/rust-toolchain no longer gets the toolchain from
+      # its ref name, so it must be passed explicitly.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # Formatting is platform-independent; check it once on Linux.
       - name: Format check
@@ -101,7 +111,7 @@ jobs:
             libxkbcommon libxcb wayland mesa \
             rust
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Build
         run: cargo build --workspace --locked
