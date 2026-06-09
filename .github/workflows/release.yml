@@ -136,8 +136,11 @@ jobs:
       # on a tag ref, so a manual workflow_dispatch still builds + collects but
       # never publishes. Uses the built-in token (no third-party action);
       # --generate-notes writes the notes from commits/PRs since the last tag.
+      # This job downloads artifacts but never checks out the repo, so `gh` has
+      # no local git to infer the target from — pass it explicitly via --repo
+      # (GITHUB_REPOSITORY is always "owner/name" in the runner env).
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip --repo "${GITHUB_REPOSITORY}" --generate-notes
