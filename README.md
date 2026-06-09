@@ -120,6 +120,14 @@ packages — those are just for the GUI.) macOS and Windows have PC/SC built in,
 and the FIDO HID backend uses `hidapi` (IOKit / hid.dll) automatically — no extra
 packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 
+> **Windows and FIDO:** Windows reserves raw FIDO HID access for elevated
+> processes (the OS routes normal apps through its own WebAuthn API instead).
+> Expect the `fido-*` commands and the Security Keys pane to require an
+> elevated ("Run as administrator") session on Windows; the Molto2, OATH,
+> OpenPGP, and PIV features go over PC/SC and work unelevated. Elevate for
+> the FIDO command you need, then drop back — don't run the whole tool
+> elevated as a habit.
+
 > **Prebuilt binaries:** the release artifacts are built on Ubuntu and linked
 > against its glibc, so they run on glibc-current distros (Arch, recent Fedora)
 > but may fail on older ones (e.g. RHEL 9) with a `GLIBC_…` error. When in doubt,
