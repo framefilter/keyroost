@@ -7,3 +7,12 @@ updates:
     directory: /
     schedule:
       interval: monthly
+  # Surfaces RustSec-relevant dependency bumps as PRs. Grouped so routine
+  # transitive churn (the eframe/wgpu tree) arrives as one reviewable PR.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]

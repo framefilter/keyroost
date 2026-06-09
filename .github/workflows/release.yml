@@ -134,8 +134,13 @@ jobs:
     needs: [linux-x86_64, macos-universal2, windows-x86_64]
     runs-on: ubuntu-latest
     # `gh release create` writes a Release, so the default token needs write.
+    # id-token + attestations let attest-build-provenance sign a statement
+    # that these exact archives were built by this workflow run — users (and
+    # `gh attestation verify`) can check a download against it.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -145,6 +150,20 @@ jobs:
 
       - name: List artifacts
         run: ls -lR dist
+
+      # Checksums ship with the release so users can verify downloads with
+      # plain `sha256sum -c`; the provenance attestation covers the stronger
+      # "built by this workflow from this commit" claim.
+      - name: Generate checksums
+        run: (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
+
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
 
       # Publish a public GitHub Release with the three archives attached. Guarded
       # on a tag ref, so a manual workflow_dispatch still builds + collects but
@@ -157,4 +176,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip --repo "${GITHUB_REPOSITORY}" --generate-notes
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --repo "${GITHUB_REPOSITORY}" --generate-notes
