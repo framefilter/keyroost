@@ -32,12 +32,22 @@ static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
     about = "Program Token2 Molto2 / Molto2v2 TOTP tokens"
 )]
 struct Cli {
-    /// Customer key as hex (alternative to --key-ascii). Default used if neither is supplied.
+    /// Customer key as hex (alternative to --key-ascii). Default used if no
+    /// key option is supplied. Argv is visible in `ps` and shell history;
+    /// prefer --key-env for a non-default key.
     #[arg(long, global = true, value_name = "HEX")]
     key: Option<String>,
-    /// Customer key as ASCII (alternative to --key).
+    /// Customer key as ASCII (alternative to --key). Argv is visible in `ps`
+    /// and shell history; prefer --key-ascii-env for a non-default key.
     #[arg(long, global = true, value_name = "TEXT", conflicts_with = "key")]
     key_ascii: Option<String>,
+    /// Read the hex customer key from the named environment variable
+    /// (keeps it out of argv and shell history).
+    #[arg(long, global = true, value_name = "VAR", conflicts_with_all = ["key", "key_ascii"])]
+    key_env: Option<String>,
+    /// Read the ASCII customer key from the named environment variable.
+    #[arg(long, global = true, value_name = "VAR", conflicts_with_all = ["key", "key_ascii", "key_env"])]
+    key_ascii_env: Option<String>,
     /// List available PC/SC readers and exit.
     #[arg(long, global = true)]
     list_readers: bool,
@@ -57,17 +67,34 @@ struct Cli {
 enum Cmd {
     /// Print device serial number and on-device UTC time.
     Info,
-    /// Write a TOTP seed to a profile slot.
+    /// Write a TOTP seed to a profile slot. The seed can come from argv
+    /// (--hex/--base32 — visible in `ps` and shell history), an environment
+    /// variable, or stdin; supply exactly one source.
     SetSeed {
         /// Profile index 0..=99.
         #[arg(short, long)]
         profile: u8,
-        /// Seed in hex.
+        /// Seed in hex. Argv is visible in `ps` and shell history; prefer
+        /// --hex-env or --hex-stdin.
         #[arg(long, conflicts_with = "base32", value_name = "HEX")]
         hex: Option<String>,
-        /// Seed in base32 (RFC 4648; whitespace and dashes tolerated).
+        /// Seed in base32 (RFC 4648; whitespace and dashes tolerated). Argv
+        /// is visible in `ps` and shell history; prefer --base32-env or
+        /// --base32-stdin.
         #[arg(long, value_name = "B32")]
         base32: Option<String>,
+        /// Read the hex seed from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        hex_env: Option<String>,
+        /// Read the base32 seed from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        base32_env: Option<String>,
+        /// Read the hex seed from stdin (one line).
+        #[arg(long)]
+        hex_stdin: bool,
+        /// Read the base32 seed from stdin (one line).
+        #[arg(long)]
+        base32_stdin: bool,
     },
     /// Write a profile title (1..=12 ASCII chars).
     SetTitle {
@@ -97,12 +124,31 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
-    /// Rotate the device's customer key (requires physical button confirmation).
+    /// Rotate the device's customer key (requires physical button
+    /// confirmation). The new key can come from argv (--hex/--ascii —
+    /// visible in `ps` and shell history), an environment variable, or
+    /// stdin; supply exactly one source.
     SetCustomerKey {
+        /// New key in hex. Argv is visible in `ps` and shell history;
+        /// prefer --hex-env or --hex-stdin.
         #[arg(long, conflicts_with = "ascii", value_name = "HEX")]
         hex: Option<String>,
+        /// New key as ASCII. Argv is visible in `ps` and shell history;
+        /// prefer --ascii-env or --ascii-stdin.
         #[arg(long, value_name = "TEXT")]
         ascii: Option<String>,
+        /// Read the new hex key from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        hex_env: Option<String>,
+        /// Read the new ASCII key from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        ascii_env: Option<String>,
+        /// Read the new hex key from stdin (one line).
+        #[arg(long)]
+        hex_stdin: bool,
+        /// Read the new ASCII key from stdin (one line).
+        #[arg(long)]
+        ascii_stdin: bool,
     },
     /// Import an otpauth:// URI to a profile: writes seed, title, and config in one go.
     Import {
@@ -115,6 +161,8 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
         /// The otpauth:// URI. Use single quotes to protect & from the shell.
+        /// Argv is visible in `ps` and shell history (the URI embeds the
+        /// secret); pass `-` to read the URI from stdin instead.
         uri: String,
     },
     /// Bulk-import a plaintext or encrypted export from Aegis, 2FAS, or a list
@@ -782,6 +830,13 @@ fn customer_key_bytes(cli: &Cli) -> Result<Vec<u8>, String> {
         hex_decode(h).map_err(|e| format!("invalid --key hex: {}", e))
     } else if let Some(s) = &cli.key_ascii {
         Ok(s.as_bytes().to_vec())
+    } else if let Some(var) = &cli.key_env {
+        let h = std::env::var(var).map_err(|_| format!("env var {} (--key-env) is not set", var))?;
+        hex_decode(&h).map_err(|e| format!("invalid hex in --key-env {}: {}", var, e))
+    } else if let Some(var) = &cli.key_ascii_env {
+        std::env::var(var)
+            .map(|s| s.into_bytes())
+            .map_err(|_| format!("env var {} (--key-ascii-env) is not set", var))
     } else {
         Ok(DEFAULT_CUSTOMER_KEY.to_vec())
     }
@@ -1082,15 +1137,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             profile,
             hex,
             base32,
+            hex_env,
+            base32_env,
+            hex_stdin,
+            base32_stdin,
         } => {
-            let seed = match (hex.as_ref(), base32.as_ref()) {
-                (Some(h), None) => hex_decode(h)?,
-                (None, Some(b)) => base32_decode(b)?,
-                (None, None) => return Err("set-seed requires --hex or --base32".into()),
-                (Some(_), Some(_)) => {
-                    return Err("set-seed: --hex and --base32 are mutually exclusive".into())
-                }
-            };
+            let mut supplied = Vec::new();
+            if let Some(h) = hex {
+                supplied.push((SecretEncoding::Hex, SecretSource::Literal(h)));
+            }
+            if let Some(b) = base32 {
+                supplied.push((SecretEncoding::Base32, SecretSource::Literal(b)));
+            }
+            if let Some(v) = hex_env {
+                supplied.push((SecretEncoding::Hex, SecretSource::Env(v)));
+            }
+            if let Some(v) = base32_env {
+                supplied.push((SecretEncoding::Base32, SecretSource::Env(v)));
+            }
+            if *hex_stdin {
+                supplied.push((SecretEncoding::Hex, SecretSource::Stdin));
+            }
+            if *base32_stdin {
+                supplied.push((SecretEncoding::Base32, SecretSource::Stdin));
+            }
+            let seed = gather_secret(
+                "set-seed",
+                "--hex, --base32, --hex-env, --base32-env, --hex-stdin, --base32-stdin",
+                supplied,
+            )?;
             if seed.is_empty() || seed.len() > 63 {
                 return Err(format!("seed must be 1..=63 bytes, got {}", seed.len()).into());
             }
@@ -1136,13 +1211,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("sync-time requires --profile <N> or --all".into());
             }
         }
-        Cmd::SetCustomerKey { hex, ascii } => {
-            let new_key = match (hex.as_ref(), ascii.as_ref()) {
-                (Some(h), None) => hex_decode(h)?,
-                (None, Some(a)) => a.as_bytes().to_vec(),
-                (None, None) => return Err("set-customer-key requires --hex or --ascii".into()),
-                (Some(_), Some(_)) => return Err("--hex and --ascii are mutually exclusive".into()),
-            };
+        Cmd::SetCustomerKey {
+            hex,
+            ascii,
+            hex_env,
+            ascii_env,
+            hex_stdin,
+            ascii_stdin,
+        } => {
+            let mut supplied = Vec::new();
+            if let Some(h) = hex {
+                supplied.push((SecretEncoding::Hex, SecretSource::Literal(h)));
+            }
+            if let Some(a) = ascii {
+                supplied.push((SecretEncoding::Ascii, SecretSource::Literal(a)));
+            }
+            if let Some(v) = hex_env {
+                supplied.push((SecretEncoding::Hex, SecretSource::Env(v)));
+            }
+            if let Some(v) = ascii_env {
+                supplied.push((SecretEncoding::Ascii, SecretSource::Env(v)));
+            }
+            if *hex_stdin {
+                supplied.push((SecretEncoding::Hex, SecretSource::Stdin));
+            }
+            if *ascii_stdin {
+                supplied.push((SecretEncoding::Ascii, SecretSource::Stdin));
+            }
+            let new_key = gather_secret(
+                "set-customer-key",
+                "--hex, --ascii, --hex-env, --ascii-env, --hex-stdin, --ascii-stdin",
+                supplied,
+            )?;
             session.set_customer_key(&new_key)?;
             println!("customer-key rotation requested. Press the up-arrow button on the device to confirm.");
         }
@@ -1152,7 +1252,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             display_timeout,
             uri,
         } => {
-            let parsed = keyroost_import::parse_otpauth(uri)?;
+            // `-` reads the URI (whose secret= parameter is the seed) from
+            // stdin so it stays out of /proc/*/cmdline and shell history.
+            let uri = if uri == "-" {
+                use std::io::BufRead;
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                line.trim_end_matches(['\r', '\n']).to_owned()
+            } else {
+                uri.clone()
+            };
+            let parsed = keyroost_import::parse_otpauth(&uri)?;
             let final_title = title.clone().unwrap_or_else(|| parsed.suggested_title());
             if final_title.is_empty() || final_title.len() > 12 {
                 return Err(format!(
@@ -2341,6 +2451,51 @@ where
     )?;
     let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
     f(&mut mgr)
+}
+
+/// How a seed/key option was supplied: literal argv value, env var name, or
+/// stdin. Used by `gather_secret` to enforce exactly-one-source.
+enum SecretSource<'a> {
+    Literal(&'a str),
+    Env(&'a str),
+    Stdin,
+}
+
+enum SecretEncoding {
+    Hex,
+    Base32,
+    Ascii,
+}
+
+/// Resolve a secret offered through several mutually-exclusive CLI options
+/// (argv literal / env var / stdin, each with an encoding) into raw bytes.
+/// `supplied` holds only the options the user actually passed.
+fn gather_secret(
+    cmd: &str,
+    sources_hint: &str,
+    supplied: Vec<(SecretEncoding, SecretSource)>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if supplied.len() != 1 {
+        return Err(format!("{} requires exactly one of {}", cmd, sources_hint).into());
+    }
+    let (encoding, source) = supplied.into_iter().next().unwrap();
+    let raw = match source {
+        SecretSource::Literal(s) => s.to_owned(),
+        SecretSource::Env(var) => std::env::var(var)
+            .map_err(|_| format!("env var {} (for {}) is not set", var, cmd))?,
+        SecretSource::Stdin => {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            stdin.lock().read_line(&mut line)?;
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
+    Ok(match encoding {
+        SecretEncoding::Hex => hex_decode(&raw)?,
+        SecretEncoding::Base32 => base32_decode(&raw)?,
+        SecretEncoding::Ascii => raw.into_bytes(),
+    })
 }
 
 fn read_secret(
