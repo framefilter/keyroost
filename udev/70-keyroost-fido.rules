@@ -12,10 +12,13 @@
 # instead of relying on group membership.
 
 # Generic FIDO/U2F devices matched by HID usage page (0xF1D0) — works for any
-# vendor as long as their report descriptor follows the spec.
+# vendor as long as their report descriptor follows the spec. systemd's hwdb
+# sets ID_SECURITY_TOKEN=1 from the usage page; matching on it (rather than
+# bInterfaceClass=="03", which is *every* HID device) keeps keyboard/mouse
+# hidraw nodes from becoming user-accessible — raw read access to a keyboard
+# node is a keylogger.
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", \
-    ENV{HID_NAME}=="*", \
-    ATTRS{bInterfaceClass}=="03", \
+    ENV{ID_SECURITY_TOKEN}=="1", \
     TAG+="uaccess", GROUP="plugdev", MODE="0660"
 
 # Yubico (YubiKey 4, 5, FIDO, Security Key, Bio)
