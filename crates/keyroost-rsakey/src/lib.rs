@@ -28,6 +28,27 @@ pub struct RsaKeyParts {
     pub n: Vec<u8>,
 }
 
+/// The `rsa` crate zeroizes its own `RsaPrivateKey` on drop; these extracted
+/// copies deserve the same so a full private key doesn't linger in freed heap
+/// pages (or swap / core dumps) after the card import finishes. `e` and `n`
+/// are public but wiping them too costs nothing.
+impl Drop for RsaKeyParts {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for buf in [
+            &mut self.e,
+            &mut self.p,
+            &mut self.q,
+            &mut self.u,
+            &mut self.dp,
+            &mut self.dq,
+            &mut self.n,
+        ] {
+            buf.zeroize();
+        }
+    }
+}
+
 /// Why obtaining RSA key parts failed. The `Display` strings are user-facing.
 #[derive(Debug)]
 pub enum RsaKeyError {
