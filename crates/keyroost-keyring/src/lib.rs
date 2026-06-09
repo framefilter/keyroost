@@ -272,8 +272,20 @@ impl Keyring {
     }
 
     /// Add a new entry. Rejects duplicate names and duplicate serials.
-    pub fn add(&mut self, entry: KeyEntry) -> Result<(), KeyringError> {
+    pub fn add(&mut self, mut entry: KeyEntry) -> Result<(), KeyringError> {
         validate_name(&entry.name)?;
+        // Sanitize on the way in with the same rules `load_from` applies on
+        // the way out, so a device-reported serial (or note) containing
+        // control characters is stored exactly as it will round-trip —
+        // otherwise the value would silently mutate on the next load, and
+        // duplicate-serial detection would compare against a phantom.
+        strip_control_chars(&mut entry.serial);
+        for field in [&mut entry.vendor, &mut entry.aaguid, &mut entry.note]
+            .into_iter()
+            .flatten()
+        {
+            strip_control_chars(field);
+        }
         if self.keys.iter().any(|k| k.name == entry.name) {
             return Err(KeyringError::DuplicateName(entry.name));
         }
@@ -468,6 +480,24 @@ mod tests {
         assert_eq!(k.keys[0].note.as_deref(), Some("ab"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_sanitizes_device_supplied_fields() {
+        // A device-reported serial with control chars must be stored in the
+        // same form load_from would produce, or the entry mutates on reload.
+        let mut k = Keyring::default();
+        k.add(KeyEntry {
+            name: "weird".into(),
+            serial: "AB\u{1b}[31mCD".into(),
+            source: IdSource::Usb,
+            vendor: None,
+            aaguid: None,
+            note: Some("x\u{7}y".into()),
+        })
+        .unwrap();
+        assert_eq!(k.keys[0].serial, "AB[31mCD");
+        assert_eq!(k.keys[0].note.as_deref(), Some("xy"));
     }
 
     #[cfg(unix)]
