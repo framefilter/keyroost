@@ -47,6 +47,23 @@ done and committed on this branch.
       otpauth URI, base32, CBOR, OATH TLV, OpenPGP BER-TLV, PIV BER
 - [x] Scheduled CI job running each target briefly (nightly toolchain)
 
+## crates.io publish runbook (readiness verified 2026-06)
+
+All crates carry version/license/description metadata and `cargo package`
+succeeds for every crate without in-workspace deps; the rest resolve once
+their deps are live (normal first-publish ordering). With a crates.io token
+(`cargo login`), publish in this order, waiting ~a minute between tiers for
+index propagation:
+
+1. `keyroost-proto`, `keyroost-hid`, `keyroost-keyring`, `keyroost-rsakey`
+2. `keyroost-ctap`, `keyroost-oath`, `keyroost-openpgp`, `keyroost-piv`,
+   `keyroost-import`, `keyroost-resolve`
+3. `keyroost-transport`
+4. `keyroostctl`, `keyroost`
+
+Afterwards `cargo install keyroostctl` / `cargo install keyroost` work for
+anyone with the Linux build prerequisites from the README.
+
 ## Deferred — decisions or external work needed
 
 - [ ] **QR code import** — requires an image-decoding + QR dependency, which
