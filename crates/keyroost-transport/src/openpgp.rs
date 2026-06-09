@@ -510,6 +510,7 @@ impl OpenPgpSession {
         let resp_sensitive = apdu.get(1..4) == Some(&[0x2A, 0x80, 0x86]);
         let mut acc = Vec::new();
         let mut to_send = apdu.to_vec();
+        let mut chunks = 0usize;
         loop {
             if self.debug {
                 eprintln!("> {:>14} >> {}", "openpgp", dump_cmd(&to_send, cmd_sensitive));
@@ -528,6 +529,12 @@ impl OpenPgpSession {
             }
             let (data, sw) = resp.split_at(resp.len() - 2);
             acc.extend_from_slice(data);
+            chunks += 1;
+            if acc.len() > crate::MAX_REASSEMBLED_RESPONSE || chunks > crate::MAX_RESPONSE_CHUNKS {
+                return Err(TransportError::MalformedResponse(
+                    "openpgp 61xx continuation exceeded reassembly limits",
+                ));
+            }
             if sw[0] == pgp::SW_MORE_DATA {
                 // The low byte hints at how many bytes remain (0 = up to 256);
                 // GET RESPONSE pulls the next chunk regardless.

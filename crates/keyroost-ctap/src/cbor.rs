@@ -196,7 +196,9 @@ fn decode_at(data: &[u8], depth: usize) -> Result<(Value, &[u8]), CborError> {
         MT_UINT => (Value::UInt(arg), rest),
         MT_NINT => (Value::NInt(arg), rest),
         MT_BYTES => {
-            let len = arg as usize;
+            // try_from, not `as`: on 32-bit targets a 64-bit length would
+            // silently truncate and "successfully" parse the wrong bytes.
+            let len = usize::try_from(arg).map_err(|_| CborError::UnexpectedEnd)?;
             if rest.len() < len {
                 return Err(CborError::UnexpectedEnd);
             }
@@ -204,7 +206,7 @@ fn decode_at(data: &[u8], depth: usize) -> Result<(Value, &[u8]), CborError> {
             (Value::Bytes(bytes.to_vec()), r)
         }
         MT_TEXT => {
-            let len = arg as usize;
+            let len = usize::try_from(arg).map_err(|_| CborError::UnexpectedEnd)?;
             if rest.len() < len {
                 return Err(CborError::UnexpectedEnd);
             }

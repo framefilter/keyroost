@@ -197,6 +197,7 @@ impl OathSession {
         let resp_sensitive = apdu.get(1) == Some(&0xA3);
         let mut acc = Vec::new();
         let mut to_send = apdu.to_vec();
+        let mut chunks = 0usize;
         loop {
             if self.debug {
                 eprintln!("> {:>14} >> {}", "oath", dump_cmd(&to_send, cmd_sensitive));
@@ -215,6 +216,12 @@ impl OathSession {
             }
             let (data, sw) = resp.split_at(resp.len() - 2);
             acc.extend_from_slice(data);
+            chunks += 1;
+            if acc.len() > crate::MAX_REASSEMBLED_RESPONSE || chunks > crate::MAX_RESPONSE_CHUNKS {
+                return Err(TransportError::MalformedResponse(
+                    "oath 61xx continuation exceeded reassembly limits",
+                ));
+            }
             if sw[0] == oath::SW_MORE_DATA {
                 // More data pending: pull the next chunk and keep accumulating.
                 to_send = oath::send_remaining();

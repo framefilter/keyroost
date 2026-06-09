@@ -755,6 +755,13 @@ pub(crate) fn dump_cmd(apdu: &[u8], sensitive: bool) -> String {
     )
 }
 
+/// Caps on `61xx` / GET RESPONSE reassembly across the CCID sessions. A
+/// misbehaving card that answers every continuation with another full chunk
+/// would otherwise drive an unbounded loop and allocation. No legitimate
+/// applet response approaches either limit.
+pub(crate) const MAX_REASSEMBLED_RESPONSE: usize = 1 << 20; // 1 MiB
+pub(crate) const MAX_RESPONSE_CHUNKS: usize = 4096;
+
 /// Molto2 commands whose data field must be redacted from `--debug` traces:
 /// `C5` set seed and `D7` set customer key carry SM4-ECB ciphertext that is
 /// trivially decryptable when the (public) default customer key is still in

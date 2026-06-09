@@ -304,6 +304,12 @@ impl CtapHidDevice {
         let mut buf = [0u8; CTAPHID_REPORT_SIZE];
 
         loop {
+            // Check the deadline on every frame, not just KEEPALIVEs: a
+            // misbehaving device spamming foreign-CID frames would otherwise
+            // spin here forever.
+            if Instant::now() >= deadline {
+                return Err(HidTransportError::Timeout);
+            }
             self.read_report(&mut buf)?;
             let cid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             let cmd = buf[4];
@@ -311,9 +317,6 @@ impl CtapHidDevice {
                 continue;
             }
             if cmd == CTAPHID_KEEPALIVE {
-                if Instant::now() >= deadline {
-                    return Err(HidTransportError::Timeout);
-                }
                 continue;
             }
             if cmd == CTAPHID_ERROR {
@@ -328,12 +331,20 @@ impl CtapHidDevice {
             }
 
             let bcnt = u16::from_be_bytes([buf[5], buf[6]]) as usize;
+            // The send side enforces this cap; reject device responses that
+            // claim more than the spec's maximum message size.
+            if bcnt > CTAPHID_MAX_PAYLOAD {
+                return Err(HidTransportError::PayloadTooLarge(bcnt));
+            }
             let mut payload = Vec::with_capacity(bcnt);
             let take = bcnt.min(INIT_FRAME_DATA);
             payload.extend_from_slice(&buf[INIT_FRAME_HEADER..INIT_FRAME_HEADER + take]);
 
             let mut seq: u8 = 0;
             while payload.len() < bcnt {
+                if Instant::now() >= deadline {
+                    return Err(HidTransportError::Timeout);
+                }
                 self.read_report(&mut buf)?;
                 let cid2 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                 if cid2 != expected_cid {
