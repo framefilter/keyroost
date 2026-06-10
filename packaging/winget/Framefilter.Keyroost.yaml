@@ -1,0 +1,8 @@
+# Version manifest — template for the FIRST manual submission to
+# microsoft/winget-pkgs (later versions are PR'd automatically by
+# wingetcreate in .github/workflows/publish.yml). Replace @VERSION@.
+PackageIdentifier: Framefilter.Keyroost
+PackageVersion: "@VERSION@"
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

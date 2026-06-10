@@ -58,7 +58,7 @@ index propagation:
 1. `keyroost-proto`, `keyroost-hid`, `keyroost-keyring`, `keyroost-rsakey`
 2. `keyroost-ctap`, `keyroost-oath`, `keyroost-openpgp`, `keyroost-piv`,
    `keyroost-import`, `keyroost-resolve`
-3. `keyroost-transport`
+3. `keyroost-qr`, `keyroost-transport`
 4. `keyroostctl`, `keyroost`
 
 Afterwards `cargo install keyroostctl` / `cargo install keyroost` work for
@@ -70,10 +70,11 @@ anyone with the Linux build prerequisites from the README.
       exception), PNG+JPEG screenshots, Google Authenticator migration
       batches, CLI `import --qr` / `import-file <image>`, GUI drag-drop,
       fuzz targets, end-to-end fixtures.
-- [ ] **Packaging** — crates.io readiness verified (runbook above) and
-      cargo-binstall metadata shipped; AUR/Homebrew-tap/winget manifests
-      pending the automation decision. Flatpak ruled out (pcscd/hidraw
-      sandboxing).
+- [x] **Packaging** — automated fanout in .github/workflows/publish.yml
+      (crates.io via OIDC trusted publishing, AUR, Homebrew tap, winget),
+      templates + one-time setup steps in packaging/. Remaining manual:
+      the account/secret setup and first publishes per packaging/README.md.
+      Flatpak ruled out (pcscd/hidraw sandboxing).
 - [ ] **Branch/tag protection** — repo settings, must be done in the GitHub
       UI by an admin: protect `main` (require PR + green CI), protect `v*`
       tags (maintainers only; tag push is release authority).

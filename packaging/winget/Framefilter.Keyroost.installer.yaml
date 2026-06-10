@@ -1,0 +1,17 @@
+# Installer manifest template. Replace @VERSION@ and @SHA_WIN@ (from the
+# release's SHA256SUMS). The zip carries two portable executables.
+PackageIdentifier: Framefilter.Keyroost
+PackageVersion: "@VERSION@"
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: keyroostctl.exe
+    PortableCommandAlias: keyroostctl
+  - RelativeFilePath: keyroost.exe
+    PortableCommandAlias: keyroost
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/framefilter/keyroost/releases/download/v@VERSION@/keyroost-v@VERSION@-windows-x86_64.zip
+    InstallerSha256: "@SHA_WIN@"
+ManifestType: installer
+ManifestVersion: 1.6.0

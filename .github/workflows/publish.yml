@@ -1,0 +1,227 @@
+name: Publish (release fanout)
+
+# Fans a published GitHub Release out to the package channels. Every channel
+# is a thin pointer at the same attested artifact set release.yml produced —
+# nothing here rebuilds binaries.
+#
+# All jobs run in the `release-publish` environment: add a required-reviewer
+# protection rule on that environment (Settings → Environments) and every
+# fanout pauses for a one-click approval before any credential is touched.
+#
+# One-time setup per channel (see packaging/README.md):
+#   crates.io — first publish by hand, then Trusted Publishing (OIDC, no
+#               stored secret) configured per crate for this workflow.
+#   AUR       — secret AUR_SSH_PRIVATE_KEY (push key for the keyroost-bin repo)
+#   Homebrew  — secret TAP_PUSH_TOKEN (fine-grained PAT, contents:write on
+#               the homebrew-keyroost tap repo only)
+#   winget    — secret WINGET_TOKEN (PAT with public_repo, used by Microsoft's
+#               wingetcreate to PR microsoft/winget-pkgs)
+# Jobs whose secret isn't configured yet skip with a notice instead of failing.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to fan out (e.g. v0.4.0)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  crates-io:
+    name: crates.io (workspace, in dependency order)
+    runs-on: ubuntu-latest
+    environment: release-publish
+    permissions:
+      contents: read
+      id-token: write # OIDC exchange for a temporary crates.io token
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      # `cargo publish` verifies each crate builds, so the build deps from CI
+      # are needed (pcsc for transport, the GL/wayland set for the GUI).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpcsclite-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+
+      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+        id: auth
+
+      # Tiered by dependency; `cargo publish` itself waits for each crate to
+      # appear in the index before dependents resolve. Already-published
+      # versions are skipped so a partial run can be re-dispatched safely.
+      - name: Publish workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          for crate in keyroost-proto keyroost-hid keyroost-keyring keyroost-rsakey \
+                       keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
+                       keyroost-import keyroost-resolve keyroost-qr keyroost-transport \
+                       keyroostctl keyroost; do
+            if curl -fsSL "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
+              echo "${crate} ${version} already on crates.io — skipping"
+              continue
+            fi
+            cargo publish -p "${crate}" --locked
+          done
+
+  aur:
+    name: AUR (keyroost-bin)
+    runs-on: ubuntu-latest
+    environment: release-publish
+    steps:
+      - name: Check secret configured
+        id: guard
+        env:
+          KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "AUR_SSH_PRIVATE_KEY not configured — skipping AUR publish"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: steps.guard.outputs.ready == 'true'
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Render and push PKGBUILD
+        if: steps.guard.outputs.ready == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          curl -fsSL --retry 4 -o SHA256SUMS \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS"
+          sha_linux="$(grep 'linux-x86_64' SHA256SUMS | cut -d' ' -f1)"
+          sha_udev="$(sha256sum udev/70-keyroost-fido.rules | cut -d' ' -f1)"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur"
+
+          git clone ssh://aur@aur.archlinux.org/keyroost-bin.git aur-repo
+          for t in PKGBUILD .SRCINFO; do
+            sed -e "s/@VERSION@/${version}/g" \
+                -e "s/@SHA_LINUX@/${sha_linux}/g" \
+                -e "s/@SHA_UDEV@/${sha_udev}/g" \
+                "packaging/aur/${t}.template" > "aur-repo/${t}"
+          done
+          cd aur-repo
+          git config user.name "keyroost release bot"
+          git config user.email "release@invalid.local"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && { echo "AUR already current"; exit 0; }
+          git commit -m "Update to ${version}"
+          git push origin master
+
+  homebrew:
+    name: Homebrew tap
+    runs-on: ubuntu-latest
+    environment: release-publish
+    steps:
+      - name: Check secret configured
+        id: guard
+        env:
+          KEY: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "TAP_PUSH_TOKEN not configured — skipping Homebrew publish"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: steps.guard.outputs.ready == 'true'
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Render and push formula
+        if: steps.guard.outputs.ready == 'true'
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          curl -fsSL --retry 4 -o SHA256SUMS \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS"
+          sha_mac="$(grep 'macos-universal2' SHA256SUMS | cut -d' ' -f1)"
+          sha_linux="$(grep 'linux-x86_64' SHA256SUMS | cut -d' ' -f1)"
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          git clone "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/${owner}/homebrew-keyroost.git" tap
+          mkdir -p tap/Formula
+          sed -e "s/@VERSION@/${version}/g" \
+              -e "s/@SHA_MAC@/${sha_mac}/g" \
+              -e "s/@SHA_LINUX@/${sha_linux}/g" \
+              packaging/homebrew/keyroost.rb.template > tap/Formula/keyroost.rb
+          cd tap
+          git config user.name "keyroost release bot"
+          git config user.email "release@invalid.local"
+          git add Formula/keyroost.rb
+          git diff --cached --quiet && { echo "tap already current"; exit 0; }
+          git commit -m "keyroost ${version}"
+          git push origin HEAD
+
+  winget:
+    name: winget (Framefilter.Keyroost)
+    runs-on: windows-latest
+    environment: release-publish
+    steps:
+      - name: Check secret configured
+        id: guard
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $Env:KEY) {
+            Write-Host "WINGET_TOKEN not configured - skipping winget publish"
+            "ready=false" | Out-File -Append $Env:GITHUB_OUTPUT
+          } else {
+            "ready=true" | Out-File -Append $Env:GITHUB_OUTPUT
+          }
+
+      # wingetcreate is Microsoft's official manifest tool; it updates the
+      # existing Framefilter.Keyroost manifests and opens the PR against
+      # microsoft/winget-pkgs. The FIRST submission must be done by hand
+      # (wingetcreate new, or a manual PR from packaging/winget/) — this job
+      # only handles version bumps.
+      - name: Update winget manifest
+        if: steps.guard.outputs.ready == 'true'
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $version = $Env:TAG.TrimStart('v')
+          $url = "https://github.com/$Env:GITHUB_REPOSITORY/releases/download/$Env:TAG/keyroost-$Env:TAG-windows-x86_64.zip"
+          curl.exe -fsSL -o wingetcreate.exe https://aka.ms/wingetcreate/latest
+          .\wingetcreate.exe update Framefilter.Keyroost `
+            --version $version `
+            --urls $url `
+            --submit `
+            --token $Env:WINGET_TOKEN

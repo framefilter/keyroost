@@ -1,0 +1,19 @@
+pkgbase = keyroost-bin
+	pkgdesc = CLI + GUI for programming Token2 Molto2 TOTP tokens and managing FIDO2/OATH/OpenPGP/PIV security keys (prebuilt)
+	pkgver = @VERSION@
+	pkgrel = 1
+	url = https://github.com/framefilter/keyroost
+	arch = x86_64
+	license = MIT OR Apache-2.0
+	depends = pcsclite
+	optdepends = ccid: smart-card reader drivers
+	optdepends = pcsc-tools: reader debugging
+	provides = keyroost
+	provides = keyroostctl
+	conflicts = keyroost
+	source = keyroost-v@VERSION@-linux-x86_64.tar.gz::https://github.com/framefilter/keyroost/releases/download/v@VERSION@/keyroost-v@VERSION@-linux-x86_64.tar.gz
+	source = 70-keyroost-fido-@VERSION@.rules::https://raw.githubusercontent.com/framefilter/keyroost/v@VERSION@/udev/70-keyroost-fido.rules
+	sha256sums = @SHA_LINUX@
+	sha256sums = @SHA_UDEV@
+
+pkgname = keyroost-bin
