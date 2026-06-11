@@ -50,7 +50,7 @@ impl core::fmt::Display for OtpAuthError {
 impl std::error::Error for OtpAuthError {}
 
 /// A parsed otpauth:// URI, normalized to the subset Molto2 can store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OtpAuth {
     /// Issuer name from the `issuer=` query param, or extracted from the label prefix.
     pub issuer: Option<String>,
@@ -61,6 +61,31 @@ pub struct OtpAuth {
     pub algorithm: HmacAlgo,
     pub digits: OtpDigits,
     pub time_step: TimeStep,
+}
+
+/// Manual Debug so a stray `{:?}` in logs or error context can't print the
+/// seed; only its length is shown.
+impl std::fmt::Debug for OtpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtpAuth")
+            .field("issuer", &self.issuer)
+            .field("account", &self.account)
+            .field("secret", &format_args!("[{} bytes]", self.secret.len()))
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("time_step", &self.time_step)
+            .finish()
+    }
+}
+
+/// The decoded seed is wiped when the parse result is dropped. (Buffer
+/// reallocations and the URI string the caller holds are out of reach —
+/// callers own those.)
+impl Drop for OtpAuth {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+    }
 }
 
 impl OtpAuth {

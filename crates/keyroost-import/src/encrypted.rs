@@ -21,6 +21,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use scrypt::scrypt;
 use serde::Deserialize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::bulk::BulkError;
 
@@ -73,8 +74,10 @@ fn hex_decode(s: &str, label: &'static str) -> Result<Vec<u8>, BulkError> {
     keyroost_proto::codec::hex_decode(s).map_err(|_| BulkError::UnsupportedFormat(label))
 }
 
-/// Decrypt the vault and return the plaintext db JSON.
-pub fn decrypt_aegis(json: &str, password: &[u8]) -> Result<String, BulkError> {
+/// Decrypt the vault and return the plaintext db JSON. The returned buffer
+/// (every imported seed, in clear) wipes itself on drop; key material
+/// derived along the way is wiped before this returns.
+pub fn decrypt_aegis(json: &str, password: &[u8]) -> Result<Zeroizing<String>, BulkError> {
     let root: Root = serde_json::from_str(json)?;
 
     // Find a password slot (type=1). Try each in order in case the user has
@@ -101,7 +104,7 @@ fn try_unlock_slot(
     password: &[u8],
     db_params: &AeadParams,
     db_b64: &str,
-) -> Result<String, BulkError> {
+) -> Result<Zeroizing<String>, BulkError> {
     let salt = hex_decode(
         slot.salt
             .as_deref()
@@ -137,15 +140,19 @@ fn try_unlock_slot(
     let params = scrypt::Params::new(log_n, r, p, 32)
         .map_err(|_| BulkError::UnsupportedFormat("invalid scrypt params"))?;
 
-    let mut kek = [0u8; 32];
-    scrypt(password, &salt, &params, &mut kek)
+    // KEK and master key are wiped on every exit path, including the `?`s
+    // between their derivation and last use.
+    let mut kek = Zeroizing::new([0u8; 32]);
+    scrypt(password, &salt, &params, kek.as_mut())
         .map_err(|_| BulkError::UnsupportedFormat("scrypt failed"))?;
 
     let slot_nonce = hex_decode(&slot.key_params.nonce, "slot nonce")?;
     let slot_tag = hex_decode(&slot.key_params.tag, "slot tag")?;
     let slot_ct = hex_decode(&slot.key, "slot key ciphertext")?;
-    let master_key = gcm_decrypt(&kek, &slot_nonce, &slot_ct, &slot_tag)
-        .map_err(|()| BulkError::UnsupportedFormat("wrong password (slot did not decrypt)"))?;
+    let master_key = Zeroizing::new(
+        gcm_decrypt(kek.as_ref(), &slot_nonce, &slot_ct, &slot_tag)
+            .map_err(|()| BulkError::UnsupportedFormat("wrong password (slot did not decrypt)"))?,
+    );
     if master_key.len() != 32 {
         return Err(BulkError::UnsupportedFormat(
             "decrypted master key is not 32 bytes",
@@ -160,13 +167,21 @@ fn try_unlock_slot(
     let plaintext = gcm_decrypt(&master_key, &db_nonce, &db_ct, &db_tag)
         .map_err(|()| BulkError::UnsupportedFormat("db did not decrypt with master key"))?;
 
-    let inner = String::from_utf8(plaintext)
-        .map_err(|_| BulkError::UnsupportedFormat("decrypted db is not UTF-8"))?;
+    // from_utf8 moves the buffer on success (no copy); on failure the bytes
+    // come back inside the error and are wiped before it propagates.
+    let mut inner = Zeroizing::new(String::from_utf8(plaintext).map_err(|e| {
+        let mut bytes = e.into_bytes();
+        bytes.zeroize();
+        BulkError::UnsupportedFormat("decrypted db is not UTF-8")
+    })?);
 
     // Aegis encrypts only the inner database object (the value normally found
     // under "db"), not the outer wrapper. Wrap it back so `aegis::parse` can
-    // consume the same shape it gets from plaintext exports.
-    Ok(format!(r#"{{"db":{}}}"#, inner))
+    // consume the same shape it gets from plaintext exports. `inner` (also a
+    // full plaintext copy) is wiped by its Zeroizing wrapper.
+    let wrapped = Zeroizing::new(format!(r#"{{"db":{}}}"#, *inner));
+    inner.zeroize();
+    Ok(wrapped)
 }
 
 /// AES-256-GCM decrypt with separately-supplied tag (Aegis stores ct and tag

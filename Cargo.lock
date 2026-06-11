@@ -1646,6 +1646,7 @@ dependencies = [
  "keyroost-resolve",
  "keyroost-rsakey",
  "keyroost-transport",
+ "zeroize",
 ]
 
 [[package]]
@@ -1680,6 +1681,7 @@ dependencies = [
  "scrypt",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -1723,6 +1725,7 @@ dependencies = [
  "keyroost-import",
  "png",
  "rqrr",
+ "zeroize",
 ]
 
 [[package]]

@@ -99,7 +99,7 @@ fn round_trip_decrypts_to_known_plaintext() {
     let recovered =
         keyroost_import::aegis::decrypt(&vault, b"correct horse battery staple").expect("decrypt");
     // `decrypt` returns the wrapped form so `parse` can consume it directly.
-    assert_eq!(recovered, format!(r#"{{"db":{}}}"#, plaintext_db));
+    assert_eq!(*recovered, format!(r#"{{"db":{}}}"#, plaintext_db));
 
     let entries = keyroost_import::aegis::parse(&recovered).expect("parse");
     assert_eq!(entries.len(), 1);

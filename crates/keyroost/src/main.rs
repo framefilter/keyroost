@@ -877,7 +877,9 @@ impl App {
             }
         } else {
             self.bulk_dialog.needs_password = false;
-            text
+            // Plaintext exports carry the seeds in clear too — same wipe-on-
+            // drop treatment as the decrypted variant.
+            zeroize::Zeroizing::new(text)
         };
 
         match keyroost_import::parse_bulk_any(&final_text) {

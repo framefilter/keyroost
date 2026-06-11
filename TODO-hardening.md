@@ -22,9 +22,10 @@ done and committed on this branch.
 
 - [x] Zeroize `PinUvAuthToken` and the CTAP shared secrets on drop
 - [x] Zeroize CLI-side secret strings (`read_secret` / `gather_secret` returns)
-- [ ] Zeroize imported TOTP seeds: `BulkEntry.secret`, the decrypted Aegis
-      vault plaintext, and GA migration entry buffers currently drop without
-      wiping (SECURITY.md is scoped to match until this lands)
+- [x] Zeroize imported TOTP seeds: `BulkEntry.secret` and `OtpAuth.secret`
+      wipe on drop (with Debug redacted to the byte count), and the decrypted
+      Aegis plaintext, GA migration buffers, and decoded QR payloads ride in
+      `Zeroizing` wrappers end to end
 
 ## Phase 4 — documentation
 

@@ -104,7 +104,9 @@ pub fn texts_from_image(bytes: &[u8]) -> Result<Vec<String>, QrError> {
 /// Decode a QR image into import entries, accepting both standard
 /// `otpauth://` enrollment QRs and Google Authenticator export batches.
 pub fn entries_from_image(bytes: &[u8]) -> Result<QrImport, QrError> {
-    let texts = texts_from_image(bytes)?;
+    // The decoded payloads are otpauth:// URIs carrying the seeds in clear;
+    // wipe them on every exit path once parsing is done.
+    let texts = zeroize::Zeroizing::new(texts_from_image(bytes)?);
     let mut import = QrImport {
         entries: Vec::new(),
         skipped: Vec::new(),
@@ -117,7 +119,7 @@ pub fn entries_from_image(bytes: &[u8]) -> Result<QrImport, QrError> {
     // when no payload in the image yielded anything.
     let mut payload_err: Option<String> = None;
     let mut any_parsed = false;
-    for text in &texts {
+    for text in texts.iter() {
         if migration::is_migration_uri(text) {
             any_otpauth = true;
             match migration::parse(text) {
@@ -141,14 +143,7 @@ pub fn entries_from_image(bytes: &[u8]) -> Result<QrImport, QrError> {
                 Ok(parsed) => {
                     let parsed: OtpAuth = parsed;
                     any_parsed = true;
-                    import.entries.push(BulkEntry {
-                        issuer: parsed.issuer,
-                        account: parsed.account,
-                        secret: parsed.secret,
-                        algorithm: parsed.algorithm,
-                        digits: parsed.digits,
-                        time_step: parsed.time_step,
-                    });
+                    import.entries.push(parsed.into());
                 }
                 Err(e) => {
                     payload_err.get_or_insert(e.to_string());

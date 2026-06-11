@@ -75,10 +75,16 @@ pub fn parse(uri: &str) -> Result<Migration, BulkError> {
     ))?;
     // The value may arrive percent-encoded (%2B %2F %3D) — decode that, but
     // do NOT apply form-decoding's '+'→space rule: '+' here is base64.
-    let data = percent_decode_keep_plus(data)
-        .ok_or(BulkError::UnsupportedFormat("bad percent-encoding in data"))?;
-    let payload = base64_decode(&data)
-        .map_err(|_| BulkError::UnsupportedFormat("migration data is not valid base64"))?;
+    // Both intermediates carry every seed in the batch (base64-coded and
+    // raw), so they wipe on drop; the caller owns the URI string itself.
+    let data = zeroize::Zeroizing::new(
+        percent_decode_keep_plus(data)
+            .ok_or(BulkError::UnsupportedFormat("bad percent-encoding in data"))?,
+    );
+    let payload = zeroize::Zeroizing::new(
+        base64_decode(&data)
+            .map_err(|_| BulkError::UnsupportedFormat("migration data is not valid base64"))?,
+    );
     parse_payload(&payload)
 }
 

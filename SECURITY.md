@@ -29,10 +29,11 @@ What keyroost defends against:
   and bounded; a fuzzing device gets an error, not a hang or a panic.
 - **Accidental secret disclosure by the tool itself.** Secrets are never
   written to disk; `--debug` traces redact secret-bearing command bodies;
-  PINs, CTAP session secrets, and RSA key components are zeroized on drop
-  (imported TOTP seeds passing through vault/QR import buffers are not yet
-  — tracked in TODO-hardening.md); secrets are accepted via env/stdin
-  rather than argv.
+  secret-typed memory is zeroized on drop where Rust allows — PINs, CTAP
+  session secrets, RSA key components, imported TOTP seeds, and the
+  decrypted-vault / QR-payload buffers they pass through (buffer
+  reallocations and library-internal copies remain out of reach); secrets
+  are accepted via env/stdin rather than argv.
 
 What keyroost does **not** defend against:
 

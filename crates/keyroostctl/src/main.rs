@@ -1390,15 +1390,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Some(u) => u.to_owned(),
                     None => return Err("import requires an otpauth:// URI or --qr <image>".into()),
                 };
-                let p = keyroost_import::parse_otpauth(&uri)?;
-                keyroost_import::BulkEntry {
-                    issuer: p.issuer,
-                    account: p.account,
-                    secret: p.secret,
-                    algorithm: p.algorithm,
-                    digits: p.digits,
-                    time_step: p.time_step,
-                }
+                keyroost_import::parse_otpauth(&uri)?.into()
             };
             let final_title = title.clone().unwrap_or_else(|| entry.suggested_title());
             if final_title.is_empty() || final_title.len() > 12 {

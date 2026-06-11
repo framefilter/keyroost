@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::otpauth::{parse as parse_otpauth, OtpAuth, OtpAuthError};
 
 /// One normalized entry ready to be programmed into a Molto2 profile slot.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BulkEntry {
     pub issuer: Option<String>,
     pub account: Option<String>,
@@ -17,6 +17,31 @@ pub struct BulkEntry {
     pub algorithm: HmacAlgo,
     pub digits: OtpDigits,
     pub time_step: TimeStep,
+}
+
+/// Manual Debug so a stray `{:?}` in logs or error context can't print the
+/// seed; only its length is shown.
+impl std::fmt::Debug for BulkEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkEntry")
+            .field("issuer", &self.issuer)
+            .field("account", &self.account)
+            .field("secret", &format_args!("[{} bytes]", self.secret.len()))
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("time_step", &self.time_step)
+            .finish()
+    }
+}
+
+/// Imported seeds are wiped when the entry is dropped — these are the
+/// highest-value secrets the tool touches, often dozens at once from a
+/// vault or QR batch.
+impl Drop for BulkEntry {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+    }
 }
 
 impl BulkEntry {
@@ -49,11 +74,14 @@ impl BulkEntry {
 }
 
 impl From<OtpAuth> for BulkEntry {
-    fn from(p: OtpAuth) -> Self {
+    fn from(mut p: OtpAuth) -> Self {
+        // `take` rather than move: OtpAuth has a zeroizing Drop, so its
+        // fields can't be moved out directly. The secret buffer itself is
+        // moved (not copied), keeping a single wipeable allocation.
         BulkEntry {
-            issuer: p.issuer,
-            account: p.account,
-            secret: p.secret,
+            issuer: p.issuer.take(),
+            account: p.account.take(),
+            secret: std::mem::take(&mut p.secret),
             algorithm: p.algorithm,
             digits: p.digits,
             time_step: p.time_step,
@@ -175,10 +203,10 @@ pub mod aegis {
     }
 
     /// Decrypt an Aegis encrypted vault and return the inner plaintext JSON,
-    /// which can then be passed back to `parse()`. Requires the `encrypted`
-    /// crate feature.
+    /// which can then be passed back to `parse()`. The returned buffer wipes
+    /// itself on drop. Requires the `encrypted` crate feature.
     #[cfg(feature = "encrypted")]
-    pub fn decrypt(json: &str, password: &[u8]) -> Result<String, BulkError> {
+    pub fn decrypt(json: &str, password: &[u8]) -> Result<zeroize::Zeroizing<String>, BulkError> {
         crate::encrypted::decrypt_aegis(json, password)
     }
 }

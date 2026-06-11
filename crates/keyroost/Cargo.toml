@@ -33,6 +33,9 @@ egui = "0.29"
 # use lets the OTP auto-clear check the clipboard still holds *our* code
 # before wiping it, instead of clobbering whatever the user copied since.
 arboard = { version = "3", default-features = false }
+# Same scoped exception as the rest of the workspace (already in the tree
+# via keyroost-import): wipe seed-bearing buffers on drop.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 # cargo-binstall support: `cargo binstall` fetches the existing attested
 # GitHub release archives (same artifacts, same SHA256SUMS/provenance)
