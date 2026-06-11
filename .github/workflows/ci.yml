@@ -32,7 +32,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # Linux links against system libraries the other platforms provide natively:
       #  - libpcsclite-dev: the `pcsc` crate (keyroost-transport). macOS uses the
@@ -111,7 +111,7 @@ jobs:
             libxkbcommon libxcb wayland mesa \
             rust
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Build
         run: cargo build --workspace --locked
