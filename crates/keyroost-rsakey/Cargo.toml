@@ -17,7 +17,7 @@ workspace = true
 # crates dependency-free and lets both front-ends (keyroostctl, keyroost) share the
 # exact same key path. `rsa` re-exports the pkcs1/pkcs8 decoders we use.
 rsa = "0.9"
-rand = "0.8"
+rand = "0.10"
 # Part of the same scoped exception: `rsa` already pulls zeroize in, and the
 # workspace-wide forbid(unsafe_code) rules out a hand-rolled volatile wipe.
 # Used to scrub the extracted CRT components on drop.
