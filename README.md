@@ -133,6 +133,14 @@ packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 > but may fail on older ones (e.g. RHEL 9) with a `GLIBC_…` error. When in doubt,
 > build from source with the commands above — `cargo install` handles the rest.
 
+> **Wayland and clipboard auto-clear:** after copying an OTP code the GUI
+> clears the clipboard ~45 s later, but only if the clipboard still holds that
+> code. The check reads the clipboard via X11/XWayland; on a pure-Wayland
+> session without XWayland clipboard sync it can't see the contents and fails
+> open (nothing is cleared) rather than clobbering whatever you copied since.
+> GNOME and KDE sync the two clipboards, so the clear works there; on other
+> compositors treat the auto-clear as best-effort.
+
 ### FIDO HID access (Linux udev rules)
 
 The OATH, OpenPGP, and PIV applets are reached over PC/SC and need no special

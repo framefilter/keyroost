@@ -26,11 +26,14 @@ jobs:
         with:
           toolchain: stable
 
+      # Caches ~/.cargo/bin, so the from-source install below is only paid
+      # when the cache rolls over, not on every dependency-bump PR.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
       # Installed from source with --locked rather than via a third-party
-      # installer action: one less moving part in the trust chain, and this
-      # job is not latency-sensitive.
+      # installer action: one less moving part in the trust chain.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
 
       - name: Audit dependencies
         run: cargo audit

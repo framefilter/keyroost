@@ -36,8 +36,18 @@ jobs:
         with:
           toolchain: nightly
 
+      # Caches ~/.cargo/bin (the cargo-fuzz binary) and the instrumented
+      # build trees — without it every weekly matrix job recompiled
+      # cargo-fuzz from source plus the whole dependency tree for ~2 min
+      # of actual fuzzing.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
 
       - name: Fuzz ${{ matrix.target }}
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=120

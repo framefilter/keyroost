@@ -88,12 +88,11 @@ anyone with the Linux build prerequisites from the README.
       the window (seconds for a stock vault, minutes at the scrypt caps);
       route through the existing job mechanism, mindful that the worker
       thread serializes device I/O.
-- [ ] **Wayland clipboard clear** — the conditional clear reads via
-      arboard's X11 backend; on pure-Wayland sessions without XWayland
-      clipboard sync it fails open and never clears. No complete fix known
-      (wl-data-control is wlroots-only); document or detect.
-- [ ] **CI cache for fuzz/audit jobs** — both `cargo install` cargo-fuzz /
-      cargo-audit from source every run; cache the binaries.
+- [x] **Wayland clipboard clear** — documented in the README as best-effort
+      on pure-Wayland sessions without XWayland clipboard sync (no complete
+      fix known; wl-data-control is wlroots-only).
+- [x] **CI cache for fuzz/audit jobs** — Swatinem/rust-cache (cache-bin
+      covers the installed binaries) added to both workflows.
 - [x] **Clipboard conditional clear** — done via arboard (already in the
       tree through eframe): clears only when the clipboard still holds the
       copied code; fails open if unreadable.
