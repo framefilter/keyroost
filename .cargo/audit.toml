@@ -1,0 +1,12 @@
+# cargo-audit configuration — advisory ignores need a written justification.
+
+[advisories]
+ignore = [
+    # Marvin Attack: timing side-channel in RSA PKCS#1 v1.5 *decryption*
+    # (`rsa` crate, no fixed release). keyroost-rsakey uses the crate only
+    # for host-side key generation and PKCS#1/PKCS#8 serialization during
+    # OpenPGP import — it never decrypts attacker-supplied ciphertexts, so
+    # the vulnerable code path is unreachable. Revisit when a fixed `rsa`
+    # version ships.
+    "RUSTSEC-2023-0071",
+]

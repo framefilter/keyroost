@@ -1363,8 +1363,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 match import.entries.len() {
                     0 => {
                         return Err(
-                            "QR decoded, but no account could be imported (see skips above)"
-                                .into(),
+                            "QR decoded, but no account could be imported (see skips above)".into(),
                         )
                     }
                     1 => import.entries.into_iter().next().unwrap(),
