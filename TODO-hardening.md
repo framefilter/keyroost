@@ -80,9 +80,14 @@ anyone with the Linux build prerequisites from the README.
       templates + one-time setup steps in packaging/. Remaining manual:
       the account/secret setup and first publishes per packaging/README.md.
       Flatpak ruled out (pcscd/hidraw sandboxing).
-- [ ] **Branch/tag protection** — repo settings, must be done in the GitHub
-      UI by an admin: protect `main` (require PR + green CI), protect `v*`
-      tags (maintainers only; tag push is release authority).
+- [x] **Branch/tag protection (light)** — repository rulesets: `v*` tag
+      creation/update/deletion is admin-only (tag push is release
+      authority), and `main` rejects force-pushes and deletion for
+      everyone. Direct pushes to `main` remain allowed.
+- [ ] **Branch protection (full)** — require PR + green CI for `main`.
+      Deliberately deferred until the product is feature-complete and
+      stable: it ends the direct-push workflow, so adopt it when release
+      cadence slows.
 - [x] **GUI: move slow imports off the frame loop** — QR decode, vault
       decrypt, and export parse run on a dedicated import thread (not the
       device worker, which serializes card I/O behind whatever runs on it);
