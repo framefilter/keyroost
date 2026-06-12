@@ -323,16 +323,26 @@ for the smartcard applets.
   adds the card transmit + `61xx`/GET RESPONSE loop, reader discovery
   (`list_piv_readers`, `NoPivApplet` on `6A82`), and a read-only `status()`
   (version, serial, PIN retries, per-slot cert presence). `keyroostctl piv status`
-  prints it. **Hardware-verified on the test YubiKey:** version `5.7.4`, serial
-  `37806840` (matches the OpenPGP/CCID serial), PIN retries `3`, all four slots
-  empty — read-only, no PIN/touch.
-  **Remaining PIV scope (write/auth — future):** GENERAL AUTHENTICATE (sign /
-  decrypt / key agreement with the slot keys), GENERATE ASYMMETRIC KEY PAIR,
-  certificate import (PUT DATA), PIN/PUK management (CHANGE REFERENCE DATA, RESET
-  RETRY COUNTER), and management-key authentication (3DES/AES challenge-response).
-  X.509 cert parsing beyond presence/length is also out of scope for now.
-  (Supersedes the earlier "PIV — demoted" note: upstream `piv-authenticator` is
-  archived but remains a fine spec reference.)
+  prints it.
+  **PIV write/auth — DONE + hardware-verified (2026-06-12).** The byte layer
+  gained GENERAL AUTHENTICATE (management-key witness/mutual-auth and key-slot
+  signing), GENERATE ASYMMETRIC KEY PAIR, PUT DATA (cert import), CHANGE
+  REFERENCE DATA / RESET RETRY COUNTER (PIN/PUK), and the Yubico SET MANAGEMENT
+  KEY / SET PIN RETRIES / GET METADATA / RESET extensions, plus a pure SPKI→PEM
+  builder for generated public keys (RSA + the NIST/Edwards curves). The
+  management-key block-cipher math (AES-128/192/256 + 3DES ECB witness/challenge)
+  lives in `keyroost_transport::PivSession` behind a scoped `aes`/`des`/`getrandom`
+  dependency exception; the byte layer stays pure. `keyroostctl piv` exposes
+  change-pin/puk, unblock-pin, set-retries, change-management-key, generate-key,
+  import-cert, export-cert, and reset; the GUI PIV pane mirrors all of it. The
+  whole lifecycle was exercised on the test YubiKey (5.7.4, AES-192 default
+  management key): mutual auth incl. wrong-key rejection, EC/RSA key generation
+  (openssl-validated PEM), cert import/export round-trip (extended-length APDUs),
+  PIN/PUK change + block/unblock with correct try counts, retry-count setting,
+  AES-256 management-key rotation, and reset (which the card gates on PIN+PUK
+  both blocked). Out of scope still: host-side self-signed-cert / CSR assembly
+  (the slot-signing primitive exists; the X.509 TBS construction does not), and
+  X.509 parsing beyond presence/length.
 - **Yubico OTP — dropped for Trussed devices.** NK3/Solo 2 don't implement
   the 132-char keyboard OTP applet; HMAC challenge-response is folded into
   the OATH/secrets app. Revisit only if we target actual YubiKeys.

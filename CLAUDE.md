@@ -34,7 +34,7 @@ tool. Workspace contains:
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt | none |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | none |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
-| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; read path (status/GET DATA) | none |
+| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | none |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching, no hardware | `serde`, `serde_json` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading for OpenPGP import | `rsa`, `rand` (scoped exception) |

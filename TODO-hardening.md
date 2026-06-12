@@ -88,14 +88,14 @@ anyone with the Linux build prerequisites from the README.
       Deliberately deferred until the product is feature-complete and
       stable: it ends the direct-push workflow, so adopt it when release
       cadence slows.
-- [ ] **PIV write path** — keyroost-piv is read-only by design so far (the
-      only PIV commit is the read-path foundation; status/version/serial/
-      cert presence). Full functionality means: management-key
-      authentication (GENERAL AUTHENTICATE), key generation in the four
-      slots, certificate import (PUT DATA), and PIN/PUK/management-key
-      changes — SP 800-73-4 byte layer first (vendored, tests), then
-      transport, CLI, GUI. Generalizes across YubiKey/Nitrokey since PIV
-      is a NIST standard.
+- [x] **PIV write path** — DONE + hardware-verified (2026-06-12). Byte layer
+      (GENERAL AUTHENTICATE, GENERATE, PUT DATA cert, CHANGE REFERENCE / RESET
+      RETRY COUNTER, Yubico SET MGMT KEY / SET PIN RETRIES / GET METADATA /
+      RESET, SPKI→PEM), transport (AES/3DES mutual management-key auth + all
+      write ops, scoped aes/des/getrandom dep), CLI (`keyroostctl piv`
+      change-pin/puk, unblock-pin, set-retries, change-management-key,
+      generate-key, import-cert, export-cert, reset), and the full GUI PIV
+      pane. Generalizes across PIV devices since it's a NIST standard.
 - [ ] **Publish-channel accounts** — one-time setup per packaging/README.md
       before the first release: the `release-publish` environment approval
       gate, crates.io account + manual first publish + trusted-publisher

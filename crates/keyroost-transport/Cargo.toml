@@ -16,3 +16,12 @@ keyroost-oath = { path = "../keyroost-oath", version = "0.3.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.3.0" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.3.0" }
 pcsc = "2"
+# Scoped crypto exception (same reasoning as keyroost-ctap's aes/sha2 and
+# keyroost-rsakey's rsa): PIV card-management-key authentication is a
+# block-cipher witness/challenge round. AES (the 5.7+ default) and 3DES
+# (older keys) ECB single-block encrypt/decrypt are not worth hand-rolling
+# and getting subtly wrong; getrandom supplies the host challenge.
+aes = { version = "0.8", default-features = false }
+des = { version = "0.8", default-features = false }
+cipher = { version = "0.4", default-features = false }
+getrandom = "0.2"

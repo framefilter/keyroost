@@ -79,6 +79,17 @@ pub enum TransportError {
     PivParse(keyroost_piv::ParseError),
     /// No PIV applet is present on the selected card (`SW 6A82` on SELECT).
     NoPivApplet,
+    /// PIV management-key authentication failed (the card's challenge response
+    /// did not verify, i.e. the supplied management key is wrong).
+    PivManagementAuthFailed,
+    /// A PIV PIN/PUK verification failed; `tries_remaining` is the count the
+    /// card reported (`63 Cx`), or `None` when blocked / unknown.
+    PivPinRejected { tries_remaining: Option<u8> },
+    /// A PIV write needed an authorization (management key or PIN) that hadn't
+    /// been satisfied (`SW 6982`).
+    PivSecurityNotSatisfied,
+    /// A supplied PIV management key was the wrong length for its algorithm.
+    PivBadKeyLength,
 }
 
 impl fmt::Display for TransportError {
@@ -140,6 +151,25 @@ impl fmt::Display for TransportError {
             }
             TransportError::PivParse(e) => write!(f, "PIV response parse error: {}", e),
             TransportError::NoPivApplet => write!(f, "no PIV applet on this card"),
+            TransportError::PivManagementAuthFailed => {
+                write!(f, "PIV management-key authentication failed (wrong key)")
+            }
+            TransportError::PivPinRejected {
+                tries_remaining: Some(n),
+            } => write!(f, "PIV PIN/PUK rejected ({} tries remaining)", n),
+            TransportError::PivPinRejected {
+                tries_remaining: None,
+            } => write!(f, "PIV PIN/PUK rejected (may be blocked)"),
+            TransportError::PivSecurityNotSatisfied => write!(
+                f,
+                "PIV operation needs a management-key auth or PIN that wasn't satisfied"
+            ),
+            TransportError::PivBadKeyLength => {
+                write!(
+                    f,
+                    "PIV management key has the wrong length for its algorithm"
+                )
+            }
         }
     }
 }

@@ -57,7 +57,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "piv" => &Help {
             title: "PIV smart card",
-            body: "A US-government smart-card standard used for enterprise sign-in, VPNs and document signing. keyroost shows its status today; management is on the roadmap.",
+            body: "A US-government smart-card standard used for enterprise sign-in, VPNs and document signing. Manage it here: generate keys, import certificates, change the PIN/PUK and management key, and reset the applet. Writes need the management key (factory default 010203…0708).",
             slug: "/piv",
         },
         "molto" => &Help {

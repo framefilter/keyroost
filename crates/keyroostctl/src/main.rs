@@ -334,14 +334,138 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OpenpgpCmd,
     },
-    /// Read PIV (smartcard) status on a security key over PC/SC (read-only).
+    /// Manage the PIV (smartcard) applet on a security key over PC/SC: status,
+    /// PIN/PUK, management key, key generation, and certificate import/export.
     Piv {
         #[command(subcommand)]
         cmd: PivCmd,
     },
 }
 
-/// PIV subcommands. Read-only for now (see PLAN.md for the write/auth roadmap).
+/// A PIV key slot, selected on the CLI by its hex key reference.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliPivSlot {
+    /// 9A — PIV Authentication.
+    #[value(name = "9a")]
+    Auth,
+    /// 9C — Digital Signature.
+    #[value(name = "9c")]
+    Sign,
+    /// 9D — Key Management (decryption).
+    #[value(name = "9d")]
+    KeyMgmt,
+    /// 9E — Card Authentication.
+    #[value(name = "9e")]
+    CardAuth,
+}
+
+impl CliPivSlot {
+    fn to_slot(self) -> keyroost_piv::Slot {
+        match self {
+            CliPivSlot::Auth => keyroost_piv::Slot::Authentication,
+            CliPivSlot::Sign => keyroost_piv::Slot::Signature,
+            CliPivSlot::KeyMgmt => keyroost_piv::Slot::KeyManagement,
+            CliPivSlot::CardAuth => keyroost_piv::Slot::CardAuthentication,
+        }
+    }
+}
+
+/// Asymmetric key algorithm for `piv generate-key`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliPivKeyAlg {
+    Rsa1024,
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    #[value(name = "eccp256")]
+    EccP256,
+    #[value(name = "eccp384")]
+    EccP384,
+    Ed25519,
+    X25519,
+}
+
+impl CliPivKeyAlg {
+    fn to_alg(self) -> keyroost_piv::KeyAlg {
+        use keyroost_piv::KeyAlg::*;
+        match self {
+            CliPivKeyAlg::Rsa1024 => Rsa1024,
+            CliPivKeyAlg::Rsa2048 => Rsa2048,
+            CliPivKeyAlg::Rsa3072 => Rsa3072,
+            CliPivKeyAlg::Rsa4096 => Rsa4096,
+            CliPivKeyAlg::EccP256 => EccP256,
+            CliPivKeyAlg::EccP384 => EccP384,
+            CliPivKeyAlg::Ed25519 => Ed25519,
+            CliPivKeyAlg::X25519 => X25519,
+        }
+    }
+}
+
+/// Management-key cipher algorithm.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliPivMgmtAlg {
+    #[value(name = "3des")]
+    TripleDes,
+    Aes128,
+    Aes192,
+    Aes256,
+}
+
+impl CliPivMgmtAlg {
+    fn to_alg(self) -> keyroost_piv::MgmtAlg {
+        use keyroost_piv::MgmtAlg::*;
+        match self {
+            CliPivMgmtAlg::TripleDes => TripleDes,
+            CliPivMgmtAlg::Aes128 => Aes128,
+            CliPivMgmtAlg::Aes192 => Aes192,
+            CliPivMgmtAlg::Aes256 => Aes256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliPinPolicy {
+    Default,
+    Never,
+    Once,
+    Always,
+}
+
+impl CliPinPolicy {
+    fn to_policy(self) -> keyroost_piv::PinPolicy {
+        use keyroost_piv::PinPolicy::*;
+        match self {
+            CliPinPolicy::Default => Default,
+            CliPinPolicy::Never => Never,
+            CliPinPolicy::Once => Once,
+            CliPinPolicy::Always => Always,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliTouchPolicy {
+    Default,
+    Never,
+    Always,
+    Cached,
+}
+
+impl CliTouchPolicy {
+    fn to_policy(self) -> keyroost_piv::TouchPolicy {
+        use keyroost_piv::TouchPolicy::*;
+        match self {
+            CliTouchPolicy::Default => Default,
+            CliTouchPolicy::Never => Never,
+            CliTouchPolicy::Always => Always,
+            CliTouchPolicy::Cached => Cached,
+        }
+    }
+}
+
+/// Subcommands for the PIV smart-card applet. Secret material (PINs, PUK,
+/// management key) is read from env/stdin, never argv. The management key is a
+/// hex string (48 hex chars for AES-192 / 3DES, 32 for AES-128, 64 for AES-256).
 #[derive(Subcommand)]
 enum PivCmd {
     /// Show PIV status: version, serial, PIN retries, and which key slots hold a
@@ -349,6 +473,132 @@ enum PivCmd {
     Status {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
+    },
+    /// Change the PIV PIN.
+    ChangePin {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
+        old_pin_env: Option<String>,
+        #[arg(long)]
+        old_pin_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
+        #[arg(long)]
+        new_pin_stdin: bool,
+    },
+    /// Change the PUK (PIN Unblocking Key).
+    ChangePuk {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "old_puk_stdin")]
+        old_puk_env: Option<String>,
+        #[arg(long)]
+        old_puk_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_puk_stdin")]
+        new_puk_env: Option<String>,
+        #[arg(long)]
+        new_puk_stdin: bool,
+    },
+    /// Unblock a blocked PIN using the PUK, setting a new PIN.
+    UnblockPin {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "puk_stdin")]
+        puk_env: Option<String>,
+        #[arg(long)]
+        puk_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
+        #[arg(long)]
+        new_pin_stdin: bool,
+    },
+    /// Set the PIN and PUK retry counts (resets both to factory defaults).
+    /// Needs the management key and the current PIN.
+    SetRetries {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "N")]
+        pin_tries: u8,
+        #[arg(long, value_name = "N")]
+        puk_tries: u8,
+        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        mgmt_key_env: Option<String>,
+        #[arg(long)]
+        mgmt_key_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+    },
+    /// Change the card-management (9B) key.
+    ChangeManagementKey {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "old_mgmt_key_stdin")]
+        old_mgmt_key_env: Option<String>,
+        #[arg(long)]
+        old_mgmt_key_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_mgmt_key_stdin")]
+        new_mgmt_key_env: Option<String>,
+        #[arg(long)]
+        new_mgmt_key_stdin: bool,
+        /// Algorithm of the NEW management key.
+        #[arg(long, value_enum, default_value = "aes192")]
+        new_algorithm: CliPivMgmtAlg,
+        /// Require a physical touch for every future management-key auth.
+        #[arg(long)]
+        touch: bool,
+    },
+    /// Generate a new key pair in a slot and print its public key (PEM). Needs
+    /// the management key. Overwrites any existing key in the slot.
+    GenerateKey {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        #[arg(long, value_enum, default_value = "eccp256")]
+        algorithm: CliPivKeyAlg,
+        #[arg(long, value_enum, default_value = "default")]
+        pin_policy: CliPinPolicy,
+        #[arg(long, value_enum, default_value = "default")]
+        touch_policy: CliTouchPolicy,
+        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        mgmt_key_env: Option<String>,
+        #[arg(long)]
+        mgmt_key_stdin: bool,
+    },
+    /// Import a DER or PEM X.509 certificate into a slot. Needs the management key.
+    ImportCert {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Path to a `.der` or `.pem` certificate file.
+        #[arg(long, value_name = "PATH")]
+        file: std::path::PathBuf,
+        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        mgmt_key_env: Option<String>,
+        #[arg(long)]
+        mgmt_key_stdin: bool,
+    },
+    /// Export a slot's certificate (DER) to a file or stdout. No PIN required.
+    ExportCert {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Output path; omit to write DER to stdout.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Reset the PIV application to factory defaults. Only works when BOTH the
+    /// PIN and PUK are already blocked. Wipes all keys, certs, and PINs.
+    Reset {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -2411,8 +2661,253 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
         }
+
+        PivCmd::ChangePin {
+            reader,
+            old_pin_env,
+            old_pin_stdin,
+            new_pin_env,
+            new_pin_stdin,
+        } => {
+            let old = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
+            let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            s.change_pin(old.as_bytes(), new.as_bytes())?;
+            println!("PIN changed.");
+        }
+
+        PivCmd::ChangePuk {
+            reader,
+            old_puk_env,
+            old_puk_stdin,
+            new_puk_env,
+            new_puk_stdin,
+        } => {
+            let old = read_secret("old PUK", old_puk_env.as_deref(), *old_puk_stdin)?;
+            let new = read_secret("new PUK", new_puk_env.as_deref(), *new_puk_stdin)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            s.change_puk(old.as_bytes(), new.as_bytes())?;
+            println!("PUK changed.");
+        }
+
+        PivCmd::UnblockPin {
+            reader,
+            puk_env,
+            puk_stdin,
+            new_pin_env,
+            new_pin_stdin,
+        } => {
+            let puk = read_secret("PUK", puk_env.as_deref(), *puk_stdin)?;
+            let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
+            println!("PIN unblocked and reset.");
+        }
+
+        PivCmd::SetRetries {
+            reader,
+            pin_tries,
+            puk_tries,
+            mgmt_key_env,
+            mgmt_key_stdin,
+            pin_env,
+            pin_stdin,
+        } => {
+            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let alg = s.management_key_algorithm();
+            s.authenticate_management(alg, &mgmt)?;
+            s.verify_pin(pin.as_bytes())?;
+            s.set_pin_retries(*pin_tries, *puk_tries)?;
+            println!(
+                "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults.",
+                pin_tries, puk_tries
+            );
+        }
+
+        PivCmd::ChangeManagementKey {
+            reader,
+            old_mgmt_key_env,
+            old_mgmt_key_stdin,
+            new_mgmt_key_env,
+            new_mgmt_key_stdin,
+            new_algorithm,
+            touch,
+        } => {
+            let old = read_mgmt_key(
+                "old management key",
+                old_mgmt_key_env.as_deref(),
+                *old_mgmt_key_stdin,
+            )?;
+            let new = read_mgmt_key(
+                "new management key",
+                new_mgmt_key_env.as_deref(),
+                *new_mgmt_key_stdin,
+            )?;
+            let new_alg = new_algorithm.to_alg();
+            if new.len() != new_alg.key_len() {
+                return Err(format!(
+                    "new management key is {} bytes; {} needs {}",
+                    new.len(),
+                    new_alg.label(),
+                    new_alg.key_len()
+                )
+                .into());
+            }
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let cur_alg = s.management_key_algorithm();
+            s.authenticate_management(cur_alg, &old)?;
+            s.set_management_key(new_alg, &new, *touch)?;
+            println!(
+                "Management key changed to {}{}.",
+                new_alg.label(),
+                if *touch { " (touch required)" } else { "" }
+            );
+        }
+
+        PivCmd::GenerateKey {
+            reader,
+            slot,
+            algorithm,
+            pin_policy,
+            touch_policy,
+            mgmt_key_env,
+            mgmt_key_stdin,
+        } => {
+            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
+            let alg = algorithm.to_alg();
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt_alg = s.management_key_algorithm();
+            s.authenticate_management(mgmt_alg, &mgmt)?;
+            eprintln!(
+                "Generating {} in {} (touch the key if it blinks)\u{2026}",
+                alg.label(),
+                slot.to_slot().label()
+            );
+            let pubkey = s.generate_key(
+                slot.to_slot(),
+                alg,
+                pin_policy.to_policy(),
+                touch_policy.to_policy(),
+            )?;
+            match keyroost_piv::spki::subject_public_key_info(&pubkey, alg) {
+                Ok(der) => print!("{}", keyroost_piv::spki::to_pem(&der)),
+                Err(e) => {
+                    return Err(
+                        format!("key generated, but encoding its public key failed: {}", e).into(),
+                    )
+                }
+            }
+        }
+
+        PivCmd::ImportCert {
+            reader,
+            slot,
+            file,
+            mgmt_key_env,
+            mgmt_key_stdin,
+        } => {
+            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
+            let bytes =
+                std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
+            let der = cert_to_der(&bytes)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let mgmt_alg = s.management_key_algorithm();
+            s.authenticate_management(mgmt_alg, &mgmt)?;
+            s.import_certificate(slot.to_slot(), &der)?;
+            println!(
+                "Imported {}-byte certificate into {}.",
+                der.len(),
+                slot.to_slot().label()
+            );
+        }
+
+        PivCmd::ExportCert { reader, slot, file } => {
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            match s.read_certificate(slot.to_slot())? {
+                None => {
+                    return Err(format!("{} holds no certificate", slot.to_slot().label()).into())
+                }
+                Some(der) => match file {
+                    Some(path) => {
+                        std::fs::write(path, &der)
+                            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                        eprintln!(
+                            "Wrote {}-byte DER certificate to {}.",
+                            der.len(),
+                            path.display()
+                        );
+                    }
+                    None => {
+                        use std::io::Write;
+                        std::io::stdout().write_all(&der)?;
+                    }
+                },
+            }
+        }
+
+        PivCmd::Reset { reader, yes } => {
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            let st = s.status()?;
+            let serial = st
+                .serial
+                .map(|v| format!("serial {}", v))
+                .unwrap_or_else(|| "this device".into());
+            if !yes {
+                return Err(format!(
+                    "refusing to reset the PIV application on {} without --yes \
+                     (this wipes all PIV keys, certificates, and PINs)",
+                    serial
+                )
+                .into());
+            }
+            s.reset()?;
+            println!("PIV application reset to factory defaults on {}.", serial);
+        }
     }
     Ok(())
+}
+
+/// Open the PIV session on the reader matching `reader` (or the sole PIV reader).
+fn open_piv(
+    reader: Option<&str>,
+    debug: bool,
+) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
+    let readers = keyroost_transport::PivSession::list_piv_readers()?;
+    let name = resolve_reader(readers, reader, "PIV")?;
+    eprintln!("\u{2192} PIV on {}", name);
+    let mut session = keyroost_transport::PivSession::open(&name)?;
+    session.set_debug(debug);
+    Ok(session)
+}
+
+/// Read a management key (a hex string) from env/stdin and decode it to bytes.
+fn read_mgmt_key(
+    label: &str,
+    env: Option<&str>,
+    from_stdin: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let hex = read_secret(label, env, from_stdin)?;
+    Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
+}
+
+/// Accept a certificate as DER or PEM, returning DER bytes.
+fn cert_to_der(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(bytes).unwrap_or("");
+    if let Some(start) = text.find("-----BEGIN CERTIFICATE-----") {
+        let after = &text[start + "-----BEGIN CERTIFICATE-----".len()..];
+        let end = after
+            .find("-----END CERTIFICATE-----")
+            .ok_or("PEM certificate has no END marker")?;
+        let b64: String = after[..end].split_whitespace().collect();
+        return Ok(keyroost_proto::codec::base64_decode(&b64)?);
+    }
+    // Not PEM — assume DER (must at least start with a SEQUENCE tag).
+    if bytes.first() != Some(&0x30) {
+        return Err("certificate is neither PEM nor DER (no 0x30 SEQUENCE)".into());
+    }
+    Ok(bytes.to_vec())
 }
 
 /// Map an OpenPGP algorithm id (first attribute byte) to a short label.
@@ -2846,6 +3341,12 @@ fn env_prefix_for(label: &str) -> &'static str {
         "PIN" => "pin-",
         "new PIN" => "new-pin-",
         "old PIN" => "old-pin-",
+        "PUK" => "puk-",
+        "new PUK" => "new-puk-",
+        "old PUK" => "old-puk-",
+        "management key" => "mgmt-key-",
+        "old management key" => "old-mgmt-key-",
+        "new management key" => "new-mgmt-key-",
         _ => "",
     }
 }

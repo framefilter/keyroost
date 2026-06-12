@@ -214,16 +214,179 @@ impl OpenPgpSlotSel {
     }
 }
 
-/// State for the PIV pane. Read-only today: a status snapshot driven over PC/SC,
-/// keyed (like OATH/OpenPGP) by the selected device's reader name.
-#[derive(Default)]
+/// State for the PIV pane: a status snapshot plus the entry fields for the full
+/// management surface (PIN/PUK, management key, key generation, certificate
+/// import/export, reset), keyed by the selected device's reader name.
 struct PivState {
     /// Last status read from the selected card.
     status: Option<keyroost_transport::PivStatus>,
-    /// User-facing error from the last read.
+    /// User-facing error from the last read/write.
     error: Option<String>,
+    /// Success/info line from the last write operation.
+    notice: Option<String>,
     /// True once a status has been fetched for the current selection.
     loaded: bool,
+    /// Management key (hex) entered to authorize key-gen / cert-import /
+    /// set-retries / management-key change. Cleared after use.
+    mgmt_key_input: String,
+    /// Change-PIN old/new entries. Cleared after use.
+    pin_old: String,
+    pin_new: String,
+    /// Change-PUK old/new entries. Cleared after use.
+    puk_old: String,
+    puk_new: String,
+    /// Unblock-PIN: PUK + new PIN entries. Cleared after use.
+    unblock_puk: String,
+    unblock_new_pin: String,
+    /// PIN/PUK retry counts for set-retries, and the PIN that authorizes it.
+    retries_pin: u8,
+    retries_puk: u8,
+    retries_pin_auth: String,
+    /// Key-generation slot + algorithm selectors.
+    gen_slot: PivSlotSel,
+    gen_alg: PivKeyAlgSel,
+    /// PEM of the most recently generated public key, shown for copying.
+    gen_pubkey_pem: Option<String>,
+    /// Certificate import slot + file path.
+    cert_slot: PivSlotSel,
+    cert_path: String,
+    /// Certificate export slot + destination path.
+    export_slot: PivSlotSel,
+    export_path: String,
+    /// New management key (hex) + algorithm for a management-key rotation.
+    new_mgmt_key_input: String,
+    new_mgmt_alg: PivMgmtAlgSel,
+    /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
+    confirm_reset: Option<String>,
+}
+
+impl Default for PivState {
+    fn default() -> Self {
+        PivState {
+            status: None,
+            error: None,
+            notice: None,
+            loaded: false,
+            mgmt_key_input: String::new(),
+            pin_old: String::new(),
+            pin_new: String::new(),
+            puk_old: String::new(),
+            puk_new: String::new(),
+            unblock_puk: String::new(),
+            unblock_new_pin: String::new(),
+            retries_pin: 3,
+            retries_puk: 3,
+            retries_pin_auth: String::new(),
+            gen_slot: PivSlotSel::default(),
+            gen_alg: PivKeyAlgSel::default(),
+            gen_pubkey_pem: None,
+            cert_slot: PivSlotSel::default(),
+            cert_path: String::new(),
+            export_slot: PivSlotSel::default(),
+            export_path: String::new(),
+            new_mgmt_key_input: String::new(),
+            new_mgmt_alg: PivMgmtAlgSel::default(),
+            confirm_reset: None,
+        }
+    }
+}
+
+/// PIV key-slot selector for the GUI controls.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PivSlotSel {
+    #[default]
+    Auth,
+    Sign,
+    KeyMgmt,
+    CardAuth,
+}
+
+impl PivSlotSel {
+    fn to_slot(self) -> keyroost_piv::Slot {
+        match self {
+            PivSlotSel::Auth => keyroost_piv::Slot::Authentication,
+            PivSlotSel::Sign => keyroost_piv::Slot::Signature,
+            PivSlotSel::KeyMgmt => keyroost_piv::Slot::KeyManagement,
+            PivSlotSel::CardAuth => keyroost_piv::Slot::CardAuthentication,
+        }
+    }
+    fn label(self) -> &'static str {
+        self.to_slot().label()
+    }
+    const ALL: [PivSlotSel; 4] = [
+        PivSlotSel::Auth,
+        PivSlotSel::Sign,
+        PivSlotSel::KeyMgmt,
+        PivSlotSel::CardAuth,
+    ];
+}
+
+/// PIV key-generation algorithm selector.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PivKeyAlgSel {
+    #[default]
+    EccP256,
+    EccP384,
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    Ed25519,
+}
+
+impl PivKeyAlgSel {
+    fn to_alg(self) -> keyroost_piv::KeyAlg {
+        use keyroost_piv::KeyAlg::*;
+        match self {
+            PivKeyAlgSel::EccP256 => EccP256,
+            PivKeyAlgSel::EccP384 => EccP384,
+            PivKeyAlgSel::Rsa2048 => Rsa2048,
+            PivKeyAlgSel::Rsa3072 => Rsa3072,
+            PivKeyAlgSel::Rsa4096 => Rsa4096,
+            PivKeyAlgSel::Ed25519 => Ed25519,
+        }
+    }
+    fn label(self) -> &'static str {
+        self.to_alg().label()
+    }
+    const ALL: [PivKeyAlgSel; 6] = [
+        PivKeyAlgSel::EccP256,
+        PivKeyAlgSel::EccP384,
+        PivKeyAlgSel::Rsa2048,
+        PivKeyAlgSel::Rsa3072,
+        PivKeyAlgSel::Rsa4096,
+        PivKeyAlgSel::Ed25519,
+    ];
+}
+
+/// PIV management-key algorithm selector (for rotation).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PivMgmtAlgSel {
+    #[default]
+    Aes192,
+    Aes128,
+    Aes256,
+    TripleDes,
+}
+
+impl PivMgmtAlgSel {
+    fn to_alg(self) -> keyroost_piv::MgmtAlg {
+        use keyroost_piv::MgmtAlg::*;
+        match self {
+            PivMgmtAlgSel::Aes192 => Aes192,
+            PivMgmtAlgSel::Aes128 => Aes128,
+            PivMgmtAlgSel::Aes256 => Aes256,
+            PivMgmtAlgSel::TripleDes => TripleDes,
+        }
+    }
+    fn label(self) -> &'static str {
+        self.to_alg().label()
+    }
+    const ALL: [PivMgmtAlgSel; 4] = [
+        PivMgmtAlgSel::Aes192,
+        PivMgmtAlgSel::Aes128,
+        PivMgmtAlgSel::Aes256,
+        PivMgmtAlgSel::TripleDes,
+    ];
 }
 
 /// A unit of work applied back to the [`App`] on the UI thread once a background
@@ -2417,6 +2580,52 @@ impl App {
             }
         }
     }
+
+    /// The reset confirmation modal for the PIV pane.
+    fn render_piv_confirms(&mut self, ctx: &egui::Context) {
+        if let Some(typed) = self.piv.confirm_reset.clone() {
+            let mut do_it = false;
+            let mut cancel = false;
+            let mut window_open = true;
+            let mut buf = typed;
+            egui::Window::new("Reset PIV applet?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut window_open)
+                .show(ctx, |ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 110, 110),
+                        "This wipes ALL PIV keys, certificates, and PINs.",
+                    );
+                    ui.label("Only works when the PIN and PUK are already blocked.");
+                    ui.label("This cannot be undone.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Type \u{201c}reset\u{201d} to confirm:");
+                        ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let armed = buf.trim() == "reset";
+                        if ui.add_enabled(armed, egui::Button::new("Reset")).clicked() {
+                            do_it = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if do_it {
+                self.piv.confirm_reset = None;
+                self.piv_reset();
+            } else if cancel || !window_open {
+                self.piv.confirm_reset = None;
+            } else {
+                self.piv.confirm_reset = Some(buf);
+            }
+        }
+    }
 }
 
 /// Map an OpenPGP algorithm id (first attribute byte) to a short label.
@@ -2652,6 +2861,316 @@ impl App {
         });
     }
 
+    /// Apply a PIV write result: on success store the notice and refreshed
+    /// status; on error store the message. Shared by every PIV write action.
+    fn apply_piv_write(
+        app: &mut App,
+        result: Result<keyroost_transport::PivStatus, TransportError>,
+        notice: String,
+    ) {
+        match result {
+            Ok(status) => {
+                app.piv.status = Some(status);
+                app.piv.error = None;
+                app.piv.notice = Some(notice);
+            }
+            Err(e) => {
+                app.piv.notice = None;
+                app.piv.error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Decode the management-key hex field, surfacing a parse error in the pane.
+    fn piv_mgmt_key_bytes(&mut self, hex: &str) -> Option<Vec<u8>> {
+        match keyroost_proto::codec::hex_decode(hex.trim()) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                self.piv.error = Some(format!("management key is not valid hex: {}", e));
+                None
+            }
+        }
+    }
+
+    fn piv_change_pin(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let (old, new) = (self.piv.pin_old.clone(), self.piv.pin_new.clone());
+        self.piv.notice = None;
+        self.spawn_job("Changing PIV PIN\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                s.change_pin(old.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.piv.pin_old.clear();
+                app.piv.pin_new.clear();
+                Self::apply_piv_write(app, result, "PIN changed.".into());
+            })
+        });
+    }
+
+    fn piv_change_puk(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let (old, new) = (self.piv.puk_old.clone(), self.piv.puk_new.clone());
+        self.piv.notice = None;
+        self.spawn_job("Changing PUK\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                s.change_puk(old.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.piv.puk_old.clear();
+                app.piv.puk_new.clear();
+                Self::apply_piv_write(app, result, "PUK changed.".into());
+            })
+        });
+    }
+
+    fn piv_unblock_pin(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let (puk, new) = (
+            self.piv.unblock_puk.clone(),
+            self.piv.unblock_new_pin.clone(),
+        );
+        self.piv.notice = None;
+        self.spawn_job("Unblocking PIN\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.piv.unblock_puk.clear();
+                app.piv.unblock_new_pin.clear();
+                Self::apply_piv_write(app, result, "PIN unblocked and reset.".into());
+            })
+        });
+    }
+
+    fn piv_set_retries(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let Some(mgmt) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
+            return;
+        };
+        let pin = self.piv.retries_pin_auth.clone();
+        let (pin_tries, puk_tries) = (self.piv.retries_pin, self.piv.retries_puk);
+        self.piv.notice = None;
+        self.spawn_job("Setting PIV retry counts\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let alg = s.management_key_algorithm();
+                s.authenticate_management(alg, &mgmt)?;
+                s.verify_pin(pin.as_bytes())?;
+                s.set_pin_retries(pin_tries, puk_tries)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.piv.mgmt_key_input.clear();
+                app.piv.retries_pin_auth.clear();
+                Self::apply_piv_write(
+                    app,
+                    result,
+                    "Retry counts set; PIN/PUK reset to defaults.".into(),
+                );
+            })
+        });
+    }
+
+    fn piv_generate_key(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let Some(mgmt) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
+            return;
+        };
+        let slot = self.piv.gen_slot.to_slot();
+        let alg = self.piv.gen_alg.to_alg();
+        self.piv.notice = None;
+        self.piv.gen_pubkey_pem = None;
+        self.spawn_job("Generating key\u{2026} (touch if it blinks)", move || {
+            let result = (|| -> Result<
+                (keyroost_piv::PublicKey, keyroost_transport::PivStatus),
+                TransportError,
+            > {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let mgmt_alg = s.management_key_algorithm();
+                s.authenticate_management(mgmt_alg, &mgmt)?;
+                let pubkey = s.generate_key(
+                    slot,
+                    alg,
+                    keyroost_piv::PinPolicy::Default,
+                    keyroost_piv::TouchPolicy::Default,
+                )?;
+                Ok((pubkey, s.status()?))
+            })();
+            Box::new(move |app: &mut App| {
+                app.piv.mgmt_key_input.clear();
+                match result {
+                    Ok((pubkey, status)) => {
+                        app.piv.status = Some(status);
+                        app.piv.error = None;
+                        match keyroost_piv::spki::subject_public_key_info(&pubkey, alg) {
+                            Ok(der) => {
+                                app.piv.gen_pubkey_pem = Some(keyroost_piv::spki::to_pem(&der));
+                                app.piv.notice = Some(format!("Generated {} key.", alg.label()));
+                            }
+                            Err(e) => {
+                                app.piv.notice = Some(format!(
+                                    "Generated {} key (public-key encoding failed: {})",
+                                    alg.label(),
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.piv.notice = None;
+                        app.piv.error = Some(e.to_string());
+                    }
+                }
+            })
+        });
+    }
+
+    fn piv_import_cert(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let Some(mgmt) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
+            return;
+        };
+        let slot = self.piv.cert_slot.to_slot();
+        let path = self.piv.cert_path.trim().to_owned();
+        self.piv.notice = None;
+        self.spawn_job("Importing certificate\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let bytes = std::fs::read(&path).map_err(|_| {
+                    TransportError::MalformedResponse("cannot read certificate file")
+                })?;
+                let der = cert_bytes_to_der(&bytes)
+                    .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let mgmt_alg = s.management_key_algorithm();
+                s.authenticate_management(mgmt_alg, &mgmt)?;
+                s.import_certificate(slot, &der)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.piv.mgmt_key_input.clear();
+                Self::apply_piv_write(app, result, "Certificate imported.".into());
+            })
+        });
+    }
+
+    fn piv_export_cert(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let slot = self.piv.export_slot.to_slot();
+        let path = self.piv.export_path.trim().to_owned();
+        if path.is_empty() {
+            self.piv.error = Some("enter a destination path for the certificate".into());
+            return;
+        }
+        self.piv.notice = None;
+        self.spawn_job("Exporting certificate\u{2026}", move || {
+            let result = (|| -> Result<usize, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let der = s
+                    .read_certificate(slot)?
+                    .ok_or(TransportError::MalformedResponse(
+                        "slot holds no certificate",
+                    ))?;
+                std::fs::write(&path, &der).map_err(|_| {
+                    TransportError::MalformedResponse("cannot write destination file")
+                })?;
+                Ok(der.len())
+            })();
+            Box::new(move |app: &mut App| match result {
+                Ok(n) => {
+                    app.piv.error = None;
+                    app.piv.notice = Some(format!("Exported {}-byte DER certificate.", n));
+                }
+                Err(e) => {
+                    app.piv.notice = None;
+                    app.piv.error = Some(e.to_string());
+                }
+            })
+        });
+    }
+
+    fn piv_change_management_key(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let Some(old) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
+            return;
+        };
+        let Some(new) = self.piv_mgmt_key_bytes(&self.piv.new_mgmt_key_input.clone()) else {
+            return;
+        };
+        let new_alg = self.piv.new_mgmt_alg.to_alg();
+        if new.len() != new_alg.key_len() {
+            self.piv.error = Some(format!(
+                "new management key is {} bytes; {} needs {}",
+                new.len(),
+                new_alg.label(),
+                new_alg.key_len()
+            ));
+            return;
+        }
+        self.piv.notice = None;
+        self.spawn_job("Changing management key\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let cur_alg = s.management_key_algorithm();
+                s.authenticate_management(cur_alg, &old)?;
+                s.set_management_key(new_alg, &new, false)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                app.piv.mgmt_key_input.clear();
+                app.piv.new_mgmt_key_input.clear();
+                Self::apply_piv_write(
+                    app,
+                    result,
+                    format!("Management key changed to {}.", new_alg.label()),
+                );
+            })
+        });
+    }
+
+    fn piv_reset(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        self.piv.notice = None;
+        self.spawn_job("Resetting PIV applet\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                s.reset()?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                Self::apply_piv_write(
+                    app,
+                    result,
+                    "PIV application reset to factory defaults.".into(),
+                );
+            })
+        });
+    }
+
     /// Apply the three rename-dialog actions shared by the security-key hero and
     /// the Molto2 hero: open the inline field, cancel it, or commit the name.
     /// The flags are collected during the `ui` closures (where `self` is already
@@ -2844,6 +3363,58 @@ fn text_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hin
         );
     });
     ui.add_space(4.0);
+}
+
+/// A PIV slot picker combo.
+fn piv_slot_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivSlotSel) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for opt in PivSlotSel::ALL {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
+/// A PIV key-algorithm picker combo.
+fn piv_keyalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivKeyAlgSel) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for opt in PivKeyAlgSel::ALL {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
+/// A PIV management-key-algorithm picker combo.
+fn piv_mgmtalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivMgmtAlgSel) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for opt in PivMgmtAlgSel::ALL {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
+/// Accept a certificate file's bytes as PEM or DER, returning DER. `None` when
+/// the bytes are neither.
+fn cert_bytes_to_der(bytes: &[u8]) -> Option<Vec<u8>> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if let Some(start) = text.find("-----BEGIN CERTIFICATE-----") {
+            let after = &text[start + "-----BEGIN CERTIFICATE-----".len()..];
+            let end = after.find("-----END CERTIFICATE-----")?;
+            let b64: String = after[..end].split_whitespace().collect();
+            return keyroost_proto::codec::base64_decode(&b64).ok();
+        }
+    }
+    // Not PEM — accept DER (must begin with a SEQUENCE tag).
+    if bytes.first() == Some(&0x30) {
+        Some(bytes.to_vec())
+    } else {
+        None
+    }
 }
 
 /// Paint a rounded glyph tile at `rect` with the painter (no widget allocation,
@@ -3258,6 +3829,7 @@ impl eframe::App for App {
         self.render_reset_dialog(ctx);
         self.render_oath_delete_confirm(ctx);
         self.render_openpgp_confirms(ctx);
+        self.render_piv_confirms(ctx);
         self.molto_dialogs(ctx, &p);
 
         // Help popover, painted last so it sits above everything.
@@ -4524,6 +5096,34 @@ impl App {
             self.piv_tried = true;
             self.load_piv_status();
         }
+        // Intents collected inside the UI closures and applied afterwards, so a
+        // submit method's `&mut self` never overlaps a card's borrow.
+        let mut do_refresh = false;
+        let mut go_change_pin = false;
+        let mut go_change_puk = false;
+        let mut go_unblock = false;
+        let mut go_generate = false;
+        let mut go_import = false;
+        let mut go_export = false;
+        let mut go_set_retries = false;
+        let mut go_change_mgmt = false;
+        let mut arm_reset = false;
+        let mut copy_pem: Option<String> = None;
+
+        let head = |ui: &mut egui::Ui, t: &str| {
+            ui.label(egui::RichText::new(t).font(theme::f_sb(14.0)).color(p.txt));
+        };
+        let sub = |ui: &mut egui::Ui, t: &str| {
+            ui.label(egui::RichText::new(t).font(theme::f_sb(12.5)).color(p.txt2));
+        };
+        let note = |ui: &mut egui::Ui, t: &str| {
+            ui.label(
+                egui::RichText::new(t)
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt3),
+            );
+        };
+
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("PIV smart card")
@@ -4533,18 +5133,22 @@ impl App {
             ui.add_space(6.0);
             self.help_dot(ui, p, "piv");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                theme::pill(ui, "read-only", p.txt3, p.raised2);
-                ui.add_space(6.0);
                 if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                    self.load_piv_status();
+                    do_refresh = true;
                 }
             });
         });
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         if let Some(err) = &self.piv.error {
             ui.colored_label(p.err, err);
             ui.add_space(6.0);
         }
+        if let Some(n) = &self.piv.notice {
+            ui.colored_label(p.ok, n);
+            ui.add_space(6.0);
+        }
+
+        // --- Status ---
         if let Some(st) = &self.piv.status {
             theme::card_frame(p).show(ui, |ui| {
                 kv(
@@ -4583,6 +5187,253 @@ impl App {
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
+        }
+        ui.add_space(10.0);
+
+        // --- Management key: authorizes key-gen / cert-import / retries / rotation ---
+        theme::card_frame(p).show(ui, |ui| {
+            head(ui, "Management key");
+            note(
+                ui,
+                "Hex key authorizing key generation, certificate import, retry \
+                 changes, and rotation below. Factory default is \
+                 010203040506070801020304050607080102030405060708. Sent for the \
+                 operation only; never stored.",
+            );
+            ui.add_space(6.0);
+            text_field(
+                ui,
+                p,
+                "Management key",
+                &mut self.piv.mgmt_key_input,
+                "hex (48/32/64 chars)",
+                300.0,
+            );
+        });
+        ui.add_space(10.0);
+
+        // --- PIN & PUK ---
+        egui::CollapsingHeader::new(
+            egui::RichText::new("PIN & PUK")
+                .font(theme::f_sb(13.5))
+                .color(p.txt),
+        )
+        .id_salt("piv-pin-puk")
+        .show(ui, |ui| {
+            theme::card_frame(p).show(ui, |ui| {
+                sub(ui, "Change PIN");
+                pin_field(ui, p, "Current PIN", &mut self.piv.pin_old);
+                pin_field(ui, p, "New PIN", &mut self.piv.pin_new);
+                if theme::button(ui, p, BtnKind::Default, "Change PIN").clicked() {
+                    go_change_pin = true;
+                }
+                ui.add_space(10.0);
+                sub(ui, "Change PUK");
+                pin_field(ui, p, "Current PUK", &mut self.piv.puk_old);
+                pin_field(ui, p, "New PUK", &mut self.piv.puk_new);
+                if theme::button(ui, p, BtnKind::Default, "Change PUK").clicked() {
+                    go_change_puk = true;
+                }
+                ui.add_space(10.0);
+                sub(ui, "Unblock PIN with PUK");
+                note(ui, "Recovers a blocked PIN without wiping any keys.");
+                pin_field(ui, p, "PUK", &mut self.piv.unblock_puk);
+                pin_field(ui, p, "New PIN", &mut self.piv.unblock_new_pin);
+                if theme::button(ui, p, BtnKind::Default, "Unblock PIN").clicked() {
+                    go_unblock = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        // --- Keys & certificates ---
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Keys & certificates")
+                .font(theme::f_sb(13.5))
+                .color(p.txt),
+        )
+        .id_salt("piv-keys")
+        .default_open(true)
+        .show(ui, |ui| {
+            theme::card_frame(p).show(ui, |ui| {
+                sub(ui, "Generate key pair");
+                note(
+                    ui,
+                    "Creates a fresh key in the slot (OVERWRITES it) and shows its \
+                     public key. Needs the management key above.",
+                );
+                ui.horizontal(|ui| {
+                    piv_slot_combo(ui, "piv-gen-slot", &mut self.piv.gen_slot);
+                    piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
+                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
+                        go_generate = true;
+                    }
+                });
+                if let Some(pem) = &self.piv.gen_pubkey_pem {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut pem.as_str())
+                            .desired_rows(4)
+                            .desired_width(360.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
+                        copy_pem = Some(pem.clone());
+                    }
+                }
+                ui.add_space(10.0);
+                sub(ui, "Import certificate");
+                note(ui, "PEM or DER X.509 file. Needs the management key.");
+                ui.horizontal(|ui| {
+                    piv_slot_combo(ui, "piv-cert-slot", &mut self.piv.cert_slot);
+                });
+                text_field(
+                    ui,
+                    p,
+                    "File",
+                    &mut self.piv.cert_path,
+                    "/path/to/cert.pem",
+                    240.0,
+                );
+                if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
+                    go_import = true;
+                }
+                ui.add_space(10.0);
+                sub(ui, "Export certificate");
+                note(ui, "Writes the slot's certificate as DER. No PIN needed.");
+                ui.horizontal(|ui| {
+                    piv_slot_combo(ui, "piv-export-slot", &mut self.piv.export_slot);
+                });
+                text_field(
+                    ui,
+                    p,
+                    "Destination",
+                    &mut self.piv.export_path,
+                    "/path/to/out.der",
+                    240.0,
+                );
+                if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
+                    go_export = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        // --- Retry counts & management-key rotation ---
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Retry counts & key rotation")
+                .font(theme::f_sb(13.5))
+                .color(p.txt),
+        )
+        .id_salt("piv-admin")
+        .show(ui, |ui| {
+            theme::card_frame(p).show(ui, |ui| {
+                sub(ui, "Set PIN/PUK retry counts");
+                note(
+                    ui,
+                    "Resets PIN and PUK to factory defaults. Needs the management \
+                     key above and the current PIN.",
+                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("PIN tries")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                    );
+                    ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("PUK tries")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                    );
+                    ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
+                });
+                pin_field(ui, p, "Current PIN", &mut self.piv.retries_pin_auth);
+                if theme::button(ui, p, BtnKind::Default, "Set retry counts").clicked() {
+                    go_set_retries = true;
+                }
+                ui.add_space(10.0);
+                sub(ui, "Change management key");
+                note(ui, "Enter the current key above; the new key here.");
+                text_field(
+                    ui,
+                    p,
+                    "New key",
+                    &mut self.piv.new_mgmt_key_input,
+                    "hex (48/32/64 chars)",
+                    300.0,
+                );
+                ui.horizontal(|ui| {
+                    piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
+                    if theme::button(ui, p, BtnKind::Default, "Change management key").clicked() {
+                        go_change_mgmt = true;
+                    }
+                });
+            });
+        });
+        ui.add_space(10.0);
+
+        // --- Danger: reset applet ---
+        theme::card_frame(p)
+            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Reset applet")
+                            .font(theme::f_sb(14.0))
+                            .color(p.err),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                            arm_reset = true;
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
+                         the PIN and PUK are already blocked.",
+                    )
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt2),
+                );
+            });
+
+        // Apply collected intents now that the card borrows have ended.
+        if do_refresh {
+            self.load_piv_status();
+        }
+        if go_change_pin {
+            self.piv_change_pin();
+        }
+        if go_change_puk {
+            self.piv_change_puk();
+        }
+        if go_unblock {
+            self.piv_unblock_pin();
+        }
+        if go_generate {
+            self.piv_generate_key();
+        }
+        if go_import {
+            self.piv_import_cert();
+        }
+        if go_export {
+            self.piv_export_cert();
+        }
+        if go_set_retries {
+            self.piv_set_retries();
+        }
+        if go_change_mgmt {
+            self.piv_change_management_key();
+        }
+        if arm_reset {
+            self.piv.confirm_reset = Some(String::new());
+        }
+        if let Some(pem) = copy_pem {
+            ui.output_mut(|o| o.copied_text = pem);
+            self.clipboard_clear_at = None; // public key, not a secret to auto-clear
         }
     }
 

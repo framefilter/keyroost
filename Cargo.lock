@@ -700,6 +700,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1641,6 +1650,7 @@ dependencies = [
  "keyroost-import",
  "keyroost-keyring",
  "keyroost-oath",
+ "keyroost-piv",
  "keyroost-proto",
  "keyroost-qr",
  "keyroost-resolve",
@@ -1750,6 +1760,10 @@ dependencies = [
 name = "keyroost-transport"
 version = "0.3.0"
 dependencies = [
+ "aes",
+ "cipher",
+ "des",
+ "getrandom 0.2.17",
  "keyroost-oath",
  "keyroost-openpgp",
  "keyroost-piv",
@@ -1770,6 +1784,7 @@ dependencies = [
  "keyroost-keyring",
  "keyroost-oath",
  "keyroost-openpgp",
+ "keyroost-piv",
  "keyroost-proto",
  "keyroost-qr",
  "keyroost-resolve",
