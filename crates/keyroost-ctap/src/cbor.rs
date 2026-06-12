@@ -3,9 +3,12 @@
 //! Supports the major types CTAP authenticators actually use: unsigned and
 //! negative integers, byte strings, text strings, arrays, maps, booleans,
 //! and null. Indefinite-length items, tags, and floats are intentionally
-//! unsupported — CTAP2 mandates canonical (definite-length, shortest-int)
-//! encoding, so anything else from a real authenticator would be a protocol
-//! violation.
+//! unsupported — CTAP2 mandates canonical (definite-length) encoding, so
+//! anything else from a real authenticator would be a protocol violation.
+//! The decoder is deliberately lenient where strictness buys nothing:
+//! non-shortest integer encodings are accepted, and a duplicate map key
+//! resolves to the first match — robustness against quirky devices matters
+//! more here than policing canonical form.
 
 use std::fmt;
 

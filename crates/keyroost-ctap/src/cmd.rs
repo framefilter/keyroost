@@ -23,11 +23,14 @@ pub enum CtapError {
     Cbor(cbor::CborError),
     /// CTAP2 status byte in the response was non-zero. See the FIDO CTAP
     /// spec section "Authenticator API Response Codes" for meanings; the
-    /// commonest cases are `0x2D` (CTAP2_ERR_NOT_ALLOWED — e.g. reset
-    /// outside the touch window) and `0x27` (CTAP2_ERR_USER_ACTION_TIMEOUT).
+    /// commonest cases are `0x30` (CTAP2_ERR_NOT_ALLOWED — e.g. reset
+    /// outside the touch window) and `0x2F` (CTAP2_ERR_USER_ACTION_TIMEOUT).
     StatusCode(u8),
     EmptyResponse,
     InvalidResponseShape(&'static str),
+    /// A caller-supplied argument was rejected before anything was sent to
+    /// the device (e.g. a PIN outside the 4–63 byte range).
+    InvalidArgument(&'static str),
 }
 
 impl std::fmt::Display for CtapError {
@@ -47,6 +50,7 @@ impl std::fmt::Display for CtapError {
             CtapError::InvalidResponseShape(s) => {
                 write!(f, "authenticator response had wrong shape: {}", s)
             }
+            CtapError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
         }
     }
 }
@@ -164,7 +168,9 @@ fn split_status(resp: &[u8]) -> Result<(u8, &[u8]), CtapError> {
         .ok_or(CtapError::EmptyResponse)
 }
 
-fn parse_authenticator_info(v: &Value) -> Result<AuthenticatorInfo, CtapError> {
+/// Parse a decoded `authenticatorGetInfo` CBOR map. Public so the fuzz
+/// harness can drive it with arbitrary device bytes.
+pub fn parse_authenticator_info(v: &Value) -> Result<AuthenticatorInfo, CtapError> {
     let map = v
         .as_map()
         .ok_or(CtapError::InvalidResponseShape("expected map at top level"))?;

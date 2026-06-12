@@ -6,13 +6,14 @@
 //! test Solo 2's firmware answers `SELECT` with `6A82` (no applet).
 //!
 //! This layer adds what the byte layer left out: the card transmit, the `61xx` /
-//! `GET RESPONSE` reassembly loop, reader discovery, and assembling a read-only
-//! status view. Write operations (PUT DATA, key generation, PSO signing) and PIN
-//! verification are deliberately not implemented yet — see the byte-layer TODOs.
+//! `GET RESPONSE` reassembly loop, reader discovery, the read-only status view,
+//! PIN verification/changes, key generation and import, PSO signing/decryption,
+//! and factory reset.
 
-use crate::{dump_cmd, dump_resp, TransportError};
+use crate::TransportError;
 use keyroost_openpgp as pgp;
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use zeroize::Zeroizing;
 
 /// `SW 6A82`: selected file/application not found — i.e. no OpenPGP applet.
 const SW_FILE_NOT_FOUND: u16 = 0x6A82;
@@ -96,6 +97,10 @@ impl OpenPgpSession {
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
                 }
+                // Release without resetting (pcsc's `Drop` hard-codes
+                // ResetCard) — probing must not disturb cards other sessions
+                // hold open.
+                let _ = session.card.disconnect(pcsc::Disposition::LeaveCard);
             }
         }
         Ok(out)
@@ -151,7 +156,8 @@ impl OpenPgpSession {
     }
 
     pub fn verify_pin(&mut self, pw_ref: u8, pin: &[u8]) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&pgp::verify(pw_ref, pin))?;
+        let apdu = Zeroizing::new(pgp::verify(pw_ref, pin));
+        let (_, sw) = self.transmit_full(&apdu)?;
         if sw == pgp::SW_OK {
             return Ok(());
         }
@@ -216,7 +222,8 @@ impl OpenPgpSession {
     /// DATA carries the old PIN itself. PINs come from the caller and are never
     /// stored or logged.
     pub fn change_pin(&mut self, pw_ref: u8, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&pgp::change_reference_data(pw_ref, old, new))?;
+        let apdu = Zeroizing::new(pgp::change_reference_data(pw_ref, old, new));
+        let (_, sw) = self.transmit_full(&apdu)?;
         if sw == pgp::SW_OK {
             return Ok(());
         }
@@ -244,7 +251,8 @@ impl OpenPgpSession {
         new_user_pin: &[u8],
     ) -> Result<(), TransportError> {
         self.verify_pin(pgp::PW3_ADMIN, admin_pin)?;
-        let (_, sw) = self.transmit_full(&pgp::reset_retry_counter(new_user_pin))?;
+        let apdu = Zeroizing::new(pgp::reset_retry_counter(new_user_pin));
+        let (_, sw) = self.transmit_full(&apdu)?;
         ok_or_apdu("openpgp reset retry counter", sw)
     }
 
@@ -280,7 +288,7 @@ impl OpenPgpSession {
         // (so the fallback can be exercised on a card that also accepts extended
         // length, e.g. for verification). Otherwise: extended length first.
         if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
-            let apdu = pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits);
+            let apdu = Zeroizing::new(pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits));
             let (_, sw) = self.transmit_full(&apdu)?;
             if sw == pgp::SW_OK {
                 return Ok(());
@@ -302,7 +310,11 @@ impl OpenPgpSession {
             eprintln!("! openpgp import: forcing command chaining (env override)");
         }
 
-        let chunks = pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254);
+        let chunks: Vec<Zeroizing<Vec<u8>>> =
+            pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254)
+                .into_iter()
+                .map(Zeroizing::new)
+                .collect();
         self.transmit_chain("openpgp import key", &chunks)
             .map(|_| ())
     }
@@ -311,15 +323,16 @@ impl OpenPgpSession {
     /// must be accepted with `9000`; the final chunk's status word is the
     /// command result, and its (reassembled) response payload is returned. Used
     /// by the chaining fallbacks of [`import_key`](Self::import_key) (which
-    /// discards the empty payload) and [`decrypt`](Self::decrypt).
-    fn transmit_chain(
+    /// discards the empty payload and passes `Zeroizing` chunks so the key
+    /// material wipes on drop) and [`decrypt`](Self::decrypt).
+    fn transmit_chain<T: AsRef<[u8]>>(
         &mut self,
         label: &'static str,
-        chunks: &[Vec<u8>],
+        chunks: &[T],
     ) -> Result<Vec<u8>, TransportError> {
         let last = chunks.len().saturating_sub(1);
         for (i, chunk) in chunks.iter().enumerate() {
-            let (data, sw) = self.transmit_full(chunk)?;
+            let (data, sw) = self.transmit_full(chunk.as_ref())?;
             if i == last {
                 ok_or_apdu(label, sw)?;
                 return Ok(data);
@@ -511,45 +524,19 @@ impl OpenPgpSession {
             Some(0x20) | Some(0x24) | Some(0x2C) | Some(0xDB)
         );
         let resp_sensitive = apdu.get(1..4) == Some(&[0x2A, 0x80, 0x86]);
-        let mut acc = Vec::new();
-        let mut to_send = apdu.to_vec();
-        let mut chunks = 0usize;
-        loop {
-            if self.debug {
-                eprintln!(
-                    "> {:>14} >> {}",
-                    "openpgp",
-                    dump_cmd(&to_send, cmd_sensitive)
-                );
-            }
-            let mut buf = [0u8; 4096];
-            let resp = self.card.transmit(&to_send, &mut buf)?;
-            if self.debug {
-                eprintln!("< {:>14} << {}", "openpgp", dump_resp(resp, resp_sensitive));
-            }
-            if resp.len() < 2 {
-                return Err(TransportError::ShortResponse {
-                    label: "openpgp apdu",
-                    got: resp.len(),
-                    expected_min: 2,
-                });
-            }
-            let (data, sw) = resp.split_at(resp.len() - 2);
-            acc.extend_from_slice(data);
-            chunks += 1;
-            if acc.len() > crate::MAX_REASSEMBLED_RESPONSE || chunks > crate::MAX_RESPONSE_CHUNKS {
-                return Err(TransportError::MalformedResponse(
-                    "openpgp 61xx continuation exceeded reassembly limits",
-                ));
-            }
-            if sw[0] == pgp::SW_MORE_DATA {
-                // The low byte hints at how many bytes remain (0 = up to 256);
-                // GET RESPONSE pulls the next chunk regardless.
-                to_send = pgp::get_response();
-                continue;
-            }
-            return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
-        }
+        const IO: crate::AppletIo = crate::AppletIo {
+            label: "openpgp",
+            more_data_sw: pgp::SW_MORE_DATA,
+            get_response: pgp::get_response,
+        };
+        crate::transmit_applet(
+            &self.card,
+            self.debug,
+            &IO,
+            apdu,
+            cmd_sensitive,
+            resp_sensitive,
+        )
     }
 }
 

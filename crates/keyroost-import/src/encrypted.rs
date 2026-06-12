@@ -177,9 +177,15 @@ fn try_unlock_slot(
 
     // Aegis encrypts only the inner database object (the value normally found
     // under "db"), not the outer wrapper. Wrap it back so `aegis::parse` can
-    // consume the same shape it gets from plaintext exports. `inner` (also a
-    // full plaintext copy) is wiped by its Zeroizing wrapper.
-    let wrapped = Zeroizing::new(format!(r#"{{"db":{}}}"#, *inner));
+    // consume the same shape it gets from plaintext exports. Built with an
+    // exact-capacity buffer — `format!` would start small and reallocate
+    // *after* the plaintext is in it, stranding an unwipeable copy in freed
+    // memory. `inner` (also a full plaintext copy) is wiped by its Zeroizing
+    // wrapper.
+    let mut wrapped = Zeroizing::new(String::with_capacity(inner.len() + 8));
+    wrapped.push_str(r#"{"db":"#);
+    wrapped.push_str(&inner);
+    wrapped.push('}');
     inner.zeroize();
     Ok(wrapped)
 }

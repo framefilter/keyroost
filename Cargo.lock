@@ -43,6 +43,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -435,6 +436,7 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -1687,6 +1689,7 @@ version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "base64",
+ "keyroost-import",
  "keyroost-proto",
  "scrypt",
  "serde",
@@ -1769,6 +1772,7 @@ dependencies = [
  "keyroost-piv",
  "keyroost-proto",
  "pcsc",
+ "zeroize",
 ]
 
 [[package]]

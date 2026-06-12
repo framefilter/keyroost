@@ -149,7 +149,10 @@ impl<'a> CredentialManager<'a> {
         if total == 0 {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(total);
+        // The count is device-claimed — cap the preallocation so a buggy or
+        // hostile authenticator can't drive a huge allocation. The loop below
+        // still honours `total`; growth past the cap just reallocates.
+        let mut out = Vec::with_capacity(total.min(1024));
         out.push(parse_rp(&first)?);
         while out.len() < total {
             let v = self.dispatch(SUB_ENUMERATE_RPS_NEXT, None)?;
@@ -178,7 +181,8 @@ impl<'a> CredentialManager<'a> {
         if total == 0 {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(total);
+        // Device-claimed count — cap the preallocation (see list_rps).
+        let mut out = Vec::with_capacity(total.min(1024));
         out.push(parse_credential(&first)?);
         while out.len() < total {
             let v = self.dispatch(SUB_ENUMERATE_CREDS_NEXT, None)?;
@@ -249,7 +253,9 @@ fn field_uint(v: &Value, key: u64) -> Option<u64> {
     v.get_uint_key(key).and_then(|x| x.as_uint())
 }
 
-fn parse_rp(v: &Value) -> Result<RelyingParty, CtapError> {
+/// Parse one enumerateRPs response map. Public so the fuzz harness can drive
+/// it with arbitrary device bytes.
+pub fn parse_rp(v: &Value) -> Result<RelyingParty, CtapError> {
     let rp_entity = v
         .get_uint_key(RESP_RP)
         .ok_or(CtapError::InvalidResponseShape("missing RP entity"))?;
@@ -281,7 +287,9 @@ fn parse_rp(v: &Value) -> Result<RelyingParty, CtapError> {
     })
 }
 
-fn parse_credential(v: &Value) -> Result<Credential, CtapError> {
+/// Parse one enumerateCredentials response map. Public so the fuzz harness
+/// can drive it with arbitrary device bytes.
+pub fn parse_credential(v: &Value) -> Result<Credential, CtapError> {
     let user = v
         .get_uint_key(RESP_USER)
         .ok_or(CtapError::InvalidResponseShape("missing user entity"))?;

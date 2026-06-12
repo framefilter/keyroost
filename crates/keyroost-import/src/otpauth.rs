@@ -179,13 +179,23 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
         other => return Err(OtpAuthError::UnsupportedPeriod(other)),
     };
 
-    let secret_b32 = secret_b32.ok_or(OtpAuthError::MissingSecret)?;
-    let secret = base32_decode(&secret_b32).map_err(|_| OtpAuthError::InvalidSecret)?;
+    let mut secret_b32 = secret_b32.ok_or(OtpAuthError::MissingSecret)?;
+    let decoded = base32_decode(&secret_b32);
+    // The percent-decoded base32 text is the seed in another spelling — wipe
+    // it as soon as the binary copy exists (the binary copy rides in `OtpAuth`,
+    // which wipes on drop).
+    {
+        use zeroize::Zeroize;
+        secret_b32.zeroize();
+    }
+    let mut secret = decoded.map_err(|_| OtpAuthError::InvalidSecret)?;
     // The Molto2 caps seeds at 63 bytes, and the protocol layer asserts the
     // same range; reject here so a malformed URI in an imported file fails
     // with an error instead of panicking mid-import (after some slots were
     // already written). Real TOTP secrets are 10–64 base32 chars (6–40 bytes).
     if secret.is_empty() || secret.len() > 63 {
+        use zeroize::Zeroize;
+        secret.zeroize();
         return Err(OtpAuthError::InvalidSecret);
     }
 

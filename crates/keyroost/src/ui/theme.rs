@@ -190,10 +190,22 @@ pub fn f_reg(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
 }
 pub fn f_sb(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("semibold".into()))
+    // Cached: these run dozens of times per frame, and `FontFamily::Name`
+    // allocates an Arc<str> each call; cloning the cached family is one
+    // refcount bump.
+    static FAM: std::sync::OnceLock<FontFamily> = std::sync::OnceLock::new();
+    FontId::new(
+        size,
+        FAM.get_or_init(|| FontFamily::Name("semibold".into()))
+            .clone(),
+    )
 }
 pub fn f_bold(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("bold".into()))
+    static FAM: std::sync::OnceLock<FontFamily> = std::sync::OnceLock::new();
+    FontId::new(
+        size,
+        FAM.get_or_init(|| FontFamily::Name("bold".into())).clone(),
+    )
 }
 pub fn f_mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)

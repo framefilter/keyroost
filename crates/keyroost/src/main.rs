@@ -27,9 +27,7 @@ const PROFILES: u8 = 100;
 
 #[derive(Default)]
 struct SecurityKeysState {
-    devices: Vec<HidDevice>,
-    selected: Option<usize>,
-    /// CTAP info for `selected`, fetched lazily after selection.
+    /// CTAP info for the selected device, fetched lazily after selection.
     info: Option<AuthenticatorInfo>,
     init: Option<InitResponse>,
     /// User-facing error from the last enumeration / open / GetInfo call.
@@ -66,8 +64,12 @@ struct ResetArm {
     target_serial: Option<String>,
     /// The armed key's HID path at arm time. Used as the identity when there is
     /// no serial (`target_serial` is `None`): its disappearance is the "unplug"
-    /// half of the dance, and any fresh path is treated as the re-insert.
+    /// half of the dance, and a fresh path is treated as the re-insert.
     target_path: Option<std::path::PathBuf>,
+    /// The armed key's USB vendor/product ids, captured at arm time. In path
+    /// mode a fresh path must match these — so plugging in a *different*
+    /// model while a reset is armed doesn't get it reset by mistake.
+    target_ids: Option<(u16, u16)>,
     /// FIDO HID paths present at the previous poll, to diff against (path mode).
     prev_paths: Vec<std::path::PathBuf>,
     /// True once the armed key has been unplugged; the next fresh insertion then
@@ -78,7 +80,17 @@ struct ResetArm {
 struct UnlockedSession {
     token: PinUvAuthToken,
     metadata: CredsMetadata,
-    rps: Vec<(RelyingParty, Vec<Credential>)>,
+    /// Behind an `Arc`: the pane clones this every frame to escape the borrow
+    /// of `self`, and credential lists (ids, user blobs) are not per-frame
+    /// clone material.
+    rps: std::sync::Arc<Vec<(RelyingParty, Vec<Credential>)>>,
+}
+
+/// One FIDO HID device as the armed-reset poll sees it.
+struct FidoHid {
+    path: std::path::PathBuf,
+    serial: Option<String>,
+    ids: (u16, u16),
 }
 
 #[derive(Default)]
@@ -130,6 +142,13 @@ struct OathAddDialog {
     require_touch: bool,
 }
 
+// The form is replaced wholesale after submit; wipe the typed seed on drop.
+impl Drop for OathAddDialog {
+    fn drop(&mut self) {
+        wipe(&mut self.secret);
+    }
+}
+
 /// State for the OpenPGP pane. Like OATH, the applet is driven over PC/SC, so a
 /// reader name identifies the card.
 #[derive(Default)]
@@ -169,6 +188,27 @@ struct OpenPgpState {
     /// New user PIN for the unblock flow (reset retry counter); authorised by
     /// `admin_pin`. Cleared after use.
     unblock_new: String,
+}
+
+impl OpenPgpState {
+    /// Zeroize every PIN entry field. Called when the selection changes (a PIN
+    /// typed for one card must not ride along to another) and on drop.
+    fn wipe_secrets(&mut self) {
+        wipe(&mut self.admin_pin);
+        wipe(&mut self.user_pin_old);
+        wipe(&mut self.user_pin_new);
+        wipe(&mut self.admin_pin_old);
+        wipe(&mut self.admin_pin_new);
+        wipe(&mut self.unblock_new);
+    }
+}
+
+/// Zeroize a secret-bearing text field (wipes the bytes, then leaves the
+/// string empty — strictly better than `.clear()`, which only resets the
+/// length and leaves the secret in the buffer).
+fn wipe(s: &mut String) {
+    use zeroize::Zeroize;
+    s.zeroize();
 }
 
 /// Where an OpenPGP key import gets its key material. Mirrors the CLI's
@@ -258,6 +298,23 @@ struct PivState {
     new_mgmt_alg: PivMgmtAlgSel,
     /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
     confirm_reset: Option<String>,
+}
+
+// The pane is replaced wholesale on device switch (`self.piv =
+// PivState::default()`); wiping on drop means the discarded fields don't
+// leave PINs/keys in freed memory.
+impl Drop for PivState {
+    fn drop(&mut self) {
+        wipe(&mut self.mgmt_key_input);
+        wipe(&mut self.pin_old);
+        wipe(&mut self.pin_new);
+        wipe(&mut self.puk_old);
+        wipe(&mut self.puk_new);
+        wipe(&mut self.unblock_puk);
+        wipe(&mut self.unblock_new_pin);
+        wipe(&mut self.retries_pin_auth);
+        wipe(&mut self.new_mgmt_key_input);
+    }
 }
 
 impl Default for PivState {
@@ -592,6 +649,9 @@ struct App {
     import_label: Option<String>,
     /// Frame-loop handle for waking egui from helper threads. `None` in tests.
     egui_ctx: Option<egui::Context>,
+    /// The `(mode, accent, colorblind)` triple whose Visuals are currently
+    /// applied to the egui context — re-applied on change, not per frame.
+    applied_theme: Option<(Mode, usize, bool)>,
 }
 
 #[derive(Default)]
@@ -716,7 +776,12 @@ impl App {
     /// the busy indicator; `job` runs off-thread and returns a closure applied
     /// back to `self` on the UI thread. Falls back to running inline if there's
     /// no worker (tests).
-    fn spawn_job<F>(&mut self, label: impl Into<String>, job: F)
+    /// Returns `false` when the job was *not* queued (a job is already in
+    /// flight, or the worker died). Callers that consumed user state to build
+    /// the job — a typed PIN, a confirmed modal, a one-shot arm — must check
+    /// the return and keep (or restore) that state on `false`, otherwise a
+    /// click during a background read silently swallows the action.
+    fn spawn_job<F>(&mut self, label: impl Into<String>, job: F) -> bool
     where
         F: FnOnce() -> ApplyFn + Send + 'static,
     {
@@ -725,7 +790,7 @@ impl App {
         // landed. (A single worker thread would serialize anyway, but this also
         // stops a growing backlog of duplicate refreshes from rapid clicks.)
         if self.busy() {
-            return;
+            return false;
         }
         match &self.worker {
             Some(worker) => {
@@ -735,11 +800,14 @@ impl App {
                     // Worker died; undo the bookkeeping so the UI doesn't hang.
                     self.busy_jobs -= 1;
                     self.busy_label = None;
+                    return false;
                 }
+                true
             }
             None => {
                 let apply = job();
                 apply(self);
+                true
             }
         }
     }
@@ -855,34 +923,56 @@ impl App {
         }
     }
 
+    /// Take the Molto2 session so a worker job can use it (the apply step
+    /// hands it back). `None` — with the reason logged — when not connected;
+    /// silently `None` while another job runs, so a click during a background
+    /// read is dropped *before* any state is consumed.
+    fn take_molto_session(&mut self) -> Option<Session> {
+        if self.busy() {
+            return None;
+        }
+        match self.session.take() {
+            Some(s) => Some(s),
+            None => {
+                self.log(Severity::Warn, "not connected");
+                None
+            }
+        }
+    }
+
     fn authenticate(&mut self) {
         let key = match self.customer_key_bytes() {
-            Ok(k) => k,
+            Ok(k) => zeroize::Zeroizing::new(k),
             Err(e) => {
                 self.log(Severity::Err, e);
                 return;
             }
         };
-        let Some(s) = self.session.as_mut() else {
-            self.log(Severity::Warn, "not connected");
+        let Some(mut s) = self.take_molto_session() else {
             return;
         };
-        match s.authenticate(&key) {
-            Ok(()) => {
-                self.authenticated = true;
-                self.log(Severity::Ok, "authenticated");
-            }
-            Err(TransportError::AuthFailed { tries_remaining }) => {
-                self.log(
-                    Severity::Err,
-                    format!(
-                        "authentication failed (wrong customer key); {} attempt(s) left",
-                        tries_remaining
-                    ),
-                );
-            }
-            Err(e) => self.log(Severity::Err, format!("auth failed: {}", e)),
-        }
+        self.spawn_job("Authenticating\u{2026}", move || {
+            let result = s.authenticate(&key);
+            Box::new(move |app: &mut App| {
+                app.session = Some(s);
+                match result {
+                    Ok(()) => {
+                        app.authenticated = true;
+                        app.log(Severity::Ok, "authenticated");
+                    }
+                    Err(TransportError::AuthFailed { tries_remaining }) => {
+                        app.log(
+                            Severity::Err,
+                            format!(
+                                "authentication failed (wrong customer key); {} attempt(s) left",
+                                tries_remaining
+                            ),
+                        );
+                    }
+                    Err(e) => app.log(Severity::Err, format!("auth failed: {}", e)),
+                }
+            })
+        });
     }
 
     fn apply_draft(&mut self) {
@@ -890,7 +980,7 @@ impl App {
             return;
         }
         let secret = match keyroost_proto::codec::base32_decode(&self.draft.secret_base32) {
-            Ok(s) if !s.is_empty() && s.len() <= 63 => s,
+            Ok(s) if !s.is_empty() && s.len() <= 63 => zeroize::Zeroizing::new(s),
             Ok(s) => {
                 self.log(
                     Severity::Err,
@@ -916,24 +1006,36 @@ impl App {
             utc_time: unix_now(),
         };
         let p = self.slot;
-        let s = self.session.as_mut().expect("auth implies session");
-        if let Err(e) = s.set_seed(p, &secret) {
-            self.log(Severity::Err, format!("set_seed #{}: {}", p, e));
+        let Some(mut s) = self.take_molto_session() else {
             return;
-        }
-        if let Err(e) = s.set_title(p, &title) {
-            self.log(Severity::Err, format!("set_title #{}: {}", p, e));
-            return;
-        }
-        if let Err(e) = s.set_config(p, &cfg) {
-            self.log(Severity::Err, format!("set_config #{}: {}", p, e));
-            return;
-        }
-        // The seed now lives on the device; keeping it in the (masked) field
-        // for the app's lifetime is pure liability. Title/config drafts stay —
-        // they're convenient for programming a run of similar slots.
-        self.draft.secret_base32.clear();
-        self.log(Severity::Ok, format!("profile #{} written", p));
+        };
+        self.spawn_job(format!("Writing profile #{p}\u{2026}"), move || {
+            let result = s
+                .set_seed(p, &secret)
+                .map_err(|e| format!("set_seed #{}: {}", p, e))
+                .and_then(|()| {
+                    s.set_title(p, &title)
+                        .map_err(|e| format!("set_title #{}: {}", p, e))
+                })
+                .and_then(|()| {
+                    s.set_config(p, &cfg)
+                        .map_err(|e| format!("set_config #{}: {}", p, e))
+                });
+            Box::new(move |app: &mut App| {
+                app.session = Some(s);
+                match result {
+                    Ok(()) => {
+                        // The seed now lives on the device; keeping it in the
+                        // (masked) field for the app's lifetime is pure
+                        // liability. Title/config drafts stay — convenient for
+                        // programming a run of similar slots.
+                        wipe(&mut app.draft.secret_base32);
+                        app.log(Severity::Ok, format!("profile #{} written", p));
+                    }
+                    Err(e) => app.log(Severity::Err, e),
+                }
+            })
+        });
     }
 
     fn sync_time_selected(&mut self) {
@@ -941,32 +1043,48 @@ impl App {
             return;
         }
         let p = self.slot;
-        let s = self.session.as_mut().expect("auth implies session");
-        match s.sync_time(p, unix_now()) {
-            Ok(()) => self.log(Severity::Ok, format!("time synced on #{}", p)),
-            Err(e) => self.log(Severity::Err, format!("sync_time #{}: {}", p, e)),
-        }
+        let Some(mut s) = self.take_molto_session() else {
+            return;
+        };
+        self.spawn_job("Syncing time\u{2026}", move || {
+            let result = s.sync_time(p, unix_now());
+            Box::new(move |app: &mut App| {
+                app.session = Some(s);
+                match result {
+                    Ok(()) => app.log(Severity::Ok, format!("time synced on #{}", p)),
+                    Err(e) => app.log(Severity::Err, format!("sync_time #{}: {}", p, e)),
+                }
+            })
+        });
     }
 
     fn sync_time_all(&mut self) {
         if !self.ensure_auth() {
             return;
         }
-        let s = self.session.as_mut().expect("auth implies session");
-        let mut ok = 0;
-        let mut fail = 0;
-        for p in 0..PROFILES {
-            match s.sync_time(p, unix_now()) {
-                Ok(()) => ok += 1,
-                Err(_) => fail += 1,
-            }
-        }
-        let sev = if fail == 0 {
-            Severity::Ok
-        } else {
-            Severity::Warn
+        let Some(mut s) = self.take_molto_session() else {
+            return;
         };
-        self.log(sev, format!("time-sync-all: {} ok, {} failed", ok, fail));
+        // 100 slots × one APDU each — emphatically not frame-loop work.
+        self.spawn_job("Syncing time on all profiles\u{2026}", move || {
+            let mut ok = 0;
+            let mut fail = 0;
+            for p in 0..PROFILES {
+                match s.sync_time(p, unix_now()) {
+                    Ok(()) => ok += 1,
+                    Err(_) => fail += 1,
+                }
+            }
+            Box::new(move |app: &mut App| {
+                app.session = Some(s);
+                let sev = if fail == 0 {
+                    Severity::Ok
+                } else {
+                    Severity::Warn
+                };
+                app.log(sev, format!("time-sync-all: {} ok, {} failed", ok, fail));
+            })
+        });
     }
 
     fn import_otpauth(&mut self) {
@@ -1015,17 +1133,22 @@ impl App {
     }
 
     fn factory_reset(&mut self) {
-        let Some(s) = self.session.as_mut() else {
-            self.log(Severity::Warn, "not connected");
+        let Some(mut s) = self.take_molto_session() else {
             return;
         };
-        match s.factory_reset() {
-            Ok(()) => self.log(
-                Severity::Warn,
-                "factory-reset requested. Confirm with the ▲ button on the device.",
-            ),
-            Err(e) => self.log(Severity::Err, format!("factory_reset: {}", e)),
-        }
+        self.spawn_job("Requesting factory reset\u{2026}", move || {
+            let result = s.factory_reset();
+            Box::new(move |app: &mut App| {
+                app.session = Some(s);
+                match result {
+                    Ok(()) => app.log(
+                        Severity::Warn,
+                        "factory-reset requested. Confirm with the ▲ button on the device.",
+                    ),
+                    Err(e) => app.log(Severity::Err, format!("factory_reset: {}", e)),
+                }
+            })
+        });
     }
 
     fn bulk_load(&mut self) {
@@ -1037,67 +1160,70 @@ impl App {
             self.bulk_dialog.error = Some("enter a file path first".into());
             return;
         }
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.bulk_dialog.error = Some(format!("read failed: {}", e));
-                return;
-            }
-        };
+        let password = zeroize::Zeroizing::new(self.bulk_dialog.password.clone());
+        // Everything below — including the file read (slow media, network
+        // mounts) and the format branching — runs on the import thread; the
+        // frame loop only ever sees the finished apply step.
+        self.run_import("Loading import file\u{2026}", move || {
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    let msg = format!("read failed: {}", e);
+                    return Box::new(move |app: &mut App| app.bulk_dialog.error = Some(msg));
+                }
+            };
 
-        // Screenshot import: a PNG/JPEG (by magic bytes) goes through QR
-        // decode — handles both standard otpauth:// enrollment codes and
-        // Google Authenticator export batches. The decode (megapixel scan)
-        // runs on the import thread, not in the frame loop.
-        if keyroost_qr::looks_like_image(&bytes) {
-            self.run_import("Decoding QR image\u{2026}", move || {
+            // Screenshot import: a PNG/JPEG (by magic bytes) goes through QR
+            // decode — handles both standard otpauth:// enrollment codes and
+            // Google Authenticator export batches.
+            if keyroost_qr::looks_like_image(&bytes) {
                 let result = keyroost_qr::entries_from_image(&bytes);
-                Box::new(move |app: &mut App| app.bulk_qr_loaded(result))
-            });
-            return;
-        }
-
-        let text = match String::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(_) => {
-                self.bulk_dialog.error =
-                    Some("file is neither a text export nor a PNG/JPEG image".into());
-                return;
+                return Box::new(move |app: &mut App| app.bulk_qr_loaded(result));
             }
-        };
 
-        // If this looks like an encrypted Aegis vault, ask for a password first
-        // (unless the user has already typed one). The scrypt KDF is seconds of
-        // CPU at stock parameters — import thread, never the frame loop.
-        let is_encrypted_aegis = keyroost_import::aegis::is_encrypted(&text).unwrap_or(false);
-        if is_encrypted_aegis {
-            self.bulk_dialog.needs_password = true;
-            if self.bulk_dialog.password.is_empty() {
-                self.bulk_dialog.entries.clear();
-                self.bulk_dialog.error =
-                    Some("encrypted Aegis vault — enter password and click Load again".into());
-                return;
-            }
-            let password = zeroize::Zeroizing::new(self.bulk_dialog.password.clone());
-            self.run_import("Decrypting vault\u{2026}", move || {
+            // Plaintext exports carry the seeds in clear — wipe-on-drop, same
+            // as the decrypted variant.
+            let text = match String::from_utf8(bytes) {
+                Ok(t) => zeroize::Zeroizing::new(t),
+                Err(_) => {
+                    return Box::new(move |app: &mut App| {
+                        app.bulk_dialog.error =
+                            Some("file is neither a text export nor a PNG/JPEG image".into());
+                    })
+                }
+            };
+
+            // An encrypted Aegis vault needs the password; the scrypt KDF is
+            // seconds of CPU at stock parameters — exactly why this thread
+            // exists.
+            let is_encrypted_aegis = keyroost_import::aegis::is_encrypted(&text).unwrap_or(false);
+            if is_encrypted_aegis {
+                if password.is_empty() {
+                    return Box::new(move |app: &mut App| {
+                        app.bulk_dialog.needs_password = true;
+                        app.bulk_dialog.entries.clear();
+                        app.bulk_dialog.error = Some(
+                            "encrypted Aegis vault — enter password and click Load again".into(),
+                        );
+                    });
+                }
                 let result = match keyroost_import::aegis::decrypt(&text, password.as_bytes()) {
                     Ok(plaintext) => {
                         keyroost_import::parse_bulk_any(&plaintext).map_err(|e| e.to_string())
                     }
                     Err(e) => Err(format!("decrypt: {}", e)),
                 };
-                Box::new(move |app: &mut App| app.bulk_text_loaded(result, path))
-            });
-            return;
-        }
+                return Box::new(move |app: &mut App| {
+                    app.bulk_dialog.needs_password = true;
+                    app.bulk_text_loaded(result, path);
+                });
+            }
 
-        self.bulk_dialog.needs_password = false;
-        // Plaintext exports carry the seeds in clear too — same wipe-on-
-        // drop treatment as the decrypted variant.
-        let text = zeroize::Zeroizing::new(text);
-        self.run_import("Parsing export\u{2026}", move || {
             let result = keyroost_import::parse_bulk_any(&text).map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| app.bulk_text_loaded(result, path))
+            Box::new(move |app: &mut App| {
+                app.bulk_dialog.needs_password = false;
+                app.bulk_text_loaded(result, path);
+            })
         });
     }
 
@@ -1151,7 +1277,7 @@ impl App {
             Ok(entries) => {
                 self.bulk_dialog.entries = entries;
                 self.bulk_dialog.error = None;
-                self.bulk_dialog.password.clear();
+                wipe(&mut self.bulk_dialog.password);
                 self.log(
                     Severity::Info,
                     format!(
@@ -1192,43 +1318,57 @@ impl App {
             return;
         }
         let timeout = self.bulk_dialog.display_timeout.to_proto();
-        let mut ok = 0;
-        let mut fail = 0;
-        for (i, entry) in self.bulk_dialog.entries.clone().into_iter().enumerate() {
-            let p = start + i as u8;
-            let title = entry.suggested_title();
-            if title.is_empty() {
-                self.log(Severity::Warn, format!("#{}: no title; skipping", p));
-                fail += 1;
-                continue;
-            }
-            let s = self.session.as_mut().expect("auth implies session");
-            if let Err(e) = s.set_seed(p, &entry.secret) {
-                self.log(Severity::Err, format!("#{} set_seed: {}", p, e));
-                fail += 1;
-                continue;
-            }
-            if let Err(e) = s.set_title(p, &title) {
-                self.log(Severity::Err, format!("#{} set_title: {}", p, e));
-                fail += 1;
-                continue;
-            }
-            if let Err(e) = s.set_config(p, &entry.to_profile_config(unix_now(), timeout)) {
-                self.log(Severity::Err, format!("#{} set_config: {}", p, e));
-                fail += 1;
-                continue;
-            }
-            ok += 1;
-        }
-        let sev = if fail == 0 {
-            Severity::Ok
-        } else {
-            Severity::Warn
+        let entries = self.bulk_dialog.entries.clone();
+        let Some(mut s) = self.take_molto_session() else {
+            return;
         };
-        self.log(sev, format!("bulk import: {} ok, {} failed", ok, fail));
-        if fail == 0 {
-            self.bulk_dialog.open = false;
-        }
+        // Up to 100 × 3 card writes — runs on the worker, log lines are
+        // collected and replayed in the apply step.
+        self.spawn_job(format!("Programming {n} profiles\u{2026}"), move || {
+            let mut ok = 0;
+            let mut fail = 0;
+            let mut lines: Vec<(Severity, String)> = Vec::new();
+            for (i, entry) in entries.into_iter().enumerate() {
+                let p = start + i as u8;
+                let title = entry.suggested_title();
+                if title.is_empty() {
+                    lines.push((Severity::Warn, format!("#{}: no title; skipping", p)));
+                    fail += 1;
+                    continue;
+                }
+                if let Err(e) = s.set_seed(p, &entry.secret) {
+                    lines.push((Severity::Err, format!("#{} set_seed: {}", p, e)));
+                    fail += 1;
+                    continue;
+                }
+                if let Err(e) = s.set_title(p, &title) {
+                    lines.push((Severity::Err, format!("#{} set_title: {}", p, e)));
+                    fail += 1;
+                    continue;
+                }
+                if let Err(e) = s.set_config(p, &entry.to_profile_config(unix_now(), timeout)) {
+                    lines.push((Severity::Err, format!("#{} set_config: {}", p, e)));
+                    fail += 1;
+                    continue;
+                }
+                ok += 1;
+            }
+            Box::new(move |app: &mut App| {
+                app.session = Some(s);
+                for (sev, line) in lines {
+                    app.log(sev, line);
+                }
+                let sev = if fail == 0 {
+                    Severity::Ok
+                } else {
+                    Severity::Warn
+                };
+                app.log(sev, format!("bulk import: {} ok, {} failed", ok, fail));
+                if fail == 0 {
+                    app.bulk_dialog.open = false;
+                }
+            })
+        });
     }
 
     fn ensure_auth(&mut self) -> bool {
@@ -1252,6 +1392,10 @@ impl App {
         let Some(path) = self.selected_fido_path() else {
             return;
         };
+        // Tag the job with the device it reads — if the user switches devices
+        // while it's in flight, the result must not be painted into the new
+        // device's pane (or its row in the sidebar).
+        let for_device = self.selected_device.clone();
         self.spawn_job("Reading key info\u{2026}", move || {
             // Off-thread: open the hidraw, run INIT + GetInfo.
             let outcome = match CtapHidDevice::open(&path) {
@@ -1270,39 +1414,46 @@ impl App {
                 )),
             };
             // Back on the UI thread: store the results.
-            Box::new(move |app: &mut App| match outcome {
-                Ok((init, info)) => {
-                    // Surface the key's firmware on the hero (e.g. "fw 5.7.4").
-                    let fw = format!(
-                        "{}.{}.{}",
-                        init.device_major, init.device_minor, init.device_build
-                    );
-                    app.security_keys.init = Some(init);
-                    if let Some(id) = app.selected_device.clone() {
-                        if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
-                            dev.firmware = fw;
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return; // selection changed mid-read; discard
+                }
+                match outcome {
+                    Ok((init, info)) => {
+                        // Surface the key's firmware on the hero (e.g. "fw 5.7.4").
+                        let fw = format!(
+                            "{}.{}.{}",
+                            init.device_major, init.device_minor, init.device_build
+                        );
+                        app.security_keys.init = Some(init);
+                        if let Some(id) = for_device.clone() {
+                            if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
+                                dev.firmware = fw;
+                            }
                         }
-                    }
-                    match info {
-                        Some(Ok(info)) => {
-                            // Refine the model from the AAGUID (e.g. "YubiKey" ->
-                            // "YubiKey 5 Series with NFC") on the selected device.
-                            if let Some(model) = ui::aaguid::model_for_aaguid(&info.aaguid) {
-                                if let Some(id) = app.selected_device.clone() {
-                                    if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
-                                        dev.model = model.to_string();
+                        match info {
+                            Some(Ok(info)) => {
+                                // Refine the model from the AAGUID (e.g. "YubiKey" ->
+                                // "YubiKey 5 Series with NFC") on the read device.
+                                if let Some(model) = ui::aaguid::model_for_aaguid(&info.aaguid) {
+                                    if let Some(id) = for_device {
+                                        if let Some(dev) =
+                                            app.devices.iter_mut().find(|d| d.id == id)
+                                        {
+                                            dev.model = model.to_string();
+                                        }
                                     }
                                 }
+                                app.security_keys.info = Some(info);
                             }
-                            app.security_keys.info = Some(info);
+                            Some(Err(e)) => {
+                                app.security_keys.error = Some(format!("GetInfo failed: {}", e))
+                            }
+                            None => {}
                         }
-                        Some(Err(e)) => {
-                            app.security_keys.error = Some(format!("GetInfo failed: {}", e))
-                        }
-                        None => {}
                     }
+                    Err(e) => app.security_keys.error = Some(e),
                 }
-                Err(e) => app.security_keys.error = Some(e),
             })
         });
     }
@@ -1311,6 +1462,11 @@ impl App {
     /// session with metadata + credential listing. Errors land in
     /// `security_keys.error`.
     fn try_unlock(&mut self) {
+        // Check busy *before* consuming the typed PIN — spawn_job would drop
+        // the job (and the PIN with it) if a background read is in flight.
+        if self.busy() {
+            return;
+        }
         let Some(path) = self.selected_fido_path() else {
             return;
         };
@@ -1361,16 +1517,22 @@ impl App {
         Ok(UnlockedSession {
             token,
             metadata,
-            rps,
+            rps: std::sync::Arc::new(rps),
         })
     }
 
     fn lock_session(&mut self) {
         self.security_keys.session = None;
-        self.security_keys.pin_input.clear();
+        wipe(&mut self.security_keys.pin_input);
     }
 
     fn refresh_credentials(&mut self) {
+        // Check busy *before* taking the session — spawn_job would silently
+        // drop the job, destroying the unlocked session (and its PIN token)
+        // and logging the user out for clicking Reload at the wrong moment.
+        if self.busy() {
+            return;
+        }
         let Some(path) = self.selected_fido_path() else {
             return;
         };
@@ -1405,7 +1567,7 @@ impl App {
         Ok(UnlockedSession {
             token,
             metadata,
-            rps,
+            rps: std::sync::Arc::new(rps),
         })
     }
 
@@ -1447,6 +1609,10 @@ impl App {
     }
 
     fn submit_change_pin(&mut self) {
+        // Check busy *before* consuming the typed PINs (see try_unlock).
+        if self.busy() {
+            return;
+        }
         let Some(path) = self.selected_fido_path() else {
             return;
         };
@@ -1484,6 +1650,10 @@ impl App {
     /// the two entries match and meet the 4-char minimum, then re-reads info so
     /// the status flips to "PIN set".
     fn submit_set_pin(&mut self) {
+        // Check busy *before* consuming the typed PINs (see try_unlock).
+        if self.busy() {
+            return;
+        }
         let Some(path) = self.selected_fido_path() else {
             return;
         };
@@ -1522,7 +1692,7 @@ impl App {
     /// the UI frame. Used by the armed-reset flow, which targets the
     /// just-reconnected key rather than the (now stale) selection. On success
     /// the cached session and CTAP info are cleared.
-    fn submit_reset_path(&mut self, path: std::path::PathBuf) {
+    fn submit_reset_path(&mut self, path: std::path::PathBuf) -> bool {
         self.spawn_job("Resetting key\u{2026} (touch now)", move || {
             let result = (|| -> Result<(), String> {
                 // A just-replugged node (especially on a fresh port) can take a
@@ -1562,7 +1732,7 @@ impl App {
                     app.security_keys.error = Some(msg);
                 }
             })
-        });
+        })
     }
 
     fn selected_oath_reader(&self) -> Option<String> {
@@ -1603,17 +1773,19 @@ impl App {
 
     /// Store the outcome of an op that ends by (re)listing credentials.
     fn apply_oath_rows(app: &mut App, result: Result<Vec<OathRow>, TransportError>) {
+        // The typed password is consumed whatever the outcome — success,
+        // wrong-password, or a transport error must not leave it buffered for
+        // an automatic retry against (potentially) a different key.
+        wipe(&mut app.oath.password_input);
         match result {
             Ok(rows) => {
                 app.oath.creds = rows;
                 app.oath.loaded = true;
                 app.oath.locked = false;
-                app.oath.password_input.clear();
             }
             Err(TransportError::OathPasswordRejected) => {
                 app.oath.locked = true;
                 app.oath.error = Some("wrong OATH password".into());
-                app.oath.password_input.clear();
             }
             Err(e) => app.oath.error = Some(e.to_string()),
         }
@@ -1627,11 +1799,19 @@ impl App {
             self.oath.error = Some("no OATH key selected".into());
             return;
         };
-        let password = self.oath.password_input.clone();
+        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
+        let for_device = self.selected_device.clone();
         self.spawn_job("Reading OATH codes\u{2026}", move || {
             let result = Self::oath_open_unlock(&name, &password)
                 .and_then(|mut session| Self::oath_list_rows(&mut session));
-            Box::new(move |app: &mut App| Self::apply_oath_rows(app, result))
+            Box::new(move |app: &mut App| {
+                // Discard if the user switched devices while the read (which
+                // can block on a touch) was in flight — device B's pane must
+                // not show device A's codes.
+                if app.selected_device == for_device {
+                    Self::apply_oath_rows(app, result);
+                }
+            })
         });
     }
 
@@ -1648,7 +1828,7 @@ impl App {
             return;
         }
         let secret = match keyroost_proto::codec::base32_decode(self.oath.add.secret.trim()) {
-            Ok(s) if !s.is_empty() => s,
+            Ok(s) if !s.is_empty() => zeroize::Zeroizing::new(s),
             Ok(_) => {
                 self.oath.error = Some("secret is empty".into());
                 return;
@@ -1664,7 +1844,7 @@ impl App {
             keyroost_oath::OathType::Hotp
         };
         let require_touch = self.oath.add.require_touch;
-        let password = self.oath.password_input.clone();
+        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
         // Clear the form now; on error the message is surfaced separately.
         self.oath.add = OathAddDialog::default();
         self.spawn_job("Adding credential\u{2026}", move || {
@@ -1693,7 +1873,7 @@ impl App {
             return;
         };
         let cred_name = name.to_owned();
-        let password = self.oath.password_input.clone();
+        let password = zeroize::Zeroizing::new(self.oath.password_input.clone());
         self.spawn_job("Deleting credential\u{2026}", move || {
             let result = (|| -> Result<Vec<OathRow>, TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
@@ -1794,10 +1974,11 @@ impl App {
             return;
         }
         let label = self
-            .security_keys
-            .selected
-            .and_then(|i| self.security_keys.devices.get(i))
-            .map(|d| d.product_name.clone())
+            .selected_device()
+            .map(|d| match &d.name {
+                Some(name) => name.clone(),
+                None => format!("{} {}", d.vendor, d.model).trim().to_string(),
+            })
             .unwrap_or_else(|| "this key".into());
 
         let mut window_open = true;
@@ -1862,17 +2043,19 @@ impl App {
         if arm {
             // Snapshot the current FIDO keys so the poll can tell when ours
             // leaves and a fresh one arrives. Prefer the armed key's HID serial
-            // (port-independent) and fall back to its path.
+            // (port-independent) and fall back to its path + USB ids.
             let target_path = self.selected_fido_path();
             let devices = Self::fido_devices();
-            let target_serial = target_path
+            let target = target_path
                 .as_ref()
-                .and_then(|p| devices.iter().find(|(dp, _)| dp == p))
-                .and_then(|(_, s)| s.clone());
+                .and_then(|p| devices.iter().find(|d| &d.path == p));
+            let target_serial = target.and_then(|d| d.serial.clone());
+            let target_ids = target.map(|d| d.ids);
             self.reset_arm = Some(ResetArm {
                 target_serial,
                 target_path,
-                prev_paths: devices.into_iter().map(|(p, _)| p).collect(),
+                target_ids,
+                prev_paths: devices.into_iter().map(|d| d.path).collect(),
                 saw_removal: false,
             });
         } else if cancel || !window_open {
@@ -1882,13 +2065,17 @@ impl App {
         }
     }
 
-    /// Current FIDO HID devices as `(path, serial)` (cheap sysfs read, no PC/SC).
-    fn fido_devices() -> Vec<(std::path::PathBuf, Option<String>)> {
+    /// Current FIDO HID devices (cheap sysfs read, no PC/SC).
+    fn fido_devices() -> Vec<FidoHid> {
         keyroost_hid::enumerate()
             .unwrap_or_default()
             .into_iter()
             .filter(HidDevice::is_fido)
-            .map(|h| (h.path, h.serial_number))
+            .map(|h| FidoHid {
+                path: h.path,
+                serial: h.serial_number,
+                ids: (h.vendor_id, h.product_id),
+            })
             .collect()
     }
 
@@ -1904,16 +2091,18 @@ impl App {
                 // Serial mode: identity is port-independent.
                 let here = current
                     .iter()
-                    .find(|(_, s)| s.as_deref() == Some(target_serial.as_str()));
+                    .find(|d| d.serial.as_deref() == Some(target_serial.as_str()));
                 match here {
                     None => arm.saw_removal = true, // unplugged
-                    Some((path, _)) if arm.saw_removal => fire = Some(path.clone()),
+                    Some(d) if arm.saw_removal => fire = Some(d.path.clone()),
                     Some(_) => {}
                 }
             } else {
                 // Path mode (no serial, e.g. most YubiKeys): the armed path
-                // leaving is the unplug; any fresh path is the re-insert.
-                let present = |p: &std::path::PathBuf| current.iter().any(|(cp, _)| cp == p);
+                // leaving is the unplug; a fresh path with the armed key's
+                // vendor/product ids is the re-insert. (Without the id match,
+                // any newly plugged key would receive the reset.)
+                let present = |p: &std::path::PathBuf| current.iter().any(|d| &d.path == p);
                 match &arm.target_path {
                     Some(t) if !present(t) => arm.saw_removal = true,
                     _ => {}
@@ -1921,17 +2110,29 @@ impl App {
                 if arm.saw_removal {
                     fire = current
                         .iter()
-                        .map(|(p, _)| p)
+                        .filter(|d| arm.target_ids.is_none() || arm.target_ids == Some(d.ids))
+                        .map(|d| &d.path)
                         .find(|p| !arm.prev_paths.contains(p))
                         .cloned();
                 }
             }
-            arm.prev_paths = current.into_iter().map(|(p, _)| p).collect();
         }
-        if let Some(path) = fire {
-            self.reset_arm = None;
-            self.security_keys.reset = ResetDialog::default();
-            self.submit_reset_path(path);
+        match fire {
+            Some(path) => {
+                // The replug window is one-shot. If the worker is mid-job the
+                // submission is refused — keep the arm (and the stale
+                // prev_paths, so the fresh path still counts as new) and let
+                // the next poll retry instead of silently losing the reset.
+                if self.submit_reset_path(path) {
+                    self.reset_arm = None;
+                    self.security_keys.reset = ResetDialog::default();
+                }
+            }
+            None => {
+                if let Some(arm) = self.reset_arm.as_mut() {
+                    arm.prev_paths = current.into_iter().map(|d| d.path).collect();
+                }
+            }
         }
     }
 
@@ -1946,17 +2147,23 @@ impl App {
             self.openpgp.error = Some("no OpenPGP card selected".into());
             return;
         };
+        let for_device = self.selected_device.clone();
         self.spawn_job("Reading OpenPGP status\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
                 let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
                 session.status()
             })();
-            Box::new(move |app: &mut App| match result {
-                Ok(status) => {
-                    app.openpgp.status = Some(status);
-                    app.openpgp.loaded = true;
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return; // selection changed mid-read; discard
                 }
-                Err(e) => app.openpgp.error = Some(e.to_string()),
+                match result {
+                    Ok(status) => {
+                        app.openpgp.status = Some(status);
+                        app.openpgp.loaded = true;
+                    }
+                    Err(e) => app.openpgp.error = Some(e.to_string()),
+                }
             })
         });
     }
@@ -1984,11 +2191,11 @@ impl App {
                 app.openpgp.loaded = true;
                 app.openpgp.error = None;
                 app.openpgp.notice = Some(notice);
-                app.openpgp.admin_pin.clear();
+                wipe(&mut app.openpgp.admin_pin);
             }
             Err(e) => {
                 app.openpgp.error = Some(e.to_string());
-                app.openpgp.admin_pin.clear();
+                wipe(&mut app.openpgp.admin_pin);
             }
         }
     }
@@ -1998,7 +2205,7 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let pin = self.openpgp.admin_pin.clone();
+        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
         let value = self.openpgp.name_input.clone();
         self.openpgp.notice = None;
         self.spawn_job("Setting cardholder name…", move || {
@@ -2018,7 +2225,7 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let pin = self.openpgp.admin_pin.clone();
+        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
         let value = self.openpgp.url_input.clone();
         self.openpgp.notice = None;
         self.spawn_job("Setting public-key URL…", move || {
@@ -2035,11 +2242,13 @@ impl App {
 
     /// Generate + register a key in the selected slot (PW3-gated, destructive),
     /// then refresh status. May require a touch on the key.
-    fn generate_openpgp_key(&mut self) {
+    /// Returns `false` when the job couldn't be queued (worker busy) — the
+    /// caller's confirm modal stays open so the confirmed click isn't lost.
+    fn generate_openpgp_key(&mut self) -> bool {
         let Some(name) = self.selected_openpgp_reader() else {
-            return;
+            return true; // nothing to do; let the modal close
         };
-        let pin = self.openpgp.admin_pin.clone();
+        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
         let slot = self.openpgp.gen_slot;
         let creation_time = unix_now();
         self.openpgp.notice = None;
@@ -2056,24 +2265,25 @@ impl App {
                     app.openpgp.loaded = true;
                     app.openpgp.error = None;
                     app.openpgp.notice = Some(format!("Generated {} key: {}", slot.label(), hex_lower(&fpr)));
-                    app.openpgp.admin_pin.clear();
+                    wipe(&mut app.openpgp.admin_pin);
                 }
                 Err(e) => {
                     app.openpgp.error = Some(e.to_string());
-                    app.openpgp.admin_pin.clear();
+                    wipe(&mut app.openpgp.admin_pin);
                 }
             })
-        });
+        })
     }
 
     /// Import a key into the selected slot (PW3-gated, destructive), then refresh
     /// status. The key material comes from host keygen or a file, obtained on the
-    /// worker thread (keygen is slow). May require a touch on the key.
-    fn import_openpgp_key(&mut self, source: ImportSource) {
+    /// worker thread (keygen is slow). May require a touch on the key. Returns
+    /// `false` when the job couldn't be queued (worker busy).
+    fn import_openpgp_key(&mut self, source: ImportSource) -> bool {
         let Some(name) = self.selected_openpgp_reader() else {
-            return;
+            return true; // nothing to do; let the modal close
         };
-        let pin = self.openpgp.admin_pin.clone();
+        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
         let slot = self.openpgp.import_slot;
         let path = self.openpgp.import_path.clone();
         let creation_time = unix_now();
@@ -2123,22 +2333,23 @@ impl App {
                         slot.label(),
                         hex_lower(&fpr)
                     ));
-                    app.openpgp.admin_pin.clear();
+                    wipe(&mut app.openpgp.admin_pin);
                     app.openpgp.import_path.clear();
                 }
                 Err(e) => {
                     app.openpgp.error = Some(e);
-                    app.openpgp.admin_pin.clear();
+                    wipe(&mut app.openpgp.admin_pin);
                 }
             })
-        });
+        })
     }
 
     /// Factory-reset the OpenPGP applet (destructive), then refresh status. No
-    /// PIN needed — reset blocks the PINs itself.
-    fn reset_openpgp(&mut self) {
+    /// PIN needed — reset blocks the PINs itself. Returns `false` when the job
+    /// couldn't be queued (worker busy).
+    fn reset_openpgp(&mut self) -> bool {
         let Some(name) = self.selected_openpgp_reader() else {
-            return;
+            return true; // nothing to do; let the modal close
         };
         self.openpgp.notice = None;
         self.spawn_job("Resetting OpenPGP applet…", move || {
@@ -2154,7 +2365,7 @@ impl App {
                     "OpenPGP applet reset; keys wiped, PINs back to defaults.".into(),
                 )
             })
-        });
+        })
     }
 
     /// Change the user PIN (PW1) from old to new, then refresh status. No admin
@@ -2163,8 +2374,8 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let old = self.openpgp.user_pin_old.clone();
-        let new = self.openpgp.user_pin_new.clone();
+        let old = zeroize::Zeroizing::new(self.openpgp.user_pin_old.clone());
+        let new = zeroize::Zeroizing::new(self.openpgp.user_pin_new.clone());
         self.openpgp.notice = None;
         self.spawn_job("Changing user PIN\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
@@ -2173,8 +2384,8 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.openpgp.user_pin_old.clear();
-                app.openpgp.user_pin_new.clear();
+                wipe(&mut app.openpgp.user_pin_old);
+                wipe(&mut app.openpgp.user_pin_new);
                 Self::apply_openpgp_write(app, result, "User PIN (PW1) changed.".into());
             })
         });
@@ -2185,8 +2396,8 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let old = self.openpgp.admin_pin_old.clone();
-        let new = self.openpgp.admin_pin_new.clone();
+        let old = zeroize::Zeroizing::new(self.openpgp.admin_pin_old.clone());
+        let new = zeroize::Zeroizing::new(self.openpgp.admin_pin_new.clone());
         self.openpgp.notice = None;
         self.spawn_job("Changing admin PIN\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
@@ -2195,8 +2406,8 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.openpgp.admin_pin_old.clear();
-                app.openpgp.admin_pin_new.clear();
+                wipe(&mut app.openpgp.admin_pin_old);
+                wipe(&mut app.openpgp.admin_pin_new);
                 Self::apply_openpgp_write(app, result, "Admin PIN (PW3) changed.".into());
             })
         });
@@ -2208,8 +2419,8 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let admin = self.openpgp.admin_pin.clone();
-        let new = self.openpgp.unblock_new.clone();
+        let admin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
+        let new = zeroize::Zeroizing::new(self.openpgp.unblock_new.clone());
         self.openpgp.notice = None;
         self.spawn_job("Unblocking user PIN\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
@@ -2218,7 +2429,7 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.openpgp.unblock_new.clear();
+                wipe(&mut app.openpgp.unblock_new);
                 Self::apply_openpgp_write(app, result, "User PIN (PW1) unblocked.".into());
             })
         });
@@ -2239,19 +2450,9 @@ impl App {
         let mut go_unblock = false;
         let mut arm_reset = false;
 
-        let head = |ui: &mut egui::Ui, t: &str| {
-            ui.label(egui::RichText::new(t).font(theme::f_sb(14.0)).color(p.txt));
-        };
-        let sub = |ui: &mut egui::Ui, t: &str| {
-            ui.label(egui::RichText::new(t).font(theme::f_sb(12.5)).color(p.txt2));
-        };
-        let note = |ui: &mut egui::Ui, t: &str| {
-            ui.label(
-                egui::RichText::new(t)
-                    .font(theme::f_reg(12.0))
-                    .color(p.txt3),
-            );
-        };
+        let head = |ui: &mut egui::Ui, t: &str| card_head(ui, p, t);
+        let sub = |ui: &mut egui::Ui, t: &str| card_sub(ui, p, t);
+        let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
 
         // --- Admin PIN: shared by the card-detail and key writes (PW3) ---
         theme::card_frame(p).show(ui, |ui| {
@@ -2483,8 +2684,12 @@ impl App {
                     });
                 });
             if do_it {
-                self.openpgp.confirm_generate = false;
-                self.generate_openpgp_key();
+                // Close the modal only once the job was actually queued — a
+                // busy worker would otherwise silently swallow the confirmed
+                // click.
+                if self.generate_openpgp_key() {
+                    self.openpgp.confirm_generate = false;
+                }
             } else if cancel || !window_open {
                 self.openpgp.confirm_generate = false;
             }
@@ -2531,100 +2736,98 @@ impl App {
                     });
                 });
             if do_it {
-                self.openpgp.confirm_import = None;
-                self.import_openpgp_key(source);
+                // Close the modal only once the job was actually queued (see
+                // the generate modal above).
+                if self.import_openpgp_key(source) {
+                    self.openpgp.confirm_import = None;
+                }
             } else if cancel || !window_open {
                 self.openpgp.confirm_import = None;
             }
         }
 
-        if let Some(typed) = self.openpgp.confirm_reset.clone() {
-            let mut do_it = false;
-            let mut cancel = false;
-            let mut window_open = true;
-            let mut buf = typed;
-            egui::Window::new("Reset OpenPGP applet?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut window_open)
-                .show(ctx, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 110, 110),
-                        "This wipes ALL OpenPGP keys and resets the PINs to defaults.",
-                    );
-                    ui.label("This cannot be undone.");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Type \u{201c}reset\u{201d} to confirm:");
-                        ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let armed = buf.trim() == "reset";
-                        if ui.add_enabled(armed, egui::Button::new("Reset")).clicked() {
-                            do_it = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            if do_it {
-                self.openpgp.confirm_reset = None;
-                self.reset_openpgp();
-            } else if cancel || !window_open {
-                self.openpgp.confirm_reset = None;
-            } else {
-                self.openpgp.confirm_reset = Some(buf);
-            }
+        if typed_reset_modal(
+            ctx,
+            "Reset OpenPGP applet?",
+            "This wipes ALL OpenPGP keys and resets the PINs to defaults.",
+            &[],
+            &mut self.openpgp.confirm_reset,
+        ) && self.reset_openpgp()
+        {
+            self.openpgp.confirm_reset = None;
         }
     }
 
     /// The reset confirmation modal for the PIV pane.
     fn render_piv_confirms(&mut self, ctx: &egui::Context) {
-        if let Some(typed) = self.piv.confirm_reset.clone() {
-            let mut do_it = false;
-            let mut cancel = false;
-            let mut window_open = true;
-            let mut buf = typed;
-            egui::Window::new("Reset PIV applet?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut window_open)
-                .show(ctx, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 110, 110),
-                        "This wipes ALL PIV keys, certificates, and PINs.",
-                    );
-                    ui.label("Only works when the PIN and PUK are already blocked.");
-                    ui.label("This cannot be undone.");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Type \u{201c}reset\u{201d} to confirm:");
-                        ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
-                    });
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let armed = buf.trim() == "reset";
-                        if ui.add_enabled(armed, egui::Button::new("Reset")).clicked() {
-                            do_it = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            if do_it {
-                self.piv.confirm_reset = None;
-                self.piv_reset();
-            } else if cancel || !window_open {
-                self.piv.confirm_reset = None;
-            } else {
-                self.piv.confirm_reset = Some(buf);
-            }
+        if typed_reset_modal(
+            ctx,
+            "Reset PIV applet?",
+            "This wipes ALL PIV keys, certificates, and PINs.",
+            &["Only works when the PIN and PUK are already blocked."],
+            &mut self.piv.confirm_reset,
+        ) && self.piv_reset()
+        {
+            self.piv.confirm_reset = None;
         }
+    }
+}
+
+/// A typed-"reset" confirmation modal, shared by the OpenPGP and PIV panes.
+/// `confirm` is the modal state (`Some(typed text)` = open). Returns `true`
+/// when the user confirmed; the *caller* fires the action and closes the
+/// modal only if the action was actually queued — a busy worker must not
+/// swallow a confirmed destructive click.
+fn typed_reset_modal(
+    ctx: &egui::Context,
+    title: &str,
+    warning: &str,
+    extra_lines: &[&str],
+    confirm: &mut Option<String>,
+) -> bool {
+    let Some(typed) = confirm.clone() else {
+        return false;
+    };
+    let mut do_it = false;
+    let mut cancel = false;
+    let mut window_open = true;
+    let mut buf = typed;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .open(&mut window_open)
+        .show(ctx, |ui| {
+            ui.colored_label(egui::Color32::from_rgb(220, 110, 110), warning);
+            for line in extra_lines {
+                ui.label(*line);
+            }
+            ui.label("This cannot be undone.");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Type \u{201c}reset\u{201d} to confirm:");
+                ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let armed = buf.trim() == "reset";
+                if ui.add_enabled(armed, egui::Button::new("Reset")).clicked() {
+                    do_it = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    if do_it {
+        true
+    } else {
+        if cancel || !window_open {
+            *confirm = None;
+        } else {
+            *confirm = Some(buf);
+        }
+        false
     }
 }
 
@@ -2651,11 +2854,14 @@ fn fpr_label(fpr: &[u8; 20]) -> String {
 
 /// Lowercase hex of a byte slice.
 fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    keyroost_proto::codec::hex_encode(bytes)
+}
+
+/// Decode a management-key hex field into wipe-on-drop bytes.
+fn piv_mgmt_key_bytes(hex: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    keyroost_proto::codec::hex_decode(hex.trim())
+        .map(zeroize::Zeroizing::new)
+        .map_err(|e| format!("management key is not valid hex: {}", e))
 }
 
 fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
@@ -2786,7 +2992,22 @@ impl App {
         self.openpgp.status = None;
         self.openpgp.loaded = false;
         self.openpgp.error = None;
+        self.openpgp.notice = None;
+        self.openpgp.name_input.clear();
+        self.openpgp.url_input.clear();
         self.piv = PivState::default();
+        // Typed secrets must never survive a selection change — a PIN entered
+        // for one key would otherwise be sent to another (the OATH pane even
+        // auto-submits its password on tab open), silently burning retry
+        // counters on the wrong device.
+        wipe(&mut self.security_keys.pin_input);
+        wipe(&mut self.security_keys.change_pin.old);
+        wipe(&mut self.security_keys.change_pin.new);
+        wipe(&mut self.security_keys.change_pin.confirm);
+        self.security_keys.change_pin.open = false;
+        wipe(&mut self.oath.password_input);
+        wipe(&mut self.oath.add.secret);
+        self.openpgp.wipe_secrets();
         self.oath_tried = false;
         self.piv_tried = false;
         self.molto_reset_confirm = false;
@@ -2849,14 +3070,20 @@ impl App {
         let Some(reader) = self.selected_oath_reader() else {
             return;
         };
+        let for_device = self.selected_device.clone();
         self.spawn_job("Reading PIV status\u{2026}", move || {
             let result = keyroost_transport::PivSession::open(&reader).and_then(|mut s| s.status());
-            Box::new(move |app: &mut App| match result {
-                Ok(status) => {
-                    app.piv.status = Some(status);
-                    app.piv.loaded = true;
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return; // selection changed mid-read; discard
                 }
-                Err(e) => app.piv.error = Some(e.to_string()),
+                match result {
+                    Ok(status) => {
+                        app.piv.status = Some(status);
+                        app.piv.loaded = true;
+                    }
+                    Err(e) => app.piv.error = Some(e.to_string()),
+                }
             })
         });
     }
@@ -2882,16 +3109,6 @@ impl App {
     }
 
     /// Decode the management-key hex field, surfacing a parse error in the pane.
-    fn piv_mgmt_key_bytes(&mut self, hex: &str) -> Option<Vec<u8>> {
-        match keyroost_proto::codec::hex_decode(hex.trim()) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                self.piv.error = Some(format!("management key is not valid hex: {}", e));
-                None
-            }
-        }
-    }
-
     fn piv_change_pin(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
@@ -2905,8 +3122,8 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.piv.pin_old.clear();
-                app.piv.pin_new.clear();
+                wipe(&mut app.piv.pin_old);
+                wipe(&mut app.piv.pin_new);
                 Self::apply_piv_write(app, result, "PIN changed.".into());
             })
         });
@@ -2925,8 +3142,8 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.piv.puk_old.clear();
-                app.piv.puk_new.clear();
+                wipe(&mut app.piv.puk_old);
+                wipe(&mut app.piv.puk_new);
                 Self::apply_piv_write(app, result, "PUK changed.".into());
             })
         });
@@ -2948,8 +3165,8 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.piv.unblock_puk.clear();
-                app.piv.unblock_new_pin.clear();
+                wipe(&mut app.piv.unblock_puk);
+                wipe(&mut app.piv.unblock_new_pin);
                 Self::apply_piv_write(app, result, "PIN unblocked and reset.".into());
             })
         });
@@ -2959,10 +3176,14 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let Some(mgmt) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
-            return;
+        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
         };
-        let pin = self.piv.retries_pin_auth.clone();
+        let pin = zeroize::Zeroizing::new(self.piv.retries_pin_auth.clone());
         let (pin_tries, puk_tries) = (self.piv.retries_pin, self.piv.retries_puk);
         self.piv.notice = None;
         self.spawn_job("Setting PIV retry counts\u{2026}", move || {
@@ -2975,8 +3196,8 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.piv.mgmt_key_input.clear();
-                app.piv.retries_pin_auth.clear();
+                wipe(&mut app.piv.mgmt_key_input);
+                wipe(&mut app.piv.retries_pin_auth);
                 Self::apply_piv_write(
                     app,
                     result,
@@ -2990,8 +3211,12 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let Some(mgmt) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
-            return;
+        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
         };
         let slot = self.piv.gen_slot.to_slot();
         let alg = self.piv.gen_alg.to_alg();
@@ -3014,7 +3239,7 @@ impl App {
                 Ok((pubkey, s.status()?))
             })();
             Box::new(move |app: &mut App| {
-                app.piv.mgmt_key_input.clear();
+                wipe(&mut app.piv.mgmt_key_input);
                 match result {
                     Ok((pubkey, status)) => {
                         app.piv.status = Some(status);
@@ -3046,8 +3271,12 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let Some(mgmt) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
-            return;
+        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
         };
         let slot = self.piv.cert_slot.to_slot();
         let path = self.piv.cert_path.trim().to_owned();
@@ -3066,7 +3295,7 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.piv.mgmt_key_input.clear();
+                wipe(&mut app.piv.mgmt_key_input);
                 Self::apply_piv_write(app, result, "Certificate imported.".into());
             })
         });
@@ -3080,6 +3309,14 @@ impl App {
         let path = self.piv.export_path.trim().to_owned();
         if path.is_empty() {
             self.piv.error = Some("enter a destination path for the certificate".into());
+            return;
+        }
+        // Refuse to clobber an existing file — the user can delete it or pick
+        // another name; there is no undo for an overwritten file.
+        if std::path::Path::new(&path).exists() {
+            self.piv.error = Some(format!(
+                "{path} already exists — delete it first or choose another name"
+            ));
             return;
         }
         self.piv.notice = None;
@@ -3113,11 +3350,19 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let Some(old) = self.piv_mgmt_key_bytes(&self.piv.mgmt_key_input.clone()) else {
-            return;
+        let old = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
         };
-        let Some(new) = self.piv_mgmt_key_bytes(&self.piv.new_mgmt_key_input.clone()) else {
-            return;
+        let new = match piv_mgmt_key_bytes(&self.piv.new_mgmt_key_input) {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
         };
         let new_alg = self.piv.new_mgmt_alg.to_alg();
         if new.len() != new_alg.key_len() {
@@ -3139,8 +3384,8 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                app.piv.mgmt_key_input.clear();
-                app.piv.new_mgmt_key_input.clear();
+                wipe(&mut app.piv.mgmt_key_input);
+                wipe(&mut app.piv.new_mgmt_key_input);
                 Self::apply_piv_write(
                     app,
                     result,
@@ -3150,9 +3395,11 @@ impl App {
         });
     }
 
-    fn piv_reset(&mut self) {
+    /// Returns `false` when the job couldn't be queued (worker busy) — the
+    /// caller's confirm modal stays open so the confirmed click isn't lost.
+    fn piv_reset(&mut self) -> bool {
         let Some(name) = self.selected_oath_reader() else {
-            return;
+            return true; // nothing to do; let the modal close
         };
         self.piv.notice = None;
         self.spawn_job("Resetting PIV applet\u{2026}", move || {
@@ -3168,7 +3415,7 @@ impl App {
                     "PIV application reset to factory defaults.".into(),
                 );
             })
-        });
+        })
     }
 
     /// Apply the three rename-dialog actions shared by the security-key hero and
@@ -3342,6 +3589,49 @@ fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
         );
     });
     ui.add_space(4.0);
+}
+
+/// Like [`pin_field`] but with a hint and custom width — for secrets that are
+/// longer than a PIN (the PIV management key). Masked: a management key is a
+/// card-write credential and shouldn't sit readable on screen.
+fn secret_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hint: &str, w: f32) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [96.0, 22.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            ),
+        );
+        ui.add(
+            egui::TextEdit::singleline(buf)
+                .password(true)
+                .hint_text(hint)
+                .desired_width(w),
+        );
+    });
+    ui.add_space(4.0);
+}
+
+/// Section heading inside a management card (shared by the OpenPGP and PIV
+/// panes).
+fn card_head(ui: &mut egui::Ui, p: &Palette, t: &str) {
+    ui.label(egui::RichText::new(t).font(theme::f_sb(14.0)).color(p.txt));
+}
+
+/// Sub-heading inside a management card.
+fn card_sub(ui: &mut egui::Ui, p: &Palette, t: &str) {
+    ui.label(egui::RichText::new(t).font(theme::f_sb(12.5)).color(p.txt2));
+}
+
+/// Fine-print note inside a management card.
+fn card_note(ui: &mut egui::Ui, p: &Palette, t: &str) {
+    ui.label(
+        egui::RichText::new(t)
+            .font(theme::f_reg(12.0))
+            .color(p.txt3),
+    );
 }
 
 /// A themed single-line text input with a fixed-width label — the non-password
@@ -3773,7 +4063,13 @@ impl eframe::App for App {
         self.drain_worker();
         self.drain_import();
         let p = self.palette();
-        p.apply(ctx, self.mode);
+        // Rebuilding + re-applying egui Visuals every frame is wasted work;
+        // only do it when a theme knob actually changed.
+        let theme_key = (self.mode, self.accent_idx, self.colorblind);
+        if self.applied_theme != Some(theme_key) {
+            p.apply(ctx, self.mode);
+            self.applied_theme = Some(theme_key);
+        }
 
         // First frame: scan for devices automatically so the user isn't staring
         // at an empty pane wondering whether the app is broken.
@@ -4653,6 +4949,12 @@ impl App {
                     let msg = if self.security_keys.error.is_some() {
                         "Couldn't read this key."
                     } else {
+                        // The initial read can be dropped if the worker was
+                        // busy at selection time; retry rather than showing
+                        // "Reading key…" forever.
+                        if self.security_keys.init.is_none() && !self.busy() {
+                            self.fetch_selected_info();
+                        }
                         "Reading key\u{2026}"
                     };
                     ui.label(
@@ -4791,7 +5093,7 @@ impl App {
                     // `central` handles overflow, so a long passkey list flows
                     // down the page instead of trapping the wheel in a box.
                     ui.vertical(|ui| {
-                        for (rp, creds) in &rps {
+                        for (rp, creds) in rps.iter() {
                             let header =
                                 if let Some(name) = rp.name.as_ref().filter(|s| !s.is_empty()) {
                                     format!("{}  ({})", rp.id, name)
@@ -4913,10 +5215,14 @@ impl App {
             self.help_dot(ui, p, "oath");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::button(ui, p, BtnKind::Primary, "+ Add credential").clicked() {
+                    // No struct-update syntax: OathAddDialog has a Drop impl
+                    // (it wipes the typed seed), which forbids `..Default`.
                     self.oath.add = OathAddDialog {
                         open: true,
+                        name: String::new(),
+                        secret: String::new(),
                         totp: true,
-                        ..Default::default()
+                        require_touch: false,
                     };
                 }
                 ui.add_space(6.0);
@@ -5110,19 +5416,9 @@ impl App {
         let mut arm_reset = false;
         let mut copy_pem: Option<String> = None;
 
-        let head = |ui: &mut egui::Ui, t: &str| {
-            ui.label(egui::RichText::new(t).font(theme::f_sb(14.0)).color(p.txt));
-        };
-        let sub = |ui: &mut egui::Ui, t: &str| {
-            ui.label(egui::RichText::new(t).font(theme::f_sb(12.5)).color(p.txt2));
-        };
-        let note = |ui: &mut egui::Ui, t: &str| {
-            ui.label(
-                egui::RichText::new(t)
-                    .font(theme::f_reg(12.0))
-                    .color(p.txt3),
-            );
-        };
+        let head = |ui: &mut egui::Ui, t: &str| card_head(ui, p, t);
+        let sub = |ui: &mut egui::Ui, t: &str| card_sub(ui, p, t);
+        let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
 
         ui.horizontal(|ui| {
             ui.label(
@@ -5201,7 +5497,7 @@ impl App {
                  operation only; never stored.",
             );
             ui.add_space(6.0);
-            text_field(
+            secret_field(
                 ui,
                 p,
                 "Management key",
@@ -5356,7 +5652,7 @@ impl App {
                 ui.add_space(10.0);
                 sub(ui, "Change management key");
                 note(ui, "Enter the current key above; the new key here.");
-                text_field(
+                secret_field(
                     ui,
                     p,
                     "New key",

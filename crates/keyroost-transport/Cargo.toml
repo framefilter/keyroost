@@ -21,7 +21,10 @@ pcsc = "2"
 # block-cipher witness/challenge round. AES (the 5.7+ default) and 3DES
 # (older keys) ECB single-block encrypt/decrypt are not worth hand-rolling
 # and getting subtly wrong; getrandom supplies the host challenge.
-aes = { version = "0.8", default-features = false }
-des = { version = "0.8", default-features = false }
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
+des = { version = "0.8", default-features = false, features = ["zeroize"] }
 cipher = { version = "0.4", default-features = false }
 getrandom = "0.2"
+# Wipe PIN/PUK/management-key APDU bodies after transmit (the same hygiene the
+# CLI and importers already apply to their secret buffers).
+zeroize = "1"

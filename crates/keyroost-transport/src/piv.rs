@@ -9,10 +9,11 @@
 //! PIN/PUK change and unblock, set-pin-retries, set-management-key, key
 //! generation, certificate import/export, and applet reset.
 
-use crate::{dump_cmd, hex_dump, TransportError};
+use crate::TransportError;
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use zeroize::Zeroizing;
 
 /// A read-only snapshot of a PIV application's state.
 #[derive(Debug, Clone)]
@@ -79,6 +80,10 @@ impl PivSession {
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
                 }
+                // Release without resetting (pcsc's `Drop` hard-codes
+                // ResetCard) — probing must not disturb cards other sessions
+                // hold open.
+                let _ = session.card.disconnect(pcsc::Disposition::LeaveCard);
             }
         }
         Ok(out)
@@ -181,57 +186,72 @@ impl PivSession {
         ok_or_apdu("piv authenticate (request witness)", sw)?;
         let z1 = piv::parse_general_auth(&resp, 0x80).map_err(TransportError::PivParse)?;
         // Decrypt it with the management key — proves we hold the key.
-        let witness = block_crypt(alg, key, z1, CryptOp::Decrypt)?;
+        let witness = Zeroizing::new(block_crypt(alg, key, z1, CryptOp::Decrypt)?);
 
         // Step 2: return the decrypted witness plus our own random challenge.
         let mut challenge = vec![0u8; alg.block_size()];
-        getrandom::getrandom(&mut challenge)
-            .map_err(|_| TransportError::MalformedResponse("OS RNG failed"))?;
-        let (resp2, sw2) = self.transmit_full(&piv::general_auth_mutual(
+        getrandom::getrandom(&mut challenge).map_err(|_| TransportError::HostRngFailed)?;
+        let apdu = Zeroizing::new(piv::general_auth_mutual(
             alg,
             piv::KEY_REF_MANAGEMENT,
             &witness,
             &challenge,
-        ))?;
+        ));
+        let (resp2, sw2) = self.transmit_full(&apdu)?;
         // A wrong key makes the card reject our witness here.
         if sw2 != piv::SW_OK {
             return Err(TransportError::PivManagementAuthFailed);
         }
         // Verify the card encrypted our challenge correctly (authenticates the
-        // card to us, completing mutual auth).
+        // card to us, completing mutual auth). Constant-time out of principle —
+        // both sides are fresh per attempt, so the timing leaks nothing useful,
+        // but secret-adjacent comparisons shouldn't short-circuit.
         let z2 = piv::parse_general_auth(&resp2, 0x82).map_err(TransportError::PivParse)?;
-        let expected = block_crypt(alg, key, &challenge, CryptOp::Encrypt)?;
-        if z2 != expected.as_slice() {
+        let expected = Zeroizing::new(block_crypt(alg, key, &challenge, CryptOp::Encrypt)?);
+        if !ct_eq(z2, &expected) {
             return Err(TransportError::PivManagementAuthFailed);
         }
         Ok(())
     }
 
     /// Present the PIV application PIN. Required before private-key use and
-    /// set-pin-retries.
+    /// set-pin-retries. The PIN must be 6–8 bytes — the byte layer pads/truncates
+    /// to the card's fixed 8-byte field, so an unchecked over-length PIN would
+    /// silently verify (and store) something other than what the user typed.
     pub fn verify_pin(&mut self, pin: &[u8]) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&piv::verify_pin(pin))?;
+        check_pin_len(pin)?;
+        let apdu = Zeroizing::new(piv::verify_pin(pin));
+        let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
 
     /// Change the PIV PIN. A wrong `old` PIN consumes a try and reports the
-    /// remaining count.
+    /// remaining count. Both PINs must be 6–8 bytes.
     pub fn change_pin(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
-        let (_, sw) =
-            self.transmit_full(&piv::change_reference(piv::PIN_REF_APPLICATION, old, new))?;
+        check_pin_len(old)?;
+        check_pin_len(new)?;
+        let apdu = Zeroizing::new(piv::change_reference(piv::PIN_REF_APPLICATION, old, new));
+        let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
 
     /// Change the PUK. A wrong `old` PUK consumes a try and reports the count.
+    /// Both PUKs must be 6–8 bytes.
     pub fn change_puk(&mut self, old: &[u8], new: &[u8]) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&piv::change_reference(piv::PIN_REF_PUK, old, new))?;
+        check_pin_len(old)?;
+        check_pin_len(new)?;
+        let apdu = Zeroizing::new(piv::change_reference(piv::PIN_REF_PUK, old, new));
+        let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
 
     /// Unblock a blocked PIN using the PUK, setting a new PIN. A wrong PUK
-    /// consumes a try and reports the remaining count.
+    /// consumes a try and reports the remaining count. Both must be 6–8 bytes.
     pub fn unblock_pin(&mut self, puk: &[u8], new_pin: &[u8]) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&piv::unblock_pin(puk, new_pin))?;
+        check_pin_len(puk)?;
+        check_pin_len(new_pin)?;
+        let apdu = Zeroizing::new(piv::unblock_pin(puk, new_pin));
+        let (_, sw) = self.transmit_full(&apdu)?;
         map_pin_sw(sw)
     }
 
@@ -252,7 +272,8 @@ impl PivSession {
         if key.len() != alg.key_len() {
             return Err(TransportError::PivBadKeyLength);
         }
-        let (_, sw) = self.transmit_full(&piv::set_management_key(alg, key, require_touch))?;
+        let apdu = Zeroizing::new(piv::set_management_key(alg, key, require_touch));
+        let (_, sw) = self.transmit_full(&apdu)?;
         ok_or_write("piv set management key", sw)
     }
 
@@ -289,16 +310,16 @@ impl PivSession {
         }
         let inner = piv::unwrap_data_object(&data).map_err(TransportError::PivParse)?;
         // The cert object wraps the DER in a 0x70 TLV.
-        Ok(find_tlv(inner, 0x70).map(<[u8]>::to_vec))
+        Ok(piv::find_tlv(inner, 0x70).map(<[u8]>::to_vec))
     }
 
     /// Reset the PIV application to factory defaults. Only succeeds when **both**
     /// the PIN and PUK are blocked (the card enforces this); otherwise the card
-    /// returns `6983` and this maps to [`TransportError::PivSecurityNotSatisfied`].
+    /// returns `6983` and this maps to [`TransportError::PivResetNotAllowed`].
     pub fn reset(&mut self) -> Result<(), TransportError> {
         let (_, sw) = self.transmit_full(&piv::reset())?;
         if sw == piv::SW_AUTH_BLOCKED {
-            return Err(TransportError::PivSecurityNotSatisfied);
+            return Err(TransportError::PivResetNotAllowed);
         }
         ok_or_write("piv reset", sw)
     }
@@ -332,40 +353,41 @@ impl PivSession {
             apdu.get(1),
             Some(0x20) | Some(0x24) | Some(0x2C) | Some(0x87) | Some(0xFF)
         );
-        let mut acc = Vec::new();
-        let mut to_send = apdu.to_vec();
-        let mut chunks = 0usize;
-        loop {
-            if self.debug {
-                eprintln!("> {:>14} >> {}", "piv", dump_cmd(&to_send, cmd_sensitive));
-            }
-            let mut buf = [0u8; 4096];
-            let resp = self.card.transmit(&to_send, &mut buf)?;
-            if self.debug {
-                eprintln!("< {:>14} << {}", "piv", hex_dump(resp));
-            }
-            if resp.len() < 2 {
-                return Err(TransportError::ShortResponse {
-                    label: "piv apdu",
-                    got: resp.len(),
-                    expected_min: 2,
-                });
-            }
-            let (data, sw) = resp.split_at(resp.len() - 2);
-            acc.extend_from_slice(data);
-            chunks += 1;
-            if acc.len() > crate::MAX_REASSEMBLED_RESPONSE || chunks > crate::MAX_RESPONSE_CHUNKS {
-                return Err(TransportError::MalformedResponse(
-                    "piv 61xx continuation exceeded reassembly limits",
-                ));
-            }
-            if sw[0] == piv::SW_MORE_DATA {
-                to_send = piv::get_response();
-                continue;
-            }
-            return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
-        }
+        // GENERAL AUTHENTICATE responses today are only ciphertext (witness /
+        // encrypted challenge), but the same INS in signing/decrypt mode
+        // returns recovered plaintext — redact uniformly so a future caller
+        // can't leak through a trace.
+        let resp_sensitive = apdu.get(1) == Some(&0x87);
+        const IO: crate::AppletIo = crate::AppletIo {
+            label: "piv",
+            more_data_sw: piv::SW_MORE_DATA,
+            get_response: piv::get_response,
+        };
+        crate::transmit_applet(
+            &self.card,
+            self.debug,
+            &IO,
+            apdu,
+            cmd_sensitive,
+            resp_sensitive,
+        )
     }
+}
+
+/// Reject PIN/PUK values the card field can't represent (SP 800-73-4 fixes the
+/// field at 8 bytes, 0xFF-padded; 6 is the universal minimum). Checked here so
+/// every front-end gets it, before a retry counter is consumed.
+fn check_pin_len(pin: &[u8]) -> Result<(), TransportError> {
+    if (6..=8).contains(&pin.len()) {
+        Ok(())
+    } else {
+        Err(TransportError::PivBadPinLength)
+    }
+}
+
+/// Constant-time slice equality (fold-XOR; no early exit on the bytes).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Map a PIV status word to success or a labelled APDU error.
@@ -421,7 +443,9 @@ enum CryptOp {
 }
 
 /// AES / 3DES ECB single-block (or block-aligned) transform for the
-/// management-key witness/challenge round. `data` is one cipher block.
+/// management-key witness/challenge round. `data` must be a non-empty multiple
+/// of the cipher block size — the witness comes from the card, and an unaligned
+/// length would otherwise panic in the block conversion below.
 fn block_crypt(
     alg: MgmtAlg,
     key: &[u8],
@@ -430,6 +454,12 @@ fn block_crypt(
 ) -> Result<Vec<u8>, TransportError> {
     use cipher::generic_array::GenericArray;
     use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+
+    if data.is_empty() || data.len() % alg.block_size() != 0 {
+        return Err(TransportError::MalformedResponse(
+            "PIV witness/challenge length is not a whole cipher block",
+        ));
+    }
 
     fn run<C: BlockEncrypt + BlockDecrypt>(c: &C, data: &[u8], op: CryptOp, bs: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len());
@@ -463,34 +493,4 @@ fn block_crypt(
             Ok(run(&c, data, op, 16))
         }
     }
-}
-
-/// Find the value of the first top-level TLV with single-byte `tag`.
-fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
-    let mut i = 0;
-    while i < buf.len() {
-        let t = buf[i];
-        let first = *buf.get(i + 1)?;
-        let (len, header) = if first < 0x80 {
-            (first as usize, 1)
-        } else {
-            let n = (first & 0x7F) as usize;
-            if n == 0 || n > 2 {
-                return None;
-            }
-            let bytes = buf.get(i + 2..i + 2 + n)?;
-            (
-                bytes.iter().fold(0usize, |a, &b| (a << 8) | b as usize),
-                1 + n,
-            )
-        };
-        let vstart = i + 1 + header;
-        let vend = vstart.checked_add(len)?;
-        let value = buf.get(vstart..vend)?;
-        if t == tag {
-            return Some(value);
-        }
-        i = vend;
-    }
-    None
 }

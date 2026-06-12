@@ -106,7 +106,9 @@ pub fn generate_2048() -> Result<RsaKeyParts, RsaKeyError> {
 /// RSA-2048 (the only size the card slot is provisioned for here). The file
 /// bytes are read locally; this crate never logs them.
 pub fn load_from_file(path: &Path) -> Result<RsaKeyParts, RsaKeyError> {
-    let bytes = std::fs::read(path)?;
+    // The raw file *is* the private key — wipe the read buffer on drop, the
+    // same hygiene `RsaKeyParts` applies to the parsed components.
+    let bytes = zeroize::Zeroizing::new(std::fs::read(path)?);
     parts_from_encoded(&bytes)
 }
 

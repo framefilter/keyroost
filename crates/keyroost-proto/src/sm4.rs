@@ -77,6 +77,18 @@ pub struct Sm4 {
     rk: [u32; 32],
 }
 
+// The expanded schedule is key-equivalent material (the customer key protects
+// seed confidentiality on the wire); scrub it on drop. Best-effort without
+// `unsafe` (forbidden workspace-wide) or a `zeroize` dependency (this crate is
+// deliberately dependency-free): `black_box` keeps the store from being
+// optimized away in practice.
+impl Drop for Sm4 {
+    fn drop(&mut self) {
+        self.rk = [0u32; 32];
+        std::hint::black_box(&self.rk);
+    }
+}
+
 impl Sm4 {
     pub fn new(key: &[u8; BLOCK_SIZE]) -> Self {
         let mut k = [0u32; 36];
@@ -88,6 +100,10 @@ impl Sm4 {
         }
         let mut rk = [0u32; 32];
         rk.copy_from_slice(&k[4..36]);
+        // The scratch schedule holds key-equivalent material; wipe it before
+        // the stack frame is reused (best-effort — see `Drop` below).
+        k = [0u32; 36];
+        std::hint::black_box(&k);
         Self { rk }
     }
 

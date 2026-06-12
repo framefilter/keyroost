@@ -852,12 +852,16 @@ fn strip_leading_zero(field: &[u8]) -> &[u8] {
 /// its low `reqlen` bytes are used unchanged.
 fn pad_exponent(e: &[u8], reqlen: usize) -> Vec<u8> {
     let e = strip_leading_zero(e);
+    // An exponent wider than the card's declared field can't be imported
+    // faithfully — truncating it would import a *different* key. Host-supplied
+    // input (e is from the caller's key, reqlen from the card), so assert
+    // rather than silently corrupt.
+    assert!(
+        e.len() <= reqlen,
+        "RSA exponent is wider than the card's declared exponent field"
+    );
     let mut out = vec![0u8; reqlen];
-    if e.len() >= reqlen {
-        out.copy_from_slice(&e[e.len() - reqlen..]);
-    } else {
-        out[reqlen - e.len()..].copy_from_slice(e);
-    }
+    out[reqlen - e.len()..].copy_from_slice(e);
     out
 }
 
@@ -1185,13 +1189,26 @@ pub fn find_tag<'a>(tlvs: &[Tlv<'a>], tag: u16) -> Option<&'a [u8]> {
 /// nested inside `73` inside `6E`.
 #[must_use]
 pub fn find_nested<'a>(tlvs: &[Tlv<'a>], tag: u16) -> Option<&'a [u8]> {
+    find_nested_at(tlvs, tag, 0)
+}
+
+/// Real OpenPGP data objects nest two or three levels (`6E` → `73` → leaf);
+/// anything deeper is garbage. Without a cap, a card answering with
+/// `73 <len> 73 <len> …` recurses once per ~2 input bytes and can overflow a
+/// worker thread's stack (the CBOR decoder caps at 16 for the same reason).
+const NEST_DEPTH_LIMIT: usize = 16;
+
+fn find_nested_at<'a>(tlvs: &[Tlv<'a>], tag: u16, depth: usize) -> Option<&'a [u8]> {
+    if depth >= NEST_DEPTH_LIMIT {
+        return None;
+    }
     for tlv in tlvs {
         if tlv.tag == tag {
             return Some(tlv.value);
         }
         if tlv.constructed {
             if let Ok(children) = parse_tlvs(tlv.value) {
-                if let Some(found) = find_nested(&children, tag) {
+                if let Some(found) = find_nested_at(&children, tag, depth + 1) {
                     return Some(found);
                 }
             }
@@ -2342,5 +2359,37 @@ mod tests {
         assert_eq!(chunks[1][0], 0x00); // cleared on the final link
         let body: Vec<u8> = chunks.iter().flat_map(|c| c[5..].iter().copied()).collect();
         assert_eq!(body, ehl);
+    }
+
+    #[test]
+    fn find_nested_caps_recursion_depth() {
+        // ~16 000 levels of `73 <len> 73 <len> …` (as deep as 2-byte BER
+        // lengths allow) — without the depth cap this overflows the stack,
+        // one recursion frame (plus a Vec) per ~4 input bytes. With it, the
+        // search just gives up.
+        let mut v: Vec<u8> = vec![0x73, 0x00];
+        while v.len() < 65_000 {
+            let mut w = Vec::with_capacity(v.len() + 4);
+            w.push(0x73);
+            if v.len() < 0x80 {
+                w.push(v.len() as u8);
+            } else if v.len() <= 0xFF {
+                w.extend([0x81, v.len() as u8]);
+            } else {
+                w.extend([0x82, (v.len() >> 8) as u8, v.len() as u8]);
+            }
+            w.extend_from_slice(&v);
+            v = w;
+        }
+        let tlvs = parse_tlvs(&v).unwrap();
+        assert_eq!(find_nested(&tlvs, 0xC5), None);
+        // Sanity: realistic nesting (6E → 73 → C5) still resolves.
+        let inner = [0xC5u8, 0x02, 0xAA, 0xBB];
+        let mut mid = vec![0x73, inner.len() as u8];
+        mid.extend_from_slice(&inner);
+        let mut outer = vec![0x6E, mid.len() as u8];
+        outer.extend_from_slice(&mid);
+        let tlvs = parse_tlvs(&outer).unwrap();
+        assert_eq!(find_nested(&tlvs, 0xC5), Some(&[0xAA, 0xBB][..]));
     }
 }

@@ -34,10 +34,11 @@ mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
 mod piv;
+pub use piv::{PivSession, PivSlotStatus, PivStatus};
+
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{KeyCrt, RsaPrivateKeyParts};
-pub use piv::{PivSession, PivSlotStatus, PivStatus};
 
 /// Things that can go wrong talking to a Molto2.
 #[derive(Debug)]
@@ -90,6 +91,15 @@ pub enum TransportError {
     PivSecurityNotSatisfied,
     /// A supplied PIV management key was the wrong length for its algorithm.
     PivBadKeyLength,
+    /// A supplied PIV PIN/PUK was outside the 6–8 byte range the card stores.
+    /// Caught before transmit — the card would silently truncate or pad.
+    PivBadPinLength,
+    /// PIV reset refused by the card: the PIN and PUK must both be blocked
+    /// before the applet allows a factory reset (`SW 6983`).
+    PivResetNotAllowed,
+    /// The host operating system's random-number source failed; a security
+    /// handshake that needs an unpredictable challenge was aborted.
+    HostRngFailed,
 }
 
 impl fmt::Display for TransportError {
@@ -170,6 +180,18 @@ impl fmt::Display for TransportError {
                     "PIV management key has the wrong length for its algorithm"
                 )
             }
+            TransportError::PivBadPinLength => {
+                write!(f, "PIV PIN/PUK must be 6-8 characters")
+            }
+            TransportError::PivResetNotAllowed => {
+                write!(
+                    f,
+                    "PIV reset refused: the PIN and PUK must both be blocked first"
+                )
+            }
+            TransportError::HostRngFailed => {
+                write!(f, "the host OS random-number source failed")
+            }
         }
     }
 }
@@ -208,6 +230,17 @@ pub struct Session {
     sm4_key: Option<[u8; 16]>,
     /// When true, every APDU and response is printed to stderr with its label.
     debug: bool,
+}
+
+// The derived SM4 key is customer-key-equivalent (it MACs every write and
+// decrypts seed ciphertext); scrub it when the session ends.
+impl Drop for Session {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(k) = self.sm4_key.as_mut() {
+            k.zeroize();
+        }
+    }
 }
 
 impl Session {
@@ -493,6 +526,10 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
             (usb_bus, usb_address) = read_channel_id(&card);
             serial = read_yubikey_serial(&card).ok();
+            // Release without resetting — pcsc's `Drop` hard-codes ResetCard,
+            // which would yank the rug from under any session another process
+            // (or this one) holds on the same card.
+            let _ = card.disconnect(pcsc::Disposition::LeaveCard);
         }
         out.push(YubiKeyCcid {
             reader_name,
@@ -814,6 +851,67 @@ pub(crate) fn dump_resp(resp: &[u8], sensitive: bool) -> String {
         resp.len() - 2,
         hex_dump(&resp[resp.len() - 2..])
     )
+}
+
+/// Static per-applet plumbing for [`transmit_applet`]: the trace label, the
+/// SW1 byte that signals more data pending, and the continuation-APDU builder.
+pub(crate) struct AppletIo {
+    pub label: &'static str,
+    pub more_data_sw: u8,
+    pub get_response: fn() -> Vec<u8>,
+}
+
+/// One applet APDU exchange with `61xx`-continuation reassembly, shared by the
+/// OATH, OpenPGP, and PIV sessions (each computes its own sensitivity
+/// predicates). `cmd_sensitive` redacts command bodies from `--debug` traces;
+/// `resp_sensitive` redacts every response chunk of the reassembly loop
+/// (sticky, so GET RESPONSE chunks of a secret payload stay hidden). The
+/// transmitted copy is zeroized so PIN/key bodies don't linger on the heap.
+pub(crate) fn transmit_applet(
+    card: &Card,
+    debug: bool,
+    io: &AppletIo,
+    apdu: &[u8],
+    cmd_sensitive: bool,
+    resp_sensitive: bool,
+) -> Result<(Vec<u8>, u16), TransportError> {
+    let mut acc = Vec::new();
+    let mut to_send = zeroize::Zeroizing::new(apdu.to_vec());
+    let mut chunks = 0usize;
+    loop {
+        if debug {
+            eprintln!(
+                "> {:>14} >> {}",
+                io.label,
+                dump_cmd(&to_send, cmd_sensitive)
+            );
+        }
+        let mut buf = [0u8; 4096];
+        let resp = card.transmit(&to_send, &mut buf)?;
+        if debug {
+            eprintln!("< {:>14} << {}", io.label, dump_resp(resp, resp_sensitive));
+        }
+        if resp.len() < 2 {
+            return Err(TransportError::ShortResponse {
+                label: io.label,
+                got: resp.len(),
+                expected_min: 2,
+            });
+        }
+        let (data, sw) = resp.split_at(resp.len() - 2);
+        acc.extend_from_slice(data);
+        chunks += 1;
+        if acc.len() > MAX_REASSEMBLED_RESPONSE || chunks > MAX_RESPONSE_CHUNKS {
+            return Err(TransportError::MalformedResponse(
+                "61xx continuation exceeded reassembly limits",
+            ));
+        }
+        if sw[0] == io.more_data_sw {
+            to_send = zeroize::Zeroizing::new((io.get_response)());
+            continue;
+        }
+        return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
+    }
 }
 
 #[cfg(test)]

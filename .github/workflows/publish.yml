@@ -113,6 +113,11 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
+          # The version is interpolated into a sed script that renders the
+          # PKGBUILD (which AUR users execute) — accept plain x.y.z only.
+          case "$version" in
+            *[!0-9.]*|'') echo "refusing: tag '$TAG' is not a plain x.y.z version" >&2; exit 1;;
+          esac
           curl -fsSL --retry 4 -o SHA256SUMS \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS"
           sha_linux="$(grep 'linux-x86_64' SHA256SUMS | cut -d' ' -f1)"
@@ -168,6 +173,10 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
+          # Interpolated into the sed that renders the formula — x.y.z only.
+          case "$version" in
+            *[!0-9.]*|'') echo "refusing: tag '$TAG' is not a plain x.y.z version" >&2; exit 1;;
+          esac
           curl -fsSL --retry 4 -o SHA256SUMS \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/SHA256SUMS"
           sha_mac="$(grep 'macos-universal2' SHA256SUMS | cut -d' ' -f1)"

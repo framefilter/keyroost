@@ -89,8 +89,10 @@ impl EphemeralKey {
         peer_x: &[u8; 32],
         peer_y: &[u8; 32],
     ) -> Result<SharedSecretV1, PinError> {
-        let z = self.raw_ecdh(peer_x, peer_y)?;
+        use zeroize::Zeroize;
+        let mut z = self.raw_ecdh(peer_x, peer_y)?;
         let digest = Sha256::digest(z);
+        z.zeroize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest);
         Ok(SharedSecretV1(out))
@@ -103,9 +105,11 @@ impl EphemeralKey {
         peer_x: &[u8; 32],
         peer_y: &[u8; 32],
     ) -> Result<SharedSecretV2, PinError> {
-        let z = self.raw_ecdh(peer_x, peer_y)?;
+        use zeroize::Zeroize;
+        let mut z = self.raw_ecdh(peer_x, peer_y)?;
         let hmac_key = hkdf_sha256_l32(&[0u8; 32], &z, b"CTAP2 HMAC key");
         let aes_key = hkdf_sha256_l32(&[0u8; 32], &z, b"CTAP2 AES key");
+        z.zeroize();
         Ok(SharedSecretV2 { hmac_key, aes_key })
     }
 
@@ -262,10 +266,12 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// HKDF-SHA-256 reduced to the single-block expand case (L=32) we actually
 /// use in CTAP. Avoids pulling the full `hkdf` crate for a 30-line helper.
 fn hkdf_sha256_l32(salt: &[u8; 32], ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    use zeroize::Zeroize;
     // Extract: PRK = HMAC(salt, IKM)
-    let prk = hmac_sha256(salt, ikm);
+    let mut prk = hmac_sha256(salt, ikm);
     // Expand to one block: T(1) = HMAC(PRK, info || 0x01)
     let mut mac = HmacSha256::new_from_slice(&prk).expect("HMAC accepts any key length");
+    prk.zeroize();
     mac.update(info);
     mac.update(&[0x01]);
     let out = mac.finalize().into_bytes();

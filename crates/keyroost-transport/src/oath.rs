@@ -13,9 +13,10 @@
 //! and [`clear_password`](OathSession::clear_password) — though Trussed devices
 //! (Solo 2 / Nitrokey 3) omit that handshake.
 
-use crate::{dump_cmd, dump_resp, TransportError};
+use crate::TransportError;
 use keyroost_oath as oath;
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use zeroize::Zeroizing;
 
 /// An open OATH applet session on one PC/SC reader.
 pub struct OathSession {
@@ -61,16 +62,19 @@ impl OathSession {
         let Some(card_challenge) = self.select_info.challenge.clone() else {
             return Ok(()); // not protected
         };
-        let key = oath::derive_access_key(password, &self.select_info.device_id);
-        let host_challenge = random_challenge();
-        let (data, sw) =
-            self.transmit_full(&oath::validate(&key, &card_challenge, &host_challenge))?;
+        let key = Zeroizing::new(oath::derive_access_key(
+            password,
+            &self.select_info.device_id,
+        ));
+        let host_challenge = random_challenge()?;
+        let apdu = Zeroizing::new(oath::validate(&key[..], &card_challenge, &host_challenge));
+        let (data, sw) = self.transmit_full(&apdu)?;
         if sw == 0x6A80 || sw == 0x6982 {
             // Wrong response / security status not satisfied → wrong password.
             return Err(TransportError::OathPasswordRejected);
         }
         ok_or_apdu("oath validate", sw)?;
-        let ok = oath::verify_validate(&key, &host_challenge, &data)
+        let ok = oath::verify_validate(&key[..], &host_challenge, &data)
             .map_err(TransportError::OathParse)?;
         if !ok {
             return Err(TransportError::MalformedResponse(
@@ -83,9 +87,13 @@ impl OathSession {
     /// Set (or replace) the applet password. Requires the session to be unlocked
     /// already if a password is currently set.
     pub fn set_password(&mut self, password: &str) -> Result<(), TransportError> {
-        let key = oath::derive_access_key(password, &self.select_info.device_id);
-        let challenge = random_challenge();
-        let (_, sw) = self.transmit_full(&oath::set_code(&key, &challenge))?;
+        let key = Zeroizing::new(oath::derive_access_key(
+            password,
+            &self.select_info.device_id,
+        ));
+        let challenge = random_challenge()?;
+        let apdu = Zeroizing::new(oath::set_code(&key[..], &challenge));
+        let (_, sw) = self.transmit_full(&apdu)?;
         ok_or_apdu("oath set code", sw)?;
         // A password is now set; reflect that locally.
         self.select_info.challenge = Some(challenge.to_vec());
@@ -131,6 +139,10 @@ impl OathSession {
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
                 }
+                // Release without resetting (pcsc's `Drop` hard-codes
+                // ResetCard) — probing must not disturb cards other sessions
+                // hold open.
+                let _ = session.card.disconnect(pcsc::Disposition::LeaveCard);
             }
         }
         Ok(out)
@@ -176,7 +188,9 @@ impl OathSession {
 
     /// Provision (add) a credential.
     pub fn put(&mut self, params: &oath::PutParams<'_>) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&oath::put(params))?;
+        // The PUT body carries the raw TOTP/HOTP seed — wipe it after transmit.
+        let apdu = Zeroizing::new(oath::put(params));
+        let (_, sw) = self.transmit_full(&apdu)?;
         ok_or_apdu("oath put", sw)
     }
 
@@ -195,63 +209,29 @@ impl OathSession {
         // for the password — so its response chunks are redacted too.
         let cmd_sensitive = matches!(apdu.get(1), Some(0x01) | Some(0x03) | Some(0xA3));
         let resp_sensitive = apdu.get(1) == Some(&0xA3);
-        let mut acc = Vec::new();
-        let mut to_send = apdu.to_vec();
-        let mut chunks = 0usize;
-        loop {
-            if self.debug {
-                eprintln!("> {:>14} >> {}", "oath", dump_cmd(&to_send, cmd_sensitive));
-            }
-            let mut buf = [0u8; 4096];
-            let resp = self.card.transmit(&to_send, &mut buf)?;
-            if self.debug {
-                eprintln!("< {:>14} << {}", "oath", dump_resp(resp, resp_sensitive));
-            }
-            if resp.len() < 2 {
-                return Err(TransportError::ShortResponse {
-                    label: "oath apdu",
-                    got: resp.len(),
-                    expected_min: 2,
-                });
-            }
-            let (data, sw) = resp.split_at(resp.len() - 2);
-            acc.extend_from_slice(data);
-            chunks += 1;
-            if acc.len() > crate::MAX_REASSEMBLED_RESPONSE || chunks > crate::MAX_RESPONSE_CHUNKS {
-                return Err(TransportError::MalformedResponse(
-                    "oath 61xx continuation exceeded reassembly limits",
-                ));
-            }
-            if sw[0] == oath::SW_MORE_DATA {
-                // More data pending: pull the next chunk and keep accumulating.
-                to_send = oath::send_remaining();
-                continue;
-            }
-            return Ok((acc, u16::from_be_bytes([sw[0], sw[1]])));
-        }
+        const IO: crate::AppletIo = crate::AppletIo {
+            label: "oath",
+            more_data_sw: oath::SW_MORE_DATA,
+            get_response: oath::send_remaining,
+        };
+        crate::transmit_applet(
+            &self.card,
+            self.debug,
+            &IO,
+            apdu,
+            cmd_sensitive,
+            resp_sensitive,
+        )
     }
 }
 
-/// An 8-byte random host challenge for OATH mutual authentication.
-///
-/// Reads `/dev/urandom` directly — this crate is already Linux/PC-SC-bound, so
-/// that avoids pulling in an RNG dependency. Falls back to a time-seeded value
-/// only if the device can't be read (a challenge needs to be unpredictable, not
-/// secret; the security of the handshake rests on the HMAC key, not this value).
-fn random_challenge() -> [u8; 8] {
-    use std::io::Read;
+/// An 8-byte random host challenge for OATH mutual authentication, from the OS
+/// RNG. Fails closed — a predictable challenge would let a recorded card
+/// response be replayed, defeating the card-side half of mutual auth.
+fn random_challenge() -> Result<[u8; 8], TransportError> {
     let mut buf = [0u8; 8];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok()
-    {
-        return buf;
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos.to_le_bytes()
+    getrandom::getrandom(&mut buf).map_err(|_| TransportError::HostRngFailed)?;
+    Ok(buf)
 }
 
 /// Map an OATH status word to success or a labelled APDU error.

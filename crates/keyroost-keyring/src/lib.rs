@@ -266,6 +266,20 @@ impl Keyring {
     pub fn save_to(&self, path: &Path) -> Result<(), KeyringError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            // Owner-only on the directory too, matching the file below. Only
+            // tightened when we (may have) just created it — an existing dir
+            // the user deliberately opened up is left alone.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(parent) {
+                    let mut perms = meta.permissions();
+                    if perms.mode() & 0o077 != 0 && parent.ends_with("keyroost") {
+                        perms.set_mode(0o700);
+                        let _ = fs::set_permissions(parent, perms);
+                    }
+                }
+            }
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| KeyringError::Parse(e.to_string()))?;
@@ -274,9 +288,14 @@ impl Keyring {
         // owner-only — which security keys a person owns is their business —
         // instead of inheriting the umask default (typically world-readable).
         let tmp = path.with_extension("json.tmp");
+        // Remove any stale temp file so `create_new` below can succeed.
+        // `create_new` (not `create`) matters twice over: a pre-existing file
+        // would keep its old permissions (the 0o600 applies only at creation),
+        // and a symlink planted at the temp path would otherwise be followed.
+        let _ = fs::remove_file(&tmp);
         {
             let mut opts = fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;

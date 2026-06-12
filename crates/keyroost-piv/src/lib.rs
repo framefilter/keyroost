@@ -52,7 +52,7 @@ pub const PIN_REF_PUK: u8 = 0x81;
 pub const KEY_REF_MANAGEMENT: u8 = 0x9B;
 
 /// PIV / Yubico-PIV instruction bytes.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Instruction {
     /// SELECT (ISO 7816) — activate the PIV application by AID.
@@ -361,6 +361,12 @@ pub struct Metadata {
     pub retries: Option<(u8, u8)>,
     /// `(pin_policy, touch_policy)` bytes (tag 0x02), for key references.
     pub policy: Option<(u8, u8)>,
+    /// Key origin (tag 0x03): 1 = generated on-card, 2 = imported.
+    pub origin: Option<u8>,
+    /// The slot's public key (tag 0x04), as the same inner TLVs a GENERATE
+    /// response carries (`81`/`82` for RSA, `86` for EC) — feed to
+    /// [`parse_public_key`] after wrapping, or match the tags directly.
+    pub public_key: Option<Vec<u8>>,
 }
 
 /// Errors from parsing PIV responses.
@@ -420,6 +426,7 @@ pub fn select() -> Vec<u8> {
 /// the `61xx` / GET RESPONSE loop.
 #[must_use]
 pub fn get_data(tag: &[u8]) -> Vec<u8> {
+    assert!(tag.len() <= 0x7F, "GET DATA object tag too long");
     let mut selector = Vec::with_capacity(2 + tag.len());
     selector.push(TAG_OBJECT_SELECTOR);
     selector.push(tag.len() as u8);
@@ -480,8 +487,11 @@ pub fn get_response() -> Vec<u8> {
 
 /// Encode a BER-TLV definite length: short form below 0x80, else `0x81`/`0x82`
 /// long form. PIV write objects (certs, RSA moduli) exceed 255 bytes, so the
-/// 2-byte form is required.
+/// 2-byte form is required. Values are host-built and never legitimately exceed
+/// the 2-byte form, so anything larger is a caller bug — assert rather than
+/// silently truncate the length field.
 fn push_ber_len(out: &mut Vec<u8>, len: usize) {
+    assert!(len <= 0xFFFF, "BER-TLV value too large");
     if len < 0x80 {
         out.push(len as u8);
     } else if len <= 0xFF {
@@ -506,6 +516,7 @@ fn push_tlv(out: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
 /// form, 256 in short form). YubiKey accepts extended-length APDUs over CCID;
 /// bodies over 255 bytes (cert import, RSA signing input) require them.
 fn build_apdu_ext(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8], le: Option<u16>) -> Vec<u8> {
+    assert!(data.len() <= 0xFFFF, "extended APDU body too large");
     if data.len() <= 255 && le.map_or(true, |v| v <= 256) {
         // Short form. Le==256 is encoded as the single byte 0x00.
         let mut out = Vec::with_capacity(6 + data.len());
@@ -696,6 +707,7 @@ pub fn unblock_pin(puk: &[u8], new_pin: &[u8]) -> Vec<u8> {
 /// management-key authentication.
 #[must_use]
 pub fn set_management_key(alg: MgmtAlg, key: &[u8], require_touch: bool) -> Vec<u8> {
+    assert!(key.len() <= 255, "management key too long");
     // Body: <alg> 9B <keylen> <key>.
     let mut body = Vec::with_capacity(3 + key.len());
     body.push(alg.id());
@@ -830,6 +842,8 @@ pub fn parse_metadata(buf: &[u8]) -> Result<Metadata, ParseError> {
         match tag {
             0x01 => md.algorithm = value.first().copied(),
             0x02 if value.len() >= 2 => md.policy = Some((value[0], value[1])),
+            0x03 => md.origin = value.first().copied(),
+            0x04 => md.public_key = Some(value.to_vec()),
             0x05 => md.is_default = value.first().map(|&b| b != 0),
             0x06 if value.len() >= 2 => md.retries = Some((value[0], value[1])),
             _ => {}
@@ -840,7 +854,10 @@ pub fn parse_metadata(buf: &[u8]) -> Result<Metadata, ParseError> {
 }
 
 /// Find the value of the first top-level TLV with single-byte `tag` in `buf`.
-fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
+/// Public so the transport layer can reuse it instead of growing its own
+/// BER-TLV walker.
+#[must_use]
+pub fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i < buf.len() {
         let t = buf[i];
@@ -858,8 +875,9 @@ fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
 
 /// Read a BER-TLV length field, returning `(length, header_byte_count)`.
 /// Handles the short form and the `0x81`/`0x82` long forms (a PIV cert easily
-/// exceeds 255 bytes, so the 2-byte form is required).
-fn read_ber_len(buf: &[u8]) -> Result<(usize, usize), ParseError> {
+/// exceeds 255 bytes, so the 2-byte form is required). Indefinite (`0x80`) and
+/// longer forms are deliberately rejected — no PIV object needs them.
+pub fn read_ber_len(buf: &[u8]) -> Result<(usize, usize), ParseError> {
     let first = *buf.first().ok_or(ParseError::Truncated)?;
     if first < 0x80 {
         return Ok((first as usize, 1));
@@ -1185,5 +1203,93 @@ mod tests {
         let pin = parse_metadata(&[0x06, 0x02, 0x03, 0x03, 0x05, 0x01, 0x00]).unwrap();
         assert_eq!(pin.retries, Some((3, 3)));
         assert_eq!(pin.is_default, Some(false));
+    }
+
+    #[test]
+    fn parse_metadata_origin_and_public_key() {
+        // slot 9A: 01 01 11 (ECC P-256), 03 01 01 (generated), 04 04 86 02 AA BB
+        let md = parse_metadata(&[
+            0x01, 0x01, 0x11, 0x03, 0x01, 0x01, 0x04, 0x04, 0x86, 0x02, 0xAA, 0xBB,
+        ])
+        .unwrap();
+        assert_eq!(md.origin, Some(1));
+        assert_eq!(md.public_key, Some(vec![0x86, 0x02, 0xAA, 0xBB]));
+    }
+
+    #[test]
+    fn parse_metadata_rejects_garbage() {
+        // tag with no length byte
+        assert_eq!(parse_metadata(&[0x06]), Err(ParseError::Truncated));
+        // length runs past the buffer
+        assert_eq!(
+            parse_metadata(&[0x01, 0x05, 0xAA]),
+            Err(ParseError::Truncated)
+        );
+        // indefinite-length form is rejected, not misread
+        assert!(matches!(
+            parse_metadata(&[0x01, 0x80, 0x00]),
+            Err(ParseError::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn general_auth_sign_short_and_extended() {
+        // Small ECC payload stays in a short APDU:
+        // 00 87 11 9A 0A  7C 08 82 00 81 04 <payload>  00
+        let apdu = general_auth_sign(KeyAlg::EccP256, 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            apdu,
+            vec![
+                0x00, 0x87, 0x11, 0x9A, 0x0A, 0x7C, 0x08, 0x82, 0x00, 0x81, 0x04, 0xAA, 0xBB, 0xCC,
+                0xDD, 0x00,
+            ]
+        );
+        // A 256-byte RSA-2048 block forces the extended form: marker 0x00,
+        // 2-byte Lc, body, 2-byte Le 0x0000 ("up to 65536").
+        let apdu = general_auth_sign(KeyAlg::Rsa2048, 0x9A, &[0x55; 256]);
+        // data: 7C 82 01 06 ( 82 00  81 82 01 00 <256> )
+        assert_eq!(&apdu[..5], &[0x00, 0x87, 0x07, 0x9A, 0x00]);
+        let lc = ((apdu[5] as usize) << 8) | apdu[6] as usize;
+        assert_eq!(lc, 4 + 2 + 4 + 256); // 7C len hdr + 82 00 + 81 len hdr + payload
+        assert_eq!(&apdu[7..11], &[0x7C, 0x82, 0x01, 0x06]);
+        assert_eq!(&apdu[apdu.len() - 2..], &[0x00, 0x00]);
+        assert_eq!(apdu.len(), 7 + lc + 2);
+    }
+
+    #[test]
+    fn get_response_bytes() {
+        assert_eq!(get_response(), vec![0x00, 0xC0, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn pad_pin_truncates_and_pads() {
+        // Documented behavior: longer-than-8 input is truncated (callers must
+        // validate 6–8 first); shorter input is 0xFF-padded.
+        let apdu = verify_pin(b"1234567890");
+        assert_eq!(&apdu[5..], b"12345678");
+        let apdu = verify_pin(b"123456");
+        assert_eq!(
+            &apdu[5..],
+            &[0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF]
+        );
+    }
+
+    #[test]
+    fn read_ber_len_forms() {
+        // two-byte long form (a typical certificate length)
+        assert_eq!(read_ber_len(&[0x82, 0x01, 0x30]).unwrap(), (0x130, 3));
+        assert_eq!(read_ber_len(&[0x81, 0xC8]).unwrap(), (0xC8, 2));
+        // indefinite and >2-byte forms are unsupported
+        assert!(matches!(
+            read_ber_len(&[0x80]),
+            Err(ParseError::BadResponse(_))
+        ));
+        assert!(matches!(
+            read_ber_len(&[0x83, 0x01, 0x00, 0x00]),
+            Err(ParseError::BadResponse(_))
+        ));
+        // truncated long form
+        assert_eq!(read_ber_len(&[0x82, 0x01]), Err(ParseError::Truncated));
+        assert_eq!(read_ber_len(&[]), Err(ParseError::Truncated));
     }
 }

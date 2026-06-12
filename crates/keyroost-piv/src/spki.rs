@@ -68,6 +68,11 @@ fn der_uint(bytes: &[u8]) -> Vec<u8> {
     while v.len() > 1 && v[0] == 0 {
         v = &v[1..];
     }
+    // A card could hand back an empty key component; DER has no zero-length
+    // INTEGER, so encode the canonical zero rather than emit invalid DER.
+    if v.is_empty() {
+        v = &[0x00];
+    }
     let mut value = Vec::with_capacity(v.len() + 1);
     if v.first().is_some_and(|&b| b & 0x80 != 0) {
         value.push(0x00);
@@ -151,6 +156,54 @@ mod tests {
         assert_eq!(der_uint(&[0x7F]), vec![0x02, 0x01, 0x7F]);
         // strips leading zeros
         assert_eq!(der_uint(&[0x00, 0x00, 0x01]), vec![0x02, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn der_uint_empty_and_zero_encode_canonical_zero() {
+        // An empty component (possible from a malformed card response) must not
+        // produce a zero-length INTEGER, which is invalid DER.
+        assert_eq!(der_uint(&[]), vec![0x02, 0x01, 0x00]);
+        assert_eq!(der_uint(&[0x00]), vec![0x02, 0x01, 0x00]);
+        assert_eq!(der_uint(&[0x00, 0x00]), vec![0x02, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn ed25519_spki_known_answer() {
+        // AlgorithmIdentifier { 1.3.101.112 }, BIT STRING over a 32-byte point.
+        let point = vec![0x11u8; 32];
+        let der = subject_public_key_info(
+            &PublicKey::Ecc {
+                point: point.clone(),
+            },
+            KeyAlg::Ed25519,
+        )
+        .unwrap();
+        let mut expected = vec![0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70];
+        expected.extend_from_slice(&[0x03, 0x21, 0x00]);
+        expected.extend_from_slice(&point);
+        assert_eq!(der, expected);
+    }
+
+    #[test]
+    fn x25519_spki_uses_x25519_oid() {
+        let der = subject_public_key_info(
+            &PublicKey::Ecc {
+                point: vec![0x22; 32],
+            },
+            KeyAlg::X25519,
+        )
+        .unwrap();
+        assert!(der.windows(OID_X25519.len()).any(|w| w == OID_X25519));
+        assert!(!der.windows(OID_ED25519.len()).any(|w| w == OID_ED25519));
+    }
+
+    #[test]
+    fn pem_known_answer() {
+        // base64("hello") == "aGVsbG8=" — locks alphabet, padding, and armor.
+        assert_eq!(
+            to_pem(b"hello"),
+            "-----BEGIN PUBLIC KEY-----\naGVsbG8=\n-----END PUBLIC KEY-----\n"
+        );
     }
 
     #[test]

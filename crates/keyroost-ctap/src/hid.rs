@@ -210,8 +210,19 @@ impl CtapHidDevice {
             #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
             HidIo::Hidapi(d) => {
                 buf.fill(0);
-                d.read(buf)
+                let n = d
+                    .read(buf)
                     .map_err(|e| HidTransportError::Backend(e.to_string()))?;
+                // CTAPHID input reports are a fixed 64 bytes; a short read
+                // would otherwise let the zero-filled tail be parsed as frame
+                // content. (The hidraw path uses read_exact and can't hit this.)
+                if n != buf.len() {
+                    return Err(HidTransportError::Backend(format!(
+                        "short HID read: {} of {} bytes",
+                        n,
+                        buf.len()
+                    )));
+                }
             }
         }
         Ok(())

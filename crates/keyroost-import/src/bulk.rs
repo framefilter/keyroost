@@ -152,6 +152,15 @@ pub mod aegis {
         period: Option<u32>,
     }
 
+    // `build_entry` copies the seed into a zeroize-on-drop `BulkEntry`; wipe
+    // the serde-owned original too so it doesn't linger in freed memory.
+    impl Drop for EntryInfo {
+        fn drop(&mut self) {
+            use zeroize::Zeroize;
+            self.secret.zeroize();
+        }
+    }
+
     pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
         let root: Root = serde_json::from_str(json)?;
         let db: Db = match &root.db {
@@ -232,6 +241,14 @@ pub mod twofas {
         otp: Otp,
     }
 
+    // Same hygiene as the Aegis `EntryInfo`: wipe the serde-owned seed copy.
+    impl Drop for Service {
+        fn drop(&mut self) {
+            use zeroize::Zeroize;
+            self.secret.zeroize();
+        }
+    }
+
     #[derive(Deserialize, Default)]
     struct Otp {
         account: Option<String>,
@@ -251,17 +268,19 @@ pub mod twofas {
             ));
         }
         let mut out = Vec::with_capacity(root.services.len());
-        for (i, s) in root.services.into_iter().enumerate() {
+        for (i, mut s) in root.services.into_iter().enumerate() {
             // 2FAS includes Steam etc; skip non-TOTP.
             if let Some(tt) = s.otp.token_type.as_deref() {
                 if !tt.eq_ignore_ascii_case("TOTP") {
                     continue;
                 }
             }
+            // `take()` rather than move — `Service` has a Drop impl (it wipes
+            // the seed), and Rust forbids moving fields out past one.
             let entry = build_entry(
                 i,
-                s.otp.issuer.or(s.name),
-                s.otp.account,
+                s.otp.issuer.take().or(s.name.take()),
+                s.otp.account.take(),
                 &s.secret,
                 s.otp.algorithm.as_deref(),
                 s.otp.digits.unwrap_or(6),
@@ -299,8 +318,12 @@ pub fn parse_otpauth_list(text: &str) -> Result<Vec<BulkEntry>, BulkError> {
 pub fn parse_any(bytes: &str) -> Result<Vec<BulkEntry>, BulkError> {
     if bytes.trim_start().starts_with('{') {
         // JSON — try Aegis first (more specific shape), then 2FAS.
-        if let Ok(v) = aegis::parse(bytes) {
-            return Ok(v);
+        match aegis::parse(bytes) {
+            Ok(v) => return Ok(v),
+            // An encrypted vault is a definitive diagnosis with an actionable
+            // message — don't let the 2FAS fallback bury it in "no entries".
+            Err(e @ BulkError::Encrypted(_)) => return Err(e),
+            Err(_) => {}
         }
         return twofas::parse(bytes);
     }

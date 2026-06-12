@@ -158,7 +158,7 @@ impl PinUvAuthToken {
 
 /// Read the current PIN retry counter. No auth required.
 pub fn get_pin_retries(dev: &mut CtapHidDevice) -> Result<u32, CtapError> {
-    let req = build_request(PIN_PROTOCOL_V1, SUB_GET_PIN_RETRIES, &[]);
+    let req = build_request_extra(PIN_PROTOCOL_V1, SUB_GET_PIN_RETRIES, &[]);
     let resp = dispatch(dev, &req)?;
     resp.retries
         .ok_or(CtapError::InvalidResponseShape("missing retries"))
@@ -176,7 +176,7 @@ pub fn get_key_agreement(
     dev: &mut CtapHidDevice,
     protocol: u32,
 ) -> Result<([u8; 32], [u8; 32]), CtapError> {
-    let req = build_request(protocol, SUB_GET_KEY_AGREEMENT, &[]);
+    let req = build_request_extra(protocol, SUB_GET_KEY_AGREEMENT, &[]);
     let resp = dispatch(dev, &req)?;
     resp.key_agreement
         .ok_or(CtapError::InvalidResponseShape("missing keyAgreement"))
@@ -184,11 +184,14 @@ pub fn get_key_agreement(
 
 /// Set the initial PIN on an authenticator that doesn't have one yet.
 pub fn set_pin(dev: &mut CtapHidDevice, new_pin: &str) -> Result<(), CtapError> {
+    use zeroize::Zeroize;
     validate_pin(new_pin)?;
     let chosen = negotiate_protocol(dev)?;
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
-    let new_pin_enc = proto.encrypt(&pad_pin_to_64(new_pin));
+    let mut padded = pad_pin_to_64(new_pin);
+    let new_pin_enc = proto.encrypt(&padded);
+    padded.zeroize();
     let pin_auth = proto.authenticate(&new_pin_enc);
 
     let extra = vec![
@@ -203,12 +206,17 @@ pub fn set_pin(dev: &mut CtapHidDevice, new_pin: &str) -> Result<(), CtapError> 
 
 /// Change an existing PIN.
 pub fn change_pin(dev: &mut CtapHidDevice, old_pin: &str, new_pin: &str) -> Result<(), CtapError> {
+    use zeroize::Zeroize;
     validate_pin(new_pin)?;
     let chosen = negotiate_protocol(dev)?;
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
-    let new_pin_enc = proto.encrypt(&pad_pin_to_64(new_pin));
-    let pin_hash_enc = proto.encrypt(&left16_sha256(old_pin.as_bytes()));
+    let mut padded = pad_pin_to_64(new_pin);
+    let new_pin_enc = proto.encrypt(&padded);
+    padded.zeroize();
+    let mut pin_hash = left16_sha256(old_pin.as_bytes());
+    let pin_hash_enc = proto.encrypt(&pin_hash);
+    pin_hash.zeroize();
     let mut auth_input = Vec::with_capacity(new_pin_enc.len() + pin_hash_enc.len());
     auth_input.extend_from_slice(&new_pin_enc);
     auth_input.extend_from_slice(&pin_hash_enc);
@@ -239,9 +247,12 @@ fn token_legacy(
     pin: &str,
     chosen: SelectedPinProtocol,
 ) -> Result<PinUvAuthToken, CtapError> {
+    use zeroize::Zeroize;
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
-    let pin_hash_enc = proto.encrypt(&left16_sha256(pin.as_bytes()));
+    let mut pin_hash = left16_sha256(pin.as_bytes());
+    let pin_hash_enc = proto.encrypt(&pin_hash);
+    pin_hash.zeroize();
 
     let extra = vec![
         (Value::UInt(KEY_KEY_AGREEMENT), our_pub),
@@ -255,10 +266,26 @@ fn token_legacy(
     let token = proto
         .decrypt(&enc_token)
         .map_err(|_| CtapError::InvalidResponseShape("pinToken decrypt failed"))?;
-    Ok(PinUvAuthToken {
+    check_token_len(token, chosen.version()).map(|token| PinUvAuthToken {
         protocol: chosen.version(),
         token,
     })
+}
+
+/// Validate the decrypted pinUvAuthToken length: the spec fixes it at 16 or
+/// 32 bytes. Anything else means a corrupted exchange — catch it here rather
+/// than let a bogus value ride along as an HMAC key. The rejected buffer is
+/// wiped before the error returns.
+fn check_token_len(mut token: Vec<u8>, _protocol: u32) -> Result<Vec<u8>, CtapError> {
+    use zeroize::Zeroize;
+    if token.len() == 16 || token.len() == 32 {
+        Ok(token)
+    } else {
+        token.zeroize();
+        Err(CtapError::InvalidResponseShape(
+            "pinUvAuthToken is not 16 or 32 bytes",
+        ))
+    }
 }
 
 /// Permission bits for [`get_pin_uv_auth_token_with_permissions`]
@@ -320,9 +347,12 @@ fn token_with_permissions(
     rp_id: Option<&str>,
     chosen: SelectedPinProtocol,
 ) -> Result<PinUvAuthToken, CtapError> {
+    use zeroize::Zeroize;
     let (proto, peer) = key_agreement(dev, chosen)?;
     let our_pub = peer.our_public_cose();
-    let pin_hash_enc = proto.encrypt(&left16_sha256(pin.as_bytes()));
+    let mut pin_hash = left16_sha256(pin.as_bytes());
+    let pin_hash_enc = proto.encrypt(&pin_hash);
+    pin_hash.zeroize();
 
     let extra = pin_uv_auth_token_extra(our_pub, pin_hash_enc, permissions, rp_id);
     let req = build_request_extra(
@@ -337,7 +367,7 @@ fn token_with_permissions(
     let token = proto
         .decrypt(&enc_token)
         .map_err(|_| CtapError::InvalidResponseShape("pinUvAuthToken decrypt failed"))?;
-    Ok(PinUvAuthToken {
+    check_token_len(token, chosen.version()).map(|token| PinUvAuthToken {
         protocol: chosen.version(),
         token,
     })
@@ -422,9 +452,7 @@ fn negotiate_protocol(dev: &mut CtapHidDevice) -> Result<SelectedPinProtocol, Ct
 fn validate_pin(pin: &str) -> Result<(), CtapError> {
     let n = pin.len();
     if !(4..=63).contains(&n) {
-        return Err(CtapError::InvalidResponseShape(
-            "PIN must be 4..=63 UTF-8 bytes",
-        ));
+        return Err(CtapError::InvalidArgument("PIN must be 4..=63 UTF-8 bytes"));
     }
     Ok(())
 }
@@ -445,10 +473,6 @@ fn dispatch(dev: &mut CtapHidDevice, req: &[u8]) -> Result<PinResponse, CtapErro
     }
     let (value, _) = cbor::decode(body)?;
     parse_pin_response(&value)
-}
-
-fn build_request(protocol: u32, sub: u8, extra: &[(Value, Value)]) -> Vec<u8> {
-    build_request_extra(protocol, sub, extra)
 }
 
 fn build_request_extra(protocol: u32, sub: u8, extra: &[(Value, Value)]) -> Vec<u8> {
@@ -479,7 +503,9 @@ fn n(v: i64) -> Value {
     }
 }
 
-fn parse_pin_response(v: &Value) -> Result<PinResponse, CtapError> {
+/// Parse a decoded `clientPin` response map. Public so the fuzz harness can
+/// drive it with arbitrary device bytes.
+pub fn parse_pin_response(v: &Value) -> Result<PinResponse, CtapError> {
     let map = v
         .as_map()
         .ok_or(CtapError::InvalidResponseShape("expected map"))?;
@@ -551,7 +577,7 @@ mod tests {
 
     #[test]
     fn request_carries_protocol_and_subcommand() {
-        let bytes = build_request(PIN_PROTOCOL_V1, SUB_GET_PIN_RETRIES, &[]);
+        let bytes = build_request_extra(PIN_PROTOCOL_V1, SUB_GET_PIN_RETRIES, &[]);
         let (val, _) = cbor::decode(&bytes).unwrap();
         let map = val.as_map().unwrap();
         assert_eq!(map.len(), 2);
@@ -567,7 +593,7 @@ mod tests {
     /// different protocol.
     #[test]
     fn get_key_agreement_request_declares_chosen_protocol() {
-        let bytes = build_request(PIN_PROTOCOL_V2, SUB_GET_KEY_AGREEMENT, &[]);
+        let bytes = build_request_extra(PIN_PROTOCOL_V2, SUB_GET_KEY_AGREEMENT, &[]);
         let (val, _) = cbor::decode(&bytes).unwrap();
         let map = val.as_map().unwrap();
         assert_eq!(map[0].0.as_uint(), Some(KEY_PIN_PROTOCOL));

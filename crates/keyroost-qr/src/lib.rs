@@ -79,7 +79,9 @@ pub struct QrImport {
 }
 
 /// Decode every QR code in a PNG/JPEG image and return the payload strings.
-pub fn texts_from_image(bytes: &[u8]) -> Result<Vec<String>, QrError> {
+/// The payloads of 2FA QRs are seeds in clear text, so they come back in a
+/// wipe-on-drop buffer — callers don't get to forget.
+pub fn texts_from_image(bytes: &[u8]) -> Result<zeroize::Zeroizing<Vec<String>>, QrError> {
     let (w, h, luma) = to_grayscale(bytes)?;
     let mut img = rqrr::PreparedImage::prepare_from_greyscale(w as usize, h as usize, |x, y| {
         luma[y * w as usize + x]
@@ -88,7 +90,7 @@ pub fn texts_from_image(bytes: &[u8]) -> Result<Vec<String>, QrError> {
     if grids.is_empty() {
         return Err(QrError::NoQrFound);
     }
-    let mut out = Vec::new();
+    let mut out = zeroize::Zeroizing::new(Vec::new());
     for grid in grids {
         if let Ok((_meta, text)) = grid.decode() {
             out.push(text);
@@ -105,8 +107,8 @@ pub fn texts_from_image(bytes: &[u8]) -> Result<Vec<String>, QrError> {
 /// `otpauth://` enrollment QRs and Google Authenticator export batches.
 pub fn entries_from_image(bytes: &[u8]) -> Result<QrImport, QrError> {
     // The decoded payloads are otpauth:// URIs carrying the seeds in clear;
-    // wipe them on every exit path once parsing is done.
-    let texts = zeroize::Zeroizing::new(texts_from_image(bytes)?);
+    // they arrive in (and stay in) a wipe-on-drop buffer.
+    let texts = texts_from_image(bytes)?;
     let mut import = QrImport {
         entries: Vec::new(),
         skipped: Vec::new(),

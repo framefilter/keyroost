@@ -474,7 +474,8 @@ enum PivCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
-    /// Change the PIV PIN.
+    /// Change the PIV PIN. PINs are sourced from env vars or stdin (stdin
+    /// reads two consecutive lines: old then new).
     ChangePin {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -487,7 +488,8 @@ enum PivCmd {
         #[arg(long)]
         new_pin_stdin: bool,
     },
-    /// Change the PUK (PIN Unblocking Key).
+    /// Change the PUK (PIN Unblocking Key). PUKs are sourced from env vars or
+    /// stdin (stdin reads two consecutive lines: old then new).
     ChangePuk {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1092,29 +1094,40 @@ impl TimeoutArg {
     }
 }
 
-fn customer_key_bytes(cli: &Cli) -> Result<Vec<u8>, String> {
+fn customer_key_bytes(cli: &Cli) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    use zeroize::Zeroizing;
     if let Some(h) = &cli.key {
-        hex_decode(h).map_err(|e| format!("invalid --key hex: {}", e))
+        hex_decode(h)
+            .map(Zeroizing::new)
+            .map_err(|e| format!("invalid --key hex: {}", e))
     } else if let Some(s) = &cli.key_ascii {
-        Ok(s.as_bytes().to_vec())
+        Ok(Zeroizing::new(s.as_bytes().to_vec()))
     } else if let Some(var) = &cli.key_env {
-        let h =
-            std::env::var(var).map_err(|_| format!("env var {} (--key-env) is not set", var))?;
-        hex_decode(&h).map_err(|e| format!("invalid hex in --key-env {}: {}", var, e))
+        let h = Zeroizing::new(
+            std::env::var(var).map_err(|_| format!("env var {} (--key-env) is not set", var))?,
+        );
+        hex_decode(&h)
+            .map(Zeroizing::new)
+            .map_err(|e| format!("invalid hex in --key-env {}: {}", var, e))
     } else if let Some(var) = &cli.key_ascii_env {
         std::env::var(var)
-            .map(|s| s.into_bytes())
+            .map(|s| Zeroizing::new(s.into_bytes()))
             .map_err(|_| format!("env var {} (--key-ascii-env) is not set", var))
     } else {
-        Ok(DEFAULT_CUSTOMER_KEY.to_vec())
+        Ok(Zeroizing::new(DEFAULT_CUSTOMER_KEY.to_vec()))
     }
 }
 
 fn unix_now() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as u32,
+        Err(_) => {
+            // A pre-1970 clock would otherwise silently program time 0 into
+            // the device (configure / sync-time / key registration).
+            eprintln!("warning: system clock reads before 1970; using time 0");
+            0
+        }
+    }
 }
 
 /// Load a bulk-import file, transparently decrypting an Aegis encrypted
@@ -1169,12 +1182,12 @@ fn load_bulk_entries(
     Ok(keyroost_import::parse_bulk_any(&text)?)
 }
 
-fn read_password(stdin: bool, env_var: Option<&str>) -> Option<String> {
+fn read_password(stdin: bool, env_var: Option<&str>) -> Option<zeroize::Zeroizing<String>> {
     if let Some(name) = env_var {
-        return std::env::var(name).ok();
+        return std::env::var(name).ok().map(zeroize::Zeroizing::new);
     }
     if stdin {
-        let mut s = String::new();
+        let mut s = zeroize::Zeroizing::new(String::new());
         if std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).is_err() {
             return None;
         }
@@ -1679,7 +1692,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             password_stdin,
             password_env,
         } => {
-            let _ = dry_run; // dry-run is handled before auth
+            // dry-run prints the plan and returns *before* authentication
+            // (see the pre-auth handling above) — it is always false here.
+            debug_assert!(!*dry_run);
             let entries = load_bulk_entries(path, *password_stdin, password_env.as_deref())?;
             let n = entries.len();
             let last = (*start as usize).saturating_add(n);
@@ -1716,9 +1731,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     entry.algorithm,
                     entry.digits as u8
                 );
-                if *dry_run {
-                    continue;
-                }
                 session.set_seed(p, &entry.secret)?;
                 session.set_title(p, &title)?;
                 session.set_config(
@@ -1726,11 +1738,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
                 )?;
             }
-            if *dry_run {
-                println!("dry-run: nothing written");
-            } else {
-                println!("done");
-            }
+            println!("done");
         }
         Cmd::FactoryReset { .. } => unreachable!("handled above before auth"),
         Cmd::Probe { .. } => unreachable!("handled above before auth"),
@@ -2340,11 +2348,7 @@ fn oath_algo_str(a: keyroost_oath::Algorithm) -> &'static str {
 fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         OpenpgpCmd::Status { reader } => {
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             let status = session.status()?;
 
             println!("AID:            {}", hex_encode(&status.aid));
@@ -2378,38 +2382,40 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             reader,
         } => {
             let pin_value = read_secret("OpenPGP PIN", pin_env.as_deref(), *pin_stdin)?;
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.verify_pin(pin.pw_ref(), pin_value.as_bytes())?;
             println!("{} PIN verified.", pin.label());
         }
         OpenpgpCmd::PublicKey { slot, reader } => {
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             let key = session.read_public_key(slot.to_crt())?;
             println!("{} key (RSA):", slot.label());
             println!("  modulus:  {}", hex_encode(&key.modulus));
             println!("  exponent: {}", hex_encode(&key.exponent));
         }
         OpenpgpCmd::Reset { yes, reader } => {
+            // Resolve and identify the target *before* the --yes gate, so the
+            // refusal (and the consent the flag implies) names the exact card —
+            // the same posture as `factory-reset` and `piv reset`.
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
+            let status = session.status()?;
+            let ident = match status.serial() {
+                Some(serial) => format!("serial {}", serial),
+                None => format!("AID {}", hex_encode(&status.aid)),
+            };
             if !yes {
-                return Err("refusing to reset without --yes (this wipes ALL OpenPGP \
-                            keys and resets PINs to defaults)"
-                    .into());
+                return Err(format!(
+                    "refusing to reset the OpenPGP applet on {} without --yes \
+                     (this wipes ALL OpenPGP keys and resets PINs to defaults)",
+                    ident
+                )
+                .into());
             }
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
             session.factory_reset()?;
-            println!("OpenPGP applet reset. All keys wiped; PINs restored to defaults.");
+            println!(
+                "OpenPGP applet on {} reset. All keys wiped; PINs restored to defaults.",
+                ident
+            );
         }
         OpenpgpCmd::GenerateKey {
             slot,
@@ -2430,11 +2436,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 admin_pin_env.as_deref(),
                 *admin_pin_stdin,
             )?;
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!(
                 "Generating {} key — touch the key if it blinks…",
@@ -2490,11 +2492,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 keyroost_rsakey::load_from_file(path)?
             };
 
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!("Importing {} key…", slot.label());
             let parts = keyroost_transport::RsaPrivateKeyParts {
@@ -2527,11 +2525,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 admin_pin_env.as_deref(),
                 *admin_pin_stdin,
             )?;
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             session.set_cardholder_name(cardholder.as_bytes())?;
             println!("Cardholder name set.");
@@ -2547,11 +2541,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 admin_pin_env.as_deref(),
                 *admin_pin_stdin,
             )?;
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             session.set_url(url.as_bytes())?;
             println!("Public-key URL set.");
@@ -2571,11 +2561,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // in-tree (keyroost-proto); the card signs whatever DigestInfo it gets.
             let digest_info = hash.digest_info(&data);
             let pin = read_secret("signing PIN (PW1)", pin_env.as_deref(), *pin_stdin)?;
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.verify_pin(keyroost_openpgp::PW1_SIGN, pin.as_bytes())?;
             eprintln!("Signing ({}) — touch the key if it blinks…", hash.label());
             let sig = session.sign(&digest_info)?;
@@ -2598,11 +2584,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let cryptogram = std::fs::read(r#in)
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
             let pin = read_secret("user PIN (PW1)", pin_env.as_deref(), *pin_stdin)?;
-            let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "OpenPGP")?;
-            eprintln!("\u{2192} OpenPGP on {}", name);
-            let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
             // Decryption authorizes under PW1 in the "other"/decipher context
             // (ref 0x82), not the signing context (0x81).
             session.verify_pin(keyroost_openpgp::PW1_OTHER, pin.as_bytes())?;
@@ -2628,11 +2610,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         PivCmd::Status { reader } => {
-            let readers = keyroost_transport::PivSession::list_piv_readers()?;
-            let name = resolve_reader(readers, reader.as_deref(), "PIV")?;
-            eprintln!("\u{2192} PIV on {}", name);
-            let mut session = keyroost_transport::PivSession::open(&name)?;
-            session.set_debug(debug);
+            let mut session = open_piv(reader.as_deref(), debug)?;
             let status = session.status()?;
 
             match status.version {
@@ -2713,11 +2691,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_env,
             pin_stdin,
         } => {
+            if *pin_tries == 0 || *puk_tries == 0 {
+                return Err(
+                    "retry counts must be at least 1 — a zero count would leave the \
+                            PIN or PUK permanently blocked"
+                        .into(),
+                );
+            }
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            let alg = s.management_key_algorithm();
-            s.authenticate_management(alg, &mgmt)?;
+            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
             s.verify_pin(pin.as_bytes())?;
             s.set_pin_retries(*pin_tries, *puk_tries)?;
             println!(
@@ -2755,9 +2738,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            let cur_alg = s.management_key_algorithm();
-            s.authenticate_management(cur_alg, &old)?;
+            let mut s = open_piv_authed(reader.as_deref(), debug, &old)?;
             s.set_management_key(new_alg, &new, *touch)?;
             println!(
                 "Management key changed to {}{}.",
@@ -2777,9 +2758,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let alg = algorithm.to_alg();
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            let mgmt_alg = s.management_key_algorithm();
-            s.authenticate_management(mgmt_alg, &mgmt)?;
+            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
             eprintln!(
                 "Generating {} in {} (touch the key if it blinks)\u{2026}",
                 alg.label(),
@@ -2812,9 +2791,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let bytes =
                 std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
             let der = cert_to_der(&bytes)?;
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            let mgmt_alg = s.management_key_algorithm();
-            s.authenticate_management(mgmt_alg, &mgmt)?;
+            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
             s.import_certificate(slot.to_slot(), &der)?;
             println!(
                 "Imported {}-byte certificate into {}.",
@@ -2840,7 +2817,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         );
                     }
                     None => {
-                        use std::io::Write;
+                        use std::io::{IsTerminal, Write};
+                        // DER is binary — don't garble an interactive terminal.
+                        if std::io::stdout().is_terminal() {
+                            return Err("stdout is a terminal; pass --file PATH or pipe \
+                                        (e.g. | openssl x509 -inform der -text)"
+                                .into());
+                        }
                         std::io::stdout().write_all(&der)?;
                     }
                 },
@@ -2869,6 +2852,20 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// Open the OpenPGP session on the reader matching `reader` (or the sole
+/// OpenPGP reader), announcing the target on stderr.
+fn open_openpgp(
+    reader: Option<&str>,
+    debug: bool,
+) -> Result<keyroost_transport::OpenPgpSession, Box<dyn std::error::Error>> {
+    let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
+    let name = resolve_reader(readers, reader, "OpenPGP")?;
+    eprintln!("\u{2192} OpenPGP on {}", name);
+    let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
+    session.set_debug(debug);
+    Ok(session)
+}
+
 /// Open the PIV session on the reader matching `reader` (or the sole PIV reader).
 fn open_piv(
     reader: Option<&str>,
@@ -2879,6 +2876,29 @@ fn open_piv(
     eprintln!("\u{2192} PIV on {}", name);
     let mut session = keyroost_transport::PivSession::open(&name)?;
     session.set_debug(debug);
+    Ok(session)
+}
+
+/// [`open_piv`], then authenticate the management key against the card's own
+/// algorithm — with a friendly wrong-length message *before* the card sees
+/// anything, instead of a bare transport error afterwards.
+fn open_piv_authed(
+    reader: Option<&str>,
+    debug: bool,
+    mgmt_key: &[u8],
+) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
+    let mut session = open_piv(reader, debug)?;
+    let alg = session.management_key_algorithm();
+    if mgmt_key.len() != alg.key_len() {
+        return Err(format!(
+            "management key is {} bytes; this card's {} key needs {}",
+            mgmt_key.len(),
+            alg.label(),
+            alg.key_len()
+        )
+        .into());
+    }
+    session.authenticate_management(alg, mgmt_key)?;
     Ok(session)
 }
 
@@ -2900,6 +2920,10 @@ fn cert_to_der(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let end = after
             .find("-----END CERTIFICATE-----")
             .ok_or("PEM certificate has no END marker")?;
+        // A chain/bundle holds several blocks; the card slot stores one cert.
+        if after[end..].contains("-----BEGIN CERTIFICATE-----") {
+            eprintln!("note: file contains multiple certificates; using the first");
+        }
         let b64: String = after[..end].split_whitespace().collect();
         return Ok(keyroost_proto::codec::base64_decode(&b64)?);
     }
@@ -3284,7 +3308,8 @@ fn gather_secret(
                     cmd
                 );
             }
-            let mut line = String::new();
+            // The raw line buffer holds the secret too — wipe it on drop.
+            let mut line = zeroize::Zeroizing::new(String::new());
             stdin.lock().read_line(&mut line)?;
             line.trim_end_matches(['\r', '\n']).to_owned()
         }
@@ -3321,7 +3346,8 @@ fn read_secret(
                 label
             );
         }
-        let mut line = String::new();
+        // The raw line buffer holds the secret too — wipe it on drop.
+        let mut line = zeroize::Zeroizing::new(String::new());
         stdin.lock().read_line(&mut line)?;
         return Ok(zeroize::Zeroizing::new(
             line.trim_end_matches(['\r', '\n']).to_owned(),
@@ -3338,7 +3364,7 @@ fn read_secret(
 
 fn env_prefix_for(label: &str) -> &'static str {
     match label {
-        "PIN" => "pin-",
+        "PIN" | "OpenPGP PIN" | "signing PIN (PW1)" | "user PIN (PW1)" => "pin-",
         "new PIN" => "new-pin-",
         "old PIN" => "old-pin-",
         "PUK" => "puk-",
@@ -3347,7 +3373,13 @@ fn env_prefix_for(label: &str) -> &'static str {
         "management key" => "mgmt-key-",
         "old management key" => "old-mgmt-key-",
         "new management key" => "new-mgmt-key-",
-        _ => "",
+        "admin PIN (PW3)" => "admin-pin-",
+        "secret" => "secret-",
+        "OATH password" => "password-",
+        "new OATH password" => "new-password-",
+        // A label without a mapping would render a broken hint ("--env VAR");
+        // fall back to something generic rather than nothing.
+        _ => "…-",
     }
 }
 
