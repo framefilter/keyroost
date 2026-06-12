@@ -83,11 +83,11 @@ anyone with the Linux build prerequisites from the README.
 - [ ] **Branch/tag protection** — repo settings, must be done in the GitHub
       UI by an admin: protect `main` (require PR + green CI), protect `v*`
       tags (maintainers only; tag push is release authority).
-- [ ] **GUI: move slow imports off the frame loop** — QR image decode and
-      Aegis scrypt decryption run synchronously inside `update()`, freezing
-      the window (seconds for a stock vault, minutes at the scrypt caps);
-      route through the existing job mechanism, mindful that the worker
-      thread serializes device I/O.
+- [x] **GUI: move slow imports off the frame loop** — QR decode, vault
+      decrypt, and export parse run on a dedicated import thread (not the
+      device worker, which serializes card I/O behind whatever runs on it);
+      the dialog shows a spinner and blocks Load / Program all while one is
+      in flight.
 - [x] **Wayland clipboard clear** — documented in the README as best-effort
       on pure-Wayland sessions without XWayland clipboard sync (no complete
       fix known; wl-data-control is wlroots-only).

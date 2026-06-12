@@ -313,6 +313,7 @@ fn main() -> eframe::Result<()> {
                 accent_idx,
                 colorblind,
                 worker: Some(Worker::spawn(cc.egui_ctx.clone())),
+                egui_ctx: Some(cc.egui_ctx.clone()),
                 devices_dirty,
                 reader_watch: Some(reader_watch),
                 ..Default::default()
@@ -419,6 +420,15 @@ struct App {
     /// Held only to keep the thread alive; dropped on app exit.
     #[allow(dead_code)]
     reader_watch: Option<keyroost_transport::ReaderWatcher>,
+    /// Result channel of the in-flight bulk-import stage (QR decode, vault
+    /// decrypt, export parse). `Some` while one is running — these can take
+    /// seconds (scrypt: minutes at the caps) and run on their own thread so
+    /// they block neither the frame loop nor the device worker. One at a time.
+    import_rx: Option<std::sync::mpsc::Receiver<ApplyFn>>,
+    /// What the import thread is doing, for the dialog's progress row.
+    import_label: Option<String>,
+    /// Frame-loop handle for waking egui from helper threads. `None` in tests.
+    egui_ctx: Option<egui::Context>,
 }
 
 #[derive(Default)]
@@ -592,6 +602,70 @@ impl App {
     /// True while any background device job is in flight.
     fn busy(&self) -> bool {
         self.busy_jobs > 0
+    }
+
+    /// True while a bulk-import stage runs on its own thread.
+    fn import_busy(&self) -> bool {
+        self.import_rx.is_some()
+    }
+
+    /// Run a bulk-import stage (QR decode / vault decrypt / export parse) on a
+    /// dedicated thread. Not `spawn_job`: that queue serializes device I/O,
+    /// and a multi-second scrypt must not park card operations behind it.
+    fn run_import<F>(&mut self, label: impl Into<String>, job: F)
+    where
+        F: FnOnce() -> ApplyFn + Send + 'static,
+    {
+        if self.import_busy() {
+            return;
+        }
+        let Some(ctx) = self.egui_ctx.clone() else {
+            // Tests: no frame loop to wake; run inline.
+            let apply = job();
+            apply(self);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<ApplyFn>();
+        let spawned = std::thread::Builder::new()
+            .name("keyroost-import".into())
+            .spawn(move || {
+                let apply = job();
+                if tx.send(apply).is_ok() {
+                    ctx.request_repaint(); // wake the frame loop to apply it
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.import_rx = Some(rx);
+                self.import_label = Some(label.into());
+            }
+            Err(e) => {
+                self.bulk_dialog.error = Some(format!("could not start import thread: {}", e));
+            }
+        }
+    }
+
+    /// Apply a finished bulk-import stage. Called once per frame from
+    /// `update()`, alongside `drain_worker`.
+    fn drain_import(&mut self) {
+        let received = match &self.import_rx {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match received {
+            Ok(apply) => {
+                self.import_rx = None;
+                self.import_label = None;
+                apply(self);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Import thread died (panicked) without sending a result.
+                self.import_rx = None;
+                self.import_label = None;
+                self.bulk_dialog.error = Some("import failed unexpectedly".into());
+            }
+        }
     }
 
     fn log(&mut self, severity: Severity, text: impl Into<String>) {
@@ -792,6 +866,9 @@ impl App {
     }
 
     fn bulk_load(&mut self) {
+        if self.import_busy() {
+            return;
+        }
         let path = self.bulk_dialog.path.trim().to_owned();
         if path.is_empty() {
             self.bulk_dialog.error = Some("enter a file path first".into());
@@ -807,43 +884,13 @@ impl App {
 
         // Screenshot import: a PNG/JPEG (by magic bytes) goes through QR
         // decode — handles both standard otpauth:// enrollment codes and
-        // Google Authenticator export batches.
+        // Google Authenticator export batches. The decode (megapixel scan)
+        // runs on the import thread, not in the frame loop.
         if keyroost_qr::looks_like_image(&bytes) {
-            match keyroost_qr::entries_from_image(&bytes) {
-                Ok(import) => {
-                    self.bulk_dialog.error = None;
-                    self.bulk_dialog.needs_password = false;
-                    for s in &import.skipped {
-                        self.log(
-                            Severity::Err,
-                            format!("skipped {:?}: {}", s.label, s.reason),
-                        );
-                    }
-                    if let Some((i, n)) = import.batch {
-                        self.log(
-                            Severity::Info,
-                            format!(
-                                "this is QR {} of {} in the export — load the others too",
-                                i + 1,
-                                n
-                            ),
-                        );
-                    }
-                    self.log(
-                        Severity::Info,
-                        format!(
-                            "loaded {} entries from QR image — delete the screenshot after a \
-                             successful import",
-                            import.entries.len()
-                        ),
-                    );
-                    self.bulk_dialog.entries = import.entries;
-                }
-                Err(e) => {
-                    self.bulk_dialog.entries.clear();
-                    self.bulk_dialog.error = Some(e.to_string());
-                }
-            }
+            self.run_import("Decoding QR image\u{2026}", move || {
+                let result = keyroost_qr::entries_from_image(&bytes);
+                Box::new(move |app: &mut App| app.bulk_qr_loaded(result))
+            });
             return;
         }
 
@@ -857,9 +904,10 @@ impl App {
         };
 
         // If this looks like an encrypted Aegis vault, ask for a password first
-        // (unless the user has already typed one).
+        // (unless the user has already typed one). The scrypt KDF is seconds of
+        // CPU at stock parameters — import thread, never the frame loop.
         let is_encrypted_aegis = keyroost_import::aegis::is_encrypted(&text).unwrap_or(false);
-        let final_text = if is_encrypted_aegis {
+        if is_encrypted_aegis {
             self.bulk_dialog.needs_password = true;
             if self.bulk_dialog.password.is_empty() {
                 self.bulk_dialog.entries.clear();
@@ -867,22 +915,76 @@ impl App {
                     Some("encrypted Aegis vault — enter password and click Load again".into());
                 return;
             }
-            match keyroost_import::aegis::decrypt(&text, self.bulk_dialog.password.as_bytes()) {
-                Ok(plaintext) => plaintext,
-                Err(e) => {
-                    self.bulk_dialog.entries.clear();
-                    self.bulk_dialog.error = Some(format!("decrypt: {}", e));
-                    return;
-                }
-            }
-        } else {
-            self.bulk_dialog.needs_password = false;
-            // Plaintext exports carry the seeds in clear too — same wipe-on-
-            // drop treatment as the decrypted variant.
-            zeroize::Zeroizing::new(text)
-        };
+            let password = zeroize::Zeroizing::new(self.bulk_dialog.password.clone());
+            self.run_import("Decrypting vault\u{2026}", move || {
+                let result = match keyroost_import::aegis::decrypt(&text, password.as_bytes()) {
+                    Ok(plaintext) => {
+                        keyroost_import::parse_bulk_any(&plaintext).map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(format!("decrypt: {}", e)),
+                };
+                Box::new(move |app: &mut App| app.bulk_text_loaded(result, path))
+            });
+            return;
+        }
 
-        match keyroost_import::parse_bulk_any(&final_text) {
+        self.bulk_dialog.needs_password = false;
+        // Plaintext exports carry the seeds in clear too — same wipe-on-
+        // drop treatment as the decrypted variant.
+        let text = zeroize::Zeroizing::new(text);
+        self.run_import("Parsing export\u{2026}", move || {
+            let result = keyroost_import::parse_bulk_any(&text).map_err(|e| e.to_string());
+            Box::new(move |app: &mut App| app.bulk_text_loaded(result, path))
+        });
+    }
+
+    /// Apply a finished QR-image decode to the bulk dialog.
+    fn bulk_qr_loaded(&mut self, result: Result<keyroost_qr::QrImport, keyroost_qr::QrError>) {
+        match result {
+            Ok(import) => {
+                self.bulk_dialog.error = None;
+                self.bulk_dialog.needs_password = false;
+                for s in &import.skipped {
+                    self.log(
+                        Severity::Err,
+                        format!("skipped {:?}: {}", s.label, s.reason),
+                    );
+                }
+                if let Some((i, n)) = import.batch {
+                    self.log(
+                        Severity::Info,
+                        format!(
+                            "this is QR {} of {} in the export — load the others too",
+                            i + 1,
+                            n
+                        ),
+                    );
+                }
+                self.log(
+                    Severity::Info,
+                    format!(
+                        "loaded {} entries from QR image — delete the screenshot after a \
+                         successful import",
+                        import.entries.len()
+                    ),
+                );
+                self.bulk_dialog.entries = import.entries;
+            }
+            Err(e) => {
+                self.bulk_dialog.entries.clear();
+                self.bulk_dialog.error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Apply a finished text-export parse (with or without vault decryption)
+    /// to the bulk dialog.
+    fn bulk_text_loaded(
+        &mut self,
+        result: Result<Vec<keyroost_import::BulkEntry>, String>,
+        path: String,
+    ) {
+        match result {
             Ok(entries) => {
                 self.bulk_dialog.entries = entries;
                 self.bulk_dialog.error = None;
@@ -898,7 +1000,7 @@ impl App {
             }
             Err(e) => {
                 self.bulk_dialog.entries.clear();
-                self.bulk_dialog.error = Some(e.to_string());
+                self.bulk_dialog.error = Some(e);
             }
         }
     }
@@ -3095,8 +3197,10 @@ impl eframe::App for App {
             self.bulk_load();
         }
 
-        // Apply any results from background device jobs before drawing.
+        // Apply any results from background device jobs and the import
+        // thread before drawing.
         self.drain_worker();
+        self.drain_import();
         let p = self.palette();
         p.apply(ctx, self.mode);
 
@@ -4808,8 +4912,18 @@ impl App {
                         );
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Load").clicked() {
+                        let importing = self.import_busy();
+                        if ui
+                            .add_enabled(!importing, egui::Button::new("Load"))
+                            .clicked()
+                        {
                             do_load = true;
+                        }
+                        if importing {
+                            ui.spinner();
+                            if let Some(label) = &self.import_label {
+                                ui.label(label.as_str());
+                            }
                         }
                         ui.label("Start at profile:");
                         ui.add(
@@ -4880,7 +4994,9 @@ impl App {
                                 }
                             });
                         ui.horizontal(|ui| {
-                            let can_apply = self.authenticated;
+                            // Block programming while a load is in flight so a
+                            // stale entry list can't be written mid-replace.
+                            let can_apply = self.authenticated && !self.import_busy();
                             if ui
                                 .add_enabled(can_apply, egui::Button::new("Program all"))
                                 .on_hover_text("Write seed, title, and config for every entry")
