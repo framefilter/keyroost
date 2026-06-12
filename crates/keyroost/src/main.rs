@@ -3582,13 +3582,27 @@ impl App {
                             self.device_hero(ui, p, &dev);
                             self.cap_tabs(ui, p, &dev);
                             ui.add_space(16.0);
-                            match self.cap_tab {
-                                CapTab::Overview => self.overview(ui, p, &dev),
-                                CapTab::Fido2 => self.cap_fido2(ui, p),
-                                CapTab::Oath => self.cap_oath(ui, p),
-                                CapTab::Pgp => self.cap_pgp(ui, p),
-                                CapTab::Piv => self.cap_piv(ui, p),
-                            }
+                            // Hero + tabs stay pinned; the active pane scrolls.
+                            // This is the one place every capability pane gets
+                            // its overflow handling — a card-heavy OpenPGP pane
+                            // or a key holding dozens of passkeys/TOTP codes
+                            // scrolls instead of clipping at the window edge.
+                            // Salted per tab so each pane keeps its own
+                            // scroll position.
+                            egui::ScrollArea::vertical()
+                                .id_salt(("cap-pane", self.cap_tab as u8))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    match self.cap_tab {
+                                        CapTab::Overview => self.overview(ui, p, &dev),
+                                        CapTab::Fido2 => self.cap_fido2(ui, p),
+                                        CapTab::Oath => self.cap_oath(ui, p),
+                                        CapTab::Pgp => self.cap_pgp(ui, p),
+                                        CapTab::Piv => self.cap_piv(ui, p),
+                                    }
+                                    // Breathing room below the last card.
+                                    ui.add_space(18.0);
+                                });
                         });
                 }
             });
@@ -3832,172 +3846,164 @@ impl App {
     }
 
     /// Overview tab: one summary card per capability, each with a `Manage →` jump.
+    /// Scrolling comes from the shared capability-pane scroller in `central`.
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &UiDevice) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if dev.caps.has(Caps::FIDO2) {
-                    theme::card_frame(p).show(ui, |ui| {
-                        if self.card_head(ui, p, "Passkeys & sign-in (FIDO2)", "fido2") {
-                            self.cap_tab = CapTab::Fido2;
-                        }
-                        ui.add_space(8.0);
-                        match self
-                            .security_keys
-                            .info
-                            .as_ref()
-                            .and_then(|i| i.option("clientPin"))
-                        {
-                            Some(true) => {
-                                ui.horizontal(|ui| {
-                                    theme::pill(ui, "PIN set", p.ok, p.ok_soft());
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "PIN configured \u{00B7} ready for passkeys",
-                                        )
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt2),
-                                    );
-                                });
-                            }
-                            Some(false) => {
-                                theme::pill(ui, "No PIN configured", p.warn, p.warn_soft());
-                            }
-                            None => {
+        ui.vertical(|ui| {
+            if dev.caps.has(Caps::FIDO2) {
+                theme::card_frame(p).show(ui, |ui| {
+                    if self.card_head(ui, p, "Passkeys & sign-in (FIDO2)", "fido2") {
+                        self.cap_tab = CapTab::Fido2;
+                    }
+                    ui.add_space(8.0);
+                    match self
+                        .security_keys
+                        .info
+                        .as_ref()
+                        .and_then(|i| i.option("clientPin"))
+                    {
+                        Some(true) => {
+                            ui.horizontal(|ui| {
+                                theme::pill(ui, "PIN set", p.ok, p.ok_soft());
+                                ui.add_space(8.0);
                                 ui.label(
-                                    egui::RichText::new("Reading key\u{2026}")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt3),
+                                    egui::RichText::new(
+                                        "PIN configured \u{00B7} ready for passkeys",
+                                    )
+                                    .font(theme::f_reg(13.0))
+                                    .color(p.txt2),
                                 );
-                            }
+                            });
                         }
-                    });
-                    ui.add_space(14.0);
-                }
-                if dev.caps.has(Caps::OATH) {
-                    theme::card_frame(p).show(ui, |ui| {
-                        if self.card_head(ui, p, "Authenticator codes (OATH)", "oath") {
-                            self.cap_tab = CapTab::Oath;
+                        Some(false) => {
+                            theme::pill(ui, "No PIN configured", p.warn, p.warn_soft());
                         }
-                        ui.add_space(8.0);
-                        if self.oath.loaded && !self.oath.creds.is_empty() {
-                            let total = self.oath.creds.len();
-                            let mut copy = None;
-                            for row in self.oath.creds.iter().take(2) {
-                                let is_copied =
-                                    self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
-                                if let (Some(code), _) = oath_row(
-                                    ui,
-                                    p,
-                                    &row.name,
-                                    row.code.as_deref(),
-                                    is_copied,
-                                    false,
-                                ) {
-                                    copy = Some((row.name.clone(), code));
-                                }
-                                ui.add_space(6.0);
-                            }
-                            if total > 2 {
-                                ui.label(
-                                    egui::RichText::new(format!("+{} more codes", total - 2))
-                                        .font(theme::f_reg(12.5))
-                                        .color(p.txt3),
-                                );
-                            }
-                            if let Some((name, code)) = copy {
-                                ui.output_mut(|o| o.copied_text = code.clone());
-                                self.copied = Some((name, now_secs_f64() + 1.2));
-                                self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
-                            }
-                        } else {
+                        None => {
                             ui.label(
-                                egui::RichText::new("Open Authenticator to view live codes.")
+                                egui::RichText::new("Reading key\u{2026}")
                                     .font(theme::f_reg(13.0))
                                     .color(p.txt3),
                             );
                         }
-                    });
-                    ui.add_space(14.0);
-                }
-                if dev.caps.has(Caps::PGP) {
-                    theme::card_frame(p).show(ui, |ui| {
-                        if self.card_head(ui, p, "OpenPGP", "pgp") {
-                            self.cap_tab = CapTab::Pgp;
+                    }
+                });
+                ui.add_space(14.0);
+            }
+            if dev.caps.has(Caps::OATH) {
+                theme::card_frame(p).show(ui, |ui| {
+                    if self.card_head(ui, p, "Authenticator codes (OATH)", "oath") {
+                        self.cap_tab = CapTab::Oath;
+                    }
+                    ui.add_space(8.0);
+                    if self.oath.loaded && !self.oath.creds.is_empty() {
+                        let total = self.oath.creds.len();
+                        let mut copy = None;
+                        for row in self.oath.creds.iter().take(2) {
+                            let is_copied =
+                                self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
+                            if let (Some(code), _) =
+                                oath_row(ui, p, &row.name, row.code.as_deref(), is_copied, false)
+                            {
+                                copy = Some((row.name.clone(), code));
+                            }
+                            ui.add_space(6.0);
                         }
-                        ui.add_space(8.0);
-                        if let Some(st) = &self.openpgp.status {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 5.0;
-                                theme::pill(
-                                    ui,
-                                    &format!(
-                                        "Signature \u{00B7} {}",
-                                        slot_summary(st.sig_algo_id, &st.fingerprint_sig)
-                                    ),
-                                    p.txt2,
-                                    p.raised2,
-                                );
-                                theme::pill(
-                                    ui,
-                                    &format!(
-                                        "Encryption \u{00B7} {}",
-                                        slot_summary(st.dec_algo_id, &st.fingerprint_dec)
-                                    ),
-                                    p.txt2,
-                                    p.raised2,
-                                );
-                                theme::pill(
-                                    ui,
-                                    &format!(
-                                        "Auth \u{00B7} {}",
-                                        slot_summary(st.aut_algo_id, &st.fingerprint_aut)
-                                    ),
-                                    p.txt2,
-                                    p.raised2,
-                                );
-                            });
-                        } else {
+                        if total > 2 {
                             ui.label(
-                                egui::RichText::new(
-                                    "Open OpenPGP and Read status to view key slots.",
-                                )
+                                egui::RichText::new(format!("+{} more codes", total - 2))
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt3),
+                            );
+                        }
+                        if let Some((name, code)) = copy {
+                            ui.output_mut(|o| o.copied_text = code.clone());
+                            self.copied = Some((name, now_secs_f64() + 1.2));
+                            self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Open Authenticator to view live codes.")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
+                        );
+                    }
+                });
+                ui.add_space(14.0);
+            }
+            if dev.caps.has(Caps::PGP) {
+                theme::card_frame(p).show(ui, |ui| {
+                    if self.card_head(ui, p, "OpenPGP", "pgp") {
+                        self.cap_tab = CapTab::Pgp;
+                    }
+                    ui.add_space(8.0);
+                    if let Some(st) = &self.openpgp.status {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            theme::pill(
+                                ui,
+                                &format!(
+                                    "Signature \u{00B7} {}",
+                                    slot_summary(st.sig_algo_id, &st.fingerprint_sig)
+                                ),
+                                p.txt2,
+                                p.raised2,
                             );
-                        }
-                    });
-                    ui.add_space(14.0);
-                }
-                if dev.caps.has(Caps::PIV) {
-                    theme::card_frame(p).show(ui, |ui| {
-                        if self.card_head(ui, p, "PIV smart card", "piv") {
-                            self.cap_tab = CapTab::Piv;
-                        }
-                        ui.add_space(8.0);
-                        if let Some(st) = &self.piv.status {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 5.0;
-                                for slot in &st.slots {
-                                    let lab = format!(
-                                        "{:02X} \u{00B7} {}",
-                                        slot.slot.key_ref(),
-                                        if slot.cert_present { "cert" } else { "empty" }
-                                    );
-                                    theme::pill(ui, &lab, p.txt2, p.raised2);
-                                }
-                            });
-                        } else {
-                            ui.label(
-                                egui::RichText::new("Open PIV to read certificate slots.")
-                                    .font(theme::f_reg(13.0))
-                                    .color(p.txt3),
+                            theme::pill(
+                                ui,
+                                &format!(
+                                    "Encryption \u{00B7} {}",
+                                    slot_summary(st.dec_algo_id, &st.fingerprint_dec)
+                                ),
+                                p.txt2,
+                                p.raised2,
                             );
-                        }
-                    });
-                }
-            });
+                            theme::pill(
+                                ui,
+                                &format!(
+                                    "Auth \u{00B7} {}",
+                                    slot_summary(st.aut_algo_id, &st.fingerprint_aut)
+                                ),
+                                p.txt2,
+                                p.raised2,
+                            );
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Open OpenPGP and Read status to view key slots.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    }
+                });
+                ui.add_space(14.0);
+            }
+            if dev.caps.has(Caps::PIV) {
+                theme::card_frame(p).show(ui, |ui| {
+                    if self.card_head(ui, p, "PIV smart card", "piv") {
+                        self.cap_tab = CapTab::Piv;
+                    }
+                    ui.add_space(8.0);
+                    if let Some(st) = &self.piv.status {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            for slot in &st.slots {
+                                let lab = format!(
+                                    "{:02X} \u{00B7} {}",
+                                    slot.slot.key_ref(),
+                                    if slot.cert_present { "cert" } else { "empty" }
+                                );
+                                theme::pill(ui, &lab, p.txt2, p.raised2);
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Open PIV to read certificate slots.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    }
+                });
+            }
+        });
     }
 
     /// FIDO2 / Passkeys tab — reuses the existing PIN + credentials section.
@@ -4203,53 +4209,48 @@ impl App {
                                 .color(p.txt3),
                         );
                     }
-                    egui::ScrollArea::vertical()
-                        .max_height(320.0)
-                        .show(ui, |ui| {
-                            for (rp, creds) in &rps {
-                                let header = if let Some(name) =
-                                    rp.name.as_ref().filter(|s| !s.is_empty())
-                                {
+                    // No inner scroller: the shared capability-pane scroller in
+                    // `central` handles overflow, so a long passkey list flows
+                    // down the page instead of trapping the wheel in a box.
+                    ui.vertical(|ui| {
+                        for (rp, creds) in &rps {
+                            let header =
+                                if let Some(name) = rp.name.as_ref().filter(|s| !s.is_empty()) {
                                     format!("{}  ({})", rp.id, name)
                                 } else {
                                     rp.id.clone()
                                 };
-                                ui.collapsing(header, |ui| {
-                                    if creds.is_empty() {
-                                        ui.label("(no credentials)");
-                                    }
-                                    for c in creds {
-                                        ui.horizontal(|ui| {
-                                            ui.monospace(hex_short(&c.credential_id));
-                                            let user_field = c
-                                                .user
-                                                .display_name
-                                                .clone()
-                                                .or_else(|| c.user.name.clone())
-                                                .unwrap_or_else(|| {
-                                                    String::from_utf8_lossy(&c.user.id).into_owned()
-                                                });
-                                            ui.label(user_field);
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if theme::button(
-                                                        ui,
-                                                        p,
-                                                        BtnKind::Ghost,
-                                                        "Remove",
-                                                    )
+                            ui.collapsing(header, |ui| {
+                                if creds.is_empty() {
+                                    ui.label("(no credentials)");
+                                }
+                                for c in creds {
+                                    ui.horizontal(|ui| {
+                                        ui.monospace(hex_short(&c.credential_id));
+                                        let user_field = c
+                                            .user
+                                            .display_name
+                                            .clone()
+                                            .or_else(|| c.user.name.clone())
+                                            .unwrap_or_else(|| {
+                                                String::from_utf8_lossy(&c.user.id).into_owned()
+                                            });
+                                        ui.label(user_field);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if theme::button(ui, p, BtnKind::Ghost, "Remove")
                                                     .clicked()
-                                                    {
-                                                        delete = Some(c.credential_id.clone());
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    }
-                                });
-                            }
-                        });
+                                                {
+                                                    delete = Some(c.credential_id.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                        }
+                    });
                 } else {
                     ui.horizontal(|ui| {
                         let resp = ui.add(

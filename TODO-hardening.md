@@ -88,6 +88,21 @@ anyone with the Linux build prerequisites from the README.
       Deliberately deferred until the product is feature-complete and
       stable: it ends the direct-push workflow, so adopt it when release
       cadence slows.
+- [ ] **PIV write path** — keyroost-piv is read-only by design so far (the
+      only PIV commit is the read-path foundation; status/version/serial/
+      cert presence). Full functionality means: management-key
+      authentication (GENERAL AUTHENTICATE), key generation in the four
+      slots, certificate import (PUT DATA), and PIN/PUK/management-key
+      changes — SP 800-73-4 byte layer first (vendored, tests), then
+      transport, CLI, GUI. Generalizes across YubiKey/Nitrokey since PIV
+      is a NIST standard.
+- [ ] **Publish-channel accounts** — one-time setup per packaging/README.md
+      before the first release: the `release-publish` environment approval
+      gate, crates.io account + manual first publish + trusted-publisher
+      grants, AUR account/SSH key + first `keyroost-bin` push, the Homebrew
+      tap repo + `TAP_PUSH_TOKEN`, and the manual first winget submission +
+      `WINGET_TOKEN`. Channels can be enabled one at a time; unset secrets
+      skip cleanly.
 - [x] **GUI: move slow imports off the frame loop** — QR decode, vault
       decrypt, and export parse run on a dedicated import thread (not the
       device worker, which serializes card I/O behind whatever runs on it);
