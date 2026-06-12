@@ -27,7 +27,7 @@ impl core::fmt::Display for SpkiError {
 impl std::error::Error for SpkiError {}
 
 /// Encode a DER definite length.
-fn der_len(out: &mut Vec<u8>, len: usize) {
+pub(crate) fn der_len(out: &mut Vec<u8>, len: usize) {
     if len < 0x80 {
         out.push(len as u8);
     } else {
@@ -44,7 +44,7 @@ fn der_len(out: &mut Vec<u8>, len: usize) {
 }
 
 /// Encode a DER `tag length value` element.
-fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+pub(crate) fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len() + 4);
     out.push(tag);
     der_len(&mut out, value.len());
@@ -53,7 +53,7 @@ fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
 }
 
 /// DER SEQUENCE (tag 0x30) over already-encoded members.
-fn der_seq(members: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn der_seq(members: &[&[u8]]) -> Vec<u8> {
     let mut body = Vec::new();
     for m in members {
         body.extend_from_slice(m);
@@ -63,7 +63,7 @@ fn der_seq(members: &[&[u8]]) -> Vec<u8> {
 
 /// DER unsigned INTEGER (tag 0x02): strip leading zeros, then prepend one `0x00`
 /// if the top bit is set so the value stays positive.
-fn der_uint(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn der_uint(bytes: &[u8]) -> Vec<u8> {
     let mut v = bytes;
     while v.len() > 1 && v[0] == 0 {
         v = &v[1..];
@@ -82,7 +82,7 @@ fn der_uint(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// DER BIT STRING (tag 0x03) with zero unused bits.
-fn der_bitstring(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn der_bitstring(bytes: &[u8]) -> Vec<u8> {
     let mut value = Vec::with_capacity(bytes.len() + 1);
     value.push(0x00); // unused-bits count
     value.extend_from_slice(bytes);
@@ -136,13 +136,25 @@ fn eddsa_spki(oid: &[u8], point: &[u8]) -> Vec<u8> {
 
 /// PEM-armor a DER `SubjectPublicKeyInfo` as a `PUBLIC KEY` block.
 pub fn to_pem(spki_der: &[u8]) -> String {
-    let b64 = keyroost_proto::codec::base64_encode(spki_der);
-    let mut out = String::from("-----BEGIN PUBLIC KEY-----\n");
+    pem("PUBLIC KEY", spki_der)
+}
+
+/// PEM-armor arbitrary DER under the given label (64-column base64 body).
+/// Shared with [`crate::x509`] for `CERTIFICATE` / `CERTIFICATE REQUEST`.
+pub(crate) fn pem(label: &str, der: &[u8]) -> String {
+    let b64 = keyroost_proto::codec::base64_encode(der);
+    let mut out = String::with_capacity(b64.len() + b64.len() / 64 + 2 * label.len() + 40);
+    out.push_str("-----BEGIN ");
+    out.push_str(label);
+    out.push_str("-----\n");
     for chunk in b64.as_bytes().chunks(64) {
+        // base64 output is pure ASCII, so the chunking can't split a char.
         out.push_str(core::str::from_utf8(chunk).unwrap());
         out.push('\n');
     }
-    out.push_str("-----END PUBLIC KEY-----\n");
+    out.push_str("-----END ");
+    out.push_str(label);
+    out.push_str("-----\n");
     out
 }
 

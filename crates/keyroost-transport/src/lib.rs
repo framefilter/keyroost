@@ -100,6 +100,9 @@ pub enum TransportError {
     /// The host operating system's random-number source failed; a security
     /// handshake that needs an unpredictable challenge was aborted.
     HostRngFailed,
+    /// Building a certificate/CSR structure failed (bad subject, expiry before
+    /// start, or an algorithm that cannot sign).
+    X509(keyroost_piv::x509::X509Error),
 }
 
 impl fmt::Display for TransportError {
@@ -192,6 +195,7 @@ impl fmt::Display for TransportError {
             TransportError::HostRngFailed => {
                 write!(f, "the host OS random-number source failed")
             }
+            TransportError::X509(e) => write!(f, "{}", e),
         }
     }
 }
@@ -203,6 +207,7 @@ impl std::error::Error for TransportError {
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::PivParse(e) => Some(e),
+            TransportError::X509(e) => Some(e),
             _ => None,
         }
     }

@@ -296,6 +296,13 @@ struct PivState {
     /// New management key (hex) + algorithm for a management-key rotation.
     new_mgmt_key_input: String,
     new_mgmt_alg: PivMgmtAlgSel,
+    /// Certificate creation: slot, subject (bare name or full DN), validity,
+    /// the PIN that authorizes the on-card signature, and the CSR destination.
+    certify_slot: PivSlotSel,
+    cert_subject: String,
+    cert_days: u32,
+    sign_pin: String,
+    csr_path: String,
     /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
     confirm_reset: Option<String>,
 }
@@ -314,6 +321,7 @@ impl Drop for PivState {
         wipe(&mut self.unblock_new_pin);
         wipe(&mut self.retries_pin_auth);
         wipe(&mut self.new_mgmt_key_input);
+        wipe(&mut self.sign_pin);
     }
 }
 
@@ -343,6 +351,11 @@ impl Default for PivState {
             export_path: String::new(),
             new_mgmt_key_input: String::new(),
             new_mgmt_alg: PivMgmtAlgSel::default(),
+            certify_slot: PivSlotSel::default(),
+            cert_subject: String::new(),
+            cert_days: 365,
+            sign_pin: String::new(),
+            csr_path: String::new(),
             confirm_reset: None,
         }
     }
@@ -3301,6 +3314,118 @@ impl App {
         });
     }
 
+    /// Normalize the certificate-subject field: a bare name becomes `CN=name`;
+    /// anything containing `=` is taken as a full distinguished name.
+    fn piv_subject(&self) -> Option<String> {
+        let s = self.piv.cert_subject.trim();
+        if s.is_empty() {
+            return None;
+        }
+        Some(if s.contains('=') {
+            s.to_owned()
+        } else {
+            format!("CN={s}")
+        })
+    }
+
+    /// Create a self-signed certificate for the selected slot's key and store
+    /// it in the slot (management key authorizes the import, PIN the signing).
+    fn piv_self_sign(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
+        };
+        let Some(subject) = self.piv_subject() else {
+            self.piv.error = Some("enter a name for the certificate".into());
+            return;
+        };
+        let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
+        let slot = self.piv.certify_slot.to_slot();
+        let days = i64::from(self.piv.cert_days.max(1));
+        self.piv.notice = None;
+        self.spawn_job(
+            "Creating self-signed certificate\u{2026} (touch if it blinks)",
+            move || {
+                let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                    let mut s = keyroost_transport::PivSession::open(&name)?;
+                    let mgmt_alg = s.management_key_algorithm();
+                    s.authenticate_management(mgmt_alg, &mgmt)?;
+                    s.verify_pin(pin.as_bytes())?;
+                    let now = i64::from(unix_now());
+                    s.self_signed_certificate(slot, &subject, now, now + days * 86_400)?;
+                    s.status()
+                })();
+                Box::new(move |app: &mut App| {
+                    wipe(&mut app.piv.sign_pin);
+                    wipe(&mut app.piv.mgmt_key_input);
+                    Self::apply_piv_write(
+                        app,
+                        result,
+                        format!("Self-signed certificate stored in {}.", slot.label()),
+                    );
+                })
+            },
+        );
+    }
+
+    /// Sign a PKCS#10 certificate request on the card and save it as PEM.
+    fn piv_request_csr(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let Some(subject) = self.piv_subject() else {
+            self.piv.error = Some("enter a name for the certificate request".into());
+            return;
+        };
+        let path = self.piv.csr_path.trim().to_owned();
+        if path.is_empty() {
+            self.piv.error = Some("enter a destination path for the request".into());
+            return;
+        }
+        if std::path::Path::new(&path).exists() {
+            self.piv.error = Some(format!(
+                "{path} already exists — delete it first or choose another name"
+            ));
+            return;
+        }
+        let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
+        let slot = self.piv.certify_slot.to_slot();
+        self.piv.notice = None;
+        self.spawn_job(
+            "Signing certificate request\u{2026} (touch if it blinks)",
+            move || {
+                let result = (|| -> Result<(), TransportError> {
+                    let mut s = keyroost_transport::PivSession::open(&name)?;
+                    s.verify_pin(pin.as_bytes())?;
+                    let pem = s.generate_csr(slot, &subject)?;
+                    std::fs::write(&path, pem.as_bytes()).map_err(|_| {
+                        TransportError::MalformedResponse("cannot write destination file")
+                    })?;
+                    Ok(())
+                })();
+                Box::new(move |app: &mut App| {
+                    wipe(&mut app.piv.sign_pin);
+                    match result {
+                        Ok(()) => {
+                            app.piv.error = None;
+                            app.piv.notice = Some("Certificate request signed and saved.".into());
+                        }
+                        Err(e) => {
+                            app.piv.notice = None;
+                            app.piv.error = Some(e.to_string());
+                        }
+                    }
+                })
+            },
+        );
+    }
+
     fn piv_export_cert(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
@@ -5411,6 +5536,8 @@ impl App {
         let mut go_generate = false;
         let mut go_import = false;
         let mut go_export = false;
+        let mut go_self_sign = false;
+        let mut go_csr = false;
         let mut go_set_retries = false;
         let mut go_change_mgmt = false;
         let mut arm_reset = false;
@@ -5578,6 +5705,56 @@ impl App {
                     }
                 }
                 ui.add_space(10.0);
+                sub(ui, "Create certificate");
+                note(
+                    ui,
+                    "Signed on the card with the slot's key (generate one above \
+                     first). \u{201c}Self-signed\u{201d} stores the certificate in \
+                     the slot — needs the PIN and the management key. \u{201c}Save \
+                     CSR\u{201d} writes a request file to hand to a certificate \
+                     authority — needs only the PIN.",
+                );
+                ui.horizontal(|ui| {
+                    piv_slot_combo(ui, "piv-certify-slot", &mut self.piv.certify_slot);
+                });
+                text_field(
+                    ui,
+                    p,
+                    "Name",
+                    &mut self.piv.cert_subject,
+                    "e.g. Alice — or full CN=Alice,O=Example,C=US",
+                    300.0,
+                );
+                pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Valid for")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.piv.cert_days)
+                            .range(1..=3650u32)
+                            .suffix(" days"),
+                    );
+                    ui.add_space(8.0);
+                    if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
+                    {
+                        go_self_sign = true;
+                    }
+                });
+                text_field(
+                    ui,
+                    p,
+                    "CSR file",
+                    &mut self.piv.csr_path,
+                    "/path/to/request.csr",
+                    240.0,
+                );
+                if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
+                    go_csr = true;
+                }
+                ui.add_space(10.0);
                 sub(ui, "Import certificate");
                 note(ui, "PEM or DER X.509 file. Needs the management key.");
                 ui.horizontal(|ui| {
@@ -5717,6 +5894,12 @@ impl App {
         }
         if go_export {
             self.piv_export_cert();
+        }
+        if go_self_sign {
+            self.piv_self_sign();
+        }
+        if go_csr {
+            self.piv_request_csr();
         }
         if go_set_retries {
             self.piv_set_retries();

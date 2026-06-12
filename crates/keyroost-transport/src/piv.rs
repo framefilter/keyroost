@@ -313,6 +313,93 @@ impl PivSession {
         Ok(piv::find_tlv(inner, 0x70).map(<[u8]>::to_vec))
     }
 
+    /// Ask `slot`'s private key to sign a *prepared* block via GENERAL
+    /// AUTHENTICATE: a full PKCS#1 v1.5 padded block for RSA, the raw hash for
+    /// ECDSA, or the raw message for Ed25519 (see
+    /// [`keyroost_piv::x509::signature_hash`]). Requires a verified PIN —
+    /// immediately prior for the signature slot (9C), whose policy is
+    /// PIN-per-use. ECDSA signatures come back DER-encoded (`SEQUENCE{r,s}`),
+    /// RSA/Ed25519 as raw blocks — either drops verbatim into an X.509
+    /// signature BIT STRING.
+    pub fn sign(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        prepared: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        let (data, sw) =
+            self.transmit_full(&piv::general_auth_sign(alg, slot.key_ref(), prepared))?;
+        ok_or_write("piv sign", sw)?;
+        piv::parse_general_auth(&data, 0x82)
+            .map(<[u8]>::to_vec)
+            .map_err(TransportError::PivParse)
+    }
+
+    /// The algorithm and public key of the key stored in `slot`, from GET
+    /// METADATA (firmware 5.3+). Errors when the slot is empty or the
+    /// firmware predates the extension.
+    pub fn slot_key(&mut self, slot: Slot) -> Result<(KeyAlg, PublicKey), TransportError> {
+        let md = self
+            .metadata(slot.key_ref())
+            .ok_or(TransportError::MalformedResponse(
+                "slot has no key (or the firmware lacks GET METADATA)",
+            ))?;
+        let alg =
+            md.algorithm
+                .and_then(KeyAlg::from_id)
+                .ok_or(TransportError::MalformedResponse(
+                    "slot metadata carries no key algorithm",
+                ))?;
+        let raw = md.public_key.ok_or(TransportError::MalformedResponse(
+            "slot metadata carries no public key",
+        ))?;
+        let key = public_key_from_metadata(&raw).map_err(TransportError::PivParse)?;
+        Ok((alg, key))
+    }
+
+    /// Build a PKCS#10 certificate-signing request for the key in `slot`,
+    /// signed on the card, returned as PEM. The slot must hold a key
+    /// (generated or imported) and the PIN must already be verified.
+    pub fn generate_csr(&mut self, slot: Slot, subject: &str) -> Result<String, TransportError> {
+        let (alg, key) = self.slot_key(slot)?;
+        let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
+        let spki = piv::spki::subject_public_key_info(&key, alg)
+            .map_err(|_| TransportError::MalformedResponse("slot key/algorithm mismatch"))?;
+        let cri = piv::x509::csr_info(&subject, &spki);
+        let prepared = prepared_block(alg, &cri)?;
+        let sig = self.sign(slot, alg, &prepared)?;
+        let der = piv::x509::assemble(&cri, alg, &sig).map_err(TransportError::X509)?;
+        Ok(piv::x509::pem_csr(&der))
+    }
+
+    /// Create a self-signed certificate for the key in `slot` (validity in
+    /// unix seconds), sign it on the card, **import it into the slot**, and
+    /// return the DER. Requires a verified PIN (for the signature) and prior
+    /// management-key auth (for the import).
+    pub fn self_signed_certificate(
+        &mut self,
+        slot: Slot,
+        subject: &str,
+        not_before: i64,
+        not_after: i64,
+    ) -> Result<Vec<u8>, TransportError> {
+        let (alg, key) = self.slot_key(slot)?;
+        let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
+        let spki = piv::spki::subject_public_key_info(&key, alg)
+            .map_err(|_| TransportError::MalformedResponse("slot key/algorithm mismatch"))?;
+        // 16 random bytes keep the serial unique and well under RFC 5280's
+        // 20-octet ceiling even after the positive-INTEGER zero prefix.
+        let mut serial = [0u8; 16];
+        getrandom::getrandom(&mut serial).map_err(|_| TransportError::HostRngFailed)?;
+        let tbs = piv::x509::tbs_certificate(&serial, alg, &subject, not_before, not_after, &spki)
+            .map_err(TransportError::X509)?;
+        let prepared = prepared_block(alg, &tbs)?;
+        let sig = self.sign(slot, alg, &prepared)?;
+        let der = piv::x509::assemble(&tbs, alg, &sig).map_err(TransportError::X509)?;
+        self.import_certificate(slot, &der)?;
+        Ok(der)
+    }
+
     /// Reset the PIV application to factory defaults. Only succeeds when **both**
     /// the PIN and PUK are blocked (the card enforces this); otherwise the card
     /// returns `6983` and this maps to [`TransportError::PivResetNotAllowed`].
@@ -371,6 +458,53 @@ impl PivSession {
             cmd_sensitive,
             resp_sensitive,
         )
+    }
+}
+
+/// Turn to-be-signed bytes into the block the card's GENERAL AUTHENTICATE
+/// expects: PKCS#1 v1.5 over SHA-256 for RSA (the card does raw RSA), the bare
+/// SHA-256/384 digest for ECDSA, and the unhashed message for Ed25519.
+fn prepared_block(alg: KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, TransportError> {
+    use keyroost_piv::x509::{self, SigHash};
+    match x509::signature_hash(alg).map_err(TransportError::X509)? {
+        SigHash::Sha256 => {
+            let digest = keyroost_proto::sha256::sha256(tbs);
+            let rsa_k = match alg {
+                KeyAlg::Rsa1024 => Some(128),
+                KeyAlg::Rsa2048 => Some(256),
+                KeyAlg::Rsa3072 => Some(384),
+                KeyAlg::Rsa4096 => Some(512),
+                _ => None,
+            };
+            Ok(match rsa_k {
+                Some(k) => x509::pkcs1_v15_sha256(&digest, k),
+                None => digest.to_vec(),
+            })
+        }
+        SigHash::Sha384 => Ok(keyroost_proto::sha512::sha384(tbs).to_vec()),
+        SigHash::None => Ok(tbs.to_vec()),
+    }
+}
+
+/// Decode the public key carried in GET METADATA tag `0x04`. Yubico encodes it
+/// as the same TLVs a GENERATE response carries — observed both with and
+/// without the outer `7F49` template across firmware, so accept either shape.
+fn public_key_from_metadata(raw: &[u8]) -> Result<PublicKey, keyroost_piv::ParseError> {
+    if raw.starts_with(&[0x7F, 0x49]) {
+        return piv::parse_public_key(raw);
+    }
+    // Bare inner TLVs: 86 (EC point) or 81/82 (RSA modulus/exponent).
+    if let Some(point) = piv::find_tlv(raw, 0x86) {
+        return Ok(PublicKey::Ecc {
+            point: point.to_vec(),
+        });
+    }
+    match (piv::find_tlv(raw, 0x81), piv::find_tlv(raw, 0x82)) {
+        (Some(m), Some(e)) => Ok(PublicKey::Rsa {
+            modulus: m.to_vec(),
+            exponent: e.to_vec(),
+        }),
+        _ => Err(keyroost_piv::ParseError::NotPublicKey),
     }
 }
 

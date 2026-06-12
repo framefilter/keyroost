@@ -594,6 +594,53 @@ enum PivCmd {
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
     },
+    /// Create a PKCS#10 certificate signing request for the key in a slot,
+    /// signed on the card (PEM to stdout or --file). Hand the result to a CA;
+    /// import the certificate it issues with `import-cert`.
+    RequestCert {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
+        /// (supported attributes: CN, O, OU, C, L, ST).
+        #[arg(long, value_name = "DN")]
+        subject: String,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        /// Output path; omit to print the PEM to stdout.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+    },
+    /// Create a self-signed certificate for the key in a slot, signed on the
+    /// card, and store it in that slot (the slot then works in PIV-aware
+    /// software without an external CA).
+    SelfSign {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
+        /// (supported attributes: CN, O, OU, C, L, ST).
+        #[arg(long, value_name = "DN")]
+        subject: String,
+        /// Validity period in days, starting now.
+        #[arg(long, value_name = "N", default_value_t = 365)]
+        days: u32,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        mgmt_key_env: Option<String>,
+        #[arg(long)]
+        mgmt_key_stdin: bool,
+        /// Also write the certificate as PEM to this path.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
+    },
     /// Reset the PIV application to factory defaults. Only works when BOTH the
     /// PIN and PUK are already blocked. Wipes all keys, certs, and PINs.
     Reset {
@@ -2827,6 +2874,74 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         std::io::stdout().write_all(&der)?;
                     }
                 },
+            }
+        }
+
+        PivCmd::RequestCert {
+            reader,
+            slot,
+            subject,
+            pin_env,
+            pin_stdin,
+            file,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            s.verify_pin(pin.as_bytes())?;
+            eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
+            let pem = s.generate_csr(slot.to_slot(), subject)?;
+            match file {
+                Some(path) => {
+                    std::fs::write(path, pem.as_bytes())
+                        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                    eprintln!(
+                        "Wrote certificate request for {} to {}.",
+                        slot.to_slot().label(),
+                        path.display()
+                    );
+                }
+                None => print!("{}", pem),
+            }
+        }
+
+        PivCmd::SelfSign {
+            reader,
+            slot,
+            subject,
+            days,
+            pin_env,
+            pin_stdin,
+            mgmt_key_env,
+            mgmt_key_stdin,
+            file,
+        } => {
+            if *days == 0 {
+                return Err("validity must be at least 1 day".into());
+            }
+            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            // Management-key auth covers the certificate import; the PIN
+            // covers the signature itself.
+            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            s.verify_pin(pin.as_bytes())?;
+            eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
+            let now = unix_now() as i64;
+            let der = s.self_signed_certificate(
+                slot.to_slot(),
+                subject,
+                now,
+                now + i64::from(*days) * 86_400,
+            )?;
+            println!(
+                "Self-signed certificate ({} bytes, {} days) created and stored in {}.",
+                der.len(),
+                days,
+                slot.to_slot().label()
+            );
+            if let Some(path) = file {
+                std::fs::write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
+                    .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                eprintln!("PEM copy written to {}.", path.display());
             }
         }
 
