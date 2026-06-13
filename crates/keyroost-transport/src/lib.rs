@@ -21,7 +21,6 @@ use std::fmt;
 use keyroost_proto::commands::{
     self, derive_sm4_key, sw_auth_failed, sw_ok, Command, ProfileConfig,
 };
-use keyroost_proto::READER_NAME_HINT;
 use pcsc::{
     Attribute, Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State,
     PNP_NOTIFICATION,
@@ -261,9 +260,8 @@ impl Session {
         let mut readers = ctx
             .list_readers(&mut readers_buf)
             .map_err(TransportError::PcscUnavailable)?;
-        let hint = READER_NAME_HINT.to_ascii_lowercase();
         let name = readers
-            .find(|r| r.to_string_lossy().to_ascii_lowercase().contains(&hint))
+            .find(|r| keyroost_proto::is_molto2_reader(&r.to_string_lossy()))
             .ok_or(TransportError::NoMolto2Reader)?;
         let card = ctx.connect(name, ShareMode::Shared, Protocols::ANY)?;
         Ok(Self {
@@ -593,10 +591,11 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         .map(|r| r.to_owned())
         .collect();
 
-    let molto_hint = READER_NAME_HINT.to_ascii_lowercase();
     let mut out = Vec::with_capacity(names.len());
     for name in names {
         let reader_name = name.to_string_lossy().into_owned();
+        // Lowercased copy for the YubiKey-hint check below, taken before
+        // `reader_name` is moved into a `ReaderProbe`.
         let lower = reader_name.to_ascii_lowercase();
 
         // Molto2: list it by name only — NEVER connect during enumeration.
@@ -605,7 +604,11 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         // that wedges pcscd until the PC/SC stack is restarted (the reader then
         // stops enumerating entirely). The serial is read later, when the user
         // opens the token (`Session::read_info`).
-        if lower.contains(&molto_hint) {
+        //
+        // `is_molto2_reader` (not a bare "TOKEN2" substring) so Token2's own
+        // FIDO keys — same brand, same VID, also a CCID reader — aren't
+        // mis-flagged as a ghost Molto2 (issue #21).
+        if keyroost_proto::is_molto2_reader(&reader_name) {
             out.push(ReaderProbe {
                 reader_name,
                 is_molto2: true,
