@@ -36,6 +36,12 @@ pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 mod piv;
 pub use piv::{PivSession, PivSlotStatus, PivStatus};
 
+mod token2otp;
+pub use token2otp::{
+    otp_type_str, ButtonPrompt, HidOtpTransport, OtpTransportError, PcScOtpTransport,
+    Token2OtpSession,
+};
+
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{KeyCrt, RsaPrivateKeyParts};

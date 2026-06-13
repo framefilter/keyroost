@@ -11,6 +11,7 @@ members = [
     "crates/keyroost-keyring",
     "crates/keyroost-resolve",
     "crates/keyroost-oath",
+    "crates/keyroost-token2otp",
     "crates/keyroost-openpgp",
     "crates/keyroost-piv",
     "crates/keyroost-rsakey",

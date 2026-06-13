@@ -1760,6 +1760,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyroost-token2otp"
+version = "0.4.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "p256",
+ "rand_core",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
 name = "keyroost-transport"
 version = "0.4.0"
 dependencies = [
@@ -1767,10 +1779,13 @@ dependencies = [
  "cipher",
  "des",
  "getrandom 0.2.17",
+ "hidapi",
+ "keyroost-hid",
  "keyroost-oath",
  "keyroost-openpgp",
  "keyroost-piv",
  "keyroost-proto",
+ "keyroost-token2otp",
  "pcsc",
  "zeroize",
 ]
@@ -1793,6 +1808,7 @@ dependencies = [
  "keyroost-qr",
  "keyroost-resolve",
  "keyroost-rsakey",
+ "keyroost-token2otp",
  "keyroost-transport",
  "zeroize",
 ]

@@ -1,0 +1,536 @@
+//! Pure-Rust byte layer for the Token2 T2F2 / PIN+ on-device OTP management
+//! applet — the protocol that provisions and reads the TOTP/HOTP entries the
+//! key stores, *not* CTAP/FIDO2 (that is the standard FIDO interface, handled by
+//! `keyroost-ctap`).
+//!
+//! This crate is hardware-free in the same spirit as [`keyroost_oath`] and
+//! [`keyroost_proto`]: it builds APDUs, parses responses, and performs the
+//! ECDH+AES payload encryption that seed-bearing commands require. The actual
+//! USB-HID / PC/SC transmission lives in `keyroost-transport`.
+//!
+//! Spec reference: the bundled *Token2 OTP — Protocol & SDK Reference*, which is
+//! cross-checked against the vendor *OTP on FIDO Command Manual* §§1.1–1.11. The
+//! one command not in the vendor manual is [`read_serial`](cmd::READ_SERIAL_INS)
+//! (§6.10), observed in the reference client only.
+//!
+//! # Security posture
+//!
+//! TOTP/HOTP are shared-secret schemes and are **not** phishing-resistant; the
+//! spec is emphatic that FIDO2 should be preferred for any account that supports
+//! it. This crate exists to manage OTP on legacy services, not to endorse it for
+//! new deployments. Seeds are scrubbed from memory on drop and never logged.
+
+#![forbid(unsafe_code)]
+
+pub mod crypto;
+pub mod entry;
+pub mod hidframe;
+
+pub use crypto::{encrypt_seed_payload, EncryptError, IV_OTP, IV_HOTP};
+pub use entry::{
+    parse_enum_page, serialize_delete_entry, serialize_read_entry, serialize_write_entry,
+    Algorithm, EnumPage, Entry, OtpType, ParseError, WriteEntry,
+};
+
+use zeroize::Zeroizing;
+
+/// USB Vendor ID for the Token2 T2F2 / PIN+ FIDO2 key (decimal 13470).
+///
+/// Distinct from [`keyroost_proto::USB_VID`]'s Molto2 PID — same vendor, but the
+/// FIDO key and the Molto2 TOTP token are different products. Match on VID plus
+/// the manufacturer/product strings per spec §2.1.
+pub const USB_VID: u16 = 0x349E;
+/// USB Product ID seen on the reference udev rule (spec §2.1).
+pub const USB_PID: u16 = 0x0022;
+/// Manufacturer string to match when the VID alone is ambiguous (spec §2.1).
+pub const USB_MANUFACTURER: &str = "TOKEN2";
+/// Product string to match alongside [`USB_MANUFACTURER`] (spec §2.1).
+pub const USB_PRODUCT: &str = "FIDO2 Security Key";
+/// HID usage page these keys expose (standard FIDO/U2F page). Used as the
+/// primary discriminator alongside the VID, since the PID varies by model.
+pub const FIDO_USAGE_PAGE: u16 = 0xF1D0;
+
+/// PC/SC SELECT AID for the OTP management applet (spec §2.2), `"Otp\x01"`-suffixed.
+pub const OTP_APPLET_AID: [u8; 8] = [0xF0, 0x00, 0x00, 0x01, 0x4F, 0x74, 0x70, 0x01];
+/// PC/SC SELECT AID for the FIDO applet — needed before reading the serial
+/// number over PC/SC (spec §5, §6.10).
+pub const FIDO_APPLET_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
+
+/// APDU command bytes (`CLA INS P1 P2`) from spec §6.
+pub mod cmd {
+    /// `WRITE_HOTP_SEED` — encrypted (IV-2), spec §1.7.
+    pub const WRITE_HOTP_SEED: [u8; 4] = [0x80, 0xC5, 0x00, 0x00];
+    /// `GET_ECDH_PUBKEY` — device returns its raw 64-byte P-256 pubkey, §1.1.
+    pub const GET_ECDH_PUBKEY: [u8; 4] = [0x80, 0xC5, 0x01, 0x00];
+    /// `READ_CONFIG` — host sends 1 byte (read length); device returns info, §1.11.
+    pub const READ_CONFIG: [u8; 4] = [0x80, 0xC5, 0x02, 0x00];
+    /// `SET_DEVICE_TYPE` — host sends a 1-byte disable bitmask, §1.6. **Bricking
+    /// risk** — see [`SetDeviceTypeError`].
+    pub const SET_DEVICE_TYPE: [u8; 4] = [0x80, 0xC5, 0x02, 0x01];
+    /// `CFG_HOTP_ENTER` — 1 byte, §1.8.
+    pub const CFG_HOTP_ENTER: [u8; 4] = [0x80, 0xC5, 0x02, 0x02];
+    /// `CFG_HOTP_TOUCH` — 1 byte, §1.9.
+    pub const CFG_HOTP_TOUCH: [u8; 4] = [0x80, 0xC5, 0x02, 0x04];
+    /// `ENABLE_TOTP` — 1 byte (00/01), §1.2.
+    pub const ENABLE_TOTP: [u8; 4] = [0x80, 0xC5, 0x02, 0x05];
+    /// `CFG_HOTP_KBD_TYPE` — 1 byte, §1.10.
+    pub const CFG_HOTP_KBD_TYPE: [u8; 4] = [0x80, 0xC5, 0x02, 0x06];
+    /// `ENUM_CODES` — host sends subcommand + args, §1.4.
+    pub const ENUM_CODES: [u8; 4] = [0x80, 0xC5, 0x05, 0x00];
+    /// `ENUM_CODES_CONTINUE` — host sends an 8-byte timestamp, §1.5.
+    pub const ENUM_CODES_CONTINUE: [u8; 4] = [0x80, 0xC5, 0x05, 0x01];
+    /// `WRITE_SEED` — encrypted (IV-1), or empty data for erase-all, §1.3.
+    pub const WRITE_SEED: [u8; 4] = [0x80, 0xC5, 0x05, 0x02];
+    /// `GET_INFO` on the FIDO applet — read serial number, §6.10 (reference only).
+    pub const READ_SERIAL_INS: [u8; 4] = [0x80, 0x33, 0x00, 0x00];
+
+    /// ENUM_CODES subcommand: read one entry by name (§6.2).
+    pub const SUB_READ_ONE: u8 = 0x01;
+    /// ENUM_CODES subcommand: code-only, no metadata (§6, unused by reference).
+    pub const SUB_GET_METADATA: u8 = 0x02;
+    /// ENUM_CODES subcommand: paginated read-all (§6.1).
+    pub const SUB_READ_ALL: u8 = 0x03;
+}
+
+/// ISO-7816 status words this applet returns (spec §3.1).
+pub mod sw {
+    pub const OK: u16 = 0x9000;
+    pub const ENTRY_NOT_FOUND: u16 = 0x6A80;
+    pub const ENTRY_NOT_FOUND_ALT: u16 = 0x6A83;
+    pub const NOT_ENOUGH_SPACE: u16 = 0x6A84;
+    pub const HID_NOT_SUPPORTED: u16 = 0x6A86;
+    pub const BUTTON_TIMEOUT: u16 = 0x6FF9;
+}
+
+/// An expected, surface-to-the-user error from the applet, mirroring the
+/// reference client's exception hierarchy (spec §8.4). Transport-level and
+/// crypto errors are separate types in their own modules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtpError {
+    /// `6A80` / `6A83`. Note: on a clean `ENUM_CODES` READ_ALL this means "zero
+    /// entries", which [`is_empty_token`](OtpError::is_empty_token) flags so the
+    /// caller can treat it as success.
+    EntryNotFound,
+    /// `6A84` — device storage is full.
+    NotEnoughSpace,
+    /// `6FF9` — timed out waiting for the confirming button press.
+    ButtonPressRequired,
+    /// `6A86` — this model does not expose HOTP-over-HID (older PIN+ revisions).
+    HidNotSupported,
+    /// Any other non-`9000` status word.
+    BadStatusCode(u16),
+}
+
+impl OtpError {
+    /// Map a raw status word to an [`OtpError`], or `Ok(())` for `9000`.
+    pub fn check(sw: u16) -> Result<(), OtpError> {
+        match sw {
+            sw::OK => Ok(()),
+            sw::ENTRY_NOT_FOUND | sw::ENTRY_NOT_FOUND_ALT => Err(OtpError::EntryNotFound),
+            sw::NOT_ENOUGH_SPACE => Err(OtpError::NotEnoughSpace),
+            sw::BUTTON_TIMEOUT => Err(OtpError::ButtonPressRequired),
+            sw::HID_NOT_SUPPORTED => Err(OtpError::HidNotSupported),
+            other => Err(OtpError::BadStatusCode(other)),
+        }
+    }
+
+    /// True for the `EntryNotFound` that a READ_ALL returns on an empty token,
+    /// which the caller should treat as "zero entries", not an error (spec §3.1,
+    /// §11).
+    pub fn is_empty_token(&self) -> bool {
+        matches!(self, OtpError::EntryNotFound)
+    }
+}
+
+impl std::fmt::Display for OtpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OtpError::EntryNotFound => write!(f, "entry not found"),
+            OtpError::NotEnoughSpace => write!(f, "not enough space on device"),
+            OtpError::ButtonPressRequired => {
+                write!(f, "timed out waiting for a button press on the key")
+            }
+            OtpError::HidNotSupported => {
+                write!(f, "HOTP-over-HID is not supported on this model")
+            }
+            OtpError::BadStatusCode(sw) => write!(f, "unexpected status word {:#06X}", sw),
+        }
+    }
+}
+
+impl std::error::Error for OtpError {}
+
+/// Build an extended-length APDU: `CLA INS P1 P2 00 Lc_hi Lc_lo data...`
+/// (spec §3). Used for every command except the PC/SC SELECT, which is
+/// short-form via [`build_select`].
+///
+/// The device ignores Le and returns whatever it has, so none is appended.
+pub fn build_apdu(header: [u8; 4], data: &[u8]) -> Vec<u8> {
+    let len = data.len();
+    assert!(len <= 0xFFFF, "extended APDU body exceeds 16-bit Lc");
+    let mut out = Vec::with_capacity(7 + len);
+    out.extend_from_slice(&header);
+    if len > 0 {
+        out.push(0x00);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xFF) as u8);
+        out.extend_from_slice(data);
+    }
+    // erase-all (WRITE_SEED with empty data) sends no Lc/Le at all — just the
+    // 4-byte header. The device interprets a bodyless WRITE_SEED as erase-all.
+    out
+}
+
+/// Build the short-form PC/SC SELECT-by-name APDU for an applet AID (spec §2.2,
+/// §3): `00 A4 04 00 Lc aid...`. Short Lc is used *only* here.
+pub fn build_select(aid: &[u8]) -> Vec<u8> {
+    assert!(!aid.is_empty() && aid.len() <= 255, "SELECT AID length");
+    let mut out = Vec::with_capacity(5 + aid.len());
+    out.extend_from_slice(&[0x00, 0xA4, 0x04, 0x00]);
+    out.push(aid.len() as u8);
+    out.extend_from_slice(aid);
+    out
+}
+
+/// Build the `ENABLE_TOTP` APDU (spec §6.7). `enabled` → `0x01`, else `0x00`.
+pub fn enable_totp(enabled: bool) -> Vec<u8> {
+    build_apdu(cmd::ENABLE_TOTP, &[enabled as u8])
+}
+
+/// Build the `READ_CONFIG` request for `num_bytes` of device info (spec §6.9).
+/// `num_bytes` is clamped to `1..=64`; the firmware fills the first 10.
+pub fn read_config(num_bytes: u8) -> Vec<u8> {
+    let n = num_bytes.clamp(1, 64);
+    build_apdu(cmd::READ_CONFIG, &[n])
+}
+
+/// Build the bodyless `WRITE_SEED` that erases every entry (spec §6.5). The
+/// device requires a confirming button press, so the transport should set its
+/// "detect button wait" flag.
+pub fn erase_all() -> Vec<u8> {
+    build_apdu(cmd::WRITE_SEED, &[])
+}
+
+/// Build the FIDO-applet `GET_INFO` serial-number request (spec §6.10): the
+/// fixed 18-byte payload `D1 10` followed by 16 zero bytes.
+pub fn read_serial_request() -> Vec<u8> {
+    let mut payload = [0u8; 18];
+    payload[0] = 0xD1;
+    payload[1] = 0x10;
+    build_apdu(cmd::READ_SERIAL_INS, &payload)
+}
+
+/// Parse the serial-number response (spec §6.10): `D1 len ascii_hex...`. The SN
+/// is double-encoded — ASCII-hex characters the host then hex-decodes to bytes.
+pub fn parse_serial(data: &[u8]) -> Result<Vec<u8>, ParseError> {
+    if data.len() < 2 || data[0] != 0xD1 {
+        return Err(ParseError::Truncated);
+    }
+    let sn_len = data[1] as usize;
+    let hex = data.get(2..2 + sn_len).ok_or(ParseError::Truncated)?;
+    decode_ascii_hex(hex)
+}
+
+/// Decode an even-length ASCII-hex byte slice (spec §6.10 SN field).
+fn decode_ascii_hex(hex: &[u8]) -> Result<Vec<u8>, ParseError> {
+    if hex.len() % 2 != 0 {
+        return Err(ParseError::Malformed("serial hex length is odd"));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        let hi = hex_nibble(pair[0]).ok_or(ParseError::Malformed("non-hex char in serial"))?;
+        let lo = hex_nibble(pair[1]).ok_or(ParseError::Malformed("non-hex char in serial"))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decoded `READ_CONFIG` device-info blob (spec §6.9). Each meaningful bit is
+/// exposed as a named boolean rather than making callers mask bytes (spec §8.3).
+///
+/// Bit numbering follows the manual: "bit 1" is `value & 0x01`, "bit 8" is
+/// `value & 0x80` (spec §6.9 reminder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub transfer_type: u8,
+    pub device_config: u8,
+    pub appearance: [u8; 4],
+    pub fido_version: [u8; 3],
+    pub device_extension: u8,
+    /// Anything beyond byte 9, retained for forward-compat (spec §8.3).
+    pub raw_tail: Vec<u8>,
+}
+
+impl DeviceInfo {
+    /// Parse the fixed-format response (spec §6.9). Requires at least 10 bytes.
+    pub fn parse(data: &[u8]) -> Result<Self, ParseError> {
+        if data.len() < 10 {
+            return Err(ParseError::Truncated);
+        }
+        Ok(DeviceInfo {
+            transfer_type: data[0],
+            device_config: data[1],
+            appearance: [data[2], data[3], data[4], data[5]],
+            fido_version: [data[6], data[7], data[8]],
+            device_extension: data[9],
+            raw_tail: data[10..].to_vec(),
+        })
+    }
+
+    // --- transfer-type bits (byte 0) ---
+    /// Bit 1: FIDO interface disabled.
+    pub fn fido_disabled(&self) -> bool {
+        self.transfer_type & 0x01 != 0
+    }
+    /// Bit 2: HOTP-via-keystroke disabled.
+    pub fn hotp_keystroke_disabled(&self) -> bool {
+        self.transfer_type & 0x02 != 0
+    }
+
+    // --- device-config bits (byte 1) ---
+    /// Bit 1: HOTP will *not* send Enter after the code.
+    pub fn hotp_suppresses_enter(&self) -> bool {
+        self.device_config & 0x01 != 0
+    }
+    /// Bit 2: a FIDO PIN is registered.
+    pub fn fido_pin_set(&self) -> bool {
+        self.device_config & 0x02 != 0
+    }
+    /// Bit 3: HOTP is supported.
+    pub fn hotp_supported(&self) -> bool {
+        self.device_config & 0x04 != 0
+    }
+    /// Bit 4: a fingerprint sensor is present.
+    pub fn fingerprint_present(&self) -> bool {
+        self.device_config & 0x08 != 0
+    }
+    /// Bit 5: NFC is supported.
+    pub fn nfc_supported(&self) -> bool {
+        self.device_config & 0x10 != 0
+    }
+    /// Bit 6: HOTP is triggered by a *long* press (else short tap).
+    pub fn hotp_long_press(&self) -> bool {
+        self.device_config & 0x20 != 0
+    }
+    /// Bit 7: the FIDO PIN is locked.
+    pub fn pin_locked(&self) -> bool {
+        self.device_config & 0x40 != 0
+    }
+    /// Bit 8: the HOTP-on-button seed slot is occupied.
+    pub fn button_hotp_configured(&self) -> bool {
+        self.device_config & 0x80 != 0
+    }
+
+    // --- device-extension bits (byte 9) ---
+    /// Bit 1: the TOTP function is supported.
+    pub fn totp_supported(&self) -> bool {
+        self.device_extension & 0x01 != 0
+    }
+    /// Bit 2: FIDO 2.1 is supported.
+    pub fn fido_21_supported(&self) -> bool {
+        self.device_extension & 0x02 != 0
+    }
+    /// Bit 4: HOTP keystrokes use the numeric-keypad layout (else main row).
+    pub fn hotp_uses_numpad(&self) -> bool {
+        self.device_extension & 0x08 != 0
+    }
+    /// Bit 5: a CCID interface is supported.
+    pub fn ccid_supported(&self) -> bool {
+        self.device_extension & 0x10 != 0
+    }
+    /// Bit 6 is set when HOTP-on-button is **not** supported; this returns the
+    /// inverted, positive sense ("is button-HOTP available?") for ergonomics.
+    pub fn button_hotp_supported(&self) -> bool {
+        self.device_extension & 0x20 == 0
+    }
+}
+
+/// Which USB interfaces a `SET_DEVICE_TYPE` mask would leave enabled, and the
+/// guard against bricking the device (spec §6.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetDeviceTypeError {
+    /// The supplied mask would disable every interface, leaving the device with
+    /// no way to be talked to — refused client-side exactly as the vendor
+    /// companion app does (spec §6.8).
+    WouldBrick,
+}
+
+impl std::fmt::Display for SetDeviceTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetDeviceTypeError::WouldBrick => write!(
+                f,
+                "refusing SET_DEVICE_TYPE: mask would disable every interface and brick the key"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SetDeviceTypeError {}
+
+/// The three interface bits in a `SET_DEVICE_TYPE` disable-mask (spec §6.8).
+pub const DEV_FIDO: u8 = 0x01;
+pub const DEV_KEYBOARD: u8 = 0x02;
+pub const DEV_CCID: u8 = 0x04;
+/// All three interface bits — a mask equal to this disables everything.
+pub const DEV_ALL: u8 = DEV_FIDO | DEV_KEYBOARD | DEV_CCID;
+
+/// Build a guarded `SET_DEVICE_TYPE` APDU from a disable-mask (spec §6.8).
+///
+/// The firmware does **not** refuse a mask that disables every interface, which
+/// bricks the key. This function performs the same client-side check the vendor
+/// companion app does and returns [`SetDeviceTypeError::WouldBrick`] rather than
+/// emit such an APDU. Bits outside the three known interfaces are ignored for
+/// the brick check but still sent, matching the raw protocol.
+pub fn set_device_type(disable_mask: u8) -> Result<Vec<u8>, SetDeviceTypeError> {
+    if disable_mask & DEV_ALL == DEV_ALL {
+        return Err(SetDeviceTypeError::WouldBrick);
+    }
+    Ok(build_apdu(cmd::SET_DEVICE_TYPE, &[disable_mask]))
+}
+
+/// Validate an entry seed length after Base32 decode (spec §9): `1..=64` bytes.
+pub fn validate_seed_len(decoded_len: usize) -> Result<(), &'static str> {
+    match decoded_len {
+        1..=64 => Ok(()),
+        0 => Err("seed is empty after Base32 decode"),
+        _ => Err("seed exceeds 64 bytes after Base32 decode"),
+    }
+}
+
+/// Decode a user-supplied Base32 (RFC 4648) seed, re-padding stripped `=` first
+/// (spec §9, §10). Returns the raw seed bytes, wrapped so they zeroize on drop.
+pub fn decode_base32_seed(s: &str) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let upper = cleaned.trim_end_matches('=').to_ascii_uppercase();
+    let decoded = base32_decode(&upper)?;
+    validate_seed_len(decoded.len())?;
+    Ok(Zeroizing::new(decoded))
+}
+
+/// Minimal RFC 4648 Base32 decoder (no external dep, matching the "vendor over
+/// depend" convention — base32 is already hand-rolled elsewhere in the tree).
+/// Input must be upper-case with padding already stripped.
+fn base32_decode(s: &str) -> Result<Vec<u8>, &'static str> {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut buffer: u64 = 0;
+    let mut bits: u32 = 0;
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    for ch in s.bytes() {
+        let val = ALPHABET
+            .iter()
+            .position(|&a| a == ch)
+            .ok_or("invalid Base32 character in seed")? as u64;
+        buffer = (buffer << 5) | val;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extended_apdu_layout() {
+        // ENUM_CODES READ_ALL at t=0 (spec §10.1 host frame).
+        let mut data = vec![cmd::SUB_READ_ALL];
+        data.extend_from_slice(&0u64.to_be_bytes());
+        let apdu = build_apdu(cmd::ENUM_CODES, &data);
+        assert_eq!(
+            apdu,
+            vec![
+                0x80, 0xC5, 0x05, 0x00, // header
+                0x00, 0x00, 0x09, // extended Lc = 9
+                0x03, // READ_ALL
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // u64 ts = 0
+            ]
+        );
+    }
+
+    #[test]
+    fn erase_all_is_bodyless_write_seed() {
+        // erase-all is a WRITE_SEED with no data at all (spec §6.5, §11).
+        assert_eq!(erase_all(), vec![0x80, 0xC5, 0x05, 0x02]);
+    }
+
+    #[test]
+    fn select_uses_short_lc() {
+        let apdu = build_select(&OTP_APPLET_AID);
+        assert_eq!(
+            apdu,
+            vec![0x00, 0xA4, 0x04, 0x00, 0x08, 0xF0, 0x00, 0x00, 0x01, 0x4F, 0x74, 0x70, 0x01]
+        );
+    }
+
+    #[test]
+    fn status_word_mapping() {
+        assert_eq!(OtpError::check(0x9000), Ok(()));
+        assert_eq!(OtpError::check(0x6A80), Err(OtpError::EntryNotFound));
+        assert_eq!(OtpError::check(0x6A83), Err(OtpError::EntryNotFound));
+        assert_eq!(OtpError::check(0x6A84), Err(OtpError::NotEnoughSpace));
+        assert_eq!(OtpError::check(0x6A86), Err(OtpError::HidNotSupported));
+        assert_eq!(OtpError::check(0x6FF9), Err(OtpError::ButtonPressRequired));
+        assert_eq!(OtpError::check(0x6985), Err(OtpError::BadStatusCode(0x6985)));
+        assert!(OtpError::check(0x6A80).unwrap_err().is_empty_token());
+    }
+
+    #[test]
+    fn set_device_type_refuses_brick() {
+        assert_eq!(set_device_type(DEV_ALL), Err(SetDeviceTypeError::WouldBrick));
+        // disabling just the keyboard leaves FIDO+CCID — allowed (spec §6.8 example).
+        assert_eq!(
+            set_device_type(DEV_KEYBOARD).unwrap(),
+            vec![0x80, 0xC5, 0x02, 0x01, 0x00, 0x00, 0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn device_info_bit_decoding() {
+        // extension bit 1 set (TOTP supported), config bit 3 set (HOTP supported),
+        // config bit 8 set (button-HOTP slot occupied).
+        let data = [0x00, 0x84, 0x86, 0x01, 0x00, 0x00, 0x02, 0x00, 0x01, 0x01];
+        let info = DeviceInfo::parse(&data).unwrap();
+        assert!(info.totp_supported());
+        assert!(info.hotp_supported());
+        assert!(info.button_hotp_configured());
+        assert!(!info.hotp_suppresses_enter());
+        assert!(info.button_hotp_supported()); // ext bit 6 clear -> supported
+    }
+
+    #[test]
+    fn serial_double_decode() {
+        // D1, len=10 ascii-hex chars "1234567890" -> bytes 12 34 56 78 90 (spec §10.3).
+        let resp = [
+            0xD1, 0x0A, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0',
+        ];
+        assert_eq!(parse_serial(&resp).unwrap(), vec![0x12, 0x34, 0x56, 0x78, 0x90]);
+    }
+
+    #[test]
+    fn base32_seed_decodes_hello() {
+        // "Hello" = 0x48 65 6c 6c 6f; Base32 = "JBSWY3DP" (spec §10.2 uses this seed).
+        let seed = decode_base32_seed("JBSWY3DP").unwrap();
+        assert_eq!(&seed[..], b"Hello");
+    }
+
+    #[test]
+    fn base32_repads_stripped_padding() {
+        // lower-case + stripped padding should still decode (spec §9 forgiving rule).
+        let seed = decode_base32_seed("jbswy3dp").unwrap();
+        assert_eq!(&seed[..], b"Hello");
+    }
+}

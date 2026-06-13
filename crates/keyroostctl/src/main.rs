@@ -340,6 +340,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PivCmd,
     },
+    /// Manage on-device OTP entries on a Token2 T2F2 / PIN+ FIDO key over USB-HID
+    /// or CCID/NFC: list, get a code, add/delete entries, the button-press HOTP
+    /// keystroke slot, and the serial number. This is the Token2 OTP applet,
+    /// distinct from the Yubico/Trussed `oath` applet above.
+    Otp {
+        /// Which transport to reach the OTP applet on. `auto` (default) tries
+        /// USB-HID and falls back to CCID/NFC when HID is disabled on the key.
+        #[arg(long, value_enum, default_value_t = OtpTransportArg::Auto, global = true)]
+        transport: OtpTransportArg,
+        #[command(subcommand)]
+        cmd: OtpCmd,
+    },
 }
 
 /// A PIV key slot, selected on the CLI by its hex key reference.
@@ -1037,6 +1049,138 @@ enum OathCmd {
     },
 }
 
+/// Subcommands for the Token2 on-device OTP applet (T2F2 / PIN+) over USB-HID
+/// or NFC. Seeds are read from stdin or an env var — never argv.
+#[derive(Subcommand)]
+enum OtpCmd {
+    /// List the OTP entries stored on the key, with their live codes where the
+    /// device returns them (TOTP without button-press).
+    List,
+    /// Print the current code for one entry, identified by app and account.
+    /// A button-required entry will prompt for a touch.
+    Get {
+        /// Application/issuer name as stored (may be empty).
+        #[arg(long, default_value = "")]
+        app: String,
+        /// Account name as stored.
+        #[arg(long)]
+        account: String,
+    },
+    /// Add (or overwrite) an OTP entry. The base32 seed is read from stdin or an
+    /// env var — never argv.
+    Add {
+        /// Application/issuer name (0..=64 ASCII chars; may be empty).
+        #[arg(long, default_value = "")]
+        app: String,
+        /// Account name (1..=64 ASCII chars).
+        #[arg(long)]
+        account: String,
+        /// Entry type: time-based (TOTP) or counter-based (HOTP).
+        #[arg(long = "type", value_enum, default_value_t = OtpTypeArg::Totp)]
+        otp_type: OtpTypeArg,
+        /// HMAC algorithm.
+        #[arg(long, value_enum, default_value_t = OtpAlgoArg::Sha1)]
+        algorithm: OtpAlgoArg,
+        /// Code length in digits (4..=10).
+        #[arg(long, default_value_t = 6)]
+        digits: u8,
+        /// TOTP time step in seconds (ignored for HOTP).
+        #[arg(long, default_value_t = 30)]
+        period: u16,
+        /// Require a button press on the key to emit this code.
+        #[arg(long)]
+        touch: bool,
+        /// Read the base32 seed from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
+        seed_env: Option<String>,
+        /// Read the base32 seed from stdin (one line).
+        #[arg(long)]
+        seed_stdin: bool,
+    },
+    /// Delete one OTP entry by app and account.
+    Delete {
+        /// Application/issuer name as stored (may be empty).
+        #[arg(long, default_value = "")]
+        app: String,
+        /// Account name as stored.
+        #[arg(long)]
+        account: String,
+    },
+    /// Erase every OTP entry on the key. Requires a confirming button press and
+    /// the `--yes` acknowledgement.
+    EraseAll {
+        /// Acknowledge that this wipes all on-device OTP entries.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Read the device serial number (over USB, or NFC where the model allows).
+    Serial,
+    /// Configure the single HOTP-on-button keystroke slot: the key types this
+    /// code when touched outside a session. The base32 seed is read from stdin
+    /// or an env var — never argv.
+    ButtonHotp {
+        /// Code length — must be 6 or 8.
+        #[arg(long, default_value_t = 6)]
+        digits: u8,
+        /// Suppress the trailing Enter keystroke after typing the code.
+        #[arg(long)]
+        no_enter: bool,
+        /// Require a 2-second long touch (else a short tap triggers it).
+        #[arg(long)]
+        long_touch: bool,
+        /// Type the digits using the numeric-keypad scancodes.
+        #[arg(long)]
+        numpad: bool,
+        /// Read the base32 seed from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
+        seed_env: Option<String>,
+        /// Read the base32 seed from stdin (one line).
+        #[arg(long)]
+        seed_stdin: bool,
+    },
+    /// Delete the HOTP-on-button keystroke slot.
+    DeleteButtonHotp,
+}
+
+/// Transport selector for the `otp` command group.
+#[derive(Copy, Clone, ValueEnum)]
+enum OtpTransportArg {
+    /// USB-HID first, fall back to CCID/NFC if HID is disabled on the key.
+    Auto,
+    /// Force USB-HID.
+    Hid,
+    /// Force CCID / NFC (PC/SC reader).
+    Ccid,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum OtpTypeArg {
+    Totp,
+    Hotp,
+}
+impl OtpTypeArg {
+    fn to_t2(self) -> keyroost_token2otp::OtpType {
+        match self {
+            OtpTypeArg::Totp => keyroost_token2otp::OtpType::Totp,
+            OtpTypeArg::Hotp => keyroost_token2otp::OtpType::Hotp,
+        }
+    }
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum OtpAlgoArg {
+    Sha1,
+    Sha256,
+}
+impl OtpAlgoArg {
+    fn to_t2(self) -> keyroost_token2otp::Algorithm {
+        match self {
+            OtpAlgoArg::Sha1 => keyroost_token2otp::Algorithm::Sha1,
+            OtpAlgoArg::Sha256 => keyroost_token2otp::Algorithm::Sha256,
+        }
+    }
+}
+
 #[derive(Copy, Clone, ValueEnum)]
 enum OathTypeArg {
     Totp,
@@ -1439,6 +1583,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Token2 on-device OTP talks to the FIDO key's OTP applet over USB-HID
+    // (with a PC/SC fallback), not the Molto2 — handle it before the Molto2
+    // PC/SC auth flow below.
+    if let Cmd::Otp { cmd, transport } = cmd {
+        run_otp(cmd, *transport, cli.debug)?;
+        return Ok(());
+    }
+
     // Factory reset is a plain CLA 0x80 command and needs no auth. Read the
     // (read-only) device info before the --yes gate so even the refusal names
     // exactly which device would be wiped.
@@ -1794,6 +1946,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Oath { .. } => unreachable!("handled above before auth"),
         Cmd::Openpgp { .. } => unreachable!("handled above before auth"),
         Cmd::Piv { .. } => unreachable!("handled above before auth"),
+        Cmd::Otp { .. } => unreachable!("handled above before auth"),
         Cmd::FidoInfo { .. }
         | Cmd::FidoReset { .. }
         | Cmd::FidoPinRetries { .. }
@@ -2381,6 +2534,162 @@ fn oath_type_str(t: keyroost_oath::OathType) -> &'static str {
     match t {
         keyroost_oath::OathType::Totp => "TOTP",
         keyroost_oath::OathType::Hotp => "HOTP",
+    }
+}
+
+/// Open a Token2 OTP session on the requested transport and register a touch
+/// prompt for button-required commands.
+fn open_otp(
+    transport: OtpTransportArg,
+    debug: bool,
+) -> Result<keyroost_transport::Token2OtpSession, Box<dyn std::error::Error>> {
+    let mut session = match transport {
+        OtpTransportArg::Auto => keyroost_transport::Token2OtpSession::detect_debug(debug)?,
+        OtpTransportArg::Hid => keyroost_transport::Token2OtpSession::detect_hid_only(debug)?,
+        OtpTransportArg::Ccid => keyroost_transport::Token2OtpSession::detect_pcsc_only(debug)?,
+    };
+    session.set_debug(debug);
+    eprintln!(
+        "\u{2192} Token2 OTP on {}",
+        if session.is_pcsc() { "CCID/NFC" } else { "USB-HID" }
+    );
+    session.set_button_prompt(Box::new(|| {
+        eprintln!("touch your key to continue\u{2026}");
+    }));
+    Ok(session)
+}
+
+fn run_otp(
+    cmd: &OtpCmd,
+    transport: OtpTransportArg,
+    debug: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        OtpCmd::List => {
+            let mut session = open_otp(transport, debug)?;
+            let now = unix_now() as u64;
+            let entries = session.enumerate(now)?;
+            if entries.is_empty() {
+                println!("(no OTP entries)");
+            } else {
+                for e in entries {
+                    let label = if e.app_name.is_empty() {
+                        e.account_name.clone()
+                    } else {
+                        format!("{}:{}", e.app_name, e.account_name)
+                    };
+                    let code = e.code.as_deref().unwrap_or("\u{2014}"); // em dash when withheld
+                    println!(
+                        "{label}  [{}/{}]  {}{}",
+                        keyroost_transport::otp_type_str(e.otp_type),
+                        otp_algo_str_t2(e.algorithm),
+                        code,
+                        if e.button_required { "  (touch)" } else { "" },
+                    );
+                }
+            }
+        }
+        OtpCmd::Get { app, account } => {
+            let mut session = open_otp(transport, debug)?;
+            let now = unix_now() as u64;
+            let entry = session.read_entry(now, app, account)?;
+            match entry.code {
+                Some(code) => println!("{code}"),
+                None => return Err("device did not return a code for that entry".into()),
+            }
+        }
+        OtpCmd::Add {
+            app,
+            account,
+            otp_type,
+            algorithm,
+            digits,
+            period,
+            touch,
+            seed_env,
+            seed_stdin,
+        } => {
+            if !(4..=10).contains(digits) {
+                return Err("--digits must be between 4 and 10".into());
+            }
+            let seed_b32 = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
+            let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
+                .map_err(|e| format!("invalid base32 seed: {e}"))?;
+            let mut session = open_otp(transport, debug)?;
+            let entry = keyroost_token2otp::WriteEntry {
+                otp_type: otp_type.to_t2(),
+                algorithm: algorithm.to_t2(),
+                timestep: *period,
+                code_length: *digits,
+                button_required: *touch,
+                app_name: app,
+                account_name: account,
+                seed: &seed,
+            };
+            session.write_entry(&entry)?;
+            let label = if app.is_empty() {
+                account.clone()
+            } else {
+                format!("{app}:{account}")
+            };
+            println!("Added OTP entry {label:?}.");
+        }
+        OtpCmd::Delete { app, account } => {
+            let mut session = open_otp(transport, debug)?;
+            session.delete_entry(app, account)?;
+            let label = if app.is_empty() {
+                account.clone()
+            } else {
+                format!("{app}:{account}")
+            };
+            println!("Deleted OTP entry {label:?}.");
+        }
+        OtpCmd::EraseAll { yes } => {
+            if !yes {
+                return Err("refusing to erase all OTP entries without --yes".into());
+            }
+            let mut session = open_otp(transport, debug)?;
+            eprintln!("touch your key to confirm the erase\u{2026}");
+            session.erase_all()?;
+            println!("Erased all OTP entries.");
+        }
+        OtpCmd::Serial => {
+            let mut session = open_otp(transport, debug)?;
+            let sn = session.read_serial()?;
+            let hex: String = sn.iter().map(|b| format!("{b:02x}")).collect();
+            println!("{hex}");
+        }
+        OtpCmd::ButtonHotp {
+            digits,
+            no_enter,
+            long_touch,
+            numpad,
+            seed_env,
+            seed_stdin,
+        } => {
+            if *digits != 6 && *digits != 8 {
+                return Err("button HOTP --digits must be 6 or 8".into());
+            }
+            let seed_b32 = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
+            let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
+                .map_err(|e| format!("invalid base32 seed: {e}"))?;
+            let mut session = open_otp(transport, debug)?;
+            session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
+            println!("Configured the HOTP-on-button keystroke slot.");
+        }
+        OtpCmd::DeleteButtonHotp => {
+            let mut session = open_otp(transport, debug)?;
+            session.delete_button_hotp()?;
+            println!("Deleted the HOTP-on-button keystroke slot.");
+        }
+    }
+    Ok(())
+}
+
+fn otp_algo_str_t2(a: keyroost_token2otp::Algorithm) -> &'static str {
+    match a {
+        keyroost_token2otp::Algorithm::Sha1 => "SHA1",
+        keyroost_token2otp::Algorithm::Sha256 => "SHA256",
     }
 }
 
@@ -3658,10 +3967,28 @@ fn print_info(info: &keyroost_transport::DeviceInfo) {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+    // HID enumeration (hidapi walking the system's device tree and parsing
+    // report descriptors) is deep enough to exhaust the default main-thread
+    // stack in unoptimized debug builds on Windows, where frames are large and
+    // nothing is inlined — it manifests as STATUS_STACK_OVERFLOW before any
+    // output. Release builds fit fine. Run the real work on a worker thread with
+    // a generous 16 MiB stack so debug and release behave identically across
+    // platforms. `run`'s error type is `Box<dyn Error>` (not `Send`), so flatten
+    // it to a `String` inside the worker before it crosses the join boundary.
+    let worker = std::thread::Builder::new()
+        .name("keyroostctl-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| run().map_err(|e| e.to_string()))
+        .expect("spawn worker thread");
+
+    match worker.join() {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(e)) => {
             eprintln!("error: {}", e);
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            eprintln!("error: worker thread panicked");
             ExitCode::FAILURE
         }
     }
