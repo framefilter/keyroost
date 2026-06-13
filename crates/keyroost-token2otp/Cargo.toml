@@ -1,0 +1,13 @@
+[package]
+name = "keyroost-token2otp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Token2 OTP-on-FIDO management protocol (TOTP/HOTP provisioning) — pure APDU builders + parsers."
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -13,6 +13,7 @@ members = [
     "crates/keyroost-oath",
     "crates/keyroost-openpgp",
     "crates/keyroost-piv",
+    "crates/keyroost-token2otp",
     "crates/keyroost-rsakey",
     "crates/keyroost-qr",
     "crates/keyroost-import",

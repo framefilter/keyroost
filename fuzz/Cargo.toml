@@ -26,6 +26,7 @@ keyroost-ctap = { path = "../crates/keyroost-ctap" }
 keyroost-oath = { path = "../crates/keyroost-oath" }
 keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
 keyroost-piv = { path = "../crates/keyroost-piv" }
+keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
 
 [workspace]
 
@@ -74,6 +75,13 @@ bench = false
 [[bin]]
 name = "piv_parse"
 path = "fuzz_targets/piv_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token2otp_parse"
+path = "fuzz_targets/token2otp_parse.rs"
 test = false
 doc = false
 bench = false
