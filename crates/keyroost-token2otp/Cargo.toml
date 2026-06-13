@@ -5,9 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Token2 OTP-on-FIDO management protocol (TOTP/HOTP provisioning) — pure APDU builders + parsers."
+description = "Pure-Rust byte layer for the Token2 T2F2 / PIN+ on-device OTP (TOTP/HOTP) management applet: APDU builders, ENUM parser, ECDH+AES seed encryption."
 
 [lints]
 workspace = true
 
 [dependencies]
+# Seed-bearing commands (WRITE_SEED / WRITE_HOTP_SEED) wrap their payload in an
+# ECDH-derived AES-256-CBC blob (spec §7): P-256 ECDH, SHA-256 of the shared X
+# coord for the key, AES-CBC with PKCS#7. This is the exact primitive set the
+# CTAP client-PIN code already depends on (see keyroost-ctap/Cargo.toml); these
+# are RustCrypto-audited and not something forbid(unsafe_code) lets us hand-roll.
+sha2 = { version = "0.10", default-features = false }
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding", "alloc"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
+# OsRng for the per-command ephemeral keypair (freshness; the IVs are constants).
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+# Scrub the decoded seed and derived session key on drop.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]

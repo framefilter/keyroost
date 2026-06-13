@@ -30,6 +30,7 @@ impl Caps {
     pub const PGP: Caps = Caps(1 << 2);
     pub const PIV: Caps = Caps(1 << 3);
     pub const TOTP: Caps = Caps(1 << 4); // Molto2 programmable token
+    pub const OTP: Caps = Caps(1 << 5); // Token2 FIDO key on-device OTP applet
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
@@ -59,6 +60,7 @@ pub enum CapTab {
     Oath,
     Pgp,
     Piv,
+    Otp,
 }
 
 /// A stable identity for a device across refreshes. Prefer the effective serial;
@@ -118,6 +120,9 @@ impl UiDevice {
         if self.caps.has(Caps::PIV) {
             v.push(CapTab::Piv);
         }
+        if self.caps.has(Caps::OTP) {
+            v.push(CapTab::Otp);
+        }
         v
     }
 }
@@ -131,6 +136,7 @@ fn vendor_name(vid: u16) -> &'static str {
         0x1209 => "SoloKeys",
         0x096e | 0x311f => "Feitian",
         0x2581 => "Kanokey",
+        0x349e => "Token2",
         0x1e0d => "OpenSK",
         _ => "Security key",
     }
@@ -285,7 +291,14 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
             // The HID merge step below picks it up if it matches a HID node.
             continue;
         }
-        let serial = p.yubikey_serial.clone().unwrap_or_default();
+        // Prefer a YubiKey management serial; otherwise fall back to a serial
+        // recovered from the OpenPGP AID during probing (e.g. Token2 PIN+, which
+        // has no HID serial). Either way `serial` drives the header `#…` field.
+        let serial = p
+            .yubikey_serial
+            .clone()
+            .or_else(|| p.serial.clone())
+            .unwrap_or_default();
         let id = if serial.is_empty() {
             format!("reader:{}", p.reader_name)
         } else {
@@ -369,6 +382,11 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
         });
         if let Some(dev) = existing {
             dev.caps.insert(Caps::FIDO2);
+            // Token2 FIDO keys (VID 0x349E) carry the on-device OTP applet,
+            // reachable over CCID and/or HID. Offer the OTP tab for them.
+            if hid.vendor_id == 0x349E {
+                dev.caps.insert(Caps::OTP);
+            }
             dev.hid_path = Some(hid.path.clone());
             dev.transport = "USB · PC/SC + FIDO HID".into();
             if dev.serial.is_empty() {
@@ -385,6 +403,9 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
             };
             let mut caps = Caps::default();
             caps.insert(Caps::FIDO2);
+            if hid.vendor_id == 0x349E {
+                caps.insert(Caps::OTP);
+            }
             devices.push(UiDevice {
                 id,
                 name: keyring.name_for(Some(&serial)).map(str::to_owned),
