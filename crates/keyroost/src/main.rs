@@ -8,6 +8,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod ui;
+mod otp_pane;
+use otp_pane::OtpState;
 use ui::device::{self, CapTab, Caps, DeviceId, DeviceKind, UiDevice};
 use ui::theme::{self, BtnKind, Mode, Palette};
 
@@ -604,6 +606,8 @@ struct App {
     openpgp: OpenPgpState,
     /// PIV read-only status view state.
     piv: PivState,
+    /// Token2 on-device OTP (TOTP/HOTP) view state.
+    otp: OtpState,
     /// Dark / light theme (persisted via eframe storage).
     mode: Mode,
     /// Accent index into `Palette::ACCENTS` (persisted).
@@ -623,6 +627,8 @@ struct App {
     oath_tried: bool,
     /// Same guard for the PIV pane's auto-read.
     piv_tried: bool,
+    /// Same guard for the OTP pane's auto-read.
+    otp_tried: bool,
     /// True while the Molto2 factory-reset confirmation is showing.
     molto_reset_confirm: bool,
     /// True while the selected device's inline rename field is open.
@@ -3020,9 +3026,12 @@ impl App {
         self.security_keys.change_pin.open = false;
         wipe(&mut self.oath.password_input);
         wipe(&mut self.oath.add.secret);
+        wipe(&mut self.otp.add.secret);
         self.openpgp.wipe_secrets();
         self.oath_tried = false;
         self.piv_tried = false;
+        self.otp_tried = false;
+        self.otp = OtpState::default();
         self.molto_reset_confirm = false;
         self.rename_open = false;
         self.rename_input.clear();
@@ -3693,6 +3702,7 @@ fn cap_tab_label(t: CapTab) -> &'static str {
         CapTab::Oath => "Authenticator",
         CapTab::Pgp => "OpenPGP",
         CapTab::Piv => "PIV",
+        CapTab::Otp => "On-device OTP",
     }
 }
 
@@ -4598,6 +4608,7 @@ impl App {
                                         CapTab::Oath => self.cap_oath(ui, p),
                                         CapTab::Pgp => self.cap_pgp(ui, p),
                                         CapTab::Piv => self.cap_piv(ui, p),
+                                        CapTab::Otp => self.cap_otp(ui, p),
                                     }
                                     // Breathing room below the last card.
                                     ui.add_space(18.0);
@@ -5614,15 +5625,25 @@ impl App {
         ui.add_space(10.0);
 
         // --- Management key: authorizes key-gen / cert-import / retries / rotation ---
+        // Compute the vendor-specific default hint before the closure borrows self.
+        let is_token2 = self
+            .selected_device()
+            .map(|d| d.vendor.eq_ignore_ascii_case("token2"))
+            .unwrap_or(false);
+        let mgmt_default_note = if is_token2 {
+            "Hex key authorizing key generation, certificate import, retry \
+             changes, and rotation below. Token2 PIN+ factory default is \
+             865362865362865362865362865362865362865362865362. Sent for the \
+             operation only; never stored."
+        } else {
+            "Hex key authorizing key generation, certificate import, retry \
+             changes, and rotation below. Factory default (most keys) is \
+             010203040506070801020304050607080102030405060708. Sent for the \
+             operation only; never stored."
+        };
         theme::card_frame(p).show(ui, |ui| {
             head(ui, "Management key");
-            note(
-                ui,
-                "Hex key authorizing key generation, certificate import, retry \
-                 changes, and rotation below. Factory default is \
-                 010203040506070801020304050607080102030405060708. Sent for the \
-                 operation only; never stored.",
-            );
+            note(ui, mgmt_default_note);
             ui.add_space(6.0);
             secret_field(
                 ui,

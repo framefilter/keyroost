@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 keyroost-proto = { path = "../keyroost-proto", version = "0.4.0" }
 keyroost-transport = { path = "../keyroost-transport", version = "0.4.0" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.4.0" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.4.0" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.4.0" }
 keyroost-ctap = { path = "../keyroost-ctap", version = "0.4.0" }

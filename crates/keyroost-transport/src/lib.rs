@@ -35,6 +35,12 @@ pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 mod piv;
 pub use piv::{PivSession, PivSlotStatus, PivStatus};
 
+mod token2otp;
+pub use token2otp::{
+    otp_type_str, ButtonPrompt, HidOtpTransport, OtpTransportError, PcScOtpTransport,
+    Token2OtpSession,
+};
+
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{KeyCrt, RsaPrivateKeyParts};
@@ -634,18 +640,75 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             usb_bus: None,
             usb_address: None,
         };
+        let trace = std::env::var_os("KEYROOST_PROBE_DEBUG").is_some();
+        if trace {
+            eprintln!("[probe] reader seen: {}", probe.reader_name);
+        }
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
             (probe.usb_bus, probe.usb_address) = read_channel_id(&card);
-            let answers = |apdu: Vec<u8>| matches!(transmit_apdu(&card, &apdu), Ok((_, s1, s2)) if sw_ok(s1, s2));
-            probe.has_oath = answers(keyroost_oath::select());
-            probe.has_openpgp = answers(keyroost_openpgp::select());
-            probe.has_piv = answers(keyroost_piv::select());
+            // An applet SELECT counts as "present" on a 9000, and also on the
+            // T=0 continuation status words 61xx ("more data available") and
+            // 6Cxx ("wrong Le"): both mean the SELECT was accepted and the applet
+            // is answering. Some keys (e.g. Token2 PIN+ over CCID) reply 61xx to
+            // a bare SELECT rather than 9000; without this they'd be misdetected
+            // as lacking the applet and the GUI would hide the tab.
+            let answers = |label: &str, apdu: Vec<u8>| {
+                let r = transmit_apdu(&card, &apdu);
+                if trace {
+                    match &r {
+                        Ok((_, s1, s2)) => eprintln!("[probe]   {label} select -> {s1:02X}{s2:02X}"),
+                        Err(e) => eprintln!("[probe]   {label} select -> error: {e}"),
+                    }
+                }
+                matches!(r, Ok((_, s1, s2)) if sw_ok(s1, s2) || s1 == 0x61 || s1 == 0x6C)
+            };
+            probe.has_oath = answers("oath", keyroost_oath::select());
+            probe.has_openpgp = answers("openpgp", keyroost_openpgp::select());
+            probe.has_piv = answers("piv", keyroost_piv::select());
+            // When OpenPGP is present, recover the card serial from its AID (the
+            // standard OpenPGP AID encodes a 4-byte serial at offset 10). This
+            // lets keys with no HID serial (e.g. Token2 PIN+) still show one.
+            // Re-SELECT OpenPGP first: the PIV probe above left a different applet
+            // current, so GET DATA would otherwise hit the wrong one.
+            if probe.has_openpgp {
+                let _ = transmit_apdu(&card, &keyroost_openpgp::select());
+                let get_aid = [0x00u8, 0xCA, 0x00, 0x4F, 0x00];
+                if let Ok((data, s1, s2)) = transmit_apdu(&card, &get_aid) {
+                    let resp = if s1 == 0x61 {
+                        transmit_apdu(&card, &[0x00, 0xC0, 0x00, 0x00, s2])
+                            .map(|(d, _, _)| d)
+                            .unwrap_or(data)
+                    } else {
+                        data
+                    };
+                    // The response may be the raw 16-byte AID, or wrapped in a
+                    // `4F len ...` TLV. Locate the D2 76 00 01 24 01 prefix.
+                    let aid = if resp.len() >= 2 && resp[0] == 0x4F {
+                        &resp[2..]
+                    } else {
+                        &resp[..]
+                    };
+                    if aid.len() >= 14 && aid[0..6] == [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01] {
+                        let sn = &aid[10..14];
+                        probe.serial =
+                            Some(sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                        if trace {
+                            eprintln!("[probe]   openpgp serial -> {:?}", probe.serial);
+                        }
+                    } else if trace {
+                        let hex: String = resp.iter().map(|b| format!("{b:02x}")).collect();
+                        eprintln!("[probe]   openpgp AID unparsed: {hex}");
+                    }
+                }
+            }
             if lower.contains(YUBIKEY_READER_HINT) {
                 probe.yubikey_serial = read_yubikey_serial(&card).ok();
             }
             // Release without resetting, so a card another session holds is left
             // alone.
             let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+        } else if trace {
+            eprintln!("[probe]   connect failed");
         }
         out.push(probe);
     }

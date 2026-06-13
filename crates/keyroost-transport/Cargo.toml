@@ -15,7 +15,17 @@ keyroost-proto = { path = "../keyroost-proto", version = "0.4.0" }
 keyroost-oath = { path = "../keyroost-oath", version = "0.4.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.4.0" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.4.0" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.4.0" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.4.0" }
 pcsc = "2"
+# hidapi backs the Token2 OTP USB-HID transport on macOS / Windows; Linux uses
+# the dependency-free hidraw `File` path (same split as keyroost-ctap). Optional
+# + cfg-gated so a default Linux build pulls nothing extra.
+hidapi = { version = "2.6", optional = true, default-features = false, features = [
+    "linux-static-hidraw",
+    "macos-shared-device",
+    "windows-native",
+] }
 # Scoped crypto exception (same reasoning as keyroost-ctap's aes/sha2 and
 # keyroost-rsakey's rsa): PIV card-management-key authentication is a
 # block-cipher witness/challenge round. AES (the 5.7+ default) and 3DES
@@ -28,3 +38,16 @@ getrandom = "0.2"
 # Wipe PIN/PUK/management-key APDU bodies after transmit (the same hygiene the
 # CLI and importers already apply to their secret buffers).
 zeroize = "1"
+
+[features]
+# Forces the hidapi backend on Linux for building/testing the Token2 OTP USB-HID
+# transport there; the default Linux build uses the dependency-free hidraw path.
+hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend"]
+
+# Auto-select the hidapi I/O backend on macOS / Windows for the Token2 OTP HID
+# transport (Linux keeps the dependency-free hidraw File backend).
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = [
+    "macos-shared-device",
+    "windows-native",
+] }
