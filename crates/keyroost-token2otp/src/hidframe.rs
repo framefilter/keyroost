@@ -257,7 +257,7 @@ mod tests {
         let apdu = vec![0xAA; 62];
         let frames = build_send_frames(&apdu);
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0][2], FLAG_MORE | 0);
+        assert_eq!(frames[0][2], FLAG_MORE);
         assert_eq!(frames[0][3], 61);
         assert_eq!(frames[1][2], FLAG_LAST | 1);
         assert_eq!(frames[1][3], 1);
@@ -268,7 +268,7 @@ mod tests {
         let apdu = vec![0xAA; 130]; // -> 61 + 61 + 8
         let frames = build_send_frames(&apdu);
         assert_eq!(frames.len(), 3);
-        assert_eq!(frames[0][2], FLAG_MORE | 0);
+        assert_eq!(frames[0][2], FLAG_MORE);
         assert_eq!(frames[0][3], 61);
         assert_eq!(frames[1][2], FLAG_MORE | 1);
         assert_eq!(frames[1][3], 61);
@@ -287,7 +287,7 @@ mod tests {
     fn assemble_single_frame_with_sw() {
         let mut asm = ResponseAssembler::new();
         let step = asm
-            .push(&payload(FLAG_LAST | 0, &[b'A', b'B', 0x90, 0x00]))
+            .push(&payload(FLAG_LAST, &[b'A', b'B', 0x90, 0x00]))
             .unwrap();
         assert_eq!(step, Step::Done);
         let (data, sw) = asm.into_response().unwrap();
@@ -299,11 +299,12 @@ mod tests {
     fn assemble_multi_frame() {
         let mut asm = ResponseAssembler::new();
         assert_eq!(
-            asm.push(&payload(FLAG_MORE | 0, &[0x01, 0x02])).unwrap(),
+            asm.push(&payload(FLAG_MORE, &[0x01, 0x02])).unwrap(),
             Step::NeedMore
         );
         assert_eq!(
-            asm.push(&payload(FLAG_LAST | 1, &[0x03, 0x90, 0x00])).unwrap(),
+            asm.push(&payload(FLAG_LAST | 1, &[0x03, 0x90, 0x00]))
+                .unwrap(),
             Step::Done
         );
         let (data, sw) = asm.into_response().unwrap();
@@ -320,9 +321,7 @@ mod tests {
                 Step::Busy { retries: i }
             );
         }
-        let step = asm
-            .push(&payload(FLAG_LAST | 0, &[b'Z', 0x90, 0x00]))
-            .unwrap();
+        let step = asm.push(&payload(FLAG_LAST, &[b'Z', 0x90, 0x00])).unwrap();
         assert_eq!(step, Step::Done);
         let (data, sw) = asm.into_response().unwrap();
         assert_eq!(data, b"Z");
@@ -340,7 +339,7 @@ mod tests {
     #[test]
     fn out_of_sequence_rejected() {
         let mut asm = ResponseAssembler::new();
-        asm.push(&payload(FLAG_MORE | 0, &[0x01])).unwrap();
+        asm.push(&payload(FLAG_MORE, &[0x01])).unwrap();
         assert_eq!(
             asm.push(&payload(FLAG_LAST | 2, &[0x90, 0x00])),
             Err(FrameError::OutOfSequence {

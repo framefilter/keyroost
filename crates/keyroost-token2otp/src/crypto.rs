@@ -75,11 +75,9 @@ pub fn encrypt_seed_payload(
     let mut sec1 = [0u8; 65];
     sec1[0] = 0x04;
     sec1[1..].copy_from_slice(device_pub_xy);
-    let device_point =
-        EncodedPoint::from_bytes(sec1).map_err(|_| EncryptError::BadDevicePubkey)?;
-    let device_pub =
-        Option::<PublicKey>::from(PublicKey::from_encoded_point(&device_point))
-            .ok_or(EncryptError::BadDevicePubkey)?;
+    let device_point = EncodedPoint::from_bytes(sec1).map_err(|_| EncryptError::BadDevicePubkey)?;
+    let device_pub = Option::<PublicKey>::from(PublicKey::from_encoded_point(&device_point))
+        .ok_or(EncryptError::BadDevicePubkey)?;
 
     // Fresh ephemeral host keypair (spec §7: per-command).
     let host_secret = SecretKey::random(&mut OsRng);

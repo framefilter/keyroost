@@ -656,7 +656,9 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 let r = transmit_apdu(&card, &apdu);
                 if trace {
                     match &r {
-                        Ok((_, s1, s2)) => eprintln!("[probe]   {label} select -> {s1:02X}{s2:02X}"),
+                        Ok((_, s1, s2)) => {
+                            eprintln!("[probe]   {label} select -> {s1:02X}{s2:02X}")
+                        }
                         Err(e) => eprintln!("[probe]   {label} select -> error: {e}"),
                     }
                 }

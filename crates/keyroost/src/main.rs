@@ -7,8 +7,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-mod ui;
 mod otp_pane;
+mod ui;
 use otp_pane::OtpState;
 use ui::device::{self, CapTab, Caps, DeviceId, DeviceKind, UiDevice};
 use ui::theme::{self, BtnKind, Mode, Palette};

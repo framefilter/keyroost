@@ -26,10 +26,10 @@ pub mod crypto;
 pub mod entry;
 pub mod hidframe;
 
-pub use crypto::{encrypt_seed_payload, EncryptError, IV_OTP, IV_HOTP};
+pub use crypto::{encrypt_seed_payload, EncryptError, IV_HOTP, IV_OTP};
 pub use entry::{
     parse_enum_page, serialize_delete_entry, serialize_read_entry, serialize_write_entry,
-    Algorithm, EnumPage, Entry, OtpType, ParseError, WriteEntry,
+    Algorithm, Entry, EnumPage, OtpType, ParseError, WriteEntry,
 };
 
 use zeroize::Zeroizing;
@@ -484,13 +484,19 @@ mod tests {
         assert_eq!(OtpError::check(0x6A84), Err(OtpError::NotEnoughSpace));
         assert_eq!(OtpError::check(0x6A86), Err(OtpError::HidNotSupported));
         assert_eq!(OtpError::check(0x6FF9), Err(OtpError::ButtonPressRequired));
-        assert_eq!(OtpError::check(0x6985), Err(OtpError::BadStatusCode(0x6985)));
+        assert_eq!(
+            OtpError::check(0x6985),
+            Err(OtpError::BadStatusCode(0x6985))
+        );
         assert!(OtpError::check(0x6A80).unwrap_err().is_empty_token());
     }
 
     #[test]
     fn set_device_type_refuses_brick() {
-        assert_eq!(set_device_type(DEV_ALL), Err(SetDeviceTypeError::WouldBrick));
+        assert_eq!(
+            set_device_type(DEV_ALL),
+            Err(SetDeviceTypeError::WouldBrick)
+        );
         // disabling just the keyboard leaves FIDO+CCID — allowed (spec §6.8 example).
         assert_eq!(
             set_device_type(DEV_KEYBOARD).unwrap(),
@@ -517,7 +523,10 @@ mod tests {
         let resp = [
             0xD1, 0x0A, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0',
         ];
-        assert_eq!(parse_serial(&resp).unwrap(), vec![0x12, 0x34, 0x56, 0x78, 0x90]);
+        assert_eq!(
+            parse_serial(&resp).unwrap(),
+            vec![0x12, 0x34, 0x56, 0x78, 0x90]
+        );
     }
 
     #[test]

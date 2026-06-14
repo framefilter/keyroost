@@ -2582,7 +2582,11 @@ fn open_otp(
     session.set_debug(debug);
     eprintln!(
         "\u{2192} Token2 OTP on {}",
-        if session.is_pcsc() { "CCID/NFC" } else { "USB-HID" }
+        if session.is_pcsc() {
+            "CCID/NFC"
+        } else {
+            "USB-HID"
+        }
     );
     session.set_button_prompt(Box::new(|| {
         eprintln!("touch your key to continue\u{2026}");

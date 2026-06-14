@@ -134,31 +134,36 @@ impl App {
         let sel = self.otp.transport;
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OTP entries\u{2026}", move || {
-            let result = (|| -> Result<(Vec<OtpRow>, &'static str, Option<String>), OtpTransportError> {
-                let mut session = sel.open()?;
-                let active = if session.is_pcsc() { "CCID/NFC" } else { "USB-HID" };
-                // Read the serial first, while we hold the session. It's a
-                // nice-to-have: some models/readers don't expose it over CCID,
-                // so a failure here must not block the entry list.
-                let serial = session
-                    .read_serial()
-                    .ok()
-                    .map(|sn| sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                let now = unix_now();
-                let entries = session.enumerate(now)?;
-                let rows = entries
-                    .into_iter()
-                    .map(|e| OtpRow {
-                        app_name: e.app_name,
-                        account_name: e.account_name,
-                        type_str: keyroost_transport::otp_type_str(e.otp_type),
-                        algo_str: otp_algo_str(e.algorithm),
-                        button_required: e.button_required,
-                        code: e.code,
-                    })
-                    .collect();
-                Ok((rows, active, serial))
-            })();
+            let result =
+                (|| -> Result<(Vec<OtpRow>, &'static str, Option<String>), OtpTransportError> {
+                    let mut session = sel.open()?;
+                    let active = if session.is_pcsc() {
+                        "CCID/NFC"
+                    } else {
+                        "USB-HID"
+                    };
+                    // Read the serial first, while we hold the session. It's a
+                    // nice-to-have: some models/readers don't expose it over CCID,
+                    // so a failure here must not block the entry list.
+                    let serial = session
+                        .read_serial()
+                        .ok()
+                        .map(|sn| sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    let now = unix_now();
+                    let entries = session.enumerate(now)?;
+                    let rows = entries
+                        .into_iter()
+                        .map(|e| OtpRow {
+                            app_name: e.app_name,
+                            account_name: e.account_name,
+                            type_str: keyroost_transport::otp_type_str(e.otp_type),
+                            algo_str: otp_algo_str(e.algorithm),
+                            button_required: e.button_required,
+                            code: e.code,
+                        })
+                        .collect();
+                    Ok((rows, active, serial))
+                })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
                     return; // user switched keys mid-read
@@ -406,39 +411,36 @@ impl App {
                                 .color(p.txt3),
                         );
                     });
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if theme::button(ui, p, BtnKind::Default, "Delete").clicked() {
-                                delete = Some((row.app_name.clone(), row.account_name.clone()));
-                            }
-                            ui.add_space(8.0);
-                            match &row.code {
-                                Some(code) => {
-                                    if theme::button(ui, p, BtnKind::Default, "Copy").clicked() {
-                                        copy = Some(code.clone());
-                                    }
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        egui::RichText::new(code)
-                                            .font(theme::f_mono(16.0))
-                                            .color(p.txt),
-                                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Delete").clicked() {
+                            delete = Some((row.app_name.clone(), row.account_name.clone()));
+                        }
+                        ui.add_space(8.0);
+                        match &row.code {
+                            Some(code) => {
+                                if theme::button(ui, p, BtnKind::Default, "Copy").clicked() {
+                                    copy = Some(code.clone());
                                 }
-                                None => {
-                                    ui.label(
-                                        egui::RichText::new(if row.button_required {
-                                            "touch to view"
-                                        } else {
-                                            "\u{2014}"
-                                        })
-                                        .font(theme::f_reg(11.5))
-                                        .color(p.txt3),
-                                    );
-                                }
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(code)
+                                        .font(theme::f_mono(16.0))
+                                        .color(p.txt),
+                                );
                             }
-                        },
-                    );
+                            None => {
+                                ui.label(
+                                    egui::RichText::new(if row.button_required {
+                                        "touch to view"
+                                    } else {
+                                        "\u{2014}"
+                                    })
+                                    .font(theme::f_reg(11.5))
+                                    .color(p.txt3),
+                                );
+                            }
+                        }
+                    });
                 });
                 if i + 1 < n {
                     ui.add_space(5.0);

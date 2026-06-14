@@ -23,9 +23,7 @@
 use keyroost_token2otp as t2;
 use keyroost_token2otp::entry::{serialize_enum_all, ParseError};
 use keyroost_token2otp::hidframe::{self, ResponseAssembler, Step};
-use keyroost_token2otp::{
-    cmd, EncryptError, Entry, OtpError, OtpType, WriteEntry,
-};
+use keyroost_token2otp::{cmd, EncryptError, Entry, OtpError, OtpType, WriteEntry};
 
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::fs::{File, OpenOptions};
@@ -233,7 +231,10 @@ impl HidOtpTransport {
     /// payload bytes directly; hidapi on Windows/macOS returns the 64-byte
     /// report (report ID 0 is not prepended for non-numbered reports). The
     /// assembler auto-detects whether a report-ID byte is present.
-    fn read_report(&mut self, buf: &mut [u8; hidframe::REPORT_PAYLOAD + 1]) -> Result<usize, OtpTransportError> {
+    fn read_report(
+        &mut self,
+        buf: &mut [u8; hidframe::REPORT_PAYLOAD + 1],
+    ) -> Result<usize, OtpTransportError> {
         let n = match &mut self.io {
             #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
             HidIo::Hidraw(f) => {
@@ -308,7 +309,9 @@ impl OtpTransport for HidOtpTransport {
                 Step::Done => break,
             }
         }
-        let (data, sw) = asm.into_response().ok_or(OtpTransportError::EmptyResponse)?;
+        let (data, sw) = asm
+            .into_response()
+            .ok_or(OtpTransportError::EmptyResponse)?;
         if self.debug {
             let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
             eprintln!("[token2otp HID parsed] data={hex} sw={sw:#06x}");
@@ -359,13 +362,21 @@ impl PcScOtpTransport {
             }
             // Try shared first, then exclusive; some CCID interfaces only grant
             // one or the other.
-            let card = match ctx.connect(name.as_c_str(), pcsc::ShareMode::Shared, pcsc::Protocols::ANY) {
+            let card = match ctx.connect(
+                name.as_c_str(),
+                pcsc::ShareMode::Shared,
+                pcsc::Protocols::ANY,
+            ) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     if debug {
                         eprintln!("[token2otp PCSC]   shared connect failed: {e}");
                     }
-                    match ctx.connect(name.as_c_str(), pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY) {
+                    match ctx.connect(
+                        name.as_c_str(),
+                        pcsc::ShareMode::Exclusive,
+                        pcsc::Protocols::ANY,
+                    ) {
                         Ok(c) => Some(c),
                         Err(e2) => {
                             if debug {
@@ -679,7 +690,8 @@ impl Token2OtpSession {
                 "button HOTP code_length must be 6 or 8",
             )));
         }
-        t2::validate_seed_len(seed.len()).map_err(|m| OtpTransportError::Parse(ParseError::Invalid(m)))?;
+        t2::validate_seed_len(seed.len())
+            .map_err(|m| OtpTransportError::Parse(ParseError::Invalid(m)))?;
 
         // 1. Seed (IV-2).
         let mut cleartext = Zeroizing::new(Vec::with_capacity(2 + seed.len()));
@@ -733,11 +745,15 @@ impl Token2OtpSession {
 
     /// Send a one-byte plaintext config command (spec §6.6 steps 2–4).
     fn config_byte(&mut self, header: [u8; 4], byte: u8) -> Result<(), OtpTransportError> {
-        let (_, sw) = self.transport.transmit(&t2::build_apdu(header, &[byte]), false)?;
+        let (_, sw) = self
+            .transport
+            .transmit(&t2::build_apdu(header, &[byte]), false)?;
         // HOTP-over-HID may be unsupported on older models (spec §6.6 compat).
         match OtpError::check(sw) {
             Ok(()) => Ok(()),
-            Err(OtpError::HidNotSupported) => Err(OtpTransportError::Applet(OtpError::HidNotSupported)),
+            Err(OtpError::HidNotSupported) => {
+                Err(OtpTransportError::Applet(OtpError::HidNotSupported))
+            }
             Err(e) => Err(e.into()),
         }
     }
