@@ -29,24 +29,24 @@ pub const USB_PID: u16 = 0x0300;
 pub const READER_NAME_HINT: &str = "TOKEN2";
 
 /// True when a PC/SC reader name denotes a Token2 **Molto2 / Molto2v2** TOTP
-/// token, as opposed to one of Token2's *FIDO* keys (PIN+, FIDO2+).
+/// token, as opposed to one of Token2's *FIDO* keys (FIDO2+, PIN+, PIN+R3, …).
 ///
 /// Token2 brands its whole line "TOKEN2" and its FIDO keys also expose a CCID
-/// reader, so the old bare-`"TOKEN2"` substring match mis-flagged those FIDO
-/// keys as a Molto2 — a ghost/duplicate device in the GUI (issue #21). The
-/// Molto2's reader name carries the product name `Molto2`
-/// (e.g. `TOKEN2 Molto2 [CCID Interface] 00 00`); the FIDO keys carry
-/// `FIDO2 Security Key`. Match on the product name, with a fallback that
-/// accepts a bare-`TOKEN2` reader only when nothing announces a FIDO interface
-/// (so a future Molto2 whose reader omits the product word still resolves,
-/// without re-admitting the FIDO keys).
+/// reader, so identifying a Molto2 by the brand is wrong twice over:
+/// - the original bare-`"TOKEN2"` substring matched every Token2 FIDO key
+///   (issue #21, a ghost Molto2 in the GUI);
+/// - a follow-up that matched `"TOKEN2"` *unless* the name said "fido" or
+///   "security key" still misfired on `Token2 PIN+R3 00 00` — the PIN+R3
+///   mini's reader names neither — flagging that FIDO key as a Molto2 and
+///   making `keyroostctl` attempt Molto2 commands on it (`SW 6A81`).
+///
+/// The only reliable signal is the **product name**: a Molto2's reader carries
+/// `Molto2` (e.g. `TOKEN2 Molto2 [CCID Interface] 00 00`), every other Token2
+/// device is a FIDO key. So match on `"molto"` and nothing else — no
+/// brand-level fallback to re-admit the FIDO line.
 #[must_use]
 pub fn is_molto2_reader(reader_name: &str) -> bool {
-    let n = reader_name.to_ascii_lowercase();
-    if n.contains("molto") {
-        return true;
-    }
-    n.contains("token2") && !n.contains("fido") && !n.contains("security key")
+    reader_name.to_ascii_lowercase().contains("molto")
 }
 
 #[cfg(test)]
@@ -59,20 +59,19 @@ mod reader_match_tests {
         assert!(is_molto2_reader("TOKEN2 Molto2 [CCID Interface] 00 00"));
         assert!(is_molto2_reader("Token2 Molto2 0"));
         assert!(is_molto2_reader("token2 molto2v2 [ccid] 01 00"));
-        // Bare-TOKEN2 fallback: a Molto2 whose reader omits the product word,
-        // as long as nothing announces a FIDO interface.
-        assert!(is_molto2_reader("TOKEN2 [CCID Interface] 00 00"));
     }
 
     #[test]
     fn rejects_token2_fido_keys() {
-        // Issue #21: Token2's FIDO keys share the brand and expose a CCID
-        // reader, but must not be flagged as a Molto2.
+        // Token2's FIDO keys share the brand and expose a CCID reader, but must
+        // not be flagged as a Molto2. The reader strings below are real ones
+        // reported on Linux in issue #21 (a PIN+R3 / "3.2 mini" and a FIDO2+).
         assert!(!is_molto2_reader("TOKEN2 FIDO2 Security Key 00 00"));
+        assert!(!is_molto2_reader("Token2 PIN+R3 00 00"));
         assert!(!is_molto2_reader("Token2 PIN+ [FIDO] 0"));
-        assert!(!is_molto2_reader(
-            "TOKEN2 Security Key [CCID Interface] 01 00"
-        ));
+        // A bare-"TOKEN2" reader is NOT assumed to be a Molto2 anymore — the
+        // bare-brand fallback is exactly what misfired on PIN+R3.
+        assert!(!is_molto2_reader("TOKEN2 [CCID Interface] 00 00"));
     }
 
     #[test]

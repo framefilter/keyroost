@@ -17,12 +17,13 @@ behaviour of the Token2 device itself; none of it is copyrighted by anyone.
   *and* the PIN+/FIDO2+ FIDO keys — so VID alone does not identify a Molto2)
 - **Product ID:** `0x0300` (Molto2 / Molto2v2; the FIDO keys are `0x0022`)
 - **Reader name:** the Molto2 reader carries the product name, e.g.
-  `TOKEN2 Molto2 [CCID Interface] 00 00`. A bare-"TOKEN2" substring match is
-  **too broad** — Token2's FIDO keys also brand as "TOKEN2" and expose a CCID
-  reader, so matching on "TOKEN2" alone mis-flags them as a Molto2 (this was
-  issue #21). Use `keyroost_proto::is_molto2_reader`, which matches the
-  `Molto2` product word (with a FIDO-excluding fallback for a bare-"TOKEN2"
-  reader).
+  `TOKEN2 Molto2 [CCID Interface] 00 00`. Matching on the brand "TOKEN2" is
+  **too broad** — Token2's FIDO keys (FIDO2+, PIN+, PIN+R3, …) also brand as
+  "TOKEN2" and expose a CCID reader (e.g. `Token2 PIN+R3 00 00`,
+  `TOKEN2 FIDO2 Security Key 00 00`), so any brand-level match mis-flags them
+  as a Molto2 (issue #21). The only reliable signal is the product word: use
+  `keyroost_proto::is_molto2_reader`, which matches **`Molto2`** and nothing
+  else — every other Token2 device is a FIDO key.
 - On Linux the device requires an entry in libccid's `Info.plist` so that
   pcscd picks it up; recent libccid versions ship that entry pre-configured.
 
