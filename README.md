@@ -72,6 +72,18 @@ Token2 for affordable programmable hardware TOTP. keyroost also rests on open
 standards from the FIDO Alliance, the OATH/IETF TOTP–HOTP RFCs, and the OpenPGP
 card specification.
 
+### Contributors
+
+Beyond the maintainers, keyroost is grateful for community contributions:
+
+- **[@token2](https://github.com/token2)** — contributed on-device TOTP/HOTP
+  management for Token2 FIDO keys (PIN+ / FIDO2+), and published the protocol
+  reference it was built from
+  ([#24](https://github.com/framefilter/keyroost/pull/24)).
+
+(This credits their contribution to the codebase; it does not change keyroost's
+independent status described above.)
+
 ## Design principles
 
 - **Vendor over depend.** SM4, SHA-1/256, base32, hex, CBOR, CTAP-HID framing,
