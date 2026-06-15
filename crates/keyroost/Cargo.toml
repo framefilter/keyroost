@@ -15,20 +15,20 @@ name = "keyroost"
 path = "src/main.rs"
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.5.0" }
-keyroost-transport = { path = "../keyroost-transport", version = "0.5.0" }
-keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.5.0" }
-keyroost-piv = { path = "../keyroost-piv", version = "0.5.0" }
-keyroost-hid = { path = "../keyroost-hid", version = "0.5.0" }
-keyroost-ctap = { path = "../keyroost-ctap", version = "0.5.0" }
-keyroost-keyring = { path = "../keyroost-keyring", version = "0.5.0" }
-keyroost-resolve = { path = "../keyroost-resolve", version = "0.5.0" }
-keyroost-oath = { path = "../keyroost-oath", version = "0.5.0" }
-keyroost-qr = { path = "../keyroost-qr", version = "0.5.0" }
-keyroost-import = { path = "../keyroost-import", version = "0.5.0", features = ["bulk", "encrypted"] }
+keyroost-proto = { path = "../keyroost-proto", version = "0.5.1" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.5.1" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.5.1" }
+keyroost-piv = { path = "../keyroost-piv", version = "0.5.1" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.5.1" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.5.1" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.5.1" }
+keyroost-resolve = { path = "../keyroost-resolve", version = "0.5.1" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.5.1" }
+keyroost-qr = { path = "../keyroost-qr", version = "0.5.1" }
+keyroost-import = { path = "../keyroost-import", version = "0.5.1", features = ["bulk", "encrypted"] }
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
 # keyroostctl). Owns the scoped `rsa` dependency exception.
-keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.5.0" }
+keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.5.1" }
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.29"
 # Already in the tree via eframe/egui-winit's clipboard integration; direct

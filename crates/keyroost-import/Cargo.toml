@@ -19,7 +19,7 @@ bulk = ["dep:serde", "dep:serde_json"]
 encrypted = ["bulk", "dep:scrypt", "dep:aes-gcm", "dep:base64"]
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.5.0" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.5.1" }
 # Same scoped exception as keyroost-ctap/keyroost-rsakey: compiler-fence-
 # backed wiping of secret buffers is not something to hand-roll.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }

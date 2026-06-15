@@ -18,7 +18,7 @@ workspace = true
 # GUI stack; jpeg-decoder runs single-threaded (rayon feature off).
 [dependencies]
 jpeg-decoder = { version = "0.3.2", default-features = false }
-keyroost-import = { path = "../keyroost-import", version = "0.5.0", features = ["bulk"] }
+keyroost-import = { path = "../keyroost-import", version = "0.5.1", features = ["bulk"] }
 png = "0.18.1"
 rqrr = { version = "0.10.1", default-features = false }
 # Same scoped exception as the rest of the workspace: decoded QR payloads

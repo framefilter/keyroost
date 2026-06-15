@@ -11,4 +11,4 @@ description = "Pure-Rust PIV (NIST SP 800-73 / FIPS 201) smartcard byte layer (A
 workspace = true
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.5.0" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.5.1" }
