@@ -712,6 +712,50 @@ impl Token2OtpSession {
 
     /// Delete the HOTP-on-button slot (spec §6.6): seal the two zero bytes with
     /// IV-2 and send `WRITE_HOTP_SEED`.
+    /// Set which USB interfaces the key exposes, via `SET_DEVICE_TYPE`
+    /// (spec §6.8). The argument is a *disable* mask over [`t2::DEV_FIDO`],
+    /// [`t2::DEV_KEYBOARD`], and [`t2::DEV_CCID`]: a set bit disables that
+    /// interface, a clear bit enables it.
+    ///
+    /// **Brick risk.** The firmware does not refuse a mask that disables every
+    /// interface, which would leave the key permanently unreachable. The byte
+    /// layer's [`t2::set_device_type`] refuses such a mask client-side
+    /// ([`SetDeviceTypeError::WouldBrick`]); this method surfaces that as an
+    /// error and never transmits a bricking APDU. Callers should additionally
+    /// confirm the change with the user before calling.
+    pub fn set_device_type(&mut self, disable_mask: u8) -> Result<(), OtpTransportError> {
+        let apdu = t2::set_device_type(disable_mask)
+            .map_err(|_| OtpTransportError::Parse(ParseError::Invalid(
+                "refusing to disable every interface (would brick the key)",
+            )))?;
+        let (_, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check(sw)?;
+        Ok(())
+    }
+
+    /// Read the key's interface-configuration byte via `READ_CONFIG`
+    /// (spec §6.9), so callers can show which interfaces are currently enabled
+    /// before changing them. Returns the raw config bytes the device reports.
+    pub fn read_config(&mut self) -> Result<Vec<u8>, OtpTransportError> {
+        // READ_CONFIG (0x80 0xC5 0x02) is in the same command family as
+        // ENUM_CODES (0x80 0xC5 0x05) and is answered by the OTP applet — NOT the
+        // FIDO applet. The OTP applet is already current (selected at session
+        // open), so issue the command directly, exactly as `enumerate` does.
+        let apdu = t2::read_config(64);
+        let (data, sw) = self.transport.transmit(&apdu, false)?;
+        OtpError::check(sw)?;
+        Ok(data)
+    }
+
+    /// Read and parse the device-info / configuration block (spec §6.9). Callers
+    /// can use the returned [`t2::DeviceInfo`] to tell, for example, whether the
+    /// keyboard-HID interface is enabled before offering HOTP-on-touch (which
+    /// types over that interface and fails with `6A81` when it's disabled).
+    pub fn read_device_info(&mut self) -> Result<t2::DeviceInfo, OtpTransportError> {
+        let data = self.read_config()?;
+        Ok(t2::DeviceInfo::parse(&data)?)
+    }
+
     pub fn delete_button_hotp(&mut self) -> Result<(), OtpTransportError> {
         let blob = self.seal(&[0x00, 0x00], &t2::IV_HOTP)?;
         let apdu = t2::build_apdu(cmd::WRITE_HOTP_SEED, &blob);

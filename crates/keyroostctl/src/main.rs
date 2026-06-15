@@ -1140,6 +1140,31 @@ enum OtpCmd {
     },
     /// Delete the HOTP-on-button keystroke slot.
     DeleteButtonHotp,
+    /// Enable or disable the key's USB interfaces (FIDO / keyboard-HID / CCID)
+    /// via SET_DEVICE_TYPE.
+    ///
+    /// You name the interfaces to ENABLE; any not named are disabled. At least
+    /// TWO must remain enabled: disabling all of them bricks the key, and leaving
+    /// only one risks locking you out, so the tool refuses fewer than two. This
+    /// reconfigures the hardware and requires typing a confirmation phrase.
+    /// Read and print the device configuration (interface states, capabilities).
+    /// Useful for diagnosing why the GUI's keyboard toggle or Touch HOTP gating
+    /// behaves as it does.
+    Config,
+    Interface {
+        /// Enable the FIDO2/U2F interface.
+        #[arg(long)]
+        fido: bool,
+        /// Enable the keyboard-HID interface (needed for HOTP-on-touch keystroke).
+        #[arg(long)]
+        keyboard: bool,
+        /// Enable the CCID/smart-card interface (PIV, OpenPGP, OTP over PC/SC).
+        #[arg(long)]
+        ccid: bool,
+        /// Skip the interactive confirmation (still refuses to disable all).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Transport selector for the `otp` command group.
@@ -2716,6 +2741,108 @@ fn run_otp(
             let mut session = open_otp(transport, debug)?;
             session.delete_button_hotp()?;
             println!("Deleted the HOTP-on-button keystroke slot.");
+        }
+        OtpCmd::Config => {
+            let mut session = open_otp(transport, debug)?;
+            // Show the raw READ_CONFIG bytes first (diagnostic), then the parse.
+            match session.read_config() {
+                Ok(raw) => {
+                    let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+                    println!("READ_CONFIG returned {} bytes: {hex}", raw.len());
+                }
+                Err(e) => {
+                    eprintln!("READ_CONFIG failed: {e}");
+                    return Err(e.into());
+                }
+            }
+            let info = session.read_device_info()?;
+            println!("Device configuration:");
+            println!("  FIDO interface:         {}", if info.fido_disabled() { "disabled" } else { "enabled" });
+            println!("  keyboard-HID interface: {}", if info.hotp_keystroke_disabled() { "disabled" } else { "enabled" });
+            println!("  CCID interface:         {}", if info.ccid_disabled() { "disabled" } else { "enabled" });
+            println!("  HOTP-on-touch support:  {}", if info.button_hotp_supported() { "yes" } else { "no" });
+            println!("  HOTP-on-touch slot:     {}", if info.button_hotp_configured() { "configured" } else { "empty" });
+        }
+        OtpCmd::Interface {
+            fido,
+            keyboard,
+            ccid,
+            yes,
+        } => {
+            use keyroost_token2otp::{DEV_CCID, DEV_FIDO, DEV_KEYBOARD};
+            // Require at least TWO interfaces to remain enabled. Disabling all
+            // three bricks the key; leaving only one is fragile (if that single
+            // interface can't be reached you'd be locked out), so the tool keeps
+            // a two-interface minimum as a safety margin.
+            let enabled_count = [*fido, *keyboard, *ccid].iter().filter(|x| **x).count();
+            if enabled_count < 2 {
+                return Err(
+                    "at least two interfaces must stay enabled (--fido / --keyboard / --ccid); \
+                     reducing to one or zero risks locking you out of the key"
+                        .into(),
+                );
+            }
+            // Build the *disable* mask: a set bit disables that interface.
+            let mut disable: u8 = 0;
+            if !*fido {
+                disable |= DEV_FIDO;
+            }
+            if !*keyboard {
+                disable |= DEV_KEYBOARD;
+            }
+            if !*ccid {
+                disable |= DEV_CCID;
+            }
+
+            let enabled: Vec<&str> = [
+                (*fido, "FIDO2/U2F"),
+                (*keyboard, "keyboard-HID"),
+                (*ccid, "CCID/smart-card"),
+            ]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+            let disabled: Vec<&str> = [
+                (!*fido, "FIDO2/U2F"),
+                (!*keyboard, "keyboard-HID"),
+                (!*ccid, "CCID/smart-card"),
+            ]
+            .into_iter()
+            .filter_map(|(off, name)| off.then_some(name))
+            .collect();
+
+            eprintln!("This will reconfigure the key's USB interfaces:");
+            eprintln!("  enable:  {}", enabled.join(", "));
+            eprintln!(
+                "  disable: {}",
+                if disabled.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    disabled.join(", ")
+                }
+            );
+            eprintln!(
+                "Disabling an interface removes the matching features until you re-enable it.\n\
+                 If you disable the interface you are currently connected over, you may not be\n\
+                 able to reach the key to undo this. Proceed with caution."
+            );
+
+            if !*yes {
+                // Require typing an exact phrase — not just "y" — for a hardware
+                // reconfiguration this consequential.
+                eprint!("Type EXACTLY 'reconfigure interfaces' to proceed: ");
+                use std::io::Write as _;
+                std::io::stderr().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if line.trim() != "reconfigure interfaces" {
+                    return Err("confirmation phrase did not match; aborted".into());
+                }
+            }
+
+            let mut session = open_otp(transport, debug)?;
+            session.set_device_type(disable)?;
+            println!("Interface configuration updated. Re-plug the key for it to take effect.");
         }
     }
     Ok(())
