@@ -183,10 +183,36 @@ manual with the personal token, then add its Trusted Publishing entry, exactly
 like `keyroost-token2otp`. Keep the personal token until v0.6.0 ships for this
 reason; revoke afterward.) Replace reader-name Molto2 detection with stable identifiers:
 USB PID (Molto2 = `0x0300`) and/or the architectural fact that the Molto2 is
-the only Token2 device with no FIDO HID interface. **Depends on token2's answer
-to the PID issue** (is `0x0300` always-and-only Molto2; canonical FIDO PID list;
-`READ_CONFIG` appearance→model map). Fallback if no answer: keep "molto" name
-match + a FIDO-HID-sibling cross-check.
+the only Token2 device with no FIDO HID interface.
+
+**Dependency RESOLVED — Token2 answered the PID issue (#25, 2026-06-15):**
+- `0x349E:0x0300` is **always and only** the Molto2 and **will not change** —
+  confirmed authoritative. This is now the primary detection signal.
+- The full PID→product map is published and captured in code as
+  `keyroost_proto::TOKEN2_PRODUCTS` (+ `token2_product`, `is_molto2_usb`,
+  `token2_pid_label`). Token2 submits new PIDs to the CCID repo, so the table
+  can grow; unknown PIDs fall through to "not provably a Molto2" → cross-checks.
+- Token2 cautioned that the `READ_CONFIG` appearance field **can overlap** across
+  products, so do **not** key on it — PID + product description is the contract.
+
+Detection plan: where the USB PID is in hand (HID/USB enumeration), use
+`is_molto2_usb(vid, pid)`. The bare PC/SC path only has a reader string, so keep
+`is_molto2_reader` (name match) there, correlated to the USB side by topology
+(the `CHANNEL_ID` bus/address pairing the transport already reads). Retain the
+"no FIDO-HID sibling" architectural cross-check as defense in depth.
+
+**ATR option (My1, #25/#21) — keep for the NFC future, verify before relying.**
+My1 suggested classifying via the CCID **ATR** (as `pcsc_scan` does) rather than
+the reader name. Honest assessment: it's the *right* tool over **NFC**, where
+the reader is a generic contactless reader and neither USB PID nor reader name
+denotes the card — if keyroost ever grows NFC support, ATR + AID-selection
+becomes the only signal, so record it as the NFC strategy. For the **USB** case
+it's weaker than the now-confirmed PID: (a) reading the ATR needs `SCardConnect`,
+which resets the card — exactly the connect we avoid on the Molto2 during
+enumeration; (b) the Token2 line may share a smartcard platform and present
+indistinguishable ATRs across Molto2/FIDO — unverified, needs the 3.x hardware
+Token2 offered (#21) before we'd trust it to discriminate. So: not the primary
+USB discriminator, but a good cross-check and the clear NFC path.
 
 ### Phase 2 — Bare invocation + `list` redesign
 Bare `keyroostctl` → friendly correlated overview (one row per physical device,
