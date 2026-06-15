@@ -286,14 +286,22 @@ pub fn enumerate() -> Result<Vec<UiDevice>, String> {
         if p.has_piv {
             caps.insert(Caps::PIV);
         }
+        // Token2 keys carry the on-device OTP applet, reachable over CCID/NFC as
+        // well as USB-HID. The HID path below sets Caps::OTP from the USB VID, but
+        // a Token2 key presented over CCID only (HID disabled, or contactless)
+        // would otherwise lose its OTP tab. Detect it from the reader name here so
+        // the capability is offered on the smart-card interface too.
+        if p.reader_name.to_ascii_lowercase().contains("token2") {
+            caps.insert(Caps::OTP);
+        }
         if caps.is_empty() {
             // No key applet we manage — likely a FIDO-only key's CCID interface.
             // The HID merge step below picks it up if it matches a HID node.
             continue;
         }
-        // Prefer a YubiKey management serial; otherwise fall back to a serial
-        // recovered from the OpenPGP AID during probing (e.g. Token2 PIN+, which
-        // has no HID serial). Either way `serial` drives the header `#…` field.
+        // Prefer a YubiKey management serial; otherwise the serial recovered
+        // during probing (the full Token2 GET_INFO serial where available, else
+        // the shorter OpenPGP-AID serial). Either way `serial` drives the header.
         let serial = p
             .yubikey_serial
             .clone()
