@@ -117,3 +117,65 @@ anyone with the Linux build prerequisites from the README.
 - [x] **Clipboard conditional clear** — done via arboard (already in the
       tree through eframe): clears only when the clipboard still holds the
       copied code; fails open if unreadable.
+
+## v0.6.0 — CLI maturity & device-centric model (branch: `v0.6.0-cli-maturity`)
+
+Holistic pass over `keyroostctl` (and the shared plumbing the GUI uses):
+confirm the workflows make sense, dedup, fix the device-identification root
+cause, and add the friendly device overview. **Breaking CLI changes** — done
+deliberately now while pre-1.0 and the user base is small, landed as one
+coherent release with a migration note.
+
+Context: this follows two reader-name misidentification bugs (#21: a Token2
+PIN+ then a PIN+R3 "3.2 mini" both mis-seen as a Molto2). v0.5.1 stopped the
+bleed by matching only the "molto" product word; v0.6.0 replaces name-matching
+with stable identifiers.
+
+### Phase 0 — Command-surface inventory (do first; read-only)
+Enumerate every `keyroostctl` command from clap, map each to the user task it
+serves, flag dead / duplicated / confusing commands. Grounds every later
+decision. Produce as the first artifact.
+
+### Phase 1 — Shared device model
+Lift the device-correlation logic (HID↔PC/SC pairing, capability union,
+Molto2-vs-key classification) out of the GUI crate (`keyroost/src/ui/device.rs`)
+into a shared library crate consumed by **both** GUI and CLI, so they stop
+drifting. (This is a **new crate name** — its first crates.io publish must be
+manual with the personal token, then add its Trusted Publishing entry, exactly
+like `keyroost-token2otp`. Keep the personal token until v0.6.0 ships for this
+reason; revoke afterward.) Replace reader-name Molto2 detection with stable identifiers:
+USB PID (Molto2 = `0x0300`) and/or the architectural fact that the Molto2 is
+the only Token2 device with no FIDO HID interface. **Depends on token2's answer
+to the PID issue** (is `0x0300` always-and-only Molto2; canonical FIDO PID list;
+`READ_CONFIG` appearance→model map). Fallback if no answer: keep "molto" name
+match + a FIDO-HID-sibling cross-check.
+
+### Phase 2 — Bare invocation + `list` redesign
+Bare `keyroostctl` → friendly correlated overview (one row per physical device,
+capability badges — GUI parity). `keyroostctl list` → repositioned as the
+diagnostic dump, enriched with VID:PID + the computed classification (so the
+next bug report hands us what My1's did, by design). Bare invocation rewired
+exactly once, straight to the friendly form (no interim raw-list step).
+
+### Phase 3 — Consistency pass (the breaking part)
+Unify command shape: FIDO is flat (`fido-creds-list`) while OATH/OpenPGP/PIV/OTP
+are nested (`piv status`). Pick one — lean nested `fido <sub>` for symmetry —
+and align verb/noun naming across all groups. Dedup shared plumbing: secret
+input (env/stdin), reader resolution, session-open-and-announce — extend the
+existing `open_piv` / `open_openpgp` helper pattern to FIDO / OATH / Molto2.
+
+### Phase 4 — Feature gaps
+Per-device parity audit (esp. the Token2 OTP CLI merged in #24 — confirm it
+covers enumerate / add / delete / config / button-HOTP). Evaluate a `--json`
+output mode for scripting (everything is human-text today). Note any missing
+per-device operations.
+
+### Phase 5 — Bug sweep + hardware workflow walkthrough
+Fresh per-device end-to-end pass on available hardware (YubiKey, Solo 2,
+Molto2; Token2 FIDO via the vendor / @My1). The bare-invocation "is the device
+plugged in?" wart is retired here as a side effect of Phase 2.
+
+### Sequencing
+Phases 0–2 are additive/safe; Phase 3 is where breaking renames land — keep
+them in one change with a clear migration note. Ship v0.6.0 once all five are
+done and walked through on hardware.
