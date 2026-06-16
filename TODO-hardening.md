@@ -178,10 +178,10 @@ Findings:
 Lift the device-correlation logic (HID↔PC/SC pairing, capability union,
 Molto2-vs-key classification) out of the GUI crate (`keyroost/src/ui/device.rs`)
 into a shared library crate consumed by **both** GUI and CLI, so they stop
-drifting. (This is a **new crate name** — its first crates.io publish must be
-manual with the personal token, then add its Trusted Publishing entry, exactly
-like `keyroost-token2otp`. Keep the personal token until v0.6.0 ships for this
-reason; revoke afterward.) Replace reader-name Molto2 detection with stable identifiers:
+drifting. (**Decision 2026-06-16: extend the existing `keyroost-resolve` crate
+rather than create a new one** — see Design below; this avoids a fresh crates.io
+publish and the manual-token/Trusted-Publishing dance entirely.) Replace
+reader-name Molto2 detection with stable identifiers:
 USB PID (Molto2 = `0x0300`) and/or the architectural fact that the Molto2 is
 the only Token2 device with no FIDO HID interface.
 
@@ -213,6 +213,72 @@ enumeration; (b) the Token2 line may share a smartcard platform and present
 indistinguishable ATRs across Molto2/FIDO — unverified, needs the 3.x hardware
 Token2 offered (#21) before we'd trust it to discriminate. So: not the primary
 USB discriminator, but a good cross-check and the clear NFC path.
+
+**Design (locked 2026-06-16; hardware-verified against YubiKey 5 / Solo 2 /
+Molto2 — see [[phase1-device-correlation-hardware]]).**
+
+*Decisions (these override the older notes above):*
+1. **Extend `keyroost-resolve`, no new crate.** It already owns the HID↔CCID
+   serial correlation, already depends on hid/transport/keyring, and is already
+   consumed by GUI + CLI. The change is additive (existing fns stay): no new
+   crates.io publish, no rename, no new dependency edges between the frontends.
+   Implementation must verify the dep graph stays acyclic (resolve →
+   hid/transport/proto/keyring, never the reverse).
+2. **Stable-ID classification, cross-platform, no sysfs.** FIDO keys carry a USB
+   VID:PID from HID → classify by PID (`keyroost_proto::token2_product` /
+   `token2_pid_label` for Token2 keys; VID for Yubico/Solo/Nitrokey). The Molto2
+   is CCID-only (no HID; lsusb confirms `349e:0300` but it is not exposed over
+   HID), so it is identified as **the Token2 CCID reader with no FIDO-HID
+   sibling** — the #21 defense, since a Token2 PIN+ key always *has* a HID
+   sibling and so can never be mis-seen as a Molto2. sysfs USB↔reader PID
+   correlation is deferred as an optional Linux-only hardening; not needed now.
+3. **One shared `Device` model, consumed by both frontends.** Today's
+   `UiDevice` is already pure data (no egui) — move it (drop the `Ui` prefix)
+   plus `Caps` and `DeviceKind` into keyroost-resolve. The GUI renders it, the
+   CLI prints it; the friendly-name overlay (keyring) is applied in the shared
+   layer so naming is identical in both.
+
+*Shape (in `keyroost-resolve`):*
+- Types: `Device { id, name, vendor, model, serial, transport, firmware, caps,
+  kind, hid_path, reader }`; `Caps` (bitset FIDO2/OATH/PGP/PIV/TOTP/OTP);
+  `DeviceKind { Key, Token }`.
+- **I/O-vs-pure split (for testability):**
+  - `enumerate(keyring: Option<&Keyring>) -> Result<Vec<Device>, String>` — does
+    the I/O (HID enumerate + PC/SC probe), then calls the pure correlator.
+    Resilient: a reader that fails or times out (cf. the Molto2 libccid init
+    timeout) degrades to a partial/absent entry, never a hard error.
+  - `correlate(hid: &[HidDevice], readers: &[ReaderProbe], keyring:
+    Option<&Keyring>) -> Vec<Device>` — **pure, no I/O.** Pairs HID↔CCID (direct
+    serial match → CCID-serial/topology → standalone), unions capabilities,
+    classifies via the PID + no-sibling rules, applies friendly names. This is
+    the unit-tested core.
+
+*Correlation signals (observed on hardware):* direct serial match (Solo 2 —
+serial in both the HID serial and the CCID reader name); CCID-serial/topology
+(YubiKey — no HID serial, matched via the existing `ccid_serial_for`); standalone
+CCID (Molto2) and standalone HID.
+
+*Phase 1 deliverables:*
+- D1 — `Device`/`Caps`/`DeviceKind` + `enumerate`/`correlate` in keyroost-resolve.
+- D2 — PID + no-sibling classification replaces the reader-name-only Molto2 path;
+  retire the ad-hoc `contains("token2")` / name-based `is_molto2` checks in
+  `ui/device.rs`.
+- D3 — GUI migrated onto `keyroost_resolve::Device` (its `ui/device.rs::enumerate`
+  becomes a thin adapter or is removed; any egui-only per-device state stays in
+  the GUI).
+- D4 — unit tests for `correlate` with synthetic fixtures: the three real-hardware
+  cases plus the no-sibling rule (Token2 reader + HID sibling ⇒ FIDO key, not
+  Molto2).
+
+*Out of scope (later phases):* CLI consuming `enumerate` for the bare/`list`
+overview (Phase 2); unified `--name` targeting for every group (Phase 3); command
+renames (Phase 3). Phase 1 only makes the crate CLI-ready (zero egui deps) and
+migrates the GUI.
+
+*Risks:* (a) dependency cycle if transport/hid already depend on resolve — verify
+before moving; (b) `Device` must carry only hardware identity so the GUI's view
+state stays separate; (c) the friendly-name overlay must reproduce today's
+keyring behavior exactly.
 
 ### Phase 2 — Bare invocation + `list` redesign
 Bare `keyroostctl` → friendly correlated overview (one row per physical device,
