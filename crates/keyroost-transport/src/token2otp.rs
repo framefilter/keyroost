@@ -724,10 +724,11 @@ impl Token2OtpSession {
     /// error and never transmits a bricking APDU. Callers should additionally
     /// confirm the change with the user before calling.
     pub fn set_device_type(&mut self, disable_mask: u8) -> Result<(), OtpTransportError> {
-        let apdu = t2::set_device_type(disable_mask)
-            .map_err(|_| OtpTransportError::Parse(ParseError::Invalid(
+        let apdu = t2::set_device_type(disable_mask).map_err(|_| {
+            OtpTransportError::Parse(ParseError::Invalid(
                 "refusing to disable every interface (would brick the key)",
-            )))?;
+            ))
+        })?;
         let (_, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check(sw)?;
         Ok(())

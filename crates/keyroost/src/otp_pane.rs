@@ -517,24 +517,27 @@ impl App {
         self.otp.error = None;
         let sel = self.otp.transport;
         let for_device = self.selected_device.clone();
-        self.spawn_job("Erasing all OTP entries \u{2014} touch your key\u{2026}", move || {
-            let result = (|| -> Result<(), OtpTransportError> {
-                let mut session = sel.open()?;
-                session.erase_all()
-            })();
-            Box::new(move |app: &mut App| {
-                if app.selected_device != for_device {
-                    return;
-                }
-                match result {
-                    Ok(()) => {
-                        app.otp.info = Some("All OTP entries erased.".into());
-                        app.load_otp_entries();
+        self.spawn_job(
+            "Erasing all OTP entries \u{2014} touch your key\u{2026}",
+            move || {
+                let result = (|| -> Result<(), OtpTransportError> {
+                    let mut session = sel.open()?;
+                    session.erase_all()
+                })();
+                Box::new(move |app: &mut App| {
+                    if app.selected_device != for_device {
+                        return;
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
-                }
-            })
-        });
+                    match result {
+                        Ok(()) => {
+                            app.otp.info = Some("All OTP entries erased.".into());
+                            app.load_otp_entries();
+                        }
+                        Err(e) => app.otp.error = Some(e.to_string()),
+                    }
+                })
+            },
+        );
     }
 
     /// Render the OTP tab.
@@ -609,9 +612,7 @@ impl App {
                     ui.add_enabled_ui(!would_underflow, |ui| {
                         let r = theme::button(ui, p, BtnKind::Ghost, label);
                         let r = if would_underflow {
-                            r.on_disabled_hover_text(
-                                "at least two interfaces must stay enabled",
-                            )
+                            r.on_disabled_hover_text("at least two interfaces must stay enabled")
                         } else {
                             r
                         };

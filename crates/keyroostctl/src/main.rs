@@ -2757,11 +2757,46 @@ fn run_otp(
             }
             let info = session.read_device_info()?;
             println!("Device configuration:");
-            println!("  FIDO interface:         {}", if info.fido_disabled() { "disabled" } else { "enabled" });
-            println!("  keyboard-HID interface: {}", if info.hotp_keystroke_disabled() { "disabled" } else { "enabled" });
-            println!("  CCID interface:         {}", if info.ccid_disabled() { "disabled" } else { "enabled" });
-            println!("  HOTP-on-touch support:  {}", if info.button_hotp_supported() { "yes" } else { "no" });
-            println!("  HOTP-on-touch slot:     {}", if info.button_hotp_configured() { "configured" } else { "empty" });
+            println!(
+                "  FIDO interface:         {}",
+                if info.fido_disabled() {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
+            );
+            println!(
+                "  keyboard-HID interface: {}",
+                if info.hotp_keystroke_disabled() {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
+            );
+            println!(
+                "  CCID interface:         {}",
+                if info.ccid_disabled() {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
+            );
+            println!(
+                "  HOTP-on-touch support:  {}",
+                if info.button_hotp_supported() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            println!(
+                "  HOTP-on-touch slot:     {}",
+                if info.button_hotp_configured() {
+                    "configured"
+                } else {
+                    "empty"
+                }
+            );
         }
         OtpCmd::Interface {
             fido,
