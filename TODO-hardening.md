@@ -266,7 +266,21 @@ bring them level with reality before tagging. Concretely:
   CCID, an interface enable/disable command, full-serial read, and a touch-HOTP
   GUI dialog. Add the device, its capabilities, and `otp` examples; the
   Contributors note already acknowledges the feature, so the body contradicts
-  itself today.
+  itself today. *(DONE — `eb6fd85`: Token2 FIDO key added to intro / "What it
+  does" / devices table / quick-start, and the stale "PIV read-only" bullet
+  corrected to full management.)*
+- **Dependency accounting is stale — keep it honest, shrink it over time.** The
+  "Vendor over depend" principle claimed the only external deps were
+  `pcsc`/`clap`/`eframe`/`serde`/`rsa`, but the tree also pulls in RustCrypto
+  (`sha2`/`hmac`/`aes`/`cbc`/`des`/`aes-gcm`/`scrypt`/`p256`), `hidapi` (macOS/
+  Windows HID), `base64`, `zeroize`, and the QR stack (`rqrr`/`png`/
+  `jpeg-decoder`) — and the workspace table omitted `keyroost-token2otp` and
+  `keyroost-qr` outright. The project's stance is to add an external crate only
+  when not doing so would be irresponsible (audited crypto we won't hand-roll) or
+  impractical (platform glue), and to **reduce the count over time**. *(DONE —
+  `eb6fd85`/this commit: principle reframed, per-crate dep column corrected, both
+  missing crates added.)* Standing follow-up: revisit each dep at each release and
+  drop any that in-tree code can replace.
 - **Every command example must follow the Phase 3 renames.** README Quick-start
   + all `docs/*.html` use the flat `fido-*` commands and the bare-Molto2 `info` /
   `import` form; after Phase 3 these become `fido …` and `molto …`. Sweep

@@ -94,11 +94,18 @@ independent status described above.)
 
 ## Design principles
 
-- **Vendor over depend.** SM4, SHA-1/256, base32, hex, CBOR, CTAP-HID framing,
-  the OATH/OpenPGP byte layers, and `otpauth://` parsing are all in-tree. The only
-  external deps are `pcsc`, `clap`, `eframe`/`egui`, `serde`, and — for RSA
-  keygen/parsing alone — `rsa`/`rand`.
-- **Pure-Rust crypto**, checked against standard test vectors.
+- **Few dependencies, by design.** The protocol and codec layers are hand-written
+  and pull in nothing: the Molto2 wire protocol (SM4, SHA-1, the MAC), base32, hex,
+  CBOR, CTAP-HID framing, and the OATH / OpenPGP / PIV byte layers are all in-tree.
+  External crates are added only when *not* doing so would be irresponsible or
+  impractical — audited cryptography we won't hand-roll under `forbid(unsafe_code)`
+  (RustCrypto: `sha2` / `hmac` / `aes` / `p256` / `rsa` / …) and platform glue
+  (`pcsc`, `hidapi` on macOS/Windows, `clap`, `eframe`/`egui`). The per-crate list
+  is in the table below, and the standing goal is to shrink it over time, not grow
+  it.
+- **Pure-Rust crypto** — no OpenSSL or other C crypto; the in-tree primitives are
+  checked against standard test vectors, and standard algorithms come from the
+  audited RustCrypto crates.
 - **Secrets stay yours.** PINs and passwords come from stdin or env vars, never
   argv; the tool never prints or persists them.
 - **Single static binary per OS** — no scripts, no Python, no Qt.
@@ -224,19 +231,21 @@ keyroost
 
 | Crate | Purpose | External deps |
 |---|---|---|
-| `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, SHA-256, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets | `pcsc` |
-| `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs | none |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management | none |
+| `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session | `pcsc`, `aes`/`des` (mgmt-key auth), `zeroize`; `hidapi` on macOS/Windows |
+| `keyroost-hid` | USB HID enumeration of FIDO devices | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`) for client-PIN, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | none |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
-| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; read path (status / GET DATA) | none |
+| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM | none |
+| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`) for ECDH seed encryption, `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |
-| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
-| `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand` |
-| `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers | `serde`, `serde_json` (behind `bulk`) |
-| `keyroostctl` | Command-line interface | `clap` |
-| `keyroost` | egui desktop GUI | `eframe`, `egui` |
+| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | none |
+| `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand`, `zeroize` |
+| `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers | `serde`/`serde_json`, `scrypt`, `aes-gcm`, `base64`, `zeroize` (all behind `bulk`) |
+| `keyroost-qr` | QR-image 2FA import (PNG/JPEG screenshots, GA export batches) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
+| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `zeroize` |
+| `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `zeroize` |
 
 ## Protocol
 
