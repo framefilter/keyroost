@@ -14,3 +14,4 @@ workspace = true
 keyroost-keyring = { path = "../keyroost-keyring", version = "0.5.1" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.5.1" }
 keyroost-transport = { path = "../keyroost-transport", version = "0.5.1" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.5.1" }

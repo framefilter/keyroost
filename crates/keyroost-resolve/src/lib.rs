@@ -15,6 +15,9 @@ use keyroost_hid::HidDevice;
 use keyroost_keyring::{ConnectedKey, IdSource};
 use keyroost_transport::YubiKeyCcid;
 
+pub mod device;
+pub use device::{correlate, enumerate, Caps, Device, DeviceId, DeviceKind};
+
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.
 pub const VID_YUBICO: u16 = 0x1050;
 
