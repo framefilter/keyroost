@@ -2,8 +2,9 @@
 
 An independent, open-source Rust toolchain for managing hardware security keys —
 across vendors — over PC/SC and USB HID. It speaks FIDO2/CTAP2, OATH (TOTP/HOTP),
-and the OpenPGP card protocol, and also programs the Token2 Molto2 / Molto2v2 TOTP
-token it started life targeting. Ships a Rust library, a CLI (`keyroostctl`), and a
+and the OpenPGP and PIV card protocols, manages on-device OTP on Token2 FIDO keys,
+and also programs the Token2 Molto2 / Molto2v2 TOTP token it started life
+targeting. Ships a Rust library, a CLI (`keyroostctl`), and a
 dark-themed desktop GUI (`keyroost`) — implemented from public standards, with no
 vendor SDKs, no Python, and no Qt.
 
@@ -28,11 +29,17 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 - **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
   keygen or a PKCS#1/PKCS#8 PEM/DER file); sign (SHA-256 or SHA-1); decrypt; set
   cardholder name / URL; register a key for GnuPG; factory-reset the applet.
-- **PIV (SP 800-73-4)** — read-only status so far: applet/firmware version,
-  serial, PIN retries, and which key slots (9A/9C/9D/9E) hold a certificate.
+- **PIV (SP 800-73-4)** — full management: status (applet/firmware version,
+  serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
+  generation, certificate import / export, self-signed certs or a CSR for a CA,
+  and PIN / PUK / management-key changes and applet reset.
 - **Token2 Molto2 / Molto2v2** — program a slot from an `otpauth://` URI;
   bulk-import from Aegis (plaintext or encrypted), 2FAS, or a list of `otpauth://`
   URIs; sync the host clock; rotate the customer key; factory reset.
+- **Token2 on-device OTP (T2F2 / PIN+ FIDO keys)** — store TOTP/HOTP credentials
+  directly on a Token2 FIDO security key and read their codes over USB-HID, NFC,
+  or CCID; configure the single HOTP-on-touch keystroke slot; read the serial;
+  and enable / disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
 - **Friendly device names** — an opt-in `keys.json` registry to target a specific
   physical key by name when several are connected, instead of by a reshuffling
   `/dev/hidrawN` path. Destructive operations always resolve to an explicit
@@ -43,7 +50,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 | Device | Capabilities | Notes |
 |---|---|---|
 | **Token2 Molto2 / Molto2v2** | TOTP slot programming | The original target. |
-| **YubiKey** (5 series) | FIDO2, OATH, OpenPGP | Built and verified against a YubiKey 5.7. |
+| **Token2 T2F2 / PIN+** | FIDO2, on-device OTP (TOTP/HOTP) | OTP applet over USB-HID / NFC / CCID; contributed by [@token2](https://github.com/token2). |
+| **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. |
 | **Nitrokey 3** | FIDO2, OATH | Shares the Solo 2 / Trussed stack. |
 
@@ -199,10 +207,16 @@ keyroostctl info
 keyroostctl import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3PXP'
 keyroostctl import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate first
 
+# --- Token2 on-device OTP (T2F2 / PIN+ FIDO keys) ---
+keyroostctl otp list
+keyroostctl otp add GitHub me@x.com --seed-stdin    # base32 seed from stdin, never argv
+keyroostctl otp get GitHub me@x.com
+
 # name a key to target it when several are plugged in (opt-in)
 keyroostctl key-name list
 
-# launch the GUI (tabs: Molto2 profiles, Security Keys, OATH, OpenPGP)
+# launch the GUI (per-device tabs: Overview, Security Keys, OATH, OpenPGP, PIV,
+# On-device OTP, plus the distinct Molto2 view)
 keyroost
 ```
 
