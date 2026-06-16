@@ -271,18 +271,27 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    /// Parse the fixed-format response (spec §6.9). Requires at least 10 bytes.
+    /// Parse the device-info response (spec §6.9). The interface-state bits all
+    /// live in byte 0 (`transfer_type`), so that byte is the only hard
+    /// requirement. Some firmware returns just the config byte(s) rather than the
+    /// full fixed-format block, so the later appearance/version/extension fields
+    /// are filled from whatever is present and default to zero when absent.
     pub fn parse(data: &[u8]) -> Result<Self, ParseError> {
-        if data.len() < 10 {
+        if data.is_empty() {
             return Err(ParseError::Truncated);
         }
+        let get = |i: usize| data.get(i).copied().unwrap_or(0);
         Ok(DeviceInfo {
             transfer_type: data[0],
-            device_config: data[1],
-            appearance: [data[2], data[3], data[4], data[5]],
-            fido_version: [data[6], data[7], data[8]],
-            device_extension: data[9],
-            raw_tail: data[10..].to_vec(),
+            device_config: get(1),
+            appearance: [get(2), get(3), get(4), get(5)],
+            fido_version: [get(6), get(7), get(8)],
+            device_extension: get(9),
+            raw_tail: if data.len() > 10 {
+                data[10..].to_vec()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -294,6 +303,10 @@ impl DeviceInfo {
     /// Bit 2: HOTP-via-keystroke disabled.
     pub fn hotp_keystroke_disabled(&self) -> bool {
         self.transfer_type & 0x02 != 0
+    }
+    /// Bit 3: CCID/smart-card interface disabled.
+    pub fn ccid_disabled(&self) -> bool {
+        self.transfer_type & 0x04 != 0
     }
 
     // --- device-config bits (byte 1) ---
@@ -515,6 +528,22 @@ mod tests {
         assert!(info.button_hotp_configured());
         assert!(!info.hotp_suppresses_enter());
         assert!(info.button_hotp_supported()); // ext bit 6 clear -> supported
+    }
+
+    #[test]
+    fn device_info_parses_short_response() {
+        // Some firmware returns only the config byte(s) from READ_CONFIG rather
+        // than the full 10-byte block. The interface-state bits live in byte 0,
+        // so a 1-byte response (e.g. 0x02 = keyboard-HID disabled) must still
+        // parse, with the optional trailing fields defaulting to zero.
+        let info = DeviceInfo::parse(&[0x02]).unwrap();
+        assert!(!info.fido_disabled());
+        assert!(info.hotp_keystroke_disabled());
+        assert!(!info.ccid_disabled());
+        // device_extension defaults to 0 -> button-HOTP reported as supported.
+        assert!(info.button_hotp_supported());
+        // An empty response is still rejected.
+        assert!(DeviceInfo::parse(&[]).is_err());
     }
 
     #[test]

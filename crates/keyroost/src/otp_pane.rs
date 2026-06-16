@@ -104,6 +104,79 @@ impl Drop for OtpAddDialog {
     }
 }
 
+/// Dialog state for configuring the HOTP-on-touch keystroke slot: the key types
+/// a fresh HOTP code as keyboard input when touched outside any session.
+pub struct ButtonHotpDialog {
+    pub open: bool,
+    /// Base32 secret, entered masked.
+    pub secret: String,
+    /// 6 or 8.
+    pub digits: u8,
+    /// Append an Enter keystroke after the code.
+    pub send_enter: bool,
+    /// Require a 2-second long touch (else a short tap triggers it).
+    pub long_touch: bool,
+    /// Type digits using the numeric-keypad scancodes.
+    pub numpad: bool,
+}
+
+impl Default for ButtonHotpDialog {
+    fn default() -> Self {
+        ButtonHotpDialog {
+            open: false,
+            secret: String::new(),
+            digits: 6,
+            send_enter: true,
+            long_touch: false,
+            numpad: false,
+        }
+    }
+}
+
+impl Drop for ButtonHotpDialog {
+    fn drop(&mut self) {
+        wipe(&mut self.secret);
+    }
+}
+
+/// Current enabled-state of the key's three USB interfaces, read from the device
+/// config. Used to show the keyboard-HID toggle and to keep at least two
+/// interfaces enabled when changing one.
+#[derive(Clone, Copy)]
+pub struct IfaceState {
+    pub fido: bool,
+    pub keyboard: bool,
+    pub ccid: bool,
+}
+
+impl IfaceState {
+    fn enabled_count(&self) -> usize {
+        [self.fido, self.keyboard, self.ccid]
+            .iter()
+            .filter(|x| **x)
+            .count()
+    }
+}
+
+/// Pending keyboard-HID toggle awaiting a typed-phrase confirmation.
+pub struct KbdToggle {
+    /// The state keyboard-HID will be set to.
+    pub enable: bool,
+    /// What the user has typed; must match the required phrase to proceed.
+    pub typed: String,
+}
+
+/// Result of a successful OTP-pane load: the entry rows plus the device facts the
+/// pane shows (transport label, serial, touch-HOTP availability, interface state).
+struct OtpLoad {
+    rows: Vec<OtpRow>,
+    active: &'static str,
+    serial: Option<String>,
+    touch_ok: Option<bool>,
+    touch_why: Option<&'static str>,
+    iface: Option<IfaceState>,
+}
+
 /// Per-selection state for the OTP pane.
 #[derive(Default)]
 pub struct OtpState {
@@ -113,11 +186,24 @@ pub struct OtpState {
     pub info: Option<String>,
     pub loaded: bool,
     pub add: OtpAddDialog,
+    /// Dialog for the HOTP-on-touch keystroke slot.
+    pub button_hotp: ButtonHotpDialog,
     pub confirm_delete: Option<(String, String)>,
     /// Active transport label after a successful open (for the status line).
     pub active: Option<&'static str>,
     /// Device serial number (hex), read alongside the entry list when available.
     pub serial: Option<String>,
+    /// Whether the key currently supports HOTP-on-touch (keyboard-HID enabled and
+    /// the feature present). `None` until determined. Drives the Touch HOTP button.
+    pub touch_hotp_ok: Option<bool>,
+    /// Why touch-HOTP is unavailable, for the disabled-button tooltip.
+    pub touch_hotp_why: Option<&'static str>,
+    /// Current interface enabled-states (fido, keyboard-HID, ccid), read from the
+    /// device config on load. `None` until known.
+    pub iface: Option<IfaceState>,
+    /// Pending keyboard-HID toggle confirmation: the target state and the typed
+    /// confirmation phrase. `Some` while the confirm dialog is open.
+    pub kbd_confirm: Option<KbdToggle>,
 }
 
 fn unix_now() -> u64 {
@@ -135,7 +221,7 @@ impl App {
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OTP entries\u{2026}", move || {
             let result =
-                (|| -> Result<(Vec<OtpRow>, &'static str, Option<String>), OtpTransportError> {
+                (|| -> Result<OtpLoad, OtpTransportError> {
                     let mut session = sel.open()?;
                     let active = if session.is_pcsc() {
                         "CCID/NFC"
@@ -149,6 +235,34 @@ impl App {
                         .read_serial()
                         .ok()
                         .map(|sn| sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    // Determine whether HOTP-on-touch is usable: it types over the
+                    // keyboard-HID interface, so a key with that interface disabled
+                    // (or that doesn't support the feature) returns 6A81. Detect it
+                    // up front so the UI can disable the action with a reason rather
+                    // than letting the user fill the form and fail at submit.
+                    // Read the device config once; derive both the touch-HOTP
+                    // availability and the interface states from it.
+                    let dev_info = session.read_device_info().ok();
+                    let (touch_ok, touch_why): (Option<bool>, Option<&'static str>) =
+                        match &dev_info {
+                            Some(info) => {
+                                if !info.button_hotp_supported() {
+                                    (Some(false), Some("this key model does not support HOTP-on-touch"))
+                                } else if info.hotp_keystroke_disabled() {
+                                    (Some(false), Some("the keyboard-HID interface is disabled on this key; enable it to use HOTP-on-touch"))
+                                } else {
+                                    (Some(true), None)
+                                }
+                            }
+                            // Couldn't read config (older model / reader quirk):
+                            // leave it permitted rather than wrongly blocking.
+                            None => (None, None),
+                        };
+                    let iface = dev_info.as_ref().map(|info| IfaceState {
+                        fido: !info.fido_disabled(),
+                        keyboard: !info.hotp_keystroke_disabled(),
+                        ccid: !info.ccid_disabled(),
+                    });
                     let now = unix_now();
                     let entries = session.enumerate(now)?;
                     let rows = entries
@@ -162,18 +276,28 @@ impl App {
                             code: e.code,
                         })
                         .collect();
-                    Ok((rows, active, serial))
+                    Ok(OtpLoad {
+                        rows,
+                        active,
+                        serial,
+                        touch_ok,
+                        touch_why,
+                        iface,
+                    })
                 })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
                     return; // user switched keys mid-read
                 }
                 match result {
-                    Ok((rows, active, serial)) => {
-                        app.otp.rows = rows;
+                    Ok(load) => {
+                        app.otp.rows = load.rows;
                         app.otp.loaded = true;
-                        app.otp.active = Some(active);
-                        app.otp.serial = serial;
+                        app.otp.active = Some(load.active);
+                        app.otp.serial = load.serial;
+                        app.otp.touch_hotp_ok = load.touch_ok;
+                        app.otp.touch_hotp_why = load.touch_why;
+                        app.otp.iface = load.iface;
                         app.otp.error = None;
                     }
                     Err(e) => {
@@ -244,6 +368,125 @@ impl App {
         });
     }
 
+    /// Configure the HOTP-on-touch keystroke slot from the dialog fields.
+    pub(crate) fn provision_button_hotp(&mut self) {
+        self.otp.error = None;
+        let digits = self.otp.button_hotp.digits;
+        if digits != 6 && digits != 8 {
+            self.otp.error = Some("button HOTP digits must be 6 or 8".into());
+            return;
+        }
+        let secret = zeroize::Zeroizing::new(self.otp.button_hotp.secret.clone());
+        let send_enter = self.otp.button_hotp.send_enter;
+        let long_touch = self.otp.button_hotp.long_touch;
+        let numpad = self.otp.button_hotp.numpad;
+        let sel = self.otp.transport;
+        let for_device = self.selected_device.clone();
+
+        self.spawn_job("Setting touch HOTP\u{2026}", move || {
+            let result = (|| -> Result<(), String> {
+                let seed = keyroost_token2otp::decode_base32_seed(secret.trim())
+                    .map_err(|m| format!("invalid Base32 secret: {m}"))?;
+                let mut session = sel.open().map_err(|e| e.to_string())?;
+                session
+                    .set_button_hotp(digits, &seed, send_enter, long_touch, numpad)
+                    .map_err(|e| e.to_string())
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        app.otp.button_hotp = ButtonHotpDialog::default();
+                        app.otp.info = Some("Touch HOTP configured.".into());
+                    }
+                    Err(e) => app.otp.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
+    /// Apply a keyboard-HID enable/disable, preserving the other two interfaces
+    /// and never dropping below two enabled. Built from the cached `iface` state.
+    pub(crate) fn apply_keyboard_toggle(&mut self, enable: bool) {
+        self.otp.error = None;
+        let Some(cur) = self.otp.iface else {
+            self.otp.error = Some("interface state unknown; refresh first".into());
+            return;
+        };
+        // Compute the resulting state and enforce the two-interface minimum.
+        let next = IfaceState {
+            fido: cur.fido,
+            keyboard: enable,
+            ccid: cur.ccid,
+        };
+        if next.enabled_count() < 2 {
+            self.otp.error = Some(
+                "at least two interfaces must stay enabled; enable another interface first".into(),
+            );
+            return;
+        }
+        // Build the SET_DEVICE_TYPE *disable* mask (set bit = disable).
+        use keyroost_token2otp::{DEV_CCID, DEV_FIDO, DEV_KEYBOARD};
+        let mut disable: u8 = 0;
+        if !next.fido {
+            disable |= DEV_FIDO;
+        }
+        if !next.keyboard {
+            disable |= DEV_KEYBOARD;
+        }
+        if !next.ccid {
+            disable |= DEV_CCID;
+        }
+        let sel = self.otp.transport;
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Updating interfaces\u{2026}", move || {
+            let result = (|| -> Result<(), String> {
+                let mut session = sel.open().map_err(|e| e.to_string())?;
+                session.set_device_type(disable).map_err(|e| e.to_string())
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        app.otp.info = Some(
+                            "Interface updated. Re-plug the key for the change to take effect."
+                                .into(),
+                        );
+                        // Reflect the change locally; a refresh re-reads from hardware.
+                        app.otp.iface = Some(next);
+                    }
+                    Err(e) => app.otp.error = Some(e),
+                }
+            })
+        });
+    }
+
+    /// Clear the HOTP-on-touch keystroke slot.
+    pub(crate) fn delete_button_hotp_slot(&mut self) {
+        self.otp.error = None;
+        let sel = self.otp.transport;
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Clearing touch HOTP\u{2026}", move || {
+            let result = (|| -> Result<(), String> {
+                let mut session = sel.open().map_err(|e| e.to_string())?;
+                session.delete_button_hotp().map_err(|e| e.to_string())
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(()) => app.otp.info = Some("Touch HOTP cleared.".into()),
+                    Err(e) => app.otp.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
     /// Delete the entry identified by `(app, account)`.
     pub(crate) fn delete_otp_entry(&mut self, app_name: String, account_name: String) {
         self.otp.error = None;
@@ -274,24 +517,27 @@ impl App {
         self.otp.error = None;
         let sel = self.otp.transport;
         let for_device = self.selected_device.clone();
-        self.spawn_job("Erasing all OTP entries\u{2026}", move || {
-            let result = (|| -> Result<(), OtpTransportError> {
-                let mut session = sel.open()?;
-                session.erase_all()
-            })();
-            Box::new(move |app: &mut App| {
-                if app.selected_device != for_device {
-                    return;
-                }
-                match result {
-                    Ok(()) => {
-                        app.otp.info = Some("All OTP entries erased.".into());
-                        app.load_otp_entries();
+        self.spawn_job(
+            "Erasing all OTP entries \u{2014} touch your key\u{2026}",
+            move || {
+                let result = (|| -> Result<(), OtpTransportError> {
+                    let mut session = sel.open()?;
+                    session.erase_all()
+                })();
+                Box::new(move |app: &mut App| {
+                    if app.selected_device != for_device {
+                        return;
                     }
-                    Err(e) => app.otp.error = Some(e.to_string()),
-                }
-            })
-        });
+                    match result {
+                        Ok(()) => {
+                            app.otp.info = Some("All OTP entries erased.".into());
+                            app.load_otp_entries();
+                        }
+                        Err(e) => app.otp.error = Some(e.to_string()),
+                    }
+                })
+            },
+        );
     }
 
     /// Render the OTP tab.
@@ -310,12 +556,8 @@ impl App {
             );
             if let Some(active) = self.otp.active {
                 ui.add_space(8.0);
-                let mut meta = format!("via {active}");
-                if let Some(serial) = &self.otp.serial {
-                    meta.push_str(&format!("  ·  S/N {serial}"));
-                }
                 ui.label(
-                    egui::RichText::new(meta)
+                    egui::RichText::new(format!("via {active}"))
                         .font(theme::f_reg(11.5))
                         .color(p.txt3),
                 );
@@ -328,6 +570,62 @@ impl App {
                     let mut dlg = OtpAddDialog::default();
                     dlg.open = true;
                     self.otp.add = dlg;
+                }
+                ui.add_space(6.0);
+                // Touch-HOTP types over the keyboard-HID interface; disable the
+                // action when that interface is off or the model lacks the feature.
+                let touch_blocked = self.otp.touch_hotp_ok == Some(false);
+                let mut open_touch = false;
+                ui.add_enabled_ui(!touch_blocked, |ui| {
+                    let r = theme::button(ui, p, BtnKind::Default, "Touch HOTP");
+                    let r = match self.otp.touch_hotp_why {
+                        Some(why) if touch_blocked => r.on_disabled_hover_text(why),
+                        _ => r,
+                    };
+                    if r.clicked() {
+                        open_touch = true;
+                    }
+                });
+                if open_touch {
+                    let mut dlg = ButtonHotpDialog::default();
+                    dlg.open = true;
+                    self.otp.button_hotp = dlg;
+                }
+                // Keyboard-HID enable/disable toggle (governs whether Touch HOTP
+                // can work at all). Only shown once we know the interface state.
+                if let Some(iface) = self.otp.iface {
+                    ui.add_space(6.0);
+                    let (label, target) = if iface.keyboard {
+                        ("Disable keyboard", false)
+                    } else {
+                        ("Enable keyboard", true)
+                    };
+                    // Don't offer a disable that would drop below two interfaces.
+                    let would_underflow = !target && {
+                        let after = IfaceState {
+                            keyboard: false,
+                            ..iface
+                        };
+                        after.enabled_count() < 2
+                    };
+                    let mut open_kbd = false;
+                    ui.add_enabled_ui(!would_underflow, |ui| {
+                        let r = theme::button(ui, p, BtnKind::Ghost, label);
+                        let r = if would_underflow {
+                            r.on_disabled_hover_text("at least two interfaces must stay enabled")
+                        } else {
+                            r
+                        };
+                        if r.clicked() {
+                            open_kbd = true;
+                        }
+                    });
+                    if open_kbd {
+                        self.otp.kbd_confirm = Some(KbdToggle {
+                            enable: target,
+                            typed: String::new(),
+                        });
+                    }
                 }
                 ui.add_space(6.0);
                 if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
@@ -358,6 +656,15 @@ impl App {
                     });
             });
         });
+        // Serial on its own line, so a long serial never collides with the
+        // controls on the header row.
+        if let Some(serial) = &self.otp.serial {
+            ui.label(
+                egui::RichText::new(format!("S/N {serial}"))
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+            );
+        }
         ui.add_space(12.0);
 
         if let Some(info) = &self.otp.info {
@@ -370,6 +677,8 @@ impl App {
         }
 
         self.render_otp_add_form(ui, p);
+        self.render_button_hotp_form(ui, p);
+        self.render_keyboard_confirm(ui, p);
         self.render_otp_delete_confirm(ui, p);
 
         if !self.otp.loaded {
@@ -553,6 +862,155 @@ impl App {
         }
     }
 
+    /// The touch-HOTP form, shown inline when `button_hotp.open`. Configures the
+    /// single HOTP-on-touch keystroke slot.
+    fn render_button_hotp_form(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if !self.otp.button_hotp.open {
+            return;
+        }
+        let mut submit = false;
+        let mut clear = false;
+        let mut cancel = false;
+        theme::card_frame(p).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Touch HOTP (keystroke)")
+                    .font(theme::f_sb(13.5))
+                    .color(p.txt),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "The key types a fresh HOTP code as keyboard input when you touch it \
+                     outside any session. One slot per key.",
+                )
+                .font(theme::f_reg(11.5))
+                .color(p.txt3),
+            );
+            ui.add_space(8.0);
+            egui::Grid::new("button_hotp_grid")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("Secret (Base32)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.otp.button_hotp.secret)
+                            .password(true)
+                            .desired_width(260.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Digits");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.otp.button_hotp.digits, 6u8, "6");
+                        ui.selectable_value(&mut self.otp.button_hotp.digits, 8u8, "8");
+                    });
+                    ui.end_row();
+
+                    ui.label("Send Enter");
+                    ui.checkbox(&mut self.otp.button_hotp.send_enter, "");
+                    ui.end_row();
+
+                    ui.label("Long touch (2s)");
+                    ui.checkbox(&mut self.otp.button_hotp.long_touch, "");
+                    ui.end_row();
+
+                    ui.label("Numeric keypad");
+                    ui.checkbox(&mut self.otp.button_hotp.numpad, "");
+                    ui.end_row();
+                });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Primary, "Save").clicked() {
+                    submit = true;
+                }
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Danger, "Clear slot").clicked() {
+                        clear = true;
+                    }
+                });
+            });
+        });
+        ui.add_space(10.0);
+        if submit {
+            self.otp.button_hotp.open = false;
+            self.provision_button_hotp();
+        } else if clear {
+            self.otp.button_hotp.open = false;
+            self.delete_button_hotp_slot();
+        } else if cancel {
+            self.otp.button_hotp = ButtonHotpDialog::default();
+        }
+    }
+
+    /// Typed-phrase confirmation for the keyboard-HID enable/disable toggle.
+    /// Mirrors the CLI's `interface` confirmation: this reconfigures the hardware,
+    /// so the user must type an exact phrase before it applies.
+    fn render_keyboard_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Some(tog) = self.otp.kbd_confirm.as_ref() else {
+            return;
+        };
+        let enable = tog.enable;
+        const PHRASE: &str = "change interface";
+        let mut apply = false;
+        let mut cancel = false;
+        theme::card_frame(p).show(ui, |ui| {
+            let title = if enable {
+                "Enable the keyboard-HID interface?"
+            } else {
+                "Disable the keyboard-HID interface?"
+            };
+            ui.colored_label(p.err, title);
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "This reconfigures the key's USB interfaces. The change takes effect \
+                     after you re-plug the key. Disabling an interface removes the matching \
+                     features until you re-enable it; if you disable the interface you are \
+                     connected over, you may lose access to the key.",
+                )
+                .font(theme::f_reg(11.5))
+                .color(p.txt3),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("Type \u{201c}{PHRASE}\u{201d} to confirm:"))
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt2),
+            );
+            if let Some(t) = self.otp.kbd_confirm.as_mut() {
+                ui.add(egui::TextEdit::singleline(&mut t.typed).desired_width(220.0));
+            }
+            ui.add_space(8.0);
+            let matched = self
+                .otp
+                .kbd_confirm
+                .as_ref()
+                .is_some_and(|t| t.typed.trim() == PHRASE);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(matched, |ui| {
+                    if theme::button(ui, p, BtnKind::Danger, "Apply").clicked() {
+                        apply = true;
+                    }
+                });
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+        if apply {
+            self.otp.kbd_confirm = None;
+            self.apply_keyboard_toggle(enable);
+        } else if cancel {
+            self.otp.kbd_confirm = None;
+        }
+    }
+
     /// Confirmation dialog for delete / erase-all.
     fn render_otp_delete_confirm(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let Some((app_name, account_name)) = self.otp.confirm_delete.clone() else {
@@ -570,6 +1028,17 @@ impl App {
                 format!("Delete OTP entry \"{app_name}:{account_name}\"?")
             };
             ui.colored_label(p.err, msg);
+            if erase_all {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "After you confirm, touch the key's sensor to complete the erase \
+                         — the device waits for a physical touch.",
+                    )
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+                );
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let label = if erase_all { "Erase all" } else { "Delete" };

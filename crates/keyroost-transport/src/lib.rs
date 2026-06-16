@@ -672,7 +672,42 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // lets keys with no HID serial (e.g. Token2 PIN+) still show one.
             // Re-SELECT OpenPGP first: the PIV probe above left a different applet
             // current, so GET DATA would otherwise hit the wrong one.
-            if probe.has_openpgp {
+            // Token2 keys expose a full serial via the FIDO applet's GET_INFO
+            // (spec §6.10), which is longer than the 4-byte serial embedded in the
+            // OpenPGP AID. Prefer it so the device header shows the complete serial.
+            // Best-effort: SELECT the FIDO applet (ignore its status word, as some
+            // PIN+ firmware answers 6A81 yet still switches applets), then GET_INFO.
+            if probe.reader_name.to_ascii_lowercase().contains("token2") {
+                let _ = transmit_apdu(
+                    &card,
+                    &keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
+                );
+                if let Ok((data, s1, s2)) =
+                    transmit_apdu(&card, &keyroost_token2otp::read_serial_request())
+                {
+                    let body = if s1 == 0x61 {
+                        transmit_apdu(&card, &[0x00, 0xC0, 0x00, 0x00, s2])
+                            .map(|(d, _, _)| d)
+                            .unwrap_or(data)
+                    } else {
+                        data
+                    };
+                    if let Ok(sn) = keyroost_token2otp::parse_serial(&body) {
+                        let hex: String = sn.iter().map(|b| format!("{b:02x}")).collect();
+                        if !hex.is_empty() {
+                            probe.serial = Some(hex);
+                            if trace {
+                                eprintln!("[probe]   token2 full serial -> {:?}", probe.serial);
+                            }
+                        }
+                    } else if trace {
+                        eprintln!("[probe]   token2 serial parse failed");
+                    }
+                }
+            }
+            // Fall back to the OpenPGP AID serial (4 bytes) only if the full read
+            // above didn't populate one.
+            if probe.has_openpgp && probe.serial.is_none() {
                 let _ = transmit_apdu(&card, &keyroost_openpgp::select());
                 let get_aid = [0x00u8, 0xCA, 0x00, 0x4F, 0x00];
                 if let Ok((data, s1, s2)) = transmit_apdu(&card, &get_aid) {
