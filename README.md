@@ -43,6 +43,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 | Device | Capabilities | Notes |
 |---|---|---|
 | **Token2 Molto2 / Molto2v2** | TOTP slot programming | The original target. |
+| **Token2 PIN+ Series** | FIDO2, OTP, OpenPGP, PIV | Also supports on-device OTP, including TOTP/HOTP and HID/keyboard-based HOTP. |
 | **YubiKey** (5 series) | FIDO2, OATH, OpenPGP | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. |
 | **Nitrokey 3** | FIDO2, OATH | Shares the Solo 2 / Trussed stack. |
