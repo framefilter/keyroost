@@ -21,6 +21,8 @@ use keyroost_resolve::{
     read_effective_serial, VID_YUBICO,
 };
 
+mod overview;
+
 /// The global `--name` selector, captured once in `run()` so the FIDO device
 /// resolver can honor it without threading it through every subcommand handler.
 static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
