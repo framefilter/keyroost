@@ -57,9 +57,13 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-    /// Print a man page (troff) to stdout (e.g. `keyroostctl manpage >
-    /// keyroostctl.1`).
-    Manpage,
+    /// Write a set of man pages (keyroostctl.1 + keyroostctl-<group>.1) into a
+    /// directory, e.g. `keyroostctl manpage ./man && man -l ./man/keyroostctl-piv.1`.
+    Manpage {
+        /// Directory to write the .1 files into (created if missing).
+        #[arg(value_name = "DIR")]
+        dir: std::path::PathBuf,
+    },
     /// Diagnose the local environment: PC/SC service, readers, FIDO HID
     /// access, udev rules, registry permissions. Read-only, touches no key.
     Doctor,
@@ -1480,9 +1484,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         clap_complete::generate(*shell, &mut c, "keyroostctl", &mut std::io::stdout());
         return Ok(());
     }
-    if let Cmd::Manpage = cmd {
+    if let Cmd::Manpage { dir } = cmd {
         use clap::CommandFactory;
-        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        std::fs::create_dir_all(dir)?;
+        let top = Cli::command();
+        let render = |c: &clap::Command, file: &std::path::Path| -> Result<(), Box<dyn std::error::Error>> {
+            let mut buf = Vec::new();
+            clap_mangen::Man::new(c.clone()).render(&mut buf)?;
+            std::fs::write(file, buf)?;
+            Ok(())
+        };
+        render(&top, &dir.join("keyroostctl.1"))?;
+        for sub in top.get_subcommands() {
+            let name = format!("keyroostctl-{}.1", sub.get_name());
+            render(sub, &dir.join(name))?;
+        }
+        eprintln!("wrote man pages to {}", dir.display());
         return Ok(());
     }
     if let Cmd::Doctor = cmd {
@@ -4281,6 +4298,23 @@ mod cli_tests {
     fn clap_command_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn manpage_set_renders_for_every_subcommand() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let mut buf = Vec::new();
+        clap_mangen::Man::new(cmd.clone()).render(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+        let mut count = 0;
+        for sub in cmd.get_subcommands() {
+            let mut b = Vec::new();
+            clap_mangen::Man::new(sub.clone()).render(&mut b).unwrap();
+            assert!(!b.is_empty(), "empty man page for {}", sub.get_name());
+            count += 1;
+        }
+        assert!(count >= 7, "expected >=7 subcommand groups, got {count}");
     }
 
     #[test]
