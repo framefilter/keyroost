@@ -1436,11 +1436,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let Some(cmd) = cli.command.as_ref() else {
-        // No subcommand → show info, mirroring molto2.py's bare-invocation behavior.
-        let mut session = Session::open()?;
-        session.set_debug(cli.debug);
-        let info = session.read_info()?;
-        print_info(&info);
+        // No subcommand → the friendly correlated overview of every connected
+        // device. (The Molto2 serial/clock still lives under `info`.)
+        let devices = keyroost_resolve::enumerate()?;
+        overview::print_overview(&devices);
         return Ok(());
     };
 
