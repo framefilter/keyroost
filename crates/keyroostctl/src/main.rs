@@ -2125,33 +2125,38 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("Applet probe (per reader):");
-    match keyroost_transport::probe_readers() {
-        Ok(probes) if probes.is_empty() => println!("  (no readers)"),
-        Ok(probes) => {
-            for p in probes {
-                if p.is_molto2 {
-                    println!("  {}  [Molto2 token]", p.reader_name);
-                    continue;
-                }
-                let mut applets = Vec::new();
-                if p.has_oath {
-                    applets.push("OATH");
-                }
-                if p.has_openpgp {
-                    applets.push("OpenPGP");
-                }
-                if p.has_piv {
-                    applets.push("PIV");
-                }
-                let list = if applets.is_empty() {
-                    "(none detected)".to_string()
-                } else {
-                    applets.join(", ")
-                };
-                println!("  {}  ->  {}", p.reader_name, list);
-            }
+    let probes = match keyroost_transport::probe_readers() {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  (unavailable: {})", e);
+            Vec::new()
         }
-        Err(e) => println!("  (unavailable: {})", e),
+    };
+    if probes.is_empty() {
+        println!("  (no readers)");
+    } else {
+        for p in &probes {
+            if p.is_molto2 {
+                println!("  {}  [Molto2 token]", p.reader_name);
+                continue;
+            }
+            let mut applets = Vec::new();
+            if p.has_oath {
+                applets.push("OATH");
+            }
+            if p.has_openpgp {
+                applets.push("OpenPGP");
+            }
+            if p.has_piv {
+                applets.push("PIV");
+            }
+            let list = if applets.is_empty() {
+                "(none detected)".to_string()
+            } else {
+                applets.join(", ")
+            };
+            println!("  {}  ->  {}", p.reader_name, list);
+        }
     }
 
     println!();
@@ -2161,58 +2166,63 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
         "FIDO HID devices:"
     };
     println!("{}", header);
-    match keyroost_hid::enumerate() {
-        Ok(devices) => {
-            let filtered: Vec<_> = devices
-                .into_iter()
-                .filter(|d| all_hid || d.is_fido())
-                .collect();
-            if filtered.is_empty() {
-                println!("  (none)");
-                if let Some(bl) = keyroost_hid::bootloader_device_present() {
-                    println!("  note: detected {bl} — re-plug it to return to application mode.");
-                }
-            } else {
-                let keyring = Keyring::load_default().unwrap_or_default();
-                let ccid = ccid_readers_if_needed(&filtered);
-                for d in &filtered {
-                    let tag = if d.is_fido() {
-                        " [FIDO]"
-                    } else if d.bootloader_label().is_some() {
-                        " [bootloader]"
-                    } else {
-                        ""
-                    };
-                    let eff = d
-                        .serial_number
-                        .clone()
-                        .or_else(|| ccid_serial_for(d, &ccid));
-                    let serial = match (&d.serial_number, &eff) {
-                        (Some(s), _) => format!(" serial={}", s),
-                        (None, Some(s)) => format!(" serial={}(ccid)", s),
-                        (None, None) => String::new(),
-                    };
-                    let name = keyring
-                        .name_for(eff.as_deref())
-                        .map(|n| format!(" name={}", n))
-                        .unwrap_or_default();
-                    println!(
-                        "  {} {:04x}:{:04x} usage={:04x}:{:04x} {}{}{}{}",
-                        d.path.display(),
-                        d.vendor_id,
-                        d.product_id,
-                        d.usage_page,
-                        d.usage,
-                        d.product_name,
-                        serial,
-                        name,
-                        tag,
-                    );
-                }
+    let hids = match keyroost_hid::enumerate() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("  (unavailable: {})", e);
+            Vec::new()
+        }
+    };
+    let keyring = Keyring::load_default().unwrap_or_default();
+    {
+        let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
+        if filtered.is_empty() {
+            println!("  (none)");
+            if let Some(bl) = keyroost_hid::bootloader_device_present() {
+                println!("  note: detected {bl} — re-plug it to return to application mode.");
+            }
+        } else {
+            let ccid = ccid_readers_if_needed(&hids);
+            for d in &filtered {
+                let tag = if d.is_fido() {
+                    " [FIDO]"
+                } else if d.bootloader_label().is_some() {
+                    " [bootloader]"
+                } else {
+                    ""
+                };
+                let eff = d.serial_number.clone().or_else(|| ccid_serial_for(d, &ccid));
+                let serial = match (&d.serial_number, &eff) {
+                    (Some(s), _) => format!(" serial={}", s),
+                    (None, Some(s)) => format!(" serial={}(ccid)", s),
+                    (None, None) => String::new(),
+                };
+                let name = keyring
+                    .name_for(eff.as_deref())
+                    .map(|n| format!(" name={}", n))
+                    .unwrap_or_default();
+                println!(
+                    "  {} {:04x}:{:04x} usage={:04x}:{:04x} {}{}{}{}",
+                    d.path.display(),
+                    d.vendor_id,
+                    d.product_id,
+                    d.usage_page,
+                    d.usage,
+                    d.product_name,
+                    serial,
+                    name,
+                    tag,
+                );
             }
         }
-        Err(e) => println!("  (unavailable: {})", e),
     }
+
+    // Correlated summary — built from the SAME hid+probe snapshot via the pure
+    // correlate(), so the raw sections above and this decision can't disagree.
+    println!();
+    let devices = keyroost_resolve::correlate(&hids, &probes, &keyring);
+    overview::print_correlated(&devices);
+
     Ok(())
 }
 
