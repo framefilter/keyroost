@@ -359,11 +359,37 @@ with a clear migration note (old → new command map). The README and every
 instant these renames land — they must be updated in the same change (Phase 6),
 not after.
 
+**Carried from Phase 2 (small, fold into this pass):**
+- `list` HID line: add the `keyroost_proto::token2_pid_label(pid)` product label
+  for Token2 devices. The Phase 2 design said "lightly enriched", but only the
+  raw VID:PID shipped (which already carries the bug-report value). Best verified
+  with a Token2 PIN+ in hand.
+- Reconcile the stale `enumerate(keyring: Option<&Keyring>)` line in the Phase 2
+  design text above with the shipped no-arg `enumerate()` (it loads the default
+  keyring internally).
+
 ### Phase 4 — Feature gaps
 Per-device parity audit (esp. the Token2 OTP CLI merged in #24 — confirm it
 covers enumerate / add / delete / config / button-HOTP). Evaluate a `--json`
 output mode for scripting (everything is human-text today). Note any missing
 per-device operations.
+
+**Token2 PIN+ Series — OATH / OpenPGP / PIV management is EXPERIMENTAL.** Token2
+confirmed (#28) the PIN+ Series exposes OATH, OpenPGP, and PIV applets over CCID
+on top of FIDO2 + the on-device OTP applet (keyroost-token2otp, done). Those
+three are *standards* keyroost already speaks generically (`keyroost-oath` /
+`-openpgp` / `-piv`), so **if** the PIN+ implements them with the standard AIDs
+and protocols, keyroost should manage them with no new code — exactly as it does
+a YubiKey or Nitrokey. But we have **no PIN+ hardware** to verify before v0.6.0
+ships, so the README / supported-devices table must label PIN+ OATH/OpenPGP/PIV
+as **experimental** until it's exercised on a real key (Phase 5 or a later point
+release). Likely divergence vs the Yubico/Nitrokey path: the PIV management-key
+crypto (AES vs 3DES) and any Yubico-specific PIV extensions (GET METADATA, SET
+PIN RETRIES); OATH and OpenPGP are likelier to "just work" if standards-compliant.
+**Action:** open a GitHub issue asking Token2 for the PIN+ applet AIDs, the PIV
+management-key algorithm + whether the Yubico PIV extensions are supported, and
+the OATH applet variant — enough to gauge how close their implementation sits to
+the specs keyroost already targets.
 
 ### Phase 5 — Bug sweep + hardware workflow walkthrough
 Fresh per-device end-to-end pass on available hardware (YubiKey, Solo 2,
