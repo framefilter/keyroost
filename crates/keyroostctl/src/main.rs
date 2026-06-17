@@ -155,6 +155,89 @@ mod json_out {
     pub struct OtpSerialJson {
         pub serial: String,
     }
+
+    /// `keyroostctl oath --json list` — one stored OATH credential. Mirrors the
+    /// human line `<name>  [<type>/<algorithm>]`.
+    #[derive(Serialize)]
+    pub struct OathCredentialJson {
+        pub name: String,
+        /// "TOTP" or "HOTP".
+        pub oath_type: &'static str,
+        /// "SHA1" / "SHA256" / "SHA512".
+        pub algorithm: &'static str,
+    }
+
+    /// `keyroostctl oath --json code` — the calculated code. The human handler
+    /// prints only the code; we also carry the credential name that was queried.
+    #[derive(Serialize)]
+    pub struct OathCodeJson {
+        pub name: String,
+        pub code: String,
+    }
+
+    /// `keyroostctl otp --json list` — one Token2 OTP entry. Mirrors the human
+    /// line `<app:account>  [<type>/<algo>]  <code|—>  (touch)?`.
+    #[derive(Serialize)]
+    pub struct OtpEntryJson {
+        pub app: String,
+        pub account: String,
+        /// "TOTP" or "HOTP".
+        pub otp_type: &'static str,
+        /// "SHA1" / "SHA256".
+        pub algorithm: &'static str,
+        /// `None` (JSON `null`) when the code is withheld pending a touch (the
+        /// human shows an em-dash); present otherwise.
+        pub code: Option<String>,
+        pub touch_required: bool,
+    }
+
+    /// `keyroostctl otp --json get` — a single read OTP code.
+    #[derive(Serialize)]
+    pub struct OtpGetJson {
+        pub app: String,
+        pub account: String,
+        pub code: String,
+    }
+
+    /// `keyroostctl fido --json creds-metadata` — resident-credential counts.
+    #[derive(Serialize)]
+    pub struct FidoCredsMetadataJson {
+        pub existing_resident_credentials: u64,
+        pub max_possible_remaining: u64,
+    }
+
+    /// `keyroostctl fido --json creds-list` — the resident credentials grouped
+    /// by relying party.
+    #[derive(Serialize)]
+    pub struct FidoCredsListJson {
+        pub relying_parties: Vec<FidoRelyingPartyJson>,
+    }
+
+    /// One relying party in the creds-list output.
+    #[derive(Serialize)]
+    pub struct FidoRelyingPartyJson {
+        pub rp_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub rp_name: Option<String>,
+        pub credentials: Vec<FidoCredentialJson>,
+    }
+
+    /// One resident credential under a relying party.
+    #[derive(Serialize)]
+    pub struct FidoCredentialJson {
+        /// Full hex credentialId (the value `creds-delete --cred-id` expects).
+        pub credential_id: String,
+        /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
+        pub user_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub user_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub user_display_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub algorithm: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub algorithm_name: Option<&'static str>,
+    }
 }
 
 #[derive(Parser)]
@@ -2757,6 +2840,18 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         OathCmd::List { access } => {
             let mut session = open_oath(access, debug)?;
             let creds = session.list()?;
+            if json_output() {
+                let out: Vec<json_out::OathCredentialJson> = creds
+                    .iter()
+                    .map(|c| json_out::OathCredentialJson {
+                        name: c.name.clone(),
+                        oath_type: oath_type_str(c.oath_type),
+                        algorithm: oath_algo_str(c.algorithm),
+                    })
+                    .collect();
+                emit_json(&out)?;
+                return Ok(());
+            }
             if creds.is_empty() {
                 println!("(no OATH credentials)");
             } else {
@@ -2793,6 +2888,13 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     .as_secs();
                 session.calculate_totp(name, now, *period)?
             };
+            if json_output() {
+                emit_json(&json_out::OathCodeJson {
+                    name: name.clone(),
+                    code: code.code.clone(),
+                })?;
+                return Ok(());
+            }
             println!("{}", code.code);
         }
         OathCmd::Add {
@@ -2906,6 +3008,21 @@ fn run_otp(
             let mut session = open_otp(transport, debug)?;
             let now = unix_now() as u64;
             let entries = session.enumerate(now)?;
+            if json_output() {
+                let out: Vec<json_out::OtpEntryJson> = entries
+                    .iter()
+                    .map(|e| json_out::OtpEntryJson {
+                        app: e.app_name.clone(),
+                        account: e.account_name.clone(),
+                        otp_type: keyroost_transport::otp_type_str(e.otp_type),
+                        algorithm: otp_algo_str_t2(e.algorithm),
+                        code: e.code.clone(),
+                        touch_required: e.button_required,
+                    })
+                    .collect();
+                emit_json(&out)?;
+                return Ok(());
+            }
             if entries.is_empty() {
                 println!("(no OTP entries)");
             } else {
@@ -2931,7 +3048,17 @@ fn run_otp(
             let now = unix_now() as u64;
             let entry = session.read_entry(now, app, account)?;
             match entry.code {
-                Some(code) => println!("{code}"),
+                Some(code) => {
+                    if json_output() {
+                        emit_json(&json_out::OtpGetJson {
+                            app: app.clone(),
+                            account: account.clone(),
+                            code,
+                        })?;
+                        return Ok(());
+                    }
+                    println!("{code}");
+                }
                 None => return Err("device did not return a code for that entry".into()),
             }
         }
@@ -4342,6 +4469,13 @@ fn run_fido_creds_metadata(
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_credential_manager(path, pin, |mgr| {
         let meta = mgr.metadata()?;
+        if json_output() {
+            emit_json(&json_out::FidoCredsMetadataJson {
+                existing_resident_credentials: meta.existing_count,
+                max_possible_remaining: meta.max_remaining,
+            })?;
+            return Ok(());
+        }
         println!(
             "{} resident credential(s) stored, room for {} more",
             meta.existing_count, meta.max_remaining
@@ -4356,6 +4490,30 @@ fn run_fido_creds_list(
 ) -> Result<(), Box<dyn std::error::Error>> {
     with_credential_manager(path, pin, |mgr| {
         let rps = mgr.list_relying_parties()?;
+        if json_output() {
+            let mut relying_parties = Vec::with_capacity(rps.len());
+            for rp in &rps {
+                let creds = mgr.list_credentials(&rp.rp_id_hash)?;
+                let credentials = creds
+                    .iter()
+                    .map(|c| json_out::FidoCredentialJson {
+                        credential_id: hex_encode(&c.credential_id),
+                        user_id: String::from_utf8_lossy(&c.user.id).into_owned(),
+                        user_name: c.user.name.clone(),
+                        user_display_name: c.user.display_name.clone(),
+                        algorithm: c.algorithm,
+                        algorithm_name: c.algorithm.map(cose_algorithm_name),
+                    })
+                    .collect();
+                relying_parties.push(json_out::FidoRelyingPartyJson {
+                    rp_id: rp.id.clone(),
+                    rp_name: rp.name.clone().filter(|n| !n.is_empty()),
+                    credentials,
+                });
+            }
+            emit_json(&json_out::FidoCredsListJson { relying_parties })?;
+            return Ok(());
+        }
         if rps.is_empty() {
             println!("(no resident credentials)");
             return Ok(());
@@ -5094,5 +5252,121 @@ mod cli_tests {
             serial: "0123456789ab".into(),
         };
         assert_json_has_keys(&s, &["serial"]);
+    }
+
+    #[test]
+    fn oath_credential_json_serializes() {
+        // Synthetic credential — no real account data.
+        let c = json_out::OathCredentialJson {
+            name: "example".into(),
+            oath_type: "TOTP",
+            algorithm: "SHA1",
+        };
+        assert_json_has_keys(&c, &["name", "oath_type", "algorithm"]);
+        // `oath list` emits a JSON array of these.
+        let arr = serde_json::to_string(&vec![c]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn oath_code_json_serializes() {
+        let c = json_out::OathCodeJson {
+            name: "example".into(),
+            code: "123456".into(),
+        };
+        assert_json_has_keys(&c, &["name", "code"]);
+    }
+
+    #[test]
+    fn otp_entry_json_serializes() {
+        // Synthetic entry with a code present.
+        let e = json_out::OtpEntryJson {
+            app: "Example".into(),
+            account: "alice".into(),
+            otp_type: "TOTP",
+            algorithm: "SHA1",
+            code: Some("123456".into()),
+            touch_required: false,
+        };
+        assert_json_has_keys(
+            &e,
+            &["app", "account", "otp_type", "algorithm", "code", "touch_required"],
+        );
+        // Withheld (touch-required) entry: code serializes as JSON null.
+        let withheld = json_out::OtpEntryJson {
+            app: "Example".into(),
+            account: "bob".into(),
+            otp_type: "HOTP",
+            algorithm: "SHA256",
+            code: None,
+            touch_required: true,
+        };
+        let s = serde_json::to_string(&withheld).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v.get("code").unwrap().is_null());
+        assert_eq!(v.get("touch_required").unwrap(), &serde_json::Value::Bool(true));
+        // `otp list` emits a JSON array.
+        let arr = serde_json::to_string(&vec![e]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn otp_get_json_serializes() {
+        let g = json_out::OtpGetJson {
+            app: "Example".into(),
+            account: "alice".into(),
+            code: "123456".into(),
+        };
+        assert_json_has_keys(&g, &["app", "account", "code"]);
+    }
+
+    #[test]
+    fn fido_creds_metadata_json_serializes() {
+        let m = json_out::FidoCredsMetadataJson {
+            existing_resident_credentials: 3,
+            max_possible_remaining: 22,
+        };
+        assert_json_has_keys(
+            &m,
+            &["existing_resident_credentials", "max_possible_remaining"],
+        );
+    }
+
+    #[test]
+    fn fido_creds_list_json_serializes() {
+        // Synthetic relying party + credential — no real RP/user data.
+        let cred = json_out::FidoCredentialJson {
+            credential_id: "aabbccdd".into(),
+            user_id: "user-handle".into(),
+            user_name: Some("alice".into()),
+            user_display_name: Some("Alice Example".into()),
+            algorithm: Some(-7),
+            algorithm_name: Some("ES256"),
+        };
+        assert_json_has_keys(
+            &cred,
+            &["credential_id", "user_id", "user_name", "algorithm"],
+        );
+        let list = json_out::FidoCredsListJson {
+            relying_parties: vec![json_out::FidoRelyingPartyJson {
+                rp_id: "example.com".into(),
+                rp_name: Some("Example".into()),
+                credentials: vec![cred],
+            }],
+        };
+        assert_json_has_keys(&list, &["relying_parties"]);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
+        assert!(v.get("relying_parties").unwrap().is_array());
+        // Empty rp_name is omitted (skip_serializing_if).
+        let no_name = json_out::FidoRelyingPartyJson {
+            rp_id: "example.org".into(),
+            rp_name: None,
+            credentials: vec![],
+        };
+        let s = serde_json::to_string(&no_name).unwrap();
+        assert!(!s.contains("rp_name"), "rp_name should be omitted: {s}");
     }
 }
