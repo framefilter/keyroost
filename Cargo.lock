@@ -1645,6 +1645,7 @@ name = "keyroost"
 version = "0.5.1"
 dependencies = [
  "arboard",
+ "base64",
  "eframe",
  "egui",
  "keyroost-ctap",
@@ -1659,6 +1660,9 @@ dependencies = [
  "keyroost-rsakey",
  "keyroost-token2otp",
  "keyroost-transport",
+ "png",
+ "serde",
+ "serde_json",
  "zeroize",
 ]
 

@@ -26,6 +26,12 @@ pub fn model_for_aaguid(aaguid: &[u8; 16]) -> Option<&'static str> {
 
 /// Format a 16-byte AAGUID as canonical lowercase `8-4-4-4-12` hex.
 fn format_aaguid(a: &[u8; 16]) -> String {
+    format_aaguid_pub(a)
+}
+
+/// Public canonical AAGUID formatter (lowercase `8-4-4-4-12`), shared with the
+/// MDS lookup so both key on the identical string form.
+pub fn format_aaguid_pub(a: &[u8; 16]) -> String {
     let mut s = String::with_capacity(36);
     for (i, b) in a.iter().enumerate() {
         if matches!(i, 4 | 6 | 8 | 10) {

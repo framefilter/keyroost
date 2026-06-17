@@ -38,6 +38,13 @@ arboard = { version = "3", default-features = false }
 # Same scoped exception as the rest of the workspace (already in the tree
 # via keyroost-import): wipe seed-bearing buffers on drop.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# FIDO Metadata Service (MDS) support: decode the bundled/refreshed metadata
+# projection and the vendor icon PNGs. serde_json + base64 are already in the
+# tree; png is a small, focused decoder (no full `image` crate pulled in).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+png = "0.18"
 
 # cargo-binstall support: `cargo binstall` fetches the existing attested
 # GitHub release archives (same artifacts, same SHA256SUMS/provenance)

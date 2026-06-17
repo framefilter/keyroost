@@ -16,8 +16,10 @@ pub mod cbor;
 pub mod client_pin;
 pub mod cmd;
 pub mod cred_mgmt;
+pub mod bio_enroll;
 pub mod hid;
 pub mod pin;
 
 pub use cmd::{get_info, reset, AuthenticatorInfo, CtapError};
 pub use hid::{CtapHidDevice, InitResponse};
+pub use bio_enroll::{BioEnrollment, CaptureStatus, Enrollment, SensorInfo};

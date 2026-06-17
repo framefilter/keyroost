@@ -52,6 +52,9 @@ pub struct OtpRow {
     pub algo_str: &'static str,
     pub button_required: bool,
     pub code: Option<String>,
+    /// TOTP time-step in seconds (e.g. 30 or 60), straight from the entry
+    /// record's `timestep` field. Meaningful only for TOTP entries.
+    pub period: u16,
 }
 
 impl OtpRow {
@@ -149,6 +152,21 @@ pub struct IfaceState {
     pub ccid: bool,
 }
 
+/// Current state of the HOTP-on-button keystroke slot, read from the device
+/// config. Lets the UI show whether a seed is provisioned and edit the typing
+/// options without re-entering the seed.
+#[derive(Clone, Copy)]
+pub struct ButtonHotpStatus {
+    /// A seed is provisioned in the button-HOTP slot (config bit 8).
+    pub configured: bool,
+    /// The slot types Enter after the code.
+    pub send_enter: bool,
+    /// Long-press is required to emit the code.
+    pub long_touch: bool,
+    /// Codes are typed using the numeric keypad layout.
+    pub numpad: bool,
+}
+
 impl IfaceState {
     fn enabled_count(&self) -> usize {
         [self.fido, self.keyboard, self.ccid]
@@ -175,6 +193,7 @@ struct OtpLoad {
     touch_ok: Option<bool>,
     touch_why: Option<&'static str>,
     iface: Option<IfaceState>,
+    button_hotp_status: Option<ButtonHotpStatus>,
 }
 
 /// Per-selection state for the OTP pane.
@@ -204,6 +223,15 @@ pub struct OtpState {
     /// Pending keyboard-HID toggle confirmation: the target state and the typed
     /// confirmation phrase. `Some` while the confirm dialog is open.
     pub kbd_confirm: Option<KbdToggle>,
+    /// Codes read on-demand for touch-required TOTP entries, keyed by
+    /// `(app_name, account_name)`. Populated when the user presses "Read" and
+    /// touches the key; shown in place of "touch to view" until the list reloads.
+    pub touch_codes: std::collections::HashMap<(String, String), String>,
+    /// Cached button-HOTP slot status from the device config: whether a seed is
+    /// configured, and the current send-Enter / long-touch / numpad settings.
+    /// `None` until read. Drives the "seed configured" indicator and the
+    /// settings-only editor.
+    pub button_hotp_status: Option<ButtonHotpStatus>,
 }
 
 fn unix_now() -> u64 {
@@ -241,7 +269,14 @@ impl App {
                     // up front so the UI can disable the action with a reason rather
                     // than letting the user fill the form and fail at submit.
                     // Read the device config once; derive both the touch-HOTP
-                    // availability and the interface states from it.
+                    // availability and the interface states from it. On some
+                    // firmware the full config block is only served over USB-HID
+                    // (CCID/NFC answers READ_CONFIG with a 1-byte stub, which
+                    // `read_config` rejects). We do NOT force a HID read here:
+                    // Windows restricts the FIDO HID interface for non-elevated
+                    // processes, so forcing it would surface an "access denied"
+                    // error on a path that should degrade quietly. If config is
+                    // unavailable, status simply shows as unknown.
                     let dev_info = session.read_device_info().ok();
                     let (touch_ok, touch_why): (Option<bool>, Option<&'static str>) =
                         match &dev_info {
@@ -263,6 +298,20 @@ impl App {
                         keyboard: !info.hotp_keystroke_disabled(),
                         ccid: !info.ccid_disabled(),
                     });
+                    let button_hotp_status = dev_info.as_ref().and_then(|info| {
+                        // The seed bit lives in byte 1; over a short CCID stub
+                        // (byte 0 only) we can't tell, so report unknown rather
+                        // than a misleading "no seed configured".
+                        if !info.has_config_byte() {
+                            return None;
+                        }
+                        Some(ButtonHotpStatus {
+                            configured: info.button_hotp_configured(),
+                            send_enter: !info.hotp_suppresses_enter(),
+                            long_touch: info.hotp_long_press(),
+                            numpad: info.hotp_uses_numpad(),
+                        })
+                    });
                     let now = unix_now();
                     let entries = session.enumerate(now)?;
                     let rows = entries
@@ -274,6 +323,7 @@ impl App {
                             algo_str: otp_algo_str(e.algorithm),
                             button_required: e.button_required,
                             code: e.code,
+                            period: e.timestep,
                         })
                         .collect();
                     Ok(OtpLoad {
@@ -283,6 +333,7 @@ impl App {
                         touch_ok,
                         touch_why,
                         iface,
+                        button_hotp_status,
                     })
                 })();
             Box::new(move |app: &mut App| {
@@ -298,6 +349,10 @@ impl App {
                         app.otp.touch_hotp_ok = load.touch_ok;
                         app.otp.touch_hotp_why = load.touch_why;
                         app.otp.iface = load.iface;
+                        app.otp.button_hotp_status = load.button_hotp_status;
+                        // Codes read on touch are tied to the old time-window;
+                        // drop them so the freshly-loaded list governs display.
+                        app.otp.touch_codes.clear();
                         app.otp.error = None;
                     }
                     Err(e) => {
@@ -316,6 +371,10 @@ impl App {
         let account_name = self.otp.add.account_name.trim().to_owned();
         if account_name.is_empty() {
             self.otp.error = Some("account name is required".into());
+            return;
+        }
+        if self.otp.add.secret.trim().is_empty() {
+            self.otp.error = Some("Enter a Base32 secret for this entry.".into());
             return;
         }
         let secret = zeroize::Zeroizing::new(self.otp.add.secret.clone());
@@ -376,6 +435,19 @@ impl App {
             self.otp.error = Some("button HOTP digits must be 6 or 8".into());
             return;
         }
+        // An empty secret field means "don't change the seed" — just apply the
+        // typing options (Send Enter / long touch / numeric keypad). This works
+        // whether or not a seed is already configured: with a seed it edits the
+        // options in place; without one it sets the options the device will use
+        // once a seed is written. Either way the seed slot is left untouched.
+        if self.otp.button_hotp.secret.trim().is_empty() {
+            let send_enter = self.otp.button_hotp.send_enter;
+            let long_touch = self.otp.button_hotp.long_touch;
+            let numpad = self.otp.button_hotp.numpad;
+            self.otp.button_hotp.open = false;
+            self.apply_button_hotp_options(send_enter, long_touch, numpad);
+            return;
+        }
         let secret = zeroize::Zeroizing::new(self.otp.button_hotp.secret.clone());
         let send_enter = self.otp.button_hotp.send_enter;
         let long_touch = self.otp.button_hotp.long_touch;
@@ -400,6 +472,9 @@ impl App {
                     Ok(()) => {
                         app.otp.button_hotp = ButtonHotpDialog::default();
                         app.otp.info = Some("Touch HOTP configured.".into());
+                        // Re-read the config so the "seed configured" status and
+                        // the settings-only editor reflect the new slot.
+                        app.load_otp_entries();
                     }
                     Err(e) => app.otp.error = Some(e.to_string()),
                 }
@@ -480,7 +555,10 @@ impl App {
                     return;
                 }
                 match result {
-                    Ok(()) => app.otp.info = Some("Touch HOTP cleared.".into()),
+                    Ok(()) => {
+                        app.otp.info = Some("Touch HOTP cleared.".into());
+                        app.load_otp_entries();
+                    }
                     Err(e) => app.otp.error = Some(e.to_string()),
                 }
             })
@@ -507,6 +585,81 @@ impl App {
                         app.load_otp_entries();
                     }
                     Err(e) => app.otp.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
+    /// Read a touch-required TOTP entry's current code: the device requires a
+    /// button press, so `read_entry` waits for the touch (the transport fires
+    /// the button-prompt). The returned code is stashed in `touch_codes` and
+    /// shown in place of "touch to view" until the next list reload.
+    pub(crate) fn read_touch_otp_entry(&mut self, app_name: String, account_name: String) {
+        self.otp.error = None;
+        let sel = self.otp.transport;
+        let for_device = self.selected_device.clone();
+        let key = (app_name.clone(), account_name.clone());
+        self.spawn_job(
+            "Reading code \u{2014} touch your key\u{2026}",
+            move || {
+                let result = (|| -> Result<Option<String>, String> {
+                    let mut session = sel.open().map_err(|e| e.to_string())?;
+                    let now = unix_now();
+                    let entry = session
+                        .read_entry(now, &app_name, &account_name)
+                        .map_err(|e| e.to_string())?;
+                    Ok(entry.code)
+                })();
+                Box::new(move |app: &mut App| {
+                    if app.selected_device != for_device {
+                        return;
+                    }
+                    match result {
+                        Ok(Some(code)) => {
+                            app.otp.touch_codes.insert(key, code);
+                        }
+                        Ok(None) => {
+                            app.otp.error = Some("the key did not return a code".into());
+                        }
+                        Err(e) => app.otp.error = Some(e),
+                    }
+                })
+            },
+        );
+    }
+
+    /// Apply the HOTP-on-button typing options (send-Enter, long-touch, numpad)
+    /// to the already-provisioned slot, without re-sending the seed.
+    pub(crate) fn apply_button_hotp_options(
+        &mut self,
+        send_enter: bool,
+        long_touch: bool,
+        numpad: bool,
+    ) {
+        self.otp.error = None;
+        let sel = self.otp.transport;
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Updating touch HOTP options\u{2026}", move || {
+            let result = (|| -> Result<(), String> {
+                let mut session = sel.open().map_err(|e| e.to_string())?;
+                session
+                    .set_button_hotp_options(send_enter, long_touch, numpad)
+                    .map_err(|e| e.to_string())
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        app.otp.info = Some("Touch HOTP options updated.".into());
+                        if let Some(st) = app.otp.button_hotp_status.as_mut() {
+                            st.send_enter = send_enter;
+                            st.long_touch = long_touch;
+                            st.numpad = numpad;
+                        }
+                    }
+                    Err(e) => app.otp.error = Some(e),
                 }
             })
         });
@@ -554,90 +707,37 @@ impl App {
                     .font(theme::f_sb(14.5))
                     .color(p.txt),
             );
-            if let Some(active) = self.otp.active {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(format!("via {active}"))
-                        .font(theme::f_reg(11.5))
-                        .color(p.txt3),
-                );
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::button(ui, p, BtnKind::Primary, "+ Add entry").clicked() {
-                    // OtpAddDialog has a Drop impl (wipes the typed seed), so
-                    // `..Default` struct-update isn't allowed; build via default()
-                    // then flip `open`.
-                    let mut dlg = OtpAddDialog::default();
-                    dlg.open = true;
-                    self.otp.add = dlg;
-                }
-                ui.add_space(6.0);
-                // Touch-HOTP types over the keyboard-HID interface; disable the
-                // action when that interface is off or the model lacks the feature.
-                let touch_blocked = self.otp.touch_hotp_ok == Some(false);
+                // Secondary actions live in an overflow menu so the header row
+                // doesn't crowd: HID-HOTP configure, the interface toggle, and the
+                // transport selector. Rendered first so that, in this
+                // right-to-left layout, it sits at the far right edge. Actions are
+                // accumulated as locals and applied after the menu closure to keep
+                // `self` borrows simple.
                 let mut open_touch = false;
-                ui.add_enabled_ui(!touch_blocked, |ui| {
-                    let r = theme::button(ui, p, BtnKind::Default, "Touch HOTP");
-                    let r = match self.otp.touch_hotp_why {
-                        Some(why) if touch_blocked => r.on_disabled_hover_text(why),
-                        _ => r,
-                    };
-                    if r.clicked() {
-                        open_touch = true;
-                    }
-                });
-                if open_touch {
-                    let mut dlg = ButtonHotpDialog::default();
-                    dlg.open = true;
-                    self.otp.button_hotp = dlg;
+                let mut kbd_target: Option<bool> = None;
+                let mut new_transport: Option<OtpTransportSel> = None;
+
+                let menu_btn = theme::button(ui, p, BtnKind::Default, "...")
+                    .on_hover_text("More actions");
+                let menu_id = ui.make_persistent_id("otp_more_menu");
+                if menu_btn.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(menu_id));
                 }
-                // Keyboard-HID enable/disable toggle (governs whether Touch HOTP
-                // can work at all). Only shown once we know the interface state.
-                if let Some(iface) = self.otp.iface {
-                    ui.add_space(6.0);
-                    let (label, target) = if iface.keyboard {
-                        ("Disable keyboard", false)
-                    } else {
-                        ("Enable keyboard", true)
-                    };
-                    // Don't offer a disable that would drop below two interfaces.
-                    let would_underflow = !target && {
-                        let after = IfaceState {
-                            keyboard: false,
-                            ..iface
-                        };
-                        after.enabled_count() < 2
-                    };
-                    let mut open_kbd = false;
-                    ui.add_enabled_ui(!would_underflow, |ui| {
-                        let r = theme::button(ui, p, BtnKind::Ghost, label);
-                        let r = if would_underflow {
-                            r.on_disabled_hover_text("at least two interfaces must stay enabled")
-                        } else {
-                            r
-                        };
-                        if r.clicked() {
-                            open_kbd = true;
-                        }
-                    });
-                    if open_kbd {
-                        self.otp.kbd_confirm = Some(KbdToggle {
-                            enable: target,
-                            typed: String::new(),
-                        });
-                    }
-                }
-                ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                    self.otp.active = None;
-                    self.otp.serial = None;
-                    self.load_otp_entries();
-                }
-                ui.add_space(6.0);
-                // Transport selector.
-                egui::ComboBox::from_id_salt("otp_transport")
-                    .selected_text(self.otp.transport.label())
-                    .show_ui(ui, |ui| {
+                egui::popup::popup_below_widget(
+                    ui,
+                    menu_id,
+                    &menu_btn,
+                    egui::popup::PopupCloseBehavior::CloseOnClick,
+                    |ui| {
+                        ui.set_min_width(180.0);
+
+                        // Transport selector.
+                        ui.label(
+                            egui::RichText::new("Transport")
+                                .font(theme::f_reg(11.0))
+                                .color(p.txt3),
+                        );
                         for sel in [
                             OtpTransportSel::Auto,
                             OtpTransportSel::Hid,
@@ -647,20 +747,111 @@ impl App {
                                 .selectable_label(self.otp.transport == sel, sel.label())
                                 .clicked()
                             {
-                                self.otp.transport = sel;
-                                self.otp.active = None;
-                                self.otp.serial = None;
-                                self.load_otp_entries();
+                                new_transport = Some(sel);
                             }
                         }
+                        ui.separator();
+
+                        // Configure HID-HOTP — disabled (with reason) when the
+                        // keyboard interface is off or unsupported.
+                        let touch_blocked = self.otp.touch_hotp_ok == Some(false);
+                        ui.add_enabled_ui(!touch_blocked, |ui| {
+                            let r = ui.selectable_label(false, "Configure HID-HOTP\u{2026}");
+                            let r = match self.otp.touch_hotp_why {
+                                Some(why) if touch_blocked => r.on_disabled_hover_text(why),
+                                _ => r,
+                            };
+                            if r.clicked() {
+                                open_touch = true;
+                            }
+                        });
+
+                        // Enable/Disable the keyboard-HID interface.
+                        if let Some(iface) = self.otp.iface {
+                            let (label, target) = if iface.keyboard {
+                                ("Disable HID-HOTP", false)
+                            } else {
+                                ("Enable HID-HOTP", true)
+                            };
+                            let would_underflow = !target && {
+                                let after = IfaceState {
+                                    keyboard: false,
+                                    ..iface
+                                };
+                                after.enabled_count() < 2
+                            };
+                            ui.add_enabled_ui(!would_underflow, |ui| {
+                                let r = ui.selectable_label(false, label);
+                                let r = if would_underflow {
+                                    r.on_disabled_hover_text(
+                                        "at least two interfaces must stay enabled",
+                                    )
+                                } else {
+                                    r
+                                };
+                                if r.clicked() {
+                                    kbd_target = Some(target);
+                                }
+                            });
+                        }
+                    },
+                );
+
+                // Apply menu selections after the closure.
+                if let Some(sel) = new_transport {
+                    self.otp.transport = sel;
+                    self.otp.active = None;
+                    self.otp.serial = None;
+                    self.load_otp_entries();
+                }
+                if open_touch {
+                    let mut dlg = ButtonHotpDialog::default();
+                    dlg.open = true;
+                    if let Some(st) = self.otp.button_hotp_status {
+                        dlg.send_enter = st.send_enter;
+                        dlg.long_touch = st.long_touch;
+                        dlg.numpad = st.numpad;
+                    }
+                    self.otp.button_hotp = dlg;
+                }
+                if let Some(target) = kbd_target {
+                    self.otp.kbd_confirm = Some(KbdToggle {
+                        enable: target,
+                        typed: String::new(),
                     });
+                }
+
+                // Primary actions, to the left of the overflow menu (added after
+                // it so they sit left of it in this right-to-left layout).
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Primary, "+ Add entry").clicked() {
+                    // OtpAddDialog has a Drop impl (wipes the typed seed), so
+                    // `..Default` struct-update isn't allowed; build via default()
+                    // then flip `open`.
+                    let mut dlg = OtpAddDialog::default();
+                    dlg.open = true;
+                    self.otp.add = dlg;
+                }
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
+                    self.otp.active = None;
+                    self.otp.serial = None;
+                    self.load_otp_entries();
+                }
             });
         });
-        // Serial on its own line, so a long serial never collides with the
+        // Transport + serial on their own line, so neither collides with the
         // controls on the header row.
-        if let Some(serial) = &self.otp.serial {
+        if self.otp.active.is_some() || self.otp.serial.is_some() {
+            let mut bits: Vec<String> = Vec::new();
+            if let Some(active) = self.otp.active {
+                bits.push(format!("via {active}"));
+            }
+            if let Some(serial) = &self.otp.serial {
+                bits.push(format!("S/N {serial}"));
+            }
             ui.label(
-                egui::RichText::new(format!("S/N {serial}"))
+                egui::RichText::new(bits.join("  \u{00b7}  "))
                     .font(theme::f_reg(11.5))
                     .color(p.txt3),
             );
@@ -700,6 +891,10 @@ impl App {
 
         let mut copy: Option<String> = None;
         let mut delete: Option<(String, String)> = None;
+        let mut read_touch: Option<(String, String)> = None;
+        // Snapshot on-demand-read codes so the row loop (which borrows
+        // `self.otp.rows`) can look them up without also borrowing `self.otp`.
+        let touch_codes = self.otp.touch_codes.clone();
         theme::card_frame(p).show(ui, |ui| {
             let n = self.otp.rows.len();
             for (i, row) in self.otp.rows.iter().enumerate() {
@@ -731,22 +926,68 @@ impl App {
                                     copy = Some(code.clone());
                                 }
                                 ui.add_space(8.0);
+                                let is_totp = row.type_str.eq_ignore_ascii_case("TOTP");
+                                // TOTP codes are time-based: show the same live
+                                // countdown ring + seconds the OATH pane uses, so
+                                // the user can see how long the code stays valid.
+                                // HOTP codes are counter-based and have no window.
+                                // Use the entry's own time-step (30 or 60s, etc.);
+                                // fall back to 30 if the record reported 0.
+                                let period = if row.period == 0 { 30 } else { row.period as u64 };
+                                let totp = is_totp.then(|| theme::totp_window(period));
+                                let code_color = match totp {
+                                    Some((secs, _)) if secs <= 5 => p.warn,
+                                    _ => p.txt,
+                                };
                                 ui.label(
                                     egui::RichText::new(code)
                                         .font(theme::f_mono(16.0))
-                                        .color(p.txt),
+                                        .color(code_color),
                                 );
+                                if let Some((secs, pct)) = totp {
+                                    let ring_color = if secs <= 5 { p.warn } else { p.accent };
+                                    ui.add_space(8.0);
+                                    theme::ring(ui, pct, 18.0, ring_color, p.line);
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("{secs}s"))
+                                            .font(theme::f_reg(11.0))
+                                            .color(p.txt3),
+                                    );
+                                }
                             }
                             None => {
-                                ui.label(
-                                    egui::RichText::new(if row.button_required {
-                                        "touch to view"
-                                    } else {
-                                        "\u{2014}"
-                                    })
-                                    .font(theme::f_reg(11.5))
-                                    .color(p.txt3),
-                                );
+                                let rkey =
+                                    (row.app_name.clone(), row.account_name.clone());
+                                if let Some(code) = touch_codes.get(&rkey) {
+                                    // Already read on touch this session — show it
+                                    // (TOTP touch entries still have a window, but
+                                    // the device gives no countdown for them here).
+                                    if theme::button(ui, p, BtnKind::Default, "Copy")
+                                        .clicked()
+                                    {
+                                        copy = Some(code.clone());
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new(code)
+                                            .font(theme::f_mono(16.0))
+                                            .color(p.txt),
+                                    );
+                                } else if row.button_required {
+                                    if theme::button(ui, p, BtnKind::Default, "Read")
+                                        .on_hover_text("Touch the key to read this code")
+                                        .clicked()
+                                    {
+                                        read_touch = Some(rkey);
+                                    }
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("\u{2014}")
+                                            .font(theme::f_reg(11.5))
+                                            .color(p.txt3),
+                                    );
+                                }
                             }
                         }
                     });
@@ -777,6 +1018,9 @@ impl App {
         }
         if let Some((a, acct)) = delete {
             self.otp.confirm_delete = Some((a, acct));
+        }
+        if let Some((a, acct)) = read_touch {
+            self.read_touch_otp_entry(a, acct);
         }
     }
 
@@ -872,11 +1116,15 @@ impl App {
         let mut clear = false;
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("Touch HOTP (keystroke)")
-                    .font(theme::f_sb(13.5))
-                    .color(p.txt),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("HID-HOTP (keystroke)")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "touch-hotp");
+            });
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
@@ -887,23 +1135,85 @@ impl App {
                 .color(p.txt3),
             );
             ui.add_space(8.0);
+            // Show whether a seed is already provisioned in the slot, read from
+            // the device config on load.
+            match self.otp.button_hotp_status {
+                Some(st) if st.configured => {
+                    theme::pill(ui, "Seed configured", p.ok, p.ok_soft());
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "A seed is already set. Leave the secret blank and Save \
+                             to change only the typing options; enter a new secret to \
+                             replace the seed or change the digit length.",
+                        )
+                        .font(theme::f_reg(11.0))
+                        .color(p.txt3),
+                    );
+                }
+                Some(_) => {
+                    theme::pill(ui, "No seed configured", p.txt3, p.line);
+                }
+                None => {
+                    // Couldn't read the device config — most often because the
+                    // full config block is only served over USB-HID, which
+                    // Windows restricts for FIDO-class devices unless elevated.
+                    // Don't claim "no seed"; say we can't tell.
+                    theme::pill(ui, "Slot status unknown", p.txt3, p.line);
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Couldn't read the slot status from this key's config \
+                             block. Provisioning still works; reload to retry.",
+                        )
+                        .font(theme::f_reg(11.0))
+                        .color(p.txt3),
+                    );
+                }
+            }
+            ui.add_space(8.0);
             egui::Grid::new("button_hotp_grid")
                 .num_columns(2)
                 .spacing([10.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Secret (Base32)");
+                    let configured = matches!(
+                        self.otp.button_hotp_status,
+                        Some(st) if st.configured
+                    );
+                    ui.label(if configured {
+                        "New secret (Base32)"
+                    } else {
+                        "Secret (Base32)"
+                    });
                     ui.add(
                         egui::TextEdit::singleline(&mut self.otp.button_hotp.secret)
                             .password(true)
+                            .hint_text(if configured {
+                                "leave blank to keep current seed"
+                            } else {
+                                ""
+                            })
                             .desired_width(260.0),
                     );
                     ui.end_row();
 
+                    // Digit length is only settable as part of a seed write
+                    // (spec §1.7); there's no standalone command for it. So it's
+                    // only editable when a secret is being entered — with a blank
+                    // secret (options-only Save) the existing length is kept.
+                    let seed_present = !self.otp.button_hotp.secret.trim().is_empty();
                     ui.label("Digits");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.otp.button_hotp.digits, 6u8, "6");
-                        ui.selectable_value(&mut self.otp.button_hotp.digits, 8u8, "8");
-                    });
+                    ui.add_enabled_ui(seed_present, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.otp.button_hotp.digits, 6u8, "6");
+                            ui.selectable_value(&mut self.otp.button_hotp.digits, 8u8, "8");
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text(
+                        "Digit length can only change when you set a new secret \u{2014} \
+                         the key has no command to change it on its own.",
+                    );
                     ui.end_row();
 
                     ui.label("Send Enter");
@@ -959,9 +1269,9 @@ impl App {
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             let title = if enable {
-                "Enable the keyboard-HID interface?"
+                "Enable HID-HOTP (keyboard interface)?"
             } else {
-                "Disable the keyboard-HID interface?"
+                "Disable HID-HOTP (keyboard interface)?"
             };
             ui.colored_label(p.err, title);
             ui.add_space(4.0);

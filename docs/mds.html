@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device metadata — FIDO MDS — keyroost</title>
+<meta name="description" content="What the FIDO Metadata Service publishes about your key — model, icon, certification level — looked up by AAGUID and shown on the Overview tab.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Device metadata</p>
+    <h1>Device metadata</h1>
+    <p class="kr-lede">What the FIDO Alliance publishes about your key — model, icon, certification level and date — looked up by its AAGUID and shown on the Overview tab.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it shows</h2>
+    <p>Every FIDO2 authenticator model has an <strong>AAGUID</strong> — a 128-bit identifier
+      shared by all units of that model. The FIDO Alliance's Metadata Service publishes a
+      signed registry mapping each AAGUID to its vendor description, icon and certification
+      status. keyroost reads your key's AAGUID and looks it up to show the model name and
+      logo, certification level (e.g. <code>FIDO Certified L2</code>) and date, protocol
+      family, and the CTAP/U2F versions the key reports.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Where the data comes from</h2>
+    <p>keyroost ships a bundled snapshot of the metadata so the card works offline with no
+      network access at runtime. The snapshot is a slimmed projection of the official MDS3
+      BLOB.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Updating the metadata</h2>
+    <p>The bundled snapshot is embedded at build time, but keyroost <strong>also loads a
+      user-supplied copy at startup if present</strong> — so packaged builds (AppImage,
+      signed <code>.exe</code>, <code>.dmg</code>) can be refreshed without rebuilding.</p>
+<pre><code>python3 tools/gen_mds_data.py            # downloads the live FIDO BLOB
+python3 tools/gen_mds_data.py --blob mds.jwt   # offline, from a local copy</code></pre>
+    <p>Then place the resulting <code>mds_data.json</code> at any of:
+      <code>$KEYROOST_MDS_FILE</code>, <code>~/.config/keyroost/mds_data.json</code> (Linux),
+      <code>~/Library/Application Support/keyroost/mds_data.json</code> (macOS),
+      <code>%APPDATA%\keyroost\mds_data.json</code> (Windows), or next to the executable.</p>
+    <p class="kr-muted">The runtime copy is read for display only and isn't cryptographically
+      verified, so treat it as a convenience cache; the bundled copy is trusted build input.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Why a key might show no metadata</h2>
+    <p>The AAGUID isn't in the bundled snapshot (regenerate with <code>--all</code> to
+      include more vendors), or the key reports an all-zero AAGUID — some U2F-only or
+      privacy modes — which has no MDS entry.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/metadata/"><span class="who">FIDO</span>Metadata Service (MDS)</a>
+      <a href="https://fidoalliance.org/specs/mds/fido-metadata-statement-v3.0-ps-20210518.html"><span class="who">FIDO</span>Metadata statement format</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="security-keys.html">Next: Security keys →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

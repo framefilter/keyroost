@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fingerprints — biometric enrollment — keyroost</title>
+<meta name="description" content="Enroll, rename and delete fingerprints on a biometric Token2 key via CTAP2 authenticatorBioEnrollment, so user verification can be done by touch instead of the PIN.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Fingerprints</p>
+    <h1>Fingerprints</h1>
+    <p class="kr-lede">Enroll a fingerprint on a biometric key so user verification is a touch, not a typed PIN — managed over standard CTAP2, with templates that never leave the device.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>Biometric security keys store fingerprint templates on the device itself. When a
+      service asks the key for <strong>user verification</strong>, the key can accept a
+      fingerprint touch in place of the PIN. keyroost manages these templates over the
+      standard CTAP2 <code>authenticatorBioEnrollment</code> command, so enrollments are
+      interoperable with any FIDO2 service.</p>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>Templates never leave the key. keyroost only sends enroll / rename / delete
+        commands and reads back template IDs and names; the biometric data stays on the
+        secure element.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Requirements</h2>
+    <p>A Token2 key with a fingerprint sensor (the Fingerprints card only appears when the
+      key reports biometric support), and a <strong>PIN set on the key</strong> —
+      fingerprint management is PIN-gated. If no PIN is configured, set one first in the
+      Passkeys / FIDO2 tab.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Enrolling</h2>
+    <p>Open the <strong>Passkeys</strong> tab and unlock with your PIN. In the
+      <strong>Fingerprints</strong> card, start an enrollment and give it a name, then
+      touch the sensor repeatedly as prompted — most keys need several touches from
+      slightly different angles. A progress bar tracks captures; when complete, the new
+      fingerprint appears in the list, where it can be renamed or deleted.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Command line</h2>
+<pre><code>keyroostctl fido-fingerprint-list   --pin-env KR_PIN
+keyroostctl fido-fingerprint-enroll --pin-env KR_PIN --name "Right index"
+keyroostctl fido-fingerprint-rename --pin-env KR_PIN --template-id 0001 --name "Left index"
+keyroostctl fido-fingerprint-delete --pin-env KR_PIN --template-id 0002</code></pre>
+  </section>
+
+  <section class="kr-section">
+    <h2>Troubleshooting</h2>
+    <p class="kr-muted"><strong>Timed out during enroll</strong> — touch the sensor when
+      prompted; the key sends keep-alive frames while waiting and keyroost extends the
+      timeout for the enrollment. <strong>A later op fails after a successful one</strong>
+      — the key invalidates its verification token after some biometric writes; keyroost
+      re-derives a fresh token per operation, so retry.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#authenticatorBioEnrollment"><span class="who">FIDO</span>CTAP2 authenticatorBioEnrollment</a>
+      <a href="https://www.token2.com/"><span class="who">Token2</span>PIN+ bio keys</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="openpgp.html">Next: OpenPGP →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
