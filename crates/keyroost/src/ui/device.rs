@@ -35,11 +35,21 @@ impl DeviceView for Device {
             return Vec::new();
         }
         let mut v = vec![CapTab::Overview];
-        if self.caps.has(Caps::FIDO2) { v.push(CapTab::Fido2); }
-        if self.caps.has(Caps::OATH) { v.push(CapTab::Oath); }
-        if self.caps.has(Caps::PGP) { v.push(CapTab::Pgp); }
-        if self.caps.has(Caps::PIV) { v.push(CapTab::Piv); }
-        if self.caps.has(Caps::OTP) { v.push(CapTab::Otp); }
+        if self.caps.has(Caps::FIDO2) {
+            v.push(CapTab::Fido2);
+        }
+        if self.caps.has(Caps::OATH) {
+            v.push(CapTab::Oath);
+        }
+        if self.caps.has(Caps::PGP) {
+            v.push(CapTab::Pgp);
+        }
+        if self.caps.has(Caps::PIV) {
+            v.push(CapTab::Piv);
+        }
+        if self.caps.has(Caps::OTP) {
+            v.push(CapTab::Otp);
+        }
         v
     }
 }

@@ -1748,6 +1748,7 @@ version = "0.5.1"
 dependencies = [
  "keyroost-hid",
  "keyroost-keyring",
+ "keyroost-proto",
  "keyroost-transport",
 ]
 
