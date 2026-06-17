@@ -1346,22 +1346,22 @@ impl TimeoutArg {
     }
 }
 
-fn customer_key_bytes(cli: &KeyArgs) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+fn customer_key_bytes(args: &KeyArgs) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     use zeroize::Zeroizing;
-    if let Some(h) = &cli.key {
+    if let Some(h) = &args.key {
         hex_decode(h)
             .map(Zeroizing::new)
             .map_err(|e| format!("invalid --key hex: {}", e))
-    } else if let Some(s) = &cli.key_ascii {
+    } else if let Some(s) = &args.key_ascii {
         Ok(Zeroizing::new(s.as_bytes().to_vec()))
-    } else if let Some(var) = &cli.key_env {
+    } else if let Some(var) = &args.key_env {
         let h = Zeroizing::new(
             std::env::var(var).map_err(|_| format!("env var {} (--key-env) is not set", var))?,
         );
         hex_decode(&h)
             .map(Zeroizing::new)
             .map_err(|e| format!("invalid hex in --key-env {}: {}", var, e))
-    } else if let Some(var) = &cli.key_ascii_env {
+    } else if let Some(var) = &args.key_ascii_env {
         std::env::var(var)
             .map(|s| Zeroizing::new(s.into_bytes()))
             .map_err(|_| format!("env var {} (--key-ascii-env) is not set", var))
@@ -1488,12 +1488,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         use clap::CommandFactory;
         std::fs::create_dir_all(dir)?;
         let top = Cli::command();
-        let render = |c: &clap::Command, file: &std::path::Path| -> Result<(), Box<dyn std::error::Error>> {
-            let mut buf = Vec::new();
-            clap_mangen::Man::new(c.clone()).render(&mut buf)?;
-            std::fs::write(file, buf)?;
-            Ok(())
-        };
+        let render =
+            |c: &clap::Command, file: &std::path::Path| -> Result<(), Box<dyn std::error::Error>> {
+                let mut buf = Vec::new();
+                clap_mangen::Man::new(c.clone()).render(&mut buf)?;
+                std::fs::write(file, buf)?;
+                Ok(())
+            };
         render(&top, &dir.join("keyroostctl.1"))?;
         for sub in top.get_subcommands() {
             let name = format!("keyroostctl-{}.1", sub.get_name());
@@ -1561,11 +1562,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Dispatch the Token2 Molto2 / Molto2v2 subcommands. The customer key comes
 /// from the Molto2-scoped `--key*` flags (`KeyArgs`), not a global flag.
-fn run_molto(
-    cmd: &MoltoCmd,
-    key: &KeyArgs,
-    debug: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     // --dry-run on bulk import doesn't need the device at all.
     if let MoltoCmd::ImportFile {
         path,
@@ -4329,7 +4326,15 @@ mod cli_tests {
     #[test]
     fn molto_is_nested() {
         assert!(parse(&["keyroostctl", "molto", "info"]).is_ok());
-        assert!(parse(&["keyroostctl", "molto", "seed", "--profile", "0", "--hex-stdin"]).is_ok());
+        assert!(parse(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--profile",
+            "0",
+            "--hex-stdin"
+        ])
+        .is_ok());
         assert!(parse(&["keyroostctl", "molto", "reset", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "molto", "probe", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "set-seed", "--profile", "0", "--hex-stdin"]).is_err());
