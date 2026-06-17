@@ -2222,6 +2222,30 @@ fn fido_target_hint(path: Option<&Path>) -> String {
     }
 }
 
+/// Resolve the global `--name` (if set) to a PC/SC reader name via the shared
+/// device model, so `--name` targets smart-card / Molto2 groups the same way
+/// `--reader` does. Returns the reader substring to match, or None when no
+/// `--name` was given. Errors if a name is set but resolves to no PC/SC reader.
+fn reader_from_name() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(name) = SELECTED_KEY_NAME.get().and_then(|o| o.clone()) else {
+        return Ok(None);
+    };
+    let devices = keyroost_resolve::enumerate()?;
+    let dev = devices
+        .iter()
+        .find(|d| d.name.as_deref() == Some(name.as_str()))
+        .ok_or_else(|| {
+            format!("no connected device is named '{name}' (see `keyroostctl key-name list`)")
+        })?;
+    match &dev.reader {
+        Some(r) => Ok(Some(r.clone())),
+        None => Err(format!(
+            "device '{name}' has no smart-card (PC/SC) interface for this command"
+        )
+        .into()),
+    }
+}
+
 fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
     if explicit.is_some() && name.is_some() {
@@ -2430,7 +2454,8 @@ fn open_oath(
     access: &OathAccess,
     debug: bool,
 ) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
-    let name = resolve_oath_reader(access.reader.as_deref())?;
+    let by_name = reader_from_name()?;
+    let name = resolve_oath_reader(access.reader.as_deref().or(by_name.as_deref()))?;
     eprintln!("\u{2192} OATH on {}", name);
     let mut session = keyroost_transport::OathSession::open(&name)?;
     session.set_debug(debug);
@@ -3451,7 +3476,8 @@ fn open_openpgp(
     debug: bool,
 ) -> Result<keyroost_transport::OpenPgpSession, Box<dyn std::error::Error>> {
     let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-    let name = resolve_reader(readers, reader, "OpenPGP")?;
+    let by_name = reader_from_name()?;
+    let name = resolve_reader(readers, reader.or(by_name.as_deref()), "OpenPGP")?;
     eprintln!("\u{2192} OpenPGP on {}", name);
     let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
     session.set_debug(debug);
@@ -3464,7 +3490,8 @@ fn open_piv(
     debug: bool,
 ) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
     let readers = keyroost_transport::PivSession::list_piv_readers()?;
-    let name = resolve_reader(readers, reader, "PIV")?;
+    let by_name = reader_from_name()?;
+    let name = resolve_reader(readers, reader.or(by_name.as_deref()), "PIV")?;
     eprintln!("\u{2192} PIV on {}", name);
     let mut session = keyroost_transport::PivSession::open(&name)?;
     session.set_debug(debug);
@@ -4274,5 +4301,19 @@ mod cli_tests {
         assert!(parse(&["keyroostctl", "set-seed", "--profile", "0", "--hex-stdin"]).is_err());
         assert!(parse(&["keyroostctl", "factory-reset", "--yes"]).is_err());
         assert!(parse(&["keyroostctl", "molto", "info", "--key-env", "K"]).is_ok());
+    }
+
+    #[test]
+    fn name_is_accepted_on_every_group() {
+        for g in [
+            &["keyroostctl", "--name", "k", "piv", "status"][..],
+            &["keyroostctl", "--name", "k", "oath", "list"][..],
+            &["keyroostctl", "--name", "k", "openpgp", "status"][..],
+            &["keyroostctl", "--name", "k", "otp", "list"][..],
+            &["keyroostctl", "--name", "k", "molto", "info"][..],
+            &["keyroostctl", "--name", "k", "fido", "info"][..],
+        ] {
+            assert!(parse(g).is_ok(), "should parse: {:?}", g);
+        }
     }
 }
