@@ -30,6 +30,10 @@ use std::fs::{File, OpenOptions};
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::io::Write;
 use std::path::Path;
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+use std::sync::mpsc;
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
@@ -120,7 +124,10 @@ impl From<pcsc::Error> for OtpTransportError {
 
 /// Callback invoked once when a touch-required command has been waiting on the
 /// key for a few poll cycles, so a front-end can prompt "touch your key".
-pub type ButtonPrompt = Box<dyn FnMut()>;
+/// Callback fired while a touch-required command waits. Must be `Send`: the
+/// transport may be moved onto a worker thread (e.g. the time-bounded HID probe
+/// in [`Token2OtpSession::detect`]).
+pub type ButtonPrompt = Box<dyn FnMut() + Send>;
 
 /// The contract both transports implement: send one APDU and return
 /// `(response_data, status_word)`, having handled all framing/reassembly and,
@@ -489,13 +496,64 @@ pub struct Token2OtpSession {
     is_pcsc: bool,
 }
 
-/// Probe a freshly opened HID transport to confirm the OTP applet actually
-/// answers over HID (it may be disabled on the device even when the FIDO HID
-/// interface enumerates). Uses the read-only `GET_ECDH_PUBKEY` command, which
-/// every model supports and which changes nothing. A non-`9000` status word or
-/// any transport error means HID is not usable for the applet.
+/// How long the HID probe waits for the OTP applet to answer before giving up.
+/// On Linux the hidraw `read()` is blocking and the kernel surfaces no timeout,
+/// so a key whose FIDO HID interface enumerates but whose OTP-over-HID channel
+/// is disabled (e.g. when the keyboard interface is enabled, changing the USB
+/// composite) would otherwise block forever here instead of falling back to
+/// PC/SC. Bounding the probe lets `detect` fail over to CCID, which carries the
+/// same applet. Only used on the Linux hidraw path; the hidapi backend bounds
+/// its own reads.
+#[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+const HID_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Probe whether the OTP applet answers over HID, taking the transport by value
+/// so a probe that hangs on a blocking read cannot stall the caller.
+///
+/// On success returns the transport back (it's reused as the live channel). On
+/// failure — including the probe exceeding [`HID_PROBE_TIMEOUT`] — returns an
+/// error; the transport is dropped (on Linux it may still be owned by a detached
+/// worker thread blocked in `read()`, which is harmless and ends when the read
+/// returns or the process exits).
+fn probe_hid_owned(
+    mut t: HidOtpTransport,
+) -> Result<HidOtpTransport, (OtpTransportError, Option<HidOtpTransport>)> {
+    #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
+    {
+        // hidraw read() is blocking with no kernel timeout, so run the probe on
+        // a worker thread and bound it with a channel recv deadline. If it times
+        // out we abandon the thread (and the transport it owns) and report a
+        // timeout so the caller can fall back to PC/SC.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let res = probe_hid(&mut t);
+            // Send the outcome and the transport back; if the receiver already
+            // gave up (timed out), this send fails and the transport is dropped
+            // here instead — either way nothing leaks.
+            let _ = tx.send((res, t));
+        });
+        match rx.recv_timeout(HID_PROBE_TIMEOUT) {
+            Ok((Ok(()), t)) => Ok(t),
+            Ok((Err(e), t)) => Err((e, Some(t))),
+            Err(_) => Err((OtpTransportError::TokenNotDetected, None)),
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(feature = "hidapi-backend"))))]
+    {
+        // hidapi's read honors its own timeout, so a direct probe can't hang.
+        match probe_hid(&mut t) {
+            Ok(()) => Ok(t),
+            Err(e) => Err((e, Some(t))),
+        }
+    }
+}
+
+/// Confirm the OTP applet answers over HID using the read-only
+/// `GET_ECDH_PUBKEY` command (supported by every model, changes nothing). A
+/// non-`9000` status word or any transport error means HID isn't usable for the
+/// applet. Called only via [`probe_hid_owned`], which bounds it in time.
 fn probe_hid(t: &mut HidOtpTransport) -> Result<(), OtpTransportError> {
-    let (_data, sw) = t.transmit(&t2::build_apdu(cmd::GET_ECDH_PUBKEY, &[]), false)?;
+    let (_data, sw) = t.transmit(&t2::get_ecdh_pubkey(), false)?;
     OtpError::check(sw)?;
     Ok(())
 }
@@ -521,21 +579,27 @@ impl Token2OtpSession {
         match HidOtpTransport::open_first() {
             Ok(mut t) => {
                 t.set_debug(debug);
-                // Probe: does the OTP applet actually answer over HID?
-                if probe_hid(&mut t).is_ok() {
-                    return Ok(Self {
-                        transport: Box::new(t),
-                        is_pcsc: false,
-                    });
-                }
-                // HID present but applet unreachable (HID likely disabled on the
-                // device) — try CCID instead.
-                match PcScOtpTransport::open_first_debug(debug) {
-                    Ok(p) => Ok(Self {
-                        transport: Box::new(p),
-                        is_pcsc: true,
-                    }),
-                    Err(_) => Err(OtpTransportError::NoUsableInterface),
+                // Probe (time-bounded): does the OTP applet actually answer over
+                // HID? A hung probe falls through to the CCID fallback below
+                // rather than blocking forever.
+                match probe_hid_owned(t) {
+                    Ok(t) => {
+                        return Ok(Self {
+                            transport: Box::new(t),
+                            is_pcsc: false,
+                        });
+                    }
+                    Err(_) => {
+                        // HID present but applet unreachable (HID disabled on the
+                        // device, or the probe timed out) — try CCID instead.
+                        match PcScOtpTransport::open_first_debug(debug) {
+                            Ok(p) => Ok(Self {
+                                transport: Box::new(p),
+                                is_pcsc: true,
+                            }),
+                            Err(_) => Err(OtpTransportError::NoUsableInterface),
+                        }
+                    }
                 }
             }
             Err(OtpTransportError::TokenNotDetected) => {
@@ -554,7 +618,7 @@ impl Token2OtpSession {
     pub fn detect_hid_only(debug: bool) -> Result<Self, OtpTransportError> {
         let mut t = HidOtpTransport::open_first()?;
         t.set_debug(debug);
-        probe_hid(&mut t)?;
+        let t = probe_hid_owned(t).map_err(|(e, _)| e)?;
         Ok(Self {
             transport: Box::new(t),
             is_pcsc: false,
@@ -710,6 +774,26 @@ impl Token2OtpSession {
         Ok(())
     }
 
+    /// Update the HOTP-on-button keystroke options (send-Enter, long-touch,
+    /// numpad) *without* touching the configured seed (spec §1.8–1.10). Sends
+    /// only the three `CFG_HOTP_*` config bytes, so the existing seed slot is
+    /// left intact — unlike [`set_button_hotp`], which rewrites the seed.
+    ///
+    /// Use this to change typing behaviour for an already-provisioned slot. It
+    /// has no effect if no seed is configured (the device keeps the config bytes
+    /// but they only matter once a seed is present).
+    pub fn set_button_hotp_options(
+        &mut self,
+        send_enter: bool,
+        long_touch: bool,
+        numpad: bool,
+    ) -> Result<(), OtpTransportError> {
+        self.config_byte(cmd::CFG_HOTP_ENTER, (!send_enter) as u8)?; // 0x01 suppresses Enter
+        self.config_byte(cmd::CFG_HOTP_TOUCH, long_touch as u8)?;
+        self.config_byte(cmd::CFG_HOTP_KBD_TYPE, numpad as u8)?;
+        Ok(())
+    }
+
     /// Delete the HOTP-on-button slot (spec §6.6): seal the two zero bytes with
     /// IV-2 and send `WRITE_HOTP_SEED`.
     /// Set which USB interfaces the key exposes, via `SET_DEVICE_TYPE`
@@ -742,6 +826,12 @@ impl Token2OtpSession {
         // ENUM_CODES (0x80 0xC5 0x05) and is answered by the OTP applet — NOT the
         // FIDO applet. The OTP applet is already current (selected at session
         // open), so issue the command directly, exactly as `enumerate` does.
+        //
+        // Note: over CCID/NFC some firmware returns only a short block (e.g. the
+        // 1-byte transfer-type byte) where USB-HID returns the full device-info.
+        // We return whatever we get; `DeviceInfo::parse` records the length so
+        // callers can tell which fields are actually backed by real bytes rather
+        // than zero-padding (see `DeviceInfo::has_config_byte`).
         let apdu = t2::read_config(64);
         let (data, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check(sw)?;
@@ -808,7 +898,7 @@ impl Token2OtpSession {
     fn seal(&mut self, cleartext: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, OtpTransportError> {
         let (device_pub, sw) = self
             .transport
-            .transmit(&t2::build_apdu(cmd::GET_ECDH_PUBKEY, &[]), false)?;
+            .transmit(&t2::get_ecdh_pubkey(), false)?;
         OtpError::check(sw)?;
         Ok(t2::encrypt_seed_payload(&device_pub, cleartext, iv)?)
     }

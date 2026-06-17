@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>On-device OTP &amp; HID-HOTP — keyroost</title>
+<meta name="description" content="TOTP/HOTP codes stored on a Token2 key's own OTP applet, plus HID-HOTP that types a code as keyboard input on touch.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · On-device OTP</p>
+    <h1>On-device OTP</h1>
+    <p class="kr-lede">TOTP and HOTP codes stored on the key's own applet — seeds sealed on the device — plus HID-HOTP that types a code as keyboard input when you touch the key.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>Token2 keys can store OATH-style OTP entries directly on a hardware applet, read
+      over CCID/NFC or USB-HID. Unlike an authenticator app, the seeds are sealed on the
+      secure element: keyroost provisions them with an encrypted write and reads live
+      codes, but the secret material cannot be exported.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Adding &amp; reading codes</h2>
+    <p>In the <strong>On-device OTP</strong> tab, choose <strong>Add credential</strong>,
+      then enter the issuer, account and Base32 secret and pick <strong>TOTP</strong>
+      (time-based) or <strong>HOTP</strong> (counter-based), the algorithm, digits, and —
+      for TOTP — the period (commonly 30 or 60 seconds). TOTP entries show a live code with
+      a countdown ring that refreshes when the window rolls over. Entries marked
+      <strong>require touch</strong> show a <strong>Read</strong> button — press it and
+      touch the key to reveal the code.</p>
+  </section>
+
+  <section class="kr-section" id="hid-hotp">
+    <h2>HID-HOTP (HOTP-on-touch)</h2>
+    <p>HID-HOTP is a single dedicated slot that makes the key act like a keyboard: touch it
+      outside any session and it <em>types</em> a fresh HOTP code wherever your cursor is —
+      handy for systems that accept a typed one-time code.</p>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>HID-HOTP types over the key's keyboard (HID) interface, so that interface must be
+        enabled. keyroost shows an <strong>Enable HID-HOTP</strong> /
+        <strong>Disable HID-HOTP</strong> control; toggling it reconfigures the key's USB
+        interfaces and needs a re-plug to take effect. keyroost refuses any change that
+        would leave fewer than two interfaces enabled, so you can't lock yourself out.</p>
+    </div>
+    <h3 style="margin-top:18px">Provisioning</h3>
+    <p>Open the <strong>HID-HOTP</strong> form, enter the Base32 secret, choose 6 or 8
+      digits, and set the typing options: <strong>Send Enter</strong> (append Return),
+      <strong>Long touch</strong> (require a 2-second press), <strong>Numeric keypad</strong>
+      (type with keypad scancodes). Save, and the card shows the slot as configured.</p>
+    <h3>Changing options without re-entering the seed</h3>
+    <p>Once a seed is provisioned you can change the typing options without re-entering the
+      secret: open the form and use <strong>Update options only</strong>. The seed slot is
+      left untouched. To replace the seed, enter a new secret and Save; to remove it, use
+      <strong>Clear slot</strong>.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Command line</h2>
+<pre><code>keyroostctl otp config                 # interface states &amp; slot status
+keyroostctl otp interface --fido --ccid --keyboard   # enable interfaces (re-plug after)</code></pre>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://datatracker.ietf.org/doc/html/rfc6238"><span class="who">IETF</span>RFC 6238 — TOTP</a>
+      <a href="https://datatracker.ietf.org/doc/html/rfc4226"><span class="who">IETF</span>RFC 4226 — HOTP</a>
+      <a href="https://www.token2.com/"><span class="who">Token2</span>PIN+ / OTP keys</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="fingerprint.html">Next: Fingerprints →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

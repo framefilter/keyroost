@@ -50,6 +50,26 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             body: "The rolling 6-digit codes you'd normally get from an authenticator app — but stored on the key itself. They survive a lost or wiped phone and never sync to anyone's cloud.",
             slug: "/oath",
         },
+        "otp" => &Help {
+            title: "On-device OTP",
+            body: "TOTP/HOTP codes stored on this Token2 key's own OTP applet, read over CCID/NFC. Add entries, read live codes, and (on keys that support it) trigger a code by touching the key. The seeds live on the device and never sync anywhere.",
+            slug: "/otp",
+        },
+        "mds" => &Help {
+            title: "Device metadata (FIDO MDS)",
+            body: "Details the FIDO Alliance publishes about this authenticator model, looked up by its AAGUID: vendor name, icon, certification level (e.g. FIDO Certified L2) and date, supported protocol versions, and more. This data is bundled with keyroost and can be refreshed by a maintainer regenerating it from the FIDO metadata.",
+            slug: "/mds",
+        },
+        "fingerprint" => &Help {
+            title: "Fingerprints (biometric enrollment)",
+            body: "Enroll, rename, and delete fingerprints on a biometric Token2 key via CTAP2 authenticatorBioEnrollment. Enrolled fingerprints let the key satisfy user verification by touch instead of typing the PIN. Requires the PIN to manage. Templates live on the device and never leave it.",
+            slug: "/fingerprint",
+        },
+        "touch-hotp" => &Help {
+            title: "HID-HOTP (HOTP-on-touch)",
+            body: "Provision a single HOTP slot that types a fresh code as keyboard input when you touch the key outside any session. Needs the keyboard (HID-HOTP) interface enabled. You can change the typing options \u{2014} send Enter, long touch, numeric keypad \u{2014} without re-entering the seed.",
+            slug: "/otp#hid-hotp",
+        },
         "pgp" => &Help {
             title: "OpenPGP",
             body: "Turns the key into a smart card for encrypting & signing email and files (and for SSH). The private keys live on the card and never touch your computer's disk.",

@@ -38,13 +38,21 @@ impl std::fmt::Display for CtapError {
         match self {
             CtapError::Hid(e) => write!(f, "{}", e),
             CtapError::Cbor(e) => write!(f, "{}", e),
-            CtapError::StatusCode(c) => match ctap_status_name(*c) {
-                Some(name) => write!(
+            CtapError::StatusCode(c) => match (ctap_status_hint(*c), ctap_status_name(*c)) {
+                // Lead with a plain-English explanation when we have one, keeping
+                // the spec name + hex for the technically inclined.
+                (Some(hint), Some(name)) => {
+                    write!(f, "{} (CTAP2 status 0x{:02X} {})", hint, c, name)
+                }
+                (Some(hint), None) => {
+                    write!(f, "{} (CTAP2 status 0x{:02X})", hint, c)
+                }
+                (None, Some(name)) => write!(
                     f,
                     "authenticator returned CTAP2 status 0x{:02X} ({})",
                     c, name
                 ),
-                None => write!(f, "authenticator returned CTAP2 status 0x{:02X}", c),
+                (None, None) => write!(f, "authenticator returned CTAP2 status 0x{:02X}", c),
             },
             CtapError::EmptyResponse => write!(f, "authenticator returned an empty CBOR response"),
             CtapError::InvalidResponseShape(s) => {
@@ -53,6 +61,31 @@ impl std::fmt::Display for CtapError {
             CtapError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
         }
     }
+}
+
+/// Plain-English explanation for the CTAP2 status codes a user is most likely
+/// to hit and least likely to understand from the spec name alone. Returns
+/// `None` when the spec name is already clear enough (or the code is unknown),
+/// in which case the caller falls back to the spec name / raw hex.
+fn ctap_status_hint(code: u8) -> Option<&'static str> {
+    Some(match code {
+        // The big one for Token2 PIN+ keys: the new PIN doesn't meet the key's
+        // complexity policy (length / character mix), not a transient failure.
+        0x37 => "the new PIN doesn't meet this key's complexity requirements \u{2014} \
+                 try a longer PIN or a different mix of characters (Token2 PIN+ \
+                 keys enforce a complexity policy)",
+        0x31 => "the PIN was incorrect",
+        0x32 => "too many wrong PIN attempts \u{2014} the key is locked; remove and \
+                 re-insert it, and note it may reset after repeated failures",
+        0x33 => "the PIN authentication was rejected; unlock again and retry",
+        0x34 => "too many PIN retries this session \u{2014} remove and re-insert the key",
+        0x35 => "no PIN is set on this key yet",
+        0x36 => "this operation needs a fresh PIN/UV authentication first",
+        0x3B => "the key needs a physical touch to continue",
+        0x3C => "user verification is temporarily blocked \u{2014} remove and re-insert the key",
+        0x2F => "timed out waiting for you to act on the key",
+        _ => return None,
+    })
 }
 
 /// Map the CTAP2 status bytes we're most likely to surface to their spec

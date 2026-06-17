@@ -318,6 +318,55 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
+    /// List enrolled fingerprints (template id + name).
+    FidoFingerprintList {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Enroll a new fingerprint. Touch the sensor repeatedly when prompted until
+    /// capture completes.
+    FidoFingerprintEnroll {
+        /// Optional friendly name to set on the new fingerprint once enrolled.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Rename an enrolled fingerprint by its hex template id (from `list`).
+    FidoFingerprintRename {
+        /// Hex-encoded template id as printed by `fido-fingerprint-list`.
+        #[arg(long, value_name = "HEX")]
+        template_id: String,
+        /// New friendly name.
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Delete an enrolled fingerprint by its hex template id (from `list`).
+    FidoFingerprintDelete {
+        /// Hex-encoded template id as printed by `fido-fingerprint-list`.
+        #[arg(long, value_name = "HEX")]
+        template_id: String,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
     /// Manage friendly names for security keys (opt-in; stored in keys.json).
     KeyName {
         #[command(subcommand)]
@@ -1589,6 +1638,54 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
         return Ok(());
     }
+    if let Cmd::FidoFingerprintList {
+        pin_env,
+        pin_stdin,
+        path,
+    } = cmd
+    {
+        let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+        run_fido_fingerprint_list(path.as_deref(), &pin)?;
+        return Ok(());
+    }
+    if let Cmd::FidoFingerprintEnroll {
+        name,
+        pin_env,
+        pin_stdin,
+        path,
+    } = cmd
+    {
+        let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+        run_fido_fingerprint_enroll(path.as_deref(), &pin, name.as_deref())?;
+        return Ok(());
+    }
+    if let Cmd::FidoFingerprintRename {
+        template_id,
+        name,
+        pin_env,
+        pin_stdin,
+        path,
+    } = cmd
+    {
+        let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+        let id = hex_decode(template_id)
+            .map_err(|e| format!("--template-id is not valid hex: {}", e))?;
+        run_fido_fingerprint_rename(path.as_deref(), &pin, &id, name)?;
+        return Ok(());
+    }
+    if let Cmd::FidoFingerprintDelete {
+        template_id,
+        pin_env,
+        pin_stdin,
+        path,
+    } = cmd
+    {
+        let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+        let id = hex_decode(template_id)
+            .map_err(|e| format!("--template-id is not valid hex: {}", e))?;
+        run_fido_fingerprint_delete(path.as_deref(), &pin, &id)?;
+        return Ok(());
+    }
 
     // OATH talks to a security key's CCID applet over PC/SC, not the Molto2.
     if let Cmd::Oath { cmd } = cmd {
@@ -1979,7 +2076,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         | Cmd::FidoPinChange { .. }
         | Cmd::FidoCredsMetadata { .. }
         | Cmd::FidoCredsList { .. }
-        | Cmd::FidoCredsDelete { .. } => {
+        | Cmd::FidoCredsDelete { .. }
+        | Cmd::FidoFingerprintList { .. }
+        | Cmd::FidoFingerprintEnroll { .. }
+        | Cmd::FidoFingerprintRename { .. }
+        | Cmd::FidoFingerprintDelete { .. } => {
             unreachable!("FIDO commands handled above before PC/SC auth")
         }
     }
@@ -2791,7 +2892,9 @@ fn run_otp(
             );
             println!(
                 "  HOTP-on-touch slot:     {}",
-                if info.button_hotp_configured() {
+                if !info.has_config_byte() {
+                    "unknown (device returned a short config block)"
+                } else if info.button_hotp_configured() {
                     "configured"
                 } else {
                     "empty"
@@ -3859,6 +3962,92 @@ fn run_fido_creds_delete(
     })
 }
 
+fn run_fido_fingerprint_list(
+    path: Option<&std::path::Path>,
+    pin: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    with_bio_enrollment(path, pin, |bio| {
+        let list = bio.enumerate()?;
+        if list.is_empty() {
+            println!("(no fingerprints enrolled)");
+            return Ok(());
+        }
+        println!("Enrolled fingerprints:");
+        for e in &list {
+            let name = e.friendly_name.as_deref().unwrap_or("(unnamed)");
+            // The hex template id is what --template-id takes for rename/delete.
+            println!("  id {}   {}", hex_encode(&e.template_id), name);
+        }
+        println!("(use the id with --template-id to rename or delete)");
+        Ok(())
+    })
+}
+
+fn run_fido_fingerprint_enroll(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_ctap::bio_enroll::sample_status_message;
+    with_bio_enrollment(path, pin, |bio| {
+        if let Ok(info) = bio.sensor_info() {
+            if info.max_capture_samples > 0 {
+                println!(
+                    "Enrolling a fingerprint ({} good samples needed).",
+                    info.max_capture_samples
+                );
+            }
+        }
+        println!("Touch the sensor now\u{2026}");
+        let (template_id, mut status) = bio.enroll_begin(None)?;
+        println!("  {}", sample_status_message(status.last_sample_status));
+        // Capture until the device says no samples remain.
+        while status.remaining_samples > 0 {
+            println!(
+                "  {} more sample(s) needed \u{2014} touch the sensor again\u{2026}",
+                status.remaining_samples
+            );
+            status = bio.enroll_capture_next(&template_id, None)?;
+            println!("  {}", sample_status_message(status.last_sample_status));
+        }
+        // Optionally name it once enrolled.
+        if let Some(n) = name {
+            bio.set_friendly_name(&template_id, n)?;
+        }
+        println!(
+            "Fingerprint enrolled: {}{}",
+            hex_encode(&template_id),
+            name.map(|n| format!("  ({})", n)).unwrap_or_default()
+        );
+        Ok(())
+    })
+}
+
+fn run_fido_fingerprint_rename(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    template_id: &[u8],
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    with_bio_enrollment(path, pin, |bio| {
+        bio.set_friendly_name(template_id, name)?;
+        println!("Renamed {} to \"{}\".", hex_short(template_id), name);
+        Ok(())
+    })
+}
+
+fn run_fido_fingerprint_delete(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    template_id: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    with_bio_enrollment(path, pin, |bio| {
+        bio.remove_enrollment(template_id)?;
+        println!("Fingerprint {} deleted.", hex_short(template_id));
+        Ok(())
+    })
+}
+
 /// Open a hidraw device, fetch GetInfo, exchange PIN/UV auth, and hand a
 /// fully-armed `CredentialManager` to the caller. Avoids a self-referential
 /// return type by keeping the device on the stack and using a closure.
@@ -3886,6 +4075,49 @@ where
     )?;
     let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
     f(&mut mgr)
+}
+
+/// Open a FIDO device and hand the caller an armed `BioEnrollment` session,
+/// mirroring `with_credential_manager`. Selects the standard (0x09) or preview
+/// (0x40) command byte based on what the authenticator advertises.
+fn with_bio_enrollment<F>(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    f: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: for<'a> FnOnce(
+        &mut keyroost_ctap::bio_enroll::BioEnrollment<'a>,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let path = resolve_fido_path(path)?;
+    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    if !init.supports_cbor() {
+        return Err("device is U2F-only; CTAP2 bio enrollment not supported".into());
+    }
+    let info = keyroost_ctap::get_info(&mut dev)?;
+    // Pick the command byte from what the authenticator advertises. The option
+    // value is Some(true) (enrolled), Some(false) (supported, none enrolled), or
+    // None (not present). For *either* state the feature is supported, so test
+    // `.is_some()` per option — but choose the command byte that matches which
+    // option name the key actually lists, since a key supports exactly one.
+    let has_standard = info.option("bioEnroll").is_some();
+    let has_preview = info.option("userVerificationMgmtPreview").is_some();
+    let cmd_code = if has_standard {
+        keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT
+    } else if has_preview {
+        keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT_PREVIEW
+    } else {
+        return Err("this authenticator does not advertise fingerprint enrollment".into());
+    };
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::BIO_ENROLLMENT,
+    )?;
+    let mut bio = keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
+    f(&mut bio)
 }
 
 /// How a seed/key option was supplied: literal argv value, env var name, or

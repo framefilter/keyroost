@@ -15,6 +15,7 @@
 pub mod aaguid;
 pub mod device;
 pub mod help;
+pub mod mds;
 pub mod theme;
 
 use theme::{f_bold, f_reg, Palette};

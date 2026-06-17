@@ -311,7 +311,7 @@ impl CtapHidDevice {
     }
 
     fn recv(&mut self, expected_cid: u32, expected_cmd: u8) -> Result<Vec<u8>, HidTransportError> {
-        let deadline = Instant::now() + self.timeout;
+        let mut deadline = Instant::now() + self.timeout;
         let mut buf = [0u8; CTAPHID_REPORT_SIZE];
 
         loop {
@@ -328,6 +328,11 @@ impl CtapHidDevice {
                 continue;
             }
             if cmd == CTAPHID_KEEPALIVE {
+                // The device is alive and working — commonly waiting for the user
+                // to touch the sensor (e.g. fingerprint enrollment or a user-
+                // presence check). Push the deadline out so the timeout bounds
+                // device *silence*, not how long the user takes to respond.
+                deadline = Instant::now() + self.timeout;
                 continue;
             }
             if cmd == CTAPHID_ERROR {

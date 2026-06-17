@@ -199,9 +199,36 @@ pub fn enable_totp(enabled: bool) -> Vec<u8> {
 
 /// Build the `READ_CONFIG` request for `num_bytes` of device info (spec §6.9).
 /// `num_bytes` is clamped to `1..=64`; the firmware fills the first 10.
+/// Build the `GET_ECDH_PUBKEY` request (§1.1): short case-2 APDU
+/// `80 C5 01 00 00` — header plus a single `Le` byte (`00`), exactly as the
+/// vendor pseudocode shows. Built explicitly rather than via `build_apdu`, which
+/// omits Le for empty bodies; without Le the device answers with a stub instead
+/// of the full 64-byte key, which made the HID probe fail and forced CCID.
+pub fn get_ecdh_pubkey() -> Vec<u8> {
+    vec![
+        cmd::GET_ECDH_PUBKEY[0],
+        cmd::GET_ECDH_PUBKEY[1],
+        cmd::GET_ECDH_PUBKEY[2],
+        cmd::GET_ECDH_PUBKEY[3],
+        0x00, // Le = 0x00 (return all available)
+    ]
+}
+
 pub fn read_config(num_bytes: u8) -> Vec<u8> {
     let n = num_bytes.clamp(1, 64);
-    build_apdu(cmd::READ_CONFIG, &[n])
+    // §1.11: `80 C5 02 00` with P3 = number of response bytes wanted. This is a
+    // short ISO case-2 APDU (header + single Le byte) — the same shape the
+    // vendor pseudocode uses for the other read command, `80 C5 01 00 00`.
+    // Earlier we built this with an *extended-Lc data* body, which made the
+    // device answer `61 01` (only 1 byte available) over PC/SC; a plain Le byte
+    // is what asks for the full block.
+    vec![
+        cmd::READ_CONFIG[0],
+        cmd::READ_CONFIG[1],
+        cmd::READ_CONFIG[2],
+        cmd::READ_CONFIG[3],
+        n, // P3 = Le = number of bytes wanted
+    ]
 }
 
 /// Build the bodyless `WRITE_SEED` that erases every entry (spec §6.5). The
@@ -268,6 +295,10 @@ pub struct DeviceInfo {
     pub device_extension: u8,
     /// Anything beyond byte 9, retained for forward-compat (spec §8.3).
     pub raw_tail: Vec<u8>,
+    /// Number of bytes actually returned by READ_CONFIG. Over CCID/NFC some
+    /// firmware returns only byte 0 (interface states) while USB-HID returns the
+    /// full block; this lets callers tell a real `false` from a zero-pad.
+    pub raw_len: usize,
 }
 
 impl DeviceInfo {
@@ -292,7 +323,17 @@ impl DeviceInfo {
             } else {
                 Vec::new()
             },
+            raw_len: data.len(),
         })
+    }
+
+    /// Whether the response actually contained the config byte (byte 1), as
+    /// opposed to being a short CCID/NFC stub that only carried byte 0. When this
+    /// is false, flags derived from `device_config` / `device_extension` (e.g.
+    /// the button-HOTP seed status) are not trustworthy and should be treated as
+    /// unknown rather than `false`.
+    pub fn has_config_byte(&self) -> bool {
+        self.raw_len >= 2
     }
 
     // --- transfer-type bits (byte 0) ---
@@ -456,6 +497,16 @@ fn base32_decode(s: &str) -> Result<Vec<u8>, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_config_apdu_form() {
+        // §1.11: short case-2 `80 C5 02 00 <Le>` — Le is the byte count wanted.
+        assert_eq!(read_config(64), vec![0x80, 0xC5, 0x02, 0x00, 0x40]);
+        assert_eq!(*read_config(0).last().unwrap(), 0x01); // clamped to >=1
+        assert_eq!(*read_config(200).last().unwrap(), 0x40); // clamped to <=64
+        // §1.1 pubkey read: short case-2 with Le=0x00.
+        assert_eq!(get_ecdh_pubkey(), vec![0x80, 0xC5, 0x01, 0x00, 0x00]);
+    }
 
     #[test]
     fn extended_apdu_layout() {
