@@ -6,6 +6,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Device-centric bare overview** — running `keyroostctl` with no subcommand
+  now prints a device-centric overview of what is connected, and `list` is
+  enriched with per-device detail (applets, serials, friendly names).
+- **`--name` targeting on every group** — the friendly-name selector now works
+  across all command groups (`molto`, `fido`, `oath`, `openpgp`, `piv`, `otp`),
+  not just a subset, so one named key can be addressed consistently everywhere.
+- **Per-group man pages** — `keyroostctl manpage <DIR>` now writes a directory
+  set of man pages (one per command group) instead of a single page on stdout.
+
+### Changed
+- **BREAKING: commands nested under `molto` and `fido` groups.** The flat
+  Molto2 and FIDO subcommands have been moved under `molto …` and `fido …`.
+  Key renames: `info` → `molto info`, `import`/`import-file` →
+  `molto import`/`molto import-file`, `set-seed`/`set-title`/`configure` →
+  `molto seed`/`molto title`/`molto config`, `set-customer-key` →
+  `molto customer-key`, `factory-reset` → `molto reset`, and every `fido-*`
+  command → `fido *` (e.g. `fido-info` → `fido info`, `fido-creds-list` →
+  `fido creds-list`). The customer-key flags (`--key`, `--key-env`, …) now live
+  under `molto customer-key`. See the migration table in the README for the full
+  old→new map.
+
 ## [0.5.1] - 2026-06-14
 
 A follow-up to the Token2-vs-Molto2 device-identification fix.

@@ -194,9 +194,9 @@ installing them.
 keyroostctl list
 
 # --- FIDO2 (YubiKey / Solo 2 / Nitrokey 3) ---
-keyroostctl fido-info
-keyroostctl fido-pin-retries
-keyroostctl fido-creds-list --pin-stdin        # PIN read from stdin, never argv
+keyroostctl fido info
+keyroostctl fido pin-retries
+keyroostctl fido creds-list --pin-stdin        # PIN read from stdin, never argv
 
 # --- OATH over PC/SC ---
 keyroostctl oath list --reader yubikey
@@ -210,9 +210,9 @@ keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey
 keyroostctl piv status --reader yubikey
 
 # --- Token2 Molto2 (TOTP programming) ---
-keyroostctl info
-keyroostctl import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3PXP'
-keyroostctl import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate first
+keyroostctl molto info
+keyroostctl molto import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3PXP'
+keyroostctl molto import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate first
 
 # --- Token2 on-device OTP (PIN+ Series FIDO keys) ---
 keyroostctl otp list
@@ -226,6 +226,37 @@ keyroostctl key-name list
 # On-device OTP, plus the distinct Molto2 view)
 keyroost
 ```
+
+## Migrating to the 0.6.0 command names
+
+The Molto2 and FIDO commands are now nested under `molto` and `fido` groups.
+The old flat names have been replaced — update any scripts as follows:
+
+| Old (≤ 0.5.x)                       | New (0.6.0)                          |
+|-------------------------------------|--------------------------------------|
+| `keyroostctl info`                  | `keyroostctl molto info`             |
+| `keyroostctl set-seed …`            | `keyroostctl molto seed …`           |
+| `keyroostctl set-title …`           | `keyroostctl molto title …`          |
+| `keyroostctl configure …`           | `keyroostctl molto config …`         |
+| `keyroostctl sync-time …`           | `keyroostctl molto sync-time …`      |
+| `keyroostctl set-customer-key …`    | `keyroostctl molto customer-key …`   |
+| `keyroostctl import …`              | `keyroostctl molto import …`         |
+| `keyroostctl import-file …`         | `keyroostctl molto import-file …`    |
+| `keyroostctl factory-reset …`       | `keyroostctl molto reset …`          |
+| `keyroostctl fido-info`             | `keyroostctl fido info`              |
+| `keyroostctl fido-reset …`          | `keyroostctl fido reset …`           |
+| `keyroostctl fido-pin-set …`        | `keyroostctl fido pin-set …`         |
+| `keyroostctl fido-pin-change …`     | `keyroostctl fido pin-change …`      |
+| `keyroostctl fido-pin-retries`      | `keyroostctl fido pin-retries`       |
+| `keyroostctl fido-creds-list …`     | `keyroostctl fido creds-list …`      |
+| `keyroostctl fido-creds-metadata …` | `keyroostctl fido creds-metadata …`  |
+| `keyroostctl fido-creds-delete …`   | `keyroostctl fido creds-delete …`    |
+| `keyroostctl manpage > x.1`         | `keyroostctl manpage ./man`          |
+
+The customer-key flags (`--key`, `--key-ascii`, `--key-env`, `--key-ascii-env`)
+now live under `molto` — e.g. `keyroostctl molto customer-key --key-env K`. The
+`piv`, `oath`, `openpgp`, `otp`, `key-name`, `list`, `doctor`, and `completions`
+commands are unchanged.
 
 ## Workspace layout
 
