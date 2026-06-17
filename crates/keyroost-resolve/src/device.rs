@@ -309,8 +309,14 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
     devices
 }
 
+/// Build the unified device list. Blocking: enumerates FIDO HID nodes and probes
+/// PC/SC readers, then correlates. A HID-layer failure is a hard error; PC/SC
+/// problems degrade to an empty probe list (FIDO-only keys still appear).
 pub fn enumerate() -> Result<Vec<Device>, String> {
-    Ok(Vec::new())
+    let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
+    let probes = keyroost_transport::probe_readers().unwrap_or_default();
+    let keyring = Keyring::load_default().unwrap_or_default();
+    Ok(correlate(&hids, &probes, &keyring))
 }
 
 #[cfg(test)]
