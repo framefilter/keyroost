@@ -4110,28 +4110,17 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
     });
     ui.painter()
         .galley(egui::pos2(tx, rect.top() + 26.0), galley, p.txt);
-    // capability pills
+    // capability pills — labels come from the shared cap_badges() vocabulary so
+    // the GUI and the CLI overview never disagree. Tokens keep the amber accent.
     let py = rect.top() + 46.0;
-    if token {
-        paint_pill(
-            ui,
-            egui::pos2(tx, py),
-            "TOTP token",
-            p.brand,
-            p.brand_soft(),
-        );
+    let (fg, bg) = if token {
+        (p.brand, p.brand_soft())
     } else {
-        let mut px = tx;
-        for (cap, label) in [
-            (Caps::FIDO2, "FIDO2"),
-            (Caps::OATH, "OATH"),
-            (Caps::PGP, "PGP"),
-            (Caps::PIV, "PIV"),
-        ] {
-            if dev.caps.has(cap) {
-                px += paint_pill(ui, egui::pos2(px, py), label, p.txt2, p.raised2) + 5.0;
-            }
-        }
+        (p.txt2, p.raised2)
+    };
+    let mut px = tx;
+    for label in dev.cap_badges() {
+        px += paint_pill(ui, egui::pos2(px, py), label, fg, bg) + 5.0;
     }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
