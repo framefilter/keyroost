@@ -60,6 +60,59 @@ pub struct Device {
     pub reader: Option<String>,
 }
 
+/// Map a USB vendor id to a display name; unknown ids fall back to a generic label.
+fn vendor_name(vid: u16) -> &'static str {
+    match vid {
+        0x1050 => "Yubico",
+        0x20a0 => "Nitrokey",
+        0x1209 => "SoloKeys",
+        0x096e | 0x311f => "Feitian",
+        0x2581 => "Kanokey",
+        0x349e => "Token2",
+        0x1e0d => "OpenSK",
+        _ => "Security key",
+    }
+}
+
+/// Turn a raw PC/SC reader name or USB product name into a clean model label,
+/// stripping bracketed groups, interface-noise tokens, a leading vendor word, and
+/// trailing two-digit pcsc index groups.
+fn clean_model(raw: &str, vendor: &str) -> String {
+    let mut s = String::with_capacity(raw.len());
+    let mut depth = 0i32;
+    for ch in raw.chars() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = (depth - 1).max(0),
+            _ if depth == 0 => s.push(ch),
+            _ => {}
+        }
+    }
+    for junk in [
+        "CCID/ICCD Interface", "OTP+FIDO+CCID", "FIDO+CCID", "OTP+FIDO", "U2F+CCID",
+        "+CCID", "ICCD", "CCID", "Interface", "Smartcard", "Smart Card",
+    ] {
+        s = s.replace(junk, " ");
+    }
+    let lead = s.trim_start();
+    if !vendor.is_empty()
+        && lead.to_ascii_lowercase().starts_with(&vendor.to_ascii_lowercase())
+    {
+        s = lead[vendor.len()..].to_string();
+    }
+    let mut parts: Vec<&str> = s.split_whitespace().collect();
+    while parts.len() > 1 {
+        let last = parts[parts.len() - 1];
+        if last.len() == 2 && last.chars().all(|c| c.is_ascii_digit()) {
+            parts.pop();
+        } else {
+            break;
+        }
+    }
+    let out = parts.join(" ");
+    if out.is_empty() { vendor.to_string() } else { out }
+}
+
 pub fn correlate(_hids: &[HidDevice], _probes: &[ReaderProbe], _keyring: &Keyring) -> Vec<Device> {
     Vec::new()
 }
@@ -81,5 +134,23 @@ mod tests {
         assert!(c.has(Caps::PIV));
         assert!(!c.has(Caps::OATH));
         assert!(!c.is_empty());
+    }
+
+    #[test]
+    fn clean_model_strips_vendor_brackets_and_index() {
+        assert_eq!(
+            clean_model("SoloKeys Solo 2 [CCID/ICCD Interface] (07A9) 01 00", "SoloKeys"),
+            "Solo 2"
+        );
+        assert_eq!(clean_model("Yubico YubiKey OTP+FIDO+CCID 00 00", "Yubico"), "YubiKey");
+        assert_eq!(clean_model("Nitrokey 3", "Nitrokey"), "3");
+    }
+
+    #[test]
+    fn vendor_name_maps_known_vids() {
+        assert_eq!(vendor_name(0x1050), "Yubico");
+        assert_eq!(vendor_name(0x1209), "SoloKeys");
+        assert_eq!(vendor_name(0x349e), "Token2");
+        assert_eq!(vendor_name(0xffff), "Security key");
     }
 }
