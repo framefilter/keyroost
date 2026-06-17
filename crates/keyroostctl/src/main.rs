@@ -242,83 +242,10 @@ enum Cmd {
         #[arg(long)]
         all_hid: bool,
     },
-    /// Run `authenticatorGetInfo` against a connected FIDO authenticator.
-    FidoInfo {
-        /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
-    /// Run `authenticatorReset`, wiping all credentials on the key.
-    ///
-    /// Most authenticators only accept Reset within ~10s of plug-in and
-    /// require a physical touch. If `--yes` is missing this is a no-op.
-    FidoReset {
-        /// Confirm you really want to wipe credentials.
-        #[arg(long)]
-        yes: bool,
-        /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
-    /// Print the current PIN retry counter.
-    FidoPinRetries {
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
-    /// Set the initial PIN on an authenticator that doesn't have one yet.
-    FidoPinSet {
-        /// Read the new PIN from the given environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (one line, trailing newline stripped).
-        #[arg(long)]
-        new_pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
-    /// Change the existing PIN. Old and new PINs are sourced from env vars
-    /// or stdin (stdin reads two consecutive lines: old then new).
-    FidoPinChange {
-        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
-        old_pin_env: Option<String>,
-        #[arg(long)]
-        old_pin_stdin: bool,
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        #[arg(long)]
-        new_pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
-    /// Show resident-credential storage stats (uses pinUvAuthToken).
-    FidoCredsMetadata {
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        #[arg(long)]
-        pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
-    /// List every resident credential on the authenticator, grouped by RP.
-    FidoCredsList {
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        #[arg(long)]
-        pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
-    /// Delete a single resident credential by its hex-encoded credentialId.
-    FidoCredsDelete {
-        /// Hex-encoded credentialId as printed by `fido-creds-list`.
-        #[arg(long, value_name = "HEX")]
-        cred_id: String,
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        #[arg(long)]
-        pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
+    /// FIDO2 / CTAP2: device info, reset, PIN management, resident credentials.
+    Fido {
+        #[command(subcommand)]
+        cmd: FidoCmd,
     },
     /// Manage friendly names for security keys (opt-in; stored in keys.json).
     KeyName {
@@ -1051,6 +978,90 @@ enum OathCmd {
     },
 }
 
+/// FIDO2 / CTAP2 subcommands. These talk to a hidraw device, not the Molto2
+/// PC/SC reader.
+#[derive(Subcommand)]
+enum FidoCmd {
+    /// Run `authenticatorGetInfo` against a connected FIDO authenticator.
+    Info {
+        /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Run `authenticatorReset`, wiping all credentials on the key.
+    ///
+    /// Most authenticators only accept Reset within ~10s of plug-in and
+    /// require a physical touch. If `--yes` is missing this is a no-op.
+    Reset {
+        /// Confirm you really want to wipe credentials.
+        #[arg(long)]
+        yes: bool,
+        /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Print the current PIN retry counter.
+    PinRetries {
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Set the initial PIN on an authenticator that doesn't have one yet.
+    PinSet {
+        /// Read the new PIN from the given environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
+        /// Read the new PIN from stdin (one line, trailing newline stripped).
+        #[arg(long)]
+        new_pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Change the existing PIN. Old and new PINs are sourced from env vars
+    /// or stdin (stdin reads two consecutive lines: old then new).
+    PinChange {
+        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
+        old_pin_env: Option<String>,
+        #[arg(long)]
+        old_pin_stdin: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
+        #[arg(long)]
+        new_pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Show resident-credential storage stats (uses pinUvAuthToken).
+    CredsMetadata {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// List every resident credential on the authenticator, grouped by RP.
+    CredsList {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Delete a single resident credential by its hex-encoded credentialId.
+    CredsDelete {
+        /// Hex-encoded credentialId as printed by `fido creds-list`.
+        #[arg(long, value_name = "HEX")]
+        cred_id: String,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
 /// Subcommands for the Token2 on-device OTP applet (T2F2 / PIN+) over USB-HID
 /// or NFC. Seeds are read from stdin or an env var — never argv.
 #[derive(Subcommand)]
@@ -1515,80 +1526,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // FIDO commands talk to a hidraw device, not the Molto2 PC/SC reader.
-    if let Cmd::FidoInfo { path } = cmd {
-        run_fido_info(path.as_deref())?;
-        return Ok(());
-    }
-    if let Cmd::FidoReset { yes, path } = cmd {
-        if !*yes {
-            return Err(format!(
-                "refusing to reset FIDO key without --yes (this wipes credentials){}",
-                fido_target_hint(path.as_deref())
-            )
-            .into());
-        }
-        run_fido_reset(path.as_deref())?;
-        return Ok(());
-    }
-    if let Cmd::FidoPinRetries { path } = cmd {
-        run_fido_pin_retries(path.as_deref())?;
-        return Ok(());
-    }
-    if let Cmd::FidoPinSet {
-        new_pin_env,
-        new_pin_stdin,
-        path,
-    } = cmd
-    {
-        let new_pin = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
-        run_fido_pin_set(path.as_deref(), &new_pin)?;
-        return Ok(());
-    }
-    if let Cmd::FidoPinChange {
-        old_pin_env,
-        old_pin_stdin,
-        new_pin_env,
-        new_pin_stdin,
-        path,
-    } = cmd
-    {
-        let old_pin = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
-        let new_pin = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
-        run_fido_pin_change(path.as_deref(), &old_pin, &new_pin)?;
-        return Ok(());
-    }
-    if let Cmd::FidoCredsMetadata {
-        pin_env,
-        pin_stdin,
-        path,
-    } = cmd
-    {
-        let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-        run_fido_creds_metadata(path.as_deref(), &pin)?;
-        return Ok(());
-    }
-    if let Cmd::FidoCredsList {
-        pin_env,
-        pin_stdin,
-        path,
-    } = cmd
-    {
-        let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-        run_fido_creds_list(path.as_deref(), &pin)?;
-        return Ok(());
-    }
-    if let Cmd::FidoCredsDelete {
-        cred_id,
-        pin_env,
-        pin_stdin,
-        path,
-    } = cmd
-    {
-        let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-        let cred_id_bytes =
-            hex_decode(cred_id).map_err(|e| format!("--cred-id is not valid hex: {}", e))?;
-        run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
-        return Ok(());
+    if let Cmd::Fido { cmd } = cmd {
+        return run_fido(cmd, cli.debug);
     }
 
     // OATH talks to a security key's CCID applet over PC/SC, not the Molto2.
@@ -1973,16 +1912,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Openpgp { .. } => unreachable!("handled above before auth"),
         Cmd::Piv { .. } => unreachable!("handled above before auth"),
         Cmd::Otp { .. } => unreachable!("handled above before auth"),
-        Cmd::FidoInfo { .. }
-        | Cmd::FidoReset { .. }
-        | Cmd::FidoPinRetries { .. }
-        | Cmd::FidoPinSet { .. }
-        | Cmd::FidoPinChange { .. }
-        | Cmd::FidoCredsMetadata { .. }
-        | Cmd::FidoCredsList { .. }
-        | Cmd::FidoCredsDelete { .. } => {
-            unreachable!("FIDO commands handled above before PC/SC auth")
-        }
+        Cmd::Fido { .. } => unreachable!("FIDO commands handled above before PC/SC auth"),
     }
     Ok(())
 }
@@ -3687,6 +3617,85 @@ fn format_aaguid(aaguid: &[u8; 16]) -> String {
     s
 }
 
+fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // FIDO handlers open their own hidraw transport and don't consult the
+    // shared PC/SC debug flag; accept it for signature parity with the other
+    // run_* group dispatchers.
+    let _ = debug;
+    match cmd {
+        FidoCmd::Info { path } => {
+            run_fido_info(path.as_deref())?;
+            Ok(())
+        }
+        FidoCmd::Reset { yes, path } => {
+            if !*yes {
+                return Err(format!(
+                    "refusing to reset FIDO key without --yes (this wipes credentials){}",
+                    fido_target_hint(path.as_deref())
+                )
+                .into());
+            }
+            run_fido_reset(path.as_deref())?;
+            Ok(())
+        }
+        FidoCmd::PinRetries { path } => {
+            run_fido_pin_retries(path.as_deref())?;
+            Ok(())
+        }
+        FidoCmd::PinSet {
+            new_pin_env,
+            new_pin_stdin,
+            path,
+        } => {
+            let new_pin = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            run_fido_pin_set(path.as_deref(), &new_pin)?;
+            Ok(())
+        }
+        FidoCmd::PinChange {
+            old_pin_env,
+            old_pin_stdin,
+            new_pin_env,
+            new_pin_stdin,
+            path,
+        } => {
+            let old_pin = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
+            let new_pin = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            run_fido_pin_change(path.as_deref(), &old_pin, &new_pin)?;
+            Ok(())
+        }
+        FidoCmd::CredsMetadata {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_creds_metadata(path.as_deref(), &pin)?;
+            Ok(())
+        }
+        FidoCmd::CredsList {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_creds_list(path.as_deref(), &pin)?;
+            Ok(())
+        }
+        FidoCmd::CredsDelete {
+            cred_id,
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let cred_id_bytes =
+                hex_decode(cred_id).map_err(|e| format!("--cred-id is not valid hex: {}", e))?;
+            run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
+            Ok(())
+        }
+    }
+}
+
 fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
     let path = resolve_fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
@@ -4202,5 +4211,30 @@ fn main() -> ExitCode {
             eprintln!("error: worker thread panicked");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn clap_command_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn fido_is_nested() {
+        assert!(parse(&["keyroostctl", "fido", "info"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "pin-set", "--new-pin-stdin"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "creds-list"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido-info"]).is_err());
+        assert!(parse(&["keyroostctl", "fido-creds-list"]).is_err());
     }
 }
