@@ -3621,8 +3621,16 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             new_pin_env,
             new_pin_stdin,
         } => {
-            let old = read_secret("old admin PIN (PW3)", old_pin_env.as_deref(), *old_pin_stdin)?;
-            let new = read_secret("new admin PIN (PW3)", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let old = read_secret(
+                "old admin PIN (PW3)",
+                old_pin_env.as_deref(),
+                *old_pin_stdin,
+            )?;
+            let new = read_secret(
+                "new admin PIN (PW3)",
+                new_pin_env.as_deref(),
+                *new_pin_stdin,
+            )?;
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.change_admin_pin(old.as_bytes(), new.as_bytes())?;
             println!("Admin PIN (PW3) changed.");
@@ -5082,9 +5090,30 @@ mod cli_tests {
 
     #[test]
     fn openpgp_pin_commands_parse() {
-        assert!(Cli::try_parse_from(["keyroostctl", "openpgp", "change-pin", "--old-pin-stdin", "--new-pin-stdin"]).is_ok());
-        assert!(Cli::try_parse_from(["keyroostctl", "openpgp", "change-admin-pin", "--old-pin-stdin", "--new-pin-stdin"]).is_ok());
-        assert!(Cli::try_parse_from(["keyroostctl", "openpgp", "unblock-pin", "--admin-pin-stdin", "--new-pin-stdin"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "keyroostctl",
+            "openpgp",
+            "change-pin",
+            "--old-pin-stdin",
+            "--new-pin-stdin"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "keyroostctl",
+            "openpgp",
+            "change-admin-pin",
+            "--old-pin-stdin",
+            "--new-pin-stdin"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "keyroostctl",
+            "openpgp",
+            "unblock-pin",
+            "--admin-pin-stdin",
+            "--new-pin-stdin"
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -5151,7 +5180,10 @@ mod cli_tests {
             kind: "key",
             caps: vec!["FIDO2", "OATH", "PIV"],
         };
-        assert_json_has_keys(&d, &["vendor", "model", "serial", "transport", "kind", "caps"]);
+        assert_json_has_keys(
+            &d,
+            &["vendor", "model", "serial", "transport", "kind", "caps"],
+        );
         // The whole overview is a JSON array of these.
         let arr = serde_json::to_string(&vec![d]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
@@ -5249,7 +5281,13 @@ mod cli_tests {
         };
         assert_json_has_keys(
             &o,
-            &["aid", "sig_algo", "pin_retries_pw1", "pin_retries_pw3", "signature_count"],
+            &[
+                "aid",
+                "sig_algo",
+                "pin_retries_pw1",
+                "pin_retries_pw3",
+                "signature_count",
+            ],
         );
     }
 
@@ -5298,7 +5336,14 @@ mod cli_tests {
         };
         assert_json_has_keys(
             &e,
-            &["app", "account", "otp_type", "algorithm", "code", "touch_required"],
+            &[
+                "app",
+                "account",
+                "otp_type",
+                "algorithm",
+                "code",
+                "touch_required",
+            ],
         );
         // Withheld (touch-required) entry: code serializes as JSON null.
         let withheld = json_out::OtpEntryJson {
@@ -5312,7 +5357,10 @@ mod cli_tests {
         let s = serde_json::to_string(&withheld).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert!(v.get("code").unwrap().is_null());
-        assert_eq!(v.get("touch_required").unwrap(), &serde_json::Value::Bool(true));
+        assert_eq!(
+            v.get("touch_required").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
         // `otp list` emits a JSON array.
         let arr = serde_json::to_string(&vec![e]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
