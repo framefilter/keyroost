@@ -454,6 +454,15 @@ management-key algorithm + whether the Yubico PIV extensions are supported, and
 the OATH applet variant — enough to gauge how close their implementation sits to
 the specs keyroost already targets.
 
+**Landed (v0.6.0):** per-device parity audit done — the only gap was OpenPGP PIN
+management, now fixed (`openpgp change-pin` / `change-admin-pin` / `unblock-pin`).
+The `--json` query-subset shipped (status/info/list-style commands). PR #30 was
+folded into v0.6.0 (Token2 PIN+ fingerprint/bio enrollment, FIDO MDS display,
+on-device OTP rounding-out), all validated on real PIN+ hardware — so the
+"experimental labeling / open-an-issue research" plan above is **superseded for
+the FIDO / OTP / bio path**; only the OATH / OpenPGP / PIV smart-card applets
+remain experimental (untested on PIN+ by this project).
+
 ### Phase 5 — Bug sweep + hardware workflow walkthrough
 Fresh per-device end-to-end pass on available hardware (YubiKey, Solo 2,
 Molto2; Token2 FIDO via the vendor / @My1). The bare-invocation "is the device

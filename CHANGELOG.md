@@ -15,6 +15,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not just a subset, so one named key can be addressed consistently everywhere.
 - **Per-group man pages** — `keyroostctl manpage <DIR>` now writes a directory
   set of man pages (one per command group) instead of a single page on stdout.
+- **Global `--json` output mode** for the status/query commands — `list` /
+  overview, `*/status`, `*/info`, `fido pin-retries` / `creds-list` /
+  `creds-metadata`, `oath list` / `code`, and `otp list` / `get` / `serial` can
+  now emit machine-readable JSON instead of human text.
+- **OpenPGP PIN management** — `openpgp change-pin`, `openpgp change-admin-pin`,
+  and `openpgp unblock-pin`, closing the OpenPGP PIN-management gap.
+- **Token2 PIN+ fingerprint enrollment** (`fido fingerprint-list` / `enroll` /
+  `rename` / `delete`), FIDO Metadata Service (MDS) metadata in the GUI, and
+  on-device OTP improvements — contributed by
+  [@token2](https://github.com/token2)
+  ([#29](https://github.com/framefilter/keyroost/pull/29),
+  [#30](https://github.com/framefilter/keyroost/pull/30)).
 
 ### Changed
 - **BREAKING: commands nested under `molto` and `fido` groups.** The flat

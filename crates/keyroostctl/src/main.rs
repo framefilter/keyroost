@@ -2525,6 +2525,13 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                     .name_for(eff.as_deref())
                     .map(|n| format!(" name={}", n))
                     .unwrap_or_default();
+                let model = if d.vendor_id == keyroost_proto::USB_VID {
+                    keyroost_proto::token2_pid_label(d.product_id)
+                        .map(|l| format!("{} [{}]", d.product_name, l))
+                        .unwrap_or_else(|| d.product_name.clone())
+                } else {
+                    d.product_name.clone()
+                };
                 println!(
                     "  {} {:04x}:{:04x} usage={:04x}:{:04x} {}{}{}{}",
                     d.path.display(),
@@ -2532,7 +2539,7 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                     d.product_id,
                     d.usage_page,
                     d.usage,
-                    d.product_name,
+                    model,
                     serial,
                     name,
                     tag,

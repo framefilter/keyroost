@@ -50,7 +50,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 | Device | Capabilities | Notes |
 |---|---|---|
 | **Token2 Molto2 / Molto2v2** | TOTP slot programming | The original target. |
-| **Token2 PIN+ Series** | FIDO2, OTP, OpenPGP, PIV | On-device OTP (TOTP/HOTP, incl. HID/keyboard HOTP) over USB-HID / NFC / CCID; OpenPGP + PIV applets per Token2. Contributed by [@token2](https://github.com/token2). |
+| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP, incl. HID/keyboard HOTP) over USB-HID / NFC / CCID — all validated on PIN+ hardware. Contributed by [@token2](https://github.com/token2). The OATH / OpenPGP / PIV smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
 | **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. |
 | **Nitrokey 3** | FIDO2, OATH | Shares the Solo 2 / Trussed stack. |
@@ -87,7 +87,11 @@ Beyond the maintainers, keyroost is grateful for community contributions:
 - **[@token2](https://github.com/token2)** — contributed on-device TOTP/HOTP
   management for Token2 FIDO keys (PIN+ / FIDO2+), and published the protocol
   reference it was built from
-  ([#24](https://github.com/framefilter/keyroost/pull/24)).
+  ([#24](https://github.com/framefilter/keyroost/pull/24)). Followed up with
+  fingerprint/bio enrollment, FIDO Metadata Service (MDS) display, and a
+  rounding-out of the on-device OTP support — all validated on real PIN+
+  hardware ([#29](https://github.com/framefilter/keyroost/pull/29),
+  [#30](https://github.com/framefilter/keyroost/pull/30)).
 
 (This credits their contribution to the codebase; it does not change keyroost's
 independent status described above.)
