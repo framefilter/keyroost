@@ -2125,16 +2125,16 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("Applet probe (per reader):");
-    let probes = match keyroost_transport::probe_readers() {
-        Ok(p) => p,
+    let (probes, probe_ok) = match keyroost_transport::probe_readers() {
+        Ok(p) => (p, true),
         Err(e) => {
             println!("  (unavailable: {})", e);
-            Vec::new()
+            (Vec::new(), false)
         }
     };
-    if probes.is_empty() {
+    if probe_ok && probes.is_empty() {
         println!("  (no readers)");
-    } else {
+    } else if probe_ok {
         for p in &probes {
             if p.is_molto2 {
                 println!("  {}  [Molto2 token]", p.reader_name);
@@ -2166,15 +2166,15 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
         "FIDO HID devices:"
     };
     println!("{}", header);
-    let hids = match keyroost_hid::enumerate() {
-        Ok(d) => d,
+    let (hids, hids_ok) = match keyroost_hid::enumerate() {
+        Ok(d) => (d, true),
         Err(e) => {
             println!("  (unavailable: {})", e);
-            Vec::new()
+            (Vec::new(), false)
         }
     };
     let keyring = Keyring::load_default().unwrap_or_default();
-    {
+    if hids_ok {
         let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
         if filtered.is_empty() {
             println!("  (none)");
