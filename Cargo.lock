@@ -1816,6 +1816,8 @@ dependencies = [
  "keyroost-rsakey",
  "keyroost-token2otp",
  "keyroost-transport",
+ "serde",
+ "serde_json",
  "zeroize",
 ]
 

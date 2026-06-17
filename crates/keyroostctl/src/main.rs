@@ -27,6 +27,136 @@ mod overview;
 /// resolver can honor it without threading it through every subcommand handler.
 static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
 
+/// Whether the global `--json` flag was set, captured once in `run()` so the
+/// status/query handlers can switch output without threading it through.
+static JSON_OUTPUT: OnceLock<bool> = OnceLock::new();
+
+fn json_output() -> bool {
+    *JSON_OUTPUT.get().unwrap_or(&false)
+}
+
+/// Pretty-print a serializable value as JSON to stdout (the `--json` path for
+/// the status/query commands).
+fn emit_json<T: serde::Serialize>(value: &T) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// Serializable shapes for the global `--json` output mode. Each struct mirrors
+/// 1:1 the data the corresponding command's human handler already prints — no
+/// new data, only structure.
+mod json_out {
+    use serde::Serialize;
+
+    /// One device in the bare-invocation overview (`keyroostctl --json`).
+    #[derive(Serialize)]
+    pub struct DeviceJson {
+        pub vendor: String,
+        pub model: String,
+        pub name: Option<String>,
+        pub serial: String,
+        pub transport: String,
+        /// "key" or "token".
+        pub kind: &'static str,
+        pub caps: Vec<&'static str>,
+    }
+
+    /// `keyroostctl molto --json info`.
+    #[derive(Serialize)]
+    pub struct MoltoInfoJson {
+        pub serial: String,
+        pub utc: u32,
+        pub drift_seconds: i64,
+    }
+
+    /// `keyroostctl fido --json info` — the CTAP2 authenticatorGetInfo fields the
+    /// human handler prints (plus the CTAPHID transport facts).
+    #[derive(Serialize)]
+    pub struct FidoInfoJson {
+        pub device: String,
+        pub channel_id: u32,
+        pub ctaphid_protocol_version: u8,
+        pub firmware: String,
+        pub hid_caps: Vec<&'static str>,
+        pub hid_caps_raw: u8,
+        /// Present only when the device speaks CTAP2 (CBOR-capable).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub ctap2: Option<Ctap2InfoJson>,
+    }
+
+    /// The authenticatorGetInfo payload (CTAP2 devices only).
+    #[derive(Serialize)]
+    pub struct Ctap2InfoJson {
+        pub versions: Vec<String>,
+        pub extensions: Vec<String>,
+        pub aaguid: String,
+        pub options: Vec<OptionJson>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub max_msg_size: Option<u64>,
+        pub pin_uv_auth_protocols: Vec<u64>,
+        pub transports: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub firmware_version: Option<u64>,
+    }
+
+    /// One authenticator option (e.g. `{ "name": "rk", "value": true }`).
+    #[derive(Serialize)]
+    pub struct OptionJson {
+        pub name: String,
+        pub value: bool,
+    }
+
+    /// `keyroostctl fido --json pin-retries`.
+    #[derive(Serialize)]
+    pub struct FidoPinRetriesJson {
+        pub pin_retries: u32,
+    }
+
+    /// `keyroostctl piv --json status`.
+    #[derive(Serialize)]
+    pub struct PivStatusJson {
+        pub version: Option<String>,
+        pub serial: Option<u32>,
+        pub pin_retries: Option<u8>,
+        pub slots: Vec<PivSlotJson>,
+    }
+
+    /// One PIV key slot in the status output.
+    #[derive(Serialize)]
+    pub struct PivSlotJson {
+        pub slot: String,
+        pub cert_present: bool,
+        pub cert_len: usize,
+    }
+
+    /// `keyroostctl openpgp --json status`.
+    #[derive(Serialize)]
+    pub struct OpenpgpStatusJson {
+        pub aid: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub serial: Option<u32>,
+        pub sig_algo: String,
+        pub dec_algo: String,
+        pub aut_algo: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub fingerprint_sig: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub fingerprint_dec: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub fingerprint_aut: Option<String>,
+        pub pin_retries_pw1: u8,
+        pub pin_retries_rc: u8,
+        pub pin_retries_pw3: u8,
+        pub signature_count: Option<u32>,
+    }
+
+    /// `keyroostctl otp --json serial`.
+    #[derive(Serialize)]
+    pub struct OtpSerialJson {
+        pub serial: String,
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "keyroostctl",
@@ -44,6 +174,10 @@ struct Cli {
     /// Resolves to the device's current path. Mutually exclusive with --path.
     #[arg(long, global = true, value_name = "NAME")]
     name: Option<String>,
+    /// Emit machine-readable JSON instead of human text (where supported: status
+    /// and query commands). Side-effect commands ignore it.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -1565,6 +1699,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Capture --name once so resolve_fido_path() can honor it without threading
     // it through every FIDO subcommand handler.
     let _ = SELECTED_KEY_NAME.set(cli.name.clone());
+    let _ = JSON_OUTPUT.set(cli.json);
 
     if cli.list_readers {
         for r in Session::list_readers()? {
@@ -1577,6 +1712,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // No subcommand → the friendly correlated overview of every connected
         // device. (The Molto2 serial/clock still lives under `molto info`.)
         let devices = keyroost_resolve::enumerate()?;
+        if json_output() {
+            use keyroost_resolve::DeviceKind;
+            let out: Vec<json_out::DeviceJson> = devices
+                .iter()
+                .map(|d| json_out::DeviceJson {
+                    vendor: d.vendor.clone(),
+                    model: d.model.clone(),
+                    name: d.name.clone(),
+                    serial: d.serial.clone(),
+                    transport: d.transport.clone(),
+                    kind: match d.kind {
+                        DeviceKind::Key => "key",
+                        DeviceKind::Token => "token",
+                    },
+                    caps: d.cap_badges(),
+                })
+                .collect();
+            emit_json(&out)?;
+            return Ok(());
+        }
         overview::print_overview(&devices);
         return Ok(());
     };
@@ -1705,6 +1860,14 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
         let mut session = Session::open()?;
         session.set_debug(debug);
         let info = session.read_info()?;
+        if json_output() {
+            emit_json(&json_out::MoltoInfoJson {
+                serial: info.serial.clone(),
+                utc: info.utc_time,
+                drift_seconds: i64::from(info.utc_time) - i64::from(unix_now()),
+            })?;
+            return Ok(());
+        }
         print_info(&info);
         return Ok(());
     }
@@ -2831,6 +2994,10 @@ fn run_otp(
             let mut session = open_otp(transport, debug)?;
             let sn = session.read_serial()?;
             let hex: String = sn.iter().map(|b| format!("{b:02x}")).collect();
+            if json_output() {
+                emit_json(&json_out::OtpSerialJson { serial: hex })?;
+                return Ok(());
+            }
             println!("{hex}");
         }
         OtpCmd::ButtonHotp {
@@ -3019,6 +3186,33 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         OpenpgpCmd::Status { reader } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             let status = session.status()?;
+
+            if json_output() {
+                // An all-zero fingerprint means "no key in that slot" — mirror the
+                // human "(none)" by emitting null rather than 40 zeros.
+                let fpr = |f: &[u8; 20]| -> Option<String> {
+                    if f.iter().all(|&b| b == 0) {
+                        None
+                    } else {
+                        Some(hex_encode(f))
+                    }
+                };
+                emit_json(&json_out::OpenpgpStatusJson {
+                    aid: hex_encode(&status.aid),
+                    serial: status.serial(),
+                    sig_algo: algo_id_str(status.sig_algo_id).to_string(),
+                    dec_algo: algo_id_str(status.dec_algo_id).to_string(),
+                    aut_algo: algo_id_str(status.aut_algo_id).to_string(),
+                    fingerprint_sig: fpr(&status.fingerprint_sig),
+                    fingerprint_dec: fpr(&status.fingerprint_dec),
+                    fingerprint_aut: fpr(&status.fingerprint_aut),
+                    pin_retries_pw1: status.tries_pw1,
+                    pin_retries_rc: status.tries_rc,
+                    pin_retries_pw3: status.tries_pw3,
+                    signature_count: status.signature_count,
+                })?;
+                return Ok(());
+            }
 
             println!("AID:            {}", hex_encode(&status.aid));
             if let Some(serial) = status.serial() {
@@ -3327,6 +3521,24 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         PivCmd::Status { reader } => {
             let mut session = open_piv(reader.as_deref(), debug)?;
             let status = session.status()?;
+
+            if json_output() {
+                emit_json(&json_out::PivStatusJson {
+                    version: status.version.map(|(a, b, c)| format!("{a}.{b}.{c}")),
+                    serial: status.serial,
+                    pin_retries: status.pin_retries,
+                    slots: status
+                        .slots
+                        .iter()
+                        .map(|s| json_out::PivSlotJson {
+                            slot: s.slot.label().to_string(),
+                            cert_present: s.cert_present,
+                            cert_len: s.cert_len,
+                        })
+                        .collect(),
+                })?;
+                return Ok(());
+            }
 
             match status.version {
                 Some((a, b, c)) => println!("Version:     {}.{}.{}", a, b, c),
@@ -3963,15 +4175,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
 fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
     let path = resolve_fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
-    println!("Device:    {}", path.display());
-    println!(
-        "Channel:   {:#010x} (CTAPHID protocol v{})",
-        init.channel_id, init.protocol_version
-    );
-    println!(
-        "Firmware:  {}.{}.{}",
-        init.device_major, init.device_minor, init.device_build
-    );
+    let json = json_output();
     let mut caps = Vec::new();
     if init.supports_wink() {
         caps.push("WINK");
@@ -3982,19 +4186,78 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
     if init.supports_u2f() {
         caps.push("U2F");
     }
-    println!(
-        "Caps:      {} (raw 0x{:02X})",
-        caps.join("+"),
-        init.capabilities
-    );
+    if !json {
+        println!("Device:    {}", path.display());
+        println!(
+            "Channel:   {:#010x} (CTAPHID protocol v{})",
+            init.channel_id, init.protocol_version
+        );
+        println!(
+            "Firmware:  {}.{}.{}",
+            init.device_major, init.device_minor, init.device_build
+        );
+        println!(
+            "Caps:      {} (raw 0x{:02X})",
+            caps.join("+"),
+            init.capabilities
+        );
+    }
 
     if !init.supports_cbor() {
+        if json {
+            emit_json(&json_out::FidoInfoJson {
+                device: path.display().to_string(),
+                channel_id: init.channel_id,
+                ctaphid_protocol_version: init.protocol_version,
+                firmware: format!(
+                    "{}.{}.{}",
+                    init.device_major, init.device_minor, init.device_build
+                ),
+                hid_caps: caps,
+                hid_caps_raw: init.capabilities,
+                ctap2: None,
+            })?;
+            return Ok(());
+        }
         println!();
         println!("(device is U2F-only; CTAP2 GetInfo not available)");
         return Ok(());
     }
 
     let info = keyroost_ctap::get_info(&mut dev)?;
+
+    if json {
+        emit_json(&json_out::FidoInfoJson {
+            device: path.display().to_string(),
+            channel_id: init.channel_id,
+            ctaphid_protocol_version: init.protocol_version,
+            firmware: format!(
+                "{}.{}.{}",
+                init.device_major, init.device_minor, init.device_build
+            ),
+            hid_caps: caps,
+            hid_caps_raw: init.capabilities,
+            ctap2: Some(json_out::Ctap2InfoJson {
+                versions: info.versions.clone(),
+                extensions: info.extensions.clone(),
+                aaguid: format_aaguid(&info.aaguid),
+                options: info
+                    .options
+                    .iter()
+                    .map(|(k, v)| json_out::OptionJson {
+                        name: k.clone(),
+                        value: *v,
+                    })
+                    .collect(),
+                max_msg_size: info.max_msg_size,
+                pin_uv_auth_protocols: info.pin_uv_auth_protocols.clone(),
+                transports: info.transports.clone(),
+                firmware_version: info.firmware_version,
+            }),
+        })?;
+        return Ok(());
+    }
+
     println!();
     println!("Versions:  {}", info.versions.join(", "));
     if !info.extensions.is_empty() {
@@ -4042,6 +4305,10 @@ fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn st
     let path = resolve_fido_path(path)?;
     let (mut dev, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
     let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
+    if json_output() {
+        emit_json(&json_out::FidoPinRetriesJson { pin_retries: n })?;
+        return Ok(());
+    }
     println!("{} PIN attempt(s) remaining", n);
     Ok(())
 }
@@ -4686,5 +4953,146 @@ mod cli_tests {
         ] {
             assert!(parse(g).is_ok(), "should parse: {:?}", g);
         }
+    }
+
+    #[test]
+    fn json_flag_parses_globally() {
+        assert!(parse(&["keyroostctl", "--json", "piv", "status"]).is_ok());
+        assert!(parse(&["keyroostctl", "--json", "fido", "info"]).is_ok());
+        assert!(parse(&["keyroostctl", "--json", "molto", "info"]).is_ok());
+        // Position-insensitive: --json after the subcommand also works (global).
+        assert!(parse(&["keyroostctl", "piv", "status", "--json"]).is_ok());
+    }
+
+    /// Serialize `value`, assert it parses back to a JSON object, and assert
+    /// every key in `keys` is present at the top level.
+    fn assert_json_has_keys<T: serde::Serialize>(value: &T, keys: &[&str]) {
+        let s = serde_json::to_string(value).expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("parse back");
+        let obj = v.as_object().expect("top-level object");
+        for k in keys {
+            assert!(obj.contains_key(*k), "missing key {k:?} in {s}");
+        }
+    }
+
+    #[test]
+    fn device_json_serializes() {
+        let d = json_out::DeviceJson {
+            vendor: "Yubico".into(),
+            model: "YubiKey 5".into(),
+            name: Some("work".into()),
+            serial: "12345678".into(),
+            transport: "USB · PC/SC + FIDO HID".into(),
+            kind: "key",
+            caps: vec!["FIDO2", "OATH", "PIV"],
+        };
+        assert_json_has_keys(&d, &["vendor", "model", "serial", "transport", "kind", "caps"]);
+        // The whole overview is a JSON array of these.
+        let arr = serde_json::to_string(&vec![d]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn molto_info_json_serializes() {
+        let m = json_out::MoltoInfoJson {
+            serial: "ABC123".into(),
+            utc: 1_700_000_000,
+            drift_seconds: -3,
+        };
+        assert_json_has_keys(&m, &["serial", "utc", "drift_seconds"]);
+    }
+
+    #[test]
+    fn fido_info_json_serializes() {
+        // CTAP2 device: ctap2 present.
+        let f = json_out::FidoInfoJson {
+            device: "/dev/hidraw0".into(),
+            channel_id: 0xdead_beef,
+            ctaphid_protocol_version: 2,
+            firmware: "5.4.3".into(),
+            hid_caps: vec!["CBOR", "U2F"],
+            hid_caps_raw: 0x0d,
+            ctap2: Some(json_out::Ctap2InfoJson {
+                versions: vec!["FIDO_2_0".into()],
+                extensions: vec!["hmac-secret".into()],
+                aaguid: "00000000-0000-0000-0000-000000000000".into(),
+                options: vec![json_out::OptionJson {
+                    name: "rk".into(),
+                    value: true,
+                }],
+                max_msg_size: Some(1200),
+                pin_uv_auth_protocols: vec![1, 2],
+                transports: vec!["usb".into()],
+                firmware_version: Some(328706),
+            }),
+        };
+        assert_json_has_keys(
+            &f,
+            &["device", "channel_id", "firmware", "hid_caps", "ctap2"],
+        );
+        // U2F-only device: ctap2 omitted entirely (skip_serializing_if).
+        let u = json_out::FidoInfoJson {
+            device: "/dev/hidraw1".into(),
+            channel_id: 1,
+            ctaphid_protocol_version: 2,
+            firmware: "1.0.0".into(),
+            hid_caps: vec!["U2F"],
+            hid_caps_raw: 0x08,
+            ctap2: None,
+        };
+        let s = serde_json::to_string(&u).unwrap();
+        assert!(!s.contains("ctap2"), "ctap2 should be omitted: {s}");
+    }
+
+    #[test]
+    fn fido_pin_retries_json_serializes() {
+        let p = json_out::FidoPinRetriesJson { pin_retries: 8 };
+        assert_json_has_keys(&p, &["pin_retries"]);
+    }
+
+    #[test]
+    fn piv_status_json_serializes() {
+        let p = json_out::PivStatusJson {
+            version: Some("5.4.3".into()),
+            serial: Some(12345678),
+            pin_retries: Some(3),
+            slots: vec![json_out::PivSlotJson {
+                slot: "9a (Authentication)".into(),
+                cert_present: true,
+                cert_len: 800,
+            }],
+        };
+        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "slots"]);
+    }
+
+    #[test]
+    fn openpgp_status_json_serializes() {
+        let o = json_out::OpenpgpStatusJson {
+            aid: "d2760001240103040006...".into(),
+            serial: Some(12345678),
+            sig_algo: "RSA".into(),
+            dec_algo: "RSA".into(),
+            aut_algo: "RSA".into(),
+            fingerprint_sig: Some("aabb...".into()),
+            fingerprint_dec: None,
+            fingerprint_aut: None,
+            pin_retries_pw1: 3,
+            pin_retries_rc: 0,
+            pin_retries_pw3: 3,
+            signature_count: Some(7),
+        };
+        assert_json_has_keys(
+            &o,
+            &["aid", "sig_algo", "pin_retries_pw1", "pin_retries_pw3", "signature_count"],
+        );
+    }
+
+    #[test]
+    fn otp_serial_json_serializes() {
+        let s = json_out::OtpSerialJson {
+            serial: "0123456789ab".into(),
+        };
+        assert_json_has_keys(&s, &["serial"]);
     }
 }
