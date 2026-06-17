@@ -2191,7 +2191,10 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     ""
                 };
-                let eff = d.serial_number.clone().or_else(|| ccid_serial_for(d, &ccid));
+                let eff = d
+                    .serial_number
+                    .clone()
+                    .or_else(|| ccid_serial_for(d, &ccid));
                 let serial = match (&d.serial_number, &eff) {
                     (Some(s), _) => format!(" serial={}", s),
                     (None, Some(s)) => format!(" serial={}(ccid)", s),

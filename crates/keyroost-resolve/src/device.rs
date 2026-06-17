@@ -626,18 +626,50 @@ mod tests {
     #[test]
     fn cap_badges_vocabulary() {
         // A Token shows a single "TOTP token" badge regardless of other bits.
-        let probes = [probe("TOKEN2 Molto2 02 00", true, false, false, false, None, Some(9), Some(4))];
+        let probes = [probe(
+            "TOKEN2 Molto2 02 00",
+            true,
+            false,
+            false,
+            false,
+            None,
+            Some(9),
+            Some(4),
+        )];
         let molto = &correlate(&[], &probes, &Keyring::default())[0];
         assert_eq!(molto.cap_badges(), vec!["TOTP token"]);
 
         // A Token2 FIDO key (FIDO2 + OTP by PID) badges both, in canonical order.
-        let hids = [hid(keyroost_proto::USB_VID, 0x0013, "/dev/hidraw9", Some("S1"), Some(9), Some(4))];
+        let hids = [hid(
+            keyroost_proto::USB_VID,
+            0x0013,
+            "/dev/hidraw9",
+            Some("S1"),
+            Some(9),
+            Some(4),
+        )];
         let key = &correlate(&hids, &[], &Keyring::default())[0];
         assert_eq!(key.cap_badges(), vec!["FIDO2", "OTP"]);
 
         // A full YubiKey badges FIDO2/OATH/PGP/PIV in order (no OTP).
-        let yk_probe = [probe("Yubico YubiKey OTP+FIDO+CCID 00 00", false, true, true, true, Some("37806840"), Some(9), Some(16))];
-        let yk_hid = [hid(0x1050, 0x0407, "/dev/hidraw17", None, Some(9), Some(16))];
+        let yk_probe = [probe(
+            "Yubico YubiKey OTP+FIDO+CCID 00 00",
+            false,
+            true,
+            true,
+            true,
+            Some("37806840"),
+            Some(9),
+            Some(16),
+        )];
+        let yk_hid = [hid(
+            0x1050,
+            0x0407,
+            "/dev/hidraw17",
+            None,
+            Some(9),
+            Some(16),
+        )];
         let yk = &correlate(&yk_hid, &yk_probe, &Keyring::default())[0];
         assert_eq!(yk.cap_badges(), vec!["FIDO2", "OATH", "PGP", "PIV"]);
     }

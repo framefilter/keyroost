@@ -29,7 +29,9 @@ fn short_serial(serial: &str) -> String {
 /// Abbreviate the `Device.transport` string for the overview column
 /// (e.g. "USB · PC/SC + FIDO HID" → "USB·PC/SC+HID").
 fn short_transport(t: &str) -> String {
-    t.replace("FIDO HID", "HID").replace(" · ", "·").replace(" + ", "+")
+    t.replace("FIDO HID", "HID")
+        .replace(" · ", "·")
+        .replace(" + ", "+")
 }
 
 /// The aligned overview rows (the "Connected devices" header is added by the
@@ -38,10 +40,26 @@ pub fn overview_lines(devices: &[Device]) -> Vec<String> {
     if devices.is_empty() {
         return vec!["No devices connected.".to_string()];
     }
-    let wv = devices.iter().map(|d| d.vendor.chars().count()).max().unwrap_or(0);
-    let wm = devices.iter().map(|d| label(d).chars().count()).max().unwrap_or(0);
-    let wb = devices.iter().map(|d| badge_line(d).chars().count()).max().unwrap_or(0);
-    let ws = devices.iter().map(|d| short_serial(&d.serial).chars().count()).max().unwrap_or(0);
+    let wv = devices
+        .iter()
+        .map(|d| d.vendor.chars().count())
+        .max()
+        .unwrap_or(0);
+    let wm = devices
+        .iter()
+        .map(|d| label(d).chars().count())
+        .max()
+        .unwrap_or(0);
+    let wb = devices
+        .iter()
+        .map(|d| badge_line(d).chars().count())
+        .max()
+        .unwrap_or(0);
+    let ws = devices
+        .iter()
+        .map(|d| short_serial(&d.serial).chars().count())
+        .max()
+        .unwrap_or(0);
     devices
         .iter()
         .map(|d| {
@@ -114,8 +132,15 @@ mod tests {
     use super::*;
     use keyroost_resolve::{Caps, DeviceKind};
 
-    fn dev(vendor: &str, model: &str, name: Option<&str>, serial: &str, transport: &str,
-           caps: Caps, kind: DeviceKind) -> Device {
+    fn dev(
+        vendor: &str,
+        model: &str,
+        name: Option<&str>,
+        serial: &str,
+        transport: &str,
+        caps: Caps,
+        kind: DeviceKind,
+    ) -> Device {
         Device {
             id: format!("test:{serial}"),
             name: name.map(str::to_owned),
@@ -162,10 +187,24 @@ mod tests {
     #[test]
     fn overview_aligns_columns_and_uses_name_over_model() {
         let devices = [
-            dev("Yubico", "YubiKey", Some("work-key"), "37806840", "USB · PC/SC + FIDO HID",
-                caps_of(&[Caps::FIDO2, Caps::OATH, Caps::PGP, Caps::PIV]), DeviceKind::Key),
-            dev("Token2", "Molto2", None, "5C7D6241EF67245B", "USB · PC/SC",
-                caps_of(&[Caps::TOTP]), DeviceKind::Token),
+            dev(
+                "Yubico",
+                "YubiKey",
+                Some("work-key"),
+                "37806840",
+                "USB · PC/SC + FIDO HID",
+                caps_of(&[Caps::FIDO2, Caps::OATH, Caps::PGP, Caps::PIV]),
+                DeviceKind::Key,
+            ),
+            dev(
+                "Token2",
+                "Molto2",
+                None,
+                "5C7D6241EF67245B",
+                "USB · PC/SC",
+                caps_of(&[Caps::TOTP]),
+                DeviceKind::Token,
+            ),
         ];
         let lines = overview_lines(&devices);
         assert!(lines[0].contains("work-key"));
@@ -179,8 +218,15 @@ mod tests {
 
     #[test]
     fn correlated_line_shows_kind_and_pairing() {
-        let mut d = dev("Token2", "Molto2", None, "5C7D", "USB · PC/SC",
-                        caps_of(&[Caps::TOTP]), DeviceKind::Token);
+        let mut d = dev(
+            "Token2",
+            "Molto2",
+            None,
+            "5C7D",
+            "USB · PC/SC",
+            caps_of(&[Caps::TOTP]),
+            DeviceKind::Token,
+        );
         d.reader = Some("TOKEN2 Molto2 (5C7D) 02 00".into());
         let lines = correlated_lines(&[d]);
         assert!(lines[0].contains("Token"));
