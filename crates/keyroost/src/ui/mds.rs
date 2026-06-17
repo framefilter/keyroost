@@ -133,7 +133,8 @@ impl MdsDb {
         if aaguid.iter().all(|&b| b == 0) {
             return None;
         }
-        self.by_aaguid.get(&super::aaguid::format_aaguid_pub(aaguid))
+        self.by_aaguid
+            .get(&super::aaguid::format_aaguid_pub(aaguid))
     }
 
     /// Merge entries parsed from the slim MDS JSON projection.

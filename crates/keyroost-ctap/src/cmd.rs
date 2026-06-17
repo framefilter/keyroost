@@ -71,12 +71,16 @@ fn ctap_status_hint(code: u8) -> Option<&'static str> {
     Some(match code {
         // The big one for Token2 PIN+ keys: the new PIN doesn't meet the key's
         // complexity policy (length / character mix), not a transient failure.
-        0x37 => "the new PIN doesn't meet this key's complexity requirements \u{2014} \
+        0x37 => {
+            "the new PIN doesn't meet this key's complexity requirements \u{2014} \
                  try a longer PIN or a different mix of characters (Token2 PIN+ \
-                 keys enforce a complexity policy)",
+                 keys enforce a complexity policy)"
+        }
         0x31 => "the PIN was incorrect",
-        0x32 => "too many wrong PIN attempts \u{2014} the key is locked; remove and \
-                 re-insert it, and note it may reset after repeated failures",
+        0x32 => {
+            "too many wrong PIN attempts \u{2014} the key is locked; remove and \
+                 re-insert it, and note it may reset after repeated failures"
+        }
         0x33 => "the PIN authentication was rejected; unlock again and retry",
         0x34 => "too many PIN retries this session \u{2014} remove and re-insert the key",
         0x35 => "no PIN is set on this key yet",

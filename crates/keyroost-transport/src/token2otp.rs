@@ -583,12 +583,10 @@ impl Token2OtpSession {
                 // HID? A hung probe falls through to the CCID fallback below
                 // rather than blocking forever.
                 match probe_hid_owned(t) {
-                    Ok(t) => {
-                        return Ok(Self {
-                            transport: Box::new(t),
-                            is_pcsc: false,
-                        });
-                    }
+                    Ok(t) => Ok(Self {
+                        transport: Box::new(t),
+                        is_pcsc: false,
+                    }),
                     Err(_) => {
                         // HID present but applet unreachable (HID disabled on the
                         // device, or the probe timed out) — try CCID instead.
@@ -896,9 +894,7 @@ impl Token2OtpSession {
     /// Run the ECDH handshake: fetch the device pubkey, then seal `cleartext`
     /// with `iv` (spec §6.3 step 1, §7).
     fn seal(&mut self, cleartext: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, OtpTransportError> {
-        let (device_pub, sw) = self
-            .transport
-            .transmit(&t2::get_ecdh_pubkey(), false)?;
+        let (device_pub, sw) = self.transport.transmit(&t2::get_ecdh_pubkey(), false)?;
         OtpError::check(sw)?;
         Ok(t2::encrypt_seed_payload(&device_pub, cleartext, iv)?)
     }

@@ -152,7 +152,10 @@ impl<'a> BioEnrollment<'a> {
             Err(CtapError::StatusCode(0x2C)) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let Some(arr) = resp.get_uint_key(RESP_TEMPLATE_INFOS).and_then(|v| v.as_array()) else {
+        let Some(arr) = resp
+            .get_uint_key(RESP_TEMPLATE_INFOS)
+            .and_then(|v| v.as_array())
+        else {
             // No templateInfos -> no enrollments.
             return Ok(Vec::new());
         };
@@ -186,7 +189,8 @@ impl<'a> BioEnrollment<'a> {
         // extends its deadline on every KEEPALIVE, but raise the base timeout too
         // so a device that sends sparse keepalives still gets time to capture.
         self.dev.set_timeout(std::time::Duration::from_secs(30));
-        let params = timeout_ms.map(|t| Value::Map(vec![(Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t))]));
+        let params =
+            timeout_ms.map(|t| Value::Map(vec![(Value::UInt(PARAM_TIMEOUT_MS), Value::UInt(t))]));
         let resp = self.dispatch(SUB_ENROLL_BEGIN, params)?;
         let template_id = resp
             .get_uint_key(RESP_TEMPLATE_ID)
@@ -389,9 +393,13 @@ mod tests {
             .and_then(|v| v.as_array())
             .unwrap();
         assert_eq!(arr.len(), 2);
-        let first_name = arr[0].get_uint_key(TI_FRIENDLY_NAME).and_then(|v| v.as_text());
+        let first_name = arr[0]
+            .get_uint_key(TI_FRIENDLY_NAME)
+            .and_then(|v| v.as_text());
         assert_eq!(first_name, Some("left thumb"));
-        let second_name = arr[1].get_uint_key(TI_FRIENDLY_NAME).and_then(|v| v.as_text());
+        let second_name = arr[1]
+            .get_uint_key(TI_FRIENDLY_NAME)
+            .and_then(|v| v.as_text());
         assert_eq!(second_name, None);
     }
 

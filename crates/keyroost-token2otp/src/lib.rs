@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(read_config(64), vec![0x80, 0xC5, 0x02, 0x00, 0x40]);
         assert_eq!(*read_config(0).last().unwrap(), 0x01); // clamped to >=1
         assert_eq!(*read_config(200).last().unwrap(), 0x40); // clamped to <=64
-        // §1.1 pubkey read: short case-2 with Le=0x00.
+                                                             // §1.1 pubkey read: short case-2 with Le=0x00.
         assert_eq!(get_ecdh_pubkey(), vec![0x80, 0xC5, 0x01, 0x00, 0x00]);
     }
 

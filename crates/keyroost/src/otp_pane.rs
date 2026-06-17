@@ -599,33 +599,30 @@ impl App {
         let sel = self.otp.transport;
         let for_device = self.selected_device.clone();
         let key = (app_name.clone(), account_name.clone());
-        self.spawn_job(
-            "Reading code \u{2014} touch your key\u{2026}",
-            move || {
-                let result = (|| -> Result<Option<String>, String> {
-                    let mut session = sel.open().map_err(|e| e.to_string())?;
-                    let now = unix_now();
-                    let entry = session
-                        .read_entry(now, &app_name, &account_name)
-                        .map_err(|e| e.to_string())?;
-                    Ok(entry.code)
-                })();
-                Box::new(move |app: &mut App| {
-                    if app.selected_device != for_device {
-                        return;
+        self.spawn_job("Reading code \u{2014} touch your key\u{2026}", move || {
+            let result = (|| -> Result<Option<String>, String> {
+                let mut session = sel.open().map_err(|e| e.to_string())?;
+                let now = unix_now();
+                let entry = session
+                    .read_entry(now, &app_name, &account_name)
+                    .map_err(|e| e.to_string())?;
+                Ok(entry.code)
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(Some(code)) => {
+                        app.otp.touch_codes.insert(key, code);
                     }
-                    match result {
-                        Ok(Some(code)) => {
-                            app.otp.touch_codes.insert(key, code);
-                        }
-                        Ok(None) => {
-                            app.otp.error = Some("the key did not return a code".into());
-                        }
-                        Err(e) => app.otp.error = Some(e),
+                    Ok(None) => {
+                        app.otp.error = Some("the key did not return a code".into());
                     }
-                })
-            },
-        );
+                    Err(e) => app.otp.error = Some(e),
+                }
+            })
+        });
     }
 
     /// Apply the HOTP-on-button typing options (send-Enter, long-touch, numpad)
@@ -718,8 +715,8 @@ impl App {
                 let mut kbd_target: Option<bool> = None;
                 let mut new_transport: Option<OtpTransportSel> = None;
 
-                let menu_btn = theme::button(ui, p, BtnKind::Default, "...")
-                    .on_hover_text("More actions");
+                let menu_btn =
+                    theme::button(ui, p, BtnKind::Default, "...").on_hover_text("More actions");
                 let menu_id = ui.make_persistent_id("otp_more_menu");
                 if menu_btn.clicked() {
                     ui.memory_mut(|m| m.toggle_popup(menu_id));
@@ -933,7 +930,11 @@ impl App {
                                 // HOTP codes are counter-based and have no window.
                                 // Use the entry's own time-step (30 or 60s, etc.);
                                 // fall back to 30 if the record reported 0.
-                                let period = if row.period == 0 { 30 } else { row.period as u64 };
+                                let period = if row.period == 0 {
+                                    30
+                                } else {
+                                    row.period as u64
+                                };
                                 let totp = is_totp.then(|| theme::totp_window(period));
                                 let code_color = match totp {
                                     Some((secs, _)) if secs <= 5 => p.warn,
@@ -957,15 +958,12 @@ impl App {
                                 }
                             }
                             None => {
-                                let rkey =
-                                    (row.app_name.clone(), row.account_name.clone());
+                                let rkey = (row.app_name.clone(), row.account_name.clone());
                                 if let Some(code) = touch_codes.get(&rkey) {
                                     // Already read on touch this session — show it
                                     // (TOTP touch entries still have a window, but
                                     // the device gives no countdown for them here).
-                                    if theme::button(ui, p, BtnKind::Default, "Copy")
-                                        .clicked()
-                                    {
+                                    if theme::button(ui, p, BtnKind::Default, "Copy").clicked() {
                                         copy = Some(code.clone());
                                     }
                                     ui.add_space(8.0);
