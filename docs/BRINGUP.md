@@ -86,7 +86,7 @@ This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, 
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 NN`:** the customer key on your device isn't the factory default. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). If you've forgotten it: `keyroostctl factory-reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command); it will wipe every profile and reset the key back to `TOKEN2MOLTO1-KEY`. The device will return `SW 90 60` and display a confirmation prompt — press the up-arrow on the device to commit the reset.
+**If `answer challenge` returns `63 NN`:** the customer key on your device isn't the factory default. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). If you've forgotten it: `keyroostctl molto reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command); it will wipe every profile and reset the key back to `TOKEN2MOLTO1-KEY`. The device will return `SW 90 60` and display a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 
@@ -187,7 +187,7 @@ kernel hidraw numbers **change on each replug**, so enumerate fresh.
 ### Step F2: GetInfo round-trips
 
 ```bash
-keyroostctl fido-info --path /dev/hidrawN
+keyroostctl fido info --path /dev/hidrawN
 ```
 
 **Expected** (sample from a SoloKeys Solo 2, firmware 2.3.196):
@@ -210,20 +210,20 @@ First state-changing step. Use a known throwaway PIN for testing — you'll
 factory-reset before putting the key into real service.
 
 ```bash
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido-pin-set \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido pin-set \
     --path /dev/hidrawN --new-pin-stdin
 ```
 
-**Expected:** `PIN set.` Re-run `fido-info`: `clientPin` should now be
-`true`. `fido-pin-retries` should still show the full attempt counter —
+**Expected:** `PIN set.` Re-run `fido info`: `clientPin` should now be
+`true`. `fido pin-retries` should still show the full attempt counter —
 the initial set doesn't consume a retry.
 
 ### Step F4: PIN-protected read paths
 
 ```bash
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-metadata \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-metadata \
     --path /dev/hidrawN --pin-stdin
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
     --path /dev/hidrawN --pin-stdin
 ```
 
@@ -231,12 +231,12 @@ printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-list \
 more`, and `(no resident credentials)`. The point isn't the (empty)
 contents — it's that the `pinUvAuthToken` exchange (`clientPin` 0x09 with
 `cm` permission) succeeded. A correct PIN must **not** decrement the retry
-counter; verify with `fido-pin-retries` afterwards.
+counter; verify with `fido pin-retries` afterwards.
 
 ### Step F5: Resident-credential round-trip (create → list → delete)
 
 Plant a discoverable credential using `ssh-keygen` as the simplest external
-RP, then exercise `fido-creds-list` and `fido-creds-delete`:
+RP, then exercise `fido creds-list` and `fido creds-delete`:
 
 ```bash
 # Create — needs PIN entry + a physical touch when the key blinks.
@@ -244,15 +244,15 @@ ssh-keygen -t ecdsa-sk -O resident -O application=ssh:moltotest \
            -N '' -f /tmp/sk_moltotest
 
 # Read back — confirm it appears, copy the FULL id= value.
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
     --path /dev/hidrawN --pin-stdin
 
 # Destructive: delete by full credentialId.
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-delete \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-delete \
     --path /dev/hidrawN --cred-id <full hex from id=> --pin-stdin
 
 # Confirm empty.
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido-creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
     --path /dev/hidrawN --pin-stdin
 ```
 

@@ -51,7 +51,7 @@ This is why the work waits for a second identical unit.
 
 - **E1 — USB string descriptors.** `lsusb -v -d <vid:pid> | grep -i iSerial`; `/sys/bus/usb/devices/*/serial`. Note which interface owns the serial (whole-device vs FIDO-only) — matters for constraint #3.
 - **E2 — HID uniq ioctl.** `HIDIOCGRAWUNIQ` on `/dev/hidrawN` (usually empty for USB HID). Confirm.
-- **E3 — AAGUID is model-level (control).** `keyroostctl fido-info` on both units; confirm AAGUID is byte-identical.
+- **E3 — AAGUID is model-level (control).** `keyroostctl fido info` on both units; confirm AAGUID is byte-identical.
 - **E4 — Other-interface serial (privacy-sensitive).** YubiKey exposes a device serial via OTP/CCID. Establish feasibility + cost only; weigh constraint #3. Do not build a reader during research.
 - **E5 — Vendor/management IDs.** Solo 2 / Trussed reports a device UUID via `solo2-cli`. Determine whether it's readable from the **application** (FIDO) interface or only bootloader/management.
 
