@@ -570,6 +570,15 @@ configured (see `packaging/README.md`):
       `keyroost-piv` + transport first** (byte-layer work). (L)
 - [ ] Native file-chooser dialogs for cert/key import — **needs a new dep
       (`rfd`); decide before adopting.** (M)
+- [ ] **Credential-entry modal + scroll-independent feedback** — *highest-leverage
+      GUI fix, from @My1's #31 follow-up.* The capability panes scroll, so the
+      management-key field, PIN entry, and success/error messages all fall below
+      the fold — a user can act blind. Move PIN/PUK/MGM entry into a focused modal
+      that stays visible regardless of scroll, auto-clears after each op, and
+      shows the result inline. App-wide pattern (PIV/FIDO/OpenPGP/OATH) — subsumes
+      #36 and #31's message-placement point. (M)
+- [ ] **Bordered text inputs** — give text fields a visible border so they don't
+      blend into the dark theme (raised by @token2 in #33; applies app-wide). (S)
 
 ### C. Device identity — issue #37 (OnlyKey)
 - [ ] OnlyKey-aware handling in `keyroost-resolve`: recognize `1d50:60fc` /
@@ -583,6 +592,12 @@ configured (see `packaging/README.md`):
       (host pcscd) + `--device=all` (hidraw) + `--filesystem=/run/udev:ro`, and
       must bundle the pcsc-lite *client* lib (runtime lacks `libpcsclite`; ship
       the lib, drop the daemon). Verify end-to-end on hardware.
+      **Distribution caveat:** Flathub has a strong stance against AI-generated
+      code, and keyroost is openly AI-authored — so Flathub itself may be off the
+      table. @errant253 (#34) suggests **self-hosting a Flatpak repo** (or using
+      an alt repo like Fedora's) to keep Flatpak's distro-agnostic + auto-update
+      benefits without the Flathub gate; that's the likely path. Note Token2
+      already ships an AppImage of their OEM edition.
 - [ ] **AppImage** — sandbox-free alternative worth weighing alongside Flatpak.
 - [ ] **musl static Linux build** — UNDER CONSIDERATION (user deferred deciding).
       Fixes the glibc-version portability caveat; wrinkle is `libpcsclite`
@@ -602,6 +617,10 @@ configured (see `packaging/README.md`):
 ### G. FIDO / CTAP — issue #33 (likely a Token2 contribution)
 - [ ] CTAP 2.1 `authenticatorConfig` (toggle alwaysUv, enterprise attestation,
       setMinPINLength) + FIDO2 GUI tab redesign.
+      **Heads-up when the PR lands:** Token2's proposed CLI names are flat
+      (`fido-always-uv`, `fido-set-min-pin`, …) — re-nest to `fido always-uv`
+      etc. to match the v0.6.0 command tree, same as the #30 integration. Their
+      "bordered text inputs" polish is split out to §B as an app-wide item.
 
 ### H. Protocol confirmation
 - [ ] Confirm the Molto2 `read_info` 3-byte preamble + 2-byte separator are
