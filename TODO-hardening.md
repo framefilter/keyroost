@@ -537,6 +537,11 @@ release is walked through on hardware.
 > package-manager release fanout.** The rest is deferred GUI/device work from
 > v0.6.0 plus packaging research. Items are seeded, not yet scoped/locked —
 > brainstorm + lock designs per item before building (same flow as v0.6.0).
+>
+> **Scoping note:** treat the list below as the v0.7.0 *envelope*, but
+> deliberately **leave headroom** — (1) issues surfacing from the freshly-shipped
+> v0.6.0 release get triaged first as they come in, and (2) a block is **reserved
+> at the end of the cycle** for the review & hardening pass (§Z) before we ship.
 
 ### A. Release-pipeline fanout — *primary theme*
 First-time channel setup; the `publish.yml` jobs skip cleanly until each is
@@ -589,6 +594,29 @@ configured (see `packaging/README.md`):
 ### H. Protocol confirmation
 - [ ] Confirm the Molto2 `read_info` 3-byte preamble + 2-byte separator are
       constant (docs/PROTOCOL.md) — the `keyroostctl probe` work item.
+
+### Post-release triage (ongoing, reserve room)
+- [ ] Watch for and triage issues from the v0.6.0 release as they arrive —
+      regressions from the breaking command restructure, packaging/install
+      reports, device-specific bugs. These take priority over the feature work
+      above when they land.
+
+### Z. End-of-cycle review & hardening — *reserve room before shipping v0.7.0*
+A deliberate pass after the feature work and before the release, ideally run as a
+multi-agent review:
+- **Simplification** — collapse accidental complexity, dead code, and any
+  duplication the v0.6.0 restructure left behind; keep files focused.
+- **Security** — re-audit secret handling (PIN/seed zeroization, `--debug`
+  redaction), device-driven loop/length bounds, and every parser against
+  untrusted input (incl. the new `keyroost-piv::x509_parse` DER reader); refresh
+  `cargo audit`.
+- **Quality** — test-coverage gaps, error-path behavior, doc accuracy, and fuzz
+  targets for any parser added this cycle.
+- **Vendoring / dependency reduction** — revisit deps we couldn't avoid earlier
+  and look for ways to drop or vendor them (the standing "shrink deps over time"
+  goal): e.g. whether `serde_json` can be replaced by an in-tree emitter now that
+  the `--json` shapes are fixed, and re-evaluate anything added this cycle (e.g.
+  `rfd` if the file-chooser lands). Keep the audited RustCrypto + platform crates.
 
 ### Still deferred (not v0.7.0)
 - Full branch protection (require PR + green CI on `main`) — adopt when release
