@@ -78,10 +78,12 @@
       <p>Read card status; <strong>generate</strong> or <strong>import</strong> RSA-2048 keys
         (host keygen, or a PKCS#1/PKCS#8 PEM/DER file); <strong>sign</strong> (SHA-256 or
         SHA-1) and <strong>decrypt</strong>; set cardholder name / URL; register a key for
-        GnuPG; and factory-reset the applet.</p>
+        GnuPG; <strong>change the user or admin PIN</strong> and <strong>unblock a
+        locked PIN</strong> (via the admin PIN / PW3); and factory-reset the applet.</p>
     </div>
 <pre><code>keyroostctl openpgp status --reader yubikey
-keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey</code></pre>
+keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey
+keyroostctl openpgp change-pin --old-pin-stdin --new-pin-stdin --reader yubikey</code></pre>
     <p class="kr-muted">The card byte layer is a pure-Rust, in-tree implementation of the
       OpenPGP Card spec (APDU + BER-TLV); RSA keygen/parsing is the one scoped host-side
       dependency.</p>

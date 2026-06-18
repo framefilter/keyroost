@@ -154,7 +154,7 @@ packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 
 > **Windows and FIDO:** Windows reserves raw FIDO HID access for elevated
 > processes (the OS routes normal apps through its own WebAuthn API instead).
-> Expect the `fido-*` commands and the Security Keys pane to require an
+> Expect the `fido` commands and the Security Keys pane to require an
 > elevated ("Run as administrator") session on Windows; the Molto2, OATH,
 > OpenPGP, and PIV features go over PC/SC and work unelevated. Elevate for
 > the FIDO command you need, then drop back — don't run the whole tool
@@ -176,7 +176,7 @@ packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 ### FIDO HID access (Linux udev rules)
 
 The OATH, OpenPGP, and PIV applets are reached over PC/SC and need no special
-permissions. Talking to a key's **FIDO interface** (`fido-*` commands, and the
+permissions. Talking to a key's **FIDO interface** (the `fido` commands, and the
 Security Keys GUI pane), though, opens a `/dev/hidraw*` node, which is
 root-only by default. Install the bundled udev rules to grant the logged-in user
 access:
