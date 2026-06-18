@@ -547,10 +547,22 @@ release is walked through on hardware.
 First-time channel setup; the `publish.yml` jobs skip cleanly until each is
 configured (see `packaging/README.md`):
 - [x] **crates.io** — live via OIDC trusted publishing (0.5.x + 0.6.0).
-- [ ] **AUR** — account + SSH key, first `keyroost-bin` push; secret `AUR_SSH_PRIVATE_KEY`.
-- [ ] **Homebrew** — create the `homebrew-keyroost` tap repo + first formula push; secret `TAP_PUSH_TOKEN`.
-- [ ] **winget** — manual first `Framefilter.Keyroost` submission; secret `WINGET_TOKEN`.
-- [ ] **`release-publish` environment** — confirm the required-reviewer approval gate.
+- [x] **`release-publish` environment** — approval gate already in use (user
+      approves each fanout).
+- [~] **Homebrew** — tap repo `framefilter/homebrew-keyroost` **created
+      (2026-06-18)**. Remaining: add `TAP_PUSH_TOKEN` (fine-grained PAT,
+      `contents:write` on the tap repo only) + re-dispatch `publish.yml` for
+      `v0.6.0` to write `Formula/keyroost.rb`.
+- [~] **winget** — v0.6.0 manifests rendered (staged under `/tmp/winget/`).
+      Remaining: add `WINGET_TOKEN` (classic PAT, `public_repo`) + submit the
+      first PR to `microsoft/winget-pkgs`; future bumps auto-PR.
+- [ ] **AUR** — **DEFERRED / BLOCKED.** Account registration is *disabled*
+      during the June 2026 "Atomic Arch" AUR supply-chain incident (~1500
+      hijacked packages; payload steals SSH keys + GitHub PATs — exactly the
+      creds our CI auto-push would create). **Resume signal:** aur.archlinux.org
+      no longer shows "Account registration is currently disabled" AND
+      archlinux.org/news posts an all-clear. Then: account + dedicated SSH key,
+      first `keyroost-bin` push, secret `AUR_SSH_PRIVATE_KEY`.
 
 ### B. PIV GUI — issue #31 items 4–6 (items 1–3 shipped in 0.6.0)
 - [ ] Slot-first PIV view: pick a slot → see/act on its contents. (M)
