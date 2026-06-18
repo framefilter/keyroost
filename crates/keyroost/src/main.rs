@@ -306,6 +306,10 @@ impl OpenPgpSlotSel {
 struct PivState {
     /// Last status read from the selected card.
     status: Option<keyroost_transport::PivStatus>,
+    /// Per-slot key algorithm, in canonical slot order, from GET METADATA.
+    /// `None` for an entry means the slot holds no key (or the firmware lacks
+    /// the metadata extension). Filled alongside `status` on each refresh.
+    slot_keys: Vec<(keyroost_piv::Slot, Option<keyroost_piv::KeyAlg>)>,
     /// User-facing error from the last read/write.
     error: Option<String>,
     /// Success/info line from the last write operation.
@@ -315,12 +319,14 @@ struct PivState {
     /// Management key (hex) entered to authorize key-gen / cert-import /
     /// set-retries / management-key change. Cleared after use.
     mgmt_key_input: String,
-    /// Change-PIN old/new entries. Cleared after use.
+    /// Change-PIN old/new/confirm entries. Cleared after use.
     pin_old: String,
     pin_new: String,
-    /// Change-PUK old/new entries. Cleared after use.
+    pin_confirm: String,
+    /// Change-PUK old/new/confirm entries. Cleared after use.
     puk_old: String,
     puk_new: String,
+    puk_confirm: String,
     /// Unblock-PIN: PUK + new PIN entries. Cleared after use.
     unblock_puk: String,
     unblock_new_pin: String,
@@ -361,8 +367,10 @@ impl Drop for PivState {
         wipe(&mut self.mgmt_key_input);
         wipe(&mut self.pin_old);
         wipe(&mut self.pin_new);
+        wipe(&mut self.pin_confirm);
         wipe(&mut self.puk_old);
         wipe(&mut self.puk_new);
+        wipe(&mut self.puk_confirm);
         wipe(&mut self.unblock_puk);
         wipe(&mut self.unblock_new_pin);
         wipe(&mut self.retries_pin_auth);
@@ -375,14 +383,17 @@ impl Default for PivState {
     fn default() -> Self {
         PivState {
             status: None,
+            slot_keys: Vec::new(),
             error: None,
             notice: None,
             loaded: false,
             mgmt_key_input: String::new(),
             pin_old: String::new(),
             pin_new: String::new(),
+            pin_confirm: String::new(),
             puk_old: String::new(),
             puk_new: String::new(),
+            puk_confirm: String::new(),
             unblock_puk: String::new(),
             unblock_new_pin: String::new(),
             retries_pin: 3,
@@ -1968,7 +1979,7 @@ impl App {
             self.security_keys.error = Some("both PIN fields are required".into());
             return;
         }
-        self.spawn_job("Changing PIN\u{2026} (touch)", move || {
+        self.spawn_job("Changing PIN\u{2026}", move || {
             let result = Self::try_change_pin(&path, &old, &new).map_err(|e| e.to_string());
             Box::new(move |app: &mut App| match result {
                 Ok(()) => {
@@ -2013,7 +2024,7 @@ impl App {
             self.security_keys.error = Some("the two PINs don't match".into());
             return;
         }
-        self.spawn_job("Setting PIN\u{2026} (touch the key)", move || {
+        self.spawn_job("Setting PIN\u{2026}", move || {
             let result = (|| -> Result<(), String> {
                 let (mut dev, _) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
                 keyroost_ctap::client_pin::set_pin(&mut dev, &new).map_err(|e| e.to_string())
@@ -3421,17 +3432,35 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading PIV status\u{2026}", move || {
-            let result = keyroost_transport::PivSession::open(&reader).and_then(|mut s| s.status());
+            // Alongside the status, probe each slot's key algorithm via GET
+            // METADATA. This surfaces an algorithm (and confirms a key exists)
+            // even for a slot with no certificate; `None` covers an empty slot
+            // or firmware without the metadata extension.
+            let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
+                let status = s.status();
+                let slot_keys: Vec<_> = keyroost_piv::Slot::all()
+                    .into_iter()
+                    .map(|slot| {
+                        let alg = s
+                            .metadata(slot.key_ref())
+                            .and_then(|m| m.algorithm)
+                            .and_then(keyroost_piv::KeyAlg::from_id);
+                        (slot, alg)
+                    })
+                    .collect();
+                (status, slot_keys)
+            });
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok(status) => {
+                    Ok((Ok(status), slot_keys)) => {
                         app.piv.status = Some(status);
+                        app.piv.slot_keys = slot_keys;
                         app.piv.loaded = true;
                     }
-                    Err(e) => app.piv.error = Some(e.to_string()),
+                    Ok((Err(e), _)) | Err(e) => app.piv.error = Some(e.to_string()),
                 }
             })
         });
@@ -3449,6 +3478,9 @@ impl App {
                 app.piv.status = Some(status);
                 app.piv.error = None;
                 app.piv.notice = Some(notice);
+                // Re-read so per-slot key algorithms (and anything the write
+                // touched) reflect the new state without a manual Refresh.
+                app.load_piv_status();
             }
             Err(e) => {
                 app.piv.notice = None;
@@ -3462,6 +3494,11 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
+        if self.piv.pin_new != self.piv.pin_confirm {
+            self.piv.notice = None;
+            self.piv.error = Some("the two new PINs don't match".into());
+            return;
+        }
         let (old, new) = (self.piv.pin_old.clone(), self.piv.pin_new.clone());
         self.piv.notice = None;
         self.spawn_job("Changing PIV PIN\u{2026}", move || {
@@ -3473,6 +3510,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.pin_old);
                 wipe(&mut app.piv.pin_new);
+                wipe(&mut app.piv.pin_confirm);
                 Self::apply_piv_write(app, result, "PIN changed.".into());
             })
         });
@@ -3482,6 +3520,11 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
+        if self.piv.puk_new != self.piv.puk_confirm {
+            self.piv.notice = None;
+            self.piv.error = Some("the two new PUKs don't match".into());
+            return;
+        }
         let (old, new) = (self.piv.puk_old.clone(), self.piv.puk_new.clone());
         self.piv.notice = None;
         self.spawn_job("Changing PUK\u{2026}", move || {
@@ -3493,6 +3536,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.puk_old);
                 wipe(&mut app.piv.puk_new);
+                wipe(&mut app.piv.puk_confirm);
                 Self::apply_piv_write(app, result, "PUK changed.".into());
             })
         });
@@ -5774,11 +5818,9 @@ impl App {
                         });
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new(
-                                "4\u{2013}63 characters. You'll touch the key to confirm.",
-                            )
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
+                            egui::RichText::new("4\u{2013}63 characters.")
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
                         );
                     });
             }
@@ -6437,6 +6479,7 @@ impl App {
         }
 
         // --- Status ---
+        let slot_keys = &self.piv.slot_keys;
         if let Some(st) = &self.piv.status {
             theme::card_frame(p).show(ui, |ui| {
                 kv(
@@ -6457,17 +6500,35 @@ impl App {
                         .map_or("\u{2014}".to_string(), |n| n.to_string()),
                 );
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    for slot in &st.slots {
-                        let lab = format!(
-                            "{:02X} \u{00B7} {}",
-                            slot.slot.key_ref(),
-                            if slot.cert_present { "cert" } else { "empty" }
+                // One row per slot: name, a state pill (cert / key only /
+                // empty), and the key algorithm when GET METADATA reports it.
+                // `slot_keys` and `st.slots` are both in canonical slot order,
+                // so the algorithm is looked up by matching the slot.
+                for slot in &st.slots {
+                    let alg = slot_keys
+                        .iter()
+                        .find(|(s, _)| *s == slot.slot)
+                        .and_then(|(_, a)| *a);
+                    let (state, tint) = if slot.cert_present {
+                        ("cert", p.txt2)
+                    } else if alg.is_some() {
+                        ("key, no cert", p.txt2)
+                    } else {
+                        ("empty", p.txt3)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.label(
+                            egui::RichText::new(slot.slot.label())
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt2),
                         );
-                        theme::pill(ui, &lab, p.txt2, p.raised2);
-                    }
-                });
+                        theme::pill(ui, state, tint, p.raised2);
+                        if let Some(a) = alg {
+                            theme::pill(ui, a.label(), p.txt2, p.raised2);
+                        }
+                    });
+                }
             });
         } else if self.piv.error.is_none() {
             ui.label(
@@ -6522,6 +6583,8 @@ impl App {
                 sub(ui, "Change PIN");
                 pin_field(ui, p, "Current PIN", &mut self.piv.pin_old);
                 pin_field(ui, p, "New PIN", &mut self.piv.pin_new);
+                pin_field(ui, p, "Confirm new PIN", &mut self.piv.pin_confirm);
+                note(ui, "6\u{2013}8 characters.");
                 if theme::button(ui, p, BtnKind::Default, "Change PIN").clicked() {
                     go_change_pin = true;
                 }
@@ -6529,6 +6592,8 @@ impl App {
                 sub(ui, "Change PUK");
                 pin_field(ui, p, "Current PUK", &mut self.piv.puk_old);
                 pin_field(ui, p, "New PUK", &mut self.piv.puk_new);
+                pin_field(ui, p, "Confirm new PUK", &mut self.piv.puk_confirm);
+                note(ui, "8 characters.");
                 if theme::button(ui, p, BtnKind::Default, "Change PUK").clicked() {
                     go_change_puk = true;
                 }
@@ -6539,6 +6604,16 @@ impl App {
                 pin_field(ui, p, "New PIN", &mut self.piv.unblock_new_pin);
                 if theme::button(ui, p, BtnKind::Default, "Unblock PIN").clicked() {
                     go_unblock = true;
+                }
+                // Echo the last write result here too, so feedback for a PIN/PUK
+                // change lands next to the buttons (the top-of-pane banner stays
+                // for ops in other sections).
+                if let Some(err) = &self.piv.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.err, err);
+                } else if let Some(n) = &self.piv.notice {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.ok, n);
                 }
             });
         });
