@@ -114,6 +114,11 @@ independent status described above.)
 - **Secrets stay yours.** PINs and passwords come from stdin or env vars, never
   argv; the tool never prints or persists them.
 - **Single static binary per OS** — no scripts, no Python, no Qt.
+- **Toward native installs everywhere.** The longer-term goal is first-class
+  distribution through each platform's mainstream channels (Homebrew, AUR, and
+  winget today; Flatpak, AppImage, and others as they're proven out on real
+  hardware), while continuing to shrink external dependencies toward a
+  self-contained binary.
 
 ## Install
 
