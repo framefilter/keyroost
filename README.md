@@ -9,11 +9,12 @@ dark-themed desktop GUI (`keyroost`) — implemented from public standards, with
 vendor SDKs, no Python, and no Qt.
 
 > **Built with AI.** I saw a real need for this but never learned to code, so
-> keyroost — code, docs, and all — was written end-to-end with AI. Since that AI
-> learned from the vast commons of free and open-source software people have
-> generously shared, releasing keyroost as FOSS isn't really a choice; it's
-> giving back to what made it possible. Absent outside contributors it will stay
-> AI-authored — issues and review are warmly welcome.
+> the parts I author — code, docs, and all — are written end-to-end with AI.
+> (Contributions from others, such as Token2's, are their own human-designed and
+> -developed work — see the Contributors section.) Since the AI I use learned
+> from the vast commons of free and open-source software people have generously
+> shared, releasing keyroost as FOSS isn't really a choice; it's giving back to
+> what made it possible. Issues, review, and contributions are warmly welcome.
 
 **New to hardware keys?** Read the companion guide —
 [*"So you bought a hardware security key… now what?"*](https://framefilter.github.io/keyroost/) —
