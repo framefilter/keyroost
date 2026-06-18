@@ -29,6 +29,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   [@token2](https://github.com/token2)
   ([#29](https://github.com/framefilter/keyroost/pull/29),
   [#30](https://github.com/framefilter/keyroost/pull/30)).
+- **GUI PIV pane detail** — each slot now shows its certificate Subject DN and
+  key algorithm, and a slot holding a key with no certificate is distinguished
+  from an empty one; the pane auto-refreshes after a write
+  ([#31](https://github.com/framefilter/keyroost/issues/31)).
+- **In-tree X.509 Subject-DN reader** (`keyroost-piv`) — a small, panic-safe,
+  dependency-free DER certificate reader backing the slot display above.
+- **Confirm-PIN fields** on the GUI PIV Change-PIN and Change-PUK dialogs, so a
+  mistyped new PIN can't lock the card
+  ([#36](https://github.com/framefilter/keyroost/issues/36)).
 
 ### Changed
 - **BREAKING: commands nested under `molto` and `fido` groups.** The flat
@@ -41,6 +50,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `fido creds-list`). The customer-key flags (`--key`, `--key-env`, …) now live
   under `molto customer-key`. See the migration table in the README for the full
   old→new map.
+
+### Fixed
+- **Firmware-accurate PIN guidance in the GUI** — removed the inaccurate "touch
+  the key to confirm" hint from the FIDO set/change-PIN flow (CTAP PIN changes
+  are not touch-gated) and corrected the PIN/PUK length text per applet
+  ([#36](https://github.com/framefilter/keyroost/issues/36)).
 
 ## [0.5.1] - 2026-06-14
 
