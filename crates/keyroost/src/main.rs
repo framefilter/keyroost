@@ -306,10 +306,16 @@ impl OpenPgpSlotSel {
 struct PivState {
     /// Last status read from the selected card.
     status: Option<keyroost_transport::PivStatus>,
-    /// Per-slot key algorithm, in canonical slot order, from GET METADATA.
-    /// `None` for an entry means the slot holds no key (or the firmware lacks
-    /// the metadata extension). Filled alongside `status` on each refresh.
-    slot_keys: Vec<(keyroost_piv::Slot, Option<keyroost_piv::KeyAlg>)>,
+    /// Per-slot detail, in canonical slot order, gathered on each refresh:
+    /// the key algorithm from GET METADATA (`None` if the slot holds no key or
+    /// the firmware lacks the metadata extension), and the certificate's
+    /// Subject DN (`None` if the slot has no certificate or its DN failed to
+    /// parse — degraded silently).
+    slot_keys: Vec<(
+        keyroost_piv::Slot,
+        Option<keyroost_piv::KeyAlg>,
+        Option<String>,
+    )>,
     /// User-facing error from the last read/write.
     error: Option<String>,
     /// Success/info line from the last write operation.
@@ -3445,7 +3451,17 @@ impl App {
                             .metadata(slot.key_ref())
                             .and_then(|m| m.algorithm)
                             .and_then(keyroost_piv::KeyAlg::from_id);
-                        (slot, alg)
+                        // Pull the slot's certificate (if any) and extract its
+                        // Subject DN for display. Any failure — no cert, read
+                        // error, or unparseable DER — degrades to `None` so the
+                        // pane never breaks on a malformed certificate.
+                        let subject = s
+                            .read_certificate(slot)
+                            .ok()
+                            .flatten()
+                            .and_then(|der| keyroost_piv::x509_parse::parse_subject_dn(&der).ok())
+                            .map(|dn| dn.to_string());
+                        (slot, alg, subject)
                     })
                     .collect();
                 (status, slot_keys)
@@ -6505,10 +6521,9 @@ impl App {
                 // `slot_keys` and `st.slots` are both in canonical slot order,
                 // so the algorithm is looked up by matching the slot.
                 for slot in &st.slots {
-                    let alg = slot_keys
-                        .iter()
-                        .find(|(s, _)| *s == slot.slot)
-                        .and_then(|(_, a)| *a);
+                    let entry = slot_keys.iter().find(|(s, _, _)| *s == slot.slot);
+                    let alg = entry.and_then(|(_, a, _)| *a);
+                    let subject = entry.and_then(|(_, _, d)| d.as_deref());
                     let (state, tint) = if slot.cert_present {
                         ("cert", p.txt2)
                     } else if alg.is_some() {
@@ -6528,6 +6543,26 @@ impl App {
                             theme::pill(ui, a.label(), p.txt2, p.raised2);
                         }
                     });
+                    // Subject DN under the row when a certificate carried one.
+                    // Truncate hard so a very long DN can't blow out the card.
+                    if let Some(dn) = subject {
+                        let shown = if dn.chars().count() > 64 {
+                            let mut s: String = dn.chars().take(63).collect();
+                            s.push('\u{2026}');
+                            s
+                        } else {
+                            dn.to_string()
+                        };
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(shown)
+                                    .font(theme::f_reg(11.5))
+                                    .color(p.txt3),
+                            )
+                            .on_hover_text(dn);
+                        });
+                    }
                 }
             });
         } else if self.piv.error.is_none() {

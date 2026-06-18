@@ -24,6 +24,7 @@ use keyroost_proto::apdu::{build_apdu, build_apdu_get};
 
 pub mod spki;
 pub mod x509;
+pub mod x509_parse;
 
 /// PIV card-application AID (the 5-byte RID/PIX prefix; the card matches on it).
 /// Full PIV AID is `A0 00 00 03 08 00 00 10 00 01 00`; selecting by the prefix
