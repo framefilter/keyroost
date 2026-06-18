@@ -80,7 +80,8 @@ anyone with the Linux build prerequisites from the README.
       (crates.io via OIDC trusted publishing, AUR, Homebrew tap, winget),
       templates + one-time setup steps in packaging/. Remaining manual:
       the account/secret setup and first publishes per packaging/README.md.
-      Flatpak ruled out (pcscd/hidraw sandboxing).
+      (Flatpak: **reconsidered for v0.7.0** — the earlier "ruled out" call was
+      wrong; it's a solved pattern. See the v0.7.0 section.)
 - [x] **Branch/tag protection (light)** — repository rulesets: `v*` tag
       creation/update/deletion is admin-only (tag push is release
       authority), and `main` rejects force-pushes and deletion for
@@ -525,3 +526,70 @@ them in one change with a clear migration note, and update the docs (Phase 6) in
 that same change so the site never serves stale command syntax. Ship v0.6.0 only
 once all phases are done, the docs are synced, the version is bumped, and the
 release is walked through on hardware.
+
+---
+
+## v0.7.0 — release-pipeline fanout, device polish & packaging (branch: `v0.7.0`)
+
+> **STATUS (2026-06-18): v0.6.0 SHIPPED** — tagged and live on crates.io + the
+> GitHub Release. `v0.7.0` branch opened off `main`; `v0.6.0-cli-maturity`
+> deleted. **Primary theme (user's call): stand up the rest of the
+> package-manager release fanout.** The rest is deferred GUI/device work from
+> v0.6.0 plus packaging research. Items are seeded, not yet scoped/locked —
+> brainstorm + lock designs per item before building (same flow as v0.6.0).
+
+### A. Release-pipeline fanout — *primary theme*
+First-time channel setup; the `publish.yml` jobs skip cleanly until each is
+configured (see `packaging/README.md`):
+- [x] **crates.io** — live via OIDC trusted publishing (0.5.x + 0.6.0).
+- [ ] **AUR** — account + SSH key, first `keyroost-bin` push; secret `AUR_SSH_PRIVATE_KEY`.
+- [ ] **Homebrew** — create the `homebrew-keyroost` tap repo + first formula push; secret `TAP_PUSH_TOKEN`.
+- [ ] **winget** — manual first `Framefilter.Keyroost` submission; secret `WINGET_TOKEN`.
+- [ ] **`release-publish` environment** — confirm the required-reviewer approval gate.
+
+### B. PIV GUI — issue #31 items 4–6 (items 1–3 shipped in 0.6.0)
+- [ ] Slot-first PIV view: pick a slot → see/act on its contents. (M)
+- [ ] In-GUI key/cert deletion — **needs a DELETE-FILE path added to
+      `keyroost-piv` + transport first** (byte-layer work). (L)
+- [ ] Native file-chooser dialogs for cert/key import — **needs a new dep
+      (`rfd`); decide before adopting.** (M)
+
+### C. Device identity — issue #37 (OnlyKey)
+- [ ] OnlyKey-aware handling in `keyroost-resolve`: recognize `1d50:60fc` /
+      product `ONLYKEY`, label it "OnlyKey", treat serial `1000000000` as a
+      non-unique placeholder (fall back to the hidraw path). No OnlyKey on hand →
+      verify with the reporter or a device. (Facts in the onlykey-device-facts note.)
+
+### D. Packaging / distribution — issue #34 + the README "native installs" goal
+- [ ] **Flatpak (tentative)** — RECONSIDERED: a solved pattern (Yubico
+      Authenticator + KeePassXC ship on Flathub). Manifest needs `--socket=pcsc`
+      (host pcscd) + `--device=all` (hidraw) + `--filesystem=/run/udev:ro`, and
+      must bundle the pcsc-lite *client* lib (runtime lacks `libpcsclite`; ship
+      the lib, drop the daemon). Verify end-to-end on hardware.
+- [ ] **AppImage** — sandbox-free alternative worth weighing alongside Flatpak.
+- [ ] **musl static Linux build** — UNDER CONSIDERATION (user deferred deciding).
+      Fixes the glibc-version portability caveat; wrinkle is `libpcsclite`
+      linking for the PC/SC path. Think it through before committing.
+
+### E. OpenPGP transport completeness (code `TODO(transport)`)
+- [ ] `INTERNAL AUTHENTICATE` builder (client/SSH auth signature) — not provided
+      yet (`keyroost-openpgp` lib.rs).
+- [ ] `GET RESPONSE` reassembly loop for `61xx`-chunked responses — belongs in
+      `keyroost-transport`; the byte layer only emits the request APDU today.
+
+### F. Token2 PIN+ standards applets — issue #23 (experimental)
+- [ ] Verify OATH/OpenPGP/PIV over CCID on a real PIN+ key to lift the
+      "experimental" label. Needs PIN+ hardware (Token2 may help, given the
+      collaboration + their OEM edition).
+
+### G. FIDO / CTAP — issue #33 (likely a Token2 contribution)
+- [ ] CTAP 2.1 `authenticatorConfig` (toggle alwaysUv, enterprise attestation,
+      setMinPINLength) + FIDO2 GUI tab redesign.
+
+### H. Protocol confirmation
+- [ ] Confirm the Molto2 `read_info` 3-byte preamble + 2-byte separator are
+      constant (docs/PROTOCOL.md) — the `keyroostctl probe` work item.
+
+### Still deferred (not v0.7.0)
+- Full branch protection (require PR + green CI on `main`) — adopt when release
+  cadence slows (see the Deferred section above).
