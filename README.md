@@ -99,17 +99,16 @@ independent status described above.)
 ## Install
 
 ```bash
-cargo install --git https://github.com/framefilter/keyroost keyroostctl keyroost
+cargo install keyroostctl keyroost
 ```
-
-(Once published to crates.io: `cargo install keyroostctl keyroost`.)
 
 ### Linux prerequisite
 
-keyroost is distro-neutral — it talks to the kernel's `hidraw`/`sysfs` and to
+keyroost is mostly¹ distro-neutral — it talks to the kernel's `hidraw`/`sysfs` and to
 PC/SC, both of which every mainstream distribution provides. Only the package
 names differ. The CLI needs the PC/SC library + daemon; the GUI additionally
-needs the X11/Wayland/GL libraries that `eframe`/`egui` link against.
+needs the X11/Wayland/GL libraries that `eframe`/`egui` link against.   
+¹the cargo install does not support atomic distros like Bazzite.
 
 ```bash
 # Debian / Ubuntu
