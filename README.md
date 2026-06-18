@@ -117,9 +117,34 @@ independent status described above.)
 
 ## Install
 
+Build and install from crates.io:
+
 ```bash
 cargo install keyroostctl keyroost
 ```
+
+### Without the Rust toolchain
+
+Each release ships pre-built binaries for Linux, macOS, and Windows, so you can
+skip compiling. Grab the binary for the **latest** release straight from a
+stable URL (no `cargo`, no toolchain) — for Linux x86_64:
+
+```bash
+curl -L https://github.com/framefilter/keyroost/releases/latest/download/keyroost-linux-x86_64.tar.gz \
+  | tar xz   # then move keyroostctl / keyroost onto your PATH
+```
+
+(macOS: `keyroost-macos-universal2.tar.gz`; Windows: `keyroost-windows-x86_64.zip`.
+Each release also publishes `SHA256SUMS` and build-provenance attestation.)
+
+Or let `cargo binstall` fetch the same pre-built archive instead of compiling:
+
+```bash
+cargo binstall keyroostctl keyroost
+```
+
+keyroost is also packaged for Homebrew, the AUR, and winget — see the latest
+[release](https://github.com/framefilter/keyroost/releases/latest).
 
 ### Linux prerequisite
 
