@@ -85,13 +85,18 @@ pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui:
                 ui.add_space(6.0);
                 // body — wraps to the frame width
                 ui.label(egui::RichText::new(h.body).font(f_reg(13.0)).color(p.txt));
-                ui.add_space(10.0);
-                ui.hyperlink_to(
-                    egui::RichText::new("Learn how to use this  ↗")
-                        .font(theme::f_sb(12.5))
-                        .color(p.accent),
-                    help::learn_url(h.slug),
-                );
+                // Only offer a "Learn" link when the topic has a docs page.
+                // Some topics (e.g. the unlock gate) are purely in-app and have
+                // no dedicated page, so they leave `slug` empty.
+                if !h.slug.is_empty() {
+                    ui.add_space(10.0);
+                    ui.hyperlink_to(
+                        egui::RichText::new("Learn how to use this  ↗")
+                            .font(theme::f_sb(12.5))
+                            .color(p.accent),
+                        help::learn_url(h.slug),
+                    );
+                }
             });
         });
 

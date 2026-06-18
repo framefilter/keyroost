@@ -53,6 +53,64 @@ struct SecurityKeysState {
     fp_confirm_delete: Option<Vec<u8>>,
     /// Inline rename editor: (template_id, new-name buffer).
     fp_rename: Option<(Vec<u8>, String)>,
+    /// Pending advanced-config action awaiting typed confirmation + PIN.
+    advanced: Option<AdvancedDialog>,
+    /// Which sub-view of the FIDO2 tab is active (passkeys / fingerprints /
+    /// settings), so the sections no longer stack in one long panel.
+    subview: FidoSubview,
+    /// Cached large-blob array, read on demand. `None` until first load.
+    large_blobs: Option<keyroost_ctap::large_blobs::LargeBlobArray>,
+    /// Index of the entry currently expanded in the hex/ASCII viewer.
+    lb_selected: Option<usize>,
+    /// Pending "delete entry N" confirmation in the structured editor.
+    lb_confirm_delete: Option<usize>,
+    /// Status / result line for the last large-blob load or write.
+    lb_status: Option<String>,
+    /// Text buffer for the "add a note" field.
+    lb_new_text: String,
+    /// Whether the add-note composer is expanded (toggled by the Add button).
+    lb_show_add: bool,
+    /// Index of the note currently being edited inline, with its edit buffer.
+    lb_editing: Option<usize>,
+    lb_edit_text: String,
+    /// Set once we've auto-loaded (or tried to) on first showing the Storage
+    /// tab, so a failed read doesn't retry every frame. Reset when the selected
+    /// device changes so a different key loads fresh.
+    lb_autoloaded: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum FidoSubview {
+    #[default]
+    Passkeys,
+    Fingerprints,
+    Settings,
+    LargeBlobs,
+}
+
+/// A pending `authenticatorConfig` action in the Advanced view. The action is
+/// only dispatched once the user supplies the PIN (these commands need a token
+/// with the AuthenticatorConfiguration permission) and, for irreversible ones,
+/// confirms explicitly.
+#[derive(Default)]
+struct AdvancedDialog {
+    action: AdvancedAction,
+    /// PIN entry for this action (config needs its own permissioned token).
+    pin_input: String,
+    /// New minimum PIN length buffer (only for SetMinPin).
+    min_pin_input: String,
+    /// Whether to also force a PIN change (SetMinPin option).
+    force_change: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum AdvancedAction {
+    #[default]
+    None,
+    ToggleAlwaysUv,
+    SetMinPin,
+    ForcePinChange,
+    EnterpriseAttestation,
 }
 
 /// Live state of an in-progress fingerprint enrollment, shared between the
@@ -67,6 +125,9 @@ struct EnrollProgress {
     last_message: String,
     /// Set when the flow finishes (Ok) or fails (Err message).
     done: Option<Result<(), String>>,
+    /// Set by the UI's Cancel button; the worker checks it between samples,
+    /// asks the device to cancel the current enrollment, and stops.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for EnrollProgress {
@@ -76,6 +137,7 @@ impl Default for EnrollProgress {
             captured: 0,
             last_message: "Touch the sensor to begin\u{2026}".into(),
             done: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -624,6 +686,13 @@ fn main() -> eframe::Result<()> {
 struct App {
     /// Active PC/SC session, if any.
     session: Option<Session>,
+    /// Background watermark textures (light-ink for dark theme, dark-ink for
+    /// light). `Some(None)` = tried and absent. Branding-only.
+    wm_dark_theme: Option<Option<egui::TextureHandle>>,
+    wm_light_theme: Option<Option<egui::TextureHandle>>,
+    /// Scattered left-pane motif textures per theme.
+    motifs_dark_theme: Option<Vec<egui::TextureHandle>>,
+    motifs_light_theme: Option<Vec<egui::TextureHandle>>,
     /// Last device info read.
     info: Option<DeviceInfo>,
     /// Whether the session has been authenticated.
@@ -1786,6 +1855,12 @@ impl App {
 
         // Shared progress cell the worker updates and the UI polls each frame.
         let progress = std::sync::Arc::new(std::sync::Mutex::new(EnrollProgress::default()));
+        // Pull out the cancel flag so the worker can poll it without locking the
+        // whole progress mutex on every check.
+        let cancel_flag = progress
+            .lock()
+            .map(|g| g.cancel.clone())
+            .unwrap_or_default();
         self.security_keys.fp_progress = Some(progress.clone());
 
         self.spawn_job("Enrolling fingerprint\u{2026}", move || {
@@ -1795,6 +1870,10 @@ impl App {
                 if !init.supports_cbor() {
                     return Err("device is U2F-only".into());
                 }
+                // Wire the cooperative-cancel flag into the transport so a
+                // capture blocked waiting for a touch aborts promptly (at the
+                // next KEEPALIVE) when the user clicks Cancel.
+                dev.set_cancel_flag(cancel_flag.clone());
                 let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
                 let cmd_code = if info.option("bioEnroll").is_some() {
                     keyroost_ctap::bio_enroll::CTAP2_BIO_ENROLLMENT
@@ -1840,9 +1919,21 @@ impl App {
                 );
 
                 while status.remaining_samples > 0 {
-                    status = bio
-                        .enroll_capture_next(&template_id, None)
-                        .map_err(|e| e.to_string())?;
+                    // The capture below blocks waiting for a touch, but the
+                    // transport checks the cancel flag on every KEEPALIVE, so a
+                    // cancel returns the "cancelled" error promptly. Map that to
+                    // a device-side cancel + a clean exit.
+                    match bio.enroll_capture_next(&template_id, None) {
+                        Ok(s) => status = s,
+                        Err(e) if e.to_string().contains("cancelled") => {
+                            // Clear the flag first, otherwise the cancel command
+                            // itself would be cancelled at its first KEEPALIVE.
+                            cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                            let _ = bio.cancel_enrollment();
+                            return Err("cancelled".into());
+                        }
+                        Err(e) => return Err(e.to_string()),
+                    }
                     let total = total.max(status.remaining_samples + 1);
                     update(
                         &progress,
@@ -1874,6 +1965,13 @@ impl App {
                         app.security_keys.fingerprints = Some(list);
                         app.security_keys.fp_new_name.clear();
                         app.security_keys.error = None;
+                    }
+                    Err(e) if e == "cancelled" => {
+                        // User cancelled — dismiss the wizard without an error
+                        // banner, and refresh the list so it reflects reality.
+                        app.security_keys.fp_progress = None;
+                        app.security_keys.error = None;
+                        app.refresh_fingerprints();
                     }
                     Err(e) => app.security_keys.error = Some(format!("enroll failed: {e}")),
                 }
@@ -1929,6 +2027,97 @@ impl App {
             Box::new(move |app: &mut App| match result {
                 Ok(list) => app.security_keys.fingerprints = Some(list),
                 Err(e) => app.security_keys.error = Some(format!("rename failed: {e}")),
+            })
+        });
+    }
+
+    /// Open the device and run `f` with a [`Configurator`] holding a fresh
+    /// pinUvAuthToken that carries the AuthenticatorConfiguration permission.
+    /// Mirrors `with_fresh_bio`; config commands need their own permissioned
+    /// token, so they always take a PIN at action time.
+    fn with_config<T>(
+        path: &std::path::Path,
+        pin: &str,
+        f: impl FnOnce(&mut keyroost_ctap::config::Configurator) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let (mut dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+        if !init.supports_cbor() {
+            return Err("device is U2F-only".into());
+        }
+        let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+        if info.option("authnrCfg") != Some(true) {
+            return Err("this key does not support authenticatorConfig".into());
+        }
+        let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+            &mut dev,
+            pin,
+            &info,
+            keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut cfg = keyroost_ctap::config::Configurator::new(&mut dev, token, &info)
+            .map_err(|e| e.to_string())?;
+        f(&mut cfg)
+    }
+
+    /// Dispatch the pending Advanced action on a worker thread, then refresh the
+    /// key's info so the view reflects the new state.
+    fn run_advanced_action(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(dlg) = self.security_keys.advanced.as_ref() else {
+            return;
+        };
+        let Some(path) = self.selected_fido_path() else {
+            return;
+        };
+        let action = dlg.action;
+        let pin = dlg.pin_input.clone();
+        let force_change = dlg.force_change;
+        let min_pin = dlg.min_pin_input.trim().parse::<u32>().ok();
+
+        // Validate inputs before spawning.
+        if action == AdvancedAction::SetMinPin && min_pin.is_none() {
+            self.security_keys.error = Some("Enter a whole number for the new minimum.".into());
+            return;
+        }
+        if pin.is_empty() {
+            self.security_keys.error = Some("Enter the device PIN to apply this change.".into());
+            return;
+        }
+
+        let label = match action {
+            AdvancedAction::ToggleAlwaysUv => "Updating always-UV\u{2026}",
+            AdvancedAction::SetMinPin => "Setting minimum PIN length\u{2026}",
+            AdvancedAction::ForcePinChange => "Requesting PIN change\u{2026}",
+            AdvancedAction::EnterpriseAttestation => "Enabling enterprise attestation\u{2026}",
+            AdvancedAction::None => return,
+        };
+        self.spawn_job(label, move || {
+            let result = Self::with_config(&path, &pin, |cfg| match action {
+                AdvancedAction::ToggleAlwaysUv => {
+                    cfg.toggle_always_uv().map_err(|e| e.to_string())
+                }
+                AdvancedAction::SetMinPin => cfg
+                    .set_min_pin_length(min_pin, &[], force_change)
+                    .map_err(|e| e.to_string()),
+                AdvancedAction::ForcePinChange => {
+                    cfg.force_pin_change().map_err(|e| e.to_string())
+                }
+                AdvancedAction::EnterpriseAttestation => {
+                    cfg.enable_enterprise_attestation().map_err(|e| e.to_string())
+                }
+                AdvancedAction::None => Ok(()),
+            });
+            Box::new(move |app: &mut App| match result {
+                Ok(()) => {
+                    app.security_keys.advanced = None;
+                    app.security_keys.error = None;
+                    // Re-read info so alwaysUv / minPinLength reflect the change.
+                    app.fetch_selected_info();
+                }
+                Err(e) => app.security_keys.error = Some(format!("config change failed: {e}")),
             })
         });
     }
@@ -3283,6 +3472,114 @@ impl App {
         )
     }
 
+    fn watermark_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        let dark = matches!(self.mode, Mode::Dark);
+        let slot = if dark { &mut self.wm_dark_theme } else { &mut self.wm_light_theme };
+        if slot.is_none() {
+            let file = if dark { "hero-watermark-light.png" } else { "hero-watermark-dark.png" };
+            let path = std::path::Path::new("crates/keyroost/assets/branding").join(file);
+            let loaded = std::fs::read(&path).ok().and_then(|b| decode_png_rgba(&b))
+                .map(|img| ctx.load_texture(format!("watermark-{file}"), img, egui::TextureOptions::LINEAR));
+            *slot = Some(loaded);
+        }
+        slot.as_ref().and_then(|o| o.clone())
+    }
+
+    fn paint_watermark(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        let Some(tex) = self.watermark_texture(ui.ctx()) else { return; };
+        let size = tex.size_vec2();
+        if size.x <= 0.0 { return; }
+        const HEADER_CLEARANCE: f32 = 140.0;
+        let top = rect.top() + HEADER_CLEARANCE;
+        let scale = rect.width() / size.x;
+        let draw = egui::Rect::from_min_size(egui::pos2(rect.left(), top), size * scale);
+        let alpha = if matches!(self.mode, Mode::Dark) { 0.34 } else { 0.15 };
+        let tint = egui::Color32::from_white_alpha((alpha * 255.0) as u8);
+        ui.painter().image(tex.id(), draw,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+    }
+
+    fn paint_central_motifs(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        let motifs = self.sidebar_motifs(ui.ctx());
+        if motifs.is_empty() { return; }
+        let alpha = if matches!(self.mode, Mode::Dark) { 0.20 } else { 0.09 };
+        let tint = egui::Color32::from_white_alpha((alpha * 255.0) as u8);
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        const HEADER_CLEARANCE: f32 = 140.0;
+        let safe_top = rect.top() + HEADER_CLEARANCE;
+        let spots = [
+            (0.86, 0.16, 96.0),
+            (0.70, 0.40, 84.0),
+            (0.90, 0.55, 78.0),
+            (0.78, 0.74, 104.0),
+            (0.40, 0.88, 88.0),
+            (0.62, 0.93, 80.0),
+        ];
+        for (i, &(fx, fy, w)) in spots.iter().enumerate() {
+            let tex = &motifs[i % motifs.len()];
+            let size = tex.size_vec2();
+            if size.x <= 0.0 { continue; }
+            let scale = w / size.x;
+            let draw_h = size.y * scale;
+            let mut top = rect.top() + rect.height() * fy;
+            if top < safe_top { top = safe_top; }
+            if top + draw_h > rect.bottom() { top = rect.bottom() - draw_h; }
+            let left = rect.left() + rect.width() * fx;
+            let left = left.min(rect.right() - w);
+            let draw = egui::Rect::from_min_size(egui::pos2(left, top), size * scale);
+            ui.painter().image(tex.id(), draw, uv, tint);
+        }
+    }
+
+    fn sidebar_motifs(&mut self, ctx: &egui::Context) -> Vec<egui::TextureHandle> {
+        let dark = matches!(self.mode, Mode::Dark);
+        let slot = if dark { &mut self.motifs_dark_theme } else { &mut self.motifs_light_theme };
+        if slot.is_none() {
+            let suffix = if dark { "light" } else { "dark" };
+            let names = ["motif-hex", "motif-shield", "motif-bag", "motif-hexrot", "motif-shieldrot", "motif-bagrot"];
+            let dir = std::path::Path::new("crates/keyroost/assets/branding");
+            let mut loaded = Vec::new();
+            for n in names {
+                let path = dir.join(format!("{n}-{suffix}.png"));
+                if let Some(img) = std::fs::read(&path).ok().and_then(|b| decode_png_rgba(&b)) {
+                    loaded.push(ctx.load_texture(format!("{n}-{suffix}"), img, egui::TextureOptions::LINEAR));
+                }
+            }
+            *slot = Some(loaded);
+        }
+        slot.clone().unwrap_or_default()
+    }
+
+    fn paint_sidebar_motifs(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        let motifs = self.sidebar_motifs(ui.ctx());
+        if motifs.is_empty() { return; }
+        let alpha = if matches!(self.mode, Mode::Dark) { 0.22 } else { 0.10 };
+        let tint = egui::Color32::from_white_alpha((alpha * 255.0) as u8);
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        const FOOTER_CLEARANCE: f32 = 60.0;
+        let safe_bottom = rect.bottom() - FOOTER_CLEARANCE;
+        let spots = [
+            (0.20, 0.09, 78.0),
+            (0.34, 0.27, 70.0),
+            (0.14, 0.45, 92.0),
+            (0.30, 0.63, 72.0),
+            (0.18, 0.80, 76.0),
+        ];
+        for (i, &(fx, fy, w)) in spots.iter().enumerate() {
+            let tex = &motifs[i % motifs.len()];
+            let size = tex.size_vec2();
+            if size.x <= 0.0 { continue; }
+            let scale = w / size.x;
+            let draw_h = size.y * scale;
+            let mut top = rect.top() + rect.height() * fy;
+            if top + draw_h > safe_bottom { top = safe_bottom - draw_h; }
+            if top < rect.top() { continue; }
+            let pos = egui::pos2(rect.left() + rect.width() * fx, top);
+            let draw = egui::Rect::from_min_size(pos, size * scale);
+            ui.painter().image(tex.id(), draw, uv, tint);
+        }
+    }
+
     /// The currently selected device, if the id still resolves to a present one.
     fn selected_device(&self) -> Option<&Device> {
         let id = self.selected_device.as_ref()?;
@@ -3348,6 +3645,13 @@ impl App {
         self.security_keys.init = None;
         self.security_keys.session = None;
         self.security_keys.error = None;
+        // Large-blob state is per-key; drop it so the next key auto-loads fresh.
+        self.security_keys.large_blobs = None;
+        self.security_keys.lb_autoloaded = false;
+        self.security_keys.lb_selected = None;
+        self.security_keys.lb_editing = None;
+        self.security_keys.lb_show_add = false;
+        self.security_keys.lb_status = None;
         self.oath.creds.clear();
         self.oath.loaded = false;
         self.oath.locked = false;
@@ -4085,7 +4389,7 @@ fn matches_filter(d: &Device, q: &str) -> bool {
 fn cap_tab_label(t: CapTab) -> &'static str {
     match t {
         CapTab::Overview => "Overview",
-        CapTab::Fido2 => "Passkeys",
+        CapTab::Fido2 => "FIDO2",
         CapTab::Oath => "Authenticator",
         CapTab::Pgp => "OpenPGP",
         CapTab::Piv => "PIV",
@@ -4433,6 +4737,24 @@ fn paint_check_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
 }
 
 /// Cross — delete / dismiss.
+fn decode_png_rgba(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let data = &buf[..frame.buffer_size()];
+    let rgba: Vec<u8> = match frame.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => data.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => data.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        _ => return None,
+    };
+    if rgba.len() != w * h * 4 { return None; }
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
+}
+
 fn paint_x_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     let s = egui::Stroke::new(1.4, color);
     ui.painter().line_segment(
@@ -4692,6 +5014,11 @@ impl eframe::App for App {
 
         // Modal dialogs (reused from the per-applet logic) + Molto2 import dialogs.
         self.render_reset_dialog(ctx);
+        self.render_advanced_confirm(ctx, &p);
+        self.render_enroll_dialog(ctx, &p);
+        if let Some(id) = self.render_fp_delete_confirm(ctx, &p) {
+            self.delete_fingerprint(id);
+        }
         self.render_oath_delete_confirm(ctx);
         self.render_openpgp_confirms(ctx);
         self.render_piv_confirms(ctx);
@@ -4902,6 +5229,8 @@ impl App {
             .resizable(false)
             .frame(panel_frame(p.side, 14.0, 12.0))
             .show(ctx, |ui| {
+                let pane = ui.max_rect();
+                self.paint_sidebar_motifs(ui, pane);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("DEVICES")
@@ -5049,7 +5378,11 @@ impl App {
     fn central(&mut self, ctx: &egui::Context, p: &Palette) {
         egui::CentralPanel::default()
             .frame(panel_frame(p.surface, 0.0, 0.0))
-            .show(ctx, |ui| match self.selected_device().cloned() {
+            .show(ctx, |ui| {
+                let bg = ui.max_rect();
+                self.paint_watermark(ui, bg);
+                self.paint_central_motifs(ui, bg);
+                match self.selected_device().cloned() {
                 None => self.empty_state(ui, p),
                 Some(dev) if dev.kind == DeviceKind::Token => self.molto_view(ui, p, &dev),
                 Some(dev) => {
@@ -5088,6 +5421,7 @@ impl App {
                                     ui.add_space(18.0);
                                 });
                         });
+                }
                 }
             });
     }
@@ -5193,10 +5527,11 @@ impl App {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     if self.rename_open {
-                        let resp = ui.add(
+                        let resp = ui.add_sized(
+                            [200.0, 32.0],
                             egui::TextEdit::singleline(&mut self.rename_input)
-                                .hint_text("friendly-name")
-                                .desired_width(200.0),
+                                .vertical_align(egui::Align::Center)
+                                .hint_text("friendly-name"),
                         );
                         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter {
@@ -5264,14 +5599,16 @@ impl App {
             for t in dev.tabs() {
                 let active = self.cap_tab == t;
                 let color = if active { p.txt } else { p.txt3 };
-                let resp = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(cap_tab_label(t))
-                            .font(theme::f_sb(13.5))
-                            .color(color),
+                let resp = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(cap_tab_label(t))
+                                .font(theme::f_sb(13.5))
+                                .color(color),
+                        )
+                        .sense(egui::Sense::click()),
                     )
-                    .sense(egui::Sense::click()),
-                );
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if active {
                     let y = resp.rect.bottom() + 6.0;
                     ui.painter().line_segment(
@@ -5730,6 +6067,15 @@ impl App {
                         };
                         self.security_keys.error = None;
                     }
+                    // Lock the whole session here, where the lock/unlock state
+                    // lives — locking ends access to passkeys, fingerprints and
+                    // settings alike, so it doesn't belong inside one panel.
+                    if self.security_keys.session.is_some() {
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Ghost, "Lock").clicked() {
+                            self.lock_session();
+                        }
+                    }
                 });
             });
             ui.add_space(8.0);
@@ -5738,13 +6084,12 @@ impl App {
                     ui.horizontal(|ui| {
                         theme::pill(ui, "PIN set", p.ok, p.ok_soft());
                         ui.add_space(8.0);
-                        // Mention fingerprints in the hint when the key supports
-                        // bio enrollment, so the user knows the Fingerprints
-                        // section appears only after unlocking.
-                        let hint = if self.bio_cmd_code().is_some() {
-                            "This key has a PIN. Unlock below to manage passkeys and fingerprints."
+                        // Reflect whether the key is already unlocked: once a
+                        // session is open, the "unlock below" prompt is stale.
+                        let hint = if self.security_keys.session.is_some() {
+                            "This key has a PIN."
                         } else {
-                            "This key has a PIN. Unlock below to manage passkeys."
+                            "This key has a PIN. Unlock below to manage it."
                         };
                         ui.label(
                             egui::RichText::new(hint)
@@ -5856,12 +6201,140 @@ impl App {
             self.submit_change_pin();
         }
 
-        // --- Resident passkeys (only meaningful once a PIN exists) ---
-        if pin_set == Some(true) {
+        let unlocked = self.security_keys.session.is_some();
+        let has_bio = self.bio_cmd_code().is_some();
+        let supports_cfg = self
+            .security_keys
+            .info
+            .as_ref()
+            .and_then(|i| i.option("authnrCfg"))
+            == Some(true);
+        let has_large_blobs = self
+            .security_keys
+            .info
+            .as_ref()
+            .and_then(|i| i.option("largeBlobs"))
+            == Some(true);
+
+        // When the key has a PIN but isn't unlocked yet, show a standalone
+        // unlock card. Unlocking gates passkeys, fingerprints, and settings
+        // alike, so it lives above the tabs rather than inside the Passkeys tab.
+        if pin_set == Some(true) && !unlocked {
             ui.add_space(14.0);
-            let mut lock = false;
-            let mut reload = false;
             let mut unlock = false;
+            theme::card_frame(p).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Unlock this key")
+                            .font(theme::f_sb(14.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "unlock");
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let resp = ui.add_sized(
+                        [220.0, 32.0],
+                        egui::TextEdit::singleline(&mut self.security_keys.pin_input)
+                            .vertical_align(egui::Align::Center)
+                            .password(true)
+                            .hint_text("Enter PIN to unlock this key"),
+                    );
+                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    if submit
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        unlock = true;
+                    }
+                });
+                let extras = match (has_bio, supports_cfg) {
+                    (true, true) => "passkeys, fingerprints, and settings",
+                    (true, false) => "passkeys and fingerprints",
+                    (false, true) => "passkeys and settings",
+                    (false, false) => "passkeys",
+                };
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("Unlock to manage {extras}."))
+                        .font(theme::f_reg(11.5))
+                        .color(p.txt3),
+                );
+            });
+            if unlock {
+                self.try_unlock();
+            }
+        }
+
+        // Once unlocked, the sub-view tabs sit at the top of the content, each
+        // owning its own panel below. Styled like the main capability tabs:
+        // bold label with an accent underline on the active one.
+        if unlocked {
+            let mut tabs: Vec<(FidoSubview, &str)> = vec![(FidoSubview::Passkeys, "Passkeys")];
+            if has_bio {
+                tabs.push((FidoSubview::Fingerprints, "Fingerprints"));
+            }
+            if supports_cfg {
+                tabs.push((FidoSubview::Settings, "Settings"));
+            }
+            if has_large_blobs {
+                tabs.push((FidoSubview::LargeBlobs, "Storage"));
+            }
+            ui.add_space(14.0);
+            let mut next: Option<FidoSubview> = None;
+            // The background watermark is painted behind the whole panel, so the
+            // sub-tab labels would sit over the dashed art and become hard to
+            // read. Paint an opaque surface strip here first (full content width,
+            // fixed height covering the label row + its underline) so the row has
+            // a clean backing - drawn before the labels, so it sits under them.
+            {
+                let top = ui.cursor().top();
+                let strip = egui::Rect::from_min_max(
+                    egui::pos2(ui.max_rect().left(), top - 4.0),
+                    egui::pos2(ui.max_rect().right(), top + 30.0),
+                );
+                ui.painter().rect_filled(strip, 0.0, p.surface);
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 20.0;
+                for (view, label) in &tabs {
+                    let active = self.security_keys.subview == *view;
+                    let color = if active { p.txt } else { p.txt3 };
+                    let resp = ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(*label).font(theme::f_sb(13.5)).color(color),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if active {
+                        let y = resp.rect.bottom() + 6.0;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(resp.rect.left(), y),
+                                egui::pos2(resp.rect.right(), y),
+                            ],
+                            egui::Stroke::new(2.0, p.accent),
+                        );
+                    }
+                    if resp.clicked() {
+                        next = Some(*view);
+                    }
+                }
+            });
+            if let Some(v) = next {
+                self.security_keys.subview = v;
+            }
+        } else {
+            self.security_keys.subview = FidoSubview::Passkeys;
+        }
+        let subview = self.security_keys.subview;
+
+        // --- Passkeys panel: only when unlocked and the Passkeys tab is active. ---
+        if unlocked && subview == FidoSubview::Passkeys {
+            ui.add_space(14.0);
+            let mut reload = false;
             let mut delete: Option<Vec<u8>> = None;
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -5872,17 +6345,11 @@ impl App {
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "passkeys");
-                    if self.security_keys.session.is_some() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::button(ui, p, BtnKind::Ghost, "Lock").clicked() {
-                                lock = true;
-                            }
-                            ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
-                                reload = true;
-                            }
-                        });
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
+                            reload = true;
+                        }
+                    });
                 });
                 ui.add_space(8.0);
                 let session_info = self.security_keys.session.as_ref().map(|s| {
@@ -5950,46 +6417,10 @@ impl App {
                             });
                         }
                     });
-                } else {
-                    let bio = self.bio_cmd_code().is_some();
-                    ui.horizontal(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.security_keys.pin_input)
-                                .password(true)
-                                .hint_text(if bio {
-                                    "Enter PIN to view passkeys & fingerprints"
-                                } else {
-                                    "Enter PIN to view passkeys"
-                                })
-                                .desired_width(220.0),
-                        );
-                        let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
-                        if submit
-                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
-                            unlock = true;
-                        }
-                    });
-                    if bio {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Fingerprint management appears here after you unlock.",
-                            )
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
-                        );
-                    }
                 }
             });
-            if lock {
-                self.lock_session();
-            }
             if reload {
                 self.refresh_credentials();
-            }
-            if unlock {
-                self.try_unlock();
             }
             if let Some(id) = delete {
                 self.delete_credential(id);
@@ -5997,11 +6428,13 @@ impl App {
         }
 
         // --- Fingerprint management (only when unlocked and the key supports it) ---
-        if self.security_keys.session.is_some() && self.bio_cmd_code().is_some() {
+        if subview == FidoSubview::Fingerprints
+            && self.security_keys.session.is_some()
+            && self.bio_cmd_code().is_some()
+        {
             ui.add_space(14.0);
             let mut do_enroll = false;
             let mut do_refresh_fp = false;
-            let mut fp_delete: Option<Vec<u8>> = None;
             let mut fp_rename_commit: Option<(Vec<u8>, String)> = None;
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -6020,54 +6453,10 @@ impl App {
                 });
                 ui.add_space(8.0);
 
-                // --- Enroll wizard: live per-sample progress while capturing ---
+                // Enroll wizard now renders as a centered modal overlay
+                // (render_enroll_dialog, called from the top-level render). Keep
+                // the flag so the list below is hidden while a capture runs.
                 let enrolling = self.security_keys.fp_progress.is_some();
-                if let Some(prog) = self.security_keys.fp_progress.clone() {
-                    if let Ok(g) = prog.lock() {
-                        let (captured, total) = (g.captured, g.total.max(1));
-                        let frac = (captured as f32 / total as f32).clamp(0.0, 1.0);
-                        match &g.done {
-                            None => {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Enrolling \u{2014} sample {} of {}",
-                                        captured.min(total),
-                                        total
-                                    ))
-                                    .font(theme::f_sb(13.0))
-                                    .color(p.accent),
-                                );
-                                ui.add(egui::ProgressBar::new(frac).desired_width(280.0));
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "\u{1F446} {}",
-                                        g.last_message
-                                    ))
-                                    .font(theme::f_reg(12.0))
-                                    .color(p.txt2),
-                                );
-                            }
-                            Some(Ok(())) => {
-                                ui.label(
-                                    egui::RichText::new("\u{2713} Fingerprint enrolled")
-                                        .font(theme::f_sb(13.0))
-                                        .color(p.ok),
-                                );
-                                ui.add(egui::ProgressBar::new(1.0).desired_width(280.0));
-                            }
-                            Some(Err(e)) => {
-                                ui.colored_label(p.err, format!("Enrollment failed: {e}"));
-                            }
-                        }
-                    }
-                    ui.add_space(8.0);
-                    // Dismiss the wizard once the flow is finished.
-                    let finished = prog.lock().ok().and_then(|g| g.done.clone()).is_some();
-                    if finished && theme::button(ui, p, BtnKind::Default, "Done").clicked() {
-                        self.security_keys.fp_progress = None;
-                    }
-                }
 
                 // The list (None until first read). Hidden while the wizard runs.
                 if !enrolling {
@@ -6099,8 +6488,10 @@ impl App {
                                     .is_some_and(|(rid, _)| rid == &id);
                                 if renaming {
                                     if let Some((_, buf)) = self.security_keys.fp_rename.as_mut() {
-                                        ui.add(
-                                            egui::TextEdit::singleline(buf).desired_width(160.0),
+                                        ui.add_sized(
+                                            [160.0, 32.0],
+                                            egui::TextEdit::singleline(buf)
+                                                .vertical_align(egui::Align::Center),
                                         );
                                     }
                                     if theme::button(ui, p, BtnKind::Primary, "Save").clicked() {
@@ -6147,10 +6538,11 @@ impl App {
                 // Enroll a new fingerprint (hidden while a wizard is running).
                 if !enrolling {
                     ui.horizontal(|ui| {
-                        ui.add(
+                        ui.add_sized(
+                            [160.0, 32.0],
                             egui::TextEdit::singleline(&mut self.security_keys.fp_new_name)
-                                .hint_text("name (optional)")
-                                .desired_width(160.0),
+                                .vertical_align(egui::Align::Center)
+                                .hint_text("name (optional)"),
                         );
                         if theme::button(ui, p, BtnKind::Primary, "Enroll new\u{2026}").clicked() {
                             do_enroll = true;
@@ -6167,34 +6559,6 @@ impl App {
                 }
 
                 // --- Delete confirmation ("Are you sure?") ---
-                if let Some(id) = self.security_keys.fp_confirm_delete.clone() {
-                    ui.add_space(8.0);
-                    let label = self
-                        .security_keys
-                        .fingerprints
-                        .as_ref()
-                        .and_then(|l| l.iter().find(|e| e.template_id == id))
-                        .and_then(|e| e.friendly_name.clone())
-                        .unwrap_or_else(|| hex_short(&id));
-                    theme::card_frame(p)
-                        .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-                        .show(ui, |ui| {
-                            ui.colored_label(
-                                p.err,
-                                format!("Delete fingerprint \u{201c}{label}\u{201d}? This cannot be undone."),
-                            );
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
-                                    fp_delete = Some(id.clone());
-                                    self.security_keys.fp_confirm_delete = None;
-                                }
-                                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
-                                    self.security_keys.fp_confirm_delete = None;
-                                }
-                            });
-                        });
-                }
             });
             if do_refresh_fp {
                 self.refresh_fingerprints();
@@ -6202,47 +6566,1083 @@ impl App {
             if do_enroll {
                 self.enroll_fingerprint();
             }
-            if let Some(id) = fp_delete {
-                self.delete_fingerprint(id);
-            }
             if let Some((id, name)) = fp_rename_commit {
                 self.rename_fingerprint(id, name);
             }
         }
 
-        // --- Danger: reset key (typed-confirm modal stays) ---
-        ui.add_space(14.0);
-        let mut arm_reset = false;
-        theme::card_frame(p)
-            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
+        // --- Settings sub-view: advanced config + the danger reset card. ---
+        if subview == FidoSubview::Settings {
+            // Advanced (authenticatorConfig) security-policy controls.
+            self.render_fido_advanced(ui, p);
+
+            // Danger: reset key (typed-confirm modal stays).
+            ui.add_space(14.0);
+            let mut arm_reset = false;
+            theme::card_frame(p)
+                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Reset this key")
+                                .font(theme::f_sb(14.5))
+                                .color(p.err),
+                        );
+                        ui.add_space(6.0);
+                        self.help_dot(ui, p, "reset");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button(ui, p, BtnKind::Danger, "Reset key\u{2026}").clicked() {
+                                arm_reset = true;
+                            }
+                        });
+                    });
                     ui.label(
-                        egui::RichText::new("Reset this key")
-                            .font(theme::f_sb(14.5))
-                            .color(p.err),
+                        egui::RichText::new(
+                            "Wipes every passkey and the PIN on this key. Cannot be undone.",
+                        )
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
                     );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "reset");
+                });
+            if arm_reset {
+                self.security_keys.reset = ResetDialog {
+                    open: true,
+                    ..Default::default()
+                };
+            }
+        }
+
+        if subview == FidoSubview::LargeBlobs {
+            self.render_large_blobs(ui, p);
+        }
+    }
+
+    /// Append a keyroost text note to the array and write it back. Needs the
+    /// unlocked session's PIN (the write path requires a Large-Blob-Write token).
+    fn add_large_blob_note(&mut self, text: String) {
+        let Some(path) = self.selected_fido_path() else {
+            self.security_keys.lb_status = Some("No FIDO key selected.".into());
+            return;
+        };
+        let Some(session) = self.security_keys.session.as_ref() else {
+            self.security_keys.lb_status =
+                Some("Unlock the key with your PIN first to add data.".into());
+            return;
+        };
+        let pin = session.pin.clone();
+        // Start from the currently-loaded array if we have one, else an empty
+        // array (read fresh inside the worker to avoid clobbering RP entries we
+        // never loaded).
+        let loaded = self.security_keys.large_blobs.clone();
+
+        self.spawn_job("Saving to large blobs\u{2026}", move || {
+            let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
+                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                if !init.supports_cbor() {
+                    return Err("device is U2F-only".into());
+                }
+                let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+
+                // Always re-read immediately before writing so we append onto the
+                // authenticator's current array (not a stale cached copy), which
+                // protects any RP entries written since our last load.
+                let current = keyroost_ctap::large_blobs::read(&mut dev, &info)
+                    .map_err(|e| e.to_string())?;
+                let _ = loaded; // cached copy only informs the UI, not the write
+
+                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                    &mut dev,
+                    &pin,
+                    &info,
+                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+                )
+                .map_err(|e| e.to_string())?;
+
+                let updated = current.with_text_note(&text);
+                let serialized = updated.serialize_with_checksum();
+                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                    .map_err(|e| e.to_string())?;
+
+                keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())
+            })();
+
+            Box::new(move |app: &mut App| match result {
+                Ok(array) => {
+                    let n = array.entries.len();
+                    app.security_keys.large_blobs = Some(array);
+                    app.security_keys.lb_new_text.clear();
+                    app.security_keys.lb_show_add = false;
+                    app.security_keys.lb_status = Some(format!("Saved. {n} entr{} total.", if n == 1 { "y" } else { "ies" }));
+                    app.security_keys.error = None;
+                }
+                Err(e) => {
+                    app.security_keys.lb_status = Some(format!("Save failed: {e}"));
+                }
+            })
+        });
+    }
+
+    /// Replace the keyroost note at `idx` with `text` and write the array back.
+    /// Refuses if the entry is not a keyroost note. Needs the session PIN.
+    fn edit_large_blob_note(&mut self, idx: usize, text: String) {
+        let Some(path) = self.selected_fido_path() else {
+            self.security_keys.lb_status = Some("No FIDO key selected.".into());
+            return;
+        };
+        let Some(session) = self.security_keys.session.as_ref() else {
+            self.security_keys.lb_status =
+                Some("Unlock the key with your PIN first to edit notes.".into());
+            return;
+        };
+        let pin = session.pin.clone();
+
+        self.spawn_job("Saving edit to large blobs\u{2026}", move || {
+            let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
+                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                if !init.supports_cbor() {
+                    return Err("device is U2F-only".into());
+                }
+                let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+
+                // Re-read live so we edit the authenticator's current array and
+                // never clobber RP entries written since our last load.
+                let current = keyroost_ctap::large_blobs::read(&mut dev, &info)
+                    .map_err(|e| e.to_string())?;
+                let updated = current
+                    .with_replaced_note(idx, &text)
+                    .ok_or("that entry is not an editable keyroost note (it may have \
+                            changed on the key — reload and try again)")?;
+
+                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                    &mut dev,
+                    &pin,
+                    &info,
+                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+                )
+                .map_err(|e| e.to_string())?;
+
+                let serialized = updated.serialize_with_checksum();
+                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                    .map_err(|e| e.to_string())?;
+
+                keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())
+            })();
+
+            Box::new(move |app: &mut App| match result {
+                Ok(array) => {
+                    app.security_keys.large_blobs = Some(array);
+                    app.security_keys.lb_editing = None;
+                    app.security_keys.lb_edit_text.clear();
+                    app.security_keys.lb_status = Some("Note updated.".into());
+                    app.security_keys.error = None;
+                }
+                Err(e) => {
+                    app.security_keys.lb_status = Some(format!("Edit failed: {e}"));
+                }
+            })
+        });
+    }
+
+    /// Read the large-blob array from the selected key (no PIN required) and
+    /// cache it. Runs synchronously — a read is one or two small fragments.
+    fn load_large_blobs(&mut self) {
+        let Some(path) = self.selected_fido_path() else {
+            self.security_keys.lb_status = Some("No FIDO key selected.".into());
+            return;
+        };
+        let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
+            let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+            if !init.supports_cbor() {
+                return Err("device is U2F-only".into());
+            }
+            let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+            keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())
+        })();
+        match result {
+            Ok(array) => {
+                let n = array.entries.len();
+                self.security_keys.large_blobs = Some(array);
+                self.security_keys.lb_selected = None;
+                self.security_keys.lb_status =
+                    Some(format!("Loaded {n} entr{}.", if n == 1 { "y" } else { "ies" }));
+            }
+            Err(e) => {
+                self.security_keys.lb_status = Some(format!("Load failed: {e}"));
+            }
+        }
+    }
+
+    /// Delete entry `idx`, re-serialize the remaining entries with a fresh
+    /// checksum, and write the array back. Needs a Large-Blob-Write token, which
+    /// we derive from the unlocked session's PIN. Runs on the worker thread.
+    fn delete_large_blob_entry(&mut self, idx: usize) {
+        let Some(path) = self.selected_fido_path() else {
+            self.security_keys.lb_status = Some("No FIDO key selected.".into());
+            return;
+        };
+        let Some(array) = self.security_keys.large_blobs.clone() else {
+            return;
+        };
+        let Some(session) = self.security_keys.session.as_ref() else {
+            self.security_keys.lb_status =
+                Some("Unlock the key with your PIN first to modify large blobs.".into());
+            return;
+        };
+        if idx >= array.entries.len() {
+            return;
+        }
+        let pin = session.pin.clone();
+
+        // Build the new array (minus the deleted entry) on the UI thread, then
+        // serialize with checksum inside the worker.
+        let mut new_entries = array.entries.clone();
+        new_entries.remove(idx);
+
+        self.spawn_job("Updating large blobs\u{2026}", move || {
+            let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
+                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                if !init.supports_cbor() {
+                    return Err("device is U2F-only".into());
+                }
+                let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                    &mut dev,
+                    &pin,
+                    &info,
+                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+                )
+                .map_err(|e| e.to_string())?;
+
+                let updated = keyroost_ctap::large_blobs::LargeBlobArray {
+                    entries: new_entries,
+                    raw_array: Vec::new(),
+                };
+                let serialized = updated.serialize_with_checksum();
+                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                    .map_err(|e| e.to_string())?;
+
+                // Read back so the view reflects the authenticator's actual state.
+                keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())
+            })();
+
+            Box::new(move |app: &mut App| match result {
+                Ok(array) => {
+                    let n = array.entries.len();
+                    app.security_keys.large_blobs = Some(array);
+                    app.security_keys.lb_selected = None;
+                    app.security_keys.lb_status =
+                        Some(format!("Entry deleted. {n} remaining."));
+                    app.security_keys.error = None;
+                }
+                Err(e) => {
+                    app.security_keys.lb_status = Some(format!("Update failed: {e}"));
+                }
+            })
+        });
+    }
+
+    /// Large-blob array viewer/editor (CTAP authenticatorLargeBlobs 0x0C).
+    ///
+    /// Reads the key-global serialized array (no PIN needed) and shows it both
+    /// as a structured entry list and as a hex/ASCII dump. Deleting an entry
+    /// re-serializes the remaining entries, recomputes the 16-byte checksum
+    /// trailer, and writes the whole array back (which needs a PIN, because the
+    /// write path requires a token with the Large Blob Write permission).
+    fn render_large_blobs(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.add_space(14.0);
+
+        // Auto-load the array the first time this tab is shown, so entries
+        // appear without a manual Load click. The flag stops a failed read from
+        // retrying every frame; Reload remains available to refresh on demand.
+        if !self.security_keys.lb_autoloaded && self.security_keys.large_blobs.is_none() {
+            self.security_keys.lb_autoloaded = true;
+            self.load_large_blobs();
+        }
+
+        // Header + Load/Reload control.
+        let mut do_load = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Large blob storage")
+                    .font(theme::f_sb(14.5))
+                    .color(p.txt),
+            );
+            ui.add_space(6.0);
+            self.help_dot(ui, p, "large_blobs");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.security_keys.large_blobs.is_some() {
+                    "Reload"
+                } else {
+                    "Load"
+                };
+                if theme::button(ui, p, BtnKind::Ghost, label).clicked() {
+                    do_load = true;
+                }
+                ui.add_space(8.0);
+                let add_label = if self.security_keys.lb_show_add {
+                    "Close"
+                } else {
+                    "Add"
+                };
+                if theme::button(ui, p, BtnKind::Ghost, add_label).clicked() {
+                    self.security_keys.lb_show_add = !self.security_keys.lb_show_add;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "This store is readable by anyone holding the key and is meant for \
+                 RP-encrypted data \u{2014} not a place for plaintext secrets.",
+            )
+            .font(theme::f_reg(11.5))
+            .color(p.txt3),
+        );
+
+        if let Some(status) = &self.security_keys.lb_status {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(status)
+                    .font(theme::f_reg(12.0))
+                    .color(p.txt2),
+            );
+        }
+
+        if do_load {
+            self.load_large_blobs();
+        }
+
+        // Add-a-note composer — only when the user clicked Add. Requires an
+        // unlocked session (the write needs a PIN-derived token); show a hint
+        // instead when locked.
+        if self.security_keys.lb_show_add {
+            ui.add_space(12.0);
+            theme::card_frame(p).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Add a text note")
+                        .font(theme::f_sb(13.0))
+                        .color(p.txt),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Stored as a keyroost entry you can read back here. It is NOT \
+                         encrypted and is visible to anyone holding the key.",
+                    )
+                    .font(theme::f_reg(11.0))
+                    .color(p.txt3),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.security_keys.lb_new_text)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Type a note to store on the key\u{2026}"),
+                );
+                ui.add_space(6.0);
+                let unlocked = self.security_keys.session.is_some();
+                let has_text = !self.security_keys.lb_new_text.trim().is_empty();
+                ui.horizontal(|ui| {
+                    let add = theme::button(ui, p, BtnKind::Primary, "Add note");
+                    if add.clicked() && unlocked && has_text {
+                        let text = self.security_keys.lb_new_text.clone();
+                        self.add_large_blob_note(text);
+                    }
+                    if !unlocked {
+                        ui.label(
+                            egui::RichText::new("Unlock with your PIN to save.")
+                                .font(theme::f_reg(11.0))
+                                .color(p.txt3),
+                        );
+                    }
+                });
+            });
+        }
+
+        // Render the loaded array, if any.
+        let Some(array) = self.security_keys.large_blobs.clone() else {
+            return;
+        };
+
+        ui.add_space(10.0);
+        if array.entries.is_empty() {
+            ui.label(
+                egui::RichText::new("The large-blob array is empty.")
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+            );
+            return;
+        }
+
+        let mut delete_request: Option<usize> = None;
+        let mut start_edit: Option<(usize, String)> = None;
+        let mut save_edit: Option<(usize, String)> = None;
+        let mut cancel_edit = false;
+        let selected = self.security_keys.lb_selected;
+        let editing = self.security_keys.lb_editing;
+        for (idx, entry) in array.entries.iter().enumerate() {
+            theme::card_frame(p).show(ui, |ui| {
+                let note_text = entry.as_text();
+                ui.horizontal(|ui| {
+                    let title = if note_text.is_some() {
+                        format!("Note {}", idx + 1)
+                    } else {
+                        format!("Entry {}", idx + 1)
+                    };
+                    ui.label(
+                        egui::RichText::new(title)
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                    ui.add_space(8.0);
+                    let meta = if note_text.is_some() {
+                        "keyroost text note".to_string()
+                    } else {
+                        format!(
+                            "{} bytes ciphertext \u{00b7} {}-byte nonce \u{00b7} origSize {} \u{00b7} relying-party data",
+                            entry.ciphertext.len(),
+                            entry.nonce.len(),
+                            entry.orig_size,
+                        )
+                    };
+                    ui.label(
+                        egui::RichText::new(meta)
+                            .font(theme::f_reg(11.5))
+                            .color(p.txt3),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset key\u{2026}").clicked() {
-                            arm_reset = true;
+                        if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
+                            delete_request = Some(idx);
+                        }
+                        let is_open = selected == Some(idx);
+                        let toggle = if is_open { "Hide bytes" } else { "View bytes" };
+                        if theme::button(ui, p, BtnKind::Ghost, toggle).clicked() {
+                            self.security_keys.lb_selected =
+                                if is_open { None } else { Some(idx) };
+                        }
+                        // Edit only applies to keyroost's own notes.
+                        if note_text.is_some() && editing != Some(idx) {
+                            if theme::button(ui, p, BtnKind::Ghost, "Edit").clicked() {
+                                start_edit = Some((idx, note_text.clone().unwrap_or_default()));
+                            }
                         }
                     });
                 });
-                ui.label(
-                    egui::RichText::new(
-                        "Wipes every passkey and the PIN on this key. Cannot be undone.",
-                    )
-                    .font(theme::f_reg(12.5))
-                    .color(p.txt2),
-                );
+                // keyroost notes: inline editor when editing this entry, else
+                // the decoded text read-only.
+                if editing == Some(idx) {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.security_keys.lb_edit_text)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(6.0);
+                    let unlocked = self.security_keys.session.is_some();
+                    let has_text =
+                        !self.security_keys.lb_edit_text.trim().is_empty();
+                    ui.horizontal(|ui| {
+                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
+                            && unlocked
+                            && has_text
+                        {
+                            save_edit = Some((idx, self.security_keys.lb_edit_text.clone()));
+                        }
+                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                            cancel_edit = true;
+                        }
+                        if !unlocked {
+                            ui.label(
+                                egui::RichText::new("Unlock with your PIN to save.")
+                                    .font(theme::f_reg(11.0))
+                                    .color(p.txt3),
+                            );
+                        }
+                    });
+                } else if let Some(text) = &note_text {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(text)
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt),
+                    );
+                }
+                if selected == Some(idx) {
+                    ui.add_space(8.0);
+                    Self::hex_ascii_view(ui, p, &entry.ciphertext);
+                }
             });
-        if arm_reset {
-            self.security_keys.reset = ResetDialog {
-                open: true,
+            ui.add_space(8.0);
+        }
+
+        // Apply edit-related actions collected during the loop (kept outside it
+        // to avoid borrowing `self` while iterating the cloned array).
+        if let Some((idx, text)) = start_edit {
+            self.security_keys.lb_editing = Some(idx);
+            self.security_keys.lb_edit_text = text;
+        }
+        if cancel_edit {
+            self.security_keys.lb_editing = None;
+            self.security_keys.lb_edit_text.clear();
+        }
+        if let Some((idx, text)) = save_edit {
+            self.edit_large_blob_note(idx, text);
+        }
+
+        // A delete is a write; confirm before touching the key.
+        if let Some(idx) = delete_request {
+            self.security_keys.lb_confirm_delete = Some(idx);
+        }
+        if let Some(idx) = self.security_keys.lb_confirm_delete {
+            ui.add_space(6.0);
+            theme::card_frame(p)
+                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Delete entry {} and rewrite the array? Requires your PIN.",
+                            idx + 1
+                        ))
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Delete entry").clicked() {
+                            self.security_keys.lb_confirm_delete = None;
+                            self.delete_large_blob_entry(idx);
+                        }
+                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                            self.security_keys.lb_confirm_delete = None;
+                        }
+                    });
+                });
+        }
+    }
+
+    /// Render a byte slice as a side-by-side hex + ASCII dump, 16 bytes/row.
+    fn hex_ascii_view(ui: &mut egui::Ui, p: &Palette, bytes: &[u8]) {
+        let mut text = String::new();
+        for (i, row) in bytes.chunks(16).enumerate() {
+            let mut hex = String::new();
+            let mut ascii = String::new();
+            for (j, b) in row.iter().enumerate() {
+                hex.push_str(&format!("{:02x} ", b));
+                if j == 7 {
+                    hex.push(' ');
+                }
+                ascii.push(if b.is_ascii_graphic() || *b == b' ' {
+                    *b as char
+                } else {
+                    '.'
+                });
+            }
+            // Pad short final rows so the ASCII column lines up.
+            let width = 16 * 3 + 1;
+            while hex.len() < width {
+                hex.push(' ');
+            }
+            text.push_str(&format!("{:08x}  {} |{}|\n", i * 16, hex, ascii));
+        }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(text.trim_end())
+                    .font(theme::f_mono(11.5))
+                    .color(p.txt2),
+            )
+            .wrap(),
+        );
+    }
+
+    /// Advanced security-policy view (CTAP authenticatorConfig). Grouped here,
+    /// behind the overflow menu, because several of these are irreversible and
+    /// shouldn't sit alongside everyday controls. Each action takes the device
+    /// PIN at apply time (config needs its own permissioned token) and the
+    /// irreversible ones require an explicit typed confirmation.
+    fn render_fido_advanced(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let always_uv = self
+            .security_keys
+            .info
+            .as_ref()
+            .and_then(|i| i.option("alwaysUv"));
+        // Enterprise attestation support: the `ep` option is present (true =
+        // already enabled, false = supported but off) on keys that can do it,
+        // and absent entirely on keys that can't. Hide the row when unsupported.
+        let ep = self
+            .security_keys
+            .info
+            .as_ref()
+            .and_then(|i| i.option("ep"));
+        let supports_ep = ep.is_some();
+        let ep_enabled = ep == Some(true);
+
+        ui.add_space(14.0);
+        theme::card_frame(p).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Security policy")
+                        .font(theme::f_sb(14.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "settings");
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "These change the key's security policy. Some are irreversible \
+                     without a full reset \u{2014} read each note before applying.",
+                )
+                .font(theme::f_reg(12.0))
+                .color(p.txt3),
+            );
+            ui.add_space(10.0);
+
+            // Each row: a description + a button that arms the confirm dialog.
+            let mut arm: Option<AdvancedAction> = None;
+
+            // Always-UV (reversible toggle).
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Always require user verification")
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                    let state = match always_uv {
+                        Some(true) => "Currently on \u{2014} every sign-in needs PIN or biometric.",
+                        Some(false) => "Currently off.",
+                        None => "State unknown.",
+                    };
+                    ui.label(
+                        egui::RichText::new(state)
+                            .font(theme::f_reg(11.5))
+                            .color(p.txt3),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Toggle").clicked() {
+                        arm = Some(AdvancedAction::ToggleAlwaysUv);
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            // Set minimum PIN length (one-way).
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Set minimum PIN length")
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Can only be raised, never lowered without a reset.",
+                        )
+                        .font(theme::f_reg(11.5))
+                        .color(p.txt3),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Set\u{2026}").clicked() {
+                        arm = Some(AdvancedAction::SetMinPin);
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            // Force PIN change.
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Force PIN change on next use")
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                    ui.label(
+                        egui::RichText::new("Useful before handing the key to someone else.")
+                            .font(theme::f_reg(11.5))
+                            .color(p.txt3),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Force\u{2026}").clicked() {
+                        arm = Some(AdvancedAction::ForcePinChange);
+                    }
+                });
+            });
+            // Enterprise attestation (one-way) — only shown on keys that
+            // support it (the `ep` getInfo option is present).
+            if supports_ep {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Enable enterprise attestation")
+                                .font(theme::f_sb(13.0))
+                                .color(p.txt),
+                        );
+                        let note = if ep_enabled {
+                            "Currently on. Disabling it again requires a device reset."
+                        } else {
+                            "One-way: disabling it again requires a device reset."
+                        };
+                        ui.label(
+                            egui::RichText::new(note)
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ep_enabled {
+                            // Already enabled: nothing actionable, show a pill.
+                            theme::pill(ui, "Enabled", p.ok, p.ok_soft());
+                        } else if theme::button(ui, p, BtnKind::Danger, "Enable\u{2026}").clicked() {
+                            arm = Some(AdvancedAction::EnterpriseAttestation);
+                        }
+                    });
+                });
+            }
+
+            if let Some(action) = arm {
+                self.security_keys.advanced = Some(AdvancedDialog {
+                    action,
+                    ..Default::default()
+                });
+                self.security_keys.error = None;
+            }
+        });
+    }
+
+    /// Inline confirm + PIN entry for an armed Advanced action.
+    /// Confirm/apply overlay for an armed Advanced action. Rendered as a
+    /// centered modal window (like the reset dialog) so it floats over the
+    /// Settings panel instead of pushing the list down.
+    /// Shared centered-modal chrome used by the Settings, fingerprint-delete,
+    /// and enrollment dialogs so they all look identical: no native title bar,
+    /// a custom frame (pop fill, line stroke, drop shadow, 20px padding), a
+    /// title at button-font size with a painted X close, and Esc-to-dismiss.
+    /// `body` draws the dialog contents. Returns true if the X or Esc was used
+    /// (the caller dismisses its own state).
+    fn modal_window(
+        ctx: &egui::Context,
+        p: &Palette,
+        id: &str,
+        title: &str,
+        body: impl FnOnce(&mut egui::Ui),
+    ) -> bool {
+        let mut closed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        egui::Window::new(id)
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame {
+                inner_margin: egui::Margin::same(20.0),
+                rounding: egui::Rounding::same(13.0),
+                fill: p.pop,
+                stroke: egui::Stroke::new(1.0, p.line),
+                shadow: egui::epaint::Shadow {
+                    offset: egui::vec2(0.0, 12.0),
+                    blur: 40.0,
+                    spread: 0.0,
+                    color: egui::Color32::from_black_alpha(115),
+                },
                 ..Default::default()
-            };
+            })
+            .show(ctx, |ui| {
+                ui.set_max_width(300.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (xr, xresp) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        let xcolor = if xresp.hovered() { p.txt } else { p.txt3 };
+                        paint_x_icon(ui, xr.center(), xcolor);
+                        if xresp.clicked() {
+                            closed = true;
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+                body(ui);
+            });
+        closed
+    }
+
+    /// Centered-modal enrollment dialog (same chrome as the Settings dialogs):
+    /// live per-sample progress, a Cancel during capture, and a Done once the
+    /// flow finishes.
+    fn render_enroll_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(prog) = self.security_keys.fp_progress.clone() else {
+            return;
+        };
+
+        // Snapshot the shared state under one short lock so the body closure
+        // (which only borrows `ui`) doesn't need the mutex.
+        let (captured, total, last_message, done) = {
+            let Ok(g) = prog.lock() else { return };
+            (g.captured, g.total.max(1), g.last_message.clone(), g.done.clone())
+        };
+        let frac = (captured as f32 / total as f32).clamp(0.0, 1.0);
+        let finished = done.is_some();
+
+        let mut want_cancel = false;
+        let mut want_done = false;
+        let closed = Self::modal_window(ctx, p, "fp_enroll", "Enroll fingerprint", |ui| {
+            match &done {
+                None => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Enrolling \u{2014} sample {} of {}",
+                            captured.min(total),
+                            total
+                        ))
+                        .font(theme::f_sb(13.0))
+                        .color(p.accent),
+                    );
+                    ui.add_space(8.0);
+                    ui.add(egui::ProgressBar::new(frac).desired_width(280.0));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!("\u{1F446} {last_message}"))
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                    ui.add_space(16.0);
+                    if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                        want_cancel = true;
+                    }
+                }
+                Some(Ok(())) => {
+                    ui.label(
+                        egui::RichText::new("\u{2713} Fingerprint enrolled")
+                            .font(theme::f_sb(13.0))
+                            .color(p.ok),
+                    );
+                    ui.add_space(8.0);
+                    ui.add(egui::ProgressBar::new(1.0).desired_width(280.0));
+                    ui.add_space(16.0);
+                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                        want_done = true;
+                    }
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(p.err, format!("Enrollment failed: {e}"));
+                    ui.add_space(16.0);
+                    if theme::button(ui, p, BtnKind::Default, "Close").clicked() {
+                        want_done = true;
+                    }
+                }
+            }
+        });
+
+        if want_cancel {
+            // Signal the worker to abort the capture between samples.
+            if let Ok(mut g) = prog.lock() {
+                g.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                g.last_message = "Cancelling\u{2026}".into();
+            }
+        }
+        // Done / Close / the X / Esc dismiss the dialog once the flow is
+        // finished. While a capture is still running, the X/Esc act as Cancel
+        // rather than leaving an orphaned worker.
+        if want_done || (closed && finished) {
+            self.security_keys.fp_progress = None;
+        } else if closed && !finished {
+            if let Ok(mut g) = prog.lock() {
+                g.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                g.last_message = "Cancelling\u{2026}".into();
+            }
+        }
+    }
+
+    /// Centered-modal confirmation for deleting a fingerprint (same chrome as
+    /// the Settings dialogs). Returns the template id to delete, if confirmed.
+    fn render_fp_delete_confirm(&mut self, ctx: &egui::Context, p: &Palette) -> Option<Vec<u8>> {
+        let id = self.security_keys.fp_confirm_delete.clone()?;
+        let label = self
+            .security_keys
+            .fingerprints
+            .as_ref()
+            .and_then(|l| l.iter().find(|e| e.template_id == id))
+            .and_then(|e| e.friendly_name.clone())
+            .unwrap_or_else(|| hex_short(&id));
+
+        let mut confirm = false;
+        let mut cancel = false;
+        let closed = Self::modal_window(ctx, p, "fp_delete", "Delete fingerprint?", |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Delete fingerprint \u{201c}{label}\u{201d}? This cannot be undone."
+                ))
+                .font(theme::f_reg(12.5))
+                .color(p.txt),
+            );
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
+                    confirm = true;
+                }
+                ui.add_space(8.0);
+                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if cancel || closed {
+            self.security_keys.fp_confirm_delete = None;
+            return None;
+        }
+        if confirm {
+            self.security_keys.fp_confirm_delete = None;
+            return Some(id);
+        }
+        None
+    }
+
+    fn render_advanced_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(dlg) = self.security_keys.advanced.as_ref() else {
+            return;
+        };
+        let action = dlg.action;
+        if action == AdvancedAction::None {
+            return;
+        }
+
+        let (title, irreversible) = match action {
+            AdvancedAction::ToggleAlwaysUv => ("Toggle always-UV", false),
+            AdvancedAction::SetMinPin => ("Set minimum PIN length", true),
+            AdvancedAction::ForcePinChange => ("Force a PIN change", false),
+            AdvancedAction::EnterpriseAttestation => ("Enable enterprise attestation", true),
+            AdvancedAction::None => return,
+        };
+
+        let mut apply = false;
+        let mut cancel = false;
+        // No built-in title bar, so handle Esc-to-dismiss ourselves.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame {
+                    inner_margin: egui::Margin::same(20.0),
+                    rounding: egui::Rounding::same(13.0),
+                    fill: p.pop,
+                    stroke: egui::Stroke::new(1.0, p.line),
+                    shadow: egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 12.0),
+                        blur: 40.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(115),
+                    },
+                    ..Default::default()
+                },
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(300.0);
+                // Custom title at the button font size (the default window title
+                // bar is dropped via title_bar(false), so render our own).
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (xr, xresp) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        let xcolor = if xresp.hovered() { p.txt } else { p.txt3 };
+                        paint_x_icon(ui, xr.center(), xcolor);
+                        if xresp.clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+                if irreversible {
+                    ui.label(
+                        egui::RichText::new(
+                            "This cannot be undone without a full reset of the key.",
+                        )
+                        .font(theme::f_reg(12.0))
+                        .color(p.warn),
+                    );
+                    ui.add_space(12.0);
+                }
+
+                if action == AdvancedAction::SetMinPin {
+                    ui.horizontal(|ui| {
+                        ui.label("New minimum length");
+                        if let Some(d) = self.security_keys.advanced.as_mut() {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.min_pin_input)
+                                    .desired_width(64.0)
+                                    .hint_text("e.g. 6"),
+                            );
+                        }
+                    });
+                    ui.add_space(8.0);
+                    if let Some(d) = self.security_keys.advanced.as_mut() {
+                        ui.checkbox(&mut d.force_change, "Also force a PIN change now");
+                    }
+                    ui.add_space(12.0);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Device PIN");
+                    if let Some(d) = self.security_keys.advanced.as_mut() {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.pin_input)
+                                .password(true)
+                                .desired_width(160.0),
+                        );
+                    }
+                });
+                ui.add_space(16.0);
+
+                ui.horizontal(|ui| {
+                    let kind = if irreversible {
+                        BtnKind::Danger
+                    } else {
+                        BtnKind::Primary
+                    };
+                    if theme::button(ui, p, kind, "Apply").clicked() {
+                        apply = true;
+                    }
+                    ui.add_space(8.0);
+                    if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+
+                if let Some(err) = &self.security_keys.error {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(err)
+                            .font(theme::f_reg(12.0))
+                            .color(p.err),
+                    );
+                }
+            });
+
+        if apply {
+            self.run_advanced_action();
+        } else if cancel {
+            // The Cancel button, the ✕, or pressing Esc all dismiss.
+            self.security_keys.advanced = None;
+            self.security_keys.error = None;
         }
     }
 
@@ -6295,10 +7695,11 @@ impl App {
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.add(
+                    ui.add_sized(
+                        [220.0, 32.0],
                         egui::TextEdit::singleline(&mut self.oath.password_input)
-                            .password(true)
-                            .desired_width(220.0),
+                            .vertical_align(egui::Align::Center)
+                            .password(true),
                     );
                     if theme::button(ui, p, BtnKind::Primary, "Unlock").clicked() {
                         self.load_oath_creds();
@@ -6927,10 +8328,11 @@ impl App {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             if self.rename_open {
-                                let resp = ui.add(
+                                let resp = ui.add_sized(
+                                    [200.0, 32.0],
                                     egui::TextEdit::singleline(&mut self.rename_input)
-                                        .hint_text("friendly-name")
-                                        .desired_width(200.0),
+                                        .vertical_align(egui::Align::Center)
+                                        .hint_text("friendly-name"),
                                 );
                                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                                 if theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter {
@@ -7004,11 +8406,12 @@ impl App {
                         );
                         self.help_dot(ui, p, "custkey");
                         ui.add_space(6.0);
-                        ui.add(
+                        ui.add_sized(
+                            [200.0, 32.0],
                             egui::TextEdit::singleline(&mut self.customer_key_input)
+                                .vertical_align(egui::Align::Center)
                                 .password(true)
-                                .hint_text("default if empty")
-                                .desired_width(200.0),
+                                .hint_text("default if empty"),
                         );
                         ui.checkbox(&mut self.customer_key_hex, "hex");
                         if theme::button(ui, p, BtnKind::Default, "Authenticate").clicked() {

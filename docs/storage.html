@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage — large blobs — keyroost</title>
+<meta name="description" content="Read and edit a FIDO2 key's large-blob array on a Token2 key: view stored entries as hex and ASCII, and add, edit, or delete plaintext keyroost notes, over the standard authenticatorLargeBlobs command.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Storage</p>
+    <h1>Large blobs</h1>
+    <p class="kr-lede">Inspect and edit a key's large-blob array — view stored entries as hex and ASCII, and keep your own plaintext notes — over the standard CTAP 2.1 <code>authenticatorLargeBlobs</code> command.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>CTAP 2.1 keys can hold a small, key-global <strong>large-blob array</strong>: a place
+      where relying parties stash data that is too big to live inside a credential ID (an SSH
+      certificate, for example). keyroost surfaces it in the <strong>Storage</strong> sub-view
+      of the FIDO2 tab, showing every stored entry and letting you keep your own text notes
+      alongside.</p>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>The array is <strong>readable by anyone holding the key</strong> — no PIN is needed to
+        read it — and it is meant for relying-party-encrypted data, <strong>not</strong> a
+        place for plaintext secrets. Treat it as a convenience scratchpad, not a vault.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Where to find it</h2>
+    <p>Open the <strong>FIDO2</strong> tab and choose the <strong>Storage</strong> tab. It
+      appears only when the key reports <code>largeBlobs</code> support in its
+      <code>getInfo</code> options. The array loads automatically when you open the tab;
+      <strong>Reload</strong> refreshes it on demand. Reading needs no PIN, but adding,
+      editing, or deleting entries does — those are writes.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>What you can do</h2>
+    <p><strong>View entries.</strong> Each stored entry is shown as a card. <em>View bytes</em>
+      expands a side-by-side <strong>hex + ASCII</strong> dump of its contents. Genuine
+      relying-party entries are labelled <em>relying-party data</em> and are read-only —
+      they are encrypted by the website that created them, so keyroost never rewrites them.</p>
+    <p><strong>Add a note.</strong> The <em>Add</em> button opens a composer; type text and
+      save it. keyroost stores it as its own entry, marked so it can be recognised and read
+      back here later. This is <strong>not encryption</strong> — the text is stored in the
+      clear.</p>
+    <p><strong>Edit a note.</strong> keyroost's own notes have an <em>Edit</em> button that
+      replaces the text in place. Relying-party entries cannot be edited.</p>
+    <p><strong>Delete an entry.</strong> Any entry can be deleted; keyroost rewrites the array
+      without it.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>How writes stay safe</h2>
+    <p>The large-blob array is not a flat byte buffer: it is a CBOR array of entries followed
+      by a <strong>16-byte truncated SHA-256 checksum</strong> over the whole serialization. A
+      naive raw edit that left a stale checksum would make the key reject the array, and could
+      break future credential writes until a reset.</p>
+    <p class="kr-muted">keyroost therefore edits the array <strong>structurally</strong> —
+      it parses the entries, applies your add / edit / delete, then re-serializes and
+      recomputes the checksum before writing. Each write re-reads the key's current array
+      first, so concurrent relying-party entries are preserved. Writes are authenticated with
+      a Large-Blob-Write token derived from your PIN.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Cautions</h2>
+    <p class="kr-muted"><strong>Nothing here is secret.</strong> Anyone who plugs in the key
+      can read the array, including your notes. <strong>Don't store passwords, recovery
+      codes, or anything sensitive.</strong> If a write is rejected, the key may be out of
+      large-blob storage or busy; keyroost reports the CTAP status with a readable hint, and
+      the array is left unchanged.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#authenticatorLargeBlobs"><span class="who">FIDO</span>CTAP2 authenticatorLargeBlobs</a>
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#large-blob"><span class="who">FIDO</span>Large blob storage</a>
+      <a href="https://www.token2.com/"><span class="who">Token2</span>PIN+ Series</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="openpgp.html">Next: OpenPGP →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>
