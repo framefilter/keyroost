@@ -566,10 +566,14 @@ configured (see `packaging/README.md`):
 
 ### B. PIV GUI — issue #31 items 4–6 (items 1–3 shipped in 0.6.0)
 - [ ] Slot-first PIV view: pick a slot → see/act on its contents. (M)
-- [ ] In-GUI key/cert deletion — **needs a DELETE-FILE path added to
-      `keyroost-piv` + transport first** (byte-layer work). (L)
-- [ ] Native file-chooser dialogs for cert/key import — **needs a new dep
-      (`rfd`); decide before adopting.** (M)
+- [ ] In-GUI key/cert deletion — **DECIDED: Option B.** Clear the certificate
+      object (`PUT DATA` empty — universal, standard PIV) **and** add the
+      YubiKey 5.7 vendor key-delete extension (device-gated, like our other
+      Yubico ops). User has a YubiKey 5.7 to verify the key-delete path. Needs
+      the byte-layer work in `keyroost-piv` + transport first. (L)
+- [ ] Native file-chooser dialogs for cert/key import — **DECIDED: adopt `rfd`**
+      (enough demand to justify the platform-glue dep; fits the eframe-style
+      carve-out). (M)
 - [ ] **Credential-entry modal + scroll-independent feedback** — *highest-leverage
       GUI fix, from @My1's #31 follow-up.* The capability panes scroll, so the
       management-key field, PIN entry, and success/error messages all fall below
