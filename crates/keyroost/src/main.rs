@@ -321,16 +321,10 @@ struct OpenPgpState {
     url_input: String,
     /// Slot selected in the generate-key control.
     gen_slot: OpenPgpSlotSel,
-    /// Generate-key confirmation modal state.
-    confirm_generate: bool,
     /// Slot selected in the import-key control.
     import_slot: OpenPgpSlotSel,
     /// Path to an RSA key file for import-from-file (text-entered).
     import_path: String,
-    /// Import confirmation modal: the chosen key source (modal open iff `Some`).
-    confirm_import: Option<ImportSource>,
-    /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
-    confirm_reset: Option<String>,
     /// Change-user-PIN (PW1) old/new entries. Cleared after use.
     user_pin_old: String,
     user_pin_new: String,
@@ -340,6 +334,17 @@ struct OpenPgpState {
     /// New user PIN for the unblock flow (reset retry counter); authorised by
     /// `admin_pin`. Cleared after use.
     unblock_new: String,
+    /// "Use default admin PIN (PW3)" toggle in the credential modal: when set,
+    /// the well-known factory default (`12345678`) fills `admin_pin` on Submit
+    /// instead of whatever was typed. Reset per modal. (Most cards still on the
+    /// factory PIN, so this saves typing during bring-up.)
+    use_default_admin: bool,
+    /// Credential-entry modal for the PIN changes + the admin-PIN-gated writes
+    /// (open iff `Some`). The PW1/PW3 secret fields render *inside* this modal,
+    /// not inline in the pane, so the entry and its result stay on-screen
+    /// (issue #31). The non-secret parameters (name, URL, slot, file path) stay
+    /// inline in the pane.
+    cred_modal: Option<OpenPgpCredModal>,
 }
 
 impl OpenPgpState {
@@ -352,7 +357,143 @@ impl OpenPgpState {
         wipe(&mut self.admin_pin_old);
         wipe(&mut self.admin_pin_new);
         wipe(&mut self.unblock_new);
+        self.use_default_admin = false;
     }
+}
+
+/// Which OpenPGP credential flow the modal is driving. The first three map 1:1
+/// to the PIN operations (`change_openpgp_user_pin` / `change_openpgp_admin_pin`
+/// / `unblock_openpgp_user_pin`); the rest are the admin-PIN (PW3)-gated writes
+/// whose *secret* (the admin PIN) now lives in the modal while their non-secret
+/// parameters (cardholder name, URL, slot, file path) stay inline in the pane.
+/// The variant selects which secret fields the modal renders and which op
+/// Submit dispatches to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenPgpCredKind {
+    ChangeUserPin,
+    ChangeAdminPin,
+    UnblockUserPin,
+    SetName,
+    SetUrl,
+    GenerateKey,
+    GenerateImportKey,
+    ImportKeyFile,
+    Reset,
+}
+
+impl OpenPgpCredKind {
+    /// Modal title, matching the FIDO/PIV dialogs' title style.
+    fn title(self) -> &'static str {
+        match self {
+            OpenPgpCredKind::ChangeUserPin => "Change user PIN",
+            OpenPgpCredKind::ChangeAdminPin => "Change admin PIN",
+            OpenPgpCredKind::UnblockUserPin => "Unblock user PIN",
+            OpenPgpCredKind::SetName => "Set cardholder name",
+            OpenPgpCredKind::SetUrl => "Set public-key URL",
+            OpenPgpCredKind::GenerateKey => "Generate key on-card",
+            OpenPgpCredKind::GenerateImportKey => "Generate & import key",
+            OpenPgpCredKind::ImportKeyFile => "Import key from file",
+            OpenPgpCredKind::Reset => "Reset applet",
+        }
+    }
+    /// Label for the modal's primary Submit button. Shorter than the title for
+    /// the verbose flows so the button doesn't overflow.
+    fn submit_label(self) -> &'static str {
+        match self {
+            OpenPgpCredKind::ChangeUserPin => "Change user PIN",
+            OpenPgpCredKind::ChangeAdminPin => "Change admin PIN",
+            OpenPgpCredKind::UnblockUserPin => "Unblock",
+            OpenPgpCredKind::SetName => "Set name",
+            OpenPgpCredKind::SetUrl => "Set URL",
+            OpenPgpCredKind::GenerateKey => "Generate",
+            OpenPgpCredKind::GenerateImportKey => "Generate & import",
+            OpenPgpCredKind::ImportKeyFile => "Import",
+            OpenPgpCredKind::Reset => "Reset applet",
+        }
+    }
+    /// Spinner caption shown while this flow's op runs.
+    fn busy_label(self) -> &'static str {
+        match self {
+            OpenPgpCredKind::ChangeUserPin => "Changing user PIN\u{2026}",
+            OpenPgpCredKind::ChangeAdminPin => "Changing admin PIN\u{2026}",
+            OpenPgpCredKind::UnblockUserPin => "Unblocking user PIN\u{2026}",
+            OpenPgpCredKind::SetName => "Setting cardholder name\u{2026}",
+            OpenPgpCredKind::SetUrl => "Setting public-key URL\u{2026}",
+            OpenPgpCredKind::GenerateKey => "Generating key\u{2026}",
+            OpenPgpCredKind::GenerateImportKey => "Generating & importing key\u{2026}",
+            OpenPgpCredKind::ImportKeyFile => "Importing key from file\u{2026}",
+            OpenPgpCredKind::Reset => "Resetting OpenPGP applet\u{2026}",
+        }
+    }
+    /// In-modal success confirmation text. The key flows whose *detailed* result
+    /// (the new fingerprint) still surfaces in the pane only need a generic
+    /// confirmation here.
+    fn success(self) -> &'static str {
+        match self {
+            OpenPgpCredKind::ChangeUserPin => "User PIN changed",
+            OpenPgpCredKind::ChangeAdminPin => "Admin PIN changed",
+            OpenPgpCredKind::UnblockUserPin => "User PIN unblocked",
+            OpenPgpCredKind::SetName => "Cardholder name set",
+            OpenPgpCredKind::SetUrl => "Public-key URL set",
+            OpenPgpCredKind::GenerateKey => "Key generated",
+            OpenPgpCredKind::GenerateImportKey => "Key generated and imported",
+            OpenPgpCredKind::ImportKeyFile => "Key imported",
+            OpenPgpCredKind::Reset => "Applet reset",
+        }
+    }
+    /// True when this flow collects the *admin* PIN (PW3) — i.e. it shows the
+    /// admin-PIN field and the "Use default admin PIN (PW3)" convenience toggle.
+    /// The user-PIN change (PW1, self-authorising) and the reset (PIN-less) do
+    /// not.
+    fn needs_admin_pin(self) -> bool {
+        matches!(
+            self,
+            OpenPgpCredKind::ChangeAdminPin
+                | OpenPgpCredKind::UnblockUserPin
+                | OpenPgpCredKind::SetName
+                | OpenPgpCredKind::SetUrl
+                | OpenPgpCredKind::GenerateKey
+                | OpenPgpCredKind::GenerateImportKey
+                | OpenPgpCredKind::ImportKeyFile
+        )
+    }
+}
+
+/// Live state of the OpenPGP credential-entry modal. Open iff
+/// `OpenPgpState::cred_modal` is `Some`. Tracks the flow, whether its op is in
+/// flight, and the op's result so the outcome is shown *in the modal* (issue
+/// #31). `result` is `None` until the op completes, then `Ok(())` on success or
+/// `Err(message)` on failure.
+struct OpenPgpCredModal {
+    kind: OpenPgpCredKind,
+    busy: bool,
+    result: Option<Result<(), String>>,
+}
+
+impl OpenPgpCredModal {
+    fn new(kind: OpenPgpCredKind) -> Self {
+        OpenPgpCredModal {
+            kind,
+            busy: false,
+            result: None,
+        }
+    }
+}
+
+/// The well-known OpenPGP Card factory-default admin PIN (PW3).
+const OPENPGP_DEFAULT_ADMIN_PIN: &str = "12345678";
+
+/// Inline new==confirm guard for the PIN-change flows, mirroring the op-level
+/// backstop. Returns the error message when the two new entries diverge (and
+/// the confirm field is non-empty). The admin-PIN-gated *writes* have no
+/// new==confirm pair — they're validated by the ops' own client-side guards.
+fn openpgp_cred_mismatch(pgp: &OpenPgpState, kind: OpenPgpCredKind) -> Option<&'static str> {
+    // The OpenPGP PIN flows ask for old + new with no separate "confirm" field
+    // (the original inline forms had none), so there is no mismatch to report.
+    // The function exists to mirror the PIV modal's shape and to give a single
+    // place to add a confirm guard later without touching the render path.
+    let _ = (pgp, kind);
+    None
 }
 
 /// Zeroize a secret-bearing text field (wipes the bytes, then leaves the
@@ -2924,6 +3065,33 @@ impl App {
                 wipe(&mut app.openpgp.admin_pin);
             }
         }
+        Self::apply_openpgp_cred_result(app);
+    }
+
+    /// Mirror an OpenPGP write result into the credential modal so the outcome
+    /// is shown in-modal (issue #31). Reads the pane status the apply closure
+    /// just set: no error → `Ok(())`; an error → the message, with the modal
+    /// kept open for a retry. `busy` always clears. No-op when the modal is
+    /// closed (e.g. the flow was triggered some other way).
+    fn apply_openpgp_cred_result(app: &mut App) {
+        if let Some(m) = app.openpgp.cred_modal.as_mut() {
+            m.busy = false;
+            m.result = match &app.openpgp.error {
+                Some(e) => Some(Err(e.clone())),
+                None => Some(Ok(())),
+            };
+        }
+    }
+
+    /// The admin PIN (PW3) the modal's flows send: the typed `admin_pin`, or the
+    /// well-known factory default when "Use default admin PIN (PW3)" is ticked.
+    /// Mirrors the PIV `use_default_mgmt` convenience. Does not mutate state.
+    fn openpgp_admin_pin_value(&self) -> String {
+        if self.openpgp.use_default_admin {
+            OPENPGP_DEFAULT_ADMIN_PIN.to_string()
+        } else {
+            self.openpgp.admin_pin.clone()
+        }
     }
 
     /// Set the cardholder name (PW3-gated), then refresh status.
@@ -2931,7 +3099,7 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
+        let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let value = self.openpgp.name_input.clone();
         self.openpgp.notice = None;
         self.spawn_job("Setting cardholder name…", move || {
@@ -2951,7 +3119,7 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
+        let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let value = self.openpgp.url_input.clone();
         self.openpgp.notice = None;
         self.spawn_job("Setting public-key URL…", move || {
@@ -2974,7 +3142,7 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return true; // nothing to do; let the modal close
         };
-        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
+        let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let slot = self.openpgp.gen_slot;
         let creation_time = unix_now();
         self.openpgp.notice = None;
@@ -2985,18 +3153,22 @@ impl App {
                 let fpr = s.register_key(slot.to_crt(), creation_time)?;
                 Ok((s.status()?, fpr))
             })();
-            Box::new(move |app: &mut App| match result {
-                Ok((status, fpr)) => {
-                    app.openpgp.status = Some(status);
-                    app.openpgp.loaded = true;
-                    app.openpgp.error = None;
-                    app.openpgp.notice = Some(format!("Generated {} key: {}", slot.label(), hex_lower(&fpr)));
-                    wipe(&mut app.openpgp.admin_pin);
+            Box::new(move |app: &mut App| {
+                match result {
+                    Ok((status, fpr)) => {
+                        app.openpgp.status = Some(status);
+                        app.openpgp.loaded = true;
+                        app.openpgp.error = None;
+                        app.openpgp.notice =
+                            Some(format!("Generated {} key: {}", slot.label(), hex_lower(&fpr)));
+                        wipe(&mut app.openpgp.admin_pin);
+                    }
+                    Err(e) => {
+                        app.openpgp.error = Some(e.to_string());
+                        wipe(&mut app.openpgp.admin_pin);
+                    }
                 }
-                Err(e) => {
-                    app.openpgp.error = Some(e.to_string());
-                    wipe(&mut app.openpgp.admin_pin);
-                }
+                Self::apply_openpgp_cred_result(app);
             })
         })
     }
@@ -3009,7 +3181,7 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return true; // nothing to do; let the modal close
         };
-        let pin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
+        let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let slot = self.openpgp.import_slot;
         let path = self.openpgp.import_path.clone();
         let creation_time = unix_now();
@@ -3049,23 +3221,26 @@ impl App {
                 let status = s.status().map_err(|e| e.to_string())?;
                 Ok((status, fpr))
             })();
-            Box::new(move |app: &mut App| match result {
-                Ok((status, fpr)) => {
-                    app.openpgp.status = Some(status);
-                    app.openpgp.loaded = true;
-                    app.openpgp.error = None;
-                    app.openpgp.notice = Some(format!(
-                        "Imported {} key: {}",
-                        slot.label(),
-                        hex_lower(&fpr)
-                    ));
-                    wipe(&mut app.openpgp.admin_pin);
-                    app.openpgp.import_path.clear();
+            Box::new(move |app: &mut App| {
+                match result {
+                    Ok((status, fpr)) => {
+                        app.openpgp.status = Some(status);
+                        app.openpgp.loaded = true;
+                        app.openpgp.error = None;
+                        app.openpgp.notice = Some(format!(
+                            "Imported {} key: {}",
+                            slot.label(),
+                            hex_lower(&fpr)
+                        ));
+                        wipe(&mut app.openpgp.admin_pin);
+                        app.openpgp.import_path.clear();
+                    }
+                    Err(e) => {
+                        app.openpgp.error = Some(e);
+                        wipe(&mut app.openpgp.admin_pin);
+                    }
                 }
-                Err(e) => {
-                    app.openpgp.error = Some(e);
-                    wipe(&mut app.openpgp.admin_pin);
-                }
+                Self::apply_openpgp_cred_result(app);
             })
         })
     }
@@ -3145,7 +3320,7 @@ impl App {
         let Some(name) = self.selected_openpgp_reader() else {
             return;
         };
-        let admin = zeroize::Zeroizing::new(self.openpgp.admin_pin.clone());
+        let admin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let new = zeroize::Zeroizing::new(self.openpgp.unblock_new.clone());
         self.openpgp.notice = None;
         self.spawn_job("Unblocking user PIN\u{2026}", move || {
@@ -3161,41 +3336,29 @@ impl App {
         });
     }
 
-    /// Write-operations section: cardholder name / URL, generate key, reset.
-    /// All write ops use the admin PIN (PW3) entered here; reset is the exception
-    /// (it blocks the PINs itself). Destructive ops route through confirm modals.
+    /// Write-operations section: cardholder name / URL, generate / import key,
+    /// PIN changes, reset. Every admin-PIN (PW3)-gated write and every PIN change
+    /// now opens the credential modal (`render_openpgp_cred_modal`) to collect
+    /// its secret(s); only the *non-secret* parameters (name, URL, slot, file
+    /// path) stay inline here. Reset is the exception (it blocks the PINs itself,
+    /// so it needs no PIN) but routes through the modal for a uniform look.
     fn render_openpgp_manage(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        // Intents collected inside the UI closures and applied afterwards, so a
-        // submit method's `&mut self` never overlaps the card's borrow.
-        let mut go_name = false;
-        let mut go_url = false;
-        let mut arm_generate = false;
-        let mut arm_import: Option<ImportSource> = None;
-        let mut go_change_user = false;
-        let mut go_change_admin = false;
-        let mut go_unblock = false;
-        let mut arm_reset = false;
+        // The kind to open the credential modal for, collected inside the UI
+        // closures and applied afterwards so a submit method's `&mut self` never
+        // overlaps the card's borrow.
+        let mut open_modal: Option<OpenPgpCredKind> = None;
 
         let head = |ui: &mut egui::Ui, t: &str| card_head(ui, p, t);
         let sub = |ui: &mut egui::Ui, t: &str| card_sub(ui, p, t);
         let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
 
-        // --- Admin PIN: shared by the card-detail and key writes (PW3) ---
-        theme::card_frame(p).show(ui, |ui| {
-            head(ui, "Admin PIN (PW3)");
-            note(
-                ui,
-                "Authorizes the card-detail and key writes below. Sent for the \
-                 operation only; never stored.",
-            );
-            ui.add_space(6.0);
-            pin_field(ui, p, "Admin PIN", &mut self.openpgp.admin_pin);
-        });
-        ui.add_space(10.0);
-
         // --- Card details: cardholder name + public-key URL ---
         theme::card_frame(p).show(ui, |ui| {
             head(ui, "Card details");
+            note(
+                ui,
+                "Setting either prompts for the admin PIN (PW3) in a dialog.",
+            );
             ui.add_space(6.0);
             text_field(
                 ui,
@@ -3206,8 +3369,8 @@ impl App {
                 200.0,
             );
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Default, "Set name").clicked() {
-                    go_name = true;
+                if theme::button(ui, p, BtnKind::Default, "Set name\u{2026}").clicked() {
+                    open_modal = Some(OpenPgpCredKind::SetName);
                 }
             });
             ui.add_space(6.0);
@@ -3220,8 +3383,8 @@ impl App {
                 240.0,
             );
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Default, "Set URL").clicked() {
-                    go_url = true;
+                if theme::button(ui, p, BtnKind::Default, "Set URL\u{2026}").clicked() {
+                    open_modal = Some(OpenPgpCredKind::SetUrl);
                 }
             });
         });
@@ -3233,7 +3396,7 @@ impl App {
             note(
                 ui,
                 "Generating or importing OVERWRITES that slot (clearable only by a \
-                 full reset). Needs the admin PIN; may need a touch.",
+                 full reset). Prompts for the admin PIN; may need a touch.",
             );
             ui.add_space(8.0);
             sub(ui, "Generate on-card");
@@ -3249,7 +3412,7 @@ impl App {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
-                    arm_generate = true;
+                    open_modal = Some(OpenPgpCredKind::GenerateKey);
                 }
             });
             ui.add_space(10.0);
@@ -3274,12 +3437,12 @@ impl App {
             let have_path = !self.openpgp.import_path.trim().is_empty();
             ui.horizontal(|ui| {
                 if theme::button(ui, p, BtnKind::Default, "Generate & import\u{2026}").clicked() {
-                    arm_import = Some(ImportSource::Generate);
+                    open_modal = Some(OpenPgpCredKind::GenerateImportKey);
                 }
                 if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked()
                     && have_path
                 {
-                    arm_import = Some(ImportSource::FromFile);
+                    open_modal = Some(OpenPgpCredKind::ImportKeyFile);
                 }
             });
         });
@@ -3288,31 +3451,21 @@ impl App {
         // --- PINs: change user / admin, unblock user ---
         theme::card_frame(p).show(ui, |ui| {
             head(ui, "PINs");
-            ui.add_space(6.0);
-            sub(ui, "Change user PIN (PW1)");
-            pin_field(ui, p, "Current", &mut self.openpgp.user_pin_old);
-            pin_field(ui, p, "New", &mut self.openpgp.user_pin_new);
+            note(
+                ui,
+                "Each opens a dialog for the PIN entry. The current and new PINs \
+                 are typed there, not here.",
+            );
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Default, "Change user PIN").clicked() {
-                    go_change_user = true;
+                if theme::button(ui, p, BtnKind::Default, "Change user PIN\u{2026}").clicked() {
+                    open_modal = Some(OpenPgpCredKind::ChangeUserPin);
                 }
-            });
-            ui.add_space(10.0);
-            sub(ui, "Change admin PIN (PW3)");
-            pin_field(ui, p, "Current", &mut self.openpgp.admin_pin_old);
-            pin_field(ui, p, "New", &mut self.openpgp.admin_pin_new);
-            ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Default, "Change admin PIN").clicked() {
-                    go_change_admin = true;
+                if theme::button(ui, p, BtnKind::Default, "Change admin PIN\u{2026}").clicked() {
+                    open_modal = Some(OpenPgpCredKind::ChangeAdminPin);
                 }
-            });
-            ui.add_space(10.0);
-            sub(ui, "Unblock user PIN");
-            note(ui, "Sets a new user PIN using the admin PIN entered above.");
-            pin_field(ui, p, "New user PIN", &mut self.openpgp.unblock_new);
-            ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Default, "Unblock user PIN").clicked() {
-                    go_unblock = true;
+                if theme::button(ui, p, BtnKind::Default, "Unblock user PIN\u{2026}").clicked() {
+                    open_modal = Some(OpenPgpCredKind::UnblockUserPin);
                 }
             });
         });
@@ -3330,7 +3483,7 @@ impl App {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
-                            arm_reset = true;
+                            open_modal = Some(OpenPgpCredKind::Reset);
                         }
                     });
                 });
@@ -3343,144 +3496,12 @@ impl App {
                 );
             });
 
-        // Apply collected intents now that the card borrows have ended.
-        if go_name {
-            self.set_openpgp_name();
-        }
-        if go_url {
-            self.set_openpgp_url();
-        }
-        if arm_generate {
-            self.openpgp.confirm_generate = true;
-        }
-        if let Some(src) = arm_import {
-            self.openpgp.confirm_import = Some(src);
-        }
-        if go_change_user {
-            self.change_openpgp_user_pin();
-        }
-        if go_change_admin {
-            self.change_openpgp_admin_pin();
-        }
-        if go_unblock {
-            self.unblock_openpgp_user_pin();
-        }
-        if arm_reset {
-            self.openpgp.confirm_reset = Some(String::new());
-        }
-    }
-
-    /// The generate-key and reset confirmation modals for the OpenPGP pane.
-    fn render_openpgp_confirms(&mut self, ctx: &egui::Context) {
-        if self.openpgp.confirm_generate {
-            let slot = self.openpgp.gen_slot.label();
-            let mut do_it = false;
-            let mut cancel = false;
-            let mut window_open = true;
-            egui::Window::new("Generate key?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut window_open)
-                .show(ctx, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 180, 80),
-                        format!("Generate a fresh RSA key in the {slot} slot?"),
-                    );
-                    ui.label("This OVERWRITES any existing key in that slot (a slot");
-                    ui.label("can only be cleared by a full applet reset). May need a touch.");
-                    if self.openpgp.admin_pin.is_empty() {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 110, 110),
-                            "Enter the admin PIN (PW3) above first.",
-                        );
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let armed = !self.openpgp.admin_pin.is_empty();
-                        if ui
-                            .add_enabled(armed, egui::Button::new("Generate"))
-                            .clicked()
-                        {
-                            do_it = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            if do_it {
-                // Close the modal only once the job was actually queued — a
-                // busy worker would otherwise silently swallow the confirmed
-                // click.
-                if self.generate_openpgp_key() {
-                    self.openpgp.confirm_generate = false;
-                }
-            } else if cancel || !window_open {
-                self.openpgp.confirm_generate = false;
-            }
-        }
-
-        if let Some(source) = self.openpgp.confirm_import {
-            let slot = self.openpgp.import_slot.label();
-            let mut do_it = false;
-            let mut cancel = false;
-            let mut window_open = true;
-            egui::Window::new("Import key?")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut window_open)
-                .show(ctx, |ui| {
-                    let what = match source {
-                        ImportSource::Generate => "a fresh host-generated RSA-2048 key".to_string(),
-                        ImportSource::FromFile => {
-                            format!("the RSA key from {}", self.openpgp.import_path.trim())
-                        }
-                    };
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 180, 80),
-                        format!("Import {what} into the {slot} slot?"),
-                    );
-                    ui.label("This OVERWRITES any existing key in that slot (a slot");
-                    ui.label("can only be cleared by a full applet reset). May need a touch.");
-                    if self.openpgp.admin_pin.is_empty() {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 110, 110),
-                            "Enter the admin PIN (PW3) above first.",
-                        );
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let armed = !self.openpgp.admin_pin.is_empty();
-                        if ui.add_enabled(armed, egui::Button::new("Import")).clicked() {
-                            do_it = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                });
-            if do_it {
-                // Close the modal only once the job was actually queued (see
-                // the generate modal above).
-                if self.import_openpgp_key(source) {
-                    self.openpgp.confirm_import = None;
-                }
-            } else if cancel || !window_open {
-                self.openpgp.confirm_import = None;
-            }
-        }
-
-        if typed_reset_modal(
-            ctx,
-            "Reset OpenPGP applet?",
-            "This wipes ALL OpenPGP keys and resets the PINs to defaults.",
-            &[],
-            &mut self.openpgp.confirm_reset,
-        ) && self.reset_openpgp()
-        {
-            self.openpgp.confirm_reset = None;
+        // Open the chosen flow's credential modal, wiping any stale secret first
+        // so a PIN typed for a previous flow can't ride along.
+        if let Some(kind) = open_modal {
+            self.openpgp.wipe_secrets();
+            self.openpgp.error = None;
+            self.openpgp.cred_modal = Some(OpenPgpCredModal::new(kind));
         }
     }
 
@@ -5174,7 +5195,7 @@ impl eframe::App for App {
             self.delete_fingerprint(id);
         }
         self.render_oath_delete_confirm(ctx);
-        self.render_openpgp_confirms(ctx);
+        self.render_openpgp_cred_modal(ctx, &p);
         self.render_piv_confirms(ctx);
         self.render_piv_cred_modal(ctx, &p);
         self.molto_dialogs(ctx, &p);
@@ -8143,6 +8164,228 @@ impl App {
         self.piv.cred_modal = None;
     }
 
+    /// Render the admin-PIN (PW3) collector inside the OpenPGP modal, but only
+    /// for the flows that need it (`OpenPgpCredKind::needs_admin_pin`). Shows a
+    /// "Use default admin PIN (PW3)" toggle (the factory default `12345678`,
+    /// common during bring-up) and, when it's off, the masked PIN field. When the
+    /// toggle is on the field is hidden and the op reads the default via
+    /// `openpgp_admin_pin_value`.
+    fn openpgp_modal_admin_field(&mut self, ui: &mut egui::Ui, p: &Palette, kind: OpenPgpCredKind) {
+        if !kind.needs_admin_pin() {
+            return;
+        }
+        ui.checkbox(
+            &mut self.openpgp.use_default_admin,
+            "Use default admin PIN (PW3)",
+        );
+        if !self.openpgp.use_default_admin {
+            pin_field(ui, p, "Admin PIN", &mut self.openpgp.admin_pin);
+        }
+    }
+
+    /// OpenPGP credential-entry modal: drives the PIN flows (Change user PIN /
+    /// Change admin PIN / Unblock user PIN) *and* the admin-PIN (PW3)-gated writes
+    /// (set cardholder name / URL, generate / import key) plus the factory reset,
+    /// inside the shared `modal_window` chrome, so the secret fields *and* the
+    /// op's result stay centered on-screen rather than scrolling off (issue #31).
+    ///
+    /// The secret fields live in `OpenPgpState` (rendered here, not inline in the
+    /// pane); the inline pane keeps the *non-secret* parameters (name, URL, slot,
+    /// file path). The modal state (`OpenPgpState::cred_modal`) tracks the flow,
+    /// an in-flight flag, and the op result. On Submit it runs the existing op,
+    /// which writes the outcome back into the modal via `apply_openpgp_cred_result`.
+    /// Rich, non-secret results (e.g. the new key fingerprint) still surface in
+    /// the pane — the modal only shows a generic success line. Cancel / ✕ / Esc —
+    /// and a successful Done — wipe the secret fields.
+    fn render_openpgp_cred_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(kind) = self.openpgp.cred_modal.as_ref().map(|m| m.kind) else {
+            return;
+        };
+        let busy = self.openpgp.cred_modal.as_ref().is_some_and(|m| m.busy);
+        let result = self
+            .openpgp
+            .cred_modal
+            .as_ref()
+            .and_then(|m| m.result.clone());
+
+        let mut want_submit = false;
+        let mut want_close = false;
+        // Inline new==confirm guard, mirroring the op-level backstop (currently
+        // never fires — the OpenPGP PIN forms have no confirm field — but kept
+        // for shape parity with the PIV modal).
+        let mismatch = openpgp_cred_mismatch(&self.openpgp, kind);
+
+        let closed = Self::modal_window(ctx, p, "openpgp_cred", kind.title(), |ui| {
+            match &result {
+                Some(Ok(())) => {
+                    // Success: confirmation + a single Done that dismisses.
+                    ui.label(
+                        egui::RichText::new(format!("\u{2713} {}", kind.success()))
+                            .font(theme::f_sb(13.0))
+                            .color(p.ok),
+                    );
+                    ui.add_space(16.0);
+                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                        want_close = true;
+                    }
+                }
+                _ => {
+                    // Entry form (also the path while busy / after an error so the
+                    // user can retry without losing the dialog).
+                    match kind {
+                        OpenPgpCredKind::ChangeUserPin => {
+                            pin_field(ui, p, "Current PIN", &mut self.openpgp.user_pin_old);
+                            pin_field(ui, p, "New PIN", &mut self.openpgp.user_pin_new);
+                            card_note(ui, p, "User PIN (PW1): 6\u{2013}127 characters.");
+                        }
+                        OpenPgpCredKind::ChangeAdminPin => {
+                            pin_field(ui, p, "Current PIN", &mut self.openpgp.admin_pin_old);
+                            pin_field(ui, p, "New PIN", &mut self.openpgp.admin_pin_new);
+                            card_note(ui, p, "Admin PIN (PW3): 8\u{2013}127 characters.");
+                        }
+                        OpenPgpCredKind::UnblockUserPin => {
+                            self.openpgp_modal_admin_field(ui, p, kind);
+                            pin_field(ui, p, "New user PIN", &mut self.openpgp.unblock_new);
+                            card_note(
+                                ui,
+                                p,
+                                "Resets a blocked user PIN using the admin PIN (PW3).",
+                            );
+                        }
+                        OpenPgpCredKind::SetName => {
+                            self.openpgp_modal_admin_field(ui, p, kind);
+                            card_note(ui, p, "Authorizes writing the cardholder name.");
+                        }
+                        OpenPgpCredKind::SetUrl => {
+                            self.openpgp_modal_admin_field(ui, p, kind);
+                            card_note(ui, p, "Authorizes writing the public-key URL.");
+                        }
+                        OpenPgpCredKind::GenerateKey => {
+                            self.openpgp_modal_admin_field(ui, p, kind);
+                            card_note(
+                                ui,
+                                p,
+                                "OVERWRITES the slot with a fresh on-card key (clearable \
+                                 only by a full reset). May need a touch.",
+                            );
+                        }
+                        OpenPgpCredKind::GenerateImportKey | OpenPgpCredKind::ImportKeyFile => {
+                            self.openpgp_modal_admin_field(ui, p, kind);
+                            card_note(
+                                ui,
+                                p,
+                                "OVERWRITES the slot with the imported key (clearable only \
+                                 by a full reset). May need a touch.",
+                            );
+                        }
+                        OpenPgpCredKind::Reset => {
+                            card_note(
+                                ui,
+                                p,
+                                "Wipes ALL OpenPGP keys and restores default PINs. Works \
+                                 even if the PINs are forgotten. No PIN needed.",
+                            );
+                        }
+                    }
+
+                    // Inline error/result line: the (currently inert) mismatch,
+                    // then the op's error (kept open for a retry).
+                    if let Some(msg) = mismatch {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.err, msg);
+                    } else if let Some(Err(e)) = &result {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.err, e);
+                    }
+
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.add(egui::Spinner::new());
+                            ui.label(
+                                egui::RichText::new(kind.busy_label())
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt2),
+                            );
+                        } else {
+                            let btn = if kind == OpenPgpCredKind::Reset {
+                                BtnKind::Danger
+                            } else {
+                                BtnKind::Primary
+                            };
+                            if theme::button(ui, p, btn, kind.submit_label()).clicked()
+                                && mismatch.is_none()
+                            {
+                                want_submit = true;
+                            }
+                            ui.add_space(8.0);
+                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                                want_close = true;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        // ✕ / Esc dismiss too, but never yank the dialog out from under a
+        // running op (mirrors the PIV modal's busy handling).
+        if (closed || want_close) && !busy {
+            self.openpgp_cred_modal_close();
+            return;
+        }
+        if want_submit && !busy {
+            // Mark busy first so the modal shows the spinner this frame; the op
+            // writes the result back via `apply_openpgp_cred_result`.
+            if let Some(m) = self.openpgp.cred_modal.as_mut() {
+                m.busy = true;
+                m.result = None;
+            }
+            self.openpgp.error = None;
+            match kind {
+                OpenPgpCredKind::ChangeUserPin => self.change_openpgp_user_pin(),
+                OpenPgpCredKind::ChangeAdminPin => self.change_openpgp_admin_pin(),
+                OpenPgpCredKind::UnblockUserPin => self.unblock_openpgp_user_pin(),
+                OpenPgpCredKind::SetName => self.set_openpgp_name(),
+                OpenPgpCredKind::SetUrl => self.set_openpgp_url(),
+                OpenPgpCredKind::GenerateKey => {
+                    self.generate_openpgp_key();
+                }
+                OpenPgpCredKind::GenerateImportKey => {
+                    self.import_openpgp_key(ImportSource::Generate);
+                }
+                OpenPgpCredKind::ImportKeyFile => {
+                    self.import_openpgp_key(ImportSource::FromFile);
+                }
+                OpenPgpCredKind::Reset => {
+                    self.reset_openpgp();
+                }
+            }
+            // If the op didn't actually queue, unstick the modal. Either the
+            // worker was busy (no error set — retry on the next click) or a
+            // client-side guard rejected the input and stored the reason in
+            // `openpgp.error`; surface that in the modal so it shows in the
+            // dialog rather than scrolling off in the pane.
+            if !self.busy() {
+                let guard_err = self.openpgp.error.clone();
+                if let Some(m) = self.openpgp.cred_modal.as_mut() {
+                    m.busy = false;
+                    if let Some(e) = guard_err {
+                        m.result = Some(Err(e));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Close the OpenPGP credential modal, wiping every PIN field it could have
+    /// touched (cheap to over-wipe; all are secrets) and clearing the
+    /// use-default toggle.
+    fn openpgp_cred_modal_close(&mut self) {
+        self.openpgp.wipe_secrets();
+        self.openpgp.cred_modal = None;
+    }
+
     /// Authenticator / OATH tab — live codes with countdown rings + copy.
     fn cap_oath(&mut self, ui: &mut egui::Ui, p: &Palette) {
         // Auto-attempt a read once per selection (a hard error won't retry).
@@ -9601,5 +9844,98 @@ mod tests {
         let m = app.piv.cred_modal.as_ref().unwrap();
         assert!(!m.busy);
         assert_eq!(m.result, Some(Err("wrong PUK".into())));
+    }
+
+    /// `OpenPgpCredKind::needs_admin_pin` is true for every admin-PIN (PW3)-gated
+    /// flow and false for the self-authorising user-PIN change and the PIN-less
+    /// reset — this is what decides whether the admin-PIN field + use-default
+    /// toggle render in the modal.
+    #[test]
+    fn openpgp_cred_kind_needs_admin_pin_mapping() {
+        use OpenPgpCredKind::*;
+        for k in [
+            ChangeAdminPin,
+            UnblockUserPin,
+            SetName,
+            SetUrl,
+            GenerateKey,
+            GenerateImportKey,
+            ImportKeyFile,
+        ] {
+            assert!(k.needs_admin_pin(), "{} should need PW3", k.title());
+        }
+        for k in [ChangeUserPin, Reset] {
+            assert!(!k.needs_admin_pin(), "{} should not need PW3", k.title());
+        }
+    }
+
+    /// With "Use default admin PIN (PW3)" ticked, `openpgp_admin_pin_value`
+    /// ignores the (possibly empty) typed field and yields the well-known factory
+    /// default; with it off, it returns the typed PIN verbatim.
+    #[test]
+    fn openpgp_admin_pin_value_honours_use_default() {
+        let mut app = App::default();
+
+        // Default toggle on, field empty → resolves to the factory default.
+        app.openpgp.use_default_admin = true;
+        app.openpgp.admin_pin.clear();
+        assert_eq!(app.openpgp_admin_pin_value(), OPENPGP_DEFAULT_ADMIN_PIN);
+        assert_eq!(app.openpgp_admin_pin_value(), "12345678");
+
+        // Toggle off → uses the typed PIN.
+        app.openpgp.use_default_admin = false;
+        app.openpgp.admin_pin = "7654321".into();
+        assert_eq!(app.openpgp_admin_pin_value(), "7654321");
+    }
+
+    /// `apply_openpgp_cred_result` mirrors the pane outcome into the open modal:
+    /// no error → `Ok`, error present → `Err(message)`, and `busy` clears.
+    #[test]
+    fn apply_openpgp_cred_result_mirrors_outcome() {
+        let mut app = App::default();
+
+        // Success path.
+        app.openpgp.cred_modal = Some(OpenPgpCredModal {
+            kind: OpenPgpCredKind::SetName,
+            busy: true,
+            result: None,
+        });
+        app.openpgp.error = None;
+        App::apply_openpgp_cred_result(&mut app);
+        let m = app.openpgp.cred_modal.as_ref().unwrap();
+        assert!(!m.busy);
+        assert_eq!(m.result, Some(Ok(())));
+
+        // Error path.
+        app.openpgp.cred_modal = Some(OpenPgpCredModal::new(OpenPgpCredKind::ChangeAdminPin));
+        app.openpgp.cred_modal.as_mut().unwrap().busy = true;
+        app.openpgp.error = Some("wrong admin PIN".into());
+        App::apply_openpgp_cred_result(&mut app);
+        let m = app.openpgp.cred_modal.as_ref().unwrap();
+        assert!(!m.busy);
+        assert_eq!(m.result, Some(Err("wrong admin PIN".into())));
+    }
+
+    /// The OpenPGP mismatch guard is inert (the PIN forms have no confirm field),
+    /// so it returns `None` for every flow — locks in the documented behaviour.
+    #[test]
+    fn openpgp_cred_mismatch_never_fires() {
+        use OpenPgpCredKind::*;
+        let mut pgp = OpenPgpState::default();
+        pgp.user_pin_new = "111111".into();
+        pgp.admin_pin_new = "22222222".into();
+        for k in [
+            ChangeUserPin,
+            ChangeAdminPin,
+            UnblockUserPin,
+            SetName,
+            SetUrl,
+            GenerateKey,
+            GenerateImportKey,
+            ImportKeyFile,
+            Reset,
+        ] {
+            assert!(openpgp_cred_mismatch(&pgp, k).is_none());
+        }
     }
 }
