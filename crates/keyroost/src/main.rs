@@ -608,6 +608,8 @@ enum PivCredKind {
     RequestCsr,
     SetRetries,
     ChangeMgmtKey,
+    DeleteCert,
+    DeleteKey,
 }
 
 impl PivCredKind {
@@ -623,6 +625,8 @@ impl PivCredKind {
             PivCredKind::RequestCsr => "Sign certificate request",
             PivCredKind::SetRetries => "Set retry counts",
             PivCredKind::ChangeMgmtKey => "Change management key",
+            PivCredKind::DeleteCert => "Delete certificate",
+            PivCredKind::DeleteKey => "Delete key",
         }
     }
     /// Label for the modal's primary Submit button. Shorter than the title for
@@ -635,6 +639,8 @@ impl PivCredKind {
             PivCredKind::RequestCsr => "Sign & save",
             PivCredKind::SetRetries => "Set retry counts",
             PivCredKind::ChangeMgmtKey => "Change key",
+            PivCredKind::DeleteCert => "Delete",
+            PivCredKind::DeleteKey => "Delete",
             _ => self.title(),
         }
     }
@@ -651,6 +657,8 @@ impl PivCredKind {
             PivCredKind::RequestCsr => "Signing request\u{2026}",
             PivCredKind::SetRetries => "Setting retry counts\u{2026}",
             PivCredKind::ChangeMgmtKey => "Changing management key\u{2026}",
+            PivCredKind::DeleteCert => "Deleting certificate\u{2026}",
+            PivCredKind::DeleteKey => "Deleting key\u{2026}",
         }
     }
     /// True when this flow collects the *current* management key (and therefore
@@ -663,6 +671,8 @@ impl PivCredKind {
                 | PivCredKind::SelfSign
                 | PivCredKind::SetRetries
                 | PivCredKind::ChangeMgmtKey
+                | PivCredKind::DeleteCert
+                | PivCredKind::DeleteKey
         )
     }
 }
@@ -735,6 +745,9 @@ struct PivState {
     /// Key-generation slot + algorithm selectors.
     gen_slot: PivSlotSel,
     gen_alg: PivKeyAlgSel,
+    /// Slot the Delete certificate / Delete key actions target (chosen in the
+    /// pane before the confirming modal opens, mirroring `gen_slot`).
+    del_slot: PivSlotSel,
     /// PEM of the most recently generated public key, shown for copying.
     gen_pubkey_pem: Option<String>,
     /// Certificate import slot + file path.
@@ -805,6 +818,7 @@ impl Default for PivState {
             retries_pin_auth: String::new(),
             gen_slot: PivSlotSel::default(),
             gen_alg: PivKeyAlgSel::default(),
+            del_slot: PivSlotSel::default(),
             gen_pubkey_pem: None,
             cert_slot: PivSlotSel::default(),
             cert_path: String::new(),
@@ -4331,6 +4345,76 @@ impl App {
         });
     }
 
+    /// Delete (clear) the certificate in the selected `del_slot`. The private
+    /// key, if any, is left intact. Management-key authorized; works on every
+    /// PIV card. Mirrors `piv_import_cert`'s shape: open → authenticate → call
+    /// the transport method → re-read status (so the slot's cert state updates).
+    fn piv_delete_cert(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let mgmt = match self.piv_current_mgmt_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
+        };
+        let slot = self.piv.del_slot.to_slot();
+        self.piv.notice = None;
+        self.spawn_job("Deleting certificate\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let mgmt_alg = s.management_key_algorithm();
+                s.authenticate_management(mgmt_alg, &mgmt)?;
+                s.clear_certificate(slot)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.mgmt_key_input);
+                Self::apply_piv_write(
+                    app,
+                    result,
+                    format!("Certificate removed from {}.", slot.label()),
+                );
+                Self::apply_piv_cred_result(app);
+            })
+        });
+    }
+
+    /// Permanently delete (erase) the private key in the selected `del_slot`.
+    /// Management-key authorized. Needs YubiKey firmware 5.7+; the transport
+    /// version-gates and surfaces `PivFirmwareTooOld` as the error on older
+    /// cards (the pane also hides the button below 5.7 — this is the backstop).
+    fn piv_delete_key(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let mgmt = match self.piv_current_mgmt_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
+        };
+        let slot = self.piv.del_slot.to_slot();
+        self.piv.notice = None;
+        self.spawn_job("Deleting key\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let mgmt_alg = s.management_key_algorithm();
+                s.authenticate_management(mgmt_alg, &mgmt)?;
+                s.delete_key(slot)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.mgmt_key_input);
+                Self::apply_piv_write(app, result, format!("Key erased from {}.", slot.label()));
+                Self::apply_piv_cred_result(app);
+            })
+        });
+    }
+
     /// Normalize the certificate-subject field: a bare name becomes `CN=name`;
     /// anything containing `=` is taken as a full distinguished name.
     fn piv_subject(&self) -> Option<String> {
@@ -4743,7 +4827,9 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
         | PivCredKind::SelfSign
         | PivCredKind::RequestCsr
         | PivCredKind::SetRetries
-        | PivCredKind::ChangeMgmtKey => return None,
+        | PivCredKind::ChangeMgmtKey
+        | PivCredKind::DeleteCert
+        | PivCredKind::DeleteKey => return None,
     };
     if confirm.is_empty() || new == confirm {
         None
@@ -4767,6 +4853,8 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
         PivCredKind::RequestCsr => "Request signed and saved",
         PivCredKind::SetRetries => "Retry counts set",
         PivCredKind::ChangeMgmtKey => "Management key changed",
+        PivCredKind::DeleteCert => "Certificate deleted",
+        PivCredKind::DeleteKey => "Key deleted",
     }
 }
 
@@ -8365,6 +8453,39 @@ impl App {
                             );
                             card_note(ui, p, "Enter the current key, then the new key.");
                         }
+                        PivCredKind::DeleteCert => {
+                            let slot = self.piv.del_slot.label();
+                            ui.colored_label(
+                                p.err,
+                                egui::RichText::new(format!(
+                                    "Removes the certificate in {slot}. The private key in \
+                                     the slot remains. This cannot be undone."
+                                ))
+                                .font(theme::f_sb(12.5)),
+                            );
+                            ui.add_space(6.0);
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            card_note(ui, p, "The management key authorizes the deletion.");
+                        }
+                        PivCredKind::DeleteKey => {
+                            let slot = self.piv.del_slot.label();
+                            ui.colored_label(
+                                p.err,
+                                egui::RichText::new(format!(
+                                    "Permanently erases the private key in {slot}. This \
+                                     cannot be undone."
+                                ))
+                                .font(theme::f_sb(12.5)),
+                            );
+                            ui.add_space(6.0);
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            card_note(
+                                ui,
+                                p,
+                                "The management key authorizes the deletion. Needs \
+                                 YubiKey 5.7 or newer.",
+                            );
+                        }
                     }
 
                     // Inline error/result line: the new==confirm mismatch, then
@@ -8430,6 +8551,8 @@ impl App {
                 PivCredKind::RequestCsr => self.piv_request_csr(),
                 PivCredKind::SetRetries => self.piv_set_retries(),
                 PivCredKind::ChangeMgmtKey => self.piv_change_management_key(),
+                PivCredKind::DeleteCert => self.piv_delete_cert(),
+                PivCredKind::DeleteKey => self.piv_delete_key(),
             }
             // If the op didn't actually queue, unstick the modal. This happens
             // either because the worker was busy (no error set — just retry on
@@ -8901,6 +9024,8 @@ impl App {
         let mut open_csr = false;
         let mut open_set_retries = false;
         let mut open_change_mgmt = false;
+        let mut open_delete_cert = false;
+        let mut open_delete_key = false;
         let mut arm_reset = false;
         let mut copy_pem: Option<String> = None;
 
@@ -9175,6 +9300,38 @@ impl App {
                 if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
                     go_export = true;
                 }
+                ui.add_space(10.0);
+                sub(ui, "Delete from slot");
+                note(
+                    ui,
+                    "Removes the certificate, or permanently erases the private \
+                     key, in the chosen slot. The management key is entered in the \
+                     dialog. This cannot be undone.",
+                );
+                // Key deletion (Yubico MOVE/DELETE KEY) needs firmware 5.7+. The
+                // transport version-gates as a backstop; here we hide the button
+                // (and explain) when the loaded status reports an older — or
+                // unknown — version. Clearing a certificate works everywhere.
+                let can_delete_key = matches!(
+                    self.piv.status.as_ref().and_then(|s| s.version),
+                    Some(v) if v >= (5, 7, 0)
+                );
+                ui.horizontal(|ui| {
+                    piv_slot_combo(ui, "piv-del-slot", &mut self.piv.del_slot);
+                    if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                        .clicked()
+                    {
+                        open_delete_cert = true;
+                    }
+                    ui.add_space(6.0);
+                    if can_delete_key {
+                        if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
+                            open_delete_key = true;
+                        }
+                    } else {
+                        note(ui, "key deletion needs YubiKey 5.7+");
+                    }
+                });
             });
         });
         ui.add_space(6.0);
@@ -9309,6 +9466,14 @@ impl App {
         if open_change_mgmt {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ChangeMgmtKey));
+        }
+        if open_delete_cert {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::DeleteCert));
+        }
+        if open_delete_key {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::DeleteKey));
         }
         if arm_reset {
             self.piv.confirm_reset = Some(String::new());
@@ -10036,6 +10201,9 @@ mod tests {
         assert!(PivCredKind::SelfSign.needs_mgmt_key());
         assert!(PivCredKind::SetRetries.needs_mgmt_key());
         assert!(PivCredKind::ChangeMgmtKey.needs_mgmt_key());
+        // Slot deletion is authorized by the management key (like generate).
+        assert!(PivCredKind::DeleteCert.needs_mgmt_key());
+        assert!(PivCredKind::DeleteKey.needs_mgmt_key());
         // CSR signs with the PIN only — no management key.
         assert!(!PivCredKind::RequestCsr.needs_mgmt_key());
         // PIN/PUK flows never collect a management key.
@@ -10055,6 +10223,8 @@ mod tests {
             PivCredKind::RequestCsr,
             PivCredKind::SetRetries,
             PivCredKind::ChangeMgmtKey,
+            PivCredKind::DeleteCert,
+            PivCredKind::DeleteKey,
         ];
         for k in kinds {
             assert!(!k.title().is_empty());
@@ -10214,6 +10384,16 @@ mod tests {
         let m = app.piv.cred_modal.as_ref().unwrap();
         assert!(!m.busy);
         assert_eq!(m.result, Some(Err("wrong PUK".into())));
+    }
+
+    /// `PivSlotSel::label` maps each selector to the canonical PIV slot name; the
+    /// delete flows name this slot in their destructive warning and success line.
+    #[test]
+    fn piv_slot_sel_labels() {
+        assert_eq!(PivSlotSel::Auth.label(), "authentication (9A)");
+        assert_eq!(PivSlotSel::Sign.label(), "signature (9C)");
+        assert_eq!(PivSlotSel::KeyMgmt.label(), "key management (9D)");
+        assert_eq!(PivSlotSel::CardAuth.label(), "card authentication (9E)");
     }
 
     /// `OpenPgpCredKind::needs_admin_pin` is true for every admin-PIN (PW3)-gated
