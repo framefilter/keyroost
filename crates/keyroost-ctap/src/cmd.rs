@@ -69,12 +69,12 @@ impl std::fmt::Display for CtapError {
 /// in which case the caller falls back to the spec name / raw hex.
 fn ctap_status_hint(code: u8) -> Option<&'static str> {
     Some(match code {
-        // The big one for Token2 PIN+ keys: the new PIN doesn't meet the key's
-        // complexity policy (length / character mix), not a transient failure.
+        // PIN policy violation: the new PIN doesn't meet the key's complexity
+        // policy (length / character mix), not a transient failure.
         0x37 => {
             "the new PIN doesn't meet this key's complexity requirements \u{2014} \
-                 try a longer PIN or a different mix of characters (Token2 PIN+ \
-                 keys enforce a complexity policy)"
+                 try a longer PIN or a different mix of characters (some keys \
+                 enforce a minimum length or required character variety)"
         }
         0x31 => "the PIN was incorrect",
         0x32 => {
