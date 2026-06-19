@@ -406,14 +406,24 @@ impl OpenPgpSlotSel {
     }
 }
 
-/// Which credential-entry flow the PIV modal is currently driving. Maps 1:1 to
-/// the three PIN/PUK operations (`piv_change_pin` / `piv_change_puk` /
-/// `piv_unblock_pin`) and selects which secret fields the modal renders.
+/// Which credential-entry flow the PIV modal is currently driving. The first
+/// three map 1:1 to the PIN/PUK operations (`piv_change_pin` / `piv_change_puk`
+/// / `piv_unblock_pin`); the rest are the management-key-gated operations whose
+/// *secrets* (management key and/or PIN) now live in the modal while their
+/// non-secret parameters (slot, algorithm, file path, subject, …) stay inline
+/// in the pane. The variant selects which secret fields the modal renders and
+/// which op Submit dispatches to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PivCredKind {
     ChangePin,
     ChangePuk,
     UnblockPin,
+    GenerateKey,
+    ImportCert,
+    SelfSign,
+    RequestCsr,
+    SetRetries,
+    ChangeMgmtKey,
 }
 
 impl PivCredKind {
@@ -423,6 +433,25 @@ impl PivCredKind {
             PivCredKind::ChangePin => "Change PIN",
             PivCredKind::ChangePuk => "Change PUK",
             PivCredKind::UnblockPin => "Unblock PIN",
+            PivCredKind::GenerateKey => "Generate key",
+            PivCredKind::ImportCert => "Import certificate",
+            PivCredKind::SelfSign => "Self-signed certificate",
+            PivCredKind::RequestCsr => "Sign certificate request",
+            PivCredKind::SetRetries => "Set retry counts",
+            PivCredKind::ChangeMgmtKey => "Change management key",
+        }
+    }
+    /// Label for the modal's primary Submit button. Shorter than the title for
+    /// the verbose flows so the button doesn't overflow.
+    fn submit_label(self) -> &'static str {
+        match self {
+            PivCredKind::GenerateKey => "Generate",
+            PivCredKind::ImportCert => "Import",
+            PivCredKind::SelfSign => "Create",
+            PivCredKind::RequestCsr => "Sign & save",
+            PivCredKind::SetRetries => "Set retry counts",
+            PivCredKind::ChangeMgmtKey => "Change key",
+            _ => self.title(),
         }
     }
     /// Spinner caption shown while this flow's op runs (matches the busy label
@@ -432,7 +461,25 @@ impl PivCredKind {
             PivCredKind::ChangePin => "Changing PIV PIN\u{2026}",
             PivCredKind::ChangePuk => "Changing PUK\u{2026}",
             PivCredKind::UnblockPin => "Unblocking PIN\u{2026}",
+            PivCredKind::GenerateKey => "Generating key\u{2026}",
+            PivCredKind::ImportCert => "Importing certificate\u{2026}",
+            PivCredKind::SelfSign => "Creating certificate\u{2026}",
+            PivCredKind::RequestCsr => "Signing request\u{2026}",
+            PivCredKind::SetRetries => "Setting retry counts\u{2026}",
+            PivCredKind::ChangeMgmtKey => "Changing management key\u{2026}",
         }
+    }
+    /// True when this flow collects the *current* management key (and therefore
+    /// shows the "Use default management key" convenience toggle).
+    fn needs_mgmt_key(self) -> bool {
+        matches!(
+            self,
+            PivCredKind::GenerateKey
+                | PivCredKind::ImportCert
+                | PivCredKind::SelfSign
+                | PivCredKind::SetRetries
+                | PivCredKind::ChangeMgmtKey
+        )
     }
 }
 
@@ -482,6 +529,10 @@ struct PivState {
     /// Management key (hex) entered to authorize key-gen / cert-import /
     /// set-retries / management-key change. Cleared after use.
     mgmt_key_input: String,
+    /// "Use default management key" toggle in the modal: when set, the standard
+    /// factory-default key is used instead of `mgmt_key_input` (the common case,
+    /// since most users never rotate the PIV management key). Reset per modal.
+    use_default_mgmt: bool,
     /// Change-PIN old/new/confirm entries. Cleared after use.
     pin_old: String,
     pin_new: String,
@@ -532,6 +583,7 @@ struct PivState {
 impl Drop for PivState {
     fn drop(&mut self) {
         wipe(&mut self.mgmt_key_input);
+        self.use_default_mgmt = false;
         wipe(&mut self.pin_old);
         wipe(&mut self.pin_new);
         wipe(&mut self.pin_confirm);
@@ -555,6 +607,7 @@ impl Default for PivState {
             notice: None,
             loaded: false,
             mgmt_key_input: String::new(),
+            use_default_mgmt: false,
             pin_old: String::new(),
             pin_new: String::new(),
             pin_confirm: String::new(),
@@ -3537,6 +3590,19 @@ fn piv_mgmt_key_bytes(hex: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> 
         .map_err(|e| format!("management key is not valid hex: {}", e))
 }
 
+/// The well-known factory-default PIV management key, as a hex string. The
+/// standard PIV default is 24 bytes of `01 02 03 04 05 06 07 08` repeated three
+/// times (a 3-DES / AES-192 key); Token2 PIN+ ships a vendor-specific default
+/// instead. Used by the modal's "Use default management key" convenience toggle
+/// so the common case (key never rotated) is one click.
+fn piv_default_mgmt_key_hex(is_token2: bool) -> &'static str {
+    if is_token2 {
+        "865362865362865362865362865362865362865362865362"
+    } else {
+        "010203040506070801020304050607080102030405060708"
+    }
+}
+
 fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(format!("{key}:")).color(ui.visuals().weak_text_color()));
@@ -3917,11 +3983,27 @@ impl App {
         });
     }
 
+    /// Resolve the *current* management key the user authorized this op with:
+    /// the well-known factory default when "Use default management key" is
+    /// ticked, otherwise the hex they typed. Decoding errors are surfaced the
+    /// same way the inline field's were.
+    fn piv_current_mgmt_key(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        if self.piv.use_default_mgmt {
+            let is_token2 = self
+                .selected_device()
+                .map(|d| d.vendor.eq_ignore_ascii_case("token2"))
+                .unwrap_or(false);
+            piv_mgmt_key_bytes(piv_default_mgmt_key_hex(is_token2))
+        } else {
+            piv_mgmt_key_bytes(&self.piv.mgmt_key_input)
+        }
+    }
+
     fn piv_set_retries(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+        let mgmt = match self.piv_current_mgmt_key() {
             Ok(b) => b,
             Err(e) => {
                 self.piv.error = Some(e);
@@ -3948,6 +4030,7 @@ impl App {
                     result,
                     "Retry counts set; PIN/PUK reset to defaults.".into(),
                 );
+                Self::apply_piv_cred_result(app);
             })
         });
     }
@@ -3956,7 +4039,7 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+        let mgmt = match self.piv_current_mgmt_key() {
             Ok(b) => b,
             Err(e) => {
                 self.piv.error = Some(e);
@@ -4008,6 +4091,7 @@ impl App {
                         app.piv.error = Some(e.to_string());
                     }
                 }
+                Self::apply_piv_cred_result(app);
             })
         });
     }
@@ -4016,7 +4100,7 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+        let mgmt = match self.piv_current_mgmt_key() {
             Ok(b) => b,
             Err(e) => {
                 self.piv.error = Some(e);
@@ -4042,6 +4126,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 Self::apply_piv_write(app, result, "Certificate imported.".into());
+                Self::apply_piv_cred_result(app);
             })
         });
     }
@@ -4066,7 +4151,7 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+        let mgmt = match self.piv_current_mgmt_key() {
             Ok(b) => b,
             Err(e) => {
                 self.piv.error = Some(e);
@@ -4101,6 +4186,7 @@ impl App {
                         result,
                         format!("Self-signed certificate stored in {}.", slot.label()),
                     );
+                    Self::apply_piv_cred_result(app);
                 })
             },
         );
@@ -4153,6 +4239,7 @@ impl App {
                             app.piv.error = Some(e.to_string());
                         }
                     }
+                    Self::apply_piv_cred_result(app);
                 })
             },
         );
@@ -4207,7 +4294,7 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let old = match piv_mgmt_key_bytes(&self.piv.mgmt_key_input) {
+        let old = match self.piv_current_mgmt_key() {
             Ok(b) => b,
             Err(e) => {
                 self.piv.error = Some(e);
@@ -4248,6 +4335,7 @@ impl App {
                     result,
                     format!("Management key changed to {}.", new_alg.label()),
                 );
+                Self::apply_piv_cred_result(app);
             })
         });
     }
@@ -4447,7 +4535,15 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
             &piv.puk_confirm,
             "the two new PUKs don't match",
         ),
-        PivCredKind::UnblockPin => return None,
+        // Unblock and the management-key-gated flows have no new==confirm pair;
+        // their inputs are validated by the op's own client-side guards.
+        PivCredKind::UnblockPin
+        | PivCredKind::GenerateKey
+        | PivCredKind::ImportCert
+        | PivCredKind::SelfSign
+        | PivCredKind::RequestCsr
+        | PivCredKind::SetRetries
+        | PivCredKind::ChangeMgmtKey => return None,
     };
     if confirm.is_empty() || new == confirm {
         None
@@ -4456,12 +4552,21 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
     }
 }
 
-/// In-modal success confirmation text for each PIV credential flow.
+/// In-modal success confirmation text for each PIV credential flow. The
+/// management-key-gated flows whose *detailed* result (e.g. the generated
+/// public-key PEM) still surfaces in the pane only need a generic confirmation
+/// here — the pane keeps showing the rich outcome.
 fn piv_cred_success(kind: PivCredKind) -> &'static str {
     match kind {
         PivCredKind::ChangePin => "PIN changed",
         PivCredKind::ChangePuk => "PUK changed",
         PivCredKind::UnblockPin => "PIN unblocked and reset",
+        PivCredKind::GenerateKey => "Key generated",
+        PivCredKind::ImportCert => "Certificate imported",
+        PivCredKind::SelfSign => "Certificate created",
+        PivCredKind::RequestCsr => "Request signed and saved",
+        PivCredKind::SetRetries => "Retry counts set",
+        PivCredKind::ChangeMgmtKey => "Management key changed",
     }
 }
 
@@ -7801,16 +7906,45 @@ impl App {
         }
     }
 
-    /// PIV credential-entry modal: drives Change PIN / Change PUK / Unblock PIN
-    /// inside the shared `modal_window` chrome, so the secret fields *and* the
-    /// op's result stay centered on-screen rather than scrolling off (issue #31).
+    /// Render the *current* management-key collector inside the modal, but only
+    /// for the flows that need it (`PivCredKind::needs_mgmt_key`). Shows a "Use
+    /// default management key" toggle (the common case — most users never rotate
+    /// the well-known factory default) and, when it's off, the hex entry field.
+    /// When the toggle is on the field is hidden and the op reads the default via
+    /// `piv_current_mgmt_key`.
+    fn piv_modal_mgmt_field(&mut self, ui: &mut egui::Ui, p: &Palette, kind: PivCredKind) {
+        if !kind.needs_mgmt_key() {
+            return;
+        }
+        ui.checkbox(&mut self.piv.use_default_mgmt, "Use default management key");
+        if !self.piv.use_default_mgmt {
+            secret_field(
+                ui,
+                p,
+                "Management key",
+                &mut self.piv.mgmt_key_input,
+                "hex (48/32/64 chars)",
+                300.0,
+            );
+        }
+    }
+
+    /// PIV credential-entry modal: drives the PIN/PUK flows (Change PIN / Change
+    /// PUK / Unblock PIN) *and* the management-key-gated operations (generate
+    /// key, import / self-sign / CSR, set retries, change management key) inside
+    /// the shared `modal_window` chrome, so the secret fields *and* the op's
+    /// result stay centered on-screen rather than scrolling off (issue #31).
     ///
-    /// The fields live in `PivState` (rendered here, not inline in the pane); the
-    /// modal state (`PivState::cred_modal`) tracks the flow, an in-flight flag,
-    /// and the op result. On Submit it validates new==confirm, then runs the
-    /// existing op (`piv_change_pin` / `piv_change_puk` / `piv_unblock_pin`),
-    /// which writes the outcome back into the modal via `apply_piv_cred_result`.
-    /// Cancel / ✕ / Esc — and a successful Done — wipe the secret fields.
+    /// The secret fields live in `PivState` (rendered here, not inline in the
+    /// pane); the inline pane keeps the *non-secret* parameters (slot, algorithm,
+    /// file path, subject, validity, retry counts). The modal state
+    /// (`PivState::cred_modal`) tracks the flow, an in-flight flag, and the op
+    /// result. On Submit it validates (new==confirm for PIN/PUK; the ops' own
+    /// client-side guards for the rest), then runs the existing op, which writes
+    /// the outcome back into the modal via `apply_piv_cred_result`. Rich,
+    /// non-secret results (e.g. the generated public-key PEM) still surface in
+    /// the pane — the modal only shows a generic success line. Cancel / ✕ / Esc —
+    /// and a successful Done — wipe the secret fields.
     fn render_piv_cred_modal(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(kind) = self.piv.cred_modal.as_ref().map(|m| m.kind) else {
             return;
@@ -7859,6 +7993,52 @@ impl App {
                             pin_field(ui, p, "New PIN", &mut self.piv.unblock_new_pin);
                             card_note(ui, p, "Recovers a blocked PIN without wiping any keys.");
                         }
+                        // Management-key-gated flows: only the *secrets* live here;
+                        // their non-secret parameters stay inline in the pane.
+                        PivCredKind::GenerateKey => {
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
+                        }
+                        PivCredKind::ImportCert => {
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            card_note(ui, p, "Authorizes writing the certificate to the slot.");
+                        }
+                        PivCredKind::SelfSign => {
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            card_note(
+                                ui,
+                                p,
+                                "Management key authorizes the import; the PIN authorizes \
+                                 the on-card signature.",
+                            );
+                        }
+                        PivCredKind::RequestCsr => {
+                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            card_note(ui, p, "The PIN authorizes the on-card signature.");
+                        }
+                        PivCredKind::SetRetries => {
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            pin_field(ui, p, "Current PIN", &mut self.piv.retries_pin_auth);
+                            card_note(
+                                ui,
+                                p,
+                                "Resets PIN and PUK to factory defaults; needs the \
+                                 management key and the current PIN.",
+                            );
+                        }
+                        PivCredKind::ChangeMgmtKey => {
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            secret_field(
+                                ui,
+                                p,
+                                "New key",
+                                &mut self.piv.new_mgmt_key_input,
+                                "hex (48/32/64 chars)",
+                                300.0,
+                            );
+                            card_note(ui, p, "Enter the current key, then the new key.");
+                        }
                     }
 
                     // Inline error/result line: the new==confirm mismatch, then
@@ -7881,7 +8061,7 @@ impl App {
                                     .color(p.txt2),
                             );
                         } else {
-                            if theme::button(ui, p, BtnKind::Primary, kind.title()).clicked()
+                            if theme::button(ui, p, BtnKind::Primary, kind.submit_label()).clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
@@ -7911,15 +8091,33 @@ impl App {
                 m.busy = true;
                 m.result = None;
             }
+            // Clear any stale pane error so a client-side guard tripping during
+            // this dispatch is distinguishable from a previous failure.
+            self.piv.error = None;
             match kind {
                 PivCredKind::ChangePin => self.piv_change_pin(),
                 PivCredKind::ChangePuk => self.piv_change_puk(),
                 PivCredKind::UnblockPin => self.piv_unblock_pin(),
+                PivCredKind::GenerateKey => self.piv_generate_key(),
+                PivCredKind::ImportCert => self.piv_import_cert(),
+                PivCredKind::SelfSign => self.piv_self_sign(),
+                PivCredKind::RequestCsr => self.piv_request_csr(),
+                PivCredKind::SetRetries => self.piv_set_retries(),
+                PivCredKind::ChangeMgmtKey => self.piv_change_management_key(),
             }
-            // If the op didn't actually queue (worker busy), unstick the modal.
+            // If the op didn't actually queue, unstick the modal. This happens
+            // either because the worker was busy (no error set — just retry on
+            // the next click) or because a client-side guard rejected the input
+            // (bad hex, wrong new-key length, empty subject/path) and stored the
+            // reason in `piv.error` — surface that reason in the modal result so
+            // it shows in the dialog rather than scrolling off in the pane.
             if !self.busy() {
+                let guard_err = self.piv.error.clone();
                 if let Some(m) = self.piv.cred_modal.as_mut() {
                     m.busy = false;
+                    if let Some(e) = guard_err {
+                        m.result = Some(Err(e));
+                    }
                 }
             }
         }
@@ -7936,6 +8134,12 @@ impl App {
         wipe(&mut self.piv.puk_confirm);
         wipe(&mut self.piv.unblock_puk);
         wipe(&mut self.piv.unblock_new_pin);
+        // Management-key-gated flows also route their secrets through this modal.
+        wipe(&mut self.piv.mgmt_key_input);
+        wipe(&mut self.piv.new_mgmt_key_input);
+        wipe(&mut self.piv.sign_pin);
+        wipe(&mut self.piv.retries_pin_auth);
+        self.piv.use_default_mgmt = false;
         self.piv.cred_modal = None;
     }
 
@@ -8150,17 +8354,16 @@ impl App {
         let mut open_change_pin = false;
         let mut open_change_puk = false;
         let mut open_unblock = false;
-        let mut go_generate = false;
-        let mut go_import = false;
+        let mut open_generate = false;
+        let mut open_import = false;
         let mut go_export = false;
-        let mut go_self_sign = false;
-        let mut go_csr = false;
-        let mut go_set_retries = false;
-        let mut go_change_mgmt = false;
+        let mut open_self_sign = false;
+        let mut open_csr = false;
+        let mut open_set_retries = false;
+        let mut open_change_mgmt = false;
         let mut arm_reset = false;
         let mut copy_pem: Option<String> = None;
 
-        let head = |ui: &mut egui::Ui, t: &str| card_head(ui, p, t);
         let sub = |ui: &mut egui::Ui, t: &str| card_sub(ui, p, t);
         let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
 
@@ -8268,37 +8471,11 @@ impl App {
         }
         ui.add_space(10.0);
 
-        // --- Management key: authorizes key-gen / cert-import / retries / rotation ---
-        // Compute the vendor-specific default hint before the closure borrows self.
-        let is_token2 = self
-            .selected_device()
-            .map(|d| d.vendor.eq_ignore_ascii_case("token2"))
-            .unwrap_or(false);
-        let mgmt_default_note = if is_token2 {
-            "Hex key authorizing key generation, certificate import, retry \
-             changes, and rotation below. Token2 PIN+ factory default is \
-             865362865362865362865362865362865362865362865362. Sent for the \
-             operation only; never stored."
-        } else {
-            "Hex key authorizing key generation, certificate import, retry \
-             changes, and rotation below. Factory default (most keys) is \
-             010203040506070801020304050607080102030405060708. Sent for the \
-             operation only; never stored."
-        };
-        theme::card_frame(p).show(ui, |ui| {
-            head(ui, "Management key");
-            note(ui, mgmt_default_note);
-            ui.add_space(6.0);
-            secret_field(
-                ui,
-                p,
-                "Management key",
-                &mut self.piv.mgmt_key_input,
-                "hex (48/32/64 chars)",
-                300.0,
-            );
-        });
-        ui.add_space(10.0);
+        // The management key that authorizes key-gen / cert-import / retries /
+        // rotation is no longer entered in a persistent card here — each gated
+        // operation collects it (and any PIN) in its own focused modal, with a
+        // "Use default management key" toggle for the common case. Only the
+        // non-secret parameters (slot, algorithm, file, subject, …) stay inline.
 
         // --- PIN & PUK ---
         egui::CollapsingHeader::new(
@@ -8349,13 +8526,13 @@ impl App {
                 note(
                     ui,
                     "Creates a fresh key in the slot (OVERWRITES it) and shows its \
-                     public key. Needs the management key above.",
+                     public key. The management key is entered in the dialog.",
                 );
                 ui.horizontal(|ui| {
                     piv_slot_combo(ui, "piv-gen-slot", &mut self.piv.gen_slot);
                     piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
                     if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
-                        go_generate = true;
+                        open_generate = true;
                     }
                 });
                 if let Some(pem) = &self.piv.gen_pubkey_pem {
@@ -8376,9 +8553,10 @@ impl App {
                     ui,
                     "Signed on the card with the slot's key (generate one above \
                      first). \u{201c}Self-signed\u{201d} stores the certificate in \
-                     the slot — needs the PIN and the management key. \u{201c}Save \
-                     CSR\u{201d} writes a request file to hand to a certificate \
-                     authority — needs only the PIN.",
+                     the slot. \u{201c}Save CSR\u{201d} writes a request file to \
+                     hand to a certificate authority. The PIN (and, for the \
+                     self-signed import, the management key) is entered in the \
+                     dialog.",
                 );
                 ui.horizontal(|ui| {
                     piv_slot_combo(ui, "piv-certify-slot", &mut self.piv.certify_slot);
@@ -8391,7 +8569,6 @@ impl App {
                     "e.g. Alice — or full CN=Alice,O=Example,C=US",
                     300.0,
                 );
-                pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Valid for")
@@ -8406,7 +8583,7 @@ impl App {
                     ui.add_space(8.0);
                     if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
                     {
-                        go_self_sign = true;
+                        open_self_sign = true;
                     }
                 });
                 text_field(
@@ -8418,11 +8595,15 @@ impl App {
                     240.0,
                 );
                 if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
-                    go_csr = true;
+                    open_csr = true;
                 }
                 ui.add_space(10.0);
                 sub(ui, "Import certificate");
-                note(ui, "PEM or DER X.509 file. Needs the management key.");
+                note(
+                    ui,
+                    "PEM or DER X.509 file. The management key is entered in the \
+                     dialog.",
+                );
                 ui.horizontal(|ui| {
                     piv_slot_combo(ui, "piv-cert-slot", &mut self.piv.cert_slot);
                 });
@@ -8435,7 +8616,7 @@ impl App {
                     240.0,
                 );
                 if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
-                    go_import = true;
+                    open_import = true;
                 }
                 ui.add_space(10.0);
                 sub(ui, "Export certificate");
@@ -8470,8 +8651,8 @@ impl App {
                 sub(ui, "Set PIN/PUK retry counts");
                 note(
                     ui,
-                    "Resets PIN and PUK to factory defaults. Needs the management \
-                     key above and the current PIN.",
+                    "Resets PIN and PUK to factory defaults. The management key \
+                     and the current PIN are entered in the dialog.",
                 );
                 ui.horizontal(|ui| {
                     ui.label(
@@ -8487,26 +8668,25 @@ impl App {
                             .color(p.txt2),
                     );
                     ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
+                    ui.add_space(8.0);
+                    if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}").clicked()
+                    {
+                        open_set_retries = true;
+                    }
                 });
-                pin_field(ui, p, "Current PIN", &mut self.piv.retries_pin_auth);
-                if theme::button(ui, p, BtnKind::Default, "Set retry counts").clicked() {
-                    go_set_retries = true;
-                }
                 ui.add_space(10.0);
                 sub(ui, "Change management key");
-                note(ui, "Enter the current key above; the new key here.");
-                secret_field(
+                note(
                     ui,
-                    p,
-                    "New key",
-                    &mut self.piv.new_mgmt_key_input,
-                    "hex (48/32/64 chars)",
-                    300.0,
+                    "Pick the new key's algorithm here; the current and new keys \
+                     are entered in the dialog.",
                 );
                 ui.horizontal(|ui| {
                     piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
-                    if theme::button(ui, p, BtnKind::Default, "Change management key").clicked() {
-                        go_change_mgmt = true;
+                    if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
+                        .clicked()
+                    {
+                        open_change_mgmt = true;
                     }
                 });
             });
@@ -8558,26 +8738,37 @@ impl App {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::UnblockPin));
         }
-        if go_generate {
-            self.piv_generate_key();
+        // The management-key-gated operations open the centered credential modal
+        // (which collects their secrets and runs the op on Submit) rather than
+        // running directly. Opening wipes any stale secret fields first so a
+        // fresh dialog starts blank. Export needs no secret, so it still runs
+        // inline.
+        if open_generate {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::GenerateKey));
         }
-        if go_import {
-            self.piv_import_cert();
+        if open_import {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportCert));
         }
         if go_export {
             self.piv_export_cert();
         }
-        if go_self_sign {
-            self.piv_self_sign();
+        if open_self_sign {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::SelfSign));
         }
-        if go_csr {
-            self.piv_request_csr();
+        if open_csr {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::RequestCsr));
         }
-        if go_set_retries {
-            self.piv_set_retries();
+        if open_set_retries {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::SetRetries));
         }
-        if go_change_mgmt {
-            self.piv_change_management_key();
+        if open_change_mgmt {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ChangeMgmtKey));
         }
         if arm_reset {
             self.piv.confirm_reset = Some(String::new());
@@ -9293,6 +9484,96 @@ mod tests {
         let busy: Vec<_> = kinds.iter().map(|k| k.busy_label()).collect();
         assert!(busy.iter().all(|s| !s.is_empty()));
         assert_eq!(busy[0], "Changing PIV PIN\u{2026}");
+    }
+
+    /// The management-key-gated flows declare they collect the current
+    /// management key (and therefore show the "Use default" toggle); the PIN/PUK
+    /// and CSR flows do not.
+    #[test]
+    fn piv_cred_kind_mgmt_key_mapping() {
+        assert!(PivCredKind::GenerateKey.needs_mgmt_key());
+        assert!(PivCredKind::ImportCert.needs_mgmt_key());
+        assert!(PivCredKind::SelfSign.needs_mgmt_key());
+        assert!(PivCredKind::SetRetries.needs_mgmt_key());
+        assert!(PivCredKind::ChangeMgmtKey.needs_mgmt_key());
+        // CSR signs with the PIN only — no management key.
+        assert!(!PivCredKind::RequestCsr.needs_mgmt_key());
+        // PIN/PUK flows never collect a management key.
+        assert!(!PivCredKind::ChangePin.needs_mgmt_key());
+        assert!(!PivCredKind::ChangePuk.needs_mgmt_key());
+        assert!(!PivCredKind::UnblockPin.needs_mgmt_key());
+    }
+
+    /// Every new gated variant has a distinct, non-empty title / submit label /
+    /// busy caption / success line.
+    #[test]
+    fn piv_cred_kind_gated_strings_are_present() {
+        let kinds = [
+            PivCredKind::GenerateKey,
+            PivCredKind::ImportCert,
+            PivCredKind::SelfSign,
+            PivCredKind::RequestCsr,
+            PivCredKind::SetRetries,
+            PivCredKind::ChangeMgmtKey,
+        ];
+        for k in kinds {
+            assert!(!k.title().is_empty());
+            assert!(!k.submit_label().is_empty());
+            assert!(k.busy_label().ends_with('\u{2026}'));
+            assert!(!piv_cred_success(k).is_empty());
+        }
+        // Mismatch guard only fires for the PIN/PUK change flows; gated flows
+        // never report a new==confirm mismatch.
+        let piv = PivState::default();
+        for k in kinds {
+            assert_eq!(piv_cred_mismatch(&piv, k), None);
+        }
+    }
+
+    /// The standard PIV factory default is 24 bytes of `01..08` ×3; Token2 PIN+
+    /// ships its own vendor default. Both decode to 24-byte keys.
+    #[test]
+    fn piv_default_mgmt_key_is_well_known() {
+        let std = piv_default_mgmt_key_hex(false);
+        assert_eq!(std, "010203040506070801020304050607080102030405060708");
+        let bytes = piv_mgmt_key_bytes(std).unwrap();
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(&bytes[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        // Repeated three times.
+        assert_eq!(&bytes[8..16], &bytes[..8]);
+        assert_eq!(&bytes[16..24], &bytes[..8]);
+
+        let t2 = piv_default_mgmt_key_hex(true);
+        assert_eq!(piv_mgmt_key_bytes(t2).unwrap().len(), 24);
+        assert_ne!(std, t2);
+    }
+
+    /// With "Use default management key" ticked, `piv_current_mgmt_key` ignores
+    /// the (possibly empty) hex field and yields the well-known default; with it
+    /// off, it decodes the typed hex.
+    #[test]
+    fn piv_current_mgmt_key_honours_use_default() {
+        let mut app = App::default();
+        // Default toggle on, hex field empty → resolves to the non-Token2 default
+        // (no device selected ⇒ not Token2).
+        app.piv.use_default_mgmt = true;
+        app.piv.mgmt_key_input.clear();
+        let key = app.piv_current_mgmt_key().expect("default fills");
+        assert_eq!(
+            &key[..],
+            &piv_mgmt_key_bytes(piv_default_mgmt_key_hex(false)).unwrap()[..]
+        );
+
+        // Toggle off → uses the typed hex.
+        app.piv.use_default_mgmt = false;
+        app.piv.mgmt_key_input = "aabbccddeeff00112233445566778899aabbccddeeff0011".into();
+        let typed = app.piv_current_mgmt_key().expect("valid hex");
+        assert_eq!(typed.len(), 24);
+        assert_eq!(typed[0], 0xaa);
+
+        // Toggle off with bad hex → error surfaces.
+        app.piv.mgmt_key_input = "nothex".into();
+        assert!(app.piv_current_mgmt_key().is_err());
     }
 
     /// `apply_piv_cred_result` mirrors the pane outcome into the open modal:
