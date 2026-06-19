@@ -242,6 +242,39 @@ mod json_out {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub algorithm_name: Option<&'static str>,
     }
+
+    /// `keyroostctl fido large-blob --json list` — one entry per stored blob.
+    #[derive(Serialize)]
+    pub struct FidoLargeBlobListJson {
+        pub entries: Vec<FidoLargeBlobEntryJson>,
+    }
+
+    /// One large-blob array entry as the `list` view renders it.
+    #[derive(Serialize)]
+    pub struct FidoLargeBlobEntryJson {
+        pub index: usize,
+        /// Declared plaintext size of the entry (origSize), in bytes.
+        pub size: u64,
+        /// Whether this entry is a keyroost-authored plaintext note (true) or an
+        /// opaque RP-encrypted record (false).
+        pub is_note: bool,
+        /// The note text when `is_note`; `null` for opaque entries.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+    }
+
+    /// `keyroostctl fido large-blob --json get <INDEX>` — a single entry in full.
+    #[derive(Serialize)]
+    pub struct FidoLargeBlobGetJson {
+        pub index: usize,
+        pub size: u64,
+        pub is_note: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub text: Option<String>,
+        /// Hex of the raw ciphertext bytes (the note magic + UTF-8 for a note, or
+        /// the RP's AEAD ciphertext for an opaque entry).
+        pub hex: String,
+    }
 }
 
 #[derive(Parser)]
@@ -1446,6 +1479,100 @@ enum FidoCmd {
     /// Enable enterprise attestation. This is typically one-way: disabling it
     /// again requires a device reset.
     EnterpriseAttestation {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Read and manage the FIDO2 large-blob array (the key's small shared store).
+    ///
+    /// IMPORTANT: the large-blob store is WORLD-READABLE without a PIN — any
+    /// software with access to the key can read every entry. It is a convenience
+    /// scratchpad, NOT a place for secrets. Relying parties (e.g. an SSH cert
+    /// flow) may also keep their own encrypted entries here; keyroost never
+    /// rewrites or deletes those without an explicit `--yes`.
+    LargeBlob {
+        #[command(subcommand)]
+        cmd: LargeBlobCmd,
+    },
+}
+
+/// Subcommands for the FIDO2 large-blob array.
+///
+/// keyroost stores its own entries as plaintext "notes" (a small magic prefix
+/// marks them); relying parties store opaque AEAD-encrypted records keyroost
+/// cannot read. Reads need no PIN (the store is world-readable); writes pull a
+/// `largeBlobWrite` token from your PIN. Every write re-reads the live array
+/// first so existing RP entries are never clobbered by stale state.
+#[derive(Subcommand)]
+enum LargeBlobCmd {
+    /// List every entry: index, size, type (note vs opaque), and a short preview.
+    List {
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Show one entry in full by its index (from `list`).
+    Get {
+        /// Zero-based entry index as printed by `large-blob list`.
+        index: usize,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Append a keyroost text note.
+    ///
+    /// IMPORTANT: the large-blob store is world-readable WITHOUT a PIN — do not
+    /// put secrets here. TEXT is passed on the command line, so it is visible to
+    /// other local processes (e.g. via the process list) while this runs.
+    Add {
+        /// The note text to store (plain UTF-8). Visible in argv to other
+        /// local processes — never a secret.
+        text: String,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Replace the text of an existing keyroost note by its index.
+    ///
+    /// Refuses to touch opaque RP-encrypted entries.
+    Edit {
+        /// Zero-based entry index as printed by `large-blob list`.
+        index: usize,
+        /// The new note text (plain UTF-8). Visible in argv to other processes.
+        text: String,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Delete a single entry by its index.
+    ///
+    /// Deleting an opaque (RP-owned) entry may break a service that stored it,
+    /// so that case requires `--yes`.
+    Delete {
+        /// Zero-based entry index as printed by `large-blob list`.
+        index: usize,
+        /// Confirm the deletion (required for opaque RP-owned entries).
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Erase the ENTIRE large-blob array, including any RP-owned entries.
+    Clear {
+        /// Confirm wiping every entry (required).
+        #[arg(long)]
+        yes: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
@@ -4426,7 +4553,357 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             })?;
             Ok(())
         }
+        FidoCmd::LargeBlob { cmd } => run_fido_large_blob(cmd),
     }
+}
+
+fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        LargeBlobCmd::List { path } => run_fido_large_blob_list(path.as_deref()),
+        LargeBlobCmd::Get { index, path } => run_fido_large_blob_get(path.as_deref(), *index),
+        LargeBlobCmd::Add {
+            text,
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_large_blob_add(path.as_deref(), &pin, text)
+        }
+        LargeBlobCmd::Edit {
+            index,
+            text,
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_large_blob_edit(path.as_deref(), &pin, *index, text)
+        }
+        LargeBlobCmd::Delete {
+            index,
+            yes,
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_large_blob_delete(path.as_deref(), &pin, *index, *yes)
+        }
+        LargeBlobCmd::Clear {
+            yes,
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            run_fido_large_blob_clear(path.as_deref(), &pin, *yes)
+        }
+    }
+}
+
+/// Open a FIDO authenticator and read its large-blob array (no PIN required).
+/// Returns the live device + info too, so a writer can reuse the same session
+/// after re-reading.
+fn open_and_read_large_blobs(
+    path: Option<&std::path::Path>,
+) -> Result<
+    (
+        keyroost_ctap::CtapHidDevice,
+        keyroost_ctap::AuthenticatorInfo,
+        keyroost_ctap::large_blobs::LargeBlobArray,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let path = resolve_fido_path(path)?;
+    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    if !init.supports_cbor() {
+        return Err("device is U2F-only; CTAP2 large blobs not supported".into());
+    }
+    let info = keyroost_ctap::get_info(&mut dev)?;
+    let array = keyroost_ctap::large_blobs::read(&mut dev, &info)?;
+    Ok((dev, info, array))
+}
+
+/// Shape a parsed large-blob array into the JSON `list` view.
+fn large_blob_list_json(
+    array: &keyroost_ctap::large_blobs::LargeBlobArray,
+) -> json_out::FidoLargeBlobListJson {
+    let entries = array
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, e)| json_out::FidoLargeBlobEntryJson {
+            index,
+            size: e.orig_size,
+            is_note: e.is_kr_note(),
+            text: e.as_text(),
+        })
+        .collect();
+    json_out::FidoLargeBlobListJson { entries }
+}
+
+fn run_fido_large_blob_list(
+    path: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_dev, _info, array) = open_and_read_large_blobs(path)?;
+    if json_output() {
+        emit_json(&large_blob_list_json(&array))?;
+        return Ok(());
+    }
+    if array.entries.is_empty() {
+        println!("(large-blob array is empty)");
+        return Ok(());
+    }
+    for (i, e) in array.entries.iter().enumerate() {
+        if let Some(text) = e.as_text() {
+            println!(
+                "[{}] {} bytes  note      {}",
+                i,
+                e.orig_size,
+                preview_note(&text)
+            );
+        } else {
+            println!(
+                "[{}] {} bytes  opaque    {}",
+                i,
+                e.orig_size,
+                preview_opaque(&e.ciphertext)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_fido_large_blob_get(
+    path: Option<&std::path::Path>,
+    index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_dev, _info, array) = open_and_read_large_blobs(path)?;
+    let entry = array
+        .entries
+        .get(index)
+        .ok_or_else(|| large_blob_bad_index(index, array.entries.len()))?;
+    if json_output() {
+        emit_json(&json_out::FidoLargeBlobGetJson {
+            index,
+            size: entry.orig_size,
+            is_note: entry.is_kr_note(),
+            text: entry.as_text(),
+            hex: hex_encode(&entry.ciphertext),
+        })?;
+        return Ok(());
+    }
+    if let Some(text) = entry.as_text() {
+        println!("Entry {}: keyroost note, {} bytes", index, entry.orig_size);
+        println!("{}", text);
+    } else {
+        println!(
+            "Entry {}: opaque (RP-encrypted), {} bytes",
+            index, entry.orig_size
+        );
+        println!();
+        print!("{}", hex_ascii_dump(&entry.ciphertext));
+    }
+    Ok(())
+}
+
+fn run_fido_large_blob_add(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Re-read the live array immediately before writing so any concurrent or
+    // pre-existing RP entries are preserved (mirror the GUI's add flow).
+    let (mut dev, info, current) = open_and_read_large_blobs(path)?;
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+    )?;
+    let updated = current.with_text_note(text);
+    let serialized = updated.serialize_with_checksum();
+    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    println!("Note added; {} entries now.", updated.entries.len());
+    Ok(())
+}
+
+fn run_fido_large_blob_edit(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    index: usize,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut dev, info, current) = open_and_read_large_blobs(path)?;
+    let updated = current.with_replaced_note(index, text).ok_or_else(|| {
+        format!(
+            "entry {} is not a keyroost note (can't edit an RP-encrypted entry)",
+            index
+        )
+    })?;
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+    )?;
+    let serialized = updated.serialize_with_checksum();
+    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    println!("Note {} updated.", index);
+    Ok(())
+}
+
+fn run_fido_large_blob_delete(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    index: usize,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut dev, info, current) = open_and_read_large_blobs(path)?;
+    let entry = current
+        .entries
+        .get(index)
+        .ok_or_else(|| large_blob_bad_index(index, current.entries.len()))?;
+    if !entry.is_kr_note() {
+        // Opaque RP-owned entry: deleting it can break the owning service.
+        if !yes {
+            return Err(format!(
+                "REFUSING to delete entry {idx}: it was NOT created by keyroost \
+                 (it is an opaque, RP-encrypted record). Deleting it may break a \
+                 service that stored it. Re-run with --yes to delete it anyway.",
+                idx = index
+            )
+            .into());
+        }
+        eprintln!(
+            "WARNING: entry {} was not created by keyroost; deleting it may break a \
+             service that stored it.",
+            index
+        );
+    } else if !yes {
+        return Err(format!("refusing to delete entry {} without --yes", index).into());
+    }
+
+    let mut entries = current.entries.clone();
+    entries.remove(index);
+    let updated = keyroost_ctap::large_blobs::LargeBlobArray {
+        entries,
+        raw_array: Vec::new(),
+    };
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+    )?;
+    let serialized = updated.serialize_with_checksum();
+    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    println!("Entry deleted; {} entries now.", updated.entries.len());
+    Ok(())
+}
+
+fn run_fido_large_blob_clear(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Re-read first so we can report exactly what will be wiped.
+    let (mut dev, info, current) = open_and_read_large_blobs(path)?;
+    let total = current.entries.len();
+    let opaque = current.entries.iter().filter(|e| !e.is_kr_note()).count();
+    if !yes {
+        eprintln!(
+            "WARNING: `clear` erases the ENTIRE large-blob array — ALL {total} \
+             entr{plural} ({opaque} opaque/RP-owned, e.g. stored SSH certs). This \
+             can break any service that stored data here.",
+            total = total,
+            plural = if total == 1 { "y" } else { "ies" },
+            opaque = opaque,
+        );
+        return Err("refusing to clear the large-blob array without --yes".into());
+    }
+    if opaque > 0 {
+        eprintln!(
+            "WARNING: wiping {} opaque/RP-owned entr{} along with everything else.",
+            opaque,
+            if opaque == 1 { "y" } else { "ies" }
+        );
+    }
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+    )?;
+    let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
+    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    println!("Large-blob array cleared ({} entries wiped).", total);
+    Ok(())
+}
+
+/// A consistent "index out of range" error for the large-blob commands.
+fn large_blob_bad_index(index: usize, len: usize) -> Box<dyn std::error::Error> {
+    if len == 0 {
+        format!("no entry {} — the large-blob array is empty", index).into()
+    } else {
+        format!("no entry {} — valid indices are 0..={}", index, len - 1).into()
+    }
+}
+
+/// A short, single-line preview of a note's text for the `list` view.
+fn preview_note(text: &str) -> String {
+    const MAX: usize = 48;
+    let one_line: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = one_line.trim();
+    let mut out: String = trimmed.chars().take(MAX).collect();
+    if trimmed.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
+/// A short hex head of an opaque entry's ciphertext for the `list` view.
+fn preview_opaque(bytes: &[u8]) -> String {
+    const HEAD: usize = 12;
+    let mut s = String::new();
+    for b in bytes.iter().take(HEAD) {
+        s.push_str(&format!("{:02x}", b));
+    }
+    if bytes.len() > HEAD {
+        s.push('…');
+    }
+    if s.is_empty() {
+        "(empty)".to_owned()
+    } else {
+        s
+    }
+}
+
+/// A classic hex + ASCII dump (16 bytes per row) for the `get` view of an
+/// opaque entry.
+fn hex_ascii_dump(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        let mut hex = String::new();
+        let mut ascii = String::new();
+        for (i, b) in chunk.iter().enumerate() {
+            hex.push_str(&format!("{:02x} ", b));
+            if i == 7 {
+                hex.push(' ');
+            }
+            ascii.push(if b.is_ascii_graphic() || *b == b' ' {
+                *b as char
+            } else {
+                '.'
+            });
+        }
+        out.push_str(&format!("{:08x}  {:<49}|{}|\n", row * 16, hex, ascii));
+    }
+    out
 }
 
 fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
@@ -5580,5 +6057,127 @@ mod cli_tests {
         };
         let s = serde_json::to_string(&no_name).unwrap();
         assert!(!s.contains("rp_name"), "rp_name should be omitted: {s}");
+    }
+
+    // ---- large-blob shaping (pure logic; no hardware) ----
+
+    use keyroost_ctap::large_blobs::{LargeBlobArray, LargeBlobEntry};
+
+    /// An opaque RP-style entry (no keyroost note magic).
+    fn opaque_entry() -> LargeBlobEntry {
+        LargeBlobEntry {
+            ciphertext: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x99],
+            nonce: vec![1u8; 12],
+            orig_size: 4,
+        }
+    }
+
+    #[test]
+    fn large_blob_list_json_classifies_note_vs_opaque() {
+        let array = LargeBlobArray {
+            entries: vec![LargeBlobEntry::from_text("hello"), opaque_entry()],
+            raw_array: Vec::new(),
+        };
+        let shaped = large_blob_list_json(&array);
+        assert_eq!(shaped.entries.len(), 2);
+
+        // [0] is a keyroost note: is_note true, text present, size == byte len.
+        assert_eq!(shaped.entries[0].index, 0);
+        assert!(shaped.entries[0].is_note);
+        assert_eq!(shaped.entries[0].text.as_deref(), Some("hello"));
+        assert_eq!(shaped.entries[0].size, "hello".len() as u64);
+
+        // [1] is opaque: is_note false, text omitted.
+        assert_eq!(shaped.entries[1].index, 1);
+        assert!(!shaped.entries[1].is_note);
+        assert!(shaped.entries[1].text.is_none());
+
+        // The opaque entry's text is omitted from the JSON (skip_serializing_if).
+        let s = serde_json::to_string(&shaped).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let arr = v.get("entries").unwrap().as_array().unwrap();
+        assert!(arr[0].get("text").is_some());
+        assert!(arr[1].get("text").is_none());
+    }
+
+    #[test]
+    fn large_blob_get_json_carries_hex_for_opaque() {
+        let entry = opaque_entry();
+        let g = json_out::FidoLargeBlobGetJson {
+            index: 0,
+            size: entry.orig_size,
+            is_note: entry.is_kr_note(),
+            text: entry.as_text(),
+            hex: hex_encode(&entry.ciphertext),
+        };
+        assert!(!g.is_note);
+        assert!(g.text.is_none());
+        assert_eq!(g.hex, "deadbeef0099");
+        assert_json_has_keys(&g, &["index", "size", "is_note", "hex"]);
+        // text omitted for an opaque entry.
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(!s.contains("\"text\""), "text should be omitted: {s}");
+    }
+
+    #[test]
+    fn large_blob_get_json_includes_note_text() {
+        let entry = LargeBlobEntry::from_text("a note");
+        let g = json_out::FidoLargeBlobGetJson {
+            index: 3,
+            size: entry.orig_size,
+            is_note: entry.is_kr_note(),
+            text: entry.as_text(),
+            hex: hex_encode(&entry.ciphertext),
+        };
+        assert!(g.is_note);
+        assert_eq!(g.text.as_deref(), Some("a note"));
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(s.contains("\"text\":\"a note\""), "{s}");
+    }
+
+    #[test]
+    fn preview_note_truncates_and_flattens() {
+        // Newlines/control chars flattened to spaces.
+        assert_eq!(preview_note("line1\nline2"), "line1 line2");
+        // Long text truncated with an ellipsis.
+        let long = "x".repeat(100);
+        let p = preview_note(&long);
+        assert!(p.ends_with('…'));
+        assert_eq!(p.chars().count(), 49); // 48 chars + ellipsis
+    }
+
+    #[test]
+    fn preview_opaque_shows_hex_head() {
+        let bytes: Vec<u8> = (0u8..20).collect();
+        let p = preview_opaque(&bytes);
+        assert!(p.starts_with("000102"));
+        assert!(p.ends_with('…'));
+        assert_eq!(preview_opaque(&[]), "(empty)");
+    }
+
+    #[test]
+    fn hex_ascii_dump_renders_offset_and_ascii() {
+        let dump = hex_ascii_dump(b"ABC");
+        assert!(dump.starts_with("00000000"));
+        assert!(dump.contains("41 42 43"));
+        assert!(dump.contains("|ABC|"));
+    }
+
+    #[test]
+    fn large_blob_bad_index_message_reflects_len() {
+        let empty = large_blob_bad_index(2, 0).to_string();
+        assert!(empty.contains("empty"), "{empty}");
+        let oob = large_blob_bad_index(5, 3).to_string();
+        assert!(oob.contains("0..=2"), "{oob}");
+    }
+
+    #[test]
+    fn large_blob_subcommands_parse() {
+        assert!(parse(&["keyroostctl", "fido", "large-blob", "list"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "large-blob", "get", "0"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "large-blob", "add", "hi"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "large-blob", "edit", "1", "new"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "large-blob", "delete", "2", "--yes"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "large-blob", "clear", "--yes"]).is_ok());
     }
 }
