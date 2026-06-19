@@ -131,25 +131,23 @@ cargo install keyroostctl keyroost
 ### Without the Rust toolchain
 
 Each release ships pre-built binaries for Linux, macOS, and Windows, so you can
-skip compiling. Grab the binary for the **latest** release straight from a
-stable URL (no `cargo`, no toolchain) — for Linux x86_64:
+skip compiling. Grab the binary for the [latest release](https://github.com/framefilter/keyroost/releases/latest) 
+straight from a URL (no `cargo`, no toolchain) — for Linux x86_64:
 
 ```bash
-curl -L https://github.com/framefilter/keyroost/releases/latest/download/keyroost-linux-x86_64.tar.gz \
+curl -L https://github.com/framefilter/keyroost/releases/download/v0.6.0/keyroost-v0.6.0-linux-x86_64.tar.gz \
   | tar xz   # then move keyroostctl / keyroost onto your PATH
 ```
 
-(macOS: `keyroost-macos-universal2.tar.gz`; Windows: `keyroost-windows-x86_64.zip`.
+(macOS: `keyroost-v0.6.0-macos-universal2.tar.gz`; Windows: `keyroost-v0.6.0-windows-x86_64.zip`.
 Each release also publishes `SHA256SUMS` and build-provenance attestation.)
 
-Or let `cargo binstall` fetch the same pre-built archive instead of compiling:
+Or let `cargo-binstall` fetch the same pre-built archive instead of compiling:
 
 ```bash
+cargo install cargo-binstall # if you don't have it installed yet, ensure its directory is added to your PATH
 cargo binstall keyroostctl keyroost
 ```
-
-keyroost is also packaged for Homebrew, the AUR, and winget — see the latest
-[release](https://github.com/framefilter/keyroost/releases/latest).
 
 ### Linux prerequisite
 
@@ -157,7 +155,8 @@ keyroost is mostly¹ distro-neutral — it talks to the kernel's `hidraw`/`sysfs
 PC/SC, both of which every mainstream distribution provides. Only the package
 names differ. The CLI needs the PC/SC library + daemon; the GUI additionally
 needs the X11/Wayland/GL libraries that `eframe`/`egui` link against.   
-¹the cargo install does not support atomic distros like Bazzite.
+¹the `cargo install` does not support atomic distros like Bazzite. 
+Use `cargo-binstall` or the [Token2-branded AppImage](https://github.com/token2/t2companion-keyroost-builder/releases/latest/download/Token2_Companion_Rust-x86_64.AppImage)
 
 ```bash
 # Debian / Ubuntu
