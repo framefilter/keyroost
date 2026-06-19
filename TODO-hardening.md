@@ -580,6 +580,22 @@ configured (see `packaging/README.md`):
 - [ ] **Bordered text inputs** — give text fields a visible border so they don't
       blend into the dark theme (raised by @token2 in #33; applies app-wide). (S)
 
+#### Candidate GUI items — from @My1's reviews (#31 + the #38 thread); NOT yet scoped
+Captured so they're not lost; designs explored but not locked. Polish-first order.
+The FIDO-settings items build on the FIDO2 tab that Token2's #38 introduces, so
+their detailed design follows #38 landing.
+- [ ] **Show current `minPinLen`** in the FIDO settings/info view (it's in
+      `authenticatorGetInfo`). (S)
+- [ ] **Show security-policy state read-only without a PIN unlock** — the policy
+      state is readable un-authenticated, so display it rather than gating it
+      behind unlock. (S)
+- [ ] **Auto-lock on a post-unlock PIN error** instead of prompting "re-lock" —
+      a stale-session bad-PIN attempt wastes a retry, and the retry counter is
+      precious (0 → key needs a reset). Safety, not just polish. (S)
+- [ ] **Extend the scroll-independent credential-entry modal to PIV/OATH/OpenPGP**
+      — build on the dialogs #38 introduces rather than duplicating (see the
+      modal item above). (M)
+
 ### C. Device identity — issue #37 (OnlyKey)
 - [ ] OnlyKey-aware handling in `keyroost-resolve`: recognize `1d50:60fc` /
       product `ONLYKEY`, label it "OnlyKey", treat serial `1000000000` as a
