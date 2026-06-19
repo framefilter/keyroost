@@ -441,3 +441,70 @@ pub fn totp_window(period: u64) -> (u64, f32) {
     let rem = period - (now % period);
     (rem, rem as f32 / period as f32)
 }
+
+// --- UI scale ("Text size") --------------------------------------------------
+//
+// egui's global zoom factor scales the whole UI uniformly — fonts AND painted
+// symbols — so one knob covers issue #42. We expose it as a "Text size" control
+// and persist the chosen factor across launches.
+
+/// Smallest allowed UI scale (80%).
+pub const ZOOM_MIN: f32 = 0.8;
+/// Largest allowed UI scale (200%).
+pub const ZOOM_MAX: f32 = 2.0;
+/// The default scale — 100%, i.e. the look existing users already see.
+pub const ZOOM_DEFAULT: f32 = 1.0;
+
+/// Clamp a zoom factor into the supported range, mapping any non-finite or
+/// non-positive value (e.g. the `0.0` a `Default`-derived field starts at, or a
+/// corrupt persisted value) back to the 100% default. Keeps `set_zoom_factor`
+/// from ever being handed something egui would choke on.
+pub fn clamp_zoom(factor: f32) -> f32 {
+    if !factor.is_finite() || factor <= 0.0 {
+        return ZOOM_DEFAULT;
+    }
+    factor.clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn default_field_value_normalizes_to_one() {
+        // A `#[derive(Default)]` f32 field starts at 0.0; that must read back as
+        // 100% so existing users see no change.
+        assert_eq!(clamp_zoom(0.0), ZOOM_DEFAULT);
+    }
+
+    #[test]
+    fn out_of_range_values_clamp() {
+        assert_eq!(clamp_zoom(0.1), ZOOM_MIN);
+        assert_eq!(clamp_zoom(5.0), ZOOM_MAX);
+        assert_eq!(clamp_zoom(-1.0), ZOOM_DEFAULT);
+    }
+
+    #[test]
+    fn non_finite_falls_back_to_default() {
+        assert_eq!(clamp_zoom(f32::NAN), ZOOM_DEFAULT);
+        assert_eq!(clamp_zoom(f32::INFINITY), ZOOM_DEFAULT);
+    }
+
+    #[test]
+    fn in_range_values_pass_through() {
+        assert_eq!(clamp_zoom(1.0), 1.0);
+        assert_eq!(clamp_zoom(1.25), 1.25);
+        assert_eq!(clamp_zoom(0.8), 0.8);
+        assert_eq!(clamp_zoom(2.0), 2.0);
+    }
+
+    #[test]
+    fn round_trips_through_string_like_storage() {
+        // Mirrors save()/load(): format then parse back.
+        for &f in &[0.8_f32, 1.0, 1.35, 2.0] {
+            let s = f.to_string();
+            let back: f32 = s.parse().unwrap();
+            assert_eq!(clamp_zoom(back), f);
+        }
+    }
+}

@@ -930,7 +930,7 @@ fn main() -> eframe::Result<()> {
             theme::install_fonts(&cc.egui_ctx);
             // Restore the persisted theme (mode + accent), defaulting to the
             // refined dark + blue accent the prototype ships with.
-            let (mode, accent_idx, colorblind) = cc
+            let (mode, accent_idx, colorblind, zoom) = cc
                 .storage
                 .map(|s| {
                     let mode = if s.get_string("mode").as_deref() == Some("light") {
@@ -944,9 +944,16 @@ fn main() -> eframe::Result<()> {
                         .unwrap_or(0)
                         .min(Palette::ACCENTS.len() - 1);
                     let colorblind = s.get_string("colorblind").as_deref() == Some("1");
-                    (mode, accent_idx, colorblind)
+                    // UI scale: stored as a plain float string; clamp on read so
+                    // a missing/corrupt value falls back to 100%.
+                    let zoom = theme::clamp_zoom(
+                        s.get_string("zoom")
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(theme::ZOOM_DEFAULT),
+                    );
+                    (mode, accent_idx, colorblind, zoom)
                 })
-                .unwrap_or((Mode::Dark, 0, false));
+                .unwrap_or((Mode::Dark, 0, false, theme::ZOOM_DEFAULT));
             Palette::new(mode, Palette::ACCENTS[accent_idx], colorblind).apply(&cc.egui_ctx, mode);
             // Watch for reader hotplug so already-plugged-in or newly-inserted
             // devices appear without a manual Refresh. The watcher only flags a
@@ -964,6 +971,7 @@ fn main() -> eframe::Result<()> {
                 mode,
                 accent_idx,
                 colorblind,
+                zoom,
                 worker: Some(Worker::spawn(cc.egui_ctx.clone())),
                 egui_ctx: Some(cc.egui_ctx.clone()),
                 devices_dirty,
@@ -1098,6 +1106,15 @@ struct App {
     /// The `(mode, accent, colorblind)` triple whose Visuals are currently
     /// applied to the egui context — re-applied on change, not per frame.
     applied_theme: Option<(Mode, usize, bool)>,
+    /// UI scale ("Text size", issue #42): egui's global zoom factor, which
+    /// scales fonts AND painted symbols uniformly. Persisted via eframe storage.
+    /// `#[derive(Default)]` starts this at `0.0`; `theme::clamp_zoom` maps that
+    /// (and any out-of-range value) back to 100%, so the default look is
+    /// unchanged for existing users until they touch the control.
+    zoom: f32,
+    /// The zoom factor currently applied to the egui context — re-applied on
+    /// change, not per frame (parallel to `applied_theme`).
+    applied_zoom: Option<f32>,
 }
 
 #[derive(Default)]
@@ -5080,6 +5097,8 @@ impl eframe::App for App {
             "colorblind",
             if self.colorblind { "1" } else { "0" }.to_string(),
         );
+        // UI scale ("Text size"): persist the clamped factor as a plain float.
+        storage.set_string("zoom", theme::clamp_zoom(self.zoom).to_string());
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -5135,6 +5154,26 @@ impl eframe::App for App {
         if self.applied_theme != Some(theme_key) {
             p.apply(ctx, self.mode);
             self.applied_theme = Some(theme_key);
+        }
+
+        // UI scale ("Text size", issue #42). Let Ctrl +/-/scroll zoom the whole
+        // UI immediately (egui then scales fonts AND painted symbols uniformly).
+        ctx.options_mut(|o| o.zoom_with_keyboard = true);
+        match self.applied_zoom {
+            // First frame: push the persisted factor into the context. (egui's
+            // own default is 1.0, so without this our stored value is ignored.)
+            None => {
+                self.zoom = theme::clamp_zoom(self.zoom);
+                ctx.set_zoom_factor(self.zoom);
+                self.applied_zoom = Some(self.zoom);
+            }
+            // Steady state: the context owns the live factor (Ctrl +/-/scroll
+            // and the slider both write to it via `set_zoom_factor`). Read it
+            // back so the slider readout and the persisted value stay in sync.
+            Some(_) => {
+                self.zoom = theme::clamp_zoom(ctx.zoom_factor());
+                self.applied_zoom = Some(self.zoom);
+            }
         }
 
         // First frame: scan for devices automatically so the user isn't staring
@@ -5370,6 +5409,13 @@ impl App {
                             self.colorblind = !self.colorblind;
                         }
                         ui.add_space(10.0);
+                        // "Text size" (issue #42): a compact UI-scale control.
+                        // The slider drives egui's global zoom factor, which
+                        // scales fonts AND painted symbols uniformly. A live "%"
+                        // readout sits to the right (rightmost in this RTL row),
+                        // with a "Reset" that appears only when off 100%.
+                        self.text_size_control(ui, p);
+                        ui.add_space(10.0);
                         for (i, c) in Palette::ACCENTS.iter().enumerate().rev() {
                             let (rect, resp) = ui
                                 .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
@@ -5396,6 +5442,71 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// "Text size" control for the top bar (issue #42): a compact slider over
+    /// egui's global zoom factor (80%–200%), with a live "%" readout and a
+    /// "Reset" that surfaces only when the scale is off 100%. Writing the slider
+    /// calls `set_zoom_factor`, so the whole UI — fonts and painted symbols —
+    /// rescales uniformly. Lives inside the top bar's right-to-left layout, so
+    /// widgets are added right-to-left: readout, slider, label, then Reset.
+    fn text_size_control(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // Work off the live context factor so keyboard/scroll zoom and the
+        // slider share one source of truth.
+        let mut factor = theme::clamp_zoom(ui.ctx().zoom_factor());
+
+        // Live percentage readout (rightmost).
+        ui.label(
+            egui::RichText::new(format!("{}%", (factor * 100.0).round() as i32))
+                .font(theme::f_sb(12.0))
+                .color(p.txt2),
+        );
+        ui.add_space(6.0);
+
+        // The slider itself. Style its track/handle to the palette so it reads
+        // as part of the bar rather than egui's default blue.
+        let style = ui.style_mut();
+        style.visuals.widgets.inactive.bg_fill = p.raised2;
+        style.visuals.widgets.hovered.bg_fill = theme::lighten(p.raised2, 0.08);
+        style.visuals.widgets.active.bg_fill = p.accent;
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.txt2);
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.txt);
+        style.spacing.slider_width = 92.0;
+        let resp = ui.add(
+            egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX).show_value(false),
+        );
+        if resp.changed() {
+            ui.ctx().set_zoom_factor(theme::clamp_zoom(factor));
+        }
+        resp.on_hover_text("Text size — scales the whole interface (Ctrl + / Ctrl − also work)");
+        ui.add_space(7.0);
+
+        // Label.
+        ui.label(
+            egui::RichText::new("Text size")
+                .font(theme::f_reg(12.0))
+                .color(p.txt3),
+        );
+
+        // "Reset" appears only when we're off the default, so the chrome stays
+        // quiet for users who never change it.
+        if (factor - theme::ZOOM_DEFAULT).abs() > f32::EPSILON {
+            ui.add_space(8.0);
+            if ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new("Reset")
+                            .font(theme::f_sb(12.0))
+                            .color(p.accent),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                ui.ctx().set_zoom_factor(theme::ZOOM_DEFAULT);
+            }
+        }
     }
 
     /// Left device bar: header · filter · rows · footer tip.
