@@ -574,13 +574,13 @@ configured (see `packaging/README.md`):
 - [ ] Native file-chooser dialogs for cert/key import — **DECIDED: adopt `rfd`**
       (enough demand to justify the platform-glue dep; fits the eframe-style
       carve-out). (M)
-- [ ] **Credential-entry modal + scroll-independent feedback** — *highest-leverage
-      GUI fix, from @My1's #31 follow-up.* The capability panes scroll, so the
-      management-key field, PIN entry, and success/error messages all fall below
-      the fold — a user can act blind. Move PIN/PUK/MGM entry into a focused modal
-      that stays visible regardless of scroll, auto-clears after each op, and
-      shows the result inline. App-wide pattern (PIV/FIDO/OpenPGP/OATH) — subsumes
-      #36 and #31's message-placement point. (M)
+- [~] **Credential-entry modal + scroll-independent feedback** — *highest-leverage
+      GUI fix, from @My1's #31 follow-up.* Built on #38's `modal_window` (FIDO
+      aesthetic), auto-clears, shows the op result IN the modal.
+      DONE (`cd61287`): **PIV Change-PIN / Change-PUK / Unblock-PIN** moved from
+      inline fields to a centered modal (buttons open it). REMAINING: the PIV
+      **management-key** flows (entangled — gates generate/import/sign/etc.), then
+      **OpenPGP + OATH** adopt the same shared chrome. FIDO already modal (#38). (M)
 - [x] **Bordered text inputs** — visible border on text fields so they don't
       blend into the dark theme — **landed via #38** (the `theme.rs` change),
       app-wide.
