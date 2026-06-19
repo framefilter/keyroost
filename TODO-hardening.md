@@ -634,13 +634,21 @@ their detailed design follows #38 landing.
       "experimental" label. Needs PIN+ hardware (Token2 may help, given the
       collaboration + their OEM edition).
 
-### G. FIDO / CTAP — issue #33 (likely a Token2 contribution)
-- [ ] CTAP 2.1 `authenticatorConfig` (toggle alwaysUv, enterprise attestation,
-      setMinPINLength) + FIDO2 GUI tab redesign.
-      **Heads-up when the PR lands:** Token2's proposed CLI names are flat
-      (`fido-always-uv`, `fido-set-min-pin`, …) — re-nest to `fido always-uv`
-      etc. to match the v0.6.0 command tree, same as the #30 integration. Their
-      "bordered text inputs" polish is split out to §B as an app-wide item.
+### G. FIDO / CTAP — issue #33 / PR #38
+- [x] CTAP 2.1 `authenticatorConfig` (`fido always-uv` / `set-min-pin` /
+      `force-pin-change` / `enterprise-attestation`) + LargeBlob (GUI) + the
+      FIDO2 tab redesign + bordered inputs — **MERGED via #38** onto v0.7.0
+      (Token2-authored; the unintentional branding was left out). CLI commands
+      are correctly nested under `fido`. Read path hardware-checked on a
+      YubiKey 5.7 (`authnrCfg`/`setMinPINLength`/`largeBlobs` all surfaced).
+- [ ] **LargeBlob CLI parity** — add a `fido large-blob` group (list / get /
+      dump + add / delete notes, with `--json`) so LargeBlob isn't the lone
+      GUI-only capability. The byte layer (`keyroost-ctap::large_blobs`) already
+      exists; this is wiring on top. Warn on writes — the array is
+      world-readable (not a secret vault). (S)
+- [ ] **Hardware-verify the config WRITE ops** — exercise `always-uv`
+      (reversible) plus the one-way ops (`set-min-pin`, `enterprise-attestation`)
+      on a key, with a `fido reset` to recover (tester key is reset-safe).
 
 ### H. Protocol confirmation
 - [ ] Confirm the Molto2 `read_info` 3-byte preamble + 2-byte separator are
