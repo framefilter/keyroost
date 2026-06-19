@@ -571,9 +571,11 @@ configured (see `packaging/README.md`):
       + transport (version-gated `delete_key` ≥5.7, `clear_certificate`) + CLI
       (`piv delete-key` / `piv delete-cert`, `--yes`-guarded). **HARDWARE-VERIFIED
       on YubiKey 5.7.4:** delete-key proven via reject-on-empty (SW 6A88) +
-      double-delete; delete-cert via status cert-present→empty. REMAINING: the
-      **GUI** delete actions (per-slot Delete cert / Delete key via the credential
-      modal, key-delete gated on 5.7 support). (L)
+      double-delete; delete-cert via status cert-present→empty. **GUI DONE**
+      (`073cc2c`): a "Delete from slot" subsection (slot selector + Delete
+      certificate / Delete key buttons) opens the credential modal with a
+      destructive warning; key-delete gated on `PivStatus.version ≥ 5.7`;
+      auto-refresh after. **OPTION B COMPLETE.** (L)
       *Minor follow-up:* CLI `piv status` is cert-based — doesn't show a
       key-without-cert; could add metadata-based key presence like the GUI. (S)
 - [ ] Native file-chooser dialogs for cert/key import — **DECIDED: adopt `rfd`**
