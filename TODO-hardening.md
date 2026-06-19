@@ -589,14 +589,16 @@ configured (see `packaging/README.md`):
 Captured so they're not lost; designs explored but not locked. Polish-first order.
 The FIDO-settings items build on the FIDO2 tab that Token2's #38 introduces, so
 their detailed design follows #38 landing.
-- [ ] **Show current `minPinLen`** in the FIDO settings/info view (it's in
-      `authenticatorGetInfo`). (S)
-- [ ] **Show security-policy state read-only without a PIN unlock** — the policy
-      state is readable un-authenticated, so display it rather than gating it
-      behind unlock. (S)
-- [ ] **Auto-lock on a post-unlock PIN error** instead of prompting "re-lock" —
-      a stale-session bad-PIN attempt wastes a retry, and the retry counter is
-      precious (0 → key needs a reset). Safety, not just polish. (S)
+- [x] **Show current `minPinLen`** — DONE (2026-06-19, `c8cda1a`): parse getInfo
+      0x0D (+ 0x0C forcePINChange), shown in `fido info`, `--json`, and the GUI
+      Settings view.
+- [x] **Show security-policy state read-only without a PIN unlock** — DONE
+      (`c8cda1a`): read-only "Security policy" summary in the pre-unlock view
+      (alwaysUv / minPinLen / forcePINChange / enterprise-attestation), controls
+      still gated behind unlock.
+- [x] **Auto-lock on a post-unlock PIN error** — DONE (`4934f6e`): broad
+      auto-lock across config + passkey + fingerprint ops on CTAP
+      0x31/0x33/0x34, protecting the retry counter. Adversarially reviewed.
 - [ ] **Extend the scroll-independent credential-entry modal to PIV/OATH/OpenPGP**
       — build on the dialogs #38 introduces rather than duplicating (see the
       modal item above). (M)
