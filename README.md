@@ -100,6 +100,66 @@ Beyond the maintainers, keyroost is grateful for community contributions:
 (This credits their contribution to the codebase; it does not change keyroost's
 independent status described above.)
 
+## Standards & protocols
+
+keyroost is built entirely from published specifications — no vendor SDKs. Every
+byte layer below is implemented in-tree against the documents named here. The
+two **vendor-specific** protocols are called out distinctly; everything else is
+an open industry standard.
+
+**FIDO2 / CTAP**
+- FIDO **CTAP 2.x** (Client to Authenticator Protocol) over CTAP-HID — device
+  info, resident-credential management, client-PIN (protocols v1 and v2), and
+  bio (fingerprint) enrollment.
+  [Spec](https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html)
+- ECDH on **NIST P-256** (FIPS 186-4) for the client-PIN/UV key agreement.
+
+**OATH (one-time passwords)**
+- **HOTP** — counter-based OTP, [RFC 4226](https://www.rfc-editor.org/rfc/rfc4226).
+- **TOTP** — time-based OTP, [RFC 6238](https://www.rfc-editor.org/rfc/rfc6238).
+- The
+  [Yubico OATH applet protocol](https://developers.yubico.com/OATH/YKOATH_Protocol.html)
+  (also implemented by Trussed devices), carried over ISO 7816-4 APDUs.
+
+**OpenPGP card**
+- [OpenPGP Card v3.4](https://gnupg.org/ftp/specs/OpenPGP-smart-card-application-3.4.pdf)
+  applet, with v4 key fingerprints per
+  [RFC 4880](https://www.rfc-editor.org/rfc/rfc4880) §12.2.
+
+**PIV**
+- **NIST SP 800-73-4** / FIPS 201 Personal Identity Verification card interface,
+  including X.509 certificate slots.
+  [Spec](https://csrc.nist.gov/pubs/sp/800/73/4/final)
+
+**Token2 Molto2 / Molto2v2 (vendor-specific)**
+- The Molto2 / Molto2v2 wire protocol, determined by observing the device and
+  its public reference tool and documented independently in
+  [`docs/PROTOCOL.md`](docs/PROTOCOL.md). It layers on:
+  - **SM4** block cipher — GB/T 32907-2016 — for seed/title encryption and the
+    per-command MAC.
+  - **SHA-1** — [RFC 3174](https://www.rfc-editor.org/rfc/rfc3174) — to derive
+    the SM4 key from the customer key.
+
+**Token2 on-device OTP (vendor-specific)**
+- The Token2 OTP-on-FIDO management protocol used by the PIN+ Series keys,
+  published as the
+  [Token2 OTP SDK Protocol](https://github.com/token2/token2-otp-cli/blob/main/docs/Token2-OTP-SDK-Protocol.md)
+  (issue [#41](https://github.com/framefilter/keyroost/issues/41)). Seed-bearing
+  commands use ECDH (NIST P-256) + AES payload encryption.
+
+**Cryptographic primitives & encodings**
+- **AES** (FIPS 197) and **HMAC** ([RFC 2104](https://www.rfc-editor.org/rfc/rfc2104))
+  — client-PIN, OTP payload encryption, and PIV management-key auth (also 3DES).
+- **RSA** with **PKCS#1** ([RFC 8017](https://www.rfc-editor.org/rfc/rfc8017)) and
+  **PKCS#8** ([RFC 5208](https://www.rfc-editor.org/rfc/rfc5208)) key
+  serialization, PEM/DER (X.509 / ASN.1 DER) — host-side OpenPGP key import.
+- **CBOR** ([RFC 8949](https://www.rfc-editor.org/rfc/rfc8949), canonical
+  encoding) — the CTAP2 message format.
+- **base32** ([RFC 4648](https://www.rfc-editor.org/rfc/rfc4648)) and the
+  **`otpauth://` URI** scheme — OTP secret encoding and 2FA import.
+- **ISO 7816-4** APDUs (with BER-TLV / simple-TLV data objects) — the common
+  framing for the OATH, OpenPGP, PIV, and Molto2 smart-card applets.
+
 ## Design principles
 
 - **Few dependencies, by design.** The protocol and codec layers are hand-written
