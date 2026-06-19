@@ -584,6 +584,11 @@ configured (see `packaging/README.md`):
       "use default management key" toggle; secrets wiped per op (Approach A,
       bulk → CLI, documented in `50032c5`). REMAINING: **OpenPGP + OATH** adopt
       the same shared chrome (cheap). FIDO already modal (#38). (M)
+- [x] **UI scale / "Text size" control (issue #42)** — DONE (`ff4597a`): egui
+      global zoom — a top-bar slider 80–200% with a live %/Reset, `Ctrl +/−/scroll`
+      keyboard zoom, persisted via eframe storage (default 100%, unchanged for
+      existing users). Scales fonts + symbols + widgets uniformly. (FUTURE:
+      broader theming/font customization — roadmap when picked up.)
 - [x] **Bordered text inputs** — visible border on text fields so they don't
       blend into the dark theme — **landed via #38** (the `theme.rs` change),
       app-wide.
