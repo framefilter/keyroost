@@ -192,6 +192,9 @@ struct OtpLoad {
     serial: Option<String>,
     touch_ok: Option<bool>,
     touch_why: Option<&'static str>,
+    /// Whether the key MODEL supports HOTP-on-touch at all (distinct from the
+    /// keyboard interface merely being disabled). `None` if config unreadable.
+    hotp_supported: Option<bool>,
     iface: Option<IfaceState>,
     button_hotp_status: Option<ButtonHotpStatus>,
 }
@@ -217,6 +220,10 @@ pub struct OtpState {
     pub touch_hotp_ok: Option<bool>,
     /// Why touch-HOTP is unavailable, for the disabled-button tooltip.
     pub touch_hotp_why: Option<&'static str>,
+    /// Whether the key MODEL supports HOTP-on-touch at all (distinct from the
+    /// keyboard interface being toggled off). Gates the "Enable HID-HOTP" item.
+    /// `None` until known.
+    pub hotp_supported: Option<bool>,
     /// Current interface enabled-states (fido, keyboard-HID, ccid), read from the
     /// device config on load. `None` until known.
     pub iface: Option<IfaceState>,
@@ -298,6 +305,10 @@ impl App {
                         keyboard: !info.hotp_keystroke_disabled(),
                         ccid: !info.ccid_disabled(),
                     });
+                    // Model-level support, separate from the interface toggle so
+                    // the UI can disable "Enable HID-HOTP" on keys that lack the
+                    // feature entirely (vs merely having the interface off).
+                    let hotp_supported = dev_info.as_ref().map(|i| i.button_hotp_supported());
                     let button_hotp_status = dev_info.as_ref().and_then(|info| {
                         // The seed bit lives in byte 1; over a short CCID stub
                         // (byte 0 only) we can't tell, so report unknown rather
@@ -332,6 +343,7 @@ impl App {
                         serial,
                         touch_ok,
                         touch_why,
+                        hotp_supported,
                         iface,
                         button_hotp_status,
                     })
@@ -348,6 +360,7 @@ impl App {
                         app.otp.serial = load.serial;
                         app.otp.touch_hotp_ok = load.touch_ok;
                         app.otp.touch_hotp_why = load.touch_why;
+                        app.otp.hotp_supported = load.hotp_supported;
                         app.otp.iface = load.iface;
                         app.otp.button_hotp_status = load.button_hotp_status;
                         // Codes read on touch are tied to the old time-window;
@@ -704,6 +717,8 @@ impl App {
                     .font(theme::f_sb(14.5))
                     .color(p.txt),
             );
+            ui.add_space(6.0);
+            self.help_dot(ui, p, "otp");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Secondary actions live in an overflow menu so the header row
                 // doesn't crowd: HID-HOTP configure, the interface toggle, and the
@@ -777,9 +792,19 @@ impl App {
                                 };
                                 after.enabled_count() < 2
                             };
-                            ui.add_enabled_ui(!would_underflow, |ui| {
+                            // Enabling the keyboard interface is pointless on a
+                            // model that doesn't have the HOTP-on-touch feature,
+                            // so block it (the interface toggle only makes sense
+                            // for keys that actually support it).
+                            let unsupported = target && self.otp.hotp_supported == Some(false);
+                            let blocked = would_underflow || unsupported;
+                            ui.add_enabled_ui(!blocked, |ui| {
                                 let r = ui.selectable_label(false, label);
-                                let r = if would_underflow {
+                                let r = if unsupported {
+                                    r.on_disabled_hover_text(
+                                        "this key model does not support HOTP-on-touch",
+                                    )
+                                } else if would_underflow {
                                     r.on_disabled_hover_text(
                                         "at least two interfaces must stay enabled",
                                     )

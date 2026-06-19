@@ -179,6 +179,14 @@ impl Palette {
         v.widgets.inactive.bg_fill = self.raised2;
         v.widgets.inactive.weak_bg_fill = self.raised2;
         v.widgets.hovered.bg_fill = self.raised2;
+        // Give text inputs a visible boundary. Without an explicit stroke the
+        // field fill (`raised`) sits only a few shades off the card behind it,
+        // so the box edge disappears and a password field looks like floating
+        // dots. A 1px border on the inactive/hovered/active states fixes that in
+        // every text field (PIN dialogs, PIV, config inputs) at once.
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, self.line);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, lighten(self.line, 0.25));
+        v.widgets.active.bg_stroke = Stroke::new(1.0, self.accent);
         v.window_rounding = Rounding::same(14.0);
         v.window_stroke = Stroke::new(1.0, self.line);
         ctx.set_visuals(v);

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings — security policy (authenticatorConfig) — keyroost</title>
+<meta name="description" content="Manage CTAP 2.1 authenticator security policy on a Token2 key: always-require-UV, minimum PIN length, force PIN change, and enterprise attestation, over the standard authenticatorConfig command.">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Settings</p>
+    <h1>Security policy</h1>
+    <p class="kr-lede">Change how a key enforces verification and PINs — always-require-UV, a minimum PIN length, a forced PIN change, and enterprise attestation — over the standard CTAP 2.1 <code>authenticatorConfig</code> command.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section">
+    <h2>What it is</h2>
+    <p>CTAP 2.1 lets a platform change a key's <strong>security policy</strong> through the
+      <code>authenticatorConfig</code> command. keyroost surfaces four of these operations in
+      the <strong>Settings</strong> sub-view of the FIDO2 tab, and as <code>keyroostctl</code>
+      commands. Each is authenticated with the device PIN at the moment it runs.</p>
+    <div class="kr-tool">
+      <span class="kr-mark mono">k</span>
+      <p>Some of these are <strong>one-way</strong>: a higher minimum PIN length can't be
+        lowered again, and enterprise attestation can't be turned off, without a full reset
+        of the key. keyroost asks for explicit confirmation before applying those.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Where to find it</h2>
+    <p>Open the <strong>FIDO2</strong> tab and unlock with your PIN. Once unlocked, choose the
+      <strong>Settings</strong> tab. Unlocking is a key-level action — it gates passkeys,
+      fingerprints, and settings alike — so it lives above the tabs rather than inside any one
+      panel. The Settings tab appears only when the key reports
+      <code>authnrCfg</code> support in its <code>getInfo</code> options.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>The operations</h2>
+    <p><strong>Always require user verification (alwaysUv).</strong> When on, every assertion
+      needs user verification (PIN or biometric), even for services that didn't ask for it.
+      This is a reversible toggle. Whether it survives a key reset is vendor-specific.</p>
+    <p><strong>Set minimum PIN length.</strong> Raises the shortest PIN the key will accept.
+      It can only be increased — never lowered without a reset — and if the current PIN is now
+      too short, the key requires a new one. An optional flag also forces a PIN change.</p>
+    <p><strong>Force PIN change on next use.</strong> Flags the key so the next platform
+      interaction must set a new PIN, without otherwise changing the minimum length. Useful
+      before handing a key to someone else.</p>
+    <p><strong>Enable enterprise attestation.</strong> Lets the key provide a vendor
+      attestation that uniquely identifies the model, for enterprise registration policies.
+      This is typically one-way. keyroost only shows this control on keys that advertise
+      support (the <code>ep</code> <code>getInfo</code> option); on keys that already have it
+      enabled, the control shows its state instead of an action.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Command line</h2>
+<pre><code>keyroostctl fido-always-uv               --pin-env KR_PIN
+keyroostctl fido-set-min-pin --length 6  --pin-env KR_PIN
+keyroostctl fido-set-min-pin --length 8 --force-change --pin-env KR_PIN
+keyroostctl fido-force-pin-change        --pin-env KR_PIN
+keyroostctl fido-enterprise-attestation  --pin-env KR_PIN</code></pre>
+    <p class="kr-muted">Each command takes the PIN via <code>--pin-env</code> (an environment
+      variable name), <code>--pin-stdin</code>, and an optional <code>--path</code> to select a
+      specific key.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Cautions</h2>
+    <p class="kr-muted"><strong>Minimum PIN length and enterprise attestation are one-way</strong>
+      — undoing them needs a full reset, which wipes every passkey and the PIN. Test the
+      reversible operations first (<code>fido-always-uv</code>, force PIN change) on a given
+      key before relying on the irreversible ones. <strong>If a command is rejected</strong>,
+      the key may not support that sub-command; keyroost reports the CTAP status with a
+      readable hint.</p>
+  </section>
+
+  <section class="kr-section kr-res-section">
+    <h2>Authoritative resources</h2>
+    <div class="kr-res">
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#authenticatorConfig"><span class="who">FIDO</span>CTAP2 authenticatorConfig</a>
+      <a href="https://fidoalliance.org/specs/fido-v2.1-ps-20210615/fido-client-to-authenticator-protocol-v2.1-ps-20210615.html#setMinPINLength"><span class="who">FIDO</span>setMinPINLength</a>
+      <a href="https://www.token2.com/"><span class="who">Token2</span>PIN+ Series</a>
+    </div>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="openpgp.html">Next: OpenPGP →</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

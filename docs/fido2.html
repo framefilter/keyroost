@@ -21,6 +21,8 @@
       <a href="otp.html">On-device OTP</a>
       <a href="fingerprint.html">Fingerprints</a>
       <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
       <a href="openpgp.html">OpenPGP</a>
       <a href="piv.html">PIV</a>
       <a href="molto2.html">Molto2</a>
@@ -108,6 +110,13 @@
         resident credentials; and <strong>reset</strong> a key. Read-only inspection needs
         no PIN.</p>
     </div>
+    <p>In the app, the <strong>FIDO2</strong> tab gates everything behind one unlock. Once
+      you enter the PIN, sub-view tabs appear: <strong>Passkeys</strong> (resident
+      credentials), <strong>Fingerprints</strong> on biometric keys
+      (<a href="fingerprint.html">see Fingerprints</a>), and <strong>Settings</strong> for
+      security policy such as always-require-UV and minimum PIN length
+      (<a href="settings.html">see Settings</a>). Locking returns to the gate and clears the
+      session for all three.</p>
 <pre><code>keyroostctl fido info
 keyroostctl fido pin-retries
 keyroostctl fido creds-list --pin-stdin   # PIN read from stdin, never argv</code></pre>

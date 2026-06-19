@@ -45,6 +45,11 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             body: "Passkeys stored directly on the key (a.k.a. discoverable credentials). They let you sign in without even typing a username. You can review and remove them here.",
             slug: "/fido2#passkeys",
         },
+        "unlock" => &Help {
+            title: "Unlocking the key",
+            body: "Enter the key's PIN to unlock it for this session. Unlocking gives access to managing passkeys, fingerprints, and security settings; it stays unlocked until you lock it again or unplug the key. The PIN never leaves the device.",
+            slug: "",
+        },
         "oath" => &Help {
             title: "Authenticator codes (OATH)",
             body: "The rolling 6-digit codes you'd normally get from an authenticator app — but stored on the key itself. They survive a lost or wiped phone and never sync to anyone's cloud.",
@@ -94,6 +99,16 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "Resetting a key",
             body: "A factory reset wipes every credential and PIN on the applet. It cannot be undone — keyroost asks you to type a confirmation and touch the key first.",
             slug: "/reset",
+        },
+        "settings" => &Help {
+            title: "Security policy",
+            body: "Change how this key enforces verification and PINs over CTAP 2.1 authenticatorConfig: always require user verification, raise the minimum PIN length, force a PIN change, or enable enterprise attestation. Some of these are one-way and can only be undone by a full reset, so keyroost confirms before applying them.",
+            slug: "/settings",
+        },
+        "large_blobs" => &Help {
+            title: "Large blob storage",
+            body: "A key-global area where relying parties store opaque, RP-encrypted data (e.g. SSH certificates). Anyone holding the key can read it, so it is not a place for plaintext secrets. keyroost shows each stored entry as hex and ASCII; you can also keep your own plaintext notes here (add, edit, delete). Writing rewrites the whole array with a fresh checksum and needs your PIN.",
+            slug: "/storage",
         },
         _ => return None,
     })

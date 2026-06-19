@@ -71,6 +71,9 @@ pub enum HidTransportError {
     },
     DeviceError(u8),
     NonceMismatch,
+    /// A cooperative cancel was requested (see [`CtapHidDevice::set_cancel_flag`])
+    /// while waiting on the device.
+    Cancelled,
     /// The hidapi I/O backend (macOS / Windows, or Linux under the
     /// `hidapi-backend` feature) reported an error opening or talking to the
     /// device.
@@ -102,6 +105,7 @@ impl std::fmt::Display for HidTransportError {
             HidTransportError::NonceMismatch => {
                 write!(f, "CTAPHID_INIT response carried the wrong nonce")
             }
+            HidTransportError::Cancelled => write!(f, "operation cancelled"),
             HidTransportError::Backend(s) => write!(f, "HID backend error: {}", s),
         }
     }
@@ -153,6 +157,10 @@ pub struct CtapHidDevice {
     io: HidIo,
     channel_id: u32,
     timeout: Duration,
+    /// Optional cooperative-cancel flag. Checked in the KEEPALIVE wait loop so a
+    /// long user-presence wait (e.g. fingerprint capture) can be aborted from
+    /// another thread without unplugging the key.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CtapHidDevice {
@@ -163,10 +171,19 @@ impl CtapHidDevice {
             io,
             channel_id: CTAPHID_BROADCAST_CID,
             timeout: Duration::from_secs(2),
+            cancel: None,
         };
         let init = dev.do_init()?;
         dev.channel_id = init.channel_id;
         Ok((dev, init))
+    }
+
+    /// Install a cooperative-cancel flag. When set to `true` from another
+    /// thread, an in-progress transaction waiting on KEEPALIVE frames returns
+    /// [`HidTransportError::Cancelled`] at the next keep-alive (≈ every 100 ms),
+    /// instead of blocking until the user acts or the device times out.
+    pub fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.cancel = Some(flag);
     }
 
     /// Linux backend: open the `/dev/hidraw*` node read/write.
@@ -330,8 +347,16 @@ impl CtapHidDevice {
             if cmd == CTAPHID_KEEPALIVE {
                 // The device is alive and working — commonly waiting for the user
                 // to touch the sensor (e.g. fingerprint enrollment or a user-
-                // presence check). Push the deadline out so the timeout bounds
-                // device *silence*, not how long the user takes to respond.
+                // presence check). This is the point to honour a cooperative
+                // cancel: a caller waiting on a touch can abort here without
+                // unplugging the key, since KEEPALIVEs arrive ≈ every 100 ms.
+                if let Some(flag) = &self.cancel {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(HidTransportError::Cancelled);
+                    }
+                }
+                // Push the deadline out so the timeout bounds device *silence*,
+                // not how long the user takes to respond.
                 deadline = Instant::now() + self.timeout;
                 continue;
             }

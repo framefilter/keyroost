@@ -1404,6 +1404,51 @@ enum FidoCmd {
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
+    /// Turn "always require user verification" (alwaysUv) on or off. This is a
+    /// toggle relative to the key's current state; run `info` to check it.
+    AlwaysUv {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Raise the minimum PIN length. The value can only be increased, never
+    /// lowered (a reset is required to lower it), and may force a PIN change.
+    SetMinPin {
+        /// New minimum PIN length (in code points). Must be >= the current one.
+        #[arg(long, value_name = "N")]
+        length: u32,
+        /// Also require the user to change the PIN on next use.
+        #[arg(long)]
+        force_change: bool,
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Force a PIN change on next use, without changing the minimum length.
+    ForcePinChange {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Enable enterprise attestation. This is typically one-way: disabling it
+    /// again requires a device reset.
+    EnterpriseAttestation {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
 }
 
 /// Subcommands for the Token2 on-device OTP applet (T2F2 / PIN+) over USB-HID
@@ -4311,6 +4356,72 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             run_fido_fingerprint_delete(path.as_deref(), &pin, &id)?;
             Ok(())
         }
+        FidoCmd::AlwaysUv {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            with_configurator(path.as_deref(), &pin, |cfg| {
+                cfg.toggle_always_uv()?;
+                println!(
+                    "Toggled \"always require user verification\". Run `fido info` to \
+                     confirm the new state."
+                );
+                Ok(())
+            })?;
+            Ok(())
+        }
+        FidoCmd::SetMinPin {
+            length,
+            force_change,
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let length = *length;
+            let force_change = *force_change;
+            with_configurator(path.as_deref(), &pin, move |cfg| {
+                cfg.set_min_pin_length(Some(length), &[], force_change)?;
+                println!(
+                    "Minimum PIN length set to {length}.{}",
+                    if force_change {
+                        " A PIN change is now required on next use."
+                    } else {
+                        ""
+                    }
+                );
+                Ok(())
+            })?;
+            Ok(())
+        }
+        FidoCmd::ForcePinChange {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            with_configurator(path.as_deref(), &pin, |cfg| {
+                cfg.force_pin_change()?;
+                println!("A PIN change is now required on next use of this key.");
+                Ok(())
+            })?;
+            Ok(())
+        }
+        FidoCmd::EnterpriseAttestation {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            with_configurator(path.as_deref(), &pin, |cfg| {
+                cfg.enable_enterprise_attestation()?;
+                println!("Enterprise attestation enabled. Disabling it again requires a reset.");
+                Ok(())
+            })?;
+            Ok(())
+        }
     }
 }
 
@@ -4742,6 +4853,38 @@ where
     )?;
     let mut bio = keyroost_ctap::bio_enroll::BioEnrollment::new(&mut dev, token, cmd_code);
     f(&mut bio)
+}
+
+/// Open the FIDO device, obtain a pinUvAuthToken with the AuthenticatorConfig
+/// permission, and run `f` with a [`Configurator`]. Mirrors
+/// [`with_bio_enrollment`] for the `authenticatorConfig` (0x0D) command family.
+fn with_configurator<F>(
+    path: Option<&std::path::Path>,
+    pin: &str,
+    f: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: for<'a> FnOnce(
+        &mut keyroost_ctap::config::Configurator<'a>,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let path = resolve_fido_path(path)?;
+    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    if !init.supports_cbor() {
+        return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
+    }
+    let info = keyroost_ctap::get_info(&mut dev)?;
+    if info.option("authnrCfg") != Some(true) {
+        return Err("this authenticator does not advertise authenticatorConfig support".into());
+    }
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
+    )?;
+    let mut cfg = keyroost_ctap::config::Configurator::new(&mut dev, token, &info)?;
+    f(&mut cfg)
 }
 
 /// How a seed/key option was supplied: literal argv value, env var name, or
