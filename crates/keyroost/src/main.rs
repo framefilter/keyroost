@@ -1115,6 +1115,14 @@ struct App {
     /// The zoom factor currently applied to the egui context — re-applied on
     /// change, not per frame (parallel to `applied_theme`).
     applied_zoom: Option<f32>,
+    /// Slider preview while the "Text size" slider is actively dragged. The
+    /// slider lives *inside* the UI it scales, so applying the zoom live during
+    /// a drag would grow/shift the slider under the cursor and run the value
+    /// away to the maximum (issue: slider runaway). Instead we stash the
+    /// in-progress value here and keep the real `set_zoom_factor` untouched
+    /// until the drag is released — see `text_size_control`. `None` means no
+    /// drag in flight, so the readout/handle track the committed factor.
+    zoom_pending: Option<f32>,
 }
 
 #[derive(Default)]
@@ -5160,19 +5168,32 @@ impl eframe::App for App {
         // UI immediately (egui then scales fonts AND painted symbols uniformly).
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
         match self.applied_zoom {
-            // First frame: push the persisted factor into the context. (egui's
-            // own default is 1.0, so without this our stored value is ignored.)
+            // First frame: push *our* persisted factor into the context. This
+            // is also the persistence-conflict fix: eframe restores egui's own
+            // memory (which includes egui's separately-persisted zoom factor)
+            // before this runs, so two sources of truth exist. We resolve it by
+            // making our "zoom" storage key authoritative — re-applying it here
+            // every launch deterministically overrides whatever egui restored,
+            // so the two can never drift (last writer is always us). We do NOT
+            // read `ctx.zoom_factor()` back on this frame: doing so previously
+            // clobbered the loaded value with a stale 1.0, which `save()` then
+            // persisted, so the chosen size reset on every reopen.
             None => {
                 self.zoom = theme::clamp_zoom(self.zoom);
                 ctx.set_zoom_factor(self.zoom);
                 self.applied_zoom = Some(self.zoom);
             }
             // Steady state: the context owns the live factor (Ctrl +/-/scroll
-            // and the slider both write to it via `set_zoom_factor`). Read it
-            // back so the slider readout and the persisted value stay in sync.
+            // and the slider's on-release commit both write it via
+            // `set_zoom_factor`). Mirror it back into `self.zoom` so the readout
+            // and the persisted value stay in sync — but never while the slider
+            // is mid-drag, since the drag stashes its preview in `zoom_pending`
+            // and has not committed to the context yet.
             Some(_) => {
-                self.zoom = theme::clamp_zoom(ctx.zoom_factor());
-                self.applied_zoom = Some(self.zoom);
+                if self.zoom_pending.is_none() {
+                    self.zoom = theme::clamp_zoom(ctx.zoom_factor());
+                    self.applied_zoom = Some(self.zoom);
+                }
             }
         }
 
@@ -5451,9 +5472,20 @@ impl App {
     /// rescales uniformly. Lives inside the top bar's right-to-left layout, so
     /// widgets are added right-to-left: readout, slider, label, then Reset.
     fn text_size_control(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        // Work off the live context factor so keyboard/scroll zoom and the
-        // slider share one source of truth.
-        let mut factor = theme::clamp_zoom(ui.ctx().zoom_factor());
+        // The slider lives inside the very UI it scales, so applying the zoom
+        // *live* during a drag grows/shifts the slider track under the cursor
+        // and runs the value away to the maximum. Fix: apply-on-release. While
+        // dragging we edit a preview (`zoom_pending`) and leave the context
+        // factor alone, so the UI stays stable; we commit `set_zoom_factor`
+        // only when the drag ends. Keyboard/scroll zoom is unaffected (it has
+        // no feedback loop) and keeps writing the context directly.
+        //
+        // The slider edits `factor`: the pending preview if a drag is in
+        // flight, otherwise the committed live factor. The readout tracks the
+        // same value so it follows the handle during the drag.
+        let mut factor = self
+            .zoom_pending
+            .unwrap_or_else(|| theme::clamp_zoom(ui.ctx().zoom_factor()));
 
         // Live percentage readout (rightmost).
         ui.label(
@@ -5475,8 +5507,18 @@ impl App {
         let resp = ui.add(
             egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX).show_value(false),
         );
-        if resp.changed() {
+        if resp.dragged() {
+            // Mid-drag: preview only, don't touch the context (avoids runaway).
+            self.zoom_pending = Some(theme::clamp_zoom(factor));
+        } else if resp.drag_stopped() {
+            // Drag released: commit the chosen size to the context once.
             ui.ctx().set_zoom_factor(theme::clamp_zoom(factor));
+            self.zoom_pending = None;
+        } else if resp.changed() {
+            // Click/keyboard committed a value without a drag (e.g. arrow keys
+            // or clicking the track): apply immediately, nothing to preview.
+            ui.ctx().set_zoom_factor(theme::clamp_zoom(factor));
+            self.zoom_pending = None;
         }
         resp.on_hover_text("Text size — scales the whole interface (Ctrl + / Ctrl − also work)");
         ui.add_space(7.0);
@@ -5505,6 +5547,7 @@ impl App {
                 .clicked()
             {
                 ui.ctx().set_zoom_factor(theme::ZOOM_DEFAULT);
+                self.zoom_pending = None;
             }
         }
     }

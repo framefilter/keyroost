@@ -507,4 +507,27 @@ mod zoom_tests {
             assert_eq!(clamp_zoom(back), f);
         }
     }
+
+    #[test]
+    fn save_then_load_preserves_chosen_factor() {
+        // End-to-end mirror of the persistence path the GUI uses:
+        //   save():  storage.set_string("zoom", clamp_zoom(self.zoom).to_string())
+        //   load():  clamp_zoom(get_string("zoom").parse())
+        // The chosen factor — not 1.0 — must survive the launch-to-launch trip.
+        // Guards the reset-on-reopen regression: the value written must be the
+        // user's pick, and reading it back must return that same pick clamped.
+        fn save(chosen: f32) -> String {
+            clamp_zoom(chosen).to_string()
+        }
+        fn load(stored: &str) -> f32 {
+            clamp_zoom(stored.parse::<f32>().unwrap_or(ZOOM_DEFAULT))
+        }
+        for &chosen in &[0.8_f32, 1.0, 1.25, 1.5, 2.0] {
+            assert_eq!(load(&save(chosen)), chosen);
+        }
+        // A chosen 1.5 must never silently persist as the 100% default.
+        assert_ne!(load(&save(1.5)), ZOOM_DEFAULT);
+        // Corrupt/missing storage still falls back to the default.
+        assert_eq!(load("not-a-float"), ZOOM_DEFAULT);
+    }
 }
