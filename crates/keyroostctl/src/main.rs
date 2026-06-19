@@ -3740,7 +3740,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let sig = session.sign(&digest_info)?;
             match out {
                 Some(path) => {
-                    std::fs::write(path, &sig)
+                    write_private_file(path, &sig)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
                     eprintln!("Wrote {} signature bytes to {}", sig.len(), path.display());
                 }
@@ -3765,7 +3765,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let plain = session.decrypt(&cryptogram)?;
             match out {
                 Some(path) => {
-                    std::fs::write(path, &plain)
+                    write_private_file(path, &plain)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
                     eprintln!(
                         "Wrote {} plaintext bytes to {}",
@@ -4225,6 +4225,30 @@ fn read_mgmt_key(
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
     let hex = read_secret(label, env, from_stdin)?;
     Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
+}
+
+/// Write `data` to `path` with owner-only permissions (0600) on Unix, so
+/// secret output (decrypted plaintext, signatures) isn't left group/world
+/// readable. Sets the mode even if the file already existed (mode passed to
+/// `OpenOptions` only applies at creation, so re-assert it after open).
+fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Re-assert 0600 in case the file pre-existed with looser perms.
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    f.write_all(data)?;
+    Ok(())
 }
 
 /// Accept a certificate as DER or PEM, returning DER bytes.
@@ -5692,6 +5716,28 @@ mod cli_tests {
     fn clap_command_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("keyroost_priv_{}", std::process::id()));
+
+        // Fresh file is created 0600.
+        write_private_file(&path, b"secret plaintext").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "fresh file should be 0600");
+
+        // Loosen perms, then re-write: the helper must tighten back to 0600.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&path, b"new secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "re-write should tighten to 0600");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
