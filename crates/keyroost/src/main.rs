@@ -8,8 +8,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod otp_pane;
+mod settings;
 mod ui;
 use otp_pane::OtpState;
+use settings::Settings;
 use ui::device::{self, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
 use ui::theme::{self, BtnKind, Mode, Palette};
 
@@ -928,32 +930,20 @@ fn main() -> eframe::Result<()> {
             // Register IBM Plex Sans + JetBrains Mono so the redesign's type
             // weights resolve. (Vendored under assets/.)
             theme::install_fonts(&cc.egui_ctx);
-            // Restore the persisted theme (mode + accent), defaulting to the
-            // refined dark + blue accent the prototype ships with.
-            let (mode, accent_idx, colorblind, zoom) = cc
-                .storage
-                .map(|s| {
-                    let mode = if s.get_string("mode").as_deref() == Some("light") {
-                        Mode::Light
-                    } else {
-                        Mode::Dark
-                    };
-                    let accent_idx = s
-                        .get_string("accent")
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(0)
-                        .min(Palette::ACCENTS.len() - 1);
-                    let colorblind = s.get_string("colorblind").as_deref() == Some("1");
-                    // UI scale: stored as a plain float string; clamp on read so
-                    // a missing/corrupt value falls back to 100%.
-                    let zoom = theme::clamp_zoom(
-                        s.get_string("zoom")
-                            .and_then(|v| v.parse::<f32>().ok())
-                            .unwrap_or(theme::ZOOM_DEFAULT),
-                    );
-                    (mode, accent_idx, colorblind, zoom)
-                })
-                .unwrap_or((Mode::Dark, 0, false, theme::ZOOM_DEFAULT));
+            // Restore the persisted UI preferences (theme mode + accent +
+            // colorblind + zoom) from our own settings.json, defaulting to the
+            // refined dark + blue accent the prototype ships with. eframe's own
+            // storage is off in this crate (no `persistence` feature), so
+            // `App::save()` never fires — `settings::Settings` carries the
+            // persistence instead. A missing/corrupt file yields defaults.
+            let saved = Settings::load();
+            let mode: Mode = saved.mode.into();
+            // Clamp the accent index against the live accent count in case the
+            // file predates an accent being removed.
+            let accent_idx = saved.accent.min(Palette::ACCENTS.len() - 1);
+            let colorblind = saved.colorblind;
+            // `Settings::load` already clamps zoom; clamp again defensively.
+            let zoom = theme::clamp_zoom(saved.zoom);
             Palette::new(mode, Palette::ACCENTS[accent_idx], colorblind).apply(&cc.egui_ctx, mode);
             // Watch for reader hotplug so already-plugged-in or newly-inserted
             // devices appear without a manual Refresh. The watcher only flags a
@@ -972,6 +962,16 @@ fn main() -> eframe::Result<()> {
                 accent_idx,
                 colorblind,
                 zoom,
+                // Seed the persistence baseline with exactly what we loaded so
+                // the first `persist_settings()` doesn't re-write an unchanged
+                // file. The sanitized values (clamped zoom / accent) are what we
+                // actually hold, so record those.
+                last_saved_settings: Some(Settings {
+                    zoom,
+                    mode: mode.into(),
+                    accent: accent_idx,
+                    colorblind,
+                }),
                 worker: Some(Worker::spawn(cc.egui_ctx.clone())),
                 egui_ctx: Some(cc.egui_ctx.clone()),
                 devices_dirty,
@@ -1107,7 +1107,7 @@ struct App {
     /// applied to the egui context — re-applied on change, not per frame.
     applied_theme: Option<(Mode, usize, bool)>,
     /// UI scale ("Text size", issue #42): egui's global zoom factor, which
-    /// scales fonts AND painted symbols uniformly. Persisted via eframe storage.
+    /// scales fonts AND painted symbols uniformly. Persisted via `settings.json`.
     /// `#[derive(Default)]` starts this at `0.0`; `theme::clamp_zoom` maps that
     /// (and any out-of-range value) back to 100%, so the default look is
     /// unchanged for existing users until they touch the control.
@@ -1123,6 +1123,11 @@ struct App {
     /// until the drag is released — see `text_size_control`. `None` means no
     /// drag in flight, so the readout/handle track the committed factor.
     zoom_pending: Option<f32>,
+    /// The last `Settings` snapshot written to `settings.json` (or loaded at
+    /// startup). `persist_settings()` compares the current UI state against
+    /// this and only writes when something actually changed, so the disk isn't
+    /// touched every frame. `None` until the first comparison.
+    last_saved_settings: Option<Settings>,
 }
 
 #[derive(Default)]
@@ -3705,6 +3710,27 @@ impl App {
         )
     }
 
+    /// Persist the current UI preferences to `settings.json` — but only when
+    /// something actually changed since the last write, so a per-change call
+    /// site can fire freely without spamming the disk. Best-effort: a write
+    /// failure is swallowed inside `Settings::save`, since a UI preference that
+    /// won't persist must never crash the app. Called at the change points
+    /// (theme toggle, accent pick, colorblind toggle, zoom commit) because
+    /// eframe's own `save()` is disabled in this crate.
+    fn persist_settings(&mut self) {
+        let current = Settings {
+            zoom: theme::clamp_zoom(self.zoom),
+            mode: self.mode.into(),
+            accent: self.accent_idx,
+            colorblind: self.colorblind,
+        };
+        if self.last_saved_settings.as_ref() == Some(&current) {
+            return;
+        }
+        current.save();
+        self.last_saved_settings = Some(current);
+    }
+
     /// The currently selected device, if the id still resolves to a present one.
     fn selected_device(&self) -> Option<&Device> {
         let id = self.selected_device.as_ref()?;
@@ -5090,24 +5116,11 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
 }
 
 impl eframe::App for App {
-    /// Persist the theme so it survives a restart.
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(
-            "mode",
-            match self.mode {
-                Mode::Dark => "dark",
-                Mode::Light => "light",
-            }
-            .to_string(),
-        );
-        storage.set_string("accent", self.accent_idx.to_string());
-        storage.set_string(
-            "colorblind",
-            if self.colorblind { "1" } else { "0" }.to_string(),
-        );
-        // UI scale ("Text size"): persist the clamped factor as a plain float.
-        storage.set_string("zoom", theme::clamp_zoom(self.zoom).to_string());
-    }
+    // Note: `eframe::App::save` is intentionally not implemented. This crate
+    // builds eframe without its `persistence` feature (to avoid pulling in
+    // three extra crates), so `save()` would never be called. UI preferences
+    // are persisted by `App::persist_settings` into `settings.json` instead —
+    // see the `settings` module.
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Clipboard hygiene: ~45s after an OTP code was copied, clear the
@@ -5193,6 +5206,12 @@ impl eframe::App for App {
                 if self.zoom_pending.is_none() {
                     self.zoom = theme::clamp_zoom(ctx.zoom_factor());
                     self.applied_zoom = Some(self.zoom);
+                    // The zoom only lands here once it's committed to the
+                    // context (slider release, Ctrl +/-/scroll, or Reset), never
+                    // mid-drag (guarded by `zoom_pending`). Persist on the
+                    // committed value; `persist_settings` no-ops when the factor
+                    // is unchanged, so this is cheap on every quiescent frame.
+                    self.persist_settings();
                 }
             }
         }
@@ -5413,6 +5432,7 @@ impl App {
                                 Mode::Dark => Mode::Light,
                                 Mode::Light => Mode::Dark,
                             };
+                            self.persist_settings();
                         }
                         ui.add_space(10.0);
                         let (erect, eresp) =
@@ -5428,6 +5448,7 @@ impl App {
                             .clicked()
                         {
                             self.colorblind = !self.colorblind;
+                            self.persist_settings();
                         }
                         ui.add_space(10.0);
                         // "Text size" (issue #42): a compact UI-scale control.
@@ -5458,6 +5479,7 @@ impl App {
                             }
                             if resp.clicked() {
                                 self.accent_idx = i;
+                                self.persist_settings();
                             }
                         }
                     });
