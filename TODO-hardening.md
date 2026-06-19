@@ -691,3 +691,15 @@ multi-agent review:
 ### Still deferred (not v0.7.0)
 - Full branch protection (require PR + green CI on `main`) — adopt when release
   cadence slows (see the Deferred section above).
+
+### Backlog — investigate (post-v0.7.0, after the planned work)
+- [ ] **"Master reset" / key decommission** — one UI + CLI action that runs
+      *every applicable* reset on a key in one go: FIDO `authenticatorReset`, PIV
+      reset, OATH applet reset, OpenPGP terminate+activate, Molto2 factory reset,
+      on-device OTP reset, and clear large-blob storage. Must be
+      **capability-aware** — each key exposes a different subset, so it detects
+      what's present and only resets those; maximally destructive → strong
+      confirmation. **Research demand FIRST:** unclear who wants it. The obvious
+      use case is decommissioning / recycling a key between users (e.g. an
+      employer reissuing a returned key) — confirm that's a real practice worth
+      the footgun before building. (Ties in the large-blob-clear item above.)
