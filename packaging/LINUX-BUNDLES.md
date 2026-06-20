@@ -42,15 +42,29 @@ bundles automatically.
    ship wrong. Also confirm the client-only `./configure` flags on the chosen
    version (flag names drift across pcsc-lite 1.9/2.x).
 
-3. **GitHub Pages (REQUIRED for the auto-update remote).** Leave Pages on its
-   current **"Deploy from a branch"** source (the branch that serves `docs/`).
-   The Flatpak job publishes the OSTree repo by **committing it into
-   `docs/flatpak/`** on that branch, so the repo appears at
-   `https://framefilter.github.io/keyroost/flatpak/` without disturbing the Learn
-   site at the repo root. **Do NOT switch Pages to the "GitHub Actions" source** —
-   `actions/deploy-pages` would make a single deployment *become* the whole site
-   and wipe the branch-served Learn pages. (This is why the workflow git-pushes
-   the tree instead of using the Pages actions.)
+3. **Auto-update repo `framefilter/keyroost-flatpak` (REQUIRED for the
+   auto-update remote).** The OSTree repo is hosted in a **dedicated** repo, NOT
+   this one: this repo's `main` requires verified-signed commits a CI bot can't
+   produce, so a separate repo sidesteps that and leaves the Learn site (served
+   from this repo's `docs/`) completely untouched. One-time:
+   - **Create** a public repo `framefilter/keyroost-flatpak` with **one initial
+     commit** (an empty `README.md` is enough — `git clone` needs a branch to
+     exist).
+   - **Enable its Pages:** in that repo, Settings → Pages → Source **"Deploy from
+     a branch"**, branch = its default, folder = **`/ (root)`**. It serves at
+     `https://framefilter.github.io/keyroost-flatpak/`.
+   - **Grant CI write access:** create a **fine-grained PAT** scoped to *only*
+     `framefilter/keyroost-flatpak` with **Contents: Read and write**, and add it
+     to **this** repo as the secret **`FLATPAK_REPO_TOKEN`**.
+   - **Place the static descriptors** in the **root** of `keyroost-flatpak`: copy
+     `packaging/flatpak/keyroost.flatpakrepo` there (as `keyroost.flatpakrepo`) and
+     the icon SVG (as `keyroost-icon.svg`), so the one-click remote URL and its
+     icon resolve. The release workflow overlays the OSTree tree alongside these on
+     each tag and does **not** delete them.
+
+   When `FLATPAK_REPO_TOKEN` is absent the OSTree-publish step **skips cleanly**:
+   the `.flatpak` bundle is still attached to the release, only the auto-update
+   remote won't refresh.
 
 4. **Flatpak repo GPG key (OPTIONAL, recommended).** To sign the OSTree repo so
    `flatpak` verifies it, add two repository secrets:
@@ -60,7 +74,8 @@ bundles automatically.
    Generate a dedicated repo-signing key (separate from any commit-signing key):
 
    ```bash
-   gpg --quick-generate-key "keyroost flatpak repo <ekpope@proton.me>" ed25519 sign never
+   # Use a non-personal UID so the published public key doesn't expose an email:
+   gpg --quick-generate-key "keyroost Flatpak Repo Signing Key" ed25519 sign never
    gpg --armor --export-secret-keys <KEYID>   # -> paste into FLATPAK_GPG_KEY
    ```
 
@@ -69,7 +84,7 @@ bundles automatically.
    pattern — no hard fail). After signing, paste the base64 public key into the
    `GPGKey=` line of `packaging/flatpak/keyroost.flatpakrepo`:
    `gpg --export <KEYID> | base64 --wrap=0`. The workflow also writes the public
-   key to `docs/flatpak/keyroost.gpg` for reference.
+   key to the root of `keyroost-flatpak` (`keyroost.gpg`) for reference.
 
 5. **App-id — DECIDED.** `io.github.framefilter.keyroost`. No action needed.
 
@@ -80,7 +95,7 @@ bundles automatically.
 ```bash
 # one-time: add the remote from the one-click descriptor
 flatpak remote-add --if-not-exists keyroost \
-    https://framefilter.github.io/keyroost/flatpak/keyroost.flatpakrepo
+    https://framefilter.github.io/keyroost-flatpak/keyroost.flatpakrepo
 flatpak install keyroost io.github.framefilter.keyroost
 # updates ride along with `flatpak update`
 ```
@@ -115,9 +130,9 @@ applets need a running **host `pcscd`** (every target talks to the host daemon).
   (never committed, never stale). Verified June 2026: the generator yields 414
   crate archives + checksums, all from `static.crates.io`.
 - **pcsc-lite sha256** is a placeholder — see setup step 2.
-- **OSTree history growth:** `docs/flatpak/` accumulates OSTree objects over
-  releases. Prune (`flatpak build-update-repo --prune`) or relocate the repo if
-  `docs/` nears GitHub Pages' soft ~1 GB guidance.
+- **OSTree history growth:** the `keyroost-flatpak` repo accumulates OSTree
+  objects over releases. Prune (`flatpak build-update-repo --prune`) periodically
+  if it nears GitHub Pages' soft ~1 GB guidance.
 - **Contact-vs-NFC** is unrelated to packaging (a PC/SC reader-mode concern, not
   a bundle concern) — do not conflate it with these targets.
 - Everything is still **unverified on real hardware** end-to-end (Molto2 + a FIDO
@@ -530,10 +545,12 @@ musl cross toolchain, then build libpcsclite there. See
 
 1. **App-id (reverse-DNS).** **DECIDED: `io.github.framefilter.keyroost`** (matches
    `framefilter.github.io/keyroost` + the GitHub org).
-2. **Where to host the Flatpak repo.** **DECIDED:** self-hosted **OSTree repo on
-   GitHub Pages** (`docs/flatpak/`, auto-update) **PLUS** a single-file
+2. **Where to host the Flatpak repo.** **DECIDED:** self-hosted **OSTree repo in a
+   dedicated repo `framefilter/keyroost-flatpak`** served by its own GitHub Pages
+   (`framefilter.github.io/keyroost-flatpak/`, auto-update) **PLUS** a single-file
    `.flatpak` bundle attached to each release (offline fallback). **NOT Flathub**;
-   not flat-manager.
+   not flat-manager. (A separate repo because this repo's `main` requires
+   verified-signed commits a CI bot can't make — see setup step 3.)
 3. **AppImage.** **DECIDED:** build the GUI AppImage and attach it to each release.
 4. **Whether/when to automate in CI.** **DECIDED:** automated in the *new*
    `.github/workflows/linux-bundles.yml` (separate from `release.yml`/`publish.yml`).
@@ -543,9 +560,10 @@ musl cross toolchain, then build libpcsclite there. See
 6. **Icon asset.** *Open (REQUIRED).* keyroost has **no icon**. Supply
    `packaging/icons/io.github.framefilter.keyroost.svg` + `-256.png`
    (see `icons/README.md`). Separate design effort.
-7. **GitHub Pages config.** *Open (REQUIRED action).* Keep the **"Deploy from a
-   branch"** source serving `docs/`; the workflow commits the OSTree repo into
-   `docs/flatpak/`. Do **not** switch to the "GitHub Actions" Pages source.
+7. **Auto-update repo + token.** *Open (REQUIRED action).* Create
+   `framefilter/keyroost-flatpak`, enable its Pages (Deploy from a branch, `/`
+   root), place the descriptors, and add the `FLATPAK_REPO_TOKEN` secret — setup
+   step 3. The main repo's Pages/Learn site is untouched.
 8. **This doc's filename.** *Open.* Keep as `packaging/LINUX-BUNDLES.md`, or
    promote to `packaging/README.md` (would need to merge with the existing
    release-fanout README)?

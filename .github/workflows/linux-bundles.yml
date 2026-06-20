@@ -254,39 +254,59 @@ jobs:
           echo "::error::release ${GITHUB_REF_NAME} never appeared; .flatpak left unattached"
           exit 1
 
-      # Publish the OSTree repo to GitHub Pages by COMMITTING it under docs/flatpak/
-      # on the Pages-serving branch.
+      # Publish the OSTree repo to a DEDICATED repo, framefilter/keyroost-flatpak,
+      # whose own GitHub Pages serves it at https://framefilter.github.io/keyroost-flatpak/.
       #
-      # Why git-push and NOT actions/deploy-pages: this repo serves Pages from a
-      # branch (docs/ at the repo root hosts the Learn site). Switching to the
-      # actions/deploy-pages mechanism would change the Pages source to "GitHub
-      # Actions" and that deployment would BECOME the entire site, wiping the
-      # branch-served Learn pages. Committing the OSTree tree into docs/flatpak/
-      # leaves the existing branch-based source — and the Learn site — untouched,
-      # and the repo simply appears at https://framefilter.github.io/keyroost/flatpak/.
+      # Why a separate repo and NOT this repo's docs/flatpak: this repo's `main`
+      # requires verified-signed commits, so a CI bot can't push to it. A dedicated
+      # repo sidesteps that, keeps the Learn site (served from this repo's docs/)
+      # completely untouched, and is the conventional way to host a Flatpak OSTree
+      # repo. Needs a cross-repo write token (the default GITHUB_TOKEN is scoped to
+      # this repo only) supplied as the FLATPAK_REPO_TOKEN secret.
       #
-      # NOTE: an OSTree repo accumulates history; prune or relocate if docs/ grows
-      # past GitHub Pages' soft ~1 GB guidance (see packaging/LINUX-BUNDLES.md).
-      - name: Publish OSTree repo to Pages (docs/flatpak/)
+      # Skips cleanly (bundle is still attached above) when the token is unset, so a
+      # release before the one-time setup doesn't fail. One-time setup — create the
+      # repo with an initial commit, enable its Pages (branch: default, / root), and
+      # add the token — is in packaging/LINUX-BUNDLES.md.
+      #
+      # NOTE: an OSTree repo accumulates history; `flatpak build-update-repo
+      # --prune` periodically (see the runbook) if it grows past Pages' ~1 GB.
+      - name: Publish OSTree repo to framefilter/keyroost-flatpak
         env:
-          GH_TOKEN: ${{ github.token }}
+          REPO_TOKEN: ${{ secrets.FLATPAK_REPO_TOKEN }}
         run: |
           set -euo pipefail
-          # The Pages-serving branch is the repo default branch (docs/ source).
-          default_branch="$(gh repo view "${GITHUB_REPOSITORY}" --json defaultBranchRef --jq .defaultBranchRef.name)"
-          tmp="$(mktemp -d)"
-          git clone --depth 1 --branch "${default_branch}" \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${tmp}/site"
-          rm -rf "${tmp}/site/docs/flatpak"
-          mkdir -p "${tmp}/site/docs"
-          cp -a out/repo "${tmp}/site/docs/flatpak"
-          cd "${tmp}/site"
-          git config user.name "keyroost release bot"
-          git config user.email "release@invalid.local"
-          git add docs/flatpak
-          if git diff --cached --quiet; then
-            echo "Flatpak repo already current on Pages"
+          if [ -z "${REPO_TOKEN:-}" ]; then
+            echo "::warning::FLATPAK_REPO_TOKEN not set — skipping the OSTree publish."
+            echo "The .flatpak bundle is still attached to the release; the auto-update"
+            echo "remote just won't refresh. See packaging/LINUX-BUNDLES.md to enable it."
             exit 0
           fi
-          git commit -m "flatpak: publish ${GITHUB_REF_NAME} OSTree repo to Pages"
-          git push origin "HEAD:${default_branch}"
+          tmp="$(mktemp -d)"
+          if ! git clone --depth 1 \
+            "https://x-access-token:${REPO_TOKEN}@github.com/framefilter/keyroost-flatpak.git" \
+            "${tmp}/repo"; then
+            echo "::error::could not clone framefilter/keyroost-flatpak — create it (with one"
+            echo "initial commit), enable its Pages, and grant FLATPAK_REPO_TOKEN write access."
+            echo "See packaging/LINUX-BUNDLES.md."
+            exit 1
+          fi
+          # Overlay the freshly built OSTree tree onto the served repo. We do NOT
+          # wipe-and-replace: the repo root also holds the static descriptors the
+          # maintainer commits once (keyroost.flatpakrepo, the icon, keyroost.gpg)
+          # and those must survive. cp overlays/overwrites the OSTree files
+          # (config/summary/objects/refs); OSTree objects are content-addressed and
+          # accumulate harmlessly — prune periodically (see packaging/LINUX-BUNDLES.md).
+          cp -a out/repo/. "${tmp}/repo/"
+          # .nojekyll so Pages serves the tree verbatim (no Jekyll processing).
+          touch "${tmp}/repo/.nojekyll"
+          cd "${tmp}/repo"
+          git config user.name "keyroost release bot"
+          git config user.email "release@invalid.local"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Flatpak OSTree repo already current"
+            exit 0
+          fi
+          git commit -m "flatpak: publish ${GITHUB_REF_NAME} OSTree repo"
+          git push origin HEAD
