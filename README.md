@@ -1,6 +1,18 @@
 # keyroost
 
-An independent, open-source Rust toolchain for managing hardware security keys —
+An independent and vendor-neutral app for managing all your hardware security keys in one place.
+
+## Linux Quick Install
+
+Don't like reading and just want to get started? Use this command to run the quick install script for Linux. Supports `brew`, `dnf`, `apt`, and `pacman`.
+
+```bash
+curl https://raw.githubusercontent.com/framefilter/keyroost/refs/heads/main/quickstart.sh | bash
+```
+
+## What it is
+
+keyroost is a Rust toolchain for managing hardware security keys —
 across vendors — over PC/SC and USB HID. It speaks FIDO2/CTAP2, OATH (TOTP/HOTP),
 and the OpenPGP and PIV card protocols, manages on-device OTP on Token2 FIDO keys,
 and also programs the Token2 Molto2 / Molto2v2 TOTP token it started life
