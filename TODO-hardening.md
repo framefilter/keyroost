@@ -689,14 +689,17 @@ their detailed design follows #38 landing.
       list/get/add/edit/delete/clear with `--json`, re-read-before-write safety,
       `--yes` + opaque-entry warnings on delete/clear, world-readable help note.
       Reviewed (write-safety + destructive guards verified). Hardware test pending.
-- [ ] **LargeBlob survives `authenticatorReset` (privacy gap).** Confirmed on a
-      YubiKey 5.7 (2026-06-19): a FIDO reset wipes credentials/PIN but **not**
-      the large-blob array — so the plaintext notes the Token2 feature lets you
-      store persist after a "reset." keyroost issues the standard reset (correct;
-      largeBlob-on-reset is vendor-specific). (a) clear-large-blob now exists in
-      the CLI (`fido large-blob clear`, `47f94b5`); REMAINING: (b) a GUI "clear
-      storage" action + (c) a note in the GUI reset confirmation that reset does
-      not wipe large-blob storage. (S)
+- [x] **LargeBlob survives `authenticatorReset` (privacy gap) — DONE.** Confirmed
+      on a YubiKey 5.7 (2026-06-19): a FIDO reset wipes sign-in records/PIN but
+      **not** the large-blob array — so the plaintext notes the Token2 feature lets
+      you store persist after a "reset." keyroost issues the standard reset (correct;
+      largeBlob-on-reset is vendor-specific). (a) clear in the CLI (`fido large-blob
+      clear`, `47f94b5`); (b) GUI "Clear all storage" action (`ffb2f1b`):
+      `clear_large_blob_storage()` writes an empty checksummed array via a
+      Large-Blob-Write token, gated on entries>0 + unlocked, two-step Danger
+      confirm; (c) note in the FIDO reset dialog (shown when the key supports
+      largeBlobs) that reset does not wipe large-blob storage. GUI eyeball + the
+      on-hardware clear (needs the user's FIDO PIN) left for the user. (S)
 - [~] **Hardware-verify the config WRITE ops** — `always-uv` (reversible)
       verified on a YubiKey 5.7 (2026-06-19). Remaining (optional, low priority,
       one-way): `set-min-pin` + `enterprise-attestation` — exercise with a
