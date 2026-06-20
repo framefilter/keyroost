@@ -18,13 +18,12 @@
 Do these once; after that every `git push origin vX.Y.Z` builds + attaches the
 bundles automatically.
 
-1. **Icon (REQUIRED).** keyroost has no icon yet. Drop two files into
-   `packaging/icons/` (filenames must match the app-id):
-   - `io.github.framefilter.keyroost.svg`
-   - `io.github.framefilter.keyroost-256.png`
-
-   See [`packaging/icons/README.md`](icons/README.md). Until they exist, **both
-   the Flatpak and AppImage builds fail at the icon-install step** — by design.
+1. **Icon — DONE.** The **dark-on-amber** `k` monogram is committed in
+   `packaging/icons/` (full hicolor tree + SVG master + 256px PNG). The alternate
+   amber-on-dark colorway is archived in `docs/app_icons/`. See
+   [`packaging/icons/README.md`](icons/README.md). (Still TODO for the auto-update
+   remote: copy the SVG into the `keyroost-flatpak` repo root as `keyroost-icon.svg`
+   — setup step 3.)
 
 2. **pcsc-lite sha256 (REQUIRED).** Pin the pcsc-lite client-lib tarball in
    `packaging/flatpak/io.github.framefilter.keyroost.yml`. The `sha256:` is a

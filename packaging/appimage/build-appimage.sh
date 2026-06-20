@@ -23,14 +23,14 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Config (TODO(maintainer): confirm app-id + icon path; they match the Flatpak
-# drafts deliberately so metadata stays consistent across targets).
+# Config (app-id + icon path match the Flatpak manifest so metadata stays
+# consistent across targets).
 # ---------------------------------------------------------------------------
 APP_ID="io.github.framefilter.keyroost"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DESKTOP_FILE="${REPO_ROOT}/packaging/flatpak/${APP_ID}.desktop"
-# TODO(maintainer): keyroost has NO icon yet — supply one (see ../icons/README.md).
-# linuxdeploy prefers a PNG; the 256px raster lives alongside the SVG.
+# Icon: the dark-on-amber 256px raster (linuxdeploy prefers a PNG); the full
+# hicolor tree + SVG master live alongside it in packaging/icons/.
 ICON_FILE="${REPO_ROOT}/packaging/icons/${APP_ID}-256.png"
 BUILD_DIR="${REPO_ROOT}/target/appimage"
 APPDIR="${BUILD_DIR}/AppDir"

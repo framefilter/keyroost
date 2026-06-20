@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 256 256">
+  <defs><linearGradient id="t" x1="0" y1="8" x2="0" y2="248" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#f6a256"></stop><stop offset="1" stop-color="#e6822a"></stop></linearGradient></defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#t)"></rect>
+  <path transform="translate(76.49 190.00) scale(0.15946 -0.15946)" d="M69 740L217 740L217 303L223 303L288 400L393 525L557 525L382 324L577 0L401 0L283 222L217 148L217 0L69 0L69 740Z" fill="#171a1f"></path>
+</svg>

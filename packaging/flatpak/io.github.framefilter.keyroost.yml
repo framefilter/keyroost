@@ -100,13 +100,11 @@ modules:
           ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
       - install -Dm0644 packaging/flatpak/io.github.framefilter.keyroost.metainfo.xml
           ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
-      # Icon: keyroost has no icon asset yet — the maintainer must drop one into
-      # packaging/icons/ before a release. See packaging/icons/README.md. Both
-      # the scalable SVG and the 256px PNG are installed.
-      - install -Dm0644 packaging/icons/io.github.framefilter.keyroost.svg
-          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
-      - install -Dm0644 packaging/icons/io.github.framefilter.keyroost-256.png
-          ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/${FLATPAK_ID}.png
+      # Icon: the dark-on-amber colorway — the full freedesktop hicolor tree
+      # (scalable SVG + 16…1024px PNGs) from packaging/icons/. The alternate
+      # amber-on-dark colorway is kept in docs/app_icons/ for reference.
+      - mkdir -p ${FLATPAK_DEST}/share/icons/hicolor
+      - cp -r packaging/icons/hicolor/* ${FLATPAK_DEST}/share/icons/hicolor/
     sources:
       # The repo tree. For a tag-based build, replace with a git/archive source
       # pinned to the release tag + commit.

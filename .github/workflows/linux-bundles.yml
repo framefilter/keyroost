@@ -25,8 +25,7 @@ name: Linux bundles (AppImage + Flatpak)
 #   * App-id = io.github.framefilter.keyroost.
 #
 # ONE-TIME MAINTAINER SETUP required before this produces working bundles:
-#   1. Drop the icon into packaging/icons/ (see packaging/icons/README.md) —
-#      both builds fail at the icon-install step until it exists. (REQUIRED)
+#   1. Icon — DONE: the dark-on-amber set is committed in packaging/icons/.
 #   2. Fill in the pcsc-lite sha256 in the Flatpak manifest (REQUIRED — flatpak
 #      refuses to build with the REPLACE_WITH_REAL_SHA256 placeholder).
 #   3. (Optional, recommended) Add repo-signing secrets FLATPAK_GPG_KEY (the
