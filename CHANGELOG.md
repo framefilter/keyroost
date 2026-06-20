@@ -10,8 +10,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **OpenPGP INTERNAL AUTHENTICATE** — `openpgp authenticate` produces a
   client/SSH authentication signature with the on-card Authentication key
   (PW1 in the "other" context). The Auth key slot is now selectable for
-  provisioning too (`openpgp generate --slot auth`, `openpgp import --slot
-  auth`), completing the third OpenPGP key.
+  provisioning too (`openpgp generate-key --slot auth`, `openpgp import-key
+  --slot auth`), completing the third OpenPGP key.
 - **PIV slot clearing** — `piv delete-cert` removes a slot's X.509 certificate
   object while leaving the private key in place (standard PIV; works on every
   card), and `piv delete-key` permanently erases a slot's private key (a Yubico
