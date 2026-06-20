@@ -581,6 +581,15 @@ configured (see `packaging/README.md`):
       gained `piv-generate/-certificate/-import/-export/-delete/-admin`); all
       applet-wide ops (PIN&PUK, retries, mgmt-key, reset) consolidated under one
       "Card administration" section (fixes the floating reset + scattered order).
+      **Round 2 (`aa67d0d`→`16cb752`, user feedback "make it look like FIDO2"):**
+      restyled to FIDO2's exact card vocabulary (full-width cards, right-pinned
+      actions, f_sb/f_reg tokens); replaced the two-column rail with a **FIDO2-style
+      slot sub-tab strip** (9A/9C/9D/9E as tabs, the layout the user actually wanted);
+      added a global **content-width cap (~920px, centered)** fixing the wide-window
+      label↔action gap across ALL panes; folded the applet admin (PIN&PUK/retries/
+      mgmt-key) into the top "PIV smart card", Reset kept as a bottom red card
+      (FIDO2-consistent). Per-slot wiring hardware-verified (ECC key in 9C → only
+      that tab shows "key, no cert · ECC P-256"). **PIV GUI COMPLETE.**
 - [x] Key/cert deletion — **Option B.** BACKEND DONE (`952c8f4`): byte layer
       (`delete_key` → `00 F6 FF <ref>`, `clear_certificate` = empty PUT DATA, KATs)
       + transport (version-gated `delete_key` ≥5.7, `clear_certificate`) + CLI
