@@ -133,7 +133,11 @@ impl CtapPcscDevice {
         let mut last = (Vec::new(), 0u8, 0u8);
         for (i, chunk) in chunks.iter().enumerate() {
             let is_last = i + 1 == chunks.len();
-            let cla = if is_last { NFCCTAP_CLA } else { NFCCTAP_CLA | CLA_CHAIN };
+            let cla = if is_last {
+                NFCCTAP_CLA
+            } else {
+                NFCCTAP_CLA | CLA_CHAIN
+            };
             let mut apdu = vec![cla, NFCCTAP_INS, 0x00, 0x00, chunk.len() as u8];
             apdu.extend_from_slice(chunk);
             apdu.push(0x00); // Le — expect a response

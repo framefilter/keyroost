@@ -34,20 +34,20 @@ enum FidoTarget {
     Pcsc(String),
 }
 
+/// The successful result of [`open_fido`]: the boxed CTAP transport, whether it
+/// speaks CTAP2 (CBOR), and the HID `InitResponse` (HID only; `None` over PC/SC).
+/// Aliased so the `open_fido` signature isn't `clippy::type_complexity`-complex.
+type OpenFido = (
+    Box<dyn keyroost_ctap::transport::CtapTransport>,
+    bool,
+    Option<InitResponse>,
+);
+
 /// Open a CTAP transport for `target`, returning the boxed transport, whether
 /// it speaks CTAP2 (CBOR), and the HID `InitResponse` when available (HID only;
 /// `None` over PC/SC, which has no INIT phase). The InitResponse carries the
 /// firmware version shown on the hero for USB keys.
-fn open_fido(
-    target: &FidoTarget,
-) -> Result<
-    (
-        Box<dyn keyroost_ctap::transport::CtapTransport>,
-        bool,
-        Option<InitResponse>,
-    ),
-    String,
-> {
+fn open_fido(target: &FidoTarget) -> Result<OpenFido, String> {
     match target {
         FidoTarget::Hid(path) => {
             let (dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
@@ -55,8 +55,8 @@ fn open_fido(
             Ok((Box::new(dev), cbor, Some(init)))
         }
         FidoTarget::Pcsc(reader) => {
-            let dev = keyroost_transport::CtapPcscDevice::open(reader)
-                .map_err(|e| e.to_string())?;
+            let dev =
+                keyroost_transport::CtapPcscDevice::open(reader).map_err(|e| e.to_string())?;
             // After a successful FIDO applet SELECT we attempt CTAP2 regardless of
             // the exact version string (keys answer U2F_V2, FIDO_2_0, FIDO_2_1,
             // sometimes with trailing bytes). A genuinely U2F-only card will make
@@ -2338,11 +2338,12 @@ impl App {
         target: &FidoTarget,
         pin: &str,
         f: impl FnOnce(
-            &mut keyroost_ctap::bio_enroll::BioEnrollment<Box<dyn keyroost_ctap::transport::CtapTransport>>,
+            &mut keyroost_ctap::bio_enroll::BioEnrollment<
+                Box<dyn keyroost_ctap::transport::CtapTransport>,
+            >,
         ) -> Result<T, SessionOpError>,
     ) -> Result<T, SessionOpError> {
-        let (mut dev, cbor, _init) =
-            open_fido(target).map_err(SessionOpError::msg)?;
+        let (mut dev, cbor, _init) = open_fido(target).map_err(SessionOpError::msg)?;
         if !cbor {
             return Err(SessionOpError::msg("device is U2F-only"));
         }
@@ -2425,8 +2426,7 @@ impl App {
         self.spawn_job("Enrolling fingerprint\u{2026}", move || {
             use keyroost_ctap::bio_enroll::sample_status_message;
             let result = (|| -> Result<Vec<keyroost_ctap::Enrollment>, SessionOpError> {
-                let (mut dev, cbor, _init) =
-                    open_fido(&target).map_err(SessionOpError::msg)?;
+                let (mut dev, cbor, _init) = open_fido(&target).map_err(SessionOpError::msg)?;
                 if !cbor {
                     return Err(SessionOpError::msg("device is U2F-only"));
                 }
@@ -2599,11 +2599,12 @@ impl App {
         target: &FidoTarget,
         pin: &str,
         f: impl FnOnce(
-            &mut keyroost_ctap::config::Configurator<Box<dyn keyroost_ctap::transport::CtapTransport>>,
+            &mut keyroost_ctap::config::Configurator<
+                Box<dyn keyroost_ctap::transport::CtapTransport>,
+            >,
         ) -> Result<T, SessionOpError>,
     ) -> Result<T, SessionOpError> {
-        let (mut dev, cbor, _init) =
-            open_fido(target).map_err(SessionOpError::msg)?;
+        let (mut dev, cbor, _init) = open_fido(target).map_err(SessionOpError::msg)?;
         if !cbor {
             return Err(SessionOpError::msg("device is U2F-only"));
         }
@@ -7466,7 +7467,7 @@ impl App {
         // RP entry written to the key since our last load is preserved and a
         // position shift can't delete the wrong entry. Matches the re-read shape
         // of `add_large_blob_note` / `edit_large_blob_note` / the CLI delete.
-        let target = array.entries[idx].clone();
+        let target_entry = array.entries[idx].clone();
 
         self.spawn_job("Updating large blobs\u{2026}", move || {
             let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
@@ -7487,7 +7488,7 @@ impl App {
                 // (by content, since `LargeBlobEntry` is `PartialEq`).
                 let live =
                     keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
-                let Some(pos) = live.entries.iter().position(|e| *e == target) else {
+                let Some(pos) = live.entries.iter().position(|e| *e == target_entry) else {
                     return Err(
                         "that entry is no longer on the key (its storage changed since it was \
                          loaded) \u{2014} nothing was deleted; reload and try again."

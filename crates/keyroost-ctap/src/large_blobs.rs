@@ -49,8 +49,8 @@ use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::{AuthenticatorInfo, CtapError};
 use crate::hid::CTAPHID_CBOR;
-use crate::transport::CtapTransport;
 use crate::pin::left16_sha256;
+use crate::transport::CtapTransport;
 
 /// CTAP command byte for `authenticatorLargeBlobs`.
 const CTAP2_LARGE_BLOBS: u8 = 0x0C;
@@ -229,7 +229,11 @@ fn dispatch(dev: &mut impl CtapTransport, params: Value) -> Result<Value, CtapEr
 }
 
 /// Read one fragment beginning at `offset`, asking for at most `count` bytes.
-fn read_fragment(dev: &mut impl CtapTransport, offset: u64, count: u64) -> Result<Vec<u8>, CtapError> {
+fn read_fragment(
+    dev: &mut impl CtapTransport,
+    offset: u64,
+    count: u64,
+) -> Result<Vec<u8>, CtapError> {
     let params = Value::Map(vec![
         (Value::UInt(KEY_GET), Value::UInt(count)),
         (Value::UInt(KEY_OFFSET), Value::UInt(offset)),

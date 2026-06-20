@@ -24,11 +24,11 @@
 use crate::cbor::{self, Value};
 use crate::cmd::{get_info, AuthenticatorInfo, CtapError};
 use crate::hid::CTAPHID_CBOR;
-use crate::transport::CtapTransport;
 use crate::pin::{
     left16_sha256, pad_pin_to_64, EphemeralKey, PinProtocol, ProtocolV1, ProtocolV2,
     PIN_PROTOCOL_V1, PIN_PROTOCOL_V2,
 };
+use crate::transport::CtapTransport;
 
 pub const CTAP2_CLIENT_PIN: u8 = 0x06;
 
@@ -206,7 +206,11 @@ pub fn set_pin(dev: &mut impl CtapTransport, new_pin: &str) -> Result<(), CtapEr
 }
 
 /// Change an existing PIN.
-pub fn change_pin(dev: &mut impl CtapTransport, old_pin: &str, new_pin: &str) -> Result<(), CtapError> {
+pub fn change_pin(
+    dev: &mut impl CtapTransport,
+    old_pin: &str,
+    new_pin: &str,
+) -> Result<(), CtapError> {
     use zeroize::Zeroize;
     validate_pin(new_pin)?;
     let chosen = negotiate_protocol(dev)?;
