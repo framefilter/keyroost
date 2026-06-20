@@ -3183,7 +3183,7 @@ impl App {
                     );
                     ui.colored_label(
                         muted,
-                        "and use \u{201c}Clear all storage\u{201d} to wipe any stored notes.",
+                        "and use \u{201c}Clear all storage\u{201d} to wipe every entry there.",
                     );
                 }
                 ui.add_space(6.0);
@@ -7385,10 +7385,12 @@ impl App {
         }
         let pin = session.pin.clone();
 
-        // Build the new array (minus the deleted entry) on the UI thread, then
-        // serialize with checksum inside the worker.
-        let mut new_entries = array.entries.clone();
-        new_entries.remove(idx);
+        // Capture the *target entry* (not its cached index). The actual removal
+        // happens against a fresh read of the live array inside the worker, so an
+        // RP entry written to the key since our last load is preserved and a
+        // position shift can't delete the wrong entry. Matches the re-read shape
+        // of `add_large_blob_note` / `edit_large_blob_note` / the CLI delete.
+        let target = array.entries[idx].clone();
 
         self.spawn_job("Updating large blobs\u{2026}", move || {
             let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
@@ -7405,8 +7407,21 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?;
 
+                // Re-read the live array and remove the matching entry from it
+                // (by content, since `LargeBlobEntry` is `PartialEq`).
+                let live =
+                    keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
+                let Some(pos) = live.entries.iter().position(|e| *e == target) else {
+                    return Err(
+                        "that entry is no longer on the key (its storage changed since it was \
+                         loaded) \u{2014} nothing was deleted; reload and try again."
+                            .into(),
+                    );
+                };
+                let mut entries = live.entries;
+                entries.remove(pos);
                 let updated = keyroost_ctap::large_blobs::LargeBlobArray {
-                    entries: new_entries,
+                    entries,
                     raw_array: Vec::new(),
                 };
                 let serialized = updated.serialize_with_checksum();
@@ -7806,8 +7821,9 @@ impl App {
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Wipe all {n} entr{} from this key? This erases every stored note, \
-                             cannot be undone, and requires your PIN.",
+                            "Wipe all {n} entr{} from this key? This erases every entry \u{2014} \
+                             including any relying-party data (e.g. SSH certificates, sign-in \
+                             records), not just keyroost notes. Cannot be undone; requires your PIN.",
                             if n == 1 { "y" } else { "ies" },
                         ))
                         .font(theme::f_reg(12.5))
@@ -8918,13 +8934,18 @@ impl App {
                 );
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized(
+                    let resp = ui.add_sized(
                         [220.0, 32.0],
                         egui::TextEdit::singleline(&mut self.oath.password_input)
                             .vertical_align(egui::Align::Center)
                             .password(true),
                     );
-                    if theme::button(ui, p, BtnKind::Primary, "Unlock").clicked() {
+                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    // Enter in the field submits too, matching the FIDO2 unlock card
+                    // and the other inline credential fields in this redesign.
+                    if submit
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
                         self.load_oath_creds();
                     }
                 });

@@ -396,11 +396,16 @@ pub fn write(
         if offset == 0 {
             entries.push((Value::UInt(KEY_LENGTH), Value::UInt(total)));
         }
+        // CTAP 2.1 §6 canonical CBOR: map keys MUST be ascending. For
+        // authenticatorLargeBlobs, pinUvAuthParam is 0x05 and pinUvAuthProtocol
+        // is 0x06 (the param has the LOWER key here, unlike other CTAP commands),
+        // so param must be pushed before protocol — else spec-strict
+        // authenticators reject the write with CTAP2_ERR_INVALID_CBOR.
+        entries.push((Value::UInt(KEY_PIN_UV_AUTH_PARAM), Value::Bytes(auth)));
         entries.push((
             Value::UInt(KEY_PIN_UV_AUTH_PROTOCOL),
             Value::UInt(token.protocol as u64),
         ));
-        entries.push((Value::UInt(KEY_PIN_UV_AUTH_PARAM), Value::Bytes(auth)));
 
         dispatch(dev, Value::Map(entries))?;
         offset = end;
