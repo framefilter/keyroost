@@ -566,7 +566,7 @@ configured (see `packaging/README.md`):
 
 ### B. PIV GUI — issue #31 items 4–6 (items 1–3 shipped in 0.6.0)
 - [ ] Slot-first PIV view: pick a slot → see/act on its contents. (M)
-- [~] Key/cert deletion — **Option B.** BACKEND DONE (`952c8f4`): byte layer
+- [x] Key/cert deletion — **Option B.** BACKEND DONE (`952c8f4`): byte layer
       (`delete_key` → `00 F6 FF <ref>`, `clear_certificate` = empty PUT DATA, KATs)
       + transport (version-gated `delete_key` ≥5.7, `clear_certificate`) + CLI
       (`piv delete-key` / `piv delete-cert`, `--yes`-guarded). **HARDWARE-VERIFIED
@@ -584,7 +584,7 @@ configured (see `packaging/README.md`):
       = Flatpak-ready, cross-platform. Async via a thread+channel off the frame
       loop. Browse… on OpenPGP/PIV cert+key imports, Save… on PIV CSR/cert export;
       text fields + drag-drop kept.
-- [~] **Credential-entry modal + scroll-independent feedback** — *highest-leverage
+- [x] **Credential-entry modal + scroll-independent feedback** — *highest-leverage
       GUI fix, from @My1's #31 follow-up.* Built on #38's `modal_window` (FIDO
       aesthetic), auto-clears, shows the op result IN the modal.
       **PIV fully done:** Change-PIN/PUK/Unblock-PIN (`cd61287`) + all the
@@ -627,9 +627,10 @@ their detailed design follows #38 landing.
 - [x] **Auto-lock on a post-unlock PIN error** — DONE (`4934f6e`): broad
       auto-lock across config + passkey + fingerprint ops on CTAP
       0x31/0x33/0x34, protecting the retry counter. Adversarially reviewed.
-- [ ] **Extend the scroll-independent credential-entry modal to PIV/OATH/OpenPGP**
-      — build on the dialogs #38 introduces rather than duplicating (see the
-      modal item above). (M)
+- [x] **Extend the scroll-independent credential-entry modal to PIV/OATH/OpenPGP**
+      — DONE; this is the same work as the §B "Credential-entry modal" item above
+      (PIV/OpenPGP/OATH all routed through `modal_window`). Kept here for the
+      #31-thread cross-reference.
 
 ### C. Device identity — issue #37 (OnlyKey)
 - [ ] OnlyKey-aware handling in `keyroost-resolve`: recognize `1d50:60fc` /
