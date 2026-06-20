@@ -6078,8 +6078,17 @@ impl App {
                     None => self.empty_state(ui, p),
                     Some(dev) if dev.kind == DeviceKind::Token => self.molto_view(ui, p, &dev),
                     Some(dev) => {
+                        // Cap the content column to a readable width and center it.
+                        // At wide window sizes a full-width card flings its label to
+                        // the far left and its action to the far right, opening a dead
+                        // gap in the middle that makes a row hard to read as one unit.
+                        // A symmetric margin that grows past the base 26px once the
+                        // pane exceeds ~920px keeps every pane (hero, tabs, cards) in
+                        // one centered, legible column instead of stretching edge to
+                        // edge — and removes the lopsided empty space on one side.
+                        let hmargin = (((ui.available_width() - 920.0) * 0.5).max(26.0)).round();
                         egui::Frame::none()
-                            .inner_margin(egui::Margin::symmetric(26.0, 16.0))
+                            .inner_margin(egui::Margin::symmetric(hmargin, 16.0))
                             .show(ui, |ui| {
                                 self.device_hero(ui, p, &dev);
                                 self.cap_tabs(ui, p, &dev);
