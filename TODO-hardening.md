@@ -564,8 +564,16 @@ configured (see `packaging/README.md`):
       archlinux.org/news posts an all-clear. Then: account + dedicated SSH key,
       first `keyroost-bin` push, secret `AUR_SSH_PRIVATE_KEY`.
 
-### B. PIV GUI — issue #31 items 4–6 (items 1–3 shipped in 0.6.0)
-- [ ] Slot-first PIV view: pick a slot → see/act on its contents. (M)
+### B. PIV GUI — issue #31 items 4–6 (items 1–3 shipped in 0.6.0) — **COMPLETE**
+- [x] Slot-first PIV view: pick a slot → see/act on its contents — **DONE**
+      (`6f5986d`, My1's literal #31 item 4). The five per-operation slot dropdowns
+      are gone; the status-card slot rows are now clickable (accent ▸ marker +
+      tinted background, painted *under* the row content via a reserved shape;
+      hover wash + pointing-hand). One `selected_slot` drives a "Selected: <slot>"
+      detail panel (state line: cert/key/empty · algo · DN) with Generate / Create
+      cert / Import / Export / Delete, all acting on that slot. `PivState` lost
+      `gen/certify/cert/export/del_slot`, gained `selected_slot` +
+      `PivSlotSel::from_slot`. GUI eyeball (row hit-testing) left for the user.
 - [x] Key/cert deletion — **Option B.** BACKEND DONE (`952c8f4`): byte layer
       (`delete_key` → `00 F6 FF <ref>`, `clear_certificate` = empty PUT DATA, KATs)
       + transport (version-gated `delete_key` ≥5.7, `clear_certificate`) + CLI
