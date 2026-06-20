@@ -45,6 +45,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 png = "0.18"
+# Native file-chooser dialogs (Browse… / Save…) for the path inputs in the
+# PIV and OpenPGP panes. The xdg-portal backend talks to the desktop portal
+# over the wire eframe already speaks — no GTK, no zbus, no ashpd pulled in.
+# The portal API is async, so dialogs run on a helper thread (see the
+# `pending_file` plumbing in main.rs) and never block the egui frame loop.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
+# Tiny pure-Rust executor used only to drive rfd's async portal dialogs to
+# completion on a throwaway helper thread. Already in the tree via rfd; declared
+# directly so `pollster::block_on` is callable.
+pollster = "0.4"
 
 # cargo-binstall support: `cargo binstall` fetches the existing attested
 # GitHub release archives (same artifacts, same SHA256SUMS/provenance)

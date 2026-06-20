@@ -1183,6 +1183,114 @@ struct App {
     /// this and only writes when something actually changed, so the disk isn't
     /// touched every frame. `None` until the first comparison.
     last_saved_settings: Option<Settings>,
+    /// In-flight native file-chooser dialogs. rfd's xdg-portal backend is
+    /// async, so each Browse…/Save… click spawns a helper thread that drives
+    /// the dialog to completion and sends the chosen path back over a channel.
+    /// `update()` drains this every frame and writes the path into the target
+    /// field, so the picker never blocks the egui frame loop. One entry per
+    /// open dialog; an entry is dropped once its result is consumed.
+    pending_files: Vec<(
+        FileTarget,
+        std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
+    )>,
+}
+
+/// Which path text field a resolved file-chooser result should populate. Keeps
+/// the dialog plumbing generic — one helper, one drain loop, no per-field
+/// duplication.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileTarget {
+    /// OpenPGP "Import RSA-2048" key file (`openpgp.import_path`).
+    OpenpgpImport,
+    /// PIV "Sign & save CSR" destination (`piv.csr_path`).
+    PivCsr,
+    /// PIV "Import certificate" source file (`piv.cert_path`).
+    PivCert,
+    /// PIV "Export certificate" destination (`piv.export_path`).
+    PivExport,
+}
+
+impl App {
+    /// Spawn a native file-chooser for `target`. `save` picks the dialog kind
+    /// (Save… vs open); `filters` is `(name, &[extensions])` rows for the
+    /// type dropdown; `default_name` seeds the filename on save dialogs.
+    ///
+    /// rfd's portal backend is async, so the dialog runs on a throwaway thread
+    /// (driven by `pollster::block_on`) and the result returns over a channel
+    /// drained in `update()` — the egui frame thread is never blocked. The
+    /// frame loop is woken via `request_repaint` once the user dismisses the
+    /// dialog so the picked path lands without waiting for the next input event.
+    fn spawn_file_dialog(
+        &mut self,
+        target: FileTarget,
+        save: bool,
+        filters: &[(&'static str, &'static [&'static str])],
+        default_name: Option<&str>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let owned_filters: Vec<(String, Vec<String>)> = filters
+            .iter()
+            .map(|(name, exts)| {
+                (
+                    (*name).to_owned(),
+                    exts.iter().map(|e| (*e).to_owned()).collect(),
+                )
+            })
+            .collect();
+        let default_name = default_name.map(str::to_owned);
+        let egui_ctx = self.egui_ctx.clone();
+        std::thread::spawn(move || {
+            let result = pollster::block_on(async move {
+                let mut dialog = rfd::AsyncFileDialog::new();
+                for (name, exts) in &owned_filters {
+                    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+                    dialog = dialog.add_filter(name, &ext_refs);
+                }
+                if let Some(name) = &default_name {
+                    dialog = dialog.set_file_name(name);
+                }
+                let handle = if save {
+                    dialog.save_file().await
+                } else {
+                    dialog.pick_file().await
+                };
+                handle.map(|h| h.path().to_path_buf())
+            });
+            let _ = tx.send(result);
+            if let Some(ctx) = egui_ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.pending_files.push((target, rx));
+    }
+
+    /// Drain any resolved file-chooser dialogs and write the picked path into
+    /// the matching text field. A `None` result (the user cancelled) leaves the
+    /// field untouched. Entries are removed once they resolve. Called once per
+    /// frame from `update()`.
+    fn drain_file_dialogs(&mut self) {
+        let mut i = 0;
+        while i < self.pending_files.len() {
+            match self.pending_files[i].1.try_recv() {
+                Ok(result) => {
+                    let (target, _) = self.pending_files.remove(i);
+                    if let Some(path) = result {
+                        let text = path.display().to_string();
+                        match target {
+                            FileTarget::OpenpgpImport => self.openpgp.import_path = text,
+                            FileTarget::PivCsr => self.piv.csr_path = text,
+                            FileTarget::PivCert => self.piv.cert_path = text,
+                            FileTarget::PivExport => self.piv.export_path = text,
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending_files.remove(i);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3618,14 +3726,27 @@ impl App {
             ) {
                 self.openpgp.import_slot = OpenPgpSlotSel::from_label(&s);
             }
-            text_field(
-                ui,
-                p,
-                "From file",
-                &mut self.openpgp.import_path,
-                "/path/to/key.pem (PKCS#1/8, PEM or DER)",
-                260.0,
-            );
+            let mut browse_import_key = false;
+            ui.horizontal(|ui| {
+                text_field(
+                    ui,
+                    p,
+                    "From file",
+                    &mut self.openpgp.import_path,
+                    "/path/to/key.pem (PKCS#1/8, PEM or DER)",
+                    260.0,
+                );
+                browse_import_key =
+                    theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+            });
+            if browse_import_key {
+                self.spawn_file_dialog(
+                    FileTarget::OpenpgpImport,
+                    false,
+                    &[("Keys", &["pem", "der", "key"]), ("All files", &["*"])],
+                    None,
+                );
+            }
             let have_path = !self.openpgp.import_path.trim().is_empty();
             ui.horizontal(|ui| {
                 if theme::button(ui, p, BtnKind::Default, "Generate & import\u{2026}").clicked() {
@@ -5384,6 +5505,8 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.drain_import();
+        // Land any path picked by a native file-chooser into its target field.
+        self.drain_file_dialogs();
         let p = self.palette();
         // Rebuilding + re-applying egui Visuals every frame is wasted work;
         // only do it when a theme knob actually changed.
@@ -9251,14 +9374,26 @@ impl App {
                         open_self_sign = true;
                     }
                 });
-                text_field(
-                    ui,
-                    p,
-                    "CSR file",
-                    &mut self.piv.csr_path,
-                    "/path/to/request.csr",
-                    240.0,
-                );
+                let mut save_csr = false;
+                ui.horizontal(|ui| {
+                    text_field(
+                        ui,
+                        p,
+                        "CSR file",
+                        &mut self.piv.csr_path,
+                        "/path/to/request.csr",
+                        240.0,
+                    );
+                    save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                });
+                if save_csr {
+                    self.spawn_file_dialog(
+                        FileTarget::PivCsr,
+                        true,
+                        &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
+                        Some("request.csr"),
+                    );
+                }
                 if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
                     open_csr = true;
                 }
@@ -9272,14 +9407,30 @@ impl App {
                 ui.horizontal(|ui| {
                     piv_slot_combo(ui, "piv-cert-slot", &mut self.piv.cert_slot);
                 });
-                text_field(
-                    ui,
-                    p,
-                    "File",
-                    &mut self.piv.cert_path,
-                    "/path/to/cert.pem",
-                    240.0,
-                );
+                let mut browse_cert = false;
+                ui.horizontal(|ui| {
+                    text_field(
+                        ui,
+                        p,
+                        "File",
+                        &mut self.piv.cert_path,
+                        "/path/to/cert.pem",
+                        240.0,
+                    );
+                    browse_cert =
+                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+                });
+                if browse_cert {
+                    self.spawn_file_dialog(
+                        FileTarget::PivCert,
+                        false,
+                        &[
+                            ("Certificates", &["pem", "der", "crt", "cer"]),
+                            ("All files", &["*"]),
+                        ],
+                        None,
+                    );
+                }
                 if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
                     open_import = true;
                 }
@@ -9289,14 +9440,30 @@ impl App {
                 ui.horizontal(|ui| {
                     piv_slot_combo(ui, "piv-export-slot", &mut self.piv.export_slot);
                 });
-                text_field(
-                    ui,
-                    p,
-                    "Destination",
-                    &mut self.piv.export_path,
-                    "/path/to/out.der",
-                    240.0,
-                );
+                let mut save_export = false;
+                ui.horizontal(|ui| {
+                    text_field(
+                        ui,
+                        p,
+                        "Destination",
+                        &mut self.piv.export_path,
+                        "/path/to/out.der",
+                        240.0,
+                    );
+                    save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                });
+                if save_export {
+                    self.spawn_file_dialog(
+                        FileTarget::PivExport,
+                        true,
+                        &[
+                            ("Certificate (DER)", &["der", "cer"]),
+                            ("Certificate (PEM)", &["pem", "crt"]),
+                            ("All files", &["*"]),
+                        ],
+                        Some("cert.der"),
+                    );
+                }
                 if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
                     go_export = true;
                 }
