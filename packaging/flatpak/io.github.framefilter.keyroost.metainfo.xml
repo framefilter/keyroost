@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DRAFT AppStream metainfo. See ../LINUX-BUNDLES.md. Validate before shipping:
+       appstreamcli validate io.github.framefilter.keyroost.metainfo.xml
+     TODO(maintainer): add real <screenshots>, confirm app-id, supply icon,
+     and set <url type="homepage"> if a custom domain is preferred. -->
+<component type="desktop-application">
+  <id>io.github.framefilter.keyroost</id>
+
+  <name>keyroost</name>
+  <summary>Program Token2 Molto2 TOTP tokens and manage FIDO2/OATH/OpenPGP/PIV security keys</summary>
+
+  <!-- Dual-licensed project; this is the project (not the metadata) license. -->
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+
+  <description>
+    <p>
+      keyroost is an independent, dual-licensed (MIT/Apache-2.0) toolchain for
+      programming the Token2 Molto2 / Molto2v2 programmable TOTP hardware token,
+      and for managing common security keys over their standard applets.
+    </p>
+    <p>It speaks to devices over PC/SC (smart-card readers) and USB HID (FIDO), and supports:</p>
+    <ul>
+      <li>Token2 Molto2 / Molto2v2 TOTP slot programming</li>
+      <li>FIDO2 / CTAP credential management and PIN handling</li>
+      <li>OATH (TOTP/HOTP) on Yubico/Trussed-style applets</li>
+      <li>OpenPGP Card v3.4 management</li>
+      <li>PIV (NIST SP 800-73-4) management: keys, certificates, PIN/PUK/management-key</li>
+    </ul>
+    <p>
+      A command-line tool (keyroostctl) and a desktop GUI (keyroost) share the
+      same protocol layers. This package provides the GUI; the CLI is also included.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.framefilter.keyroost.desktop</launchable>
+
+  <categories>
+    <category>Utility</category>
+    <category>Security</category>
+  </categories>
+
+  <url type="homepage">https://framefilter.github.io/keyroost</url>
+  <url type="bugtracker">https://github.com/framefilter/keyroost/issues</url>
+  <url type="vcs-browser">https://github.com/framefilter/keyroost</url>
+
+  <developer id="io.github.framefilter">
+    <name>framefilter</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <!-- TODO(maintainer): replace with a real screenshot URL once one exists. -->
+  <!--
+  <screenshots>
+    <screenshot type="default">
+      <image>https://framefilter.github.io/keyroost/screenshots/main.png</image>
+      <caption>The keyroost device view</caption>
+    </screenshot>
+  </screenshots>
+  -->
+
+  <releases>
+    <!-- TODO(maintainer): keep in sync with the workspace version. -->
+    <release version="0.6.0" date="2026-06-01"/>
+  </releases>
+</component>

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=keyroost
+GenericName=Security Key Manager
+Comment=Program Token2 Molto2 TOTP tokens and manage FIDO2/OATH/OpenPGP/PIV security keys
+Exec=keyroost
+Icon=io.github.framefilter.keyroost
+Terminal=false
+Categories=Utility;Security;
+Keywords=TOTP;FIDO2;OATH;OpenPGP;PIV;smartcard;security key;Token2;Molto2;YubiKey;
+StartupNotify=true
+StartupWMClass=keyroost
