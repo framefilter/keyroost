@@ -110,6 +110,9 @@ struct SecurityKeysState {
     lb_selected: Option<usize>,
     /// Pending "delete entry N" confirmation in the structured editor.
     lb_confirm_delete: Option<usize>,
+    /// Pending "clear all storage" confirmation. Set by the first click on the
+    /// destructive clear control; the confirmed click wipes every entry.
+    lb_confirm_clear: bool,
     /// Status / result line for the last large-blob load or write.
     lb_status: Option<String>,
     /// Text buffer for the "add a note" field.
@@ -3148,6 +3151,16 @@ impl App {
             })
             .unwrap_or_else(|| "this key".into());
 
+        // A reset wipes credentials + the PIN but leaves the large-blob array
+        // intact, so warn when this key supports it. Computed up front to avoid
+        // borrowing `self` inside the window closure.
+        let has_large_blobs = self
+            .security_keys
+            .info
+            .as_ref()
+            .and_then(|i| i.option("largeBlobs"))
+            == Some(true);
+
         let mut window_open = true;
         let mut arm = false;
         let mut cancel = false;
@@ -3163,6 +3176,18 @@ impl App {
                     format!("This wipes ALL credentials and the PIN on {label}."),
                 );
                 ui.label("This cannot be undone.");
+                if has_large_blobs {
+                    ui.add_space(6.0);
+                    let muted = egui::Color32::from_rgb(150, 150, 150);
+                    ui.colored_label(
+                        muted,
+                        "Note: a reset does not erase large-blob storage. Open the Storage tab",
+                    );
+                    ui.colored_label(
+                        muted,
+                        "and use \u{201c}Clear all storage\u{201d} to wipe any stored notes.",
+                    );
+                }
                 ui.add_space(6.0);
                 if waiting {
                     // Armed: the clock starts when the key is re-inserted, so we
@@ -4066,6 +4091,8 @@ impl App {
         self.security_keys.lb_editing = None;
         self.security_keys.lb_show_add = false;
         self.security_keys.lb_status = None;
+        self.security_keys.lb_confirm_delete = None;
+        self.security_keys.lb_confirm_clear = false;
         self.oath.creds.clear();
         self.oath.loaded = false;
         self.oath.locked = false;
@@ -7617,6 +7644,73 @@ impl App {
         });
     }
 
+    /// Wipe the entire large-blob array: serialize an empty array with a fresh
+    /// checksum and write it back. This is what a FIDO reset does NOT do, so it
+    /// is the only way to erase plaintext notes that survive a reset. Mirrors
+    /// `delete_large_blob_entry` but clears every entry. Needs a Large-Blob-Write
+    /// token derived from the unlocked session's PIN. Runs on the worker thread.
+    fn clear_large_blob_storage(&mut self) {
+        let Some(path) = self.selected_fido_path() else {
+            self.security_keys.lb_status = Some("No FIDO key selected.".into());
+            return;
+        };
+        if self.security_keys.large_blobs.is_none() {
+            return;
+        }
+        let Some(session) = self.security_keys.session.as_ref() else {
+            self.security_keys.lb_status =
+                Some("Unlock the key with your PIN first to modify large blobs.".into());
+            return;
+        };
+        let pin = session.pin.clone();
+
+        // Wipe all entries: an empty array, re-serialized with checksum inside
+        // the worker.
+        let new_entries = Vec::new();
+
+        self.spawn_job("Clearing large blobs\u{2026}", move || {
+            let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
+                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                if !init.supports_cbor() {
+                    return Err("device is U2F-only".into());
+                }
+                let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+                    &mut dev,
+                    &pin,
+                    &info,
+                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+                )
+                .map_err(|e| e.to_string())?;
+
+                let updated = keyroost_ctap::large_blobs::LargeBlobArray {
+                    entries: new_entries,
+                    raw_array: Vec::new(),
+                };
+                let serialized = updated.serialize_with_checksum();
+                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                    .map_err(|e| e.to_string())?;
+
+                // Read back so the view reflects the authenticator's actual state.
+                keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())
+            })();
+
+            Box::new(move |app: &mut App| match result {
+                Ok(array) => {
+                    let n = array.entries.len();
+                    app.security_keys.large_blobs = Some(array);
+                    app.security_keys.lb_selected = None;
+                    app.security_keys.lb_status =
+                        Some(format!("Storage cleared. {n} entries remaining."));
+                    app.security_keys.error = None;
+                }
+                Err(e) => {
+                    app.security_keys.lb_status = Some(format!("Clear failed: {e}"));
+                }
+            })
+        });
+    }
+
     /// Large-blob array viewer/editor (CTAP authenticatorLargeBlobs 0x0C).
     ///
     /// Reads the key-global serialized array (no PIN needed) and shows it both
@@ -7662,6 +7756,24 @@ impl App {
                 };
                 if theme::button(ui, p, BtnKind::Ghost, add_label).clicked() {
                     self.security_keys.lb_show_add = !self.security_keys.lb_show_add;
+                }
+                // "Clear all storage" wipes every entry — the only way to erase
+                // plaintext notes a FIDO reset leaves behind. Show it only when
+                // there is something to clear and the session is unlocked (the
+                // write needs a PIN-derived token, like Delete). The first click
+                // arms a confirm; the confirmed click fires below.
+                let entry_count = self
+                    .security_keys
+                    .large_blobs
+                    .as_ref()
+                    .map(|a| a.entries.len())
+                    .unwrap_or(0);
+                let unlocked = self.security_keys.session.is_some();
+                if entry_count > 0 && unlocked {
+                    ui.add_space(8.0);
+                    if theme::button(ui, p, BtnKind::Danger, "Clear all storage").clicked() {
+                        self.security_keys.lb_confirm_clear = true;
+                    }
                 }
             });
         });
@@ -7891,6 +8003,46 @@ impl App {
                         }
                         if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
                             self.security_keys.lb_confirm_delete = None;
+                        }
+                    });
+                });
+        }
+
+        // Clearing all storage is irreversible and wipes every note, so the
+        // first click only arms this confirm; the user must confirm explicitly.
+        if self.security_keys.lb_confirm_clear {
+            let n = array.entries.len();
+            ui.add_space(6.0);
+            theme::card_frame(p)
+                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Wipe all {n} entr{} from this key? This erases every stored note, \
+                             cannot be undone, and requires your PIN.",
+                            if n == 1 { "y" } else { "ies" },
+                        ))
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if theme::button(
+                            ui,
+                            p,
+                            BtnKind::Danger,
+                            &format!(
+                                "Confirm \u{2014} wipe all {n} entr{}",
+                                if n == 1 { "y" } else { "ies" }
+                            ),
+                        )
+                        .clicked()
+                        {
+                            self.security_keys.lb_confirm_clear = false;
+                            self.clear_large_blob_storage();
+                        }
+                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                            self.security_keys.lb_confirm_clear = false;
                         }
                     });
                 });
