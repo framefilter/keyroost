@@ -9572,7 +9572,10 @@ impl App {
                 |ui| {
                     ui.set_width(right_w);
                     theme::card_frame(p).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                        // Claim the full detail-column width so this card stretches
+                        // to the pane's right edge (mirrors the FIDO2 cards, which
+                        // call set_min_width as their first line).
+                        ui.set_min_width(ui.available_width());
                         // Header: which slot every action targets, + its state.
                         ui.horizontal(|ui| {
                             ui.label(
@@ -9582,45 +9585,74 @@ impl App {
                             );
                             ui.label(
                                 egui::RichText::new(sel_label)
-                                    .font(theme::f_sb(13.5))
+                                    .font(theme::f_sb(14.5))
                                     .color(p.txt),
                             );
                         });
                         ui.label(
                             egui::RichText::new(&sel_state)
-                                .font(theme::f_reg(12.0))
+                                .font(theme::f_reg(12.5))
                                 .color(p.txt2),
                         );
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
 
+                        // --- Generate key: bold label + help left, algorithm combo
+                        // and primary button pinned right (FIDO2 setting-row shape).
                         ui.horizontal(|ui| {
-                            sub(ui, "Generate key");
+                            ui.label(
+                                egui::RichText::new("Generate key")
+                                    .font(theme::f_sb(13.5))
+                                    .color(p.txt),
+                            );
+                            ui.add_space(6.0);
                             self.help_dot(ui, p, "piv-generate");
-                        });
-                        ui.horizontal(|ui| {
-                            piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
-                            if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked()
-                            {
-                                open_generate = true;
-                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}")
+                                        .clicked()
+                                    {
+                                        open_generate = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
+                                },
+                            );
                         });
                         if let Some(pem) = &self.piv.gen_pubkey_pem {
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                             ui.add(
                                 egui::TextEdit::multiline(&mut pem.as_str())
                                     .desired_rows(4)
-                                    .desired_width(360.0)
+                                    .desired_width(f32::INFINITY)
                                     .font(egui::TextStyle::Monospace),
                             );
-                            if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
-                                copy_pem = Some(pem.clone());
-                            }
+                            ui.add_space(4.0);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, p, BtnKind::Ghost, "Copy public key")
+                                        .clicked()
+                                    {
+                                        copy_pem = Some(pem.clone());
+                                    }
+                                },
+                            );
                         }
-                        ui.add_space(10.0);
+
+                        ui.add_space(12.0);
+                        // --- Certificate: subject/validity inputs, then the two
+                        // issue actions each right-aligned on their own row.
                         ui.horizontal(|ui| {
-                            sub(ui, "Certificate");
+                            ui.label(
+                                egui::RichText::new("Certificate")
+                                    .font(theme::f_sb(13.5))
+                                    .color(p.txt),
+                            );
+                            ui.add_space(6.0);
                             self.help_dot(ui, p, "piv-certificate");
                         });
+                        ui.add_space(6.0);
                         text_field(
                             ui,
                             p,
@@ -9640,13 +9672,23 @@ impl App {
                                     .range(1..=3650u32)
                                     .suffix(" days"),
                             );
-                            ui.add_space(8.0);
-                            if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
-                                .clicked()
-                            {
-                                open_self_sign = true;
-                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(
+                                        ui,
+                                        p,
+                                        BtnKind::Default,
+                                        "Self-signed \u{2192} slot",
+                                    )
+                                    .clicked()
+                                    {
+                                        open_self_sign = true;
+                                    }
+                                },
+                            );
                         });
+                        ui.add_space(6.0);
                         let mut save_csr = false;
                         ui.horizontal(|ui| {
                             text_field(
@@ -9657,8 +9699,20 @@ impl App {
                                 "/path/to/request.csr",
                                 240.0,
                             );
-                            save_csr =
-                                theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, p, BtnKind::Default, "Sign & save CSR")
+                                        .clicked()
+                                    {
+                                        open_csr = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    save_csr =
+                                        theme::button(ui, p, BtnKind::Default, "Save\u{2026}")
+                                            .clicked();
+                                },
+                            );
                         });
                         if save_csr {
                             self.spawn_file_dialog(
@@ -9668,14 +9722,19 @@ impl App {
                                 Some("request.csr"),
                             );
                         }
-                        if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
-                            open_csr = true;
-                        }
-                        ui.add_space(10.0);
+
+                        ui.add_space(12.0);
+                        // --- Import cert: file path + Browse/Import right-aligned.
                         ui.horizontal(|ui| {
-                            sub(ui, "Import cert");
+                            ui.label(
+                                egui::RichText::new("Import cert")
+                                    .font(theme::f_sb(13.5))
+                                    .color(p.txt),
+                            );
+                            ui.add_space(6.0);
                             self.help_dot(ui, p, "piv-import");
                         });
+                        ui.add_space(6.0);
                         let mut browse_cert = false;
                         ui.horizontal(|ui| {
                             text_field(
@@ -9686,8 +9745,20 @@ impl App {
                                 "/path/to/cert.pem",
                                 240.0,
                             );
-                            browse_cert =
-                                theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, p, BtnKind::Default, "Import certificate")
+                                        .clicked()
+                                    {
+                                        open_import = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    browse_cert =
+                                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
+                                            .clicked();
+                                },
+                            );
                         });
                         if browse_cert {
                             self.spawn_file_dialog(
@@ -9700,14 +9771,19 @@ impl App {
                                 None,
                             );
                         }
-                        if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
-                            open_import = true;
-                        }
-                        ui.add_space(10.0);
+
+                        ui.add_space(12.0);
+                        // --- Export cert: destination path + Save/Export right.
                         ui.horizontal(|ui| {
-                            sub(ui, "Export cert");
+                            ui.label(
+                                egui::RichText::new("Export cert")
+                                    .font(theme::f_sb(13.5))
+                                    .color(p.txt),
+                            );
+                            ui.add_space(6.0);
                             self.help_dot(ui, p, "piv-export");
                         });
+                        ui.add_space(6.0);
                         let mut save_export = false;
                         ui.horizontal(|ui| {
                             text_field(
@@ -9718,8 +9794,20 @@ impl App {
                                 "/path/to/out.der",
                                 240.0,
                             );
-                            save_export =
-                                theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, p, BtnKind::Default, "Export certificate")
+                                        .clicked()
+                                    {
+                                        go_export = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    save_export =
+                                        theme::button(ui, p, BtnKind::Default, "Save\u{2026}")
+                                            .clicked();
+                                },
+                            );
                         });
                         if save_export {
                             self.spawn_file_dialog(
@@ -9733,31 +9821,51 @@ impl App {
                                 Some("cert.der"),
                             );
                         }
-                        if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
-                            go_export = true;
-                        }
-                        ui.add_space(10.0);
+
+                        ui.add_space(12.0);
+                        // --- Delete: bold label + help left, the two delete
+                        // actions right-aligned (Delete key is Danger, gated 5.7+).
                         ui.horizontal(|ui| {
-                            sub(ui, "Delete");
-                            self.help_dot(ui, p, "piv-delete");
-                        });
-                        ui.horizontal(|ui| {
-                            if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
-                                .clicked()
-                            {
-                                open_delete_cert = true;
-                            }
+                            ui.label(
+                                egui::RichText::new("Delete")
+                                    .font(theme::f_sb(13.5))
+                                    .color(p.txt),
+                            );
                             ui.add_space(6.0);
-                            if can_delete_key {
-                                if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}")
+                            self.help_dot(ui, p, "piv-delete");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if can_delete_key {
+                                        if theme::button(
+                                            ui,
+                                            p,
+                                            BtnKind::Danger,
+                                            "Delete key\u{2026}",
+                                        )
+                                        .clicked()
+                                        {
+                                            open_delete_key = true;
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                    if theme::button(
+                                        ui,
+                                        p,
+                                        BtnKind::Default,
+                                        "Delete certificate\u{2026}",
+                                    )
                                     .clicked()
-                                {
-                                    open_delete_key = true;
-                                }
-                            } else {
-                                note(ui, "key deletion needs YubiKey 5.7+");
-                            }
+                                    {
+                                        open_delete_cert = true;
+                                    }
+                                },
+                            );
                         });
+                        if !can_delete_key {
+                            ui.add_space(4.0);
+                            note(ui, "Key deletion needs YubiKey 5.7+.");
+                        }
                     });
                 },
             );
@@ -9777,84 +9885,124 @@ impl App {
         .id_salt("piv-admin")
         .show(ui, |ui| {
             theme::card_frame(p).show(ui, |ui| {
-                // PIN & PUK
+                // Full-width like the FIDO2 Security-policy card so the setting
+                // rows pin their actions to the pane's right edge.
+                ui.set_min_width(ui.available_width());
+
+                // PIN & PUK: bold label + help left, the three actions right.
                 ui.horizontal(|ui| {
-                    sub(ui, "PIN & PUK");
+                    ui.label(
+                        egui::RichText::new("PIN & PUK")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
                     self.help_dot(ui, p, "pin");
-                });
-                ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
-                        open_change_pin = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
-                        open_change_puk = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
-                        open_unblock = true;
-                    }
-                });
-
-                // Retry counts
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    sub(ui, "Retry counts");
-                    self.help_dot(ui, p, "piv-admin");
-                });
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("PIN tries")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
-                    );
-                    ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("PUK tries")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
-                    );
-                    ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
-                    ui.add_space(8.0);
-                    if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}").clicked()
-                    {
-                        open_set_retries = true;
-                    }
-                });
-                // Management key
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    sub(ui, "Management key");
-                    self.help_dot(ui, p, "piv-admin");
-                });
-                ui.horizontal(|ui| {
-                    piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
-                    if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
-                        .clicked()
-                    {
-                        open_change_mgmt = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
+                            open_unblock = true;
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
+                            open_change_puk = true;
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
+                            open_change_pin = true;
+                        }
+                    });
                 });
 
-                // Reset applet — red, inline in this section (no longer floating
-                // right in dead space).
+                // Retry counts: label + help left, the tries DragValues and the
+                // apply button right-aligned.
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    sub(ui, "Reset applet");
-                    self.help_dot(ui, p, "reset");
+                    ui.label(
+                        egui::RichText::new("Retry counts")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}")
+                            .clicked()
+                        {
+                            open_set_retries = true;
+                        }
+                        ui.add_space(8.0);
+                        ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
+                        ui.label(
+                            egui::RichText::new("PUK tries")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
+                        ui.label(
+                            egui::RichText::new("PIN tries")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                    });
                 });
+
+                // Management key: label + help left, algorithm combo and change
+                // button right-aligned.
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
-                        arm_reset = true;
-                    }
+                    ui.label(
+                        egui::RichText::new("Management key")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
+                            .clicked()
+                        {
+                            open_change_mgmt = true;
+                        }
+                        ui.add_space(8.0);
+                        piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
+                    });
                 });
-                note(
-                    ui,
-                    "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
-                     the PIN and PUK are already blocked.",
-                );
             });
+
+            // Reset applet — its own destructive card with a red stroke, full
+            // width, description left + red button right (mirrors the FIDO2
+            // "Reset this key" card exactly).
+            ui.add_space(10.0);
+            theme::card_frame(p)
+                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Reset applet")
+                                .font(theme::f_sb(14.5))
+                                .color(p.err),
+                        );
+                        ui.add_space(6.0);
+                        self.help_dot(ui, p, "reset");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}")
+                                .clicked()
+                            {
+                                arm_reset = true;
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
+                             the PIN and PUK are already blocked.",
+                        )
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                    );
+                });
         });
 
         // Apply collected intents now that the card borrows have ended.
