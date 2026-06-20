@@ -9324,87 +9324,68 @@ impl App {
             ui.add_space(6.0);
         }
 
-        // --- Status ---
-        let slot_keys = &self.piv.slot_keys;
+        // --- Status (one compact line) ---
+        // Collapse the former three `kv` rows (version / serial / PIN retries)
+        // into a single dotted line so the two columns below get the vertical
+        // room. The "Refresh" button stays in the title row above.
         if let Some(st) = &self.piv.status {
-            theme::card_frame(p).show(ui, |ui| {
-                kv(
-                    ui,
-                    "Applet version",
-                    &st.version
-                        .map_or("\u{2014}".to_string(), |(a, b, c)| format!("{a}.{b}.{c}")),
-                );
-                kv(
-                    ui,
-                    "Serial",
-                    &st.serial.map_or("\u{2014}".to_string(), |s| s.to_string()),
-                );
-                kv(
-                    ui,
-                    "PIN retries",
-                    &st.pin_retries
-                        .map_or("\u{2014}".to_string(), |n| n.to_string()),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Slots")
-                        .font(theme::f_sb(12.5))
-                        .color(p.txt3),
-                );
-                ui.add_space(2.0);
-                // One clickable row per slot (issue #31, slot-first): name, a
-                // state pill (cert / key only / empty), and the key algorithm
-                // when GET METADATA reports it. Clicking a row sets the active
-                // slot that every action below targets; the selected row gets a
-                // leading marker and a tinted background. `slot_keys` and
-                // `st.slots` are both in canonical slot order, so the algorithm
-                // is looked up by matching the slot.
-                for slot in &st.slots {
-                    let entry = slot_keys.iter().find(|(s, _, _)| *s == slot.slot);
-                    let alg = entry.and_then(|(_, a, _)| *a);
-                    let subject = entry.and_then(|(_, _, d)| d.as_deref());
-                    let (state, tint) = if slot.cert_present {
-                        ("cert", p.txt2)
-                    } else if alg.is_some() {
-                        ("key, no cert", p.txt2)
-                    } else {
-                        ("empty", p.txt3)
-                    };
-                    let sel = PivSlotSel::from_slot(slot.slot);
-                    let is_sel = sel == selected;
-                    // The whole row (name + pills + any DN) is one click target.
-                    // Reserve a background shape slot first, then render the row
-                    // inside a group so its bounding rect covers every line; we
-                    // fill that reserved slot behind the content afterwards so
-                    // the selected tint sits *under* the text, not over it.
-                    let bg_idx = ui.painter().add(egui::Shape::Noop);
-                    let resp = ui
-                        .scope(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 5.0;
-                                ui.label(
-                                    egui::RichText::new(if is_sel {
-                                        "\u{25B8}"
-                                    } else {
-                                        "\u{2009}"
-                                    })
-                                    .font(theme::f_sb(12.5))
-                                    .color(p.accent),
-                                );
-                                ui.label(
-                                    egui::RichText::new(slot.slot.label())
-                                        .font(theme::f_reg(12.5))
-                                        .color(if is_sel { p.txt } else { p.txt2 }),
-                                );
-                                theme::pill(ui, state, tint, p.raised2);
-                                if let Some(a) = alg {
-                                    theme::pill(ui, a.label(), p.txt2, p.raised2);
-                                }
-                            });
-                            // Subject DN under the row when a certificate carried
-                            // one. Truncate hard so a long DN can't blow out the
-                            // card.
-                            if let Some(dn) = subject {
+            let ver = st
+                .version
+                .map_or("\u{2014}".to_string(), |(a, b, c)| format!("{a}.{b}.{c}"));
+            let serial = st.serial.map_or("\u{2014}".to_string(), |s| s.to_string());
+            let retries = st
+                .pin_retries
+                .map_or("\u{2014}".to_string(), |n| n.to_string());
+            ui.label(
+                egui::RichText::new(format!(
+                    "Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
+                ))
+                .font(theme::f_reg(12.5))
+                .color(p.txt2),
+            );
+            ui.add_space(10.0);
+        } else if self.piv.error.is_none() {
+            ui.label(
+                egui::RichText::new("Reading PIV status\u{2026}")
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt3),
+            );
+            ui.add_space(10.0);
+        }
+
+        // Precompute the slot rows into owned data so the left column doesn't
+        // borrow `self.piv` while the right column needs `&mut self` (for the
+        // action fields and `help_dot`). `slot_keys` and `st.slots` are both in
+        // canonical slot order; the algorithm/subject is looked up by slot.
+        struct SlotRow {
+            sel: PivSlotSel,
+            label: &'static str,
+            state: &'static str,
+            empty: bool,
+            alg: Option<&'static str>,
+            dn_short: Option<String>,
+            dn_full: Option<String>,
+        }
+        let slot_rows: Vec<SlotRow> = self
+            .piv
+            .status
+            .as_ref()
+            .map(|st| {
+                st.slots
+                    .iter()
+                    .map(|slot| {
+                        let entry = self.piv.slot_keys.iter().find(|(s, _, _)| *s == slot.slot);
+                        let alg = entry.and_then(|(_, a, _)| *a);
+                        let subject = entry.and_then(|(_, _, d)| d.as_deref());
+                        let (state, empty) = if slot.cert_present {
+                            ("cert", false)
+                        } else if alg.is_some() {
+                            ("key, no cert", false)
+                        } else {
+                            ("empty", true)
+                        };
+                        let (dn_short, dn_full) = match subject {
+                            Some(dn) => {
                                 let shown = if dn.chars().count() > 64 {
                                     let mut s: String = dn.chars().take(63).collect();
                                     s.push('\u{2026}');
@@ -9412,98 +9393,25 @@ impl App {
                                 } else {
                                     dn.to_string()
                                 };
-                                ui.horizontal(|ui| {
-                                    ui.add_space(18.0);
-                                    ui.label(
-                                        egui::RichText::new(shown)
-                                            .font(theme::f_reg(11.5))
-                                            .color(p.txt3),
-                                    )
-                                    .on_hover_text(dn);
-                                });
+                                (Some(shown), Some(dn.to_string()))
                             }
-                        })
-                        .response
-                        .interact(egui::Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    // Fill the reserved background slot behind the row content
-                    // with a selected-tint (active) or a faint hover wash.
-                    let bg = if is_sel {
-                        theme::tint(p.accent, 26)
-                    } else if resp.hovered() {
-                        theme::tint(p.txt2, 14)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-                    if bg != egui::Color32::TRANSPARENT {
-                        ui.painter().set(
-                            bg_idx,
-                            egui::epaint::RectShape::filled(
-                                resp.rect.expand2(egui::vec2(4.0, 2.0)),
-                                4.0,
-                                bg,
-                            ),
-                        );
-                    }
-                    if resp.clicked() {
-                        clicked_slot = Some(sel);
-                    }
-                }
-            });
-        } else if self.piv.error.is_none() {
-            ui.label(
-                egui::RichText::new("Reading PIV status\u{2026}")
-                    .font(theme::f_reg(13.0))
-                    .color(p.txt3),
-            );
-        }
-        ui.add_space(10.0);
+                            None => (None, None),
+                        };
+                        SlotRow {
+                            sel: PivSlotSel::from_slot(slot.slot),
+                            label: slot.slot.label(),
+                            state,
+                            empty,
+                            alg: alg.map(|a| a.label()),
+                            dn_short,
+                            dn_full,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        // The management key that authorizes key-gen / cert-import / retries /
-        // rotation is no longer entered in a persistent card here — each gated
-        // operation collects it (and any PIN) in its own focused modal, with a
-        // "Use default management key" toggle for the common case. Only the
-        // non-secret parameters (slot, algorithm, file, subject, …) stay inline.
-
-        // --- PIN & PUK ---
-        egui::CollapsingHeader::new(
-            egui::RichText::new("PIN & PUK")
-                .font(theme::f_sb(13.5))
-                .color(p.txt),
-        )
-        .id_salt("piv-pin-puk")
-        .show(ui, |ui| {
-            theme::card_frame(p).show(ui, |ui| {
-                // The PIN/PUK secret entry lives in a centered modal now, so the
-                // fields and their result stay on-screen instead of scrolling off
-                // (issue #31). These buttons just open the corresponding flow.
-                note(
-                    ui,
-                    "Change the PIN, change the PUK, or recover a blocked PIN \
-                     with the PUK \u{2014} each opens a focused dialog.",
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
-                        open_change_pin = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
-                        open_change_puk = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
-                        open_unblock = true;
-                    }
-                });
-            });
-        });
-        ui.add_space(6.0);
-
-        // --- Keys & certificates (slot-first: act on the selected slot) ---
-        // Precompute the selected slot's display data so the detail panel can
-        // show its state without re-borrowing `self.piv.status` inside the
-        // closure that also needs `&mut self.piv` for the action fields.
+        // --- Selected-slot display data (for the detail column header) ---
         let sel_label = selected.label();
         let sel_state: String = {
             let sel_slot = selected.to_slot();
@@ -9548,235 +9456,352 @@ impl App {
             self.piv.status.as_ref().and_then(|s| s.version),
             Some(v) if v >= (5, 7, 0)
         );
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Keys & certificates")
-                .font(theme::f_sb(13.5))
-                .color(p.txt),
-        )
-        .id_salt("piv-keys")
-        .default_open(true)
-        .show(ui, |ui| {
-            theme::card_frame(p).show(ui, |ui| {
-                // Detail panel header: which slot every action below targets.
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Selected:")
-                            .font(theme::f_reg(12.5))
-                            .color(p.txt3),
-                    );
-                    ui.label(
-                        egui::RichText::new(sel_label)
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                });
-                note(
-                    ui,
-                    "Pick a slot in the list above; every action here acts on it.",
-                );
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("State")
-                            .font(theme::f_reg(12.5))
-                            .color(p.txt2),
-                    );
-                    ui.label(
-                        egui::RichText::new(&sel_state)
-                            .font(theme::f_reg(12.5))
-                            .color(p.txt2),
-                    );
-                });
-                ui.add_space(8.0);
-
-                sub(ui, "Generate key pair");
-                note(
-                    ui,
-                    "Creates a fresh key in the slot (OVERWRITES it) and shows its \
-                     public key. The management key is entered in the dialog.",
-                );
-                ui.horizontal(|ui| {
-                    piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
-                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
-                        open_generate = true;
-                    }
-                });
-                if let Some(pem) = &self.piv.gen_pubkey_pem {
-                    ui.add_space(4.0);
-                    ui.add(
-                        egui::TextEdit::multiline(&mut pem.as_str())
-                            .desired_rows(4)
-                            .desired_width(360.0)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
-                        copy_pem = Some(pem.clone());
-                    }
-                }
-                ui.add_space(10.0);
-                sub(ui, "Create certificate");
-                note(
-                    ui,
-                    "Signed on the card with the slot's key (generate one above \
-                     first). \u{201c}Self-signed\u{201d} stores the certificate in \
-                     the slot. \u{201c}Save CSR\u{201d} writes a request file to \
-                     hand to a certificate authority. The PIN (and, for the \
-                     self-signed import, the management key) is entered in the \
-                     dialog.",
-                );
-                text_field(
-                    ui,
-                    p,
-                    "Name",
-                    &mut self.piv.cert_subject,
-                    "e.g. Alice — or full CN=Alice,O=Example,C=US",
-                    300.0,
-                );
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Valid for")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut self.piv.cert_days)
-                            .range(1..=3650u32)
-                            .suffix(" days"),
-                    );
-                    ui.add_space(8.0);
-                    if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
-                    {
-                        open_self_sign = true;
-                    }
-                });
-                let mut save_csr = false;
-                ui.horizontal(|ui| {
-                    text_field(
-                        ui,
-                        p,
-                        "CSR file",
-                        &mut self.piv.csr_path,
-                        "/path/to/request.csr",
-                        240.0,
-                    );
-                    save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
-                });
-                if save_csr {
-                    self.spawn_file_dialog(
-                        FileTarget::PivCsr,
-                        true,
-                        &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
-                        Some("request.csr"),
-                    );
-                }
-                if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
-                    open_csr = true;
-                }
-                ui.add_space(10.0);
-                sub(ui, "Import certificate");
-                note(
-                    ui,
-                    "PEM or DER X.509 file. The management key is entered in the \
-                     dialog.",
-                );
-                let mut browse_cert = false;
-                ui.horizontal(|ui| {
-                    text_field(
-                        ui,
-                        p,
-                        "File",
-                        &mut self.piv.cert_path,
-                        "/path/to/cert.pem",
-                        240.0,
-                    );
-                    browse_cert =
-                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
-                });
-                if browse_cert {
-                    self.spawn_file_dialog(
-                        FileTarget::PivCert,
-                        false,
-                        &[
-                            ("Certificates", &["pem", "der", "crt", "cer"]),
-                            ("All files", &["*"]),
-                        ],
-                        None,
-                    );
-                }
-                if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
-                    open_import = true;
-                }
-                ui.add_space(10.0);
-                sub(ui, "Export certificate");
-                note(ui, "Writes the slot's certificate as DER. No PIN needed.");
-                let mut save_export = false;
-                ui.horizontal(|ui| {
-                    text_field(
-                        ui,
-                        p,
-                        "Destination",
-                        &mut self.piv.export_path,
-                        "/path/to/out.der",
-                        240.0,
-                    );
-                    save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
-                });
-                if save_export {
-                    self.spawn_file_dialog(
-                        FileTarget::PivExport,
-                        true,
-                        &[
-                            ("Certificate (DER)", &["der", "cer"]),
-                            ("Certificate (PEM)", &["pem", "crt"]),
-                            ("All files", &["*"]),
-                        ],
-                        Some("cert.der"),
-                    );
-                }
-                if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
-                    go_export = true;
-                }
-                ui.add_space(10.0);
-                sub(ui, "Delete from slot");
-                note(
-                    ui,
-                    "Removes the certificate, or permanently erases the private \
-                     key, in the selected slot. The management key is entered in \
-                     the dialog. This cannot be undone.",
-                );
-                ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
-                        .clicked()
-                    {
-                        open_delete_cert = true;
-                    }
-                    ui.add_space(6.0);
-                    if can_delete_key {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
-                            open_delete_key = true;
+        // --- Two-column master/detail ---------------------------------------
+        // The PIV pane renders inside a full-width ScrollArea, so
+        // `ui.available_width()` is the real content width. Split it into a
+        // fixed-ish left "Slots" column and a flexible right "detail" column
+        // with a manual horizontal + `allocate_ui_with_layout`, so the right
+        // column actually claims the remaining width (issue: ~45% dead space).
+        let total_w = ui.available_width();
+        // Fixed-ish left column (~210), but never wider than the pane itself.
+        let left_w = 210.0_f32.min(total_w);
+        let gap = 14.0;
+        let right_w = (total_w - left_w - gap).max(0.0);
+        ui.horizontal_top(|ui| {
+            // ---- Left: slot list -------------------------------------------
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(left_w);
+                    theme::card_frame(p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        sub(ui, "Slots");
+                        ui.add_space(4.0);
+                        for row in &slot_rows {
+                            let is_sel = row.sel == selected;
+                            // Full-width clickable row with generous padding. We
+                            // reserve a background shape, render the content, then
+                            // fill the reserved slot behind it (selection tint or
+                            // hover wash) so the tint sits *under* the text. No
+                            // leading glyph — selection is the tint + a thin accent
+                            // left bar + brighter text.
+                            let row_w = ui.available_width();
+                            let bg_idx = ui.painter().add(egui::Shape::Noop);
+                            let bar_idx = ui.painter().add(egui::Shape::Noop);
+                            let resp = ui
+                                .scope(|ui| {
+                                    ui.set_width(row_w);
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(row.label)
+                                                .font(theme::f_reg(12.5))
+                                                .color(if is_sel { p.txt } else { p.txt2 }),
+                                        );
+                                        theme::pill(
+                                            ui,
+                                            row.state,
+                                            if row.empty { p.txt3 } else { p.txt2 },
+                                            p.raised2,
+                                        );
+                                        if let Some(a) = row.alg {
+                                            theme::pill(ui, a, p.txt2, p.raised2);
+                                        }
+                                    });
+                                    if let Some(dn) = &row.dn_short {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(8.0);
+                                            let lbl = ui.label(
+                                                egui::RichText::new(dn)
+                                                    .font(theme::f_reg(11.5))
+                                                    .color(p.txt3),
+                                            );
+                                            if let Some(full) = &row.dn_full {
+                                                lbl.on_hover_text(full);
+                                            }
+                                        });
+                                    }
+                                    ui.add_space(5.0);
+                                })
+                                .response
+                                .interact(egui::Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let bg = if is_sel {
+                                theme::tint(p.accent, 26)
+                            } else if resp.hovered() {
+                                theme::tint(p.txt2, 14)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            if bg != egui::Color32::TRANSPARENT {
+                                ui.painter().set(
+                                    bg_idx,
+                                    egui::epaint::RectShape::filled(
+                                        resp.rect.expand2(egui::vec2(4.0, 0.0)),
+                                        4.0,
+                                        bg,
+                                    ),
+                                );
+                            }
+                            // Thin accent left bar marks the active row.
+                            if is_sel {
+                                let r = resp.rect;
+                                let bar = egui::Rect::from_min_size(
+                                    egui::pos2(r.left() - 4.0, r.top()),
+                                    egui::vec2(3.0, r.height()),
+                                );
+                                ui.painter().set(
+                                    bar_idx,
+                                    egui::epaint::RectShape::filled(bar, 1.0, p.accent),
+                                );
+                            }
+                            if resp.clicked() {
+                                clicked_slot = Some(row.sel);
+                            }
                         }
-                    } else {
-                        note(ui, "key deletion needs YubiKey 5.7+");
-                    }
-                });
-            });
-        });
-        ui.add_space(6.0);
+                    });
+                },
+            );
+            ui.add_space(gap);
+            // ---- Right: detail for the selected slot -----------------------
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(right_w);
+                    theme::card_frame(p).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        // Header: which slot every action targets, + its state.
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Selected:")
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt3),
+                            );
+                            ui.label(
+                                egui::RichText::new(sel_label)
+                                    .font(theme::f_sb(13.5))
+                                    .color(p.txt),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(&sel_state)
+                                .font(theme::f_reg(12.0))
+                                .color(p.txt2),
+                        );
+                        ui.add_space(8.0);
 
-        // --- Retry counts & management-key rotation ---
+                        ui.horizontal(|ui| {
+                            sub(ui, "Generate key");
+                            self.help_dot(ui, p, "piv-generate");
+                        });
+                        ui.horizontal(|ui| {
+                            piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
+                            if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked()
+                            {
+                                open_generate = true;
+                            }
+                        });
+                        if let Some(pem) = &self.piv.gen_pubkey_pem {
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut pem.as_str())
+                                    .desired_rows(4)
+                                    .desired_width(360.0)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
+                                copy_pem = Some(pem.clone());
+                            }
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            sub(ui, "Certificate");
+                            self.help_dot(ui, p, "piv-certificate");
+                        });
+                        text_field(
+                            ui,
+                            p,
+                            "Name",
+                            &mut self.piv.cert_subject,
+                            "e.g. Alice — or full CN=Alice,O=Example,C=US",
+                            300.0,
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Valid for")
+                                    .font(theme::f_reg(13.0))
+                                    .color(p.txt2),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.piv.cert_days)
+                                    .range(1..=3650u32)
+                                    .suffix(" days"),
+                            );
+                            ui.add_space(8.0);
+                            if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
+                                .clicked()
+                            {
+                                open_self_sign = true;
+                            }
+                        });
+                        let mut save_csr = false;
+                        ui.horizontal(|ui| {
+                            text_field(
+                                ui,
+                                p,
+                                "CSR file",
+                                &mut self.piv.csr_path,
+                                "/path/to/request.csr",
+                                240.0,
+                            );
+                            save_csr =
+                                theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                        });
+                        if save_csr {
+                            self.spawn_file_dialog(
+                                FileTarget::PivCsr,
+                                true,
+                                &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
+                                Some("request.csr"),
+                            );
+                        }
+                        if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
+                            open_csr = true;
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            sub(ui, "Import cert");
+                            self.help_dot(ui, p, "piv-import");
+                        });
+                        let mut browse_cert = false;
+                        ui.horizontal(|ui| {
+                            text_field(
+                                ui,
+                                p,
+                                "File",
+                                &mut self.piv.cert_path,
+                                "/path/to/cert.pem",
+                                240.0,
+                            );
+                            browse_cert =
+                                theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+                        });
+                        if browse_cert {
+                            self.spawn_file_dialog(
+                                FileTarget::PivCert,
+                                false,
+                                &[
+                                    ("Certificates", &["pem", "der", "crt", "cer"]),
+                                    ("All files", &["*"]),
+                                ],
+                                None,
+                            );
+                        }
+                        if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
+                            open_import = true;
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            sub(ui, "Export cert");
+                            self.help_dot(ui, p, "piv-export");
+                        });
+                        let mut save_export = false;
+                        ui.horizontal(|ui| {
+                            text_field(
+                                ui,
+                                p,
+                                "Destination",
+                                &mut self.piv.export_path,
+                                "/path/to/out.der",
+                                240.0,
+                            );
+                            save_export =
+                                theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                        });
+                        if save_export {
+                            self.spawn_file_dialog(
+                                FileTarget::PivExport,
+                                true,
+                                &[
+                                    ("Certificate (DER)", &["der", "cer"]),
+                                    ("Certificate (PEM)", &["pem", "crt"]),
+                                    ("All files", &["*"]),
+                                ],
+                                Some("cert.der"),
+                            );
+                        }
+                        if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
+                            go_export = true;
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            sub(ui, "Delete");
+                            self.help_dot(ui, p, "piv-delete");
+                        });
+                        ui.horizontal(|ui| {
+                            if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                                .clicked()
+                            {
+                                open_delete_cert = true;
+                            }
+                            ui.add_space(6.0);
+                            if can_delete_key {
+                                if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}")
+                                    .clicked()
+                                {
+                                    open_delete_key = true;
+                                }
+                            } else {
+                                note(ui, "key deletion needs YubiKey 5.7+");
+                            }
+                        });
+                    });
+                },
+            );
+        });
+        ui.add_space(12.0);
+
+        // --- Card administration (everything applet-wide) -------------------
+        // PIN & PUK, retry counts, the management key, and the reset all apply
+        // to the whole applet rather than to one slot, so they live together
+        // here, below the master/detail. The reset button is inline within this
+        // section (it used to float right in dead space).
         egui::CollapsingHeader::new(
-            egui::RichText::new("Retry counts & key rotation")
+            egui::RichText::new("Card administration")
                 .font(theme::f_sb(13.5))
                 .color(p.txt),
         )
         .id_salt("piv-admin")
         .show(ui, |ui| {
             theme::card_frame(p).show(ui, |ui| {
-                sub(ui, "Set PIN/PUK retry counts");
-                note(
-                    ui,
-                    "Resets PIN and PUK to factory defaults. The management key \
-                     and the current PIN are entered in the dialog.",
-                );
+                // PIN & PUK
+                ui.horizontal(|ui| {
+                    sub(ui, "PIN & PUK");
+                    self.help_dot(ui, p, "pin");
+                });
+                ui.horizontal(|ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
+                        open_change_pin = true;
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
+                        open_change_puk = true;
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
+                        open_unblock = true;
+                    }
+                });
+
+                // Retry counts
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    sub(ui, "Retry counts");
+                    self.help_dot(ui, p, "piv-admin");
+                });
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("PIN tries")
@@ -9797,13 +9822,12 @@ impl App {
                         open_set_retries = true;
                     }
                 });
+                // Management key
                 ui.add_space(10.0);
-                sub(ui, "Change management key");
-                note(
-                    ui,
-                    "Pick the new key's algorithm here; the current and new keys \
-                     are entered in the dialog.",
-                );
+                ui.horizontal(|ui| {
+                    sub(ui, "Management key");
+                    self.help_dot(ui, p, "piv-admin");
+                });
                 ui.horizontal(|ui| {
                     piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
                     if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
@@ -9812,35 +9836,26 @@ impl App {
                         open_change_mgmt = true;
                     }
                 });
-            });
-        });
-        ui.add_space(10.0);
 
-        // --- Danger: reset applet ---
-        theme::card_frame(p)
-            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-            .show(ui, |ui| {
+                // Reset applet — red, inline in this section (no longer floating
+                // right in dead space).
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Reset applet")
-                            .font(theme::f_sb(14.0))
-                            .color(p.err),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
-                            arm_reset = true;
-                        }
-                    });
+                    sub(ui, "Reset applet");
+                    self.help_dot(ui, p, "reset");
                 });
-                ui.label(
-                    egui::RichText::new(
-                        "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
-                         the PIN and PUK are already blocked.",
-                    )
-                    .font(theme::f_reg(12.0))
-                    .color(p.txt2),
+                ui.horizontal(|ui| {
+                    if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                        arm_reset = true;
+                    }
+                });
+                note(
+                    ui,
+                    "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
+                     the PIN and PUK are already blocked.",
                 );
             });
+        });
 
         // Apply collected intents now that the card borrows have ended.
         if let Some(slot) = clicked_slot {

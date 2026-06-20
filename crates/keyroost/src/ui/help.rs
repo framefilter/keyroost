@@ -22,7 +22,8 @@ pub struct Help {
 }
 
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
-///   device, fido2, pin, passkeys, oath, pgp, piv, molto, custkey, reset
+///   device, fido2, pin, passkeys, oath, pgp, piv, molto, custkey, reset,
+///   piv-generate, piv-certificate, piv-import, piv-export, piv-delete, piv-admin
 pub fn help(topic: &str) -> Option<&'static Help> {
     Some(match topic {
         "device" => &Help {
@@ -84,6 +85,36 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "PIV smart card",
             body: "A US-government smart-card standard used for enterprise sign-in, VPNs and document signing. Manage it here: generate keys, create self-signed certificates or CA requests (signed on the card), import certificates, change the PIN/PUK and management key, and reset the applet. Writes need the management key (factory default 010203…0708).",
             slug: "/piv",
+        },
+        "piv-generate" => &Help {
+            title: "Generate a key",
+            body: "Creates a brand-new private key inside this slot and shows you its public key. If the slot already held a key, this overwrites it for good. You'll need the management key.",
+            slug: "/piv#generate",
+        },
+        "piv-certificate" => &Help {
+            title: "Create a certificate",
+            body: "A self-signed certificate is stored straight into the slot and is ready to use. A CSR is a request file you send to a certificate authority so they can issue one for you. Either way the signing happens on the card, so it needs the PIN.",
+            slug: "/piv#certificate",
+        },
+        "piv-import" => &Help {
+            title: "Import a certificate",
+            body: "Loads a certificate file you already have (PEM or DER) into this slot. You'll need the management key.",
+            slug: "/piv#import",
+        },
+        "piv-export" => &Help {
+            title: "Export the certificate",
+            body: "Saves this slot's certificate to a file on your computer. It's public information, so no PIN is needed.",
+            slug: "/piv#export",
+        },
+        "piv-delete" => &Help {
+            title: "Delete from the slot",
+            body: "Clearing the certificate leaves the key in place; erasing the private key removes it for good (and needs a YubiKey 5.7 or newer). Both are permanent and can't be undone.",
+            slug: "/piv#delete",
+        },
+        "piv-admin" => &Help {
+            title: "Card administration",
+            body: "These settings — the PIN and PUK, how many tries they allow, the management key, and a full reset — apply to the whole PIV applet, not to a single slot.",
+            slug: "/piv#admin",
         },
         "molto" => &Help {
             title: "Programmable TOTP token",
