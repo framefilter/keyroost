@@ -227,7 +227,10 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         if p.has_piv {
             caps.insert(Caps::PIV);
         }
-        if p.reader_name.to_ascii_lowercase().contains("token2") {
+        if p.has_fido {
+            caps.insert(Caps::FIDO2);
+        }
+        if p.has_otp {
             caps.insert(Caps::OTP);
         }
         if caps.is_empty() {
@@ -421,6 +424,8 @@ mod tests {
             has_oath: oath,
             has_openpgp: pgp,
             has_piv: piv,
+            has_fido: false,
+            has_otp: false,
             yubikey_serial: yk_serial.map(str::to_owned),
             usb_bus: bus,
             usb_address: addr,

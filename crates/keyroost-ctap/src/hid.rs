@@ -443,6 +443,23 @@ fn generate_nonce() -> [u8; 8] {
     nonce
 }
 
+impl crate::transport::CtapTransport for CtapHidDevice {
+    /// Delegate to the inherent HID `transact`, mapping its transport error into
+    /// the shared [`CtapError`]. This is what lets HID and PC/SC backends be used
+    /// interchangeably by the command layer.
+    fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, crate::cmd::CtapError> {
+        CtapHidDevice::transact(self, cmd, payload).map_err(crate::cmd::CtapError::from)
+    }
+
+    fn set_timeout(&mut self, timeout: std::time::Duration) {
+        CtapHidDevice::set_timeout(self, timeout);
+    }
+
+    fn set_cancel_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        CtapHidDevice::set_cancel_flag(self, flag);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

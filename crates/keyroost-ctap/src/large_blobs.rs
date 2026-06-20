@@ -48,7 +48,8 @@
 use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::{AuthenticatorInfo, CtapError};
-use crate::hid::{CtapHidDevice, CTAPHID_CBOR};
+use crate::hid::CTAPHID_CBOR;
+use crate::transport::CtapTransport;
 use crate::pin::left16_sha256;
 
 /// CTAP command byte for `authenticatorLargeBlobs`.
@@ -210,7 +211,7 @@ pub fn max_fragment_length(info: &AuthenticatorInfo) -> usize {
     max.saturating_sub(MSG_SIZE_OVERHEAD).max(1) as usize
 }
 
-fn dispatch(dev: &mut CtapHidDevice, params: Value) -> Result<Value, CtapError> {
+fn dispatch(dev: &mut impl CtapTransport, params: Value) -> Result<Value, CtapError> {
     let mut payload = Vec::new();
     payload.push(CTAP2_LARGE_BLOBS);
     payload.extend_from_slice(&cbor::encode(&params));
@@ -228,7 +229,7 @@ fn dispatch(dev: &mut CtapHidDevice, params: Value) -> Result<Value, CtapError> 
 }
 
 /// Read one fragment beginning at `offset`, asking for at most `count` bytes.
-fn read_fragment(dev: &mut CtapHidDevice, offset: u64, count: u64) -> Result<Vec<u8>, CtapError> {
+fn read_fragment(dev: &mut impl CtapTransport, offset: u64, count: u64) -> Result<Vec<u8>, CtapError> {
     let params = Value::Map(vec![
         (Value::UInt(KEY_GET), Value::UInt(count)),
         (Value::UInt(KEY_OFFSET), Value::UInt(offset)),
@@ -255,7 +256,7 @@ fn read_fragment(dev: &mut CtapHidDevice, offset: u64, count: u64) -> Result<Vec
 /// Read the entire serialized large-blob array, verify its checksum, and parse
 /// the entries. Requires no PIN/UV.
 pub fn read(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     info: &AuthenticatorInfo,
 ) -> Result<LargeBlobArray, CtapError> {
     let frag = max_fragment_length(info) as u64;
@@ -374,7 +375,7 @@ fn write_auth_param(token: &PinUvAuthToken, offset: u32, fragment: &[u8]) -> Vec
 /// in `maxFragmentLength`-sized fragments, honoring the authenticator's stateful
 /// write protocol (length declared once at offset 0).
 pub fn write(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     info: &AuthenticatorInfo,
     token: &PinUvAuthToken,
     serialized: &[u8],

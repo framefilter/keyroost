@@ -25,6 +25,47 @@ use keyroost_transport::{DeviceInfo, Session, TransportError};
 use keyroost_ctap::client_pin::PinUvAuthToken;
 use keyroost_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
 use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
+
+/// How the selected FIDO key is reached: over USB-HID (a `hidraw` path) or over
+/// a PC/SC reader (NFC or contact, by reader name).
+#[derive(Debug, Clone)]
+enum FidoTarget {
+    Hid(std::path::PathBuf),
+    Pcsc(String),
+}
+
+/// Open a CTAP transport for `target`, returning the boxed transport, whether
+/// it speaks CTAP2 (CBOR), and the HID `InitResponse` when available (HID only;
+/// `None` over PC/SC, which has no INIT phase). The InitResponse carries the
+/// firmware version shown on the hero for USB keys.
+fn open_fido(
+    target: &FidoTarget,
+) -> Result<
+    (
+        Box<dyn keyroost_ctap::transport::CtapTransport>,
+        bool,
+        Option<InitResponse>,
+    ),
+    String,
+> {
+    match target {
+        FidoTarget::Hid(path) => {
+            let (dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+            let cbor = init.supports_cbor();
+            Ok((Box::new(dev), cbor, Some(init)))
+        }
+        FidoTarget::Pcsc(reader) => {
+            let dev = keyroost_transport::CtapPcscDevice::open(reader)
+                .map_err(|e| e.to_string())?;
+            // After a successful FIDO applet SELECT we attempt CTAP2 regardless of
+            // the exact version string (keys answer U2F_V2, FIDO_2_0, FIDO_2_1,
+            // sometimes with trailing bytes). A genuinely U2F-only card will make
+            // get_info return a clean CTAP error, which the caller surfaces —
+            // rather than silently reporting "no CBOR" and leaving the UI idle.
+            Ok((Box::new(dev), true, None))
+        }
+    }
+}
 use keyroost_hid::HidDevice;
 
 const PROFILES: u8 = 100;
@@ -2029,7 +2070,7 @@ impl App {
         self.security_keys.info = None;
         self.security_keys.init = None;
         self.security_keys.error = None;
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         // Tag the job with the device it reads — if the user switches devices
@@ -2037,21 +2078,19 @@ impl App {
         // device's pane (or its row in the sidebar).
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading key info\u{2026}", move || {
-            // Off-thread: open the hidraw, run INIT + GetInfo.
-            let outcome = match CtapHidDevice::open(&path) {
-                Ok((mut hid, init)) => {
-                    let info = if init.supports_cbor() {
-                        Some(keyroost_ctap::get_info(&mut hid).map_err(|e| e.to_string()))
+            // Off-thread: open the transport, run GetInfo. HID also yields an
+            // InitResponse (firmware + CBOR capability); PC/SC (NFC/contact) has
+            // no INIT phase, so we synthesize a minimal one and rely on GetInfo.
+            let outcome = match open_fido(&target) {
+                Ok((mut dev, cbor, init)) => {
+                    let info = if cbor {
+                        Some(keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string()))
                     } else {
                         None
                     };
                     Ok((init, info))
                 }
-                Err(e) => Err(format!(
-                    "could not open {}: {} (have you installed udev/70-keyroost-fido.rules?)",
-                    path.display(),
-                    e
-                )),
+                Err(e) => Err(format!("could not open key: {e}")),
             };
             // Back on the UI thread: store the results.
             Box::new(move |app: &mut App| {
@@ -2060,16 +2099,19 @@ impl App {
                 }
                 match outcome {
                     Ok((init, info)) => {
-                        // Surface the key's firmware on the hero (e.g. "fw 5.7.4").
-                        let fw = format!(
-                            "{}.{}.{}",
-                            init.device_major, init.device_minor, init.device_build
-                        );
-                        app.security_keys.init = Some(init);
-                        if let Some(id) = for_device.clone() {
-                            if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
-                                dev.firmware = fw;
+                        // Surface the key's firmware on the hero (e.g. "fw 5.7.4")
+                        // when we have an InitResponse (USB-HID); PC/SC has none.
+                        if let Some(init) = init {
+                            let fw = format!(
+                                "{}.{}.{}",
+                                init.device_major, init.device_minor, init.device_build
+                            );
+                            if let Some(id) = for_device.clone() {
+                                if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
+                                    dev.firmware = fw;
+                                }
                             }
+                            app.security_keys.init = Some(init);
                         }
                         match info {
                             Some(Ok(info)) => {
@@ -2089,7 +2131,17 @@ impl App {
                             Some(Err(e)) => {
                                 app.security_keys.error = Some(format!("GetInfo failed: {}", e))
                             }
-                            None => {}
+                            None => {
+                                // CBOR was reported unavailable and we never even
+                                // attempted GetInfo. Record it as an error rather
+                                // than leaving the pane spinning on "Reading key…"
+                                // forever (the spinner re-fires while info is None).
+                                app.security_keys.error = Some(
+                                    "this key did not present a CTAP2 (FIDO2) interface over \
+                                     the reader; only U2F was detected"
+                                        .to_string(),
+                                );
+                            }
                         }
                     }
                     Err(e) => app.security_keys.error = Some(e),
@@ -2107,7 +2159,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let pin = std::mem::take(&mut self.security_keys.pin_input);
@@ -2116,7 +2168,7 @@ impl App {
             return;
         }
         self.spawn_job("Unlocking\u{2026} (enter PIN / touch)", move || {
-            let result = Self::open_and_unlock(&path, &pin).map_err(|e| e.to_string());
+            let result = Self::open_and_unlock(&target, &pin).map_err(|e| e.to_string());
             Box::new(move |app: &mut App| match result {
                 Ok(sess) => {
                     // Surface fingerprints read during unlock so the list shows
@@ -2131,11 +2183,11 @@ impl App {
     }
 
     fn open_and_unlock(
-        path: &std::path::Path,
+        target: &FidoTarget,
         pin: &str,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
-        let (mut dev, init) = CtapHidDevice::open(path)?;
-        if !init.supports_cbor() {
+        let (mut dev, cbor, _init) = open_fido(target)?;
+        if !cbor {
             return Err("device is U2F-only".into());
         }
         let info = keyroost_ctap::get_info(&mut dev)?;
@@ -2221,7 +2273,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let Some(session) = self.security_keys.session.take() else {
@@ -2231,7 +2283,7 @@ impl App {
         let pin = session.pin;
         self.spawn_job("Refreshing credentials\u{2026}", move || {
             let result =
-                Self::refresh_with_token(&path, token, pin).map_err(SessionOpError::from_boxed);
+                Self::refresh_with_token(&target, token, pin).map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| match result {
                 Ok(fresh) => app.security_keys.session = Some(fresh),
                 Err(e) => app.fail_session_op(&e, "refresh failed"),
@@ -2240,11 +2292,11 @@ impl App {
     }
 
     fn refresh_with_token(
-        path: &std::path::Path,
+        target: &FidoTarget,
         token: PinUvAuthToken,
         pin: zeroize::Zeroizing<String>,
     ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
-        let (mut dev, _) = CtapHidDevice::open(path)?;
+        let (mut dev, _cbor, _init) = open_fido(target)?;
         let info = keyroost_ctap::get_info(&mut dev)?;
         let mut mgr =
             keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token.clone(), &info)?;
@@ -2283,13 +2335,15 @@ impl App {
     /// the authenticator can invalidate a token after a UV-gated bio write, so
     /// reusing the unlock token across operations fails with 0x33.
     fn with_fresh_bio<T>(
-        path: &std::path::Path,
+        target: &FidoTarget,
         pin: &str,
-        f: impl FnOnce(&mut keyroost_ctap::bio_enroll::BioEnrollment) -> Result<T, SessionOpError>,
+        f: impl FnOnce(
+            &mut keyroost_ctap::bio_enroll::BioEnrollment<Box<dyn keyroost_ctap::transport::CtapTransport>>,
+        ) -> Result<T, SessionOpError>,
     ) -> Result<T, SessionOpError> {
-        let (mut dev, init) =
-            CtapHidDevice::open(path).map_err(|e| SessionOpError::msg(e.to_string()))?;
-        if !init.supports_cbor() {
+        let (mut dev, cbor, _init) =
+            open_fido(target).map_err(SessionOpError::msg)?;
+        if !cbor {
             return Err(SessionOpError::msg("device is U2F-only"));
         }
         let info = keyroost_ctap::get_info(&mut dev).map_err(SessionOpError::from_ctap)?;
@@ -2318,7 +2372,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let Some(session) = self.security_keys.session.as_ref() else {
@@ -2327,7 +2381,7 @@ impl App {
         };
         let pin = session.pin.clone();
         self.spawn_job("Reading fingerprints\u{2026}", move || {
-            let result = Self::with_fresh_bio(&path, &pin, |bio| {
+            let result = Self::with_fresh_bio(&target, &pin, |bio| {
                 bio.enumerate().map_err(SessionOpError::from_ctap)
             });
             Box::new(move |app: &mut App| match result {
@@ -2347,7 +2401,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let Some(session) = self.security_keys.session.as_ref() else {
@@ -2371,9 +2425,9 @@ impl App {
         self.spawn_job("Enrolling fingerprint\u{2026}", move || {
             use keyroost_ctap::bio_enroll::sample_status_message;
             let result = (|| -> Result<Vec<keyroost_ctap::Enrollment>, SessionOpError> {
-                let (mut dev, init) =
-                    CtapHidDevice::open(&path).map_err(|e| SessionOpError::msg(e.to_string()))?;
-                if !init.supports_cbor() {
+                let (mut dev, cbor, _init) =
+                    open_fido(&target).map_err(SessionOpError::msg)?;
+                if !cbor {
                     return Err(SessionOpError::msg("device is U2F-only"));
                 }
                 // Wire the cooperative-cancel flag into the transport so a
@@ -2492,7 +2546,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let Some(session) = self.security_keys.session.as_ref() else {
@@ -2500,7 +2554,7 @@ impl App {
         };
         let pin = session.pin.clone();
         self.spawn_job("Deleting fingerprint\u{2026}", move || {
-            let result = Self::with_fresh_bio(&path, &pin, |bio| {
+            let result = Self::with_fresh_bio(&target, &pin, |bio| {
                 bio.remove_enrollment(&template_id)
                     .map_err(SessionOpError::from_ctap)?;
                 bio.enumerate().map_err(SessionOpError::from_ctap)
@@ -2517,7 +2571,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let Some(session) = self.security_keys.session.as_ref() else {
@@ -2525,7 +2579,7 @@ impl App {
         };
         let pin = session.pin.clone();
         self.spawn_job("Renaming fingerprint\u{2026}", move || {
-            let result = Self::with_fresh_bio(&path, &pin, |bio| {
+            let result = Self::with_fresh_bio(&target, &pin, |bio| {
                 bio.set_friendly_name(&template_id, &new_name)
                     .map_err(SessionOpError::from_ctap)?;
                 bio.enumerate().map_err(SessionOpError::from_ctap)
@@ -2542,13 +2596,15 @@ impl App {
     /// Mirrors `with_fresh_bio`; config commands need their own permissioned
     /// token, so they always take a PIN at action time.
     fn with_config<T>(
-        path: &std::path::Path,
+        target: &FidoTarget,
         pin: &str,
-        f: impl FnOnce(&mut keyroost_ctap::config::Configurator) -> Result<T, SessionOpError>,
+        f: impl FnOnce(
+            &mut keyroost_ctap::config::Configurator<Box<dyn keyroost_ctap::transport::CtapTransport>>,
+        ) -> Result<T, SessionOpError>,
     ) -> Result<T, SessionOpError> {
-        let (mut dev, init) =
-            CtapHidDevice::open(path).map_err(|e| SessionOpError::msg(e.to_string()))?;
-        if !init.supports_cbor() {
+        let (mut dev, cbor, _init) =
+            open_fido(target).map_err(SessionOpError::msg)?;
+        if !cbor {
             return Err(SessionOpError::msg("device is U2F-only"));
         }
         let info = keyroost_ctap::get_info(&mut dev).map_err(SessionOpError::from_ctap)?;
@@ -2578,7 +2634,7 @@ impl App {
         let Some(dlg) = self.security_keys.advanced.as_ref() else {
             return;
         };
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let action = dlg.action;
@@ -2604,7 +2660,7 @@ impl App {
             AdvancedAction::None => return,
         };
         self.spawn_job(label, move || {
-            let result = Self::with_config(&path, &pin, |cfg| match action {
+            let result = Self::with_config(&target, &pin, |cfg| match action {
                 AdvancedAction::ToggleAlwaysUv => {
                     cfg.toggle_always_uv().map_err(SessionOpError::from_ctap)
                 }
@@ -2632,7 +2688,7 @@ impl App {
     }
 
     fn delete_credential(&mut self, cred_id: Vec<u8>) {
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let Some(session) = self.security_keys.session.as_ref() else {
@@ -2644,8 +2700,8 @@ impl App {
         let pin_refresh = session.pin.clone();
         self.spawn_job("Deleting credential\u{2026}", move || {
             // Delete, then re-list in the same job so the UI updates atomically.
-            let result = Self::try_delete(&path, token, &cred_id)
-                .and_then(|()| Self::refresh_with_token(&path, token_refresh, pin_refresh))
+            let result = Self::try_delete(&target, token, &cred_id)
+                .and_then(|()| Self::refresh_with_token(&target, token_refresh, pin_refresh))
                 .map_err(SessionOpError::from_boxed);
             Box::new(move |app: &mut App| match result {
                 Ok(fresh) => {
@@ -2658,11 +2714,11 @@ impl App {
     }
 
     fn try_delete(
-        path: &std::path::Path,
+        target: &FidoTarget,
         token: PinUvAuthToken,
         cred_id: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut dev, _) = CtapHidDevice::open(path)?;
+        let (mut dev, _cbor, _init) = open_fido(target)?;
         let info = keyroost_ctap::get_info(&mut dev)?;
         let mut mgr = keyroost_ctap::cred_mgmt::CredentialManager::new(&mut dev, token, &info)?;
         mgr.delete(cred_id)?;
@@ -2674,7 +2730,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let old = std::mem::take(&mut self.security_keys.change_pin.old);
@@ -2684,7 +2740,7 @@ impl App {
             return;
         }
         self.spawn_job("Changing PIN\u{2026}", move || {
-            let result = Self::try_change_pin(&path, &old, &new).map_err(|e| e.to_string());
+            let result = Self::try_change_pin(&target, &old, &new).map_err(|e| e.to_string());
             Box::new(move |app: &mut App| match result {
                 Ok(()) => {
                     app.security_keys.change_pin.open = false;
@@ -2698,11 +2754,11 @@ impl App {
     }
 
     fn try_change_pin(
-        path: &std::path::Path,
+        target: &FidoTarget,
         old: &str,
         new: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut dev, _) = CtapHidDevice::open(path)?;
+        let (mut dev, _cbor, _init) = open_fido(target)?;
         keyroost_ctap::client_pin::change_pin(&mut dev, old, new)?;
         Ok(())
     }
@@ -2715,7 +2771,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             return;
         };
         let new = std::mem::take(&mut self.security_keys.change_pin.new);
@@ -2730,7 +2786,7 @@ impl App {
         }
         self.spawn_job("Setting PIN\u{2026}", move || {
             let result = (|| -> Result<(), String> {
-                let (mut dev, _) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
+                let (mut dev, _cbor, _init) = open_fido(&target)?;
                 keyroost_ctap::client_pin::set_pin(&mut dev, &new).map_err(|e| e.to_string())
             })();
             Box::new(move |app: &mut App| match result {
@@ -2744,7 +2800,27 @@ impl App {
         });
     }
 
-    fn selected_fido_path(&self) -> Option<std::path::PathBuf> {
+    /// The transport descriptor for the selected FIDO key: a USB-HID path, or a
+    /// PC/SC reader name (NFC or contact). Prefers HID when both are present (a
+    /// USB key that also exposes a CCID interface).
+    fn selected_fido_target(&self) -> Option<FidoTarget> {
+        let d = self.selected_device()?;
+        if let Some(p) = d.hid_path.clone() {
+            return Some(FidoTarget::Hid(p));
+        }
+        if d.caps.has(Caps::FIDO2) {
+            if let Some(r) = d.reader.clone() {
+                return Some(FidoTarget::Pcsc(r));
+            }
+        }
+        None
+    }
+
+    /// The selected key's USB-HID path, if any. Used only by the armed-reset
+    /// hotplug tracker, which watches for a USB key being unplugged and
+    /// replugged within the reset window — a USB-only concept (an NFC tap has no
+    /// replug), so this intentionally returns `None` for reader-attached keys.
+    fn selected_fido_hid_path(&self) -> Option<std::path::PathBuf> {
         self.selected_device().and_then(|d| d.hid_path.clone())
     }
 
@@ -3234,7 +3310,7 @@ impl App {
             // Snapshot the current FIDO keys so the poll can tell when ours
             // leaves and a fresh one arrives. Prefer the armed key's HID serial
             // (port-independent) and fall back to its path + USB ids.
-            let target_path = self.selected_fido_path();
+            let target_path = self.selected_fido_hid_path();
             let devices = Self::fido_devices();
             let target = target_path
                 .as_ref()
@@ -6620,7 +6696,7 @@ impl App {
                         // The initial read can be dropped if the worker was
                         // busy at selection time; retry rather than showing
                         // "Reading key…" forever.
-                        if self.security_keys.init.is_none() && !self.busy() {
+                        if self.security_keys.info.is_none() && !self.busy() {
                             self.fetch_selected_info();
                         }
                         "Reading key\u{2026}"
@@ -7207,7 +7283,7 @@ impl App {
     /// Append a keyroost text note to the array and write it back. Needs the
     /// unlocked session's PIN (the write path requires a Large-Blob-Write token).
     fn add_large_blob_note(&mut self, text: String) {
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
@@ -7224,8 +7300,8 @@ impl App {
 
         self.spawn_job("Saving to large blobs\u{2026}", move || {
             let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
-                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
-                if !init.supports_cbor() {
+                let (mut dev, cbor, _init) = open_fido(&target)?;
+                if !cbor {
                     return Err("device is U2F-only".into());
                 }
                 let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
@@ -7275,7 +7351,7 @@ impl App {
     /// Replace the keyroost note at `idx` with `text` and write the array back.
     /// Refuses if the entry is not a keyroost note. Needs the session PIN.
     fn edit_large_blob_note(&mut self, idx: usize, text: String) {
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
@@ -7288,8 +7364,8 @@ impl App {
 
         self.spawn_job("Saving edit to large blobs\u{2026}", move || {
             let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
-                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
-                if !init.supports_cbor() {
+                let (mut dev, cbor, _init) = open_fido(&target)?;
+                if !cbor {
                     return Err("device is U2F-only".into());
                 }
                 let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
@@ -7336,13 +7412,13 @@ impl App {
     /// Read the large-blob array from the selected key (no PIN required) and
     /// cache it. Runs synchronously — a read is one or two small fragments.
     fn load_large_blobs(&mut self) {
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
         let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
-            let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
-            if !init.supports_cbor() {
+            let (mut dev, cbor, _init) = open_fido(&target)?;
+            if !cbor {
                 return Err("device is U2F-only".into());
             }
             let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
@@ -7368,7 +7444,7 @@ impl App {
     /// checksum, and write the array back. Needs a Large-Blob-Write token, which
     /// we derive from the unlocked session's PIN. Runs on the worker thread.
     fn delete_large_blob_entry(&mut self, idx: usize) {
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
@@ -7394,8 +7470,8 @@ impl App {
 
         self.spawn_job("Updating large blobs\u{2026}", move || {
             let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
-                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
-                if !init.supports_cbor() {
+                let (mut dev, cbor, _init) = open_fido(&target)?;
+                if !cbor {
                     return Err("device is U2F-only".into());
                 }
                 let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
@@ -7453,7 +7529,7 @@ impl App {
     /// `delete_large_blob_entry` but clears every entry. Needs a Large-Blob-Write
     /// token derived from the unlocked session's PIN. Runs on the worker thread.
     fn clear_large_blob_storage(&mut self) {
-        let Some(path) = self.selected_fido_path() else {
+        let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
@@ -7473,8 +7549,8 @@ impl App {
 
         self.spawn_job("Clearing large blobs\u{2026}", move || {
             let result = (|| -> Result<keyroost_ctap::large_blobs::LargeBlobArray, String> {
-                let (mut dev, init) = CtapHidDevice::open(&path).map_err(|e| e.to_string())?;
-                if !init.supports_cbor() {
+                let (mut dev, cbor, _init) = open_fido(&target)?;
+                if !cbor {
                     return Err("device is U2F-only".into());
                 }
                 let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;

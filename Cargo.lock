@@ -1799,6 +1799,7 @@ dependencies = [
  "des",
  "getrandom 0.2.17",
  "hidapi",
+ "keyroost-ctap",
  "keyroost-hid",
  "keyroost-oath",
  "keyroost-openpgp",

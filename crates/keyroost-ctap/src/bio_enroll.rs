@@ -13,7 +13,8 @@
 use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::CtapError;
-use crate::hid::{CtapHidDevice, CTAPHID_CBOR};
+use crate::hid::CTAPHID_CBOR;
+use crate::transport::CtapTransport;
 
 /// authenticatorBioEnrollment command byte (standard).
 pub const CTAP2_BIO_ENROLLMENT: u8 = 0x09;
@@ -104,17 +105,17 @@ pub fn sample_status_message(status: u64) -> &'static str {
 
 /// Bio-enrollment session: holds the authenticated channel + the chosen command
 /// byte (standard vs preview), like [`crate::cred_mgmt::CredentialManager`].
-pub struct BioEnrollment<'a> {
-    dev: &'a mut CtapHidDevice,
+pub struct BioEnrollment<'a, T: CtapTransport> {
+    dev: &'a mut T,
     token: PinUvAuthToken,
     cmd_code: u8,
 }
 
-impl<'a> BioEnrollment<'a> {
+impl<'a, T: CtapTransport> BioEnrollment<'a, T> {
     /// Create a session. `cmd_code` is [`CTAP2_BIO_ENROLLMENT`] or
     /// [`CTAP2_BIO_ENROLLMENT_PREVIEW`] depending on what the authenticator
     /// advertises in its `AuthenticatorInfo`.
-    pub fn new(dev: &'a mut CtapHidDevice, token: PinUvAuthToken, cmd_code: u8) -> Self {
+    pub fn new(dev: &'a mut T, token: PinUvAuthToken, cmd_code: u8) -> Self {
         BioEnrollment {
             dev,
             token,

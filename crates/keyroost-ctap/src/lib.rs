@@ -21,6 +21,7 @@ pub mod cred_mgmt;
 pub mod hid;
 pub mod large_blobs;
 pub mod pin;
+pub mod transport;
 
 pub use bio_enroll::{BioEnrollment, CaptureStatus, Enrollment, SensorInfo};
 pub use cmd::{get_info, reset, AuthenticatorInfo, CtapError};

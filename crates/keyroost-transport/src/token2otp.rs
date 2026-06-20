@@ -869,7 +869,17 @@ impl Token2OtpSession {
                 .transport
                 .transmit(&t2::build_select(&t2::FIDO_APPLET_AID), false);
         }
-        let (data, sw) = self.transport.transmit(&t2::read_serial_request(), false)?;
+        let serial = self.transport.transmit(&t2::read_serial_request(), false);
+        // Over PC/SC the FIDO SELECT above left the card on the FIDO applet.
+        // Restore the OTP applet so a following command (enumerate, config) does
+        // not fail with 6A86 ("no current applet / wrong parameters"). Without
+        // this, listing entries after a serial read returns empty.
+        if self.is_pcsc {
+            let _ = self
+                .transport
+                .transmit(&t2::build_select(&t2::OTP_APPLET_AID), false);
+        }
+        let (data, sw) = serial?;
         if OtpError::check(sw).is_err() {
             return Err(OtpTransportError::SerialUnavailable);
         }

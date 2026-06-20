@@ -13,7 +13,8 @@
 use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::{AuthenticatorInfo, CtapError};
-use crate::hid::{CtapHidDevice, CTAPHID_CBOR};
+use crate::hid::CTAPHID_CBOR;
+use crate::transport::CtapTransport;
 
 pub const CTAP2_CREDENTIAL_MANAGEMENT: u8 = 0x0A;
 pub const CTAP2_CREDENTIAL_MANAGEMENT_PREVIEW: u8 = 0x41;
@@ -90,18 +91,18 @@ pub struct Credential {
 /// sub-commands. The wrapper exists because every sub-command needs the
 /// same authentication and the device's choice between 0x0A and 0x41 has to
 /// be discovered once from `getInfo`.
-pub struct CredentialManager<'a> {
-    dev: &'a mut CtapHidDevice,
+pub struct CredentialManager<'a, T: CtapTransport> {
+    dev: &'a mut T,
     token: PinUvAuthToken,
     cmd_code: u8,
 }
 
-impl<'a> CredentialManager<'a> {
+impl<'a, T: CtapTransport> CredentialManager<'a, T> {
     /// Construct after `clientPin::get_pin_token`. Returns
     /// [`CtapError::InvalidResponseShape`] if the authenticator advertises
     /// neither `credMgmt` nor `credentialMgmtPreview`.
     pub fn new(
-        dev: &'a mut CtapHidDevice,
+        dev: &'a mut T,
         token: PinUvAuthToken,
         info: &AuthenticatorInfo,
     ) -> Result<Self, CtapError> {
