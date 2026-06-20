@@ -578,9 +578,12 @@ configured (see `packaging/README.md`):
       auto-refresh after. **OPTION B COMPLETE.** (L)
       *Minor follow-up:* CLI `piv status` is cert-based — doesn't show a
       key-without-cert; could add metadata-based key presence like the GUI. (S)
-- [ ] Native file-chooser dialogs for cert/key import — **DECIDED: adopt `rfd`**
-      (enough demand to justify the platform-glue dep; fits the eframe-style
-      carve-out). (M)
+- [x] Native file-chooser dialogs — DONE (`6387ce9`): `rfd` with the
+      **xdg-portal** backend (`default-features=false, features=["xdg-portal",
+      "wayland"]`) — ~6 pure-Rust crates, **no GTK/zbus/ashpd** (verified), portal
+      = Flatpak-ready, cross-platform. Async via a thread+channel off the frame
+      loop. Browse… on OpenPGP/PIV cert+key imports, Save… on PIV CSR/cert export;
+      text fields + drag-drop kept.
 - [~] **Credential-entry modal + scroll-independent feedback** — *highest-leverage
       GUI fix, from @My1's #31 follow-up.* Built on #38's `modal_window` (FIDO
       aesthetic), auto-clears, shows the op result IN the modal.
