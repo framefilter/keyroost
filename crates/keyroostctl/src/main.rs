@@ -5442,7 +5442,7 @@ fn with_credential_manager<F>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     F: for<'a> FnOnce(
-        &mut keyroost_ctap::cred_mgmt::CredentialManager<'a>,
+        &mut keyroost_ctap::cred_mgmt::CredentialManager<'a, keyroost_ctap::CtapHidDevice>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = resolve_fido_path(path)?;
@@ -5471,7 +5471,7 @@ fn with_bio_enrollment<F>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     F: for<'a> FnOnce(
-        &mut keyroost_ctap::bio_enroll::BioEnrollment<'a>,
+        &mut keyroost_ctap::bio_enroll::BioEnrollment<'a, keyroost_ctap::CtapHidDevice>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = resolve_fido_path(path)?;
@@ -5514,7 +5514,7 @@ fn with_configurator<F>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     F: for<'a> FnOnce(
-        &mut keyroost_ctap::config::Configurator<'a>,
+        &mut keyroost_ctap::config::Configurator<'a, keyroost_ctap::CtapHidDevice>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = resolve_fido_path(path)?;

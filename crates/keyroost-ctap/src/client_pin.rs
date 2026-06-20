@@ -23,7 +23,8 @@
 
 use crate::cbor::{self, Value};
 use crate::cmd::{get_info, AuthenticatorInfo, CtapError};
-use crate::hid::{CtapHidDevice, CTAPHID_CBOR};
+use crate::hid::CTAPHID_CBOR;
+use crate::transport::CtapTransport;
 use crate::pin::{
     left16_sha256, pad_pin_to_64, EphemeralKey, PinProtocol, ProtocolV1, ProtocolV2,
     PIN_PROTOCOL_V1, PIN_PROTOCOL_V2,
@@ -157,7 +158,7 @@ impl PinUvAuthToken {
 }
 
 /// Read the current PIN retry counter. No auth required.
-pub fn get_pin_retries(dev: &mut CtapHidDevice) -> Result<u32, CtapError> {
+pub fn get_pin_retries(dev: &mut impl CtapTransport) -> Result<u32, CtapError> {
     let req = build_request_extra(PIN_PROTOCOL_V1, SUB_GET_PIN_RETRIES, &[]);
     let resp = dispatch(dev, &req)?;
     resp.retries
@@ -173,7 +174,7 @@ pub fn get_pin_retries(dev: &mut CtapHidDevice) -> Result<u32, CtapError> {
 /// mismatch, which is why this only surfaced on the YubiKey. Confirmed from an
 /// on-wire trace: getKeyAgreement declared 1 while setPIN ran 2.
 pub fn get_key_agreement(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     protocol: u32,
 ) -> Result<([u8; 32], [u8; 32]), CtapError> {
     let req = build_request_extra(protocol, SUB_GET_KEY_AGREEMENT, &[]);
@@ -183,7 +184,7 @@ pub fn get_key_agreement(
 }
 
 /// Set the initial PIN on an authenticator that doesn't have one yet.
-pub fn set_pin(dev: &mut CtapHidDevice, new_pin: &str) -> Result<(), CtapError> {
+pub fn set_pin(dev: &mut impl CtapTransport, new_pin: &str) -> Result<(), CtapError> {
     use zeroize::Zeroize;
     validate_pin(new_pin)?;
     let chosen = negotiate_protocol(dev)?;
@@ -205,7 +206,7 @@ pub fn set_pin(dev: &mut CtapHidDevice, new_pin: &str) -> Result<(), CtapError> 
 }
 
 /// Change an existing PIN.
-pub fn change_pin(dev: &mut CtapHidDevice, old_pin: &str, new_pin: &str) -> Result<(), CtapError> {
+pub fn change_pin(dev: &mut impl CtapTransport, old_pin: &str, new_pin: &str) -> Result<(), CtapError> {
     use zeroize::Zeroize;
     validate_pin(new_pin)?;
     let chosen = negotiate_protocol(dev)?;
@@ -236,14 +237,14 @@ pub fn change_pin(dev: &mut CtapHidDevice, old_pin: &str, new_pin: &str) -> Resu
 /// Obtain a pinUvAuthToken bound to the current PIN. The returned token is
 /// usable as an HMAC key for credential management and similar commands
 /// until the authenticator power-cycles.
-pub fn get_pin_token(dev: &mut CtapHidDevice, pin: &str) -> Result<PinUvAuthToken, CtapError> {
+pub fn get_pin_token(dev: &mut impl CtapTransport, pin: &str) -> Result<PinUvAuthToken, CtapError> {
     let chosen = negotiate_protocol(dev)?;
     token_legacy(dev, pin, chosen)
 }
 
 /// `getPinToken` (0x05) with the protocol already negotiated.
 fn token_legacy(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     pin: &str,
     chosen: SelectedPinProtocol,
 ) -> Result<PinUvAuthToken, CtapError> {
@@ -310,7 +311,7 @@ pub mod permissions {
 /// `CTAP2_ERR_PIN_AUTH_INVALID` (0x33). Requesting `cm` via 0x09 fixes it.
 /// Legacy keys ignore the permission argument.
 pub fn get_pin_uv_auth_token(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     pin: &str,
     info: &AuthenticatorInfo,
     permissions: u32,
@@ -329,7 +330,7 @@ pub fn get_pin_uv_auth_token(
 /// Like [`get_pin_token`] but binds the returned token to `permissions` (and,
 /// when the permission set requires it, an `rp_id`).
 pub fn get_pin_uv_auth_token_with_permissions(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     pin: &str,
     permissions: u32,
     rp_id: Option<&str>,
@@ -341,7 +342,7 @@ pub fn get_pin_uv_auth_token_with_permissions(
 /// `getPinUvAuthTokenUsingPinWithPermissions` (0x09) with the protocol already
 /// negotiated.
 fn token_with_permissions(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     pin: &str,
     permissions: u32,
     rp_id: Option<&str>,
@@ -416,7 +417,7 @@ impl PeerKey {
 /// returned [`PinProtocol`] is boxed so the v1/v2 split key derivation and
 /// AES/HMAC framing stay behind one interface; callers don't branch on version.
 fn key_agreement(
-    dev: &mut CtapHidDevice,
+    dev: &mut impl CtapTransport,
     chosen: SelectedPinProtocol,
 ) -> Result<(Box<dyn PinProtocol>, PeerKey), CtapError> {
     let (peer_x, peer_y) = get_key_agreement(dev, chosen.version())?;
@@ -444,7 +445,7 @@ fn key_agreement(
 /// caller (`set_pin`, `change_pin`, `get_pin_token`). One extra read-only
 /// `getInfo` round-trip keeps these public signatures unchanged while still
 /// honouring the device's preferred protocol.
-fn negotiate_protocol(dev: &mut CtapHidDevice) -> Result<SelectedPinProtocol, CtapError> {
+fn negotiate_protocol(dev: &mut impl CtapTransport) -> Result<SelectedPinProtocol, CtapError> {
     let info = get_info(dev)?;
     Ok(select_pin_protocol(&info.pin_uv_auth_protocols))
 }
@@ -458,7 +459,7 @@ fn validate_pin(pin: &str) -> Result<(), CtapError> {
 }
 
 /// CBOR-encode the `clientPin` request and dispatch it.
-fn dispatch(dev: &mut CtapHidDevice, req: &[u8]) -> Result<PinResponse, CtapError> {
+fn dispatch(dev: &mut impl CtapTransport, req: &[u8]) -> Result<PinResponse, CtapError> {
     let mut payload = Vec::with_capacity(req.len() + 1);
     payload.push(CTAP2_CLIENT_PIN);
     payload.extend_from_slice(req);

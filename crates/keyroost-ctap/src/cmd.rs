@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use crate::cbor::{self, Value};
-use crate::hid::{CtapHidDevice, HidTransportError, CTAPHID_CBOR};
+use crate::hid::{HidTransportError, CTAPHID_CBOR};
+use crate::transport::CtapTransport;
 
 pub const CTAP2_GET_INFO: u8 = 0x04;
 pub const CTAP2_RESET: u8 = 0x07;
@@ -31,6 +32,10 @@ pub enum CtapError {
     /// A caller-supplied argument was rejected before anything was sent to
     /// the device (e.g. a PIN outside the 4–63 byte range).
     InvalidArgument(&'static str),
+    /// A non-HID transport (e.g. PC/SC over NFC or a contact reader) failed at
+    /// the link level — reader I/O error, card removed, or an ISO 7816 status
+    /// word that does not map to a CTAP2 status.
+    Transport(String),
 }
 
 impl CtapError {
@@ -70,6 +75,7 @@ impl std::fmt::Display for CtapError {
                 write!(f, "authenticator response had wrong shape: {}", s)
             }
             CtapError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
+            CtapError::Transport(s) => write!(f, "reader transport error: {}", s),
         }
     }
 }
@@ -189,7 +195,7 @@ impl AuthenticatorInfo {
 }
 
 /// Issue `authenticatorGetInfo` and decode the response.
-pub fn get_info(dev: &mut CtapHidDevice) -> Result<AuthenticatorInfo, CtapError> {
+pub fn get_info(dev: &mut impl CtapTransport) -> Result<AuthenticatorInfo, CtapError> {
     let resp = dev.transact(CTAPHID_CBOR, &[CTAP2_GET_INFO])?;
     let (status, body) = split_status(&resp)?;
     if status != 0 {
@@ -202,7 +208,7 @@ pub fn get_info(dev: &mut CtapHidDevice) -> Result<AuthenticatorInfo, CtapError>
 /// Issue `authenticatorReset`. Most authenticators require this within ~10
 /// seconds of plug-in *and* a physical touch — failures with status 0x2D
 /// usually mean the touch window has closed.
-pub fn reset(dev: &mut CtapHidDevice) -> Result<(), CtapError> {
+pub fn reset(dev: &mut impl CtapTransport) -> Result<(), CtapError> {
     dev.set_timeout(RESET_TIMEOUT);
     let resp = dev.transact(CTAPHID_CBOR, &[CTAP2_RESET])?;
     let (status, _) = split_status(&resp)?;

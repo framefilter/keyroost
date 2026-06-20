@@ -28,7 +28,8 @@
 use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::{AuthenticatorInfo, CtapError};
-use crate::hid::{CtapHidDevice, CTAPHID_CBOR};
+use crate::hid::CTAPHID_CBOR;
+use crate::transport::CtapTransport;
 
 pub const CTAP2_CONFIG: u8 = 0x0D;
 
@@ -50,16 +51,16 @@ const PARAM_FORCE_CHANGE_PIN: u64 = 0x03;
 
 /// Issues `authenticatorConfig` sub-commands against an open device, using a
 /// pinUvAuthToken that carries the AuthenticatorConfiguration permission.
-pub struct Configurator<'a> {
-    dev: &'a mut CtapHidDevice,
+pub struct Configurator<'a, T: CtapTransport> {
+    dev: &'a mut T,
     token: PinUvAuthToken,
 }
 
-impl<'a> Configurator<'a> {
+impl<'a, T: CtapTransport> Configurator<'a, T> {
     /// Construct after obtaining a token with the `acfg` permission. Verifies
     /// the authenticator actually advertises `authenticatorConfig` support.
     pub fn new(
-        dev: &'a mut CtapHidDevice,
+        dev: &'a mut T,
         token: PinUvAuthToken,
         info: &AuthenticatorInfo,
     ) -> Result<Self, CtapError> {

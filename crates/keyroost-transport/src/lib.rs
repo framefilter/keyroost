@@ -29,6 +29,9 @@ use pcsc::{
 mod oath;
 pub use oath::OathSession;
 
+mod ctap_pcsc;
+pub use ctap_pcsc::CtapPcscDevice;
+
 mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
@@ -574,6 +577,16 @@ pub struct ReaderProbe {
     pub has_oath: bool,
     pub has_openpgp: bool,
     pub has_piv: bool,
+    /// True when the card answers a SELECT of the FIDO applet
+    /// (`A0000006472F0001`) — i.e. a FIDO2/U2F security key reached over this
+    /// reader (NFC or contact). Lets the GUI offer the FIDO2 tab for reader-
+    /// attached keys, served by [`CtapPcscDevice`].
+    pub has_fido: bool,
+    /// True when the card answers a SELECT of the Token2 on-device OTP applet
+    /// (`F00000014F747001`). Detected by actually selecting the applet rather
+    /// than guessing from the reader name, so the OTP tab is offered only for
+    /// keys that really have it.
+    pub has_otp: bool,
     /// YubiKey management serial, read on the same connection when the reader is
     /// a YubiKey.
     pub yubikey_serial: Option<String>,
@@ -628,6 +641,8 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 has_oath: false,
                 has_openpgp: false,
                 has_piv: false,
+                has_fido: false,
+                has_otp: false,
                 yubikey_serial: None,
                 usb_bus: None,
                 usb_address: None,
@@ -642,6 +657,8 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             has_oath: false,
             has_openpgp: false,
             has_piv: false,
+            has_fido: false,
+            has_otp: false,
             yubikey_serial: None,
             usb_bus: None,
             usb_address: None,
@@ -673,6 +690,20 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             probe.has_oath = answers("oath", keyroost_oath::select());
             probe.has_openpgp = answers("openpgp", keyroost_openpgp::select());
             probe.has_piv = answers("piv", keyroost_piv::select());
+            // FIDO2/U2F: a SELECT of the FIDO applet that the card accepts means
+            // a security key is reachable over this reader (NFC or contact), to
+            // be driven by CtapPcscDevice.
+            probe.has_fido = answers(
+                "fido",
+                keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
+            );
+            // Token2 on-device OTP applet — select it to confirm presence,
+            // rather than inferring from the reader name (which mislabels any
+            // key on a "Token2" reader as having OTP).
+            probe.has_otp = answers(
+                "otp",
+                keyroost_token2otp::build_select(&keyroost_token2otp::OTP_APPLET_AID),
+            );
             // When OpenPGP is present, recover the card serial from its AID (the
             // standard OpenPGP AID encodes a 4-byte serial at offset 10). This
             // lets keys with no HID serial (e.g. Token2 PIN+) still show one.

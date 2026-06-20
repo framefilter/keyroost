@@ -35,10 +35,14 @@ impl OtpTransportSel {
     }
 
     fn open(self) -> Result<Token2OtpSession, OtpTransportError> {
+        // Honor KEYROOST_OTP_DEBUG so a stuck/empty list over NFC can be traced
+        // from the GUI (the CLI has --debug; the GUI had no switch). Matches the
+        // KEYROOST_CTAP_DEBUG convention.
+        let debug = std::env::var_os("KEYROOST_OTP_DEBUG").is_some();
         match self {
-            OtpTransportSel::Auto => Token2OtpSession::detect_debug(false),
-            OtpTransportSel::Hid => Token2OtpSession::detect_hid_only(false),
-            OtpTransportSel::Ccid => Token2OtpSession::detect_pcsc_only(false),
+            OtpTransportSel::Auto => Token2OtpSession::detect_debug(debug),
+            OtpTransportSel::Hid => Token2OtpSession::detect_hid_only(debug),
+            OtpTransportSel::Ccid => Token2OtpSession::detect_pcsc_only(debug),
         }
     }
 }
@@ -252,7 +256,28 @@ impl App {
     /// List entries on the selected key over the chosen transport.
     pub(crate) fn load_otp_entries(&mut self) {
         self.otp.error = None;
-        let sel = self.otp.transport;
+        // On a reader-attached key (no USB-HID interface), force the CCID/NFC
+        // transport. The "Auto" path probes USB-HID first, which is pointless
+        // here and — on Windows, where the FIDO HID interface is access-
+        // restricted — can disrupt the read and yield an empty list, even though
+        // the OTP applet is reachable over the reader. If the user explicitly
+        // picked a transport, honour it.
+        let reader_only = self
+            .selected_device()
+            .map(|d| d.hid_path.is_none() && d.reader.is_some())
+            .unwrap_or(false);
+        let sel = if reader_only && self.otp.transport == OtpTransportSel::Auto {
+            OtpTransportSel::Ccid
+        } else {
+            self.otp.transport
+        };
+        if std::env::var_os("KEYROOST_OTP_DEBUG").is_some() {
+            eprintln!(
+                "[otp gui] reader_only={reader_only} chosen_transport={} (user_sel={})",
+                sel.label(),
+                self.otp.transport.label()
+            );
+        }
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OTP entries\u{2026}", move || {
             let result =
