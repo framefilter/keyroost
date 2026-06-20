@@ -90,8 +90,8 @@
         <strong>self-signed certificate</strong> in the slot or a <strong>certificate
         request (CSR)</strong> for a certificate authority — signed by the card itself, the
         private key never leaves it — imports and exports certificates, changes the PIN,
-        PUK, retry counts and management key, and resets the applet. The same controls are
-        in the desktop app's PIV pane.</p>
+        PUK, retry counts and management key, clears a slot's certificate or key, and resets
+        the applet. The same controls are in the desktop app's PIV pane.</p>
     </div>
 <pre><code>keyroostctl piv status
 keyroostctl piv generate-key --slot 9a --algorithm eccp256 --mgmt-key-stdin
@@ -99,6 +99,14 @@ keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --days 365 \
     --pin-stdin --mgmt-key-stdin
 keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
     --pin-stdin --file request.csr</code></pre>
+    <p><strong>Clearing a slot.</strong> <code>delete-cert</code> removes only the slot's
+      X.509 certificate object and leaves the private key in place — standard PIV, so it
+      works on every card. <code>delete-key</code> permanently erases the slot's private key
+      (a Yubico extension that needs YubiKey firmware 5.7 or newer; older cards can't delete
+      a key — overwrite the slot with a fresh <code>generate-key</code> instead). Both need
+      the management key and are destructive, so they require an explicit <code>--yes</code>.</p>
+<pre><code>keyroostctl piv delete-cert --slot 9a --mgmt-key-stdin --yes
+keyroostctl piv delete-key  --slot 9a --mgmt-key-stdin --yes   # YubiKey 5.7+</code></pre>
   </section>
 
   <section class="kr-section">

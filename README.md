@@ -24,16 +24,23 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 
 - **FIDO2 / CTAP2** — enumerate authenticators, read `authenticatorGetInfo`,
   manage resident credentials (list / metadata / delete), set / change / verify
-  the PIN, reset a key. PIN protocols v1 and v2.
+  the PIN, reset a key. PIN protocols v1 and v2. CTAP 2.1 security policy over
+  `authenticatorConfig` (always-require-UV, minimum PIN length, force a PIN
+  change, enterprise attestation) and a `large-blob` store for plaintext notes
+  over `authenticatorLargeBlobs`.
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock.
 - **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
-  keygen or a PKCS#1/PKCS#8 PEM/DER file); sign (SHA-256 or SHA-1); decrypt; set
-  cardholder name / URL; register a key for GnuPG; factory-reset the applet.
+  keygen or a PKCS#1/PKCS#8 PEM/DER file) for the signature, encryption, or
+  authentication slot; sign (SHA-256 or SHA-1); decrypt; authenticate (a
+  client/SSH signature with the Authentication key via INTERNAL AUTHENTICATE);
+  set cardholder name / URL; change the user / admin PIN and unblock a locked
+  PIN; register a key for GnuPG; factory-reset the applet.
 - **PIV (SP 800-73-4)** — full management: status (applet/firmware version,
   serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
   generation, certificate import / export, self-signed certs or a CSR for a CA,
-  and PIN / PUK / management-key changes and applet reset. The GUI collects the
+  clearing a slot's certificate (`delete-cert`) or key (`delete-key`, on YubiKey
+  5.7+), and PIN / PUK / management-key changes and applet reset. The GUI collects the
   management key per operation (and wipes it after), which is ideal for a slot or
   two; for **provisioning many slots or keys, the CLI is the intended path** — the
   management key and PIN come from env/stdin once, so a shell loop does the batch

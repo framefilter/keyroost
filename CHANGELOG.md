@@ -12,6 +12,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (PW1 in the "other" context). The Auth key slot is now selectable for
   provisioning too (`openpgp generate --slot auth`, `openpgp import --slot
   auth`), completing the third OpenPGP key.
+- **PIV slot clearing** — `piv delete-cert` removes a slot's X.509 certificate
+  object while leaving the private key in place (standard PIV; works on every
+  card), and `piv delete-key` permanently erases a slot's private key (a Yubico
+  extension requiring YubiKey firmware 5.7 or newer). Both need the management
+  key and require an explicit `--yes`.
+- **CTAP 2.1 authenticator config and large-blob storage** — a `fido large-blob`
+  group (`list` / `get` / `add` / `edit` / `delete` / `clear`) reads and edits a
+  key's `authenticatorLargeBlobs` array, keeping keyroost's own plaintext notes
+  alongside relying-party entries (writes pull a `largeBlobWrite` token from the
+  PIN and re-read the live array so RP entries are never clobbered; the store is
+  world-readable, so it is for notes, not secrets). FIDO security-policy controls
+  over `authenticatorConfig` — always-require-UV, raise minimum PIN length, force
+  a PIN change, and enable enterprise attestation — plus a FIDO2 tab redesign in
+  the GUI. Contributed by [@token2](https://github.com/token2)
+  ([#38](https://github.com/framefilter/keyroost/pull/38)).
+
+### Changed
+- **Consistent card-based GUI for the FIDO2, PIV, and OpenPGP panes** — the
+  applet panes now share a common card layout with per-slot / per-key sub-tabs,
+  inline help bubbles, and width-capped cards.
+- **Vendor-neutral applet support, documented as such** — the OATH, OpenPGP, and
+  PIV byte layers are open-standard implementations that work over CCID with any
+  card exposing those applets (YubiKey, Nitrokey, SoloKeys, Feitian, Token2,
+  OpenSK, …), not just YubiKeys; the README capability matrix and the github.io
+  pages were reconciled to say so
+  ([#41](https://github.com/framefilter/keyroost/issues/41)). The OATH / OpenPGP
+  / PIV applets on the Token2 PIN+ are this same standards code; they remain
+  marked experimental only because the project has not yet exercised them on
+  physical PIN+ hardware.
 
 ## [0.6.0] - 2026-06-17
 
