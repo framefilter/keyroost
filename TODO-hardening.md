@@ -543,6 +543,28 @@ release is walked through on hardware.
 > v0.6.0 release get triaged first as they come in, and (2) a block is **reserved
 > at the end of the cycle** for the review & hardening pass (§Z) before we ship.
 
+> **OVERNIGHT PROGRESS (2026-06-20, autonomous run):**
+> - **§B PIV GUI — DONE** (FIDO2-style slot sub-tabs, content-width cap, admin
+>   folded into the status card; hardware-verified). **§E OpenPGP transport — DONE**
+>   (INTERNAL AUTHENTICATE end-to-end, hw-verified).
+> - **§I Docs reality sweep — DONE** (`docs-reality-sweep`, merged): README "What
+>   it does" bullets, CHANGELOG `[Unreleased]`, `docs/piv.html` clear-slot; the
+>   github.io site is **in-repo** (`docs/`, no gh-pages branch). #41 capability
+>   matrix reconciled.
+> - **§F Token2 PIN+ — ANALYSIS DONE, no code needed:** the OATH/OpenPGP/PIV
+>   applets are vendor-neutral standards code (work on any card); "experimental"
+>   is purely "untested on PIN+ hardware by us" — **needs a physical PIN+ pass
+>   (user/Token2) to lift.** NB: #23 is a *closed PR*; live FIDO issue is **#33**.
+> - **OpenPGP GUI** restyle to the FIDO2 vocabulary (key sub-tabs) — landing on
+>   branch `gui-openpgp-fido2`, rebased onto this branch once gates pass.
+> - **§D Packaging — DRAFTS DONE on branch `packaging-drafts`** (Flatpak self-host
+>   manifest + desktop/metainfo, AppImage script, musl CLI runbook, `LINUX-BUNDLES.md`).
+>   **NOT merged — has a 10-item maintainer-decisions list** (app-id, repo host,
+>   icon, musl scope, runtime version, …). See the branch + the morning summary.
+> - **DECISIONS QUEUED FOR USER:** PIN+ hardware verification; the packaging
+>   decisions; whether to merge `packaging-drafts` (needs rebase onto current
+>   `v0.7.0` first — it was based on the older `origin/v0.7.0`).
+
 ### A. Release-pipeline fanout — *primary theme*
 First-time channel setup; the `publish.yml` jobs skip cleanly until each is
 configured (see `packaging/README.md`):
