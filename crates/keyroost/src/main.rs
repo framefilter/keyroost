@@ -9349,6 +9349,90 @@ impl App {
                         .color(p.txt3),
                 );
             }
+
+            // Applet-wide administration: PIN & PUK, retry counts, and the
+            // management key all apply to the whole applet rather than to one
+            // slot, so they sit with the applet status here.
+            ui.add_space(12.0);
+
+            // PIN & PUK: bold label + help left, the three actions right.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("PIN & PUK")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "pin");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
+                        open_unblock = true;
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
+                        open_change_puk = true;
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
+                        open_change_pin = true;
+                    }
+                });
+            });
+
+            // Retry counts: label + help left, the tries DragValues and the
+            // apply button right-aligned.
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Retry counts")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "piv-admin");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}").clicked()
+                    {
+                        open_set_retries = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
+                    ui.label(
+                        egui::RichText::new("PUK tries")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                    );
+                    ui.add_space(8.0);
+                    ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
+                    ui.label(
+                        egui::RichText::new("PIN tries")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                    );
+                });
+            });
+
+            // Management key: label + help left, algorithm combo and change
+            // button right-aligned.
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Management key")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "piv-admin");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
+                        .clicked()
+                    {
+                        open_change_mgmt = true;
+                    }
+                    ui.add_space(8.0);
+                    piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
+                });
+            });
         });
 
         // --- Selected-slot display data (shown under the slot tab strip) ---
@@ -9676,138 +9760,36 @@ impl App {
         });
         ui.add_space(12.0);
 
-        // --- Card administration (everything applet-wide) -------------------
-        // PIN & PUK, retry counts, the management key, and the reset all apply
-        // to the whole applet rather than to one slot, so they live together
-        // here, below the master/detail. The reset button is inline within this
-        // section (it used to float right in dead space).
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Card administration")
-                .font(theme::f_sb(13.5))
-                .color(p.txt),
-        )
-        .id_salt("piv-admin")
-        .show(ui, |ui| {
-            theme::card_frame(p).show(ui, |ui| {
-                // Full-width like the FIDO2 Security-policy card so the setting
-                // rows pin their actions to the pane's right edge.
+        // Reset applet — its own destructive card with a red stroke at the
+        // bottom of the pane (mirrors the FIDO2 "Reset this key" card exactly),
+        // full width, description left + red button right.
+        theme::card_frame(p)
+            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+            .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-
-                // PIN & PUK: bold label + help left, the three actions right.
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("PIN & PUK")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
+                        egui::RichText::new("Reset applet")
+                            .font(theme::f_sb(14.5))
+                            .color(p.err),
                     );
                     ui.add_space(6.0);
-                    self.help_dot(ui, p, "pin");
+                    self.help_dot(ui, p, "reset");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
-                            open_unblock = true;
-                        }
-                        ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
-                            open_change_puk = true;
-                        }
-                        ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
-                            open_change_pin = true;
+                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                            arm_reset = true;
                         }
                     });
                 });
-
-                // Retry counts: label + help left, the tries DragValues and the
-                // apply button right-aligned.
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Retry counts")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-admin");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}")
-                            .clicked()
-                        {
-                            open_set_retries = true;
-                        }
-                        ui.add_space(8.0);
-                        ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
-                        ui.label(
-                            egui::RichText::new("PUK tries")
-                                .font(theme::f_reg(13.0))
-                                .color(p.txt2),
-                        );
-                        ui.add_space(8.0);
-                        ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
-                        ui.label(
-                            egui::RichText::new("PIN tries")
-                                .font(theme::f_reg(13.0))
-                                .color(p.txt2),
-                        );
-                    });
-                });
-
-                // Management key: label + help left, algorithm combo and change
-                // button right-aligned.
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Management key")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-admin");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
-                            .clicked()
-                        {
-                            open_change_mgmt = true;
-                        }
-                        ui.add_space(8.0);
-                        piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
-                    });
-                });
+                ui.label(
+                    egui::RichText::new(
+                        "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
+                         the PIN and PUK are already blocked.",
+                    )
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+                );
             });
-
-            // Reset applet — its own destructive card with a red stroke, full
-            // width, description left + red button right (mirrors the FIDO2
-            // "Reset this key" card exactly).
-            ui.add_space(10.0);
-            theme::card_frame(p)
-                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Reset applet")
-                                .font(theme::f_sb(14.5))
-                                .color(p.err),
-                        );
-                        ui.add_space(6.0);
-                        self.help_dot(ui, p, "reset");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}")
-                                .clicked()
-                            {
-                                arm_reset = true;
-                            }
-                        });
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
-                             the PIN and PUK are already blocked.",
-                        )
-                        .font(theme::f_reg(12.5))
-                        .color(p.txt2),
-                    );
-                });
-        });
 
         // Apply collected intents now that the card borrows have ended.
         if let Some(slot) = clicked_slot {
