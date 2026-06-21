@@ -32,7 +32,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   the PIN, reset a key. PIN protocols v1 and v2. CTAP 2.1 security policy over
   `authenticatorConfig` (always-require-UV, minimum PIN length, force a PIN
   change, enterprise attestation) and a `large-blob` store for plaintext notes
-  over `authenticatorLargeBlobs`.
+  over `authenticatorLargeBlobs`. Works over USB-HID and over NFC (CTAP-over-NFC
+  via a PC/SC reader), not just USB.
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock.
 - **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
@@ -201,41 +202,122 @@ an open industry standard.
 
 ## Install
 
-Build and install from crates.io:
+keyroost ships through every mainstream channel below. Each archive and bundle
+contains both `keyroost` (the GUI) and `keyroostctl` (the CLI). Pick whichever
+fits your platform; the smart-card features need a host PC/SC daemon (see
+[Smart-card prerequisite](#smart-card-prerequisite)).
+
+> Pre-1.0, availability tracks the [latest release](https://github.com/framefilter/keyroost/releases/latest):
+> when a version is published, these channels are updated to point at it. Replace
+> `vX.Y.Z` below with that release tag.
+
+### Pre-built binaries (GitHub Releases)
+
+No toolchain needed. Download from the
+[latest release](https://github.com/framefilter/keyroost/releases/latest):
+
+| Platform | Asset |
+|---|---|
+| Linux x86_64 | `keyroost-vX.Y.Z-linux-x86_64.tar.gz` |
+| macOS (Apple Silicon + Intel) | `keyroost-vX.Y.Z-macos-universal2.tar.gz` |
+| Windows x86_64 | `keyroost-vX.Y.Z-windows-x86_64.zip` |
+
+Each archive carries both `keyroost` and `keyroostctl`; unpack it and move the
+two executables onto your `PATH`. Every release also publishes `SHA256SUMS` and
+build-provenance attestation. For example, on Linux x86_64:
+
+```bash
+curl -L https://github.com/framefilter/keyroost/releases/latest/download/keyroost-vX.Y.Z-linux-x86_64.tar.gz \
+  | tar xz   # then move keyroostctl / keyroost onto your PATH
+```
+
+### cargo (from source)
+
+Needs the Rust toolchain (and, on Linux, the PC/SC dev package — see
+[Smart-card prerequisite](#smart-card-prerequisite)):
 
 ```bash
 cargo install keyroostctl keyroost
 ```
 
-### Without the Rust toolchain
-
-Each release ships pre-built binaries for Linux, macOS, and Windows, so you can
-skip compiling. Grab the binary for the [latest release](https://github.com/framefilter/keyroost/releases/latest) 
-straight from a URL (no `cargo`, no toolchain) — for Linux x86_64:
+Or let `cargo-binstall` fetch the same pre-built release archive instead of
+compiling — useful on atomic distros (e.g. Bazzite) where `cargo install`'s
+build step is awkward:
 
 ```bash
-curl -L https://github.com/framefilter/keyroost/releases/download/v0.6.0/keyroost-v0.6.0-linux-x86_64.tar.gz \
-  | tar xz   # then move keyroostctl / keyroost onto your PATH
-```
-
-(macOS: `keyroost-v0.6.0-macos-universal2.tar.gz`; Windows: `keyroost-v0.6.0-windows-x86_64.zip`.
-Each release also publishes `SHA256SUMS` and build-provenance attestation.)
-
-Or let `cargo-binstall` fetch the same pre-built archive instead of compiling:
-
-```bash
-cargo install cargo-binstall # if you don't have it installed yet, ensure its directory is added to your PATH
+cargo install cargo-binstall   # if you don't have it yet; ensure its dir is on PATH
 cargo binstall keyroostctl keyroost
 ```
 
-### Linux prerequisite
+### Homebrew (macOS + Linux)
 
-keyroost is mostly¹ distro-neutral — it talks to the kernel's `hidraw`/`sysfs` and to
-PC/SC, both of which every mainstream distribution provides. Only the package
-names differ. The CLI needs the PC/SC library + daemon; the GUI additionally
-needs the X11/Wayland/GL libraries that `eframe`/`egui` link against.   
-¹the `cargo install` does not support atomic distros like Bazzite. 
-Use `cargo-binstall` or the [Token2-branded AppImage](https://github.com/token2/t2companion-keyroost-builder/releases/latest/download/Token2_Companion_Rust-x86_64.AppImage)
+```bash
+brew tap framefilter/keyroost
+brew install keyroost
+```
+
+### AUR (Arch Linux)
+
+The `keyroost-bin` package installs the prebuilt binaries plus the FIDO udev
+rules. Use any AUR helper (or `makepkg`):
+
+```bash
+yay -S keyroost-bin
+```
+
+### winget (Windows)
+
+```powershell
+winget install Framefilter.Keyroost
+```
+
+### Flatpak (Linux — auto-updating, recommended for the GUI)
+
+Add the maintainer's GPG-signed remote, then install the app
+(app-id `io.github.framefilter.keyroost`):
+
+```bash
+flatpak remote-add --if-not-exists keyroost \
+  https://framefilter.github.io/keyroost-flatpak/keyroost.flatpakrepo
+flatpak install keyroost io.github.framefilter.keyroost
+# updates ride along with `flatpak update`
+```
+
+Or grab the offline single-file bundle (`keyroost.flatpak`) attached to each
+release:
+
+```bash
+flatpak install ./keyroost.flatpak
+```
+
+The Flatpak bundles the pcsc-lite *client* and talks to the **host** `pcscd`, so
+you still need that daemon running on the host (see
+[Smart-card prerequisite](#smart-card-prerequisite)).
+
+### AppImage (Linux — no install)
+
+Download `keyroost-x86_64.AppImage` from the
+[latest release](https://github.com/framefilter/keyroost/releases/latest):
+
+```bash
+chmod +x keyroost-x86_64.AppImage
+./keyroost-x86_64.AppImage
+# On FUSE3-only distros, install libfuse2, or run without FUSE:
+./keyroost-x86_64.AppImage --appimage-extract-and-run
+```
+
+### Smart-card prerequisite
+
+The smart-card features (OATH / OpenPGP / PIV, and Token2 Molto2 programming)
+talk to the card over PC/SC and need the **`pcscd` daemon running on the host**.
+macOS and Windows have PC/SC built in. On Linux, install the PC/SC library +
+daemon (the package name differs per distro). Building from source with `cargo`
+additionally needs the PC/SC *dev* package, and the GUI needs the X11/Wayland/GL
+libraries that `eframe`/`egui` link against.
+
+keyroost is otherwise distro-neutral — it talks to the kernel's `hidraw`/`sysfs`
+and to PC/SC, both of which every mainstream distribution provides; only the
+package names differ. Common distro one-liners:
 
 ```bash
 # Debian / Ubuntu
@@ -302,10 +384,10 @@ installing them.
 ## Quick start
 
 ```bash
-# discover connected devices: PC/SC readers + FIDO HID authenticators
+# discover connected devices: PC/SC readers + FIDO authenticators (USB-HID and NFC)
 keyroostctl list
 
-# --- FIDO2 (YubiKey / Solo 2 / Nitrokey 3) ---
+# --- FIDO2 (YubiKey / Solo 2 / Nitrokey 3), over USB-HID or an NFC reader ---
 keyroostctl fido info
 keyroostctl fido pin-retries
 keyroostctl fido creds-list --pin-stdin        # PIN read from stdin, never argv
