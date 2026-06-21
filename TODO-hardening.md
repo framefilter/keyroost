@@ -543,27 +543,35 @@ release is walked through on hardware.
 > v0.6.0 release get triaged first as they come in, and (2) a block is **reserved
 > at the end of the cycle** for the review & hardening pass (§Z) before we ship.
 
-> **OVERNIGHT PROGRESS (2026-06-20, autonomous run):**
+> **CYCLE PROGRESS (updated 2026-06-20):**
 > - **§B PIV GUI — DONE** (FIDO2-style slot sub-tabs, content-width cap, admin
 >   folded into the status card; hardware-verified). **§E OpenPGP transport — DONE**
 >   (INTERNAL AUTHENTICATE end-to-end, hw-verified).
+> - **OpenPGP GUI — DONE** (`e6c5b42`): restyled to the FIDO2/PIV card vocabulary
+>   (key sub-tabs), completing the three-pane GUI consolidation.
 > - **§I Docs reality sweep — DONE** (`docs-reality-sweep`, merged): README "What
 >   it does" bullets, CHANGELOG `[Unreleased]`, `docs/piv.html` clear-slot; the
 >   github.io site is **in-repo** (`docs/`, no gh-pages branch). #41 capability
->   matrix reconciled.
+>   matrix reconciled. README readability win from @errant253's #45 also landed
+>   (`52a062a`; the install-script half of #45 was declined).
 > - **§F Token2 PIN+ — ANALYSIS DONE, no code needed:** the OATH/OpenPGP/PIV
 >   applets are vendor-neutral standards code (work on any card); "experimental"
->   is purely "untested on PIN+ hardware by us" — **needs a physical PIN+ pass
->   (user/Token2) to lift.** NB: #23 is a *closed PR*; live FIDO issue is **#33**.
-> - **OpenPGP GUI** restyle to the FIDO2 vocabulary (key sub-tabs) — landing on
->   branch `gui-openpgp-fido2`, rebased onto this branch once gates pass.
-> - **§D Packaging — DRAFTS DONE on branch `packaging-drafts`** (Flatpak self-host
->   manifest + desktop/metainfo, AppImage script, musl CLI runbook, `LINUX-BUNDLES.md`).
->   **NOT merged — has a 10-item maintainer-decisions list** (app-id, repo host,
->   icon, musl scope, runtime version, …). See the branch + the morning summary.
-> - **DECISIONS QUEUED FOR USER:** PIN+ hardware verification; the packaging
->   decisions; whether to merge `packaging-drafts` (needs rebase onto current
->   `v0.7.0` first — it was based on the older `origin/v0.7.0`).
+>   is purely "untested on PIN+ hardware by us" — **still needs a physical PIN+
+>   pass (user/Token2) to lift.** NB: #23 is a *closed PR*; live FIDO issue is **#33**.
+> - **§D Packaging — WIRED & MERGED:** Flatpak (self-hosted signed OSTree +
+>   offline bundle), AppImage, and a Homebrew tap are all on `v0.7.0` via
+>   `.github/workflows/linux-bundles.yml` (triggers on `v*` tags, gated behind the
+>   `release-publish` environment). App icon, pcsc-lite 2.3.0 sha256, and the
+>   `.flatpakrepo` trust-pin are in place; the `keyroost-flatpak` Pages repo +
+>   secrets are set up. musl stays notes-only. Sandboxed-bundle hardware
+>   verification is the one open follow-up.
+> - **NFC — MERGED (`5a0bf0f`→`f2ba5c8`, Token2 #44):** FIDO2 + on-device OTP over
+>   PC/SC (NFC) readers via the `CtapTransport` abstraction; contact/ISO-7816
+>   readers deferred.
+> - **§Z pre-release review — DONE (`7ed4880`):** canonical-CBOR large-blob writes,
+>   re-read-before-delete, destructive-action wording, OATH unlock-on-Enter.
+> - **STILL QUEUED FOR USER:** PIN+ hardware verification (§F); the optional §G
+>   config-write hardware checks; sandboxed-bundle hardware verification (§D).
 
 ### A. Release-pipeline fanout — *primary theme*
 First-time channel setup; the `publish.yml` jobs skip cleanly until each is
@@ -572,9 +580,10 @@ configured (see `packaging/README.md`):
 - [x] **`release-publish` environment** — approval gate already in use (user
       approves each fanout).
 - [~] **Homebrew** — tap repo `framefilter/homebrew-keyroost` **created
-      (2026-06-18)**. Remaining: add `TAP_PUSH_TOKEN` (fine-grained PAT,
-      `contents:write` on the tap repo only) + re-dispatch `publish.yml` for
-      `v0.6.0` to write `Formula/keyroost.rb`.
+      (2026-06-18)** and the formula publish is wired (alongside the Flatpak/
+      AppImage bundles under the `release-publish` gate). Remaining: add
+      `TAP_PUSH_TOKEN` (fine-grained PAT, `contents:write` on the tap repo only) +
+      let the next tagged release write `Formula/keyroost.rb`.
 - [~] **winget** — v0.6.0 manifests rendered (staged under `/tmp/winget/`).
       Remaining: add `WINGET_TOKEN` (classic PAT, `public_repo`) + submit the
       first PR to `microsoft/winget-pkgs`; future bumps auto-PR.
@@ -685,19 +694,24 @@ their detailed design follows #38 landing.
       verify with the reporter or a device. (Facts in the onlykey-device-facts note.)
 
 ### D. Packaging / distribution — issue #34 + the README "native installs" goal
-- [ ] **Flatpak (tentative)** — RECONSIDERED: a solved pattern (Yubico
-      Authenticator + KeePassXC ship on Flathub). Manifest needs `--socket=pcsc`
-      (host pcscd) + `--device=all` (hidraw) + `--filesystem=/run/udev:ro`, and
-      must bundle the pcsc-lite *client* lib (runtime lacks `libpcsclite`; ship
-      the lib, drop the daemon). Verify end-to-end on hardware.
-      **Distribution caveat:** Flathub has a strong stance against AI-generated
-      code, and keyroost is openly AI-authored — so Flathub itself may be off the
-      table. @errant253 (#34) suggests **self-hosting a Flatpak repo** (or using
-      an alt repo like Fedora's) to keep Flatpak's distro-agnostic + auto-update
-      benefits without the Flathub gate; that's the likely path. Note Token2
-      already ships an AppImage of their OEM edition.
-- [ ] **AppImage** — sandbox-free alternative worth weighing alongside Flatpak.
-- [ ] **musl static Linux build** — UNDER CONSIDERATION (user deferred deciding).
+- [x] **Flatpak — DONE & WIRED** (`e85aff3`→`58050f1`): self-hosted signed OSTree
+      remote (auto-update) + an offline `.flatpak` bundle, built by
+      `.github/workflows/linux-bundles.yml` on `v*` tags behind the
+      `release-publish` gate. Manifest grants `--socket=pcsc` (host pcscd) +
+      `--device=all` (hidraw) + `--filesystem=/run/udev:ro` and bundles the
+      pcsc-lite *client* lib (2.3.0, sha256-pinned); the dark-on-amber app icon
+      (full hicolor tree) + desktop/metainfo are in `packaging/flatpak/`. **Flathub
+      is intentionally skipped** (its stance against AI-authored code) — the OSTree
+      is hosted in a dedicated `keyroost-flatpak` Pages repo (Option A, per
+      @errant253 #34) and the `.flatpakrepo` descriptor trust-pins the signing key.
+      *Open follow-up:* end-to-end hardware verification of the sandboxed bundle
+      (a Molto2 + FIDO key through the Flatpak sandbox).
+- [x] **AppImage — DONE & WIRED** (`e85aff3`, `486f9b0`): GUI AppImage
+      (`packaging/appimage/build-appimage.sh`) built in the same
+      `linux-bundles.yml` job, same app icon. Sandbox-free alternative alongside
+      Flatpak. Same hardware-verification follow-up applies.
+- [ ] **musl static Linux build** — UNDER CONSIDERATION (user deferred deciding);
+      **notes-only**, NOT wired into any workflow (`packaging/musl/README.md`).
       Fixes the glibc-version portability caveat; wrinkle is `libpcsclite`
       linking for the PC/SC path. Think it through before committing.
 
@@ -782,7 +796,14 @@ their detailed design follows #38 landing.
 
 ### Z. End-of-cycle review & hardening — *reserve room before shipping v0.7.0*
 A deliberate pass after the feature work and before the release, ideally run as a
-multi-agent review:
+multi-agent review.
+
+> **STATUS: pre-release review run (`7ed4880`).** The multi-agent review pass
+> landed its correctness findings before the cut: canonical CBOR key order in
+> large-blob writes (spec-strict authenticators like Solo 2 / Nitrokey now
+> accept writes), re-read-before-delete protecting RP large-blob entries,
+> clearer destructive-action wording, OATH unlock-on-Enter, and a docs nav fix.
+> The standing review aims below remain the checklist for any further pass.
 - **Simplification** — collapse accidental complexity, dead code, and any
   duplication the v0.6.0 restructure left behind; keep files focused.
 - **Security** — re-audit secret handling (PIN/seed zeroization, `--debug`

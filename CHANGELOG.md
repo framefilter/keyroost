@@ -35,11 +35,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a PIN change, and enable enterprise attestation — plus a FIDO2 tab redesign in
   the GUI. Contributed by [@token2](https://github.com/token2)
   ([#38](https://github.com/framefilter/keyroost/pull/38)).
+- **Linux desktop bundles** — a self-hosted Flatpak (signed OSTree remote with
+  auto-update, plus an offline `.flatpak` bundle) and an AppImage of the GUI,
+  both built by a new `linux-bundles.yml` workflow that triggers on `v*` tags and
+  is gated behind the same `release-publish` approval as the other channels. The
+  Flatpak OSTree is hosted in a dedicated `keyroost-flatpak` Pages repo (Flathub
+  is intentionally not used). A Homebrew tap (`framefilter/homebrew-keyroost`)
+  rounds out the fanout. (Flatpak ships the pcsc-lite client lib and talks to the
+  host `pcscd`; end-to-end hardware verification of the sandboxed bundles is still
+  pending.)
 
 ### Changed
-- **Consistent card-based GUI for the FIDO2, PIV, and OpenPGP panes** — the
-  applet panes now share a common card layout with per-slot / per-key sub-tabs,
-  inline help bubbles, and width-capped cards.
+- **Consolidated, card-based GUI across the FIDO2, PIV, and OpenPGP panes** — a
+  significant redesign so every applet pane shares one visual vocabulary:
+  per-slot / per-key sub-tab strips (PIV 9A/9C/9D/9E, OpenPGP sig/enc/auth),
+  full-width cards with right-pinned actions, inline `?` help bubbles in place of
+  verbose notes, and a global content-width cap (~920px, centered) that fixes the
+  wide-window label↔action gap. Applet-wide administration (PIN/PUK, retries,
+  management key, reset) is folded into each pane's status card instead of
+  floating loose, and secret entry routes through a centered, scroll-independent
+  credential modal that shows the operation result in place.
 - **Vendor-neutral applet support, documented as such** — the OATH, OpenPGP, and
   PIV byte layers are open-standard implementations that work over CCID with any
   card exposing those applets (YubiKey, Nitrokey, SoloKeys, Feitian, Token2,
@@ -49,6 +64,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   / PIV applets on the Token2 PIN+ are this same standards code; they remain
   marked experimental only because the project has not yet exercised them on
   physical PIN+ hardware.
+- **Friendlier README intro** — a more approachable opening and a "What it is"
+  framing so the project reads clearly to newcomers. Readability suggestion by
+  [@errant253](https://github.com/errant253)
+  ([#45](https://github.com/framefilter/keyroost/pull/45); the accompanying
+  install script was declined).
+
+### Fixed
+- **Canonical CBOR key order in large-blob writes** — large-blob payloads now
+  emit map keys in canonical order (parameter `0x05` before protocol `0x06`), so
+  spec-strict authenticators (Solo 2, Nitrokey) accept the writes. YubiKey is
+  lenient, which is why the earlier hardware round-trip passed.
+- **Large-blob deletes no longer clobber relying-party entries** — the GUI delete
+  path now re-reads the live large-blob array in the worker and removes the
+  matching entry by content, instead of writing back a stale cached array. This
+  protects RP entries written since the array was last loaded and avoids a
+  position-shift wrong-delete (matching the add/edit/CLI paths).
+- **Clearer destructive-action wording** — the "Clear all storage" action and the
+  FIDO reset-dialog hint now state plainly that clearing erases every large-blob
+  entry, including relying-party data, not just keyroost's notes.
+- **OATH unlock submits on Enter** — pressing Enter in the OATH unlock field now
+  submits, matching the FIDO2 unlock card and the rest of the redesign.
 
 ## [0.6.0] - 2026-06-17
 
