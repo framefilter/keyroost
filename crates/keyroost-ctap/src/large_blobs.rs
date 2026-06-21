@@ -475,8 +475,10 @@ mod tests {
 
     #[test]
     fn max_fragment_length_respects_msg_size() {
-        let mut info = AuthenticatorInfo::default();
-        info.max_msg_size = Some(1200);
+        let info = AuthenticatorInfo {
+            max_msg_size: Some(1200),
+            ..Default::default()
+        };
         assert_eq!(max_fragment_length(&info), (1200 - 64) as usize);
         // Falls back to the 1024 floor when unset.
         let info2 = AuthenticatorInfo::default();

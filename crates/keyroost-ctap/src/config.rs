@@ -210,13 +210,14 @@ mod tests {
     fn set_min_pin_length_builds_expected_params() {
         // Build the params map the way set_min_pin_length would, and confirm the
         // key/value shape round-trips. newMin=8, one RP id, force_change=true.
-        let mut entries: Vec<(Value, Value)> = Vec::new();
-        entries.push((Value::UInt(PARAM_NEW_MIN_PIN_LENGTH), Value::UInt(8)));
-        entries.push((
-            Value::UInt(PARAM_MIN_PIN_LENGTH_RP_IDS),
-            Value::Array(vec![Value::Text("example.com".into())]),
-        ));
-        entries.push((Value::UInt(PARAM_FORCE_CHANGE_PIN), Value::Bool(true)));
+        let entries: Vec<(Value, Value)> = vec![
+            (Value::UInt(PARAM_NEW_MIN_PIN_LENGTH), Value::UInt(8)),
+            (
+                Value::UInt(PARAM_MIN_PIN_LENGTH_RP_IDS),
+                Value::Array(vec![Value::Text("example.com".into())]),
+            ),
+            (Value::UInt(PARAM_FORCE_CHANGE_PIN), Value::Bool(true)),
+        ];
         let map = Value::Map(entries);
         let (decoded, _) = cbor::decode(&cbor::encode(&map)).unwrap();
         assert_eq!(

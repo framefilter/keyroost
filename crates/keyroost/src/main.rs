@@ -11011,9 +11011,11 @@ mod tests {
     #[test]
     fn openpgp_cred_mismatch_never_fires() {
         use OpenPgpCredKind::*;
-        let mut pgp = OpenPgpState::default();
-        pgp.user_pin_new = "111111".into();
-        pgp.admin_pin_new = "22222222".into();
+        let pgp = OpenPgpState {
+            user_pin_new: "111111".into(),
+            admin_pin_new: "22222222".into(),
+            ..Default::default()
+        };
         for k in [
             ChangeUserPin,
             ChangeAdminPin,
