@@ -31,7 +31,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DESKTOP_FILE="${REPO_ROOT}/packaging/flatpak/${APP_ID}.desktop"
 # Icon: the dark-on-amber 256px raster (linuxdeploy prefers a PNG); the full
 # hicolor tree + SVG master live alongside it in packaging/icons/.
-ICON_FILE="${REPO_ROOT}/packaging/icons/${APP_ID}-256.png"
+# Must be named exactly after the desktop Icon= entry (no size suffix), or
+# linuxdeploy reports "Could not find suitable icon". Use the hicolor 256px PNG.
+ICON_FILE="${REPO_ROOT}/packaging/icons/hicolor/256x256/apps/${APP_ID}.png"
 BUILD_DIR="${REPO_ROOT}/target/appimage"
 APPDIR="${BUILD_DIR}/AppDir"
 
