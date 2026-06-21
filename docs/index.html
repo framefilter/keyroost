@@ -46,6 +46,7 @@
       <a href="#do">what it does</a> ·
       <a href="#topics">the four applets</a> ·
       <a href="#faq">FAQ</a> ·
+      <a href="#install">install keyroost</a> ·
       <a href="#resources">authoritative links</a>.</p>
   </div>
 </section>
@@ -210,8 +211,43 @@
     </details>
   </section>
 
+  <section class="kr-section" id="install">
+    <h2><span class="num">06</span>Install keyroost</h2>
+    <p>keyroost ships a desktop app (<code>keyroost</code>) and a command-line tool
+      (<code>keyroostctl</code>) for Linux, macOS, and Windows. Pick whichever channel fits;
+      they all install the same open-source toolchain.</p>
+
+    <h3>Linux — desktop app</h3>
+    <p><strong>Flatpak</strong> is the easiest route for a non-technical user: it
+      auto-updates and bundles everything the GUI needs.</p>
+<pre><code>flatpak remote-add --if-not-exists keyroost https://framefilter.github.io/keyroost-flatpak/keyroost.flatpakrepo
+flatpak install keyroost io.github.framefilter.keyroost</code></pre>
+    <p><strong>AppImage</strong> needs no installation — download
+      <code>keyroost-x86_64.AppImage</code> from the latest release, make it executable, and
+      run it.</p>
+
+    <h3>macOS &amp; Linux — Homebrew</h3>
+<pre><code>brew tap framefilter/keyroost
+brew install keyroost</code></pre>
+
+    <h3>Windows — winget</h3>
+<pre><code>winget install Framefilter.Keyroost</code></pre>
+
+    <h3>Everything else — Cargo or pre-built archives</h3>
+    <p>With a Rust toolchain you can build both binaries from crates.io:</p>
+<pre><code>cargo install keyroostctl keyroost</code></pre>
+    <p>Or grab a pre-built archive for your platform from the releases page.</p>
+
+    <p class="kr-related" style="margin-top:18px">
+      <a class="kr-btn kr-btn-default" href="https://github.com/framefilter/keyroost/releases/latest">Latest release &amp; downloads →</a>
+      <a class="kr-btn kr-btn-ghost" href="https://github.com/framefilter/keyroost">Source on GitHub</a>
+    </p>
+    <p class="kr-muted">Full, canonical install notes live in the project README; this is the
+      short version.</p>
+  </section>
+
   <section class="kr-section kr-glossary" id="glossary">
-    <h2><span class="num">06</span>Mini-glossary</h2>
+    <h2><span class="num">07</span>Mini-glossary</h2>
     <dl>
       <dt>FIDO2 / WebAuthn / CTAP</dt>
       <dd>The modern passwordless standard. WebAuthn is the browser-to-website half; CTAP
@@ -234,7 +270,7 @@
   </section>
 
   <section class="kr-section kr-res-section" id="resources">
-    <h2><span class="num">07</span>Authoritative resources</h2>
+    <h2><span class="num">08</span>Authoritative resources</h2>
     <p class="kr-muted">Primary sources — standards bodies and the people who wrote the specs.</p>
     <div class="kr-res">
       <a href="https://fidoalliance.org/passkeys/"><span class="who">FIDO Alliance</span>Passkeys &amp; FIDO2 explained</a>

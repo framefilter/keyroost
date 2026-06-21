@@ -21,6 +21,8 @@
       <a href="otp.html">On-device OTP</a>
       <a href="fingerprint.html">Fingerprints</a>
       <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
       <a href="openpgp.html">OpenPGP</a>
       <a href="piv.html">PIV</a>
       <a href="molto2.html">Molto2</a>
@@ -84,7 +86,10 @@
 <pre><code>keyroostctl oath list --reader yubikey
 keyroostctl oath code &lt;name&gt; --reader yubikey</code></pre>
     <p class="kr-muted">Credentials can be added from an <code>otpauth://</code> URI (the same
-      format behind setup QR codes).</p>
+      format behind setup QR codes). This works on any card exposing the OATH applet —
+      YubiKey, Nitrokey, SoloKeys, Feitian, Token2, OpenSK and others — over USB or an
+      NFC / PC-SC reader; <code>--reader yubikey</code> above is just an example reader-name
+      filter, not a vendor requirement.</p>
   </section>
 
   <section class="kr-section kr-res-section">
@@ -94,7 +99,7 @@ keyroostctl oath code &lt;name&gt; --reader yubikey</code></pre>
       <a href="https://datatracker.ietf.org/doc/html/rfc4226"><span class="who">IETF</span>RFC 4226 — HOTP</a>
       <a href="https://developers.yubico.com/OATH/"><span class="who">Yubico</span>YKOATH protocol</a>
     </div>
-    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="openpgp.html">Next: OpenPGP →</a></p>
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="otp.html">Next: On-device OTP →</a></p>
   </section>
 
 </main>
