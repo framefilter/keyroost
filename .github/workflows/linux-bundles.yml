@@ -193,8 +193,14 @@ jobs:
           fi
           export GNUPGHOME="$(mktemp -d)"
           printf '%s\n' "${GPG_PRIVATE}" | gpg --batch --import
-          # Re-sign the repo summary + commits with the imported key, and export
-          # the public key next to the repo so the .flatpakrepo can trust-pin it.
+          # Sign the COMMIT OBJECTS first, then refresh + sign the summary.
+          # build-update-repo signs ONLY the summary; without a prior build-sign
+          # the commits stay unsigned and `flatpak install` fails with "GPG
+          # verification enabled, but no signatures found" — even though
+          # `remote-info` (which checks only the summary) passes. This bit v0.7.0
+          # (issue #46). Then export the public key next to the repo so the
+          # .flatpakrepo can trust-pin it.
+          flatpak build-sign repo "${APP_ID}" --gpg-sign="${GPG_ID}" --gpg-homedir="${GNUPGHOME}"
           flatpak build-update-repo --gpg-sign="${GPG_ID}" --gpg-homedir="${GNUPGHOME}" repo
           gpg --homedir "${GNUPGHOME}" --export "${GPG_ID}" > repo/keyroost.gpg
           echo "signed=true" >> "$GITHUB_OUTPUT"
