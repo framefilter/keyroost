@@ -579,11 +579,12 @@ configured (see `packaging/README.md`):
 - [x] **crates.io** — live via OIDC trusted publishing (0.5.x + 0.6.0).
 - [x] **`release-publish` environment** — approval gate already in use (user
       approves each fanout).
-- [~] **Homebrew** — tap repo `framefilter/homebrew-keyroost` **created
-      (2026-06-18)** and the formula publish is wired (alongside the Flatpak/
-      AppImage bundles under the `release-publish` gate). Remaining: add
-      `TAP_PUSH_TOKEN` (fine-grained PAT, `contents:write` on the tap repo only) +
-      let the next tagged release write `Formula/keyroost.rb`.
+- [x] **Homebrew** — DONE (2026-06-20): tap repo `framefilter/homebrew-keyroost`
+      created + initialized, and `TAP_PUSH_TOKEN` (fine-grained PAT,
+      `contents:write` on the tap repo only) set. The **`homebrew` job in
+      `publish.yml`** (under the `release-publish` gate) renders + pushes
+      `Formula/keyroost.rb` to the tap on the next tagged release. Install:
+      `brew tap framefilter/keyroost && brew install keyroost`.
 - [~] **winget** — v0.6.0 manifests rendered (staged under `/tmp/winget/`).
       Remaining: add `WINGET_TOKEN` (classic PAT, `public_repo`) + submit the
       first PR to `microsoft/winget-pkgs`; future bumps auto-PR.

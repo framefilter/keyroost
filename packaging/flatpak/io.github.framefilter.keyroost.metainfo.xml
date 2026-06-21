@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- DRAFT AppStream metainfo. See ../LINUX-BUNDLES.md. Validate before shipping:
-       appstreamcli validate io.github.framefilter.keyroost.metainfo.xml
-     TODO(maintainer): add real <screenshots>, confirm app-id, supply icon,
-     and set <url type="homepage"> if a custom domain is preferred. -->
+<!-- AppStream metainfo for the Flatpak/AppImage build.
+     Validate: appstreamcli validate io.github.framefilter.keyroost.metainfo.xml
+     App-id, icon (packaging/icons/), homepage, and license are set; only the
+     optional <screenshots> and the per-cut <release> remain (see notes below). -->
 <component type="desktop-application">
   <id>io.github.framefilter.keyroost</id>
 
@@ -50,7 +50,9 @@
 
   <content_rating type="oars-1.1"/>
 
-  <!-- TODO(maintainer): replace with a real screenshot URL once one exists. -->
+  <!-- Optional: software centers show screenshots; appstreamcli only WARNS
+       without them. Host a PNG (e.g. under the Pages site) then uncomment and
+       point <image> at it. -->
   <!--
   <screenshots>
     <screenshot type="default">
@@ -61,7 +63,9 @@
   -->
 
   <releases>
-    <!-- TODO(maintainer): keep in sync with the workspace version. -->
-    <release version="0.6.0" date="2026-06-01"/>
+    <!-- CUT STEP: at each release, prepend a <release> for the new version with
+         the tag date, matching the workspace version in the root Cargo.toml.
+         Next cut: add <release version="0.7.0" date="YYYY-MM-DD"/> above this. -->
+    <release version="0.6.0" date="2026-06-17"/>
   </releases>
 </component>
