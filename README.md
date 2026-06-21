@@ -8,10 +8,9 @@ in one place.
 keyroost is an open-source Rust toolchain for hardware security keys, working
 across vendors over PC/SC and USB HID. It speaks FIDO2/CTAP2, OATH (TOTP/HOTP),
 and the OpenPGP and PIV card protocols, manages on-device OTP on Token2 FIDO keys,
-and also programs the Token2 Molto2 / Molto2v2 TOTP token it started life
-targeting. Ships a Rust library, a CLI (`keyroostctl`), and a dark-themed desktop
-GUI (`keyroost`) — implemented from public standards, with no vendor SDKs, no
-Python, and no Qt.
+and also programs the Token2 Molto2 / Molto2v2 TOTP token. Ships a Rust library,
+a CLI (`keyroostctl`), and a dark-themed desktop GUI (`keyroost`) — implemented
+from public standards, with no vendor SDKs, no Python, and no Qt.
 
 > **Built with AI.** I saw a real need for this but never learned to code, so
 > the parts I author — code, docs, and all — are written end-to-end with AI.
@@ -38,10 +37,11 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   including applet-password set / clear / unlock.
 - **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
   keygen or a PKCS#1/PKCS#8 PEM/DER file) for the signature, encryption, or
-  authentication slot; sign (SHA-256 or SHA-1); decrypt; authenticate (a
+  authentication slot — each writes the v4 fingerprint and a generation timestamp
+  so GnuPG recognizes the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a
   client/SSH signature with the Authentication key via INTERNAL AUTHENTICATE);
   set cardholder name / URL; change the user / admin PIN and unblock a locked
-  PIN; register a key for GnuPG; factory-reset the applet.
+  PIN; factory-reset the applet.
 - **PIV (SP 800-73-4)** — full management: status (applet/firmware version,
   serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
   generation, certificate import / export, self-signed certs or a CSR for a CA,
@@ -67,14 +67,30 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 
 | Device | Capabilities | Notes |
 |---|---|---|
-| **Token2 Molto2 / Molto2v2** | TOTP slot programming | The original target. |
+| **Token2 Molto2 / Molto2v2** | TOTP slot programming, bulk import | Hardware-verified. Programmed over the vendor-specific SM4-MAC protocol ([docs/PROTOCOL.md](docs/PROTOCOL.md)); supports bulk import from Aegis / 2FAS / otpauth-list, clock sync, and customer-key rotation. |
 | **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP, incl. HID/keyboard HOTP) over USB-HID / NFC / CCID — all validated on PIN+ hardware. Contributed by [@token2](https://github.com/token2). The OATH / OpenPGP / PIV smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
 | **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. |
 | **Nitrokey 3** | FIDO2, OATH | Shares the Solo 2 / Trussed stack. |
+| **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, large-blob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
 
-Other CCID/FIDO devices implementing these standard applets may work; the table
-is what the project has been built and tested against.
+Each listed row notes what's actually been verified on that device; the final,
+generic row describes the standards-based behavior expected on untested but
+compliant keys.
+
+## Roadmap
+
+Planned hardware support, not yet shipped:
+
+- **OnlyKey** — it speaks FIDO2/CTAP2 over USB-HID, so the `fido` commands will
+  apply, but it exposes no smart-card interface (no OATH / OpenPGP / PIV) and its
+  firmware reports a fixed, non-unique serial that needs placeholder handling
+  before it's first-class
+  ([#37](https://github.com/framefilter/keyroost/issues/37)). Pending test
+  hardware.
+
+Want a different key supported? Open an issue requesting it — hardware-support
+requests are tracked here and added to this roadmap.
 
 ## Independence, trademarks & acknowledgements
 
@@ -195,10 +211,10 @@ an open industry standard.
   argv; the tool never prints or persists them.
 - **Single static binary per OS** — no scripts, no Python, no Qt.
 - **Toward native installs everywhere.** The longer-term goal is first-class
-  distribution through each platform's mainstream channels (Homebrew, AUR, and
-  winget today; Flatpak, AppImage, and others as they're proven out on real
-  hardware), while continuing to shrink external dependencies toward a
-  self-contained binary.
+  distribution through each platform's mainstream channels. Available today:
+  Homebrew, AUR, Flatpak, and AppImage, plus the pre-built release binaries and
+  cargo; winget is submitted and pending Microsoft's catalog review. All while
+  continuing to shrink external dependencies toward a self-contained binary.
 
 ## Install
 
@@ -266,6 +282,13 @@ yay -S keyroost-bin
 ```
 
 ### winget (Windows)
+
+> **Pending Microsoft review.** The manifest is submitted to
+> [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) but not yet
+> merged into the public catalog, so the command below will not find the package
+> until it goes live. Until then, use the
+> [pre-built Windows zip](#pre-built-binaries-github-releases). This note will be
+> removed once `winget show Framefilter.Keyroost` resolves.
 
 ```powershell
 winget install Framefilter.Keyroost
