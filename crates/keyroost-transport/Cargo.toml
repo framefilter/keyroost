@@ -16,6 +16,7 @@ keyroost-oath = { path = "../keyroost-oath", version = "0.7.1" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.1" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.7.1" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.1" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.1" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.7.1" }
 # For the CtapTransport trait — the PC/SC CTAP backend (NFC + contact readers)
 # implements it so FIDO2 commands can run over a smart-card reader, not just USB-HID.

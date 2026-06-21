@@ -328,6 +328,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MoltoCmd,
     },
+    /// Token2 2nd-generation single-profile programmable TOTP token. Uses the
+    /// token's fixed device key; no customer key is needed.
+    Prog {
+        #[command(subcommand)]
+        cmd: ProgCmd,
+    },
     /// List connected devices: PC/SC readers and FIDO HID authenticators.
     List {
         /// Show every HID device, not just those advertising the FIDO usage page.
@@ -1202,6 +1208,56 @@ struct KeyArgs {
     key_ascii_env: Option<String>,
 }
 
+/// Token2 single-profile programmable token subcommands. These talk to the
+/// token over a PC/SC reader and authenticate with the token's fixed device key
+/// (no customer key, no profile index).
+#[derive(Subcommand)]
+enum ProgCmd {
+    /// Print device serial number and on-device UTC time. No auth needed.
+    Info {
+        /// Match the reader whose name contains this substring (when more than
+        /// one reader is connected).
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// Write the TOTP seed. Supply exactly one of --hex / --base32 / their
+    /// -env / -stdin variants. Programs the configuration's clock too via
+    /// --config-time if you also pass `config` separately.
+    Seed {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        /// Seed in hex. Argv is visible in `ps`; prefer --hex-stdin.
+        #[arg(long, conflicts_with = "base32", value_name = "HEX")]
+        hex: Option<String>,
+        /// Seed in base32 (RFC 4648; whitespace and dashes tolerated).
+        #[arg(long, value_name = "B32")]
+        base32: Option<String>,
+        /// Read the hex seed from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        hex_env: Option<String>,
+        /// Read the base32 seed from the named environment variable.
+        #[arg(long, value_name = "VAR")]
+        base32_env: Option<String>,
+        /// Read the hex seed from stdin (one line).
+        #[arg(long)]
+        hex_stdin: bool,
+        /// Read the base32 seed from stdin (one line).
+        #[arg(long)]
+        base32_stdin: bool,
+    },
+    /// Set the device configuration and seed the clock with the host's UTC time.
+    Config {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
+        algorithm: AlgoArg,
+        #[arg(long, value_enum, default_value_t = StepArg::S30)]
+        time_step: StepArg,
+        #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
+        display_timeout: TimeoutArg,
+    },
+}
+
 /// Token2 Molto2 / Molto2v2 subcommands. These talk to the Molto2 PC/SC
 /// reader, authenticated with the customer key (see the `--key*` flags).
 #[derive(Subcommand)]
@@ -2040,6 +2096,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     kind: match d.kind {
                         DeviceKind::Key => "key",
                         DeviceKind::Token => "token",
+                        DeviceKind::ProgToken => "prog-token",
                     },
                     caps: d.cap_badges(),
                 })
@@ -2129,6 +2186,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // authenticated with the customer key (scoped to this group via --key*).
     if let Cmd::Molto { key, cmd } = cmd {
         return run_molto(cmd, key, cli.debug);
+    }
+
+    if let Cmd::Prog { cmd } = cmd {
+        return run_prog(cmd, cli.debug);
     }
 
     unreachable!("every subcommand is handled above");
@@ -2538,6 +2599,188 @@ fn run_molto(cmd: &MoltoCmd, key: &KeyArgs, debug: bool) -> Result<(), Box<dyn s
         MoltoCmd::Probe { .. } => unreachable!("handled above before auth"),
     }
     Ok(())
+}
+
+/// Resolve a reader for the single-profile programmable token: auto-use a lone
+/// connected reader, or match an explicit `--reader` substring.
+fn prog_pick_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let readers = keyroost_transport::Session::list_readers()?;
+    resolve_reader(readers, explicit, "programmable-token")
+}
+
+fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_token2prog as prog;
+    use keyroost_transport::Token2ProgSession;
+
+    match cmd {
+        ProgCmd::Info { reader } => {
+            let name = prog_pick_reader(reader.as_deref())?;
+            let mut session = Token2ProgSession::open_named(&name)?;
+            session.set_debug(debug);
+            let info = session.read_info()?;
+            let model = info.model();
+            if json_output() {
+                println!(
+                    "{{\"serial\":\"{}\",\"model\":{},\"utc_time\":{}}}",
+                    info.serial,
+                    match model {
+                        Some(m) => format!("\"{m}\""),
+                        None => "null".to_string(),
+                    },
+                    info.utc_time
+                );
+            } else {
+                match model {
+                    Some(m) => println!("model:    {m}"),
+                    None => println!("model:    (unrecognized serial — not a known Token2 model)"),
+                }
+                println!("serial:   {}", info.serial);
+                println!("utc_time: {}", info.utc_time);
+            }
+        }
+        ProgCmd::Seed {
+            reader,
+            hex,
+            base32,
+            hex_env,
+            base32_env,
+            hex_stdin,
+            base32_stdin,
+        } => {
+            let seed = resolve_prog_seed(
+                hex.as_deref(),
+                base32.as_deref(),
+                hex_env.as_deref(),
+                base32_env.as_deref(),
+                *hex_stdin,
+                *base32_stdin,
+            )?;
+            let name = prog_pick_reader(reader.as_deref())?;
+            let mut session = Token2ProgSession::open_named(&name)?;
+            session.set_debug(debug);
+            // Refuse to program a device whose serial does not match a known
+            // Token2 programmable-token model — guards against writing to the
+            // wrong card on a shared reader.
+            prog_guard_model(&mut session)?;
+            session.authenticate()?;
+            session.set_seed(&seed)?;
+            println!("seed programmed ({} bytes).", seed.len());
+        }
+        ProgCmd::Config {
+            reader,
+            algorithm,
+            time_step,
+            display_timeout,
+        } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            let cfg = prog::Config {
+                display_timeout: match display_timeout {
+                    TimeoutArg::S15 => prog::DisplayTimeout::Sec15,
+                    TimeoutArg::S30 => prog::DisplayTimeout::Sec30,
+                    TimeoutArg::S60 => prog::DisplayTimeout::Sec60,
+                    TimeoutArg::S120 => prog::DisplayTimeout::Sec120,
+                },
+                algorithm: match algorithm {
+                    AlgoArg::Sha1 => prog::HmacAlgo::Sha1,
+                    AlgoArg::Sha256 => prog::HmacAlgo::Sha256,
+                },
+                time_step: match time_step {
+                    StepArg::S30 => prog::TimeStep::Seconds30,
+                    StepArg::S60 => prog::TimeStep::Seconds60,
+                },
+                utc_time: now,
+            };
+            let name = prog_pick_reader(reader.as_deref())?;
+            let mut session = Token2ProgSession::open_named(&name)?;
+            session.set_debug(debug);
+            // Refuse to program an unrecognized device (see Seed above).
+            prog_guard_model(&mut session)?;
+            session.authenticate()?;
+            session.set_config(&cfg)?;
+            println!("config programmed (clock set to {now}).");
+        }
+    }
+    Ok(())
+}
+
+/// Read the device info and refuse to continue unless the serial matches a known
+/// Token2 programmable-token model. Returns the resolved model name on success.
+/// Used to gate the write commands so the tool never programs an unexpected card.
+fn prog_guard_model(
+    session: &mut keyroost_transport::Token2ProgSession,
+) -> Result<&'static str, Box<dyn std::error::Error>> {
+    let info = session.read_info()?;
+    match info.model() {
+        Some(model) => {
+            eprintln!("[*] {model} (serial {})", info.serial);
+            Ok(model)
+        }
+        None => Err(format!(
+            "serial '{}' does not match any known Token2 programmable-token model; \
+             refusing to program this device. Run `keyroostctl prog info` to inspect it.",
+            info.serial
+        )
+        .into()),
+    }
+}
+
+/// Decode a programmable-token seed from exactly one of the supplied sources.
+fn resolve_prog_seed(
+    hex: Option<&str>,
+    base32: Option<&str>,
+    hex_env: Option<&str>,
+    base32_env: Option<&str>,
+    hex_stdin: bool,
+    base32_stdin: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let sources = [
+        hex.is_some(),
+        base32.is_some(),
+        hex_env.is_some(),
+        base32_env.is_some(),
+        hex_stdin,
+        base32_stdin,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if sources != 1 {
+        return Err("supply exactly one seed source (--hex / --base32 / -env / -stdin)".into());
+    }
+    let read_stdin = || -> Result<String, Box<dyn std::error::Error>> {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    };
+    let (raw, is_hex): (String, bool) = if let Some(h) = hex {
+        (h.to_string(), true)
+    } else if let Some(b) = base32 {
+        (b.to_string(), false)
+    } else if let Some(v) = hex_env {
+        (std::env::var(v)?, true)
+    } else if let Some(v) = base32_env {
+        (std::env::var(v)?, false)
+    } else if hex_stdin {
+        (read_stdin()?, true)
+    } else {
+        (read_stdin()?, false)
+    };
+    let seed = if is_hex {
+        hex_decode(raw.trim())?
+    } else {
+        base32_decode(raw.trim())?
+    };
+    if seed.is_empty() || seed.len() > 63 {
+        return Err(format!("seed must be 1..=63 bytes (got {})", seed.len()).into());
+    }
+    // Pad short secrets to the device's 20-byte stored length with trailing
+    // zeros, matching the vendor tool — otherwise the device computes TOTP over
+    // a shorter seed than an authenticator app set up from the same secret.
+    Ok(keyroost_token2prog::pad_totp_seed(seed))
 }
 
 /// Environment diagnosis: each check prints one ✓/✗/– line with the fix

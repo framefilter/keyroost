@@ -420,7 +420,7 @@ impl PcScOtpTransport {
         Ok(())
     }
 
-    fn raw_transmit(&self, apdu: &[u8]) -> Result<(Vec<u8>, u16), OtpTransportError> {
+    fn raw_transmit(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), OtpTransportError> {
         if self.debug {
             let hex: String = apdu.iter().map(|b| format!("{b:02x}")).collect();
             eprintln!("[token2otp PCSC send] {hex}");
@@ -428,9 +428,36 @@ impl PcScOtpTransport {
         let mut acc = Vec::new();
         let mut to_send = apdu.to_vec();
         let mut chunks = 0usize;
+        // Contact (T=0) readers occasionally drop a transmit with a transient
+        // SCARD_W_RESET_CARD / SCARD_F_COMM_ERROR ("communications error, retry").
+        // Reconnect to the card and retry the *current* APDU a few times before
+        // giving up, so a momentary glitch doesn't fail the whole read.
+        let mut retries_left = 3u8;
         loop {
             let mut rbuf = [0u8; 4096];
-            let resp = self.card.transmit(&to_send, &mut rbuf)?;
+            let resp = match self.card.transmit(&to_send, &mut rbuf) {
+                Ok(r) => r,
+                Err(pcsc::Error::ResetCard)
+                | Err(pcsc::Error::RemovedCard)
+                | Err(pcsc::Error::CommError)
+                    if retries_left > 0 =>
+                {
+                    retries_left -= 1;
+                    if self.debug {
+                        eprintln!(
+                            "[token2otp PCSC] transient card error; reconnecting and retrying"
+                        );
+                    }
+                    // Re-establish the link to the same card and re-send this APDU.
+                    self.card.reconnect(
+                        pcsc::ShareMode::Shared,
+                        pcsc::Protocols::ANY,
+                        pcsc::Disposition::ResetCard,
+                    )?;
+                    continue;
+                }
+                Err(e) => return Err(OtpTransportError::Pcsc(e)),
+            };
             if self.debug {
                 let hex: String = resp.iter().map(|b| format!("{b:02x}")).collect();
                 eprintln!("[token2otp PCSC recv] {hex}");

@@ -1,0 +1,20 @@
+[package]
+name = "keyroost-token2prog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust protocol layer for the Token2 2nd-generation single-profile programmable TOTP token (NFC Type-4 / ISO 7816): get-info, SM4 challenge auth, seed and config programming."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Reuse the proven SM4 block cipher, the ISO 9797-1 SM4-CBC MAC, the ISO 7816
+# padding, and the case-3 APDU builder from the Molto2 protocol crate. The
+# single-profile token shares the same crypto primitives; only the command set,
+# the (hardcoded) device key, and a couple of framing details differ.
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.1" }
+
+[dev-dependencies]

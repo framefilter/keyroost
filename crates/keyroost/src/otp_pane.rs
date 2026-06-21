@@ -288,28 +288,32 @@ impl App {
                     } else {
                         "USB-HID"
                     };
-                    // Read the serial first, while we hold the session. It's a
-                    // nice-to-have: some models/readers don't expose it over CCID,
-                    // so a failure here must not block the entry list.
-                    let serial = session
-                        .read_serial()
-                        .ok()
-                        .map(|sn| sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                    // Determine whether HOTP-on-touch is usable: it types over the
-                    // keyboard-HID interface, so a key with that interface disabled
-                    // (or that doesn't support the feature) returns 6A81. Detect it
-                    // up front so the UI can disable the action with a reason rather
-                    // than letting the user fill the form and fail at submit.
+                    // Over a PC/SC reader (NFC/contact) we skip the best-effort
+                    // serial and device-config reads and go straight to the entry
+                    // enumeration — exactly what the CLI `otp list` does. Two
+                    // reasons: (1) `read_serial` selects the FIDO applet for the
+                    // serial, a detour only needed for display; (2) some contact
+                    // (T=0) readers stall on the Case-2 `READ_CONFIG` APDU, which
+                    // would hang the whole list. Both are cosmetic (serial string,
+                    // HOTP-on-touch hints), so their absence degrades gracefully.
+                    let pcsc = session.is_pcsc();
+                    let serial = if pcsc {
+                        None
+                    } else {
+                        session
+                            .read_serial()
+                            .ok()
+                            .map(|sn| sn.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    };
                     // Read the device config once; derive both the touch-HOTP
-                    // availability and the interface states from it. On some
-                    // firmware the full config block is only served over USB-HID
-                    // (CCID/NFC answers READ_CONFIG with a 1-byte stub, which
-                    // `read_config` rejects). We do NOT force a HID read here:
-                    // Windows restricts the FIDO HID interface for non-elevated
-                    // processes, so forcing it would surface an "access denied"
-                    // error on a path that should degrade quietly. If config is
-                    // unavailable, status simply shows as unknown.
-                    let dev_info = session.read_device_info().ok();
+                    // availability and the interface states from it. Skipped over
+                    // PC/SC (see above) — `dev_info` stays None, which the match
+                    // arms below already treat as "unknown" rather than blocking.
+                    let dev_info = if pcsc {
+                        None
+                    } else {
+                        session.read_device_info().ok()
+                    };
                     let (touch_ok, touch_why): (Option<bool>, Option<&'static str>) =
                         match &dev_info {
                             Some(info) => {

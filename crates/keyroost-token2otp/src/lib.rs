@@ -171,9 +171,19 @@ pub fn build_apdu(header: [u8; 4], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(7 + len);
     out.extend_from_slice(&header);
     if len > 0 {
-        out.push(0x00);
-        out.push((len >> 8) as u8);
-        out.push((len & 0xFF) as u8);
+        if len <= 0xFF {
+            // Short-form Lc (single byte). Required for T=0 contact readers,
+            // which reject the extended (3-byte `00 hi lo`) form with 6700
+            // ("wrong length"); short form is equally valid over T=CL (NFC) and
+            // USB-HID, so it's the safe universal encoding. Every OTP command
+            // body fits well under 255 bytes (seeds, timestamps, flags).
+            out.push(len as u8);
+        } else {
+            // Extended Lc for the (unused in practice) >255-byte case.
+            out.push(0x00);
+            out.push((len >> 8) as u8);
+            out.push((len & 0xFF) as u8);
+        }
         out.extend_from_slice(data);
     }
     // erase-all (WRITE_SEED with empty data) sends no Lc/Le at all — just the
@@ -509,8 +519,9 @@ mod tests {
     }
 
     #[test]
-    fn extended_apdu_layout() {
-        // ENUM_CODES READ_ALL at t=0 (spec §10.1 host frame).
+    fn enum_codes_apdu_layout() {
+        // ENUM_CODES READ_ALL at t=0 (spec §10.1 host frame). A 9-byte body uses
+        // short-form Lc (single 0x09), the encoding T=0 contact readers accept.
         let mut data = vec![cmd::SUB_READ_ALL];
         data.extend_from_slice(&0u64.to_be_bytes());
         let apdu = build_apdu(cmd::ENUM_CODES, &data);
@@ -518,7 +529,7 @@ mod tests {
             apdu,
             vec![
                 0x80, 0xC5, 0x05, 0x00, // header
-                0x00, 0x00, 0x09, // extended Lc = 9
+                0x09, // short Lc = 9
                 0x03, // READ_ALL
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // u64 ts = 0
             ]
@@ -562,9 +573,10 @@ mod tests {
             Err(SetDeviceTypeError::WouldBrick)
         );
         // disabling just the keyboard leaves FIDO+CCID — allowed (spec §6.8 example).
+        // Short-form Lc (single 0x01) for the 1-byte mask body.
         assert_eq!(
             set_device_type(DEV_KEYBOARD).unwrap(),
-            vec![0x80, 0xC5, 0x02, 0x01, 0x00, 0x00, 0x01, 0x02]
+            vec![0x80, 0xC5, 0x02, 0x01, 0x01, 0x02]
         );
     }
 

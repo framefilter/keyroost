@@ -24,6 +24,7 @@ keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.1" }
 keyroost-resolve = { path = "../keyroost-resolve", version = "0.7.1" }
 keyroost-oath = { path = "../keyroost-oath", version = "0.7.1" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.1" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.1" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.1" }
 keyroost-qr = { path = "../keyroost-qr", version = "0.7.1" }
 keyroost-import = { path = "../keyroost-import", version = "0.7.1", features = ["bulk", "encrypted"] }

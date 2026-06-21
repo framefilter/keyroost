@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 keyroost-proto = { path = "../keyroost-proto", version = "0.7.1" }
 keyroost-transport = { path = "../keyroost-transport", version = "0.7.1" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.1" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.1" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.7.1" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.7.1" }
@@ -55,6 +56,16 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "w
 # completion on a throwaway helper thread. Already in the tree via rfd; declared
 # directly so `pollster::block_on` is callable.
 pollster = "0.4"
+
+# QR-from-screen scanning (optional; `--features qr`). Only the screen capture
+# is new here — decoding reuses keyroost-qr (already a dependency). `screenshots`
+# is pinned to match the workspace's Rust 1.75 toolchain.
+screenshots = { version = "=0.5.4", optional = true }
+
+[features]
+# Scan a TOTP QR shown on screen to fill a seed/profile form. Adds the
+# `screenshots` capture dependency; decoding/parsing are already in the tree.
+qr = ["dep:screenshots"]
 
 # cargo-binstall support: `cargo binstall` fetches the existing attested
 # GitHub release archives (same artifacts, same SHA256SUMS/provenance)

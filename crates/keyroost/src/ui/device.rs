@@ -31,7 +31,7 @@ impl DeviceView for Device {
     }
 
     fn tabs(&self) -> Vec<CapTab> {
-        if self.kind == DeviceKind::Token {
+        if self.kind == DeviceKind::Token || self.kind == DeviceKind::ProgToken {
             return Vec::new();
         }
         let mut v = vec![CapTab::Overview];

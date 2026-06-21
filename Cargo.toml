@@ -14,6 +14,7 @@ members = [
     "crates/keyroost-openpgp",
     "crates/keyroost-piv",
     "crates/keyroost-token2otp",
+    "crates/keyroost-token2prog",
     "crates/keyroost-rsakey",
     "crates/keyroost-qr",
     "crates/keyroost-import",

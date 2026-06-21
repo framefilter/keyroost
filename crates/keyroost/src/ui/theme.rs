@@ -361,6 +361,81 @@ pub fn button(ui: &mut egui::Ui, p: &Palette, kind: BtnKind, label: &str) -> Res
     resp
 }
 
+/// Like [`button`], but reserves room for a small icon on the left, inside the
+/// button. Returns the response and the center point at which the caller should
+/// paint the icon (using the returned foreground color), so the icon and label
+/// read as one control. `icon_w` is the icon's box width in points.
+pub fn button_with_icon(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    kind: BtnKind,
+    label: &str,
+    icon_w: f32,
+) -> (Response, egui::Pos2, Color32) {
+    let (base_fill, base_fg, base_stroke) = match kind {
+        BtnKind::Primary => (p.accent, p.accent_ink, Stroke::NONE),
+        BtnKind::Default => (p.raised2, p.txt, Stroke::new(1.0, p.line)),
+        BtnKind::Ghost => (Color32::TRANSPARENT, p.txt2, Stroke::new(1.0, p.line)),
+        BtnKind::Danger => (p.err, p.accent_ink, Stroke::NONE),
+    };
+
+    let font = f_sb(13.0);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, base_fg);
+    let pad_x = 14.0;
+    let icon_gap = 6.0;
+    let size = egui::vec2(
+        galley.size().x + icon_w + icon_gap + pad_x * 2.0,
+        32.0,
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    let pressed = resp.is_pointer_button_down_on();
+    let hovered = resp.hovered();
+    let fill = if pressed {
+        darken(
+            if matches!(kind, BtnKind::Ghost) {
+                p.raised2
+            } else {
+                base_fill
+            },
+            0.12,
+        )
+    } else if hovered {
+        match kind {
+            BtnKind::Ghost => p.raised2,
+            BtnKind::Default => lighten(base_fill, 0.10),
+            _ => lighten(base_fill, 0.08),
+        }
+    } else {
+        base_fill
+    };
+    let stroke = if hovered && matches!(kind, BtnKind::Default | BtnKind::Ghost) {
+        Stroke::new(1.0, p.accent)
+    } else {
+        base_stroke
+    };
+    let fg = if hovered && matches!(kind, BtnKind::Ghost) {
+        p.txt
+    } else {
+        base_fg
+    };
+
+    let painter = ui.painter();
+    painter.rect(rect, Rounding::same(8.0), fill, stroke);
+    // Icon sits at the left padding; label follows after the gap.
+    let icon_center = egui::pos2(rect.left() + pad_x + icon_w * 0.5, rect.center().y);
+    let galley = painter.layout_no_wrap(label.to_owned(), f_sb(13.0), fg);
+    let label_pos = egui::pos2(
+        rect.left() + pad_x + icon_w + icon_gap,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    painter.galley(label_pos, galley, fg);
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    (resp, icon_center, fg)
+}
+
 /// Segmented control: a row of small buttons; returns the newly-clicked value.
 /// `accent` lets the Molto2 use brand/amber while the rest use the accent.
 pub fn segmented(

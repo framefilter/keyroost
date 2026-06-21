@@ -20,6 +20,7 @@ impl Caps {
     pub const PIV: Caps = Caps(1 << 3);
     pub const TOTP: Caps = Caps(1 << 4); // Molto2 programmable token
     pub const OTP: Caps = Caps(1 << 5); // Token2 FIDO key on-device OTP applet
+    pub const PROG: Caps = Caps(1 << 6); // Token2 single-profile programmable token
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
@@ -32,12 +33,14 @@ impl Caps {
     }
 }
 
-/// What kind of physical device this is. `Token` is the Molto2 family; everything
-/// else is a `Key`.
+/// What kind of physical device this is. `Token` is the Molto2 family;
+/// `ProgToken` is the single-profile programmable token; everything else is a
+/// `Key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
     Key,
     Token,
+    ProgToken,
 }
 
 /// A stable identity for a device across refreshes (effective serial, else reader
@@ -210,6 +213,30 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
             firmware: String::new(),
             caps,
             kind: DeviceKind::Token,
+            hid_path: None,
+            reader: Some(p.reader_name.clone()),
+        });
+    }
+
+    // --- 1b. Single-profile programmable tokens — flagged by their info
+    // response during the probe (no applet, no distinctive reader name).
+    for p in probes.iter().filter(|p| p.is_prog) {
+        let serial = p.prog_serial.clone().unwrap_or_default();
+        let model = keyroost_token2prog::model_for_serial(&serial)
+            .unwrap_or("Programmable token")
+            .to_string();
+        let mut caps = Caps::default();
+        caps.insert(Caps::PROG);
+        devices.push(Device {
+            id: format!("prog:{}", p.reader_name),
+            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            vendor: "Token2".into(),
+            model,
+            serial,
+            transport: "NFC · PC/SC".into(),
+            firmware: String::new(),
+            caps,
+            kind: DeviceKind::ProgToken,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
         });
@@ -426,6 +453,8 @@ mod tests {
             has_piv: piv,
             has_fido: false,
             has_otp: false,
+            is_prog: false,
+            prog_serial: None,
             yubikey_serial: yk_serial.map(str::to_owned),
             usb_bus: bus,
             usb_address: addr,

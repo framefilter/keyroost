@@ -90,6 +90,7 @@ pub fn correlated_lines(devices: &[Device]) -> Vec<String> {
         .map(|d| {
             let kind = match d.kind {
                 DeviceKind::Token => "Token",
+                DeviceKind::ProgToken => "Programmable token",
                 DeviceKind::Key => "Key",
             };
             let pairing = match (&d.hid_path, &d.reader) {

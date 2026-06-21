@@ -57,9 +57,26 @@ const RECV_BUF: usize = 4096;
 
 /// A FIDO2 authenticator reached over a PC/SC reader (NFC or contact).
 pub struct CtapPcscDevice {
-    card: Card,
+    /// `Option` so `Drop` can `take()` the card and disconnect it with
+    /// `LeaveCard` (the `pcsc` default `Drop` resets the card, which disturbs a
+    /// concurrent OTP read on the same contact reader — see the `Drop` impl).
+    card: Option<Card>,
     /// Applet-select answer (`U2F_V2` / `FIDO_2_0`), retained for diagnostics.
     selected_version: Vec<u8>,
+}
+
+impl Drop for CtapPcscDevice {
+    fn drop(&mut self) {
+        // The pcsc crate's default Card drop hard-codes Disposition::ResetCard,
+        // which resets the smart card. On a contact reader that reset collides
+        // with any other session on the same card (e.g. the on-device OTP read
+        // that runs right after the FIDO get-info), surfacing as
+        // SCARD_W_RESET_CARD / a comms error. Disconnect with LeaveCard instead
+        // so dropping a FIDO session leaves the card untouched.
+        if let Some(card) = self.card.take() {
+            let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+        }
+    }
 }
 
 impl CtapPcscDevice {
@@ -75,7 +92,7 @@ impl CtapPcscDevice {
             .connect(&cname, ShareMode::Shared, Protocols::ANY)
             .map_err(|e| CtapError::Transport(format!("connect to reader failed: {e}")))?;
         let mut dev = CtapPcscDevice {
-            card,
+            card: Some(card),
             selected_version: Vec::new(),
         };
         dev.select_fido_applet()?;
@@ -92,7 +109,7 @@ impl CtapPcscDevice {
         let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, FIDO_AID.len() as u8];
         apdu.extend_from_slice(&FIDO_AID);
         apdu.push(0x00); // Le
-        let (data, sw1, sw2) = self.exchange(&apdu)?;
+        let (data, sw1, sw2) = self.exchange_full(&apdu)?;
         if (sw1, sw2) != (0x90, 0x00) {
             return Err(CtapError::Transport(format!(
                 "FIDO applet not present on this card (SELECT -> {sw1:02X}{sw2:02X})"
@@ -105,8 +122,11 @@ impl CtapPcscDevice {
     /// One raw APDU exchange. Returns `(response_data, sw1, sw2)`.
     fn exchange(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), CtapError> {
         let mut buf = [0u8; RECV_BUF];
-        let resp = self
+        let card = self
             .card
+            .as_mut()
+            .ok_or_else(|| CtapError::Transport("card already disconnected".into()))?;
+        let resp = card
             .transmit(apdu, &mut buf)
             .map_err(|e| CtapError::Transport(format!("APDU transmit failed: {e}")))?;
         if resp.len() < 2 {
@@ -117,6 +137,58 @@ impl CtapPcscDevice {
         }
         let (data, sw) = resp.split_at(resp.len() - 2);
         Ok((data.to_vec(), sw[0], sw[1]))
+    }
+
+    /// Perform one APDU exchange and then drain any continuation the card
+    /// signals, returning the fully-reassembled response data and the final
+    /// status word.
+    ///
+    /// This is required for **contact (T=0)** readers: where an NFC (T=CL) card
+    /// returns the response body inline with `90 00`, a T=0 card replies `61 XX`
+    /// ("XX more bytes available — issue GET RESPONSE") and only yields the body
+    /// across follow-up `00 C0 00 00 XX` calls. `6C XX` ("wrong Le, retry with
+    /// XX") is handled by re-issuing the original APDU with the suggested length.
+    /// `91 XX` is the NFC keep-alive (NFCCTAP_GETRESPONSE pending). Handling all
+    /// of these in one place lets both applet SELECT and CTAP message exchange
+    /// work over contact and contactless alike.
+    fn exchange_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), CtapError> {
+        let (mut data, mut sw1, mut sw2) = self.exchange(apdu)?;
+        loop {
+            match (sw1, sw2) {
+                (0x90, 0x00) => break,
+                // More data available: GET RESPONSE for sw2 bytes (0 => 256).
+                (0x61, n) => {
+                    let get_response = [GET_RESPONSE_CLA, GET_RESPONSE_INS, 0x00, 0x00, n];
+                    let (more, s1, s2) = self.exchange(&get_response)?;
+                    data.extend_from_slice(&more);
+                    sw1 = s1;
+                    sw2 = s2;
+                }
+                // Wrong Le under T=0: re-issue the same command with the
+                // length the card asked for (sw2), then continue draining.
+                (0x6C, n) => {
+                    let mut retry = apdu.to_vec();
+                    // Replace/append the Le byte with the card-suggested length.
+                    if let Some(last) = retry.last_mut() {
+                        *last = n;
+                    }
+                    let (again, s1, s2) = self.exchange(&retry)?;
+                    data = again;
+                    sw1 = s1;
+                    sw2 = s2;
+                }
+                // NFC keep-alive / processing: re-poll with GET RESPONSE.
+                (0x91, _) => {
+                    let get_response = [GET_RESPONSE_CLA, GET_RESPONSE_INS, 0x00, 0x00, 0x00];
+                    let (more, s1, s2) = self.exchange(&get_response)?;
+                    data.extend_from_slice(&more);
+                    sw1 = s1;
+                    sw2 = s2;
+                }
+                _ => break,
+            }
+        }
+        Ok((data, sw1, sw2))
     }
 
     /// Send a full CTAP message body (command byte + CBOR) wrapped in
@@ -141,47 +213,28 @@ impl CtapPcscDevice {
             let mut apdu = vec![cla, NFCCTAP_INS, 0x00, 0x00, chunk.len() as u8];
             apdu.extend_from_slice(chunk);
             apdu.push(0x00); // Le — expect a response
-            last = self.exchange(&apdu)?;
-            // Non-final chaining APDUs should answer 90 00 with no data.
-            if !is_last && (last.1, last.2) != (0x90, 0x00) {
-                return Err(CtapError::Transport(format!(
-                    "command chaining rejected (SW {:02X}{:02X})",
-                    last.1, last.2
-                )));
-            }
-        }
-
-        let (mut data, mut sw1, mut sw2) = last;
-
-        // Pull any continued response.
-        loop {
-            match (sw1, sw2) {
-                (0x90, 0x00) => break,
-                // More data available: GET RESPONSE for sw2 bytes (0 => 256).
-                (0x61, n) => {
-                    let le = n;
-                    let apdu = [GET_RESPONSE_CLA, GET_RESPONSE_INS, 0x00, 0x00, le];
-                    let (more, s1, s2) = self.exchange(&apdu)?;
-                    data.extend_from_slice(&more);
-                    sw1 = s1;
-                    sw2 = s2;
-                }
-                // NFC keep-alive / processing: re-poll with GET RESPONSE.
-                (0x91, _) => {
-                    let apdu = [GET_RESPONSE_CLA, GET_RESPONSE_INS, 0x00, 0x00, 0x00];
-                    let (more, s1, s2) = self.exchange(&apdu)?;
-                    data.extend_from_slice(&more);
-                    sw1 = s1;
-                    sw2 = s2;
-                }
-                (s1, s2) => {
+            if is_last {
+                // Final piece: drain any 61xx/6Cxx/91xx continuation (contact T=0
+                // and NFC keep-alive) into the full response.
+                last = self.exchange_full(&apdu)?;
+            } else {
+                // Non-final chaining APDUs should answer 90 00 with no data.
+                let r = self.exchange(&apdu)?;
+                if (r.1, r.2) != (0x90, 0x00) {
                     return Err(CtapError::Transport(format!(
-                        "authenticator returned ISO status {s1:02X}{s2:02X}"
+                        "command chaining rejected (SW {:02X}{:02X})",
+                        r.1, r.2
                     )));
                 }
             }
         }
 
+        let (data, sw1, sw2) = last;
+        if (sw1, sw2) != (0x90, 0x00) {
+            return Err(CtapError::Transport(format!(
+                "authenticator returned ISO status {sw1:02X}{sw2:02X}"
+            )));
+        }
         Ok(data)
     }
 }

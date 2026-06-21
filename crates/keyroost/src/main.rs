@@ -8,6 +8,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod otp_pane;
+#[cfg(feature = "qr")]
+mod qrscan;
 mod settings;
 mod ui;
 use otp_pane::OtpState;
@@ -21,6 +23,7 @@ use keyroost_proto::commands::{
     DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep, DEFAULT_CUSTOMER_KEY,
 };
 use keyroost_transport::{DeviceInfo, Session, TransportError};
+use keyroost_transport::Token2ProgSession;
 
 use keyroost_ctap::client_pin::PinUvAuthToken;
 use keyroost_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
@@ -1089,6 +1092,20 @@ struct App {
     info: Option<DeviceInfo>,
     /// Whether the session has been authenticated.
     authenticated: bool,
+    /// Active single-profile programmable-token session, if any.
+    prog_session: Option<keyroost_transport::Token2ProgSession>,
+    /// Last programmable-token info read (serial + on-device UTC time).
+    prog_info: Option<keyroost_token2prog::Info>,
+    /// Whether the programmable-token session has been authenticated.
+    prog_authenticated: bool,
+    /// Form state for programming the prog token (seed + config inputs).
+    prog_seed_input: String,
+    prog_seed_hex: bool,
+    prog_algo_sha256: bool,
+    prog_step_60: bool,
+    prog_timeout_idx: usize,
+    /// Last burn result for the prog pane: (success, message). Shown inline.
+    prog_status: Option<(bool, String)>,
     /// Customer key text the user typed.
     customer_key_input: String,
     /// Treat customer_key_input as hex vs ASCII.
@@ -1766,6 +1783,19 @@ impl App {
                 app.log(sev, format!("time-sync-all: {} ok, {} failed", ok, fail));
             })
         });
+    }
+
+    /// Scan a TOTP QR from the screen, then run the normal otpauth import to
+    /// fill the Molto2 draft — reusing the same parse+fill path as paste-a-URI.
+    #[cfg(feature = "qr")]
+    fn molto_scan_qr(&mut self) {
+        match qrscan::scan_screens_for_otpauth() {
+            Ok(uri) => {
+                self.import_dialog.uri = uri;
+                self.import_otpauth();
+            }
+            Err(e) => self.log(Severity::Err, format!("scan QR: {e}")),
+        }
     }
 
     fn import_otpauth(&mut self) {
@@ -4010,6 +4040,7 @@ impl App {
         };
         match dev.kind {
             DeviceKind::Token => self.open_molto(),
+            DeviceKind::ProgToken => self.open_prog(),
             DeviceKind::Key if dev.caps.has(Caps::FIDO2) => self.fetch_selected_info(),
             DeviceKind::Key => {}
         }
@@ -4048,6 +4079,34 @@ impl App {
                     app.authenticated = false;
                 }
                 Err(e) => app.log(Severity::Err, format!("open Molto2: {e}")),
+            })
+        });
+    }
+
+    /// Open the selected programmable token's PC/SC session and read its info,
+    /// so the pane can show the model, serial and on-device clock.
+    fn open_prog(&mut self) {
+        let Some(reader) = self.selected_device().and_then(|d| d.reader.clone()) else {
+            return;
+        };
+        self.spawn_job("Opening token\u{2026}", move || {
+            let result =
+                (|| -> Result<(Token2ProgSession, keyroost_token2prog::Info), TransportError> {
+                    let mut s = Token2ProgSession::open_named(&reader)?;
+                    let info = s.read_info()?;
+                    Ok((s, info))
+                })();
+            Box::new(move |app: &mut App| match result {
+                Ok((s, info)) => {
+                    app.log(
+                        Severity::Ok,
+                        format!("opened programmable token {}", info.serial),
+                    );
+                    app.prog_session = Some(s);
+                    app.prog_info = Some(info);
+                    app.prog_authenticated = false;
+                }
+                Err(e) => app.log(Severity::Err, format!("open token: {e}")),
             })
         });
     }
@@ -5172,6 +5231,27 @@ fn paint_refresh_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Co
 }
 
 /// Two stacked sheets — copy.
+/// Format a Unix timestamp (seconds) as a human-readable UTC string
+/// `YYYY-MM-DD HH:MM:SS UTC`. Self-contained civil-date conversion (Howard
+/// Hinnant's algorithm) so no date crate is pulled in.
+fn fmt_unix_utc(secs: u32) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // days since 1970-01-01 -> civil date
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} UTC")
+}
+
 fn paint_copy_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     let s = egui::Stroke::new(1.3, color);
     let back = egui::Rect::from_min_size(center + egui::vec2(-1.0, -5.0), egui::vec2(7.0, 8.0));
@@ -5179,6 +5259,30 @@ fn paint_copy_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     ui.painter().rect_stroke(back, egui::Rounding::same(1.5), s);
     ui.painter()
         .rect_stroke(front, egui::Rounding::same(1.5), s);
+}
+
+/// A small QR-glyph: three finder squares plus a couple of module dots.
+fn paint_qr_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.2, color);
+    // Three finder squares (top-left, top-right, bottom-left).
+    let finder = |min: egui::Vec2| {
+        let r = egui::Rect::from_min_size(center + min, egui::vec2(3.4, 3.4));
+        ui.painter().rect_stroke(r, egui::Rounding::same(0.6), s);
+    };
+    finder(egui::vec2(-5.0, -5.0));
+    finder(egui::vec2(1.6, -5.0));
+    finder(egui::vec2(-5.0, 1.6));
+    // A few modules in the data quadrant so it reads as a QR, not four boxes.
+    let dot = |off: egui::Vec2| {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(center + off, egui::vec2(1.2, 1.2)),
+            egui::Rounding::ZERO,
+            color,
+        );
+    };
+    dot(egui::vec2(2.0, 2.0));
+    dot(egui::vec2(4.0, 4.0));
+    dot(egui::vec2(2.0, 4.4));
 }
 
 /// Checkmark — copied / confirmed.
@@ -5257,7 +5361,7 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
         );
     }
 
-    let token = dev.kind == DeviceKind::Token;
+    let token = dev.kind == DeviceKind::Token || dev.kind == DeviceKind::ProgToken;
     let tile = egui::Rect::from_min_size(
         rect.left_top() + egui::vec2(14.0, (h - 38.0) / 2.0),
         egui::vec2(38.0, 38.0),
@@ -5592,8 +5696,15 @@ impl App {
     /// Top bar: brand · "keyroost" · connected count | accents · theme · Learn ·
     /// Activity log · Refresh.
     fn top_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+        // The bar height must track the zoom factor: at a larger text size the
+        // glyph tile, labels and icons are all scaled up, and a fixed 52px panel
+        // would clip them and let the left content overrun the right-hand
+        // controls. Scale the base height by the live zoom so the bar grows with
+        // its contents (clamped so it never collapses below the base).
+        let zoom = theme::clamp_zoom(ctx.zoom_factor());
+        let bar_h = (52.0 * zoom).max(52.0);
         egui::TopBottomPanel::top("bar")
-            .exact_height(52.0)
+            .exact_height(bar_h)
             .frame(panel_frame(p.bar, 16.0, 0.0))
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -5616,10 +5727,16 @@ impl App {
                         ui.add_space(12.0);
                         ui.spinner();
                         if let Some(label) = &self.busy_label {
-                            ui.label(
-                                egui::RichText::new(label.as_str())
-                                    .font(theme::f_reg(12.0))
-                                    .color(p.txt3),
+                            // Truncate so a long status never pushes the left
+                            // content into the right-hand controls (overlap on
+                            // small / zoomed layouts).
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label.as_str())
+                                        .font(theme::f_reg(12.0))
+                                        .color(p.txt3),
+                                )
+                                .truncate(),
                             );
                         }
                     }
@@ -5776,6 +5893,42 @@ impl App {
         style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.txt2);
         style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.txt);
         style.spacing.slider_width = 92.0;
+
+        // [+] / [−] steppers flanking the slider, each nudging the size by 1%
+        // (0.01). The bar is laid out right-to-left, so to read "[−] slider [+]"
+        // left-to-right we emit the [+] first, then the slider, then the [−].
+        // A small closure paints one square stepper button and reports clicks.
+        let step = |ui: &mut egui::Ui, glyph: &str| -> bool {
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            let hot = resp.hovered();
+            ui.painter().rect_filled(
+                rect,
+                3.0,
+                if hot {
+                    theme::lighten(p.raised2, 0.08)
+                } else {
+                    p.raised2
+                },
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                theme::f_sb(13.0),
+                if hot { p.txt } else { p.txt2 },
+            );
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+        };
+
+        // [+] (rightmost of the trio in this RTL row).
+        if step(ui, "+") {
+            factor = theme::clamp_zoom(factor + 0.01);
+            ui.ctx().set_zoom_factor(factor);
+            self.zoom_pending = None;
+        }
+        ui.add_space(4.0);
+
         let resp = ui.add(
             egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX).show_value(false),
         );
@@ -5793,6 +5946,15 @@ impl App {
             self.zoom_pending = None;
         }
         resp.on_hover_text("Text size — scales the whole interface (Ctrl + / Ctrl − also work)");
+
+        ui.add_space(4.0);
+        // [−] (leftmost of the trio).
+        if step(ui, "\u{2212}") {
+            factor = theme::clamp_zoom(factor - 0.01);
+            ui.ctx().set_zoom_factor(factor);
+            self.zoom_pending = None;
+        }
+
         ui.add_space(7.0);
 
         // Label.
@@ -5982,6 +6144,9 @@ impl App {
                 match self.selected_device().cloned() {
                     None => self.empty_state(ui, p),
                     Some(dev) if dev.kind == DeviceKind::Token => self.molto_view(ui, p, &dev),
+                    Some(dev) if dev.kind == DeviceKind::ProgToken => {
+                        self.prog_view(ui, p, &dev)
+                    }
                     Some(dev) => {
                         // Cap the content column to a readable width and center it.
                         // At wide window sizes a full-width card flings its label to
@@ -10349,6 +10514,22 @@ impl App {
                                     self.import_dialog.open = true;
                                 }
                                 ui.add_space(6.0);
+                                #[cfg(feature = "qr")]
+                                {
+                                    let (resp, icon_center, fg) = theme::button_with_icon(
+                                        ui,
+                                        p,
+                                        BtnKind::Default,
+                                        "Scan QR",
+                                        14.0,
+                                    );
+                                    paint_qr_icon(ui, icon_center, fg);
+                                    if resp.clicked() {
+                                        self.molto_scan_qr();
+                                    }
+                                }
+                                #[cfg(feature = "qr")]
+                                ui.add_space(6.0);
                                 if theme::button(ui, p, BtnKind::Default, "Sync time").clicked() {
                                     self.sync_time_selected();
                                 }
@@ -10357,6 +10538,262 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// Pane for the single-profile programmable token: shows model/serial/clock
+    /// and a form to program a seed + configuration. Uses the brand accent like
+    /// the Molto2 view.
+    fn prog_view(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let mp = Palette {
+            accent: p.brand,
+            ..*p
+        };
+        let p = &mp;
+
+        // Hero: brand tile + model + serial + on-device clock.
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(26.0, 16.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    glyph_tile(ui, 46.0, p.brand, p.accent_ink, None);
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(dev.title())
+                                .font(theme::f_bold(18.0))
+                                .color(p.txt),
+                        );
+                        let serial = self
+                            .prog_info
+                            .as_ref()
+                            .map(|i| i.serial.clone())
+                            .unwrap_or_else(|| dev.serial.clone());
+                        ui.label(
+                            egui::RichText::new(format!("Token2 · serial {serial}"))
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt2),
+                        );
+                        if let Some(info) = &self.prog_info {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "device clock (UTC): {}",
+                                    fmt_unix_utc(info.utc_time)
+                                ))
+                                    .font(theme::f_reg(12.0))
+                                    .color(p.txt3),
+                            );
+                        }
+                    });
+                });
+            });
+
+        ui.separator();
+
+        // Program form.
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(26.0, 12.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Program seed & configuration")
+                        .font(theme::f_sb(14.0))
+                        .color(p.txt),
+                );
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Seed:").font(theme::f_reg(12.5)).color(p.txt2));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.prog_seed_input)
+                            .desired_width(320.0)
+                            .hint_text(if self.prog_seed_hex { "hex" } else { "base32" }),
+                    );
+                    ui.checkbox(&mut self.prog_seed_hex, "hex");
+                });
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Algorithm:").font(theme::f_reg(12.5)).color(p.txt2));
+                    egui::ComboBox::from_id_salt("prog-algo")
+                        .selected_text(if self.prog_algo_sha256 { "SHA256" } else { "SHA1" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.prog_algo_sha256, false, "SHA1");
+                            ui.selectable_value(&mut self.prog_algo_sha256, true, "SHA256");
+                        });
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("Time step:").font(theme::f_reg(12.5)).color(p.txt2));
+                    egui::ComboBox::from_id_salt("prog-step")
+                        .selected_text(if self.prog_step_60 { "60s" } else { "30s" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.prog_step_60, false, "30s");
+                            ui.selectable_value(&mut self.prog_step_60, true, "60s");
+                        });
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("Sleep:").font(theme::f_reg(12.5)).color(p.txt2));
+                    let timeouts = ["15s", "30s", "60s", "120s"];
+                    egui::ComboBox::from_id_salt("prog-timeout")
+                        .selected_text(timeouts[self.prog_timeout_idx.min(3)])
+                        .show_ui(ui, |ui| {
+                            for (i, t) in timeouts.iter().enumerate() {
+                                ui.selectable_value(&mut self.prog_timeout_idx, i, *t);
+                            }
+                        });
+                });
+                ui.add_space(12.0);
+
+                let busy = self.busy();
+                let can_burn = !busy && !self.prog_seed_input.trim().is_empty();
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(can_burn, |ui| {
+                        if theme::button(ui, p, BtnKind::Primary, "Burn seed").clicked() {
+                            self.prog_burn();
+                        }
+                    });
+                    #[cfg(feature = "qr")]
+                    {
+                        ui.add_space(6.0);
+                        let (resp, icon_center, fg) =
+                            theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
+                        paint_qr_icon(ui, icon_center, fg);
+                        if resp.clicked() {
+                            self.prog_scan_qr();
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Sets the configuration (clock + parameters) and writes the seed.",
+                    )
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+                );
+
+                if let Some((ok, msg)) = &self.prog_status {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .font(theme::f_sb(12.5))
+                            .color(if *ok { p.ok } else { p.err }),
+                    );
+                }
+            });
+    }
+
+    /// Authenticate (fixed device key) and program config + seed in one job.
+    fn prog_burn(&mut self) {
+        self.prog_status = None;
+        let Some(reader) = self.selected_device().and_then(|d| d.reader.clone()) else {
+            return;
+        };
+        // Decode the seed up front so input errors surface before any I/O.
+        let raw = self.prog_seed_input.trim().to_string();
+        let seed = if self.prog_seed_hex {
+            keyroost_proto::codec::hex_decode(&raw)
+        } else {
+            keyroost_proto::codec::base32_decode(&raw)
+        };
+        let seed = match seed {
+            Ok(s) if !s.is_empty() && s.len() <= 63 => s,
+            Ok(s) => {
+                self.log(Severity::Err, format!("seed length {} out of range (1..=63)", s.len()));
+                return;
+            }
+            Err(e) => {
+                self.log(Severity::Err, format!("invalid seed: {e}"));
+                return;
+            }
+        };
+        // Pad short seeds to the standard 20-byte TOTP length with trailing
+        // zero bytes, matching the vendor tool. Without this a 10-byte base32
+        // secret is stored as 10 bytes and the device's codes won't match an
+        // authenticator app that uses the same secret padded to 20 bytes.
+        let seed = keyroost_token2prog::pad_totp_seed(seed);
+        let algo = if self.prog_algo_sha256 {
+            keyroost_token2prog::HmacAlgo::Sha256
+        } else {
+            keyroost_token2prog::HmacAlgo::Sha1
+        };
+        let step = if self.prog_step_60 {
+            keyroost_token2prog::TimeStep::Seconds60
+        } else {
+            keyroost_token2prog::TimeStep::Seconds30
+        };
+        let timeout = match self.prog_timeout_idx {
+            0 => keyroost_token2prog::DisplayTimeout::Sec15,
+            2 => keyroost_token2prog::DisplayTimeout::Sec60,
+            3 => keyroost_token2prog::DisplayTimeout::Sec120,
+            _ => keyroost_token2prog::DisplayTimeout::Sec30,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+
+        self.spawn_job("Programming token\u{2026}", move || {
+            let result = (|| -> Result<(), TransportError> {
+                let mut s = Token2ProgSession::open_named(&reader)?;
+                s.authenticate()?;
+                let cfg = keyroost_token2prog::Config {
+                    display_timeout: timeout,
+                    algorithm: algo,
+                    time_step: step,
+                    utc_time: now,
+                };
+                s.set_config(&cfg)?;
+                s.set_seed(&seed)?;
+                Ok(())
+            })();
+            Box::new(move |app: &mut App| match result {
+                Ok(()) => {
+                    app.log(Severity::Ok, "programmed token (config + seed)".to_string());
+                    app.prog_status =
+                        Some((true, "Seed and configuration programmed successfully.".to_string()));
+                    app.prog_seed_input.clear();
+                }
+                Err(e) => {
+                    app.log(Severity::Err, format!("program token: {e}"));
+                    app.prog_status = Some((false, format!("Programming failed: {e}")));
+                }
+            })
+        });
+    }
+
+    /// Scan a TOTP QR from the screen and fill the prog seed form from it.
+    #[cfg(feature = "qr")]
+    fn prog_scan_qr(&mut self) {
+        self.prog_status = None;
+        let uri = match qrscan::scan_screens_for_otpauth() {
+            Ok(u) => u,
+            Err(e) => {
+                self.prog_status = Some((false, e));
+                return;
+            }
+        };
+        let parsed = match parse_otpauth(&uri) {
+            Ok(p) => p,
+            Err(e) => {
+                self.prog_status = Some((false, format!("QR parse failed: {e}")));
+                return;
+            }
+        };
+        // Fill the seed with the original base32 secret from the URI.
+        let secret = uri
+            .find("secret=")
+            .map(|i| {
+                let rest = &uri[i + 7..];
+                let end = rest.find('&').unwrap_or(rest.len());
+                rest[..end].to_owned()
+            })
+            .unwrap_or_default();
+        if secret.is_empty() {
+            self.prog_status = Some((false, "scanned QR has no secret".into()));
+            return;
+        }
+        self.prog_seed_input = secret;
+        self.prog_seed_hex = false;
+        self.prog_algo_sha256 = matches!(parsed.algorithm, HmacAlgo::Sha256);
+        self.prog_step_60 = matches!(parsed.time_step, TimeStep::Seconds60);
+        self.prog_status = Some((true, "Filled seed and parameters from the scanned QR.".into()));
     }
 
     /// The Molto2 import dialogs (otpauth:// + bulk). Reused verbatim from the

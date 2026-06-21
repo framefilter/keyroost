@@ -32,6 +32,9 @@ pub use oath::OathSession;
 mod ctap_pcsc;
 pub use ctap_pcsc::CtapPcscDevice;
 
+mod token2prog;
+pub use token2prog::Token2ProgSession;
+
 mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
@@ -587,6 +590,13 @@ pub struct ReaderProbe {
     /// than guessing from the reader name, so the OTP tab is offered only for
     /// keys that really have it.
     pub has_otp: bool,
+    /// True when the card answers the single-profile programmable token's
+    /// `get_info` with a serial whose prefix matches a known model. Set during
+    /// the same probe connection. The matched serial is carried in
+    /// [`ReaderProbe::prog_serial`].
+    pub is_prog: bool,
+    /// The programmable token's serial, when `is_prog` is true.
+    pub prog_serial: Option<String>,
     /// YubiKey management serial, read on the same connection when the reader is
     /// a YubiKey.
     pub yubikey_serial: Option<String>,
@@ -643,6 +653,8 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 has_piv: false,
                 has_fido: false,
                 has_otp: false,
+                is_prog: false,
+                prog_serial: None,
                 yubikey_serial: None,
                 usb_bus: None,
                 usb_address: None,
@@ -659,6 +671,8 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             has_piv: false,
             has_fido: false,
             has_otp: false,
+            is_prog: false,
+            prog_serial: None,
             yubikey_serial: None,
             usb_bus: None,
             usb_address: None,
@@ -704,6 +718,37 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 "otp",
                 keyroost_token2otp::build_select(&keyroost_token2otp::OTP_APPLET_AID),
             );
+            // Single-profile programmable token: it has no distinctive reader
+            // name and no applet to SELECT, so identify it by its info response.
+            // Only flag it when the returned serial matches a known model prefix
+            // — a generic NFC card that happens to answer won't be mislabelled.
+            // Skip if an applet already matched (a FIDO/OATH key isn't a prog
+            // token), keeping the get_info off cards that clearly aren't one.
+            if !probe.has_fido && !probe.has_oath && !probe.has_piv && !probe.has_openpgp {
+                let info = keyroost_token2prog::get_info();
+                if let Ok((data, s1, s2)) = transmit_apdu(&card, &info.apdu) {
+                    let body = if s1 == 0x61 {
+                        transmit_apdu(&card, &[0x00, 0xC0, 0x00, 0x00, s2])
+                            .map(|(d, _, _)| d)
+                            .unwrap_or(data)
+                    } else {
+                        data
+                    };
+                    let _ = (s1, s2);
+                    if let Ok(parsed) = keyroost_token2prog::parse_info(&body) {
+                        if let Some(_model) = keyroost_token2prog::model_for_serial(&parsed.serial) {
+                            probe.is_prog = true;
+                            probe.prog_serial = Some(parsed.serial);
+                            if trace {
+                                eprintln!(
+                                    "[probe]   prog token -> {:?}",
+                                    probe.prog_serial
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             // When OpenPGP is present, recover the card serial from its AID (the
             // standard OpenPGP AID encodes a 4-byte serial at offset 10). This
             // lets keys with no HID serial (e.g. Token2 PIN+) still show one.
