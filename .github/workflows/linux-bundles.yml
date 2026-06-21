@@ -61,6 +61,9 @@ jobs:
   # ===========================================================================
   appimage:
     name: AppImage (GUI, x86_64)
+    # Gate behind the same manual-approval environment publish.yml uses, so the
+    # whole release fanout waits for one approval before anything goes out.
+    environment: release-publish
     runs-on: ubuntu-latest
     permissions:
       contents: write # gh release upload writes a release asset
@@ -134,6 +137,7 @@ jobs:
   # ===========================================================================
   flatpak:
     name: Flatpak (OSTree repo + bundle)
+    environment: release-publish
     runs-on: ubuntu-latest
     # The official flatpak-builder action expects to run inside the freedesktop
     # flatpak image so the runtime/SDK + flatpak-builder are present.
@@ -221,7 +225,8 @@ jobs:
   # the .flatpak bundle to the release and push the OSTree repo to Pages.
   # ===========================================================================
   flatpak-publish:
-    name: Flatpak (attach bundle + publish to Pages)
+    name: Flatpak (attach bundle + publish to keyroost-flatpak)
+    environment: release-publish
     needs: flatpak
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
