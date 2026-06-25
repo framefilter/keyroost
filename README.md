@@ -514,6 +514,15 @@ The Molto2 wire protocol is documented in [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
 about the device rather than any one implementation. The FIDO2, OATH, and OpenPGP
 layers follow their respective public standards.
 
+## Contact
+
+General questions, packaging notes, and other non-security correspondence are
+welcome at **framefilter@proton.me**.
+
+Security issues should not go to email — please use GitHub's private
+vulnerability reporting (see [`SECURITY.md`](SECURITY.md)) so the report stays
+private until a fix ships.
+
 ## License
 
 Licensed under either of
