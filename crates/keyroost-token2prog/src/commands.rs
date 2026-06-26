@@ -173,7 +173,11 @@ pub fn set_seed(seed: &[u8]) -> Result<Command, SeedError> {
     };
 
     let enc_len = enc.len() as u8;
-    let mac_bytes = mac(&DEVICE_SM4_KEY, &[CLA_PLAIN, 0xC5, 0x01, 0x00, enc_len], &enc);
+    let mac_bytes = mac(
+        &DEVICE_SM4_KEY,
+        &[CLA_PLAIN, 0xC5, 0x01, 0x00, enc_len],
+        &enc,
+    );
 
     let mut body = enc;
     body.extend_from_slice(&mac_bytes);
@@ -303,8 +307,8 @@ pub fn parse_info(body: &[u8]) -> Result<Info, InfoError> {
     if body.len() < time_end {
         return Err(InfoError::Truncated);
     }
-    let serial =
-        core::str::from_utf8(&body[serial_start..serial_end]).map_err(|_| InfoError::SerialNotUtf8)?;
+    let serial = core::str::from_utf8(&body[serial_start..serial_end])
+        .map_err(|_| InfoError::SerialNotUtf8)?;
     let utc_time = u32::from_be_bytes([
         body[time_start],
         body[time_start + 1],
@@ -327,7 +331,9 @@ pub enum SeedError {
 impl core::fmt::Display for SeedError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            SeedError::Length(n) => write!(f, "seed length {n} out of range (must be 1..=63 bytes)"),
+            SeedError::Length(n) => {
+                write!(f, "seed length {n} out of range (must be 1..=63 bytes)")
+            }
         }
     }
 }

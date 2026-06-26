@@ -39,13 +39,19 @@ mod tests {
     #[test]
     fn get_info_apdu_form() {
         // 80 41 00 00 02 02 11
-        assert_eq!(get_info().apdu, vec![0x80, 0x41, 0x00, 0x00, 0x02, 0x02, 0x11]);
+        assert_eq!(
+            get_info().apdu,
+            vec![0x80, 0x41, 0x00, 0x00, 0x02, 0x02, 0x11]
+        );
     }
 
     #[test]
     fn get_challenge_apdu_form() {
         // 80 4B 08 00 01 00
-        assert_eq!(get_challenge().apdu, vec![0x80, 0x4B, 0x08, 0x00, 0x01, 0x00]);
+        assert_eq!(
+            get_challenge().apdu,
+            vec![0x80, 0x4B, 0x08, 0x00, 0x01, 0x00]
+        );
     }
 
     #[test]

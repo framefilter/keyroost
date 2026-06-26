@@ -365,6 +365,7 @@ pub fn button(ui: &mut egui::Ui, p: &Palette, kind: BtnKind, label: &str) -> Res
 /// button. Returns the response and the center point at which the caller should
 /// paint the icon (using the returned foreground color), so the icon and label
 /// read as one control. `icon_w` is the icon's box width in points.
+#[cfg(feature = "qr")]
 pub fn button_with_icon(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -383,10 +384,7 @@ pub fn button_with_icon(
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, base_fg);
     let pad_x = 14.0;
     let icon_gap = 6.0;
-    let size = egui::vec2(
-        galley.size().x + icon_w + icon_gap + pad_x * 2.0,
-        32.0,
-    );
+    let size = egui::vec2(galley.size().x + icon_w + icon_gap + pad_x * 2.0, 32.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
 
     let pressed = resp.is_pointer_button_down_on();

@@ -736,14 +736,12 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                     };
                     let _ = (s1, s2);
                     if let Ok(parsed) = keyroost_token2prog::parse_info(&body) {
-                        if let Some(_model) = keyroost_token2prog::model_for_serial(&parsed.serial) {
+                        if let Some(_model) = keyroost_token2prog::model_for_serial(&parsed.serial)
+                        {
                             probe.is_prog = true;
                             probe.prog_serial = Some(parsed.serial);
                             if trace {
-                                eprintln!(
-                                    "[probe]   prog token -> {:?}",
-                                    probe.prog_serial
-                                );
+                                eprintln!("[probe]   prog token -> {:?}", probe.prog_serial);
                             }
                         }
                     }

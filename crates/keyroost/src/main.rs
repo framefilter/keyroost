@@ -22,8 +22,8 @@ use keyroost_import::parse_otpauth;
 use keyroost_proto::commands::{
     DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep, DEFAULT_CUSTOMER_KEY,
 };
-use keyroost_transport::{DeviceInfo, Session, TransportError};
 use keyroost_transport::Token2ProgSession;
+use keyroost_transport::{DeviceInfo, Session, TransportError};
 
 use keyroost_ctap::client_pin::PinUvAuthToken;
 use keyroost_ctap::cred_mgmt::{Credential, CredsMetadata, RelyingParty};
@@ -5262,6 +5262,7 @@ fn paint_copy_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
 }
 
 /// A small QR-glyph: three finder squares plus a couple of module dots.
+#[cfg(feature = "qr")]
 fn paint_qr_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     let s = egui::Stroke::new(1.2, color);
     // Three finder squares (top-left, top-right, bottom-left).
@@ -5899,8 +5900,7 @@ impl App {
         // left-to-right we emit the [+] first, then the slider, then the [−].
         // A small closure paints one square stepper button and reports clicks.
         let step = |ui: &mut egui::Ui, glyph: &str| -> bool {
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
             let hot = resp.hovered();
             ui.painter().rect_filled(
                 rect,
@@ -5918,7 +5918,8 @@ impl App {
                 theme::f_sb(13.0),
                 if hot { p.txt } else { p.txt2 },
             );
-            resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
         };
 
         // [+] (rightmost of the trio in this RTL row).
@@ -6144,9 +6145,7 @@ impl App {
                 match self.selected_device().cloned() {
                     None => self.empty_state(ui, p),
                     Some(dev) if dev.kind == DeviceKind::Token => self.molto_view(ui, p, &dev),
-                    Some(dev) if dev.kind == DeviceKind::ProgToken => {
-                        self.prog_view(ui, p, &dev)
-                    }
+                    Some(dev) if dev.kind == DeviceKind::ProgToken => self.prog_view(ui, p, &dev),
                     Some(dev) => {
                         // Cap the content column to a readable width and center it.
                         // At wide window sizes a full-width card flings its label to
@@ -10579,8 +10578,8 @@ impl App {
                                     "device clock (UTC): {}",
                                     fmt_unix_utc(info.utc_time)
                                 ))
-                                    .font(theme::f_reg(12.0))
-                                    .color(p.txt3),
+                                .font(theme::f_reg(12.0))
+                                .color(p.txt3),
                             );
                         }
                     });
@@ -10601,7 +10600,11 @@ impl App {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Seed:").font(theme::f_reg(12.5)).color(p.txt2));
+                    ui.label(
+                        egui::RichText::new("Seed:")
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                    );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.prog_seed_input)
                             .desired_width(320.0)
@@ -10612,15 +10615,27 @@ impl App {
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Algorithm:").font(theme::f_reg(12.5)).color(p.txt2));
+                    ui.label(
+                        egui::RichText::new("Algorithm:")
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                    );
                     egui::ComboBox::from_id_salt("prog-algo")
-                        .selected_text(if self.prog_algo_sha256 { "SHA256" } else { "SHA1" })
+                        .selected_text(if self.prog_algo_sha256 {
+                            "SHA256"
+                        } else {
+                            "SHA1"
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.prog_algo_sha256, false, "SHA1");
                             ui.selectable_value(&mut self.prog_algo_sha256, true, "SHA256");
                         });
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("Time step:").font(theme::f_reg(12.5)).color(p.txt2));
+                    ui.label(
+                        egui::RichText::new("Time step:")
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                    );
                     egui::ComboBox::from_id_salt("prog-step")
                         .selected_text(if self.prog_step_60 { "60s" } else { "30s" })
                         .show_ui(ui, |ui| {
@@ -10628,7 +10643,11 @@ impl App {
                             ui.selectable_value(&mut self.prog_step_60, true, "60s");
                         });
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("Sleep:").font(theme::f_reg(12.5)).color(p.txt2));
+                    ui.label(
+                        egui::RichText::new("Sleep:")
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                    );
                     let timeouts = ["15s", "30s", "60s", "120s"];
                     egui::ComboBox::from_id_salt("prog-timeout")
                         .selected_text(timeouts[self.prog_timeout_idx.min(3)])
@@ -10695,7 +10714,10 @@ impl App {
         let seed = match seed {
             Ok(s) if !s.is_empty() && s.len() <= 63 => s,
             Ok(s) => {
-                self.log(Severity::Err, format!("seed length {} out of range (1..=63)", s.len()));
+                self.log(
+                    Severity::Err,
+                    format!("seed length {} out of range (1..=63)", s.len()),
+                );
                 return;
             }
             Err(e) => {
@@ -10746,8 +10768,10 @@ impl App {
             Box::new(move |app: &mut App| match result {
                 Ok(()) => {
                     app.log(Severity::Ok, "programmed token (config + seed)".to_string());
-                    app.prog_status =
-                        Some((true, "Seed and configuration programmed successfully.".to_string()));
+                    app.prog_status = Some((
+                        true,
+                        "Seed and configuration programmed successfully.".to_string(),
+                    ));
                     app.prog_seed_input.clear();
                 }
                 Err(e) => {
@@ -10793,7 +10817,10 @@ impl App {
         self.prog_seed_hex = false;
         self.prog_algo_sha256 = matches!(parsed.algorithm, HmacAlgo::Sha256);
         self.prog_step_60 = matches!(parsed.time_step, TimeStep::Seconds60);
-        self.prog_status = Some((true, "Filled seed and parameters from the scanned QR.".into()));
+        self.prog_status = Some((
+            true,
+            "Filled seed and parameters from the scanned QR.".into(),
+        ));
     }
 
     /// The Molto2 import dialogs (otpauth:// + bulk). Reused verbatim from the
