@@ -594,6 +594,16 @@ fn wipe(s: &mut String) {
     s.zeroize();
 }
 
+/// The shared "Scan QR" button: a Default button with the QR glyph painted into
+/// it. Returns `true` when clicked. Collapses the repeated
+/// `button_with_icon` + `paint_qr_icon` block at every scan-QR call site.
+#[cfg(feature = "qr")]
+pub(crate) fn scan_qr_button(ui: &mut egui::Ui, p: &Palette) -> bool {
+    let (resp, icon_center, fg) = theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
+    paint_qr_icon(ui, icon_center, fg);
+    resp.clicked()
+}
+
 /// Where an OpenPGP key import gets its key material. Mirrors the CLI's
 /// `--generate` / `--in <FILE>` choice.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1099,7 +1109,9 @@ struct App {
     /// Whether the programmable-token session has been authenticated.
     prog_authenticated: bool,
     /// Form state for programming the prog token (seed + config inputs).
-    prog_seed_input: String,
+    /// `Zeroizing` so the typed seed is scrubbed on drop, matching the OTP
+    /// dialogs' Drop-wipe (and it is also wiped on a successful burn).
+    prog_seed_input: zeroize::Zeroizing<String>,
     prog_seed_hex: bool,
     prog_algo_sha256: bool,
     prog_step_60: bool,
@@ -3140,10 +3152,7 @@ impl App {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.add_space(100.0);
-                            let (resp, icon_center, fg) =
-                                theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
-                            paint_qr_icon(ui, icon_center, fg);
-                            if resp.clicked() {
+                            if scan_qr_button(ui, p) {
                                 self.oath_scan_qr();
                             }
                         });
@@ -4166,6 +4175,7 @@ impl App {
         let Some(reader) = self.selected_device().and_then(|d| d.reader.clone()) else {
             return;
         };
+        let for_device = self.selected_device.clone();
         self.spawn_job("Opening token\u{2026}", move || {
             let result =
                 (|| -> Result<(Token2ProgSession, keyroost_token2prog::Info), TransportError> {
@@ -4173,17 +4183,22 @@ impl App {
                     let info = s.read_info()?;
                     Ok((s, info))
                 })();
-            Box::new(move |app: &mut App| match result {
-                Ok((s, info)) => {
-                    app.log(
-                        Severity::Ok,
-                        format!("opened programmable token {}", info.serial),
-                    );
-                    app.prog_session = Some(s);
-                    app.prog_info = Some(info);
-                    app.prog_authenticated = false;
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return; // user switched devices mid-open
                 }
-                Err(e) => app.log(Severity::Err, format!("open token: {e}")),
+                match result {
+                    Ok((s, info)) => {
+                        app.log(
+                            Severity::Ok,
+                            format!("opened programmable token {}", info.serial),
+                        );
+                        app.prog_session = Some(s);
+                        app.prog_info = Some(info);
+                        app.prog_authenticated = false;
+                    }
+                    Err(e) => app.log(Severity::Err, format!("open token: {e}")),
+                }
             })
         });
     }
@@ -10663,15 +10678,7 @@ impl App {
                                 ui.add_space(6.0);
                                 #[cfg(feature = "qr")]
                                 {
-                                    let (resp, icon_center, fg) = theme::button_with_icon(
-                                        ui,
-                                        p,
-                                        BtnKind::Default,
-                                        "Scan QR",
-                                        14.0,
-                                    );
-                                    paint_qr_icon(ui, icon_center, fg);
-                                    if resp.clicked() {
+                                    if scan_qr_button(ui, p) {
                                         self.molto_scan_qr();
                                     }
                                 }
@@ -10753,11 +10760,14 @@ impl App {
                             .font(theme::f_reg(12.5))
                             .color(p.txt2),
                     );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.prog_seed_input)
-                            .desired_width(320.0)
-                            .hint_text(if self.prog_seed_hex { "hex" } else { "base32" }),
-                    );
+                    let hint = if self.prog_seed_hex { "hex" } else { "base32" };
+                    let mut rev = self
+                        .secret_reveal
+                        .get("prog-seed")
+                        .copied()
+                        .unwrap_or(false);
+                    secret_edit(ui, p, &mut self.prog_seed_input, &mut rev, hint, 320.0);
+                    self.secret_reveal.insert("prog-seed", rev);
                     ui.checkbox(&mut self.prog_seed_hex, "hex");
                 });
                 ui.add_space(6.0);
@@ -10818,10 +10828,7 @@ impl App {
                     #[cfg(feature = "qr")]
                     {
                         ui.add_space(6.0);
-                        let (resp, icon_center, fg) =
-                            theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
-                        paint_qr_icon(ui, icon_center, fg);
-                        if resp.clicked() {
+                        if scan_qr_button(ui, p) {
                             self.prog_scan_qr();
                         }
                     }
@@ -10877,7 +10884,7 @@ impl App {
         // zero bytes, matching the vendor tool. Without this a 10-byte base32
         // secret is stored as 10 bytes and the device's codes won't match an
         // authenticator app that uses the same secret padded to 20 bytes.
-        let seed = keyroost_token2prog::pad_totp_seed(seed);
+        let seed = zeroize::Zeroizing::new(keyroost_token2prog::pad_totp_seed(seed));
         let algo = if self.prog_algo_sha256 {
             keyroost_token2prog::HmacAlgo::Sha256
         } else {
@@ -10898,40 +10905,59 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
+        let for_device = self.selected_device.clone();
 
         self.spawn_job("Programming token\u{2026}", move || {
-            let result = (|| -> Result<(), TransportError> {
-                let mut s = Token2ProgSession::open_named(&reader)?;
-                s.authenticate()?;
+            let result = (|| -> Result<(), String> {
+                let mut s = Token2ProgSession::open_named(&reader).map_err(|e| e.to_string())?;
+                // Refuse to program a device whose serial doesn't match a known
+                // Token2 programmable-token model (mirrors the CLI's
+                // `prog_guard_model`) — guards against writing to the wrong card
+                // on a shared reader.
+                let info = s.read_info().map_err(|e| e.to_string())?;
+                if info.model().is_none() {
+                    return Err(format!(
+                        "serial '{}' does not match any known Token2 programmable-token \
+                         model; refusing to program this device.",
+                        info.serial
+                    ));
+                }
+                s.authenticate().map_err(|e| e.to_string())?;
                 let cfg = keyroost_token2prog::Config {
                     display_timeout: timeout,
                     algorithm: algo,
                     time_step: step,
                     utc_time: now,
                 };
-                s.set_config(&cfg)?;
-                s.set_seed(&seed)?;
+                s.set_config(&cfg).map_err(|e| e.to_string())?;
+                s.set_seed(&seed).map_err(|e| e.to_string())?;
                 Ok(())
             })();
-            Box::new(move |app: &mut App| match result {
-                Ok(()) => {
-                    app.log(Severity::Ok, "programmed token (config + seed)".to_string());
-                    app.prog_status = Some((
-                        true,
-                        "Seed and configuration programmed successfully.".to_string(),
-                    ));
-                    app.prog_seed_input.clear();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return; // user switched tokens mid-program
                 }
-                Err(e) => {
-                    app.log(Severity::Err, format!("program token: {e}"));
-                    app.prog_status = Some((false, format!("Programming failed: {e}")));
+                match result {
+                    Ok(()) => {
+                        app.log(Severity::Ok, "programmed token (config + seed)".to_string());
+                        app.prog_status = Some((
+                            true,
+                            "Seed and configuration programmed successfully.".to_string(),
+                        ));
+                        // Scrub the typed seed (wipe, not clear — clear leaves the
+                        // bytes in the buffer) and re-mask it for the next entry.
+                        wipe(&mut app.prog_seed_input);
+                        app.secret_reveal.insert("prog-seed", false);
+                    }
+                    Err(e) => {
+                        app.log(Severity::Err, format!("program token: {e}"));
+                        app.prog_status = Some((false, format!("Programming failed: {e}")));
+                    }
                 }
             })
         });
     }
 
-    /// Scan a TOTP QR from the screen and fill the prog seed form from it.
-    #[cfg(feature = "qr")]
     /// Shared QR-from-screen scan: returns the base32 secret (as written in the
     /// URI) plus the parsed `OtpAuth`, so callers can fill issuer/algorithm/etc.
     #[cfg(feature = "qr")]
@@ -10993,44 +11019,25 @@ impl App {
         }
     }
 
+    /// Scan a TOTP QR from the screen and fill the prog seed form from it.
     #[cfg(feature = "qr")]
     fn prog_scan_qr(&mut self) {
         self.prog_status = None;
-        let uri = match qrscan::scan_screens_for_otpauth() {
-            Ok(u) => u,
-            Err(e) => {
-                self.prog_status = Some((false, e));
-                return;
+        match self.scan_qr_parsed() {
+            Ok((secret, parsed)) => {
+                self.prog_seed_input = zeroize::Zeroizing::new(secret);
+                self.prog_seed_hex = false;
+                // A freshly-scanned secret must not be revealed by a stale toggle.
+                self.secret_reveal.insert("prog-seed", false);
+                self.prog_algo_sha256 = matches!(parsed.algorithm, HmacAlgo::Sha256);
+                self.prog_step_60 = matches!(parsed.time_step, TimeStep::Seconds60);
+                self.prog_status = Some((
+                    true,
+                    "Filled seed and parameters from the scanned QR.".into(),
+                ));
             }
-        };
-        let parsed = match parse_otpauth(&uri) {
-            Ok(p) => p,
-            Err(e) => {
-                self.prog_status = Some((false, format!("QR parse failed: {e}")));
-                return;
-            }
-        };
-        // Fill the seed with the original base32 secret from the URI.
-        let secret = uri
-            .find("secret=")
-            .map(|i| {
-                let rest = &uri[i + 7..];
-                let end = rest.find('&').unwrap_or(rest.len());
-                rest[..end].to_owned()
-            })
-            .unwrap_or_default();
-        if secret.is_empty() {
-            self.prog_status = Some((false, "scanned QR has no secret".into()));
-            return;
+            Err(e) => self.prog_status = Some((false, e)),
         }
-        self.prog_seed_input = secret;
-        self.prog_seed_hex = false;
-        self.prog_algo_sha256 = matches!(parsed.algorithm, HmacAlgo::Sha256);
-        self.prog_step_60 = matches!(parsed.time_step, TimeStep::Seconds60);
-        self.prog_status = Some((
-            true,
-            "Filled seed and parameters from the scanned QR.".into(),
-        ));
     }
 
     /// The Molto2 import dialogs (otpauth:// + bulk). Reused verbatim from the

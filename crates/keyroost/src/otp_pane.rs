@@ -864,6 +864,9 @@ impl App {
                         dlg.numpad = st.numpad;
                     }
                     self.otp.button_hotp = dlg;
+                    // A reopened dialog must default to masked, regardless of a
+                    // reveal toggle left set from a prior entry.
+                    self.secret_reveal.insert("otp-buttonhotp-secret", false);
                 }
                 if let Some(target) = kbd_target {
                     self.otp.kbd_confirm = Some(KbdToggle {
@@ -882,6 +885,9 @@ impl App {
                     let mut dlg = OtpAddDialog::default();
                     dlg.open = true;
                     self.otp.add = dlg;
+                    // A reopened dialog must default to masked, regardless of a
+                    // reveal toggle left set from a prior entry.
+                    self.secret_reveal.insert("otp-add-secret", false);
                 }
                 ui.add_space(6.0);
                 if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
@@ -1117,10 +1123,7 @@ impl App {
                     #[cfg(feature = "qr")]
                     {
                         ui.label("");
-                        let (resp, icon_center, fg) =
-                            theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
-                        crate::paint_qr_icon(ui, icon_center, fg);
-                        if resp.clicked() {
+                        if crate::scan_qr_button(ui, p) {
                             self.otp_scan_qr();
                         }
                         ui.end_row();

@@ -141,9 +141,9 @@ pub fn pad_totp_seed(mut seed: Vec<u8>) -> Vec<u8> {
 /// `seed` is the raw key bytes (1..=63). Two on-wire forms exist, matching the
 /// vendor tool:
 ///
-/// * **≤ 16-byte effective / general case:** the seed is ISO 9797-1 padded to a
-///   block boundary, SM4-ECB encrypted, and MAC'd with the plain header
-///   `80 C5 01 00 <enc_len>`.
+/// * **General case (any length except exactly 32 bytes):** the seed is
+///   ISO 9797-1 padded to a block boundary, SM4-ECB encrypted, and MAC'd with
+///   the plain header `80 C5 01 00 <enc_len>`.
 /// * **Exactly 32 bytes:** an extra full pad block is appended (`0x80` followed
 ///   by fifteen `0x00`) before encryption — a 48-byte ciphertext — reflecting
 ///   the device's longer-seed framing.

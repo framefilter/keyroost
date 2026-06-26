@@ -102,7 +102,11 @@ impl fmt::Display for KeyringError {
                 write!(f, "serial {} is already named '{}'", serial, existing_name)
             }
             KeyringError::InvalidName(n) => {
-                write!(f, "invalid key name '{}': use 1-64 chars of [a-z0-9_-]", n)
+                write!(
+                    f,
+                    "invalid key name '{}': must be 1-64 characters and free of control, zero-width, and bidi-override characters",
+                    n
+                )
             }
         }
     }
@@ -155,7 +159,16 @@ impl fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-/// Validate a friendly name: 1-64 chars of lowercase ASCII, digits, `-`, `_`.
+/// Validate a friendly name. A name is a human-facing label, so the rules are
+/// deliberately permissive about content — letters of any case or script,
+/// digits, spaces and punctuation are all fine (e.g. `UPPER`, `Emin's Work
+/// Key`, `Clé de bureau`). Only three things are rejected:
+///
+/// * empty (or whitespace-only) names — there must be something after trimming;
+/// * names longer than 64 characters;
+/// * names containing control / zero-width / bidi-override characters (the
+///   spoofing chars [`is_spoofing_char`] guards against — they enable display
+///   spoofing in a saved name).
 pub fn validate_name(name: &str) -> Result<(), KeyringError> {
     // A friendly name is a human-facing label, so allow normal text — letters
     // (any case, any script), digits, spaces and common punctuation. The only
@@ -177,11 +190,6 @@ pub fn validate_name(name: &str) -> Result<(), KeyringError> {
     }
 }
 
-/// Remove control characters in place — terminal-escape hygiene for
-/// hand-editable fields that get echoed back to the user. Also strips the
-/// Unicode format characters used for display spoofing (`char::is_control`
-/// covers only Cc): bidi overrides/isolates (RLO can render "key-live" out
-/// of "evil-yek"), zero-width chars, BOM, and the soft/Arabic-letter marks.
 /// Control, zero-width, and bidi-override characters that enable display
 /// spoofing in a saved name. Shared by validation and sanitization.
 fn is_spoofing_char(c: char) -> bool {
@@ -189,6 +197,9 @@ fn is_spoofing_char(c: char) -> bool {
         || matches!(c,
             '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM/RLM
             | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO
+            | '\u{2028}' // line separator (Zl)
+            | '\u{2029}' // paragraph separator (Zp)
+            | '\u{2060}'..='\u{2064}' // word joiner + invisible format chars
             | '\u{2066}'..='\u{2069}' // bidi isolates
             | '\u{FEFF}' // BOM / ZWNBSP
             | '\u{00AD}' // soft hyphen
@@ -196,6 +207,12 @@ fn is_spoofing_char(c: char) -> bool {
         )
 }
 
+/// Remove control characters in place — terminal-escape hygiene for
+/// hand-editable fields that get echoed back to the user. Also strips the
+/// Unicode format characters used for display spoofing (`char::is_control`
+/// covers only Cc): bidi overrides/isolates (RLO can render "key-live" out
+/// of "evil-yek"), line/paragraph separators, zero-width chars, BOM, and the
+/// soft/Arabic-letter marks.
 fn strip_control_chars(s: &mut String) {
     if s.chars().any(is_spoofing_char) {
         s.retain(|c| !is_spoofing_char(c));
@@ -449,6 +466,17 @@ mod tests {
         assert!(validate_name("bad\u{202E}name").is_err());
         assert!(validate_name("zero\u{200B}width").is_err());
         assert!(validate_name("tab\tname").is_err());
+        // Line/paragraph separators and the word-joiner family of invisible
+        // format chars (outside the 200B..200F range) are rejected too — they
+        // can inject line breaks into or hide content from a terminal listing.
+        assert!(validate_name("line\u{2028}sep").is_err());
+        assert!(validate_name("para\u{2029}sep").is_err());
+        assert!(validate_name("word\u{2060}joiner").is_err());
+
+        // …and the same chars are stripped from a hand-edited field.
+        let mut s = "line\u{2028}sep\u{2060}word".to_string();
+        strip_control_chars(&mut s);
+        assert_eq!(s, "linesepword");
     }
 
     #[test]

@@ -344,6 +344,12 @@ impl OtpTransport for HidOtpTransport {
 pub struct PcScOtpTransport {
     card: pcsc::Card,
     debug: bool,
+    /// AID of the applet currently selected on the card. Tracked so that a
+    /// transient card reset (handled in [`raw_transmit`](Self::raw_transmit))
+    /// can re-SELECT the same applet before resending — a `ResetCard`
+    /// reconnect drops the selection done at open, and the resent command would
+    /// otherwise hit the default applet.
+    current_aid: Vec<u8>,
 }
 
 impl PcScOtpTransport {
@@ -395,7 +401,11 @@ impl PcScOtpTransport {
                 }
             };
             let Some(card) = card else { continue };
-            let mut t = PcScOtpTransport { card, debug };
+            let mut t = PcScOtpTransport {
+                card,
+                debug,
+                current_aid: Vec::new(),
+            };
             match t.select(&t2::OTP_APPLET_AID) {
                 Ok(()) => {
                     if debug {
@@ -425,6 +435,16 @@ impl PcScOtpTransport {
             let hex: String = apdu.iter().map(|b| format!("{b:02x}")).collect();
             eprintln!("[token2otp PCSC send] {hex}");
         }
+        // Remember which applet a SELECT switches us to (SELECT = `00 A4 04 00
+        // Lc aid...`), so the reset-recovery path below can re-SELECT it. This
+        // covers both the open-time SELECT and the FIDO/OTP applet switches the
+        // serial read performs.
+        if apdu.len() >= 5 && apdu[..4] == [0x00, 0xA4, 0x04, 0x00] {
+            let lc = apdu[4] as usize;
+            if 5 + lc <= apdu.len() {
+                self.current_aid = apdu[5..5 + lc].to_vec();
+            }
+        }
         let mut acc = Vec::new();
         let mut to_send = apdu.to_vec();
         let mut chunks = 0usize;
@@ -448,12 +468,37 @@ impl PcScOtpTransport {
                             "[token2otp PCSC] transient card error; reconnecting and retrying"
                         );
                     }
-                    // Re-establish the link to the same card and re-send this APDU.
+                    // Re-establish the link to the same card.
                     self.card.reconnect(
                         pcsc::ShareMode::Shared,
                         pcsc::Protocols::ANY,
                         pcsc::Disposition::ResetCard,
                     )?;
+                    // A `ResetCard` reconnect resets the card: it clears the
+                    // applet selection made at open AND discards any in-flight
+                    // `61xx` GET-RESPONSE chain. So we must (a) re-SELECT the
+                    // applet we were on — otherwise the resend targets the
+                    // default applet and fails — and (b) throw away everything
+                    // accumulated so far and restart from the *original* APDU.
+                    // Resending a bare GET RESPONSE (or appending fresh bytes to
+                    // a half-filled `acc`) against a freshly reset card would
+                    // corrupt the reassembly.
+                    if !self.current_aid.is_empty() {
+                        let sel = t2::build_select(&self.current_aid);
+                        let mut sbuf = [0u8; 256];
+                        let sresp = self.card.transmit(&sel, &mut sbuf)?;
+                        if sresp.len() < 2 {
+                            return Err(OtpTransportError::EmptyResponse);
+                        }
+                        let ssw =
+                            ((sresp[sresp.len() - 2] as u16) << 8) | sresp[sresp.len() - 1] as u16;
+                        // A failed re-SELECT means the resend would hit the
+                        // wrong applet; surface that rather than send blind.
+                        OtpError::check(ssw)?;
+                    }
+                    acc.clear();
+                    chunks = 0;
+                    to_send = apdu.to_vec();
                     continue;
                 }
                 Err(e) => return Err(OtpTransportError::Pcsc(e)),

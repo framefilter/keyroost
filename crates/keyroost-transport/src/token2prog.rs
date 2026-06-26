@@ -48,7 +48,23 @@ impl Token2ProgSession {
     /// the SW1/SW2 trailer. Errors on any status word other than `9000`.
     fn transmit(&mut self, cmd: &Command) -> Result<Vec<u8>, TransportError> {
         if self.debug {
-            eprintln!("> {:>16} >> {}", cmd.label, hex(&cmd.apdu));
+            // INS 0xC5 (set_seed) and 0xCE (answer_challenge) carry a
+            // secret-bearing body. That body is SM4-encrypted under a PUBLIC,
+            // hardcoded device key, so it is effectively plaintext — redact it
+            // from the trace and print only the header (mirrors the seed-body
+            // redaction in `token2otp`). The header still reveals CLA/INS/P1/P2/Lc,
+            // which is what's useful for bring-up.
+            let sensitive = matches!(cmd.apdu.get(1), Some(0xC5) | Some(0xCE));
+            if sensitive && cmd.apdu.len() > 5 {
+                eprintln!(
+                    "> {:>16} >> {}<{} bytes redacted>",
+                    cmd.label,
+                    hex(&cmd.apdu[..5]),
+                    cmd.apdu.len() - 5
+                );
+            } else {
+                eprintln!("> {:>16} >> {}", cmd.label, hex(&cmd.apdu));
+            }
         }
         let (data, sw1, sw2) = self.exchange_full(&cmd.apdu, cmd.label)?;
         if self.debug {
@@ -81,6 +97,10 @@ impl Token2ProgSession {
         label: &'static str,
     ) -> Result<(Vec<u8>, u8, u8), TransportError> {
         let (mut data, mut sw1, mut sw2) = self.exchange_once(apdu, label)?;
+        // Bound the continuation loop so a card that keeps answering 61xx/6Cxx
+        // (buggy or hostile) cannot make us spin or grow `data` without limit.
+        // Mirrors the cap in `token2otp::raw_transmit` (64 chunks / 64 KiB).
+        let mut iterations = 0usize;
         loop {
             match (sw1, sw2) {
                 (0x90, 0x00) => break,
@@ -92,6 +112,15 @@ impl Token2ProgSession {
                     sw2 = s2;
                 }
                 (0x6C, n) => {
+                    // NB: this rewrites the *last APDU byte* with the card-
+                    // suggested Le, which is only correct for a case-2/case-4
+                    // command whose trailing byte is Le. token2prog commands are
+                    // case-3 (data, no Le), so their last byte is real payload
+                    // (a MAC byte for set_seed/set_config). A genuine 6Cxx here
+                    // would corrupt the APDU — but these case-3 commands never
+                    // elicit 6Cxx (the device knows the exact response length),
+                    // so the arm is retained only for completeness. Do not copy
+                    // it into a case-2 path without revisiting this.
                     let mut retry = apdu.to_vec();
                     if let Some(last) = retry.last_mut() {
                         *last = n;
@@ -102,6 +131,12 @@ impl Token2ProgSession {
                     sw2 = s2;
                 }
                 _ => break,
+            }
+            iterations += 1;
+            if iterations > 64 || data.len() > 65536 {
+                return Err(TransportError::MalformedResponse(
+                    "61xx/6Cxx continuation exceeded reassembly limits",
+                ));
             }
         }
         Ok((data, sw1, sw2))

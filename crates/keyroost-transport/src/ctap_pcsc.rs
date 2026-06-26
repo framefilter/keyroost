@@ -153,6 +153,17 @@ impl CtapPcscDevice {
     /// work over contact and contactless alike.
     fn exchange_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u8, u8), CtapError> {
         let (mut data, mut sw1, mut sw2) = self.exchange(apdu)?;
+        // Bound the continuation loop. A card that keeps answering 61xx/6Cxx, or
+        // an NFC authenticator that keeps answering 91xx keep-alive, must not be
+        // able to make us spin forever or grow `data` without limit (DoS). Cap
+        // both the iteration count and the accumulated size; mirrors the cap in
+        // `token2otp::raw_transmit`. 64 KiB comfortably covers the largest
+        // legitimate CTAP response (large-blob reads come back in a few-KB
+        // chunks), and 4096 keep-alive polls is far more than any real touch
+        // wait needs while still terminating a stuck card.
+        const MAX_DATA: usize = 65536;
+        const MAX_ITERS: usize = 4096;
+        let mut iterations = 0usize;
         loop {
             match (sw1, sw2) {
                 (0x90, 0x00) => break,
@@ -186,6 +197,12 @@ impl CtapPcscDevice {
                     sw2 = s2;
                 }
                 _ => break,
+            }
+            iterations += 1;
+            if iterations > MAX_ITERS || data.len() > MAX_DATA {
+                return Err(CtapError::Transport(
+                    "APDU continuation exceeded reassembly limits".into(),
+                ));
             }
         }
         Ok((data, sw1, sw2))
