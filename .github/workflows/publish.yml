@@ -83,10 +83,17 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
+          # Dependency order matters: keyroost-token2prog must precede
+          # keyroost-transport/-resolve/-keyroostctl/keyroost (they depend on
+          # it), and it itself only needs keyroost-proto, so it sits right
+          # after keyroost-token2otp. (Its very first publish was by hand — a
+          # brand-new crate can't be created over OIDC — after which Trusted
+          # Publishing handles it like the rest.)
           for crate in keyroost-proto keyroost-hid keyroost-keyring keyroost-rsakey \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
-                       keyroost-token2otp keyroost-import keyroost-transport \
-                       keyroost-resolve keyroost-qr keyroostctl keyroost; do
+                       keyroost-token2otp keyroost-token2prog keyroost-import \
+                       keyroost-transport keyroost-resolve keyroost-qr \
+                       keyroostctl keyroost; do
             # crates.io rejects API requests without a User-Agent (HTTP 403),
             # which would make this "already published?" probe always fail and
             # then try to republish an existing version (a hard error). Send a
