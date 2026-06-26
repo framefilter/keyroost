@@ -1103,12 +1103,28 @@ impl App {
                     ui.end_row();
 
                     ui.label("Secret (Base32)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.otp.add.secret)
-                            .password(true)
-                            .desired_width(260.0),
-                    );
+                    {
+                        let mut rev = self
+                            .secret_reveal
+                            .get("otp-add-secret")
+                            .copied()
+                            .unwrap_or(false);
+                        crate::secret_edit(ui, p, &mut self.otp.add.secret, &mut rev, "", 260.0);
+                        self.secret_reveal.insert("otp-add-secret", rev);
+                    }
                     ui.end_row();
+
+                    #[cfg(feature = "qr")]
+                    {
+                        ui.label("");
+                        let (resp, icon_center, fg) =
+                            theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
+                        crate::paint_qr_icon(ui, icon_center, fg);
+                        if resp.clicked() {
+                            self.otp_scan_qr();
+                        }
+                        ui.end_row();
+                    }
 
                     ui.label("Type");
                     ui.horizontal(|ui| {
@@ -1237,16 +1253,27 @@ impl App {
                     } else {
                         "Secret (Base32)"
                     });
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.otp.button_hotp.secret)
-                            .password(true)
-                            .hint_text(if configured {
-                                "leave blank to keep current seed"
-                            } else {
-                                ""
-                            })
-                            .desired_width(260.0),
-                    );
+                    let bh_hint = if configured {
+                        "leave blank to keep current seed"
+                    } else {
+                        ""
+                    };
+                    {
+                        let mut rev = self
+                            .secret_reveal
+                            .get("otp-buttonhotp-secret")
+                            .copied()
+                            .unwrap_or(false);
+                        crate::secret_edit(
+                            ui,
+                            p,
+                            &mut self.otp.button_hotp.secret,
+                            &mut rev,
+                            bh_hint,
+                            260.0,
+                        );
+                        self.secret_reveal.insert("otp-buttonhotp-secret", rev);
+                    }
                     ui.end_row();
 
                     // Digit length is only settable as part of a seed write

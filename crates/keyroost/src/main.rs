@@ -1106,6 +1106,9 @@ struct App {
     prog_timeout_idx: usize,
     /// Last burn result for the prog pane: (success, message). Shown inline.
     prog_status: Option<(bool, String)>,
+    /// Per-field "show secret" toggles for password inputs, keyed by a stable
+    /// id. Absent = masked (the default).
+    secret_reveal: std::collections::HashMap<&'static str, bool>,
     /// Customer key text the user typed.
     customer_key_input: String,
     /// Treat customer_key_input as hex vs ASCII.
@@ -3132,6 +3135,19 @@ impl App {
                         "base32 (behind the QR code)",
                         300.0,
                     );
+                    #[cfg(feature = "qr")]
+                    {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(100.0);
+                            let (resp, icon_center, fg) =
+                                theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
+                            paint_qr_icon(ui, icon_center, fg);
+                            if resp.clicked() {
+                                self.oath_scan_qr();
+                            }
+                        });
+                    }
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [96.0, 22.0],
@@ -3874,6 +3890,67 @@ fn piv_default_mgmt_key_hex(is_token2: bool) -> &'static str {
     } else {
         "010203040506070801020304050607080102030405060708"
     }
+}
+
+/// Full uppercase hex of a byte slice (no truncation), matching the
+/// credential-details display.
+/// Render a masked secret input with a trailing eye toggle. `revealed` is read
+/// for the initial mask state and updated in place when the eye is clicked, so
+/// the caller can keep the flag wherever it likes. Returns the TextEdit
+/// response. The buffer text is shown in clear when `*revealed`.
+pub(crate) fn secret_edit(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    buf: &mut String,
+    revealed: &mut bool,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    let mut resp = None;
+    ui.horizontal(|ui| {
+        let mut edit = egui::TextEdit::singleline(buf)
+            .vertical_align(egui::Align::Center)
+            .desired_width(width);
+        if !*revealed {
+            edit = edit.password(true);
+        }
+        if !hint.is_empty() {
+            edit = edit.hint_text(hint);
+        }
+        resp = Some(ui.add_sized([width, 32.0], edit));
+        // Eye toggle, painted (the UI font has no emoji glyphs). Open eye =
+        // shown, slashed eye = hidden.
+        let (irect, ir) = ui.allocate_exact_size(egui::vec2(26.0, 32.0), egui::Sense::click());
+        let col = if ir.hovered() { p.txt } else { p.txt2 };
+        let c = irect.center();
+        paint_eye_icon(ui, c, col);
+        if !*revealed {
+            // Slash across the eye to signal the hidden state.
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x - 8.0, c.y + 5.0),
+                    egui::pos2(c.x + 8.0, c.y - 5.0),
+                ],
+                egui::Stroke::new(1.3, col),
+            );
+        }
+        if ir.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if ir.clicked() {
+            *revealed = !*revealed;
+        }
+        let _ = ir.on_hover_text(if *revealed { "Hide" } else { "Show" });
+    });
+    resp.unwrap()
+}
+
+fn hex_full(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02X}", b));
+    }
+    s
 }
 
 fn hex_short(bytes: &[u8]) -> String {
@@ -5263,7 +5340,7 @@ fn paint_copy_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
 
 /// A small QR-glyph: three finder squares plus a couple of module dots.
 #[cfg(feature = "qr")]
-fn paint_qr_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+pub(crate) fn paint_qr_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     let s = egui::Stroke::new(1.2, color);
     // Three finder squares (top-left, top-right, bottom-left).
     let finder = |min: egui::Vec2| {
@@ -6332,7 +6409,7 @@ impl App {
                     ui.add_space(3.0);
                     ui.label(
                         egui::RichText::new(
-                            "Saves this key's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine. Lowercase letters, digits, - and _.",
+                            "Saves this key's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine. Up to 64 characters.",
                         )
                         .font(theme::f_reg(11.5))
                         .color(p.txt3),
@@ -7241,28 +7318,87 @@ impl App {
                                     ui.label("(no credentials)");
                                 }
                                 for c in creds {
-                                    ui.horizontal(|ui| {
-                                        ui.monospace(hex_short(&c.credential_id));
-                                        let user_field = c
-                                            .user
-                                            .display_name
-                                            .clone()
-                                            .or_else(|| c.user.name.clone())
-                                            .unwrap_or_else(|| {
-                                                String::from_utf8_lossy(&c.user.id).into_owned()
-                                            });
-                                        ui.label(user_field);
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if theme::button(ui, p, BtnKind::Ghost, "Remove")
-                                                    .clicked()
+                                    // Right-to-left so the Remove button claims its
+                                    // space first; the identity column then fills the
+                                    // remaining width and wraps within it (long hex
+                                    // IDs no longer run under the button).
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Min),
+                                        |ui| {
+                                            if theme::button(ui, p, BtnKind::Ghost, "Remove")
+                                                .clicked()
+                                            {
+                                                delete = Some(c.credential_id.clone());
+                                            }
+                                            ui.add_space(8.0);
+                                            ui.vertical(|ui| {
+                                                // Distinct identity fields, like the
+                                                // authenticator's credential details:
+                                                // User Name (UPN), Display Name, User
+                                                // ID, Credential ID.
+                                                let row = |ui: &mut egui::Ui,
+                                                           label: &str,
+                                                           val: String,
+                                                           mono: bool| {
+                                                    if val.is_empty() {
+                                                        return;
+                                                    }
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                        ui.label(
+                                                            egui::RichText::new(label)
+                                                                .font(theme::f_sb(11.5))
+                                                                .color(p.txt3),
+                                                        );
+                                                        let font = if mono {
+                                                            theme::f_mono(11.5)
+                                                        } else {
+                                                            theme::f_reg(12.0)
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(val)
+                                                                .font(font)
+                                                                .color(p.txt2),
+                                                        );
+                                                    });
+                                                };
+                                                row(
+                                                    ui,
+                                                    "User Name",
+                                                    c.user.name.clone().unwrap_or_default(),
+                                                    false,
+                                                );
+                                                row(
+                                                    ui,
+                                                    "Display Name",
+                                                    c.user.display_name.clone().unwrap_or_default(),
+                                                    false,
+                                                );
+                                                // User ID: text if printable ASCII,
+                                                // else hex (often a random blob).
+                                                let uid = if c.user.id.is_empty() {
+                                                    String::new()
+                                                } else if c
+                                                    .user
+                                                    .id
+                                                    .iter()
+                                                    .all(|b| b.is_ascii_graphic() || *b == b' ')
                                                 {
-                                                    delete = Some(c.credential_id.clone());
-                                                }
-                                            },
-                                        );
-                                    });
+                                                    String::from_utf8_lossy(&c.user.id).into_owned()
+                                                } else {
+                                                    hex_full(&c.user.id)
+                                                };
+                                                row(ui, "User ID", uid, true);
+                                                row(
+                                                    ui,
+                                                    "Credential ID",
+                                                    hex_full(&c.credential_id),
+                                                    true,
+                                                );
+                                            });
+                                        },
+                                    );
+                                    ui.separator();
                                 }
                             });
                         }
@@ -10319,13 +10455,17 @@ impl App {
                         );
                         self.help_dot(ui, p, "custkey");
                         ui.add_space(6.0);
-                        ui.add_sized(
-                            [200.0, 32.0],
-                            egui::TextEdit::singleline(&mut self.customer_key_input)
-                                .vertical_align(egui::Align::Center)
-                                .password(true)
-                                .hint_text("default if empty"),
+                        let mut rev =
+                            self.secret_reveal.get("customer-key").copied().unwrap_or(false);
+                        secret_edit(
+                            ui,
+                            p,
+                            &mut self.customer_key_input,
+                            &mut rev,
+                            "default if empty",
+                            200.0,
                         );
+                        self.secret_reveal.insert("customer-key", rev);
                         ui.checkbox(&mut self.customer_key_hex, "hex");
                         if theme::button(ui, p, BtnKind::Default, "Authenticate").clicked() {
                             self.authenticate();
@@ -10439,12 +10579,20 @@ impl App {
                                 ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(360.0));
                             });
                             editor_row(ui, p, "Secret", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.draft.secret_base32)
-                                        .password(true)
-                                        .hint_text("base32 secret")
-                                        .desired_width(360.0),
+                                let mut rev = self
+                                    .secret_reveal
+                                    .get("molto-secret")
+                                    .copied()
+                                    .unwrap_or(false);
+                                secret_edit(
+                                    ui,
+                                    p,
+                                    &mut self.draft.secret_base32,
+                                    &mut rev,
+                                    "base32 secret",
+                                    360.0,
                                 );
+                                self.secret_reveal.insert("molto-secret", rev);
                             });
                             // Two columns for the short choices, to use the width.
                             let field_label = |ui: &mut egui::Ui, w: f32, text: &str| {
@@ -10783,6 +10931,68 @@ impl App {
     }
 
     /// Scan a TOTP QR from the screen and fill the prog seed form from it.
+    #[cfg(feature = "qr")]
+    /// Shared QR-from-screen scan: returns the base32 secret (as written in the
+    /// URI) plus the parsed `OtpAuth`, so callers can fill issuer/algorithm/etc.
+    #[cfg(feature = "qr")]
+    fn scan_qr_parsed(&mut self) -> Result<(String, keyroost_import::OtpAuth), String> {
+        let uri = qrscan::scan_screens_for_otpauth()?;
+        let parsed = parse_otpauth(&uri).map_err(|e| format!("QR parse failed: {e}"))?;
+        let secret = uri
+            .find("secret=")
+            .map(|i| {
+                let rest = &uri[i + 7..];
+                let end = rest.find('&').unwrap_or(rest.len());
+                rest[..end].to_owned()
+            })
+            .unwrap_or_default();
+        if secret.is_empty() {
+            return Err("scanned QR has no secret".into());
+        }
+        Ok((secret, parsed))
+    }
+
+    /// Fill the OATH "New credential" fields from a scanned screen QR.
+    #[cfg(feature = "qr")]
+    fn oath_scan_qr(&mut self) {
+        match self.scan_qr_parsed() {
+            Ok((secret, parsed)) => {
+                self.oath.add.secret = secret;
+                // The OATH dialog's name is "issuer:account"; fill it from the URI.
+                let name = parsed.suggested_title();
+                if !name.is_empty() {
+                    self.oath.add.name = name;
+                }
+                self.oath.add.totp = true; // otpauth://totp
+            }
+            Err(e) => self.log(Severity::Err, format!("scan QR: {e}")),
+        }
+    }
+
+    /// Fill the on-device OTP add-dialog fields from a scanned screen QR.
+    #[cfg(feature = "qr")]
+    fn otp_scan_qr(&mut self) {
+        match self.scan_qr_parsed() {
+            Ok((secret, parsed)) => {
+                self.otp.add.secret = secret;
+                if let Some(issuer) = &parsed.issuer {
+                    self.otp.add.app_name = issuer.clone();
+                }
+                if let Some(account) = &parsed.account {
+                    self.otp.add.account_name = account.clone();
+                }
+                self.otp.add.sha256 = matches!(parsed.algorithm, HmacAlgo::Sha256);
+                self.otp.add.digits = parsed.digits as u8;
+                self.otp.add.period = match parsed.time_step {
+                    TimeStep::Seconds30 => 30,
+                    TimeStep::Seconds60 => 60,
+                };
+                self.otp.add.totp = true; // otpauth://totp
+            }
+            Err(e) => self.log(Severity::Err, format!("scan QR: {e}")),
+        }
+    }
+
     #[cfg(feature = "qr")]
     fn prog_scan_qr(&mut self) {
         self.prog_status = None;

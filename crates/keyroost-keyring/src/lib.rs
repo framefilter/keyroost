@@ -157,11 +157,14 @@ impl std::error::Error for ResolveError {}
 
 /// Validate a friendly name: 1-64 chars of lowercase ASCII, digits, `-`, `_`.
 pub fn validate_name(name: &str) -> Result<(), KeyringError> {
-    let ok = !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    // A friendly name is a human-facing label, so allow normal text — letters
+    // (any case, any script), digits, spaces and common punctuation. The only
+    // hard rules are: non-empty, a sane length cap, and none of the control /
+    // zero-width / bidi-override characters that strip_control_chars guards
+    // against (those enable display spoofing in a saved name).
+    let trimmed = name.trim();
+    let ok =
+        !trimmed.is_empty() && name.chars().count() <= 64 && !name.chars().any(is_spoofing_char);
     if ok {
         Ok(())
     } else {
@@ -179,41 +182,71 @@ pub fn validate_name(name: &str) -> Result<(), KeyringError> {
 /// Unicode format characters used for display spoofing (`char::is_control`
 /// covers only Cc): bidi overrides/isolates (RLO can render "key-live" out
 /// of "evil-yek"), zero-width chars, BOM, and the soft/Arabic-letter marks.
+/// Control, zero-width, and bidi-override characters that enable display
+/// spoofing in a saved name. Shared by validation and sanitization.
+fn is_spoofing_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM/RLM
+            | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{FEFF}' // BOM / ZWNBSP
+            | '\u{00AD}' // soft hyphen
+            | '\u{061C}' // Arabic letter mark
+        )
+}
+
 fn strip_control_chars(s: &mut String) {
-    fn spoofing(c: char) -> bool {
-        c.is_control()
-            || matches!(c,
-                '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM/RLM
-                | '\u{202A}'..='\u{202E}' // bidi embeddings + LRO/RLO
-                | '\u{2066}'..='\u{2069}' // bidi isolates
-                | '\u{FEFF}' // BOM / ZWNBSP
-                | '\u{00AD}' // soft hyphen
-                | '\u{061C}' // Arabic letter mark
-            )
-    }
-    if s.chars().any(spoofing) {
-        s.retain(|c| !spoofing(c));
+    if s.chars().any(is_spoofing_char) {
+        s.retain(|c| !is_spoofing_char(c));
     }
 }
 
-/// Default config path: `$XDG_CONFIG_HOME/keyroost/keys.json`, else
-/// `$HOME/.config/keyroost/keys.json`.
+/// Default config path for `keys.json`.
+///
+/// * Windows: `%APPDATA%\keyroost\keys.json` (falling back to
+///   `%USERPROFILE%\.config\keyroost\keys.json`).
+/// * Otherwise: `$XDG_CONFIG_HOME/keyroost/keys.json`, else
+///   `$HOME/.config/keyroost/keys.json`.
 pub fn config_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("keyroost").join("keys.json"));
+    // Windows has no HOME/XDG by default; use the standard roaming AppData dir.
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            if !appdata.is_empty() {
+                return Some(PathBuf::from(appdata).join("keyroost").join("keys.json"));
+            }
         }
-    }
-    let home = std::env::var_os("HOME")?;
-    if home.is_empty() {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            if !profile.is_empty() {
+                return Some(
+                    PathBuf::from(profile)
+                        .join(".config")
+                        .join("keyroost")
+                        .join("keys.json"),
+                );
+            }
+        }
         return None;
     }
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("keyroost")
-            .join("keys.json"),
-    )
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("keyroost").join("keys.json"));
+            }
+        }
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
+            return None;
+        }
+        Some(
+            PathBuf::from(home)
+                .join(".config")
+                .join("keyroost")
+                .join("keys.json"),
+        )
+    }
 }
 
 impl Keyring {
@@ -400,11 +433,22 @@ mod tests {
 
     #[test]
     fn name_validation() {
+        // Normal human-facing labels are accepted: any case, spaces, scripts.
         assert!(validate_name("signing-yubikey").is_ok());
         assert!(validate_name("test_solo2").is_ok());
+        assert!(validate_name("Emin's Work Key").is_ok());
+        assert!(validate_name("UPPER").is_ok());
+        assert!(validate_name("Bad Name").is_ok());
+        assert!(validate_name("Clé de bureau").is_ok());
+        // Empty (or whitespace-only) is still rejected.
         assert!(validate_name("").is_err());
-        assert!(validate_name("Bad Name").is_err());
-        assert!(validate_name("UPPER").is_err());
+        assert!(validate_name("   ").is_err());
+        // Over the length cap is rejected.
+        assert!(validate_name(&"x".repeat(65)).is_err());
+        // Control / zero-width / bidi-override characters are still rejected.
+        assert!(validate_name("bad\u{202E}name").is_err());
+        assert!(validate_name("zero\u{200B}width").is_err());
+        assert!(validate_name("tab\tname").is_err());
     }
 
     #[test]
