@@ -227,7 +227,7 @@ pub fn config_path() -> Option<PathBuf> {
                 );
             }
         }
-        return None;
+        None
     }
     #[cfg(not(windows))]
     {
