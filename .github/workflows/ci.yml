@@ -74,6 +74,51 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # Surface dependencies the compiler will reject in a future Rust release (e.g.
+  # `screenshots`, pulled in by the optional `qr` feature). Builds with all
+  # features so opt-in deps are covered, and *warns* rather than fails — a
+  # flagged crate is tracked for replacement (screenshots → xcap), not an
+  # immediate breakage. Closes the gap dependabot/cargo-audit don't cover: a
+  # crate abandoned-then-renamed, plus compiler future-incompat notices.
+  future-incompat:
+    name: Future-incompatibility report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpcsclite-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev libxrandr-dev libxcb1-dev libdbus-1-dev \
+            libgl1-mesa-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build (all features) and report future-incompatibilities
+        run: |
+          set -o pipefail
+          cargo build --workspace --all-features --locked 2>&1 | tee build.log
+          if grep -qi 'will be rejected by a future version of Rust' build.log; then
+            crates="$(grep -i 'will be rejected by a future version of Rust' build.log \
+              | sed 's/.*future version of Rust: //' | sort -u | tr '\n' ' ')"
+            echo "::warning title=Future-incompatible dependency::Will be rejected by a future Rust; replace before then: ${crates}"
+            {
+              echo "### ⚠️ Future-incompatible dependencies"
+              echo ""
+              echo "These crates contain code a future Rust will reject — replace them before that lands:"
+              echo ""
+              echo "    ${crates}"
+              echo ""
+              echo "Run \`cargo report future-incompatibilities\` for detail (e.g. \`screenshots\` → \`xcap\`)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No future-incompatibility warnings — clean."
+          fi
+
   # Build + test inside Fedora and Arch containers so the README's per-distro
   # package lists are verified, not assumed, and a distro-specific build break is
   # caught here. Linux is distro-neutral (sysfs/hidraw + PC/SC), so this is a

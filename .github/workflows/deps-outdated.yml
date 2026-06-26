@@ -1,0 +1,49 @@
+name: Outdated dependencies
+
+# A monthly DRIFT report — not a gate. Surfaces how far behind each direct
+# dependency is, including the dependabot-ignored ones (egui/eframe, the
+# RustCrypto cipher/digest stack, rsa/rand). Dependabot is silenced for those on
+# purpose (they need deliberate, lock-step upgrades), so nothing else tells you
+# when a bump becomes possible — e.g. a rand-0.9-compatible `rsa`, or an `egui`
+# release carrying the #48 Wayland input fix. This is where you'll see it.
+on:
+  schedule:
+    - cron: '0 9 1 * *' # 09:00 UTC, 1st of each month
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  outdated:
+    name: cargo outdated report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Build scripts (pcsc-sys etc.) can run during metadata resolution.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcsclite-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+
+      - name: Install cargo-outdated
+        run: command -v cargo-outdated >/dev/null || cargo install cargo-outdated --locked
+
+      - name: Report
+        run: |
+          # Direct deps only — the ones we actually control. Never fail the job.
+          cargo outdated --workspace --root-deps-only | tee outdated.txt || true
+          {
+            echo "### Outdated direct dependencies — drift report"
+            echo ""
+            echo "Watch the dependabot-ignored deps here (egui/eframe, RustCrypto aes/cbc/hmac/sha2, rsa/rand). When a row's blocker clears upstream, that's the signal to schedule the deliberate upgrade."
+            echo ""
+            echo '```'
+            cat outdated.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
