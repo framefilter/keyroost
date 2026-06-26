@@ -75,10 +75,11 @@ jobs:
         run: cargo test --workspace --locked
 
   # Surface dependencies the compiler will reject in a future Rust release (e.g.
-  # `screenshots`, pulled in by the optional `qr` feature). Builds with all
-  # features so opt-in deps are covered, and *warns* rather than fails — a
-  # flagged crate is tracked for replacement (screenshots → xcap), not an
-  # immediate breakage. Closes the gap dependabot/cargo-audit don't cover: a
+  # `screenshots`, pulled in by the optional `qr` feature). Builds `--all-features`
+  # so every opt-in dep is covered — including keyroost-hid's `hidapi-backend`,
+  # whose `hidapi` needs `libudev-dev` (installed below). *Warns* rather than
+  # fails: a flagged crate is tracked for replacement (screenshots → xcap), not
+  # an immediate breakage. Closes the gap dependabot/cargo-audit don't cover: a
   # crate abandoned-then-renamed, plus compiler future-incompat notices.
   future-incompat:
     name: Future-incompatibility report
@@ -93,7 +94,8 @@ jobs:
             libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libx11-dev libxrandr-dev libxcb1-dev libdbus-1-dev \
-            libgl1-mesa-dev libssl-dev
+            libgl1-mesa-dev libssl-dev \
+            libudev-dev
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
         with:
           toolchain: stable
