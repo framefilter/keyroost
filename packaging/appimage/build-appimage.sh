@@ -36,6 +36,10 @@ DESKTOP_FILE="${REPO_ROOT}/packaging/flatpak/${APP_ID}.desktop"
 # Must be named exactly after the desktop Icon= entry (no size suffix), or
 # linuxdeploy reports "Could not find suitable icon". Use the hicolor 256px PNG.
 ICON_FILE="${REPO_ROOT}/packaging/icons/hicolor/256x256/apps/${APP_ID}.png"
+# AppStream metainfo — the same file the Flatpak build uses. Bundling it into the
+# AppDir gives the AppImage proper software-centre metadata, a prerequisite for
+# AppImageHub listing (#53).
+METAINFO_FILE="${REPO_ROOT}/packaging/flatpak/${APP_ID}.metainfo.xml"
 BUILD_DIR="${REPO_ROOT}/target/appimage"
 APPDIR="${BUILD_DIR}/AppDir"
 
@@ -108,15 +112,18 @@ mkdir -p "${APPDIR}"
 echo ">> dropping bundled libpcsclite (use the host's, which matches its pcscd)"
 find "${APPDIR}" -name 'libpcsclite.so*' -delete
 
-# 3c. Package the prepared AppDir into the AppImage (no re-deploy).
+# 3c. Bundle the AppStream metainfo (software-centre / AppImageHub metadata, #53),
+#     then package. UPDATE_INFORMATION makes the plugin embed gh-releases zsync
+#     update info and emit keyroost-x86_64.AppImage.zsync, so AppImageUpdate can
+#     do delta updates from each GitHub release.
+[ -f "${METAINFO_FILE}" ] || { echo "ERROR: missing ${METAINFO_FILE}"; exit 1; }
+install -Dm644 "${METAINFO_FILE}" "${APPDIR}/usr/share/metainfo/$(basename "${METAINFO_FILE}")"
+export UPDATE_INFORMATION="gh-releases-zsync|framefilter|keyroost|latest|keyroost-*x86_64.AppImage.zsync"
 ./linuxdeploy-plugin-appimage.AppImage --appdir "${APPDIR}"
 
 # ---------------------------------------------------------------------------
-# 4. Result: keyroost-x86_64.AppImage in ${BUILD_DIR}. Attach it to a GitHub
-#    Release as an asset (manually for now — this script is NOT called by
-#    release.yml in these drafts).
-#    Optional: pass --output appimage with OUTPUT=... and generate a .zsync for
-#    delta auto-updates via AppImageUpdate.
+# 4. Result: keyroost-x86_64.AppImage (+ .zsync for AppImageUpdate) in
+#    ${BUILD_DIR}. The Linux-bundles workflow attaches both to the release.
 # ---------------------------------------------------------------------------
-echo ">> done. AppImage(s):"
-ls -la "${BUILD_DIR}"/*.AppImage 2>/dev/null || true
+echo ">> done. AppImage + zsync:"
+ls -la "${BUILD_DIR}"/*.AppImage "${BUILD_DIR}"/*.AppImage.zsync 2>/dev/null || true

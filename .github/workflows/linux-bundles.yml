@@ -102,12 +102,18 @@ jobs:
           img="$(ls target/appimage/*.AppImage | head -n1)"
           echo "path=${img}" >> "$GITHUB_OUTPUT"
           echo "found ${img}"
+          # zsync sidecar for AppImageUpdate delta updates (#53), if produced.
+          zsync="$(ls target/appimage/*.AppImage.zsync 2>/dev/null | head -n1 || true)"
+          echo "zsync=${zsync}" >> "$GITHUB_OUTPUT"
+          echo "zsync ${zsync:-<none>}"
 
       - name: Upload AppImage as artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: keyroost-appimage
-          path: ${{ steps.find.outputs.path }}
+          path: |
+            target/appimage/*.AppImage
+            target/appimage/*.AppImage.zsync
 
       # Attach to the Release release.yml publishes for this tag. Retry briefly:
       # this workflow and release.yml run concurrently on the same tag, so the
@@ -120,9 +126,10 @@ jobs:
         run: |
           set -euo pipefail
           img="${{ steps.find.outputs.path }}"
+          zsync="${{ steps.find.outputs.zsync }}"
           for i in 1 2 3 4 5 6; do
             if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-              gh release upload "${GITHUB_REF_NAME}" "${img}" \
+              gh release upload "${GITHUB_REF_NAME}" "${img}" ${zsync:+"${zsync}"} \
                 --repo "${GITHUB_REPOSITORY}" --clobber
               exit 0
             fi
