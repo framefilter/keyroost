@@ -762,15 +762,10 @@ impl App {
                 let menu_btn =
                     theme::button(ui, p, BtnKind::Default, "...").on_hover_text("More actions");
                 let menu_id = ui.make_persistent_id("otp_more_menu");
-                if menu_btn.clicked() {
-                    ui.memory_mut(|m| m.toggle_popup(menu_id));
-                }
-                egui::popup::popup_below_widget(
-                    ui,
-                    menu_id,
-                    &menu_btn,
-                    egui::popup::PopupCloseBehavior::CloseOnClick,
-                    |ui| {
+                egui::Popup::menu(&menu_btn)
+                    .id(menu_id)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                    .show(|ui| {
                         ui.set_min_width(180.0);
 
                         // Transport selector.
@@ -845,8 +840,7 @@ impl App {
                                 }
                             });
                         }
-                    },
-                );
+                    });
 
                 // Apply menu selections after the closure.
                 if let Some(sel) = new_transport {
@@ -1071,7 +1065,7 @@ impl App {
         });
 
         if let Some(code) = copy {
-            ui.output_mut(|o| o.copied_text = code.clone());
+            ui.ctx().copy_text(code.clone());
             self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
         }
         if let Some((a, acct)) = delete {

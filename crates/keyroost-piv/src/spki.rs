@@ -247,7 +247,7 @@ mod tests {
     fn ec_p256_spki_contains_curve_oid_and_point() {
         let point = {
             let mut p = vec![0x04];
-            p.extend(std::iter::repeat(0xAB).take(64));
+            p.extend(std::iter::repeat_n(0xAB, 64));
             p
         };
         let der = subject_public_key_info(

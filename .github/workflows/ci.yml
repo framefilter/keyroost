@@ -125,7 +125,7 @@ jobs:
   # package lists are verified, not assumed, and a distro-specific build break is
   # caught here. Linux is distro-neutral (sysfs/hidraw + PC/SC), so this is a
   # smoke build, not a second clippy pass — the os matrix above already enforces
-  # lints. Distro toolchains (both well past our 1.75 MSRV) stand in for rustup.
+  # lints. Distro toolchains (both well past our 1.85 MSRV) stand in for rustup.
   linux-distros:
     name: build + test (${{ matrix.distro }})
     runs-on: ubuntu-latest

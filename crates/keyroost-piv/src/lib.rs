@@ -521,7 +521,7 @@ fn push_tlv(out: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
 /// bodies over 255 bytes (cert import, RSA signing input) require them.
 fn build_apdu_ext(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8], le: Option<u16>) -> Vec<u8> {
     assert!(data.len() <= 0xFFFF, "extended APDU body too large");
-    if data.len() <= 255 && le.map_or(true, |v| v <= 256) {
+    if data.len() <= 255 && le.is_none_or(|v| v <= 256) {
         // Short form. Le==256 is encoded as the single byte 0x00.
         let mut out = Vec::with_capacity(6 + data.len());
         out.extend_from_slice(&[cla, ins, p1, p2]);
@@ -982,7 +982,7 @@ mod tests {
     fn unwrap_long_form_data_object() {
         // 53 81 80 <128 bytes>
         let mut buf = vec![0x53, 0x81, 0x80];
-        buf.extend(std::iter::repeat(0x11).take(128));
+        buf.extend(std::iter::repeat_n(0x11, 128));
         let inner = unwrap_data_object(&buf).unwrap();
         assert_eq!(inner.len(), 128);
         assert!(inner.iter().all(|&b| b == 0x11));

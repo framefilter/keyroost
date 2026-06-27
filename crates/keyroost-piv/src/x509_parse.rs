@@ -328,7 +328,7 @@ mod tests {
     fn tlv_long_form_length() {
         // Tag 0x04, long-form length 0x81 0x80 (128), 128 content bytes.
         let mut buf = vec![0x04, 0x81, 0x80];
-        buf.extend(std::iter::repeat(0xAB).take(128));
+        buf.extend(std::iter::repeat_n(0xAB, 128));
         let (tlv, rest) = read_tlv(&buf).unwrap();
         assert_eq!(tlv.tag, 0x04);
         assert_eq!(tlv.content.len(), 128);
@@ -339,7 +339,7 @@ mod tests {
     fn tlv_long_form_length_two_and_three_octets() {
         // 0x82 form: 2 length octets encoding 0x0140 = 320 content bytes.
         let mut buf = vec![0x04, 0x82, 0x01, 0x40];
-        buf.extend(std::iter::repeat(0xCD).take(320));
+        buf.extend(std::iter::repeat_n(0xCD, 320));
         let (tlv, rest) = read_tlv(&buf).unwrap();
         assert_eq!(tlv.tag, 0x04);
         assert_eq!(tlv.content.len(), 320);
@@ -347,7 +347,7 @@ mod tests {
 
         // 0x83 form: 3 length octets encoding 0x010000 = 65536 content bytes.
         let mut buf = vec![0x04, 0x83, 0x01, 0x00, 0x00];
-        buf.extend(std::iter::repeat(0xEF).take(65536));
+        buf.extend(std::iter::repeat_n(0xEF, 65536));
         let (tlv, rest) = read_tlv(&buf).unwrap();
         assert_eq!(tlv.tag, 0x04);
         assert_eq!(tlv.content.len(), 65536);

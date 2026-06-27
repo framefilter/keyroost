@@ -1520,7 +1520,7 @@ mod tests {
     fn parses_long_form_length_81() {
         // 53 81 84 <132 bytes>  (0x84 = 132)
         let mut buf = vec![0x53, 0x81, 0x84];
-        buf.extend(std::iter::repeat(0xCD).take(132));
+        buf.extend(std::iter::repeat_n(0xCD, 132));
         let tlvs = parse_tlvs(&buf).unwrap();
         assert_eq!(tlvs.len(), 1);
         assert_eq!(tlvs[0].tag, 0x0053);
@@ -1532,7 +1532,7 @@ mod tests {
     fn parses_long_form_length_82() {
         // 53 82 01 00 <256 bytes>
         let mut buf = vec![0x53, 0x82, 0x01, 0x00];
-        buf.extend(std::iter::repeat(0xEE).take(256));
+        buf.extend(std::iter::repeat_n(0xEE, 256));
         let tlvs = parse_tlvs(&buf).unwrap();
         assert_eq!(tlvs[0].value.len(), 256);
     }
@@ -1847,7 +1847,7 @@ mod tests {
         // Real RSA-2048 case: 0x00 indicator + 256-byte cryptogram = 257 bytes,
         // over the short-APDU limit, so it must use extended Lc + extended Le.
         let mut data = vec![0x00];
-        data.extend(std::iter::repeat(0xAB).take(256));
+        data.extend(std::iter::repeat_n(0xAB, 256));
         let apdu = pso_decipher(&data);
         // Header + extended Lc (00 01 01) + 257 body + extended Le (00 00).
         assert_eq!(&apdu[..7], &[0x00, 0x2A, 0x80, 0x86, 0x00, 0x01, 0x01]);
@@ -1860,7 +1860,7 @@ mod tests {
     fn pso_decipher_chained_links() {
         // 257 bytes in 254-byte chunks => two links: 254 (CLA 10) + 3 (CLA 00, +Le).
         let mut data = vec![0x00];
-        data.extend(std::iter::repeat(0xAB).take(256));
+        data.extend(std::iter::repeat_n(0xAB, 256));
         let chunks = pso_decipher_chained(&data, 254);
         assert_eq!(chunks.len(), 2);
         // First link: chaining bit set, no trailing Le.

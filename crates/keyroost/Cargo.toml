@@ -30,8 +30,8 @@ keyroost-import = { path = "../keyroost-import", version = "0.7.2", features = [
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
 # keyroostctl). Owns the scoped `rsa` dependency exception.
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.7.2" }
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.29"
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.35"
 # Already in the tree via eframe/egui-winit's clipboard integration; direct
 # use lets the OTP auto-clear check the clipboard still holds *our* code
 # before wiping it, instead of clobbering whatever the user copied since.
@@ -59,7 +59,9 @@ pollster = "0.4"
 
 # QR-from-screen scanning (optional; `--features qr`). Only the screen capture
 # is new here — decoding reuses keyroost-qr (already a dependency). `screenshots`
-# is pinned to match the workspace's Rust 1.75 toolchain.
+# is pinned (future-incompat + unmaintained); migration to `xcap` is tracked
+# separately. The MSRV that motivated the original pin is moot now that the
+# egui 0.35 bump raised the workspace to Rust 1.85.
 screenshots = { version = "=0.5.4", optional = true }
 
 [features]

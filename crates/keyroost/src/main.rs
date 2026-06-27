@@ -4911,9 +4911,9 @@ fn now_secs_f64() -> f64 {
 
 /// A flat panel frame with a fill and symmetric inner padding.
 fn panel_frame(fill: egui::Color32, mx: f32, my: f32) -> egui::Frame {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(fill)
-        .inner_margin(egui::Margin::symmetric(mx, my))
+        .inner_margin(egui::Margin::symmetric(mx as i8, my as i8))
 }
 
 /// A rounded square "glyph tile". `ch = Some(c)` paints a letter; `None` paints a
@@ -4927,7 +4927,7 @@ fn glyph_tile(
 ) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(size * 0.28), fill);
+        .rect_filled(rect, egui::CornerRadius::same((size * 0.28) as u8), fill);
     match ch {
         Some(c) => {
             ui.painter().text(
@@ -5209,8 +5209,11 @@ fn paint_glyph_tile(
     fg: egui::Color32,
     ch: Option<char>,
 ) {
-    ui.painter()
-        .rect_filled(rect, egui::Rounding::same(rect.width() * 0.28), fill);
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same((rect.width() * 0.28) as u8),
+        fill,
+    );
     match ch {
         Some(c) => {
             ui.painter().text(
@@ -5246,13 +5249,13 @@ fn paint_pill(
     fg: egui::Color32,
     bg: egui::Color32,
 ) -> f32 {
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), theme::f_sb(11.0), fg));
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), theme::f_sb(11.0), fg));
     let pad_x = 8.0;
     let h = 18.0;
     let w = galley.size().x + pad_x * 2.0;
     let rect = egui::Rect::from_min_size(left_top, egui::vec2(w, h));
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(999.0), bg);
+        .rect_filled(rect, egui::CornerRadius::same(255), bg);
     let pos = egui::pos2(left_top.x + pad_x, rect.center().y - galley.size().y / 2.0);
     ui.painter().galley(pos, galley, fg);
     w
@@ -5348,9 +5351,18 @@ fn paint_copy_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     let s = egui::Stroke::new(1.3, color);
     let back = egui::Rect::from_min_size(center + egui::vec2(-1.0, -5.0), egui::vec2(7.0, 8.0));
     let front = egui::Rect::from_min_size(center + egui::vec2(-5.0, -1.0), egui::vec2(7.0, 8.0));
-    ui.painter().rect_stroke(back, egui::Rounding::same(1.5), s);
-    ui.painter()
-        .rect_stroke(front, egui::Rounding::same(1.5), s);
+    ui.painter().rect_stroke(
+        back,
+        egui::CornerRadius::same(1),
+        s,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().rect_stroke(
+        front,
+        egui::CornerRadius::same(1),
+        s,
+        egui::StrokeKind::Inside,
+    );
 }
 
 /// A small QR-glyph: three finder squares plus a couple of module dots.
@@ -5360,7 +5372,8 @@ pub(crate) fn paint_qr_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Colo
     // Three finder squares (top-left, top-right, bottom-left).
     let finder = |min: egui::Vec2| {
         let r = egui::Rect::from_min_size(center + min, egui::vec2(3.4, 3.4));
-        ui.painter().rect_stroke(r, egui::Rounding::same(0.6), s);
+        ui.painter()
+            .rect_stroke(r, egui::CornerRadius::same(1), s, egui::StrokeKind::Inside);
     };
     finder(egui::vec2(-5.0, -5.0));
     finder(egui::vec2(1.6, -5.0));
@@ -5369,7 +5382,7 @@ pub(crate) fn paint_qr_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Colo
     let dot = |off: egui::Vec2| {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(center + off, egui::vec2(1.2, 1.2)),
-            egui::Rounding::ZERO,
+            egui::CornerRadius::ZERO,
             color,
         );
     };
@@ -5432,7 +5445,7 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
     };
     ui.painter().rect(
         rect,
-        egui::Rounding::same(11.0),
+        egui::CornerRadius::same(11),
         bg,
         egui::Stroke::new(
             1.0,
@@ -5442,6 +5455,7 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
                 egui::Color32::TRANSPARENT
             },
         ),
+        egui::StrokeKind::Inside,
     );
     if selected {
         ui.painter().rect_filled(
@@ -5449,7 +5463,7 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
                 rect.left_top() + egui::vec2(0.0, 13.0),
                 egui::vec2(3.0, h - 26.0),
             ),
-            egui::Rounding::same(3.0),
+            egui::CornerRadius::same(3),
             p.accent,
         );
     }
@@ -5495,7 +5509,7 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
     );
     // model, truncated to the available width
     let avail = (rect.right() - right_pad - 8.0) - tx;
-    let galley = ui.fonts(|f| {
+    let galley = ui.fonts_mut(|f| {
         let mut job = egui::text::LayoutJob::single_section(
             dev.title().to_string(),
             egui::TextFormat {
@@ -5539,7 +5553,13 @@ impl eframe::App for App {
     // are persisted by `App::persist_settings` into `settings.json` instead —
     // see the `settings` module.
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.35 drives the app through `App::ui` with a root `Ui` rather
+        // than the old `update(ctx)`. Our layout is panel-based: the four panels
+        // below are shown into `root_ui`, while the dialogs/popovers (which still
+        // take `&Context`) use this cheap `Context` handle cloned from it.
+        let ctx_owned = root_ui.ctx().clone();
+        let ctx = &ctx_owned;
         // Clipboard hygiene: ~45s after an OTP code was copied, clear the
         // clipboard so the code doesn't live on in clipboard-manager history —
         // but only if the clipboard still holds that exact code. Content the
@@ -5676,7 +5696,7 @@ impl eframe::App for App {
         // time to register with pcscd between attempts.
         if self.reset_arm.is_none() && self.pending_scans > 0 {
             let now = std::time::Instant::now();
-            let due = self.next_scan_at.map_or(true, |t| now >= t);
+            let due = self.next_scan_at.is_none_or(|t| now >= t);
             if due && !self.busy() {
                 self.refresh_devices();
                 self.pending_scans -= 1;
@@ -5687,12 +5707,12 @@ impl eframe::App for App {
             }
         }
 
-        self.top_bar(ctx, &p);
-        self.device_sidebar(ctx, &p);
+        self.top_bar(root_ui, &p);
+        self.device_sidebar(root_ui, &p);
         if self.log_open {
-            self.activity_log(ctx, &p);
+            self.activity_log(root_ui, &p);
         }
-        self.central(ctx, &p);
+        self.central(root_ui, &p);
 
         // Modal dialogs (reused from the per-applet logic) + Molto2 import dialogs.
         self.render_reset_dialog(ctx);
@@ -5788,7 +5808,8 @@ impl App {
 
     /// Top bar: brand · "keyroost" · connected count | accents · theme · Learn ·
     /// Activity log · Refresh.
-    fn top_bar(&mut self, ctx: &egui::Context, p: &Palette) {
+    fn top_bar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
+        let ctx = root_ui.ctx().clone();
         // The bar height must track the zoom factor: at a larger text size the
         // glyph tile, labels and icons are all scaled up, and a fixed 52px panel
         // would clip them and let the left content overrun the right-hand
@@ -5796,10 +5817,10 @@ impl App {
         // its contents (clamped so it never collapses below the base).
         let zoom = theme::clamp_zoom(ctx.zoom_factor());
         let bar_h = (52.0 * zoom).max(52.0);
-        egui::TopBottomPanel::top("bar")
-            .exact_height(bar_h)
+        egui::Panel::top("bar")
+            .exact_size(bar_h)
             .frame(panel_frame(p.bar, 16.0, 0.0))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     glyph_tile(ui, 26.0, p.brand, p.accent_ink, Some('k'));
                     ui.add_space(8.0);
@@ -5960,7 +5981,7 @@ impl App {
         // we then paint the value right-aligned inside it, so the slider geometry
         // is identical for "99%" and "100%".
         let pct = (factor * 100.0).round() as i32;
-        let cell = ui.fonts(|f| {
+        let cell = ui.fonts_mut(|f| {
             f.layout_no_wrap("888%".to_owned(), theme::f_sb(12.0), p.txt2)
                 .size()
         });
@@ -6080,12 +6101,12 @@ impl App {
     }
 
     /// Left device bar: header · filter · rows · footer tip.
-    fn device_sidebar(&mut self, ctx: &egui::Context, p: &Palette) {
-        egui::SidePanel::left("devices")
-            .exact_width(286.0)
+    fn device_sidebar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
+        egui::Panel::left("devices")
+            .exact_size(286.0)
             .resizable(false)
             .frame(panel_frame(p.side, 14.0, 12.0))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("DEVICES")
@@ -6174,11 +6195,11 @@ impl App {
     }
 
     /// Global activity-log drawer (bottom), replacing the Molto2-only log.
-    fn activity_log(&mut self, ctx: &egui::Context, p: &Palette) {
-        egui::TopBottomPanel::bottom("log")
-            .exact_height(180.0)
+    fn activity_log(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
+        egui::Panel::bottom("log")
+            .exact_size(180.0)
             .frame(panel_frame(p.bar, 16.0, 10.0))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("ACTIVITY LOG")
@@ -6199,7 +6220,7 @@ impl App {
                                 .map(|l| l.text.clone())
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            ui.output_mut(|o| o.copied_text = all);
+                            ui.ctx().copy_text(all);
                             // The user copied non-secret log text over the
                             // code; a pending auto-clear would clobber it.
                             self.clipboard_clear_at = None;
@@ -6230,10 +6251,10 @@ impl App {
 
     /// The central pane: empty state, the Molto2 token view, or the selected
     /// key's hero + capability tabs + active capability panel.
-    fn central(&mut self, ctx: &egui::Context, p: &Palette) {
+    fn central(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
         egui::CentralPanel::default()
             .frame(panel_frame(p.surface, 0.0, 0.0))
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 match self.selected_device().cloned() {
                     None => self.empty_state(ui, p),
                     Some(dev) if dev.kind == DeviceKind::Token => self.molto_view(ui, p, &dev),
@@ -6248,8 +6269,8 @@ impl App {
                         // one centered, legible column instead of stretching edge to
                         // edge — and removes the lopsided empty space on one side.
                         let hmargin = (((ui.available_width() - 920.0) * 0.5).max(26.0)).round();
-                        egui::Frame::none()
-                            .inner_margin(egui::Margin::symmetric(hmargin, 16.0))
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(hmargin as i8, 16))
                             .show(ui, |ui| {
                                 self.device_hero(ui, p, &dev);
                                 self.cap_tabs(ui, p, &dev);
@@ -6303,8 +6324,12 @@ impl App {
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_stroke(rect, egui::Rounding::same(16.0), egui::Stroke::new(1.5, p.line));
+                    ui.painter().rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(16),
+                        egui::Stroke::new(1.5, p.line),
+                        egui::StrokeKind::Inside,
+                    );
                     ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -6762,7 +6787,7 @@ impl App {
                             );
                         }
                         if let Some((name, code)) = copy {
-                            ui.output_mut(|o| o.copied_text = code.clone());
+                            ui.ctx().copy_text(code.clone());
                             self.copied = Some((name, now_secs_f64() + 1.2));
                             self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
                         }
@@ -6996,10 +7021,10 @@ impl App {
             if self.security_keys.change_pin.open {
                 let setting = pin_set == Some(false);
                 ui.add_space(10.0);
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(p.raised)
-                    .inner_margin(egui::Margin::same(12.0))
-                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::same(12))
+                    .corner_radius(egui::CornerRadius::same(8))
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(if setting {
@@ -8504,14 +8529,14 @@ impl App {
             .title_bar(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(egui::Frame {
-                inner_margin: egui::Margin::same(20.0),
-                rounding: egui::Rounding::same(13.0),
+                inner_margin: egui::Margin::same(20),
+                corner_radius: egui::CornerRadius::same(13),
                 fill: p.pop,
                 stroke: egui::Stroke::new(1.0, p.line),
                 shadow: egui::epaint::Shadow {
-                    offset: egui::vec2(0.0, 12.0),
-                    blur: 40.0,
-                    spread: 0.0,
+                    offset: [0, 12],
+                    blur: 40,
+                    spread: 0,
                     color: egui::Color32::from_black_alpha(115),
                 },
                 ..Default::default()
@@ -8710,14 +8735,14 @@ impl App {
             .title_bar(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(egui::Frame {
-                inner_margin: egui::Margin::same(20.0),
-                rounding: egui::Rounding::same(13.0),
+                inner_margin: egui::Margin::same(20),
+                corner_radius: egui::CornerRadius::same(13),
                 fill: p.pop,
                 stroke: egui::Stroke::new(1.0, p.line),
                 shadow: egui::epaint::Shadow {
-                    offset: egui::vec2(0.0, 12.0),
-                    blur: 40.0,
-                    spread: 0.0,
+                    offset: [0, 12],
+                    blur: 40,
+                    spread: 0,
                     color: egui::Color32::from_black_alpha(115),
                 },
                 ..Default::default()
@@ -9414,7 +9439,7 @@ impl App {
             }
         });
         if let Some((name, code)) = copy {
-            ui.output_mut(|o| o.copied_text = code.clone());
+            ui.ctx().copy_text(code.clone());
             self.copied = Some((name, now_secs_f64() + 1.2));
             self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
         }
@@ -10361,7 +10386,7 @@ impl App {
             self.piv.confirm_reset = Some(String::new());
         }
         if let Some(pem) = copy_pem {
-            ui.output_mut(|o| o.copied_text = pem);
+            ui.ctx().copy_text(pem);
             self.clipboard_clear_at = None; // public key, not a secret to auto-clear
         }
     }
@@ -10383,8 +10408,8 @@ impl App {
         let mut do_cancel = false;
         // Hero (no amber band — the orange comes from the clock glyph + accents,
         // matching the security-key hero layout and avoiding a muddy brown tint).
-        egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(26.0, 16.0))
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(26, 16))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     glyph_tile(ui, 46.0, p.brand, p.accent_ink, None);
@@ -10453,8 +10478,8 @@ impl App {
         self.apply_rename_actions(dev, open_rename, do_cancel, do_save);
 
         // --- Device-wide settings (apply to the whole token) ---
-        egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(26.0, 14.0))
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(26, 14))
             .show(ui, |ui| {
                 theme::card_frame(p).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -10512,10 +10537,10 @@ impl App {
                     });
                     if self.molto_reset_confirm {
                         ui.add_space(10.0);
-                        egui::Frame::none()
+                        egui::Frame::NONE
                             .fill(p.err_soft())
-                            .inner_margin(egui::Margin::same(12.0))
-                            .rounding(egui::Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(12))
+                            .corner_radius(egui::CornerRadius::same(8))
                             .show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new("Factory-reset the token? This wipes all slots, then asks you to confirm with the \u{25B2} button on the device itself.")
@@ -10539,8 +10564,8 @@ impl App {
             });
 
         // --- Per-slot programming (applies only to the selected slot) ---
-        egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(26.0, 4.0))
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(26, 4))
             .show(ui, |ui| {
                 theme::card_frame(p).show(ui, |ui| {
                     ui.label(egui::RichText::new("Program a slot").font(theme::f_sb(14.5)).color(p.txt));
@@ -10569,7 +10594,13 @@ impl App {
                                     } else {
                                         egui::Color32::TRANSPARENT
                                     };
-                                    ui.painter().rect(rect, egui::Rounding::same(8.0), bg, egui::Stroke::NONE);
+                                    ui.painter().rect(
+                                        rect,
+                                        egui::CornerRadius::same(8),
+                                        bg,
+                                        egui::Stroke::NONE,
+                                        egui::StrokeKind::Inside,
+                                    );
                                     ui.painter().text(
                                         rect.left_center() + egui::vec2(12.0, 0.0),
                                         egui::Align2::LEFT_CENTER,
@@ -10705,8 +10736,8 @@ impl App {
         let p = &mp;
 
         // Hero: brand tile + model + serial + on-device clock.
-        egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(26.0, 16.0))
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(26, 16))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     glyph_tile(ui, 46.0, p.brand, p.accent_ink, None);
@@ -10744,8 +10775,8 @@ impl App {
         ui.separator();
 
         // Program form.
-        egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(26.0, 12.0))
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(26, 12))
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("Program seed & configuration")

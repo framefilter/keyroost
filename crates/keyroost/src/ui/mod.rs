@@ -36,7 +36,7 @@ pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui:
     };
 
     let mut dismissed = false;
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
 
     // --- dimmed backdrop (Middle layer): click anywhere to close ---
     egui::Area::new(egui::Id::new("help_scrim"))
@@ -62,14 +62,14 @@ pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui:
         .show(ctx, |ui| {
             ui.set_max_width(width);
             egui::Frame {
-                inner_margin: egui::Margin::same(16.0),
-                rounding: egui::Rounding::same(13.0),
+                inner_margin: egui::Margin::same(16),
+                corner_radius: egui::CornerRadius::same(13),
                 fill: p.pop,
                 stroke: egui::Stroke::new(1.0, p.line),
                 shadow: egui::epaint::Shadow {
-                    offset: egui::vec2(0.0, 12.0),
-                    blur: 40.0,
-                    spread: 0.0,
+                    offset: [0, 12],
+                    blur: 40,
+                    spread: 0,
                     color: egui::Color32::from_black_alpha(115),
                 },
                 ..Default::default()

@@ -1,7 +1,7 @@
 // crates/keyroost/src/ui/theme.rs
 //
 // Device-centric redesign — palette, fonts, and small egui paint helpers.
-// Self-contained: depends only on egui/eframe 0.29 + std. Compiles without any
+// Self-contained: depends only on egui/eframe 0.35 + std. Compiles without any
 // hardware present, so it is safe to land on the branch ahead of the
 // device-model work. Values mirror the HTML prototype exactly.
 //
@@ -11,7 +11,7 @@
 //   // in App::new(cc):  install_fonts(&cc.egui_ctx);
 //   // each frame (or on change):  self.palette().apply(ctx);
 
-use egui::{Color32, FontFamily, FontId, Margin, Response, Rounding, Stroke};
+use egui::{Color32, CornerRadius, FontFamily, FontId, Margin, Response, Stroke, StrokeKind};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -187,7 +187,7 @@ impl Palette {
         v.widgets.inactive.bg_stroke = Stroke::new(1.0, self.line);
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, lighten(self.line, 0.25));
         v.widgets.active.bg_stroke = Stroke::new(1.0, self.accent);
-        v.window_rounding = Rounding::same(14.0);
+        v.window_corner_radius = CornerRadius::same(14);
         v.window_stroke = Stroke::new(1.0, self.line);
         ctx.set_visuals(v);
     }
@@ -228,19 +228,27 @@ pub fn install_fonts(ctx: &egui::Context) {
     let mut f = egui::FontDefinitions::default();
     f.font_data.insert(
         "plex".into(),
-        egui::FontData::from_static(include_bytes!("../../assets/IBMPlexSans-Regular.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/IBMPlexSans-Regular.ttf"
+        ))),
     );
     f.font_data.insert(
         "plex_sb".into(),
-        egui::FontData::from_static(include_bytes!("../../assets/IBMPlexSans-SemiBold.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/IBMPlexSans-SemiBold.ttf"
+        ))),
     );
     f.font_data.insert(
         "plex_b".into(),
-        egui::FontData::from_static(include_bytes!("../../assets/IBMPlexSans-Bold.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/IBMPlexSans-Bold.ttf"
+        ))),
     );
     f.font_data.insert(
         "jb".into(),
-        egui::FontData::from_static(include_bytes!("../../assets/JetBrainsMono-Regular.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/JetBrainsMono-Regular.ttf"
+        ))),
     );
     f.families
         .entry(FontFamily::Proportional)
@@ -264,8 +272,8 @@ pub fn install_fonts(ctx: &egui::Context) {
 // ---- card frame ----
 pub fn card_frame(p: &Palette) -> egui::Frame {
     egui::Frame {
-        inner_margin: Margin::same(18.0),
-        rounding: Rounding::same(14.0),
+        inner_margin: Margin::same(18),
+        corner_radius: CornerRadius::same(14),
         fill: p.panel,
         stroke: Stroke::new(1.0, p.line),
         ..Default::default()
@@ -281,8 +289,8 @@ pub fn status_dot(ui: &mut egui::Ui, color: Color32, d: f32) {
 // ---- pill / badge ----
 pub fn pill(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) {
     egui::Frame {
-        inner_margin: Margin::symmetric(8.0, 2.0),
-        rounding: Rounding::same(999.0),
+        inner_margin: Margin::symmetric(8, 2),
+        corner_radius: CornerRadius::same(255),
         fill: bg,
         ..Default::default()
     }
@@ -352,7 +360,13 @@ pub fn button(ui: &mut egui::Ui, p: &Palette, kind: BtnKind, label: &str) -> Res
     };
 
     let painter = ui.painter();
-    painter.rect(rect, Rounding::same(8.0), fill, stroke);
+    painter.rect(
+        rect,
+        CornerRadius::same(8),
+        fill,
+        stroke,
+        StrokeKind::Inside,
+    );
     let galley = painter.layout_no_wrap(label.to_owned(), f_sb(13.0), fg);
     painter.galley(rect.center() - galley.size() * 0.5, galley, fg);
     if hovered {
@@ -419,7 +433,13 @@ pub fn button_with_icon(
     };
 
     let painter = ui.painter();
-    painter.rect(rect, Rounding::same(8.0), fill, stroke);
+    painter.rect(
+        rect,
+        CornerRadius::same(8),
+        fill,
+        stroke,
+        StrokeKind::Inside,
+    );
     // Icon sits at the left padding; label follows after the gap.
     let icon_center = egui::pos2(rect.left() + pad_x + icon_w * 0.5, rect.center().y);
     let galley = painter.layout_no_wrap(label.to_owned(), f_sb(13.0), fg);
@@ -459,13 +479,18 @@ pub fn segmented(
                 egui::Button::new(egui::RichText::new(opt).font(f_sb(12.0)).color(fg))
                     .fill(fill)
                     .stroke(stroke)
-                    .rounding(Rounding::same(7.0)),
+                    .corner_radius(CornerRadius::same(7)),
             );
             // Repaint the option's surface on hover so unselected segments read
             // as clickable (egui's fixed `.fill()` otherwise has no hover state).
             if r.hovered() {
-                ui.painter()
-                    .rect(r.rect, Rounding::same(7.0), hover_fill, hover_stroke);
+                ui.painter().rect(
+                    r.rect,
+                    CornerRadius::same(7),
+                    hover_fill,
+                    hover_stroke,
+                    StrokeKind::Inside,
+                );
                 ui.painter().text(
                     r.rect.center(),
                     egui::Align2::CENTER_CENTER,
