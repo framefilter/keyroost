@@ -1026,6 +1026,20 @@ impl Worker {
 }
 
 fn main() -> eframe::Result<()> {
+    // KEYROOST_X11=1 forces the GUI onto X11/XWayland instead of native Wayland.
+    // On some compositors — observed on KDE Plasma 6.7 / KWin (issue #48) — the
+    // native Wayland window loses focus shortly after startup and then stops
+    // receiving keyboard/text/IME events, while the same binary works under
+    // XWayland. winit selects the Wayland backend whenever WAYLAND_DISPLAY is
+    // set, so clearing it for our own process makes winit fall back to X11
+    // (XWayland provides DISPLAY) — the same effect as launching with
+    // `env -u WAYLAND_DISPLAY keyroost`, without pulling in a direct winit
+    // dependency. No-op when Wayland wasn't in use. Done before any thread is
+    // spawned (the worker starts inside run_native), so the env edit is safe.
+    if std::env::var_os("KEYROOST_X11").is_some() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
