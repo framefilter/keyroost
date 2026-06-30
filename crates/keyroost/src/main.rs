@@ -4048,6 +4048,62 @@ impl App {
             Box::new(move |app: &mut App| match result {
                 Ok(devices) => {
                     app.devices_error = None;
+                    // Windows only needs `devices` mutable for the additive FIDO pass
+                    // below; off-Windows the original binding flows through unchanged
+                    // (a plain `let mut` here would be an unused-mut warning).
+                    #[cfg(windows)]
+                    let mut devices = devices;
+                    // Windows non-admin: the FIDO2 capability is read from the HID
+                    // usage page 0xF1D0, which a non-elevated process can't open
+                    // (ERROR_ACCESS_DENIED). So FIDO access is detected separately
+                    // via keyroost-winwebauthn (access-denied signal). This pass is
+                    // strictly ADDITIVE — it never removes a resolved device — and
+                    // is panic-isolated so an FFI fault can't empty the list.
+                    //  * Multiprotocol keys already resolve (via PC/SC) — add the
+                    //    FIDO2 cap so the tab appears.
+                    //  * FIDO-only keys don't resolve at all — synthesize a minimal
+                    //    device from the detected VID/PID.
+                    // cap_fido2 then shows the "needs admin / use Windows settings"
+                    // card for these.
+                    #[cfg(windows)]
+                    {
+                        let fido_keys =
+                            std::panic::catch_unwind(keyroost_winwebauthn::detect_fido_keys)
+                                .unwrap_or_default();
+                        if !fido_keys.is_empty() {
+                            if devices.iter().any(|d| d.kind == DeviceKind::Key) {
+                                for d in devices.iter_mut() {
+                                    if d.kind == DeviceKind::Key && !d.caps.has(Caps::FIDO2) {
+                                        d.caps.insert(Caps::FIDO2);
+                                    }
+                                }
+                            } else {
+                                for (i, k) in fido_keys.iter().enumerate() {
+                                    let mut caps = Caps::default();
+                                    caps.insert(Caps::FIDO2);
+                                    let vid = k.vendor_id.unwrap_or(0);
+                                    let pid = k.product_id.unwrap_or(0);
+                                    let model = k
+                                        .product
+                                        .clone()
+                                        .unwrap_or_else(|| "Security key".to_string());
+                                    devices.push(Device {
+                                        id: format!("winfido:{vid:04x}:{pid:04x}:{i}"),
+                                        name: None,
+                                        vendor: format!("{vid:04X}"),
+                                        model,
+                                        serial: String::new(),
+                                        transport: "USB · FIDO HID (admin required)".into(),
+                                        firmware: String::new(),
+                                        caps,
+                                        kind: DeviceKind::Key,
+                                        hid_path: None,
+                                        reader: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     // Keep the current selection if that device is still present;
                     // otherwise fall back to the first device.
                     let keep = app
@@ -6741,34 +6797,55 @@ impl App {
                         self.cap_tab = CapTab::Fido2;
                     }
                     ui.add_space(8.0);
-                    match self
-                        .security_keys
-                        .info
-                        .as_ref()
-                        .and_then(|i| i.option("clientPin"))
-                    {
-                        Some(true) => {
-                            ui.horizontal(|ui| {
-                                theme::pill(ui, "PIN set", p.ok, p.ok_soft());
-                                ui.add_space(8.0);
+                    // Windows non-admin: FIDO access is gated, so `info` never
+                    // loads; show an admin-needed hint instead of a perpetual
+                    // "Reading key…". The Manage → jump opens the full card.
+                    #[cfg(windows)]
+                    let non_admin = self.security_keys.info.is_none()
+                        && keyroost_winwebauthn::fido_key_present();
+                    #[cfg(not(windows))]
+                    let non_admin = false;
+                    if non_admin {
+                        theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Open the FIDO2 tab to manage this key via Windows \
+                                 settings or restart as administrator.",
+                            )
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                        );
+                    } else {
+                        match self
+                            .security_keys
+                            .info
+                            .as_ref()
+                            .and_then(|i| i.option("clientPin"))
+                        {
+                            Some(true) => {
+                                ui.horizontal(|ui| {
+                                    theme::pill(ui, "PIN set", p.ok, p.ok_soft());
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "PIN configured \u{00B7} ready for passkeys",
+                                        )
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                    );
+                                });
+                            }
+                            Some(false) => {
+                                theme::pill(ui, "No PIN configured", p.warn, p.warn_soft());
+                            }
+                            None => {
                                 ui.label(
-                                    egui::RichText::new(
-                                        "PIN configured \u{00B7} ready for passkeys",
-                                    )
-                                    .font(theme::f_reg(13.0))
-                                    .color(p.txt2),
+                                    egui::RichText::new("Reading key\u{2026}")
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt3),
                                 );
-                            });
-                        }
-                        Some(false) => {
-                            theme::pill(ui, "No PIN configured", p.warn, p.warn_soft());
-                        }
-                        None => {
-                            ui.label(
-                                egui::RichText::new("Reading key\u{2026}")
-                                    .font(theme::f_reg(13.0))
-                                    .color(p.txt3),
-                            );
+                            }
                         }
                     }
                 });
@@ -6934,7 +7011,82 @@ impl App {
     }
 
     /// FIDO2 / Passkeys tab — reuses the existing PIN + credentials section.
+    /// Windows non-admin FIDO2 card: explain the admin requirement and offer to
+    /// open Windows' security-key settings (PIN / reset / biometrics work there
+    /// without elevation) or restart keyroost as administrator for full
+    /// management here. Only built on Windows; the helper is inert elsewhere.
+    #[cfg(windows)]
+    fn fido2_non_admin_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        theme::card_frame(p).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Administrator rights needed")
+                    .font(theme::f_sb(14.5))
+                    .color(p.txt),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "A security key is connected, but managing its FIDO2 settings \
+                     (PIN, passkeys, reset, fingerprints) in this app requires \
+                     administrator rights on Windows.",
+                )
+                .font(theme::f_reg(13.0))
+                .color(p.txt2),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Change the PIN, manage biometrics or reset the key without \
+                     admin rights using Windows' built-in security-key settings, \
+                     or restart this app as administrator for full management here.",
+                )
+                .font(theme::f_reg(13.0))
+                .color(p.txt2),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if theme::button(
+                    ui,
+                    p,
+                    BtnKind::Primary,
+                    "Open Windows security-key settings",
+                )
+                .clicked()
+                {
+                    if let Err(e) = keyroost_winwebauthn::open_windows_security_key_settings() {
+                        self.security_keys.error =
+                            Some(format!("Couldn't open Windows security-key settings: {e}"));
+                    }
+                }
+                if theme::button(ui, p, BtnKind::Default, "Restart as administrator").clicked() {
+                    match keyroost_winwebauthn::relaunch_as_admin() {
+                        // Elevated instance requested: exit this non-elevated one
+                        // so only the admin process remains.
+                        Ok(()) => std::process::exit(0),
+                        Err(e) => {
+                            self.security_keys.error =
+                                Some(format!("Couldn't restart as administrator: {e}"));
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     fn cap_fido2(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // Non-admin Windows: if a FIDO key is present but we have no working FIDO
+        // access (the HID interface is gated), show the admin-needed card with a
+        // link to Windows' settings and an elevate button, instead of the normal
+        // — and here non-functional — management UI.
+        #[cfg(windows)]
+        {
+            let no_access = self.security_keys.info.is_none();
+            if no_access && keyroost_winwebauthn::fido_key_present() {
+                self.fido2_non_admin_card(ui, p);
+                return;
+            }
+        }
+
         let pin_set = self
             .security_keys
             .info

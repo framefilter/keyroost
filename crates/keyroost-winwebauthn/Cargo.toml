@@ -1,0 +1,28 @@
+[package]
+name = "keyroost-winwebauthn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Windows-only helper: detect a FIDO key and open Windows' security-key settings, without admin."
+
+# This crate is the one deliberate exception to the workspace-wide
+# forbid(unsafe_code): it is a thin FFI shim over Windows' HID enumeration and
+# the shell. The unsafe is confined to src/sys.rs and to this crate.
+[lints.rust]
+unsafe_code = "allow"
+
+# Windows-only. On other platforms the crate still builds but every entry point
+# is inert (returns empty / Unsupported), so callers can depend on it
+# unconditionally and gate behaviour at runtime.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",                            # SECURITY_ATTRIBUTES (CreateFileW param)
+    "Win32_UI_WindowsAndMessaging",              # SW_SHOWNORMAL
+    "Win32_UI_Shell",                            # ShellExecuteW (ms-settings: launch)
+    "Win32_Devices_DeviceAndDriverInstallation", # SetupDi* (HID enumeration)
+    "Win32_Devices_HumanInterfaceDevice",        # HidD_* / HidP_GetCaps (usage page)
+    "Win32_Storage_FileSystem",                  # CreateFileW (open HID for caps)
+] }

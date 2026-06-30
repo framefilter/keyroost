@@ -1716,6 +1716,7 @@ dependencies = [
  "keyroost-token2otp",
  "keyroost-token2prog",
  "keyroost-transport",
+ "keyroost-winwebauthn",
  "png 0.18.1",
  "pollster",
  "rfd",
@@ -1863,6 +1864,13 @@ dependencies = [
  "keyroost-token2prog",
  "pcsc",
  "zeroize",
+]
+
+[[package]]
+name = "keyroost-winwebauthn"
+version = "0.7.2"
+dependencies = [
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -30,6 +30,9 @@ keyroost-import = { path = "../keyroost-import", version = "0.7.2", features = [
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
 # keyroostctl). Owns the scoped `rsa` dependency exception.
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.7.2" }
+# Windows-only helper for the non-admin FIDO2 path: detect a FIDO key, open
+# Windows' security-key settings, and relaunch elevated. Inert on other platforms.
+keyroost-winwebauthn = { path = "../keyroost-winwebauthn", version = "0.7.2" }
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.35"
 # Already in the tree via eframe/egui-winit's clipboard integration; direct

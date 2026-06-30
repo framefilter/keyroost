@@ -18,6 +18,7 @@ members = [
     "crates/keyroost-rsakey",
     "crates/keyroost-qr",
     "crates/keyroost-import",
+    "crates/keyroost-winwebauthn",
     "crates/keyroostctl",
     "crates/keyroost",
 ]
