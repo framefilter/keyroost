@@ -324,15 +324,23 @@ winget install Framefilter.Keyroost
 
 ### Flatpak (Linux — auto-updating, recommended for the GUI)
 
-Add the maintainer's GPG-signed remote, then install the app
-(app-id `io.github.framefilter.keyroost`):
+Add Flathub (for the shared runtime) and the maintainer's GPG-signed remote in
+the **same scope**, then install the app (app-id
+`io.github.framefilter.keyroost`). Using `--user` needs no root and avoids the
+most common failure — a scope mismatch between Flathub and the keyroost remote,
+which makes the install fail to find its runtime even when it's installed:
 
 ```bash
-flatpak remote-add --if-not-exists keyroost \
+flatpak remote-add --if-not-exists --user flathub \
+  https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak remote-add --if-not-exists --user keyroost \
   https://framefilter.github.io/keyroost-flatpak/keyroost.flatpakrepo
-flatpak install keyroost io.github.framefilter.keyroost
+flatpak install --user keyroost io.github.framefilter.keyroost
 # updates ride along with `flatpak update`
 ```
+
+Prefer a system-wide install? Use `--system` on all three commands instead —
+the key is keeping Flathub and the keyroost remote in the *same* scope.
 
 Or grab the offline single-file bundle (`keyroost.flatpak`) attached to each
 release:
