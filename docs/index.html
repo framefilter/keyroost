@@ -211,6 +211,15 @@
           toolchain with no vendor SDKs. It's optional power tooling, not a requirement.</p>
       </div>
     </details>
+
+    <details>
+      <summary>Text input in the desktop app misbehaves on my Linux session</summary>
+      <div class="kr-answer">
+        <p>On some Wayland compositors — notably KDE Plasma — GUI text fields can drop or
+          mishandle keystrokes. Launch the app with <code>KEYROOST_X11=1</code> set to force
+          it onto XWayland, which resolves the input handling.</p>
+      </div>
+    </details>
   </section>
 
   <section class="kr-section" id="install">

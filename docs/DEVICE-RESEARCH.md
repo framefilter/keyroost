@@ -100,7 +100,7 @@ Outline for a future Claude (don't over-research — breadth first, depth later)
 1. **Enumerate capabilities per device.** FIDO2/WebAuthn (passkeys, resident
    keys), U2F, OATH-TOTP/HOTP, PIV, OpenPGP, Yubico OTP / HMAC challenge-response,
    PIN & policy features. Note which the device actually supports (Solo 2 / NK3
-   differ from YubiKey — cross-check against PLAN.md's applet survey).
+   differ from YubiKey — cross-check against PLAN.md's applet notes).
 2. **Map each capability to a day-to-day use.** Plain language, concrete:
    e.g. "phishing-resistant login to Google/GitHub" (passkey), "log into SSH
    with a hardware key" (FIDO2 SSH), "2FA codes for sites without push" (OATH),

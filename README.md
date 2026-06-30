@@ -414,7 +414,10 @@ packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 > elevated ("Run as administrator") session on Windows; the Molto2, OATH,
 > OpenPGP, and PIV features go over PC/SC and work unelevated. Elevate for
 > the FIDO command you need, then drop back — don't run the whole tool
-> elevated as a habit.
+> elevated as a habit. Even without admin the GUI now *detects* an attached
+> FIDO key (via readable HID metadata, without opening the protected
+> interface) and shows an "Administrator rights needed" card with a button to
+> relaunch elevated or open Windows' own security-key settings.
 
 > **Prebuilt binaries:** the release artifacts are built on Ubuntu and linked
 > against its glibc, so they run on glibc-current distros (Arch, recent Fedora)
@@ -428,6 +431,13 @@ packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
 > open (nothing is cleared) rather than clobbering whatever you copied since.
 > GNOME and KDE sync the two clipboards, so the clear works there; on other
 > compositors treat the auto-clear as best-effort.
+
+> **Forcing X11 (`KEYROOST_X11=1`):** the GUI runs natively on Wayland by
+> default. The egui/eframe 0.35 bump fixed a Wayland/KDE input bug where text
+> entry under native Wayland — notably on KDE Plasma — could misbehave, but if
+> you still hit broken text input set `KEYROOST_X11=1` to force the GUI onto
+> XWayland as a fallback. It's opt-in; leave it unset for the native-Wayland
+> path.
 
 ### FIDO HID access (Linux udev rules)
 
@@ -554,6 +564,7 @@ commands are unchanged.
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand`, `zeroize` |
 | `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers | `serde`/`serde_json`, `scrypt`, `aes-gcm`, `base64`, `zeroize` (all behind `bulk`) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots, a live screen capture, and GA export batches (optional `qr` feature; built into the release + AppImage binaries) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
+| `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | none |
 | `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `zeroize` |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `zeroize` |
 

@@ -15,6 +15,6 @@ workspace = true
 # padding, and the case-3 APDU builder from the Molto2 protocol crate. The
 # single-profile token shares the same crypto primitives; only the command set,
 # the (hardcoded) device key, and a couple of framing details differ.
-keyroost-proto = { path = "../keyroost-proto", version = "0.7.2" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.3" }
 
 [dev-dependencies]

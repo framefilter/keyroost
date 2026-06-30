@@ -19,7 +19,7 @@ workspace = true
 hidapi-backend = ["dep:hidapi", "keyroost-hid/hidapi-backend"]
 
 [dependencies]
-keyroost-hid = { path = "../keyroost-hid", version = "0.7.2" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.7.3" }
 # Optional so a default Linux build pulls nothing (the hidraw File backend is
 # dependency-free); enabled by `hidapi-backend` for testing.
 hidapi = { version = "2.6", optional = true, default-features = false, features = [

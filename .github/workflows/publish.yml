@@ -88,11 +88,15 @@ jobs:
           # it), and it itself only needs keyroost-proto, so it sits right
           # after keyroost-token2otp. (Its very first publish was by hand — a
           # brand-new crate can't be created over OIDC — after which Trusted
-          # Publishing handles it like the rest.)
+          # Publishing handles it like the rest.) keyroost-winwebauthn is new in
+          # 0.7.3 and only keyroost depends on it (it has no in-tree deps of its
+          # own), so it sits just before the binaries; like token2prog, its FIRST
+          # publish must be done by hand before Trusted Publishing can take over.
           for crate in keyroost-proto keyroost-hid keyroost-keyring keyroost-rsakey \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
                        keyroost-token2otp keyroost-token2prog keyroost-import \
                        keyroost-transport keyroost-resolve keyroost-qr \
+                       keyroost-winwebauthn \
                        keyroostctl keyroost; do
             # crates.io rejects API requests without a User-Agent (HTTP 403),
             # which would make this "already published?" probe always fail and

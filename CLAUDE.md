@@ -35,10 +35,14 @@ tool. Workspace contains:
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | none |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | none |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | none |
+| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`), `zeroize` |
+| `keyroost-token2prog` | Pure-Rust Token2 2nd-gen single-profile programmable-token protocol (SM4 seed/MAC, config TLV); reuses `keyroost-proto` | none |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching, no hardware | `serde`, `serde_json` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading for OpenPGP import | `rsa`, `rand` (scoped exception) |
 | `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers | `serde`, `serde_json` (behind `bulk` feature) |
+| `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots + Google Authenticator migration batches (behind `qr` feature) | `rqrr`, `png`, `jpeg-decoder` |
+| `keyroost-winwebauthn` | Windows-only non-admin FIDO2 helper: detect a FIDO key, open Windows' security-key settings, relaunch elevated; inert on non-Windows | none |
 | `keyroostctl` | CLI binary | `clap` |
 | `keyroost` | egui desktop GUI | `eframe`, `egui` |
 

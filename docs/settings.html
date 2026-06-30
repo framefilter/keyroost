@@ -86,11 +86,11 @@
 
   <section class="kr-section">
     <h2>Command line</h2>
-<pre><code>keyroostctl fido-always-uv               --pin-env KR_PIN
-keyroostctl fido-set-min-pin --length 6  --pin-env KR_PIN
-keyroostctl fido-set-min-pin --length 8 --force-change --pin-env KR_PIN
-keyroostctl fido-force-pin-change        --pin-env KR_PIN
-keyroostctl fido-enterprise-attestation  --pin-env KR_PIN</code></pre>
+<pre><code>keyroostctl fido always-uv               --pin-env KR_PIN
+keyroostctl fido set-min-pin --length 6  --pin-env KR_PIN
+keyroostctl fido set-min-pin --length 8 --force-change --pin-env KR_PIN
+keyroostctl fido force-pin-change        --pin-env KR_PIN
+keyroostctl fido enterprise-attestation  --pin-env KR_PIN</code></pre>
     <p class="kr-muted">Each command takes the PIN via <code>--pin-env</code> (an environment
       variable name), <code>--pin-stdin</code>, and an optional <code>--path</code> to select a
       specific key.</p>
@@ -100,7 +100,7 @@ keyroostctl fido-enterprise-attestation  --pin-env KR_PIN</code></pre>
     <h2>Cautions</h2>
     <p class="kr-muted"><strong>Minimum PIN length and enterprise attestation are one-way</strong>
       — undoing them needs a full reset, which wipes every passkey and the PIN. Test the
-      reversible operations first (<code>fido-always-uv</code>, force PIN change) on a given
+      reversible operations first (<code>fido always-uv</code>, force PIN change) on a given
       key before relying on the irreversible ones. <strong>If a command is rejected</strong>,
       the key may not support that sub-command; keyroost reports the CTAP status with a
       readable hint.</p>

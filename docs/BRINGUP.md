@@ -47,7 +47,7 @@ keyroostctl --list-readers
 ## Step 2: Read serial and time (no auth required)
 
 ```bash
-keyroostctl --debug info
+keyroostctl --debug molto info
 ```
 
 **Expected stderr** (something like — the actual hex is device-dependent):
@@ -76,7 +76,7 @@ device UTC:    1699999284 (epoch)
 Factory-fresh devices use `TOKEN2MOLTO1-KEY`.
 
 ```bash
-keyroostctl --debug --key-ascii TOKEN2MOLTO1-KEY set-title --profile 99 "MOLTO_TEST"
+keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY title --profile 99 "MOLTO_TEST"
 ```
 
 This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, `answer challenge`, then `set title` — and end with "title set on profile #99".
@@ -98,7 +98,7 @@ should see "MOLTO_TEST" as the title.
 ## Step 5: Write a known TOTP seed and verify the codes match
 
 ```bash
-keyroostctl --debug --key-ascii TOKEN2MOLTO1-KEY \
+keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY \
   import --profile 99 \
   --title MOLTO_TEST \
   'otpauth://totp/MoltoTest?secret=JBSWY3DPEHPK3PXPJBSWY3DP&algorithm=SHA1&digits=6&period=30'
@@ -112,7 +112,7 @@ compare. Within ±1 step (30 seconds) both should show the same 6 digits. If
 they don't, the device's clock is off — fix with:
 
 ```bash
-keyroostctl --key-ascii TOKEN2MOLTO1-KEY sync-time --profile 99
+keyroostctl molto --key-ascii TOKEN2MOLTO1-KEY sync-time --profile 99
 ```
 
 …and try again on the next 30-second boundary.
@@ -123,7 +123,7 @@ Drop a small plaintext Aegis or 2FAS export (1–3 entries) into `/tmp/test.json
 and:
 
 ```bash
-keyroostctl --debug --key-ascii TOKEN2MOLTO1-KEY \
+keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY \
   import-file /tmp/test.json --start 95 --dry-run
 ```
 

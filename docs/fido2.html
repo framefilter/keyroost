@@ -125,6 +125,12 @@
 keyroostctl fido pin-retries
 keyroostctl fido creds-list --pin-stdin   # PIN read from stdin, never argv</code></pre>
     <div class="kr-callout note">
+      <div class="kr-callout-title note">On Windows</div>
+      <p>Windows reserves direct FIDO access for elevated processes, so managing a key needs
+        administrator rights. keyroost detects an unprivileged session and offers to open
+        Windows' built-in security-key settings or relaunch itself as administrator.</p>
+    </div>
+    <div class="kr-callout note">
       <div class="kr-callout-title note">Privacy</div>
       <p>A credential listing reveals which services you have accounts with — treat it as
         private and don't run it speculatively.</p>

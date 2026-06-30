@@ -15,24 +15,24 @@ name = "keyroost"
 path = "src/main.rs"
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.7.2" }
-keyroost-transport = { path = "../keyroost-transport", version = "0.7.2" }
-keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.2" }
-keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.2" }
-keyroost-piv = { path = "../keyroost-piv", version = "0.7.2" }
-keyroost-hid = { path = "../keyroost-hid", version = "0.7.2" }
-keyroost-ctap = { path = "../keyroost-ctap", version = "0.7.2" }
-keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.2" }
-keyroost-resolve = { path = "../keyroost-resolve", version = "0.7.2" }
-keyroost-oath = { path = "../keyroost-oath", version = "0.7.2" }
-keyroost-qr = { path = "../keyroost-qr", version = "0.7.2" }
-keyroost-import = { path = "../keyroost-import", version = "0.7.2", features = ["bulk", "encrypted"] }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.3" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.7.3" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.3" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.3" }
+keyroost-piv = { path = "../keyroost-piv", version = "0.7.3" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.7.3" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.7.3" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.3" }
+keyroost-resolve = { path = "../keyroost-resolve", version = "0.7.3" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.7.3" }
+keyroost-qr = { path = "../keyroost-qr", version = "0.7.3" }
+keyroost-import = { path = "../keyroost-import", version = "0.7.3", features = ["bulk", "encrypted"] }
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
 # keyroostctl). Owns the scoped `rsa` dependency exception.
-keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.7.2" }
+keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.7.3" }
 # Windows-only helper for the non-admin FIDO2 path: detect a FIDO key, open
 # Windows' security-key settings, and relaunch elevated. Inert on other platforms.
-keyroost-winwebauthn = { path = "../keyroost-winwebauthn", version = "0.7.2" }
+keyroost-winwebauthn = { path = "../keyroost-winwebauthn", version = "0.7.3" }
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.35"
 # Already in the tree via eframe/egui-winit's clipboard integration; direct

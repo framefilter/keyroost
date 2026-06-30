@@ -11,8 +11,8 @@ description = "Shared security-key identity resolution (USB + CCID serials) over
 workspace = true
 
 [dependencies]
-keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.2" }
-keyroost-hid = { path = "../keyroost-hid", version = "0.7.2" }
-keyroost-transport = { path = "../keyroost-transport", version = "0.7.2" }
-keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.2" }
-keyroost-proto = { path = "../keyroost-proto", version = "0.7.2" }
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.7.3" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.7.3" }
+keyroost-transport = { path = "../keyroost-transport", version = "0.7.3" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.3" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.3" }

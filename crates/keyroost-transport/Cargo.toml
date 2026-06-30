@@ -11,16 +11,16 @@ description = "PC/SC transport for the Token2 Molto2 / Molto2v2 programmable TOT
 workspace = true
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.7.2" }
-keyroost-oath = { path = "../keyroost-oath", version = "0.7.2" }
-keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.2" }
-keyroost-piv = { path = "../keyroost-piv", version = "0.7.2" }
-keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.2" }
-keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.2" }
-keyroost-hid = { path = "../keyroost-hid", version = "0.7.2" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.3" }
+keyroost-oath = { path = "../keyroost-oath", version = "0.7.3" }
+keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.7.3" }
+keyroost-piv = { path = "../keyroost-piv", version = "0.7.3" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.7.3" }
+keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.3" }
+keyroost-hid = { path = "../keyroost-hid", version = "0.7.3" }
 # For the CtapTransport trait — the PC/SC CTAP backend (NFC + contact readers)
 # implements it so FIDO2 commands can run over a smart-card reader, not just USB-HID.
-keyroost-ctap = { path = "../keyroost-ctap", version = "0.7.2" }
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.7.3" }
 pcsc = "2"
 # hidapi backs the Token2 OTP USB-HID transport on macOS / Windows; Linux uses
 # the dependency-free hidraw `File` path (same split as keyroost-ctap). Optional

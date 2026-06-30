@@ -6,21 +6,44 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-06-30
+
+### Added
+- **Windows: non-admin FIDO2 detection** — an unelevated process can't read a
+  FIDO key's HID usage page on Windows, so FIDO-only keys used to disappear from
+  the device list with no explanation. keyroost now detects the key via the
+  access-denied signal and shows an "Administrator rights needed" card in the
+  FIDO2 tab, with buttons to open Windows' built-in security-key settings or to
+  relaunch elevated (new `keyroost-winwebauthn` helper crate). Thanks to
+  [@token2](https://github.com/token2)
+  ([#58](https://github.com/framefilter/keyroost/issues/58),
+  [#62](https://github.com/framefilter/keyroost/pull/62)).
+- **`KEYROOST_X11=1`** — opt-in environment variable that forces the GUI onto
+  XWayland, a fallback for Wayland compositors where native input misbehaves.
+
 ### Fixed
-- **GUI text input on Wayland / KDE Plasma** — on some Wayland compositors
-  (notably KDE Plasma 6.7) the window lost keyboard focus shortly after startup
-  and no field would accept typed input. Updating the UI toolkit resolves it and
-  native Wayland input works again
-  ([#48](https://github.com/framefilter/keyroost/issues/48)). As a fallback for
-  any other compositor that still misbehaves, set `KEYROOST_X11=1` to run the GUI
-  under XWayland.
+- **GUI text input on Wayland / KDE Plasma** — on some compositors (notably KDE
+  Plasma 6.7) the window lost keyboard focus shortly after startup and no field
+  accepted typed input. The UI-toolkit update (below) resolves it; native
+  Wayland input works again
+  ([#48](https://github.com/framefilter/keyroost/issues/48)).
+- **Light-theme zoom control** — the "Text size" slider, its handle and the ±
+  steppers were nearly invisible on the light theme; they now use a contrasting
+  control colour. The ± steppers also no longer slide out from under the cursor
+  during repeated clicks — they preview and apply once you settle
+  ([#59](https://github.com/framefilter/keyroost/issues/59),
+  [#42](https://github.com/framefilter/keyroost/issues/42)).
+- **winget (Windows):** the package manifest now declares the
+  `Microsoft.VCRedist.2015+.x64` dependency, so winget pulls in the VC++
+  runtime the Windows build needs alongside keyroost.
 
 ### Changed
-- **UI toolkit updated** (egui/eframe 0.29 → 0.35) to solve the Wayland/KDE input
-  issue above. This is a sizeable refresh of the GUI layer — it should look and
-  behave just as before, but **please [open an issue](https://github.com/framefilter/keyroost/issues)
-  if you spot anything that looks off or misbehaves** so it can be polished.
-  (Building from source now requires Rust 1.85 or newer.)
+- **UI toolkit updated** (egui/eframe 0.29 → 0.35) — this fixed the Wayland/KDE
+  input bug above and is a sizeable refresh of the GUI layer. It should look and
+  behave just as before, but **please
+  [open an issue](https://github.com/framefilter/keyroost/issues) if you spot
+  anything off** so it can be polished. Building from source now requires
+  **Rust 1.85** or newer.
 
 ## [0.7.2] - 2026-06-26
 

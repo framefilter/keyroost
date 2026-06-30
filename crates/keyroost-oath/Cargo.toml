@@ -11,4 +11,4 @@ description = "Yubico/Trussed OATH (TOTP/HOTP) applet protocol over APDU."
 workspace = true
 
 [dependencies]
-keyroost-proto = { path = "../keyroost-proto", version = "0.7.2" }
+keyroost-proto = { path = "../keyroost-proto", version = "0.7.3" }

@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "arboard",
  "base64",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-ctap"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "aes",
  "cbc",
@@ -1743,14 +1743,14 @@ dependencies = [
 
 [[package]]
 name = "keyroost-hid"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "hidapi",
 ]
 
 [[package]]
 name = "keyroost-import"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-keyring"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1772,32 +1772,32 @@ dependencies = [
 
 [[package]]
 name = "keyroost-oath"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "keyroost-proto",
 ]
 
 [[package]]
 name = "keyroost-openpgp"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "keyroost-proto",
 ]
 
 [[package]]
 name = "keyroost-piv"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "keyroost-proto",
 ]
 
 [[package]]
 name = "keyroost-proto"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "keyroost-qr"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "jpeg-decoder",
  "keyroost-import",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-resolve"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "keyroost-hid",
  "keyroost-keyring",
@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-rsakey"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "rand",
  "rsa",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-token2otp"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "aes",
  "cbc",
@@ -1840,14 +1840,14 @@ dependencies = [
 
 [[package]]
 name = "keyroost-token2prog"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "keyroost-proto",
 ]
 
 [[package]]
 name = "keyroost-transport"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "aes",
  "cipher",
@@ -1868,14 +1868,14 @@ dependencies = [
 
 [[package]]
 name = "keyroost-winwebauthn"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "keyroostctl"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "clap",
  "clap_complete",
