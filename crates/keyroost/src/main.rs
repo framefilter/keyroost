@@ -11095,6 +11095,7 @@ impl App {
             egui::Window::new("Bulk import")
                 .open(&mut open)
                 .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .default_width(560.0)
                 .show(ctx, |ui| {
                     ui.label("Export file path (Aegis JSON [plain or encrypted], 2FAS JSON, or otpauth:// list):");
@@ -11226,6 +11227,7 @@ impl App {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label("Paste an otpauth:// URI:");
                     ui.add(

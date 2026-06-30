@@ -6,6 +6,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **GUI text input on Wayland / KDE Plasma** — on some Wayland compositors
+  (notably KDE Plasma 6.7) the window lost keyboard focus shortly after startup
+  and no field would accept typed input. Updating the UI toolkit resolves it and
+  native Wayland input works again
+  ([#48](https://github.com/framefilter/keyroost/issues/48)). As a fallback for
+  any other compositor that still misbehaves, set `KEYROOST_X11=1` to run the GUI
+  under XWayland.
+
+### Changed
+- **UI toolkit updated** (egui/eframe 0.29 → 0.35) to solve the Wayland/KDE input
+  issue above. This is a sizeable refresh of the GUI layer — it should look and
+  behave just as before, but **please [open an issue](https://github.com/framefilter/keyroost/issues)
+  if you spot anything that looks off or misbehaves** so it can be polished.
+  (Building from source now requires Rust 1.85 or newer.)
+
 ## [0.7.2] - 2026-06-26
 
 ### Added
