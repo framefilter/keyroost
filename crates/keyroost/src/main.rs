@@ -6069,10 +6069,18 @@ impl App {
         ui.add_space(6.0);
 
         // The slider itself. Style its track/handle to the palette so it reads
-        // as part of the bar rather than egui's default blue.
+        // as part of the bar rather than egui's default blue. egui draws both the
+        // rail and the handle from `inactive.bg_fill`; on the LIGHT theme `raised2`
+        // sits almost on top of the bar, so the rail, handle and steppers were
+        // near-invisible (#59). Use a clearly darker control gray on light (the
+        // dark bar keeps `raised2`, which already contrasts fine).
+        let (track, track_hot) = match self.mode {
+            Mode::Light => (theme::darken(p.bar, 0.16), theme::darken(p.bar, 0.26)),
+            Mode::Dark => (p.raised2, theme::lighten(p.raised2, 0.08)),
+        };
         let style = ui.style_mut();
-        style.visuals.widgets.inactive.bg_fill = p.raised2;
-        style.visuals.widgets.hovered.bg_fill = theme::lighten(p.raised2, 0.08);
+        style.visuals.widgets.inactive.bg_fill = track;
+        style.visuals.widgets.hovered.bg_fill = track_hot;
         style.visuals.widgets.active.bg_fill = p.accent;
         style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.txt2);
         style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.txt);
@@ -6085,15 +6093,8 @@ impl App {
         let step = |ui: &mut egui::Ui, glyph: &str| -> bool {
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
             let hot = resp.hovered();
-            ui.painter().rect_filled(
-                rect,
-                3.0,
-                if hot {
-                    theme::lighten(p.raised2, 0.08)
-                } else {
-                    p.raised2
-                },
-            );
+            ui.painter()
+                .rect_filled(rect, 3.0, if hot { track_hot } else { track });
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -6114,7 +6115,9 @@ impl App {
         ui.add_space(4.0);
 
         let resp = ui.add(
-            egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX).show_value(false),
+            egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX)
+                .show_value(false)
+                .trailing_fill(true),
         );
         if resp.dragged() {
             // Mid-drag: preview only, don't touch the context (avoids runaway).
@@ -6145,7 +6148,7 @@ impl App {
         ui.label(
             egui::RichText::new("Text size")
                 .font(theme::f_reg(12.0))
-                .color(p.txt3),
+                .color(p.txt2),
         );
 
         // "Reset" appears only when we're off the default, so the chrome stays
