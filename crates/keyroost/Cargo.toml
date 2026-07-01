@@ -65,7 +65,7 @@ pollster = "0.4"
 # is pinned (future-incompat + unmaintained); migration to `xcap` is tracked
 # separately. The MSRV that motivated the original pin is moot now that the
 # egui 0.35 bump raised the workspace to Rust 1.85.
-screenshots = { version = "=0.5.4", optional = true }
+screenshots = { version = "=0.8.10", optional = true }
 
 [features]
 # Scan a TOTP QR shown on screen to fill a seed/profile form. Adds the
