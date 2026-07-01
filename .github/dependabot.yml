@@ -34,10 +34,21 @@ updates:
       # rand_core 0.6 interfaces; drop when a rand-0.9+-compatible rsa ships.
       - dependency-name: rand
         versions: ['>=0.9']
+      # des and cipher are the same block-cipher generation as aes/cbc above:
+      # des 0.9 / cipher 0.5 use the cipher-0.5 traits and cannot interoperate
+      # with the pinned aes 0.8 / cbc 0.1, so they must move with the whole stack.
+      # getrandom 0.3 needs the rand 0.9 interfaces (rand is pinned just above).
+      - dependency-name: des
+        versions: ['>=0.9']
+      - dependency-name: cipher
+        versions: ['>=0.5']
+      - dependency-name: getrandom
+        versions: ['>=0.3']
       # eframe pins its own egui version, so the pair can only move in
       # lock-step, and a multi-version egui jump needs hand-migration of the
       # GUI code — an upgrade to do deliberately, not via single-crate bumps.
+      # v0.7.3 already made the deliberate jump to 0.35; defer the next one.
       - dependency-name: eframe
-        versions: ['>=0.30']
+        versions: ['>=0.36']
       - dependency-name: egui
-        versions: ['>=0.30']
+        versions: ['>=0.36']
