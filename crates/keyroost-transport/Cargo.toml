@@ -38,7 +38,7 @@ hidapi = { version = "2.6", optional = true, default-features = false, features 
 aes = { version = "0.8", default-features = false, features = ["zeroize"] }
 des = { version = "0.8", default-features = false, features = ["zeroize"] }
 cipher = { version = "0.4", default-features = false }
-getrandom = "0.2"
+getrandom = "0.3"
 # Wipe PIN/PUK/management-key APDU bodies after transmit (the same hygiene the
 # CLI and importers already apply to their secret buffers).
 zeroize = "1"
