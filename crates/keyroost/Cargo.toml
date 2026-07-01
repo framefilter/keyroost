@@ -2,7 +2,10 @@
 name = "keyroost"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# This GUI crate's real MSRV floor is higher than the rest of the workspace:
+# eframe / egui 0.35 require Rust 1.92. The libraries and the CLI keep the lower
+# workspace MSRV (1.85), so this is pinned per-crate instead of inherited.
+rust-version = "1.92"
 license.workspace = true
 repository.workspace = true
 description = "Desktop GUI for programming Token2 Molto2 / Molto2v2 TOTP tokens."
@@ -74,8 +77,8 @@ pollster = "0.4"
 #   Windows       -> GDI BitBlt via the keyroost-screengrab crate (always a dep)
 # This deliberately replaces `xcap`, whose Linux backend dragged in a whole
 # screencast stack (pipewire, gbm, drm, egl + 5 system -dev packages) to grab a
-# single frame. `qr`-enabled builds need a newer Rust than the base MSRV (ashpd
-# tracks a recent toolchain); the default (non-qr) build keeps the workspace MSRV.
+# single frame. (ashpd needs Rust 1.92 — but so does this GUI crate via egui 0.35,
+# so `qr` adds no MSRV burden beyond the crate's own rust-version above.)
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", optional = true }
 # `screenshot` is the portal we use; `async-io` drives it on zbus's async-io
