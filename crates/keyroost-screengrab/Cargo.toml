@@ -17,7 +17,7 @@ unsafe_code = "allow"
 # Windows-only: on every other target the crate compiles to an inert stub with
 # no dependencies, so `keyroost` can depend on it unconditionally.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",

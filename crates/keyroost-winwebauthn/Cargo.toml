@@ -17,7 +17,7 @@ unsafe_code = "allow"
 # is inert (returns empty / Unsupported), so callers can depend on it
 # unconditionally and gate behaviour at runtime.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",                            # SECURITY_ATTRIBUTES (CreateFileW param)
     "Win32_UI_WindowsAndMessaging",              # SW_SHOWNORMAL
