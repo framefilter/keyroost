@@ -6789,7 +6789,7 @@ impl App {
                             ui.end_row();
                         }
                     }
-                    if pairs.len() % cols != 0 {
+                    if !pairs.len().is_multiple_of(cols) {
                         ui.end_row();
                     }
                 });
