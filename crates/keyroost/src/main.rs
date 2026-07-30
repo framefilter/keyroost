@@ -4676,6 +4676,7 @@ impl App {
     /// Settings dialog for language selection and other preferences.
     fn render_settings_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         let mut close = false;
+        let mut apply = false;
         let mut new_language = self.language;
 
         egui::Window::new(self.translations.ui_string("settings").unwrap_or("Settings"))
@@ -4710,15 +4711,21 @@ impl App {
                     }
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(8.0);
 
-                // OK button
-                ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Default, "OK").clicked() {
+                // Bottom buttons: Cancel on left, OK on right
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if ui.button("Cancel").clicked() {
                         close = true;
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "OK").clicked() {
+                            close = true;
+                            apply = true;
+                        }
+                    });
                 });
             });
 
@@ -4726,8 +4733,8 @@ impl App {
             self.settings_open = false;
         }
 
-        // Apply language change if needed
-        if new_language != self.language {
+        // Apply language change only when OK is clicked
+        if apply && new_language != self.language {
             self.language = new_language;
             self.translations = Translations::new(new_language);
             self.persist_settings();
@@ -8642,10 +8649,18 @@ impl App {
             for t in dev.tabs() {
                 let active = self.cap_tab == t;
                 let color = if active { p.txt } else { p.txt3 };
+                let label = match t {
+                    CapTab::Overview => self.translations.ui_string("overview").unwrap_or("Overview"),
+                    CapTab::Fido2 => self.translations.ui_string("fido2").unwrap_or("FIDO2"),
+                    CapTab::Oath => self.translations.ui_string("authenticator").unwrap_or("Authenticator"),
+                    CapTab::Pgp => self.translations.ui_string("openpgp").unwrap_or("OpenPGP"),
+                    CapTab::Piv => self.translations.ui_string("piv").unwrap_or("PIV"),
+                    CapTab::Otp => "On-device OTP",
+                };
                 let resp = ui
                     .add(
                         egui::Label::new(
-                            egui::RichText::new(cap_tab_label(t))
+                            egui::RichText::new(label)
                                 .font(theme::f_sb(13.5))
                                 .color(color),
                         )
@@ -8875,11 +8890,14 @@ impl App {
     /// Overview tab: one summary card per capability, each with a `Manage →` jump.
     /// Scrolling comes from the shared capability-pane scroller in `central`.
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        let passkeys_label = self.translations.ui_string("passkeys_signin").unwrap_or("Passkeys & sign-in (FIDO2)").to_string();
+        let oath_label = self.translations.ui_string("auth_codes_oath").unwrap_or("Authenticator codes (OATH)").to_string();
+        let piv_label = self.translations.ui_string("piv_smart_card").unwrap_or("PIV smart card").to_string();
         ui.vertical(|ui| {
             self.mds_card(ui, p, dev);
             if dev.caps.has(Caps::FIDO2) {
                 theme::card_frame(p).show(ui, |ui| {
-                    if self.card_head(ui, p, "Passkeys & sign-in (FIDO2)", "fido2") {
+                    if self.card_head(ui, p, &passkeys_label, "fido2") {
                         self.cap_tab = CapTab::Fido2;
                     }
                     ui.add_space(8.0);
@@ -8939,7 +8957,7 @@ impl App {
             }
             if dev.caps.has(Caps::OATH) {
                 theme::card_frame(p).show(ui, |ui| {
-                    if self.card_head(ui, p, "Authenticator codes (OATH)", "oath") {
+                    if self.card_head(ui, p, &oath_label, "oath") {
                         self.cap_tab = CapTab::Oath;
                     }
                     ui.add_space(8.0);
@@ -9033,7 +9051,7 @@ impl App {
             }
             if dev.caps.has(Caps::PIV) {
                 theme::card_frame(p).show(ui, |ui| {
-                    if self.card_head(ui, p, "PIV smart card", "piv") {
+                    if self.card_head(ui, p, &piv_label, "piv") {
                         self.cap_tab = CapTab::Piv;
                     }
                     ui.add_space(8.0);
@@ -9112,7 +9130,7 @@ impl App {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new("Factory reset")
+                                    egui::RichText::new(self.translations.ui_string("factory_reset").unwrap_or("Factory reset"))
                                         .font(theme::f_sb(14.5))
                                         .color(p.err),
                                 );
@@ -9123,7 +9141,7 @@ impl App {
                                             ui,
                                             p,
                                             BtnKind::Danger,
-                                            "Factory reset\u{2026}",
+                                            &format!("{}\u{2026}", self.translations.ui_string("factory_reset").unwrap_or("Factory reset")),
                                         )
                                         .clicked()
                                         {
@@ -9133,15 +9151,7 @@ impl App {
                                 );
                             });
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "Resets every applet on this key ({}) to factory state. \
-                                     Each step reports on its own \u{2014} anything that \
-                                     doesn't complete is listed below.",
-                                    plan.iter()
-                                        .map(|s| s.label())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ))
+                                egui::RichText::new(self.translations.ui_string("factory_reset_desc").unwrap_or("Resets every applet on this key to factory state. Each step reports on its own — anything that doesn't complete is listed below."))
                                 .font(theme::f_reg(12.5))
                                 .color(p.txt2),
                             );

@@ -124,6 +124,25 @@ impl Translations {
         ui_strings.insert("devices", "DEVICES".to_string());
         ui_strings.insert("no_keys", "No keys detected yet.".to_string());
         ui_strings.insert("filter_keys", "Filter keys...".to_string());
+        ui_strings.insert("overview", "Overview".to_string());
+        ui_strings.insert("fido2", "FIDO2".to_string());
+        ui_strings.insert("authenticator", "Authenticator".to_string());
+        ui_strings.insert("openpgp", "OpenPGP".to_string());
+        ui_strings.insert("piv", "PIV".to_string());
+        ui_strings.insert("passkeys_signin", "Passkeys & sign-in (FIDO2)".to_string());
+        ui_strings.insert("admin_rights_needed", "Administrator rights needed".to_string());
+        ui_strings.insert("open_fido2_tab", "Open the FIDO2 tab to manage this key via Windows settings or restart as administrator.".to_string());
+        ui_strings.insert("auth_codes_oath", "Authenticator codes (OATH)".to_string());
+        ui_strings.insert("open_auth_view_codes", "Open Authenticator to view live codes.".to_string());
+        ui_strings.insert("open_openpgp_status", "Open OpenPGP and Read status to view key slots.".to_string());
+        ui_strings.insert("piv_smart_card", "PIV smart card".to_string());
+        ui_strings.insert("open_piv_slots", "Open PIV to read certificate slots.".to_string());
+        ui_strings.insert("factory_reset", "Factory reset".to_string());
+        ui_strings.insert("factory_reset_desc", "Resets every applet on this key (OATH, OpenPGP, PIV, FIDO2) to factory state. Each step reports on its own — anything that doesn't complete is listed below.".to_string());
+        ui_strings.insert("connected", "Connected".to_string());
+        ui_strings.insert("name_this_key", "Name this key".to_string());
+        ui_strings.insert("manage", "Manage".to_string());
+        ui_strings.insert("several_keys", "Several keys plugged in? Give them names".to_string());
 
         Self {
             help_titles,
@@ -204,6 +223,25 @@ impl Translations {
         ui_strings.insert("devices", "设备".to_string());
         ui_strings.insert("no_keys", "尚未检测到密钥。".to_string());
         ui_strings.insert("filter_keys", "筛选密钥...".to_string());
+        ui_strings.insert("overview", "概览".to_string());
+        ui_strings.insert("fido2", "FIDO2".to_string());
+        ui_strings.insert("authenticator", "身份验证器".to_string());
+        ui_strings.insert("openpgp", "OpenPGP".to_string());
+        ui_strings.insert("piv", "PIV".to_string());
+        ui_strings.insert("passkeys_signin", "通行密钥与登录 (FIDO2)".to_string());
+        ui_strings.insert("admin_rights_needed", "需要管理员权限".to_string());
+        ui_strings.insert("open_fido2_tab", "打开 FIDO2 选项卡通过 Windows 设置管理此密钥，或以管理员身份重启。".to_string());
+        ui_strings.insert("auth_codes_oath", "动态验证码 (OATH)".to_string());
+        ui_strings.insert("open_auth_view_codes", "打开身份验证器查看实时验证码。".to_string());
+        ui_strings.insert("open_openpgp_status", "打开 OpenPGP 并读取状态以查看密钥插槽。".to_string());
+        ui_strings.insert("piv_smart_card", "PIV 智能卡".to_string());
+        ui_strings.insert("open_piv_slots", "打开 PIV 读取证书插槽。".to_string());
+        ui_strings.insert("factory_reset", "出厂重置".to_string());
+        ui_strings.insert("factory_reset_desc", "将此密钥上的所有小程序 (OATH, OpenPGP, PIV, FIDO2) 重置为出厂状态。每个步骤单独报告 — 未完成的项目列在下方。".to_string());
+        ui_strings.insert("connected", "已连接".to_string());
+        ui_strings.insert("name_this_key", "命名此密钥".to_string());
+        ui_strings.insert("manage", "管理".to_string());
+        ui_strings.insert("several_keys", "插入了多个密钥？为它们命名".to_string());
 
         Self {
             help_titles,
