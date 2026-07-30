@@ -226,6 +226,13 @@ pub fn f_mono(size: f32) -> FontId {
 /// still works, only the typeface differs.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut f = egui::FontDefinitions::default();
+    // MiSans as primary font (supports Chinese)
+    f.font_data.insert(
+        "misans".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../assets/MiSans-Regular.ttf"
+        ))),
+    );
     f.font_data.insert(
         "plex".into(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
@@ -253,18 +260,18 @@ pub fn install_fonts(ctx: &egui::Context) {
     f.families
         .entry(FontFamily::Proportional)
         .or_default()
-        .insert(0, "plex".into());
+        .insert(0, "misans".into());
     f.families
         .entry(FontFamily::Monospace)
         .or_default()
         .insert(0, "jb".into());
     f.families.insert(
         FontFamily::Name("semibold".into()),
-        vec!["plex_sb".into(), "plex".into()],
+        vec!["plex_sb".into(), "misans".into()],
     );
     f.families.insert(
         FontFamily::Name("bold".into()),
-        vec!["plex_b".into(), "plex".into()],
+        vec!["plex_b".into(), "misans".into()],
     );
     ctx.set_fonts(f);
 }

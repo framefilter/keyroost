@@ -4714,10 +4714,12 @@ impl App {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // Close button
-                if theme::button(ui, p, BtnKind::Default, "Close").clicked() {
-                    close = true;
-                }
+                // OK button
+                ui.horizontal(|ui| {
+                    if theme::button(ui, p, BtnKind::Default, "OK").clicked() {
+                        close = true;
+                    }
+                });
             });
 
         if close {
@@ -7977,19 +7979,7 @@ impl App {
                         ui.add_space(4.0);
                         // Settings button
                         let settings_color = if self.settings_open { p.accent } else { p.txt2 };
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new("\u{2699}")  // gear icon
-                                        .font(theme::f_sb(14.0))
-                                        .color(settings_color),
-                                )
-                                .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text("Settings")
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
+                        if theme::button(ui, p, BtnKind::Ghost, "Settings").clicked() {
                             self.settings_open = !self.settings_open;
                         }
                         ui.add_space(4.0);
