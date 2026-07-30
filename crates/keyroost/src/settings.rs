@@ -17,6 +17,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::locales::locales::Language;
 use crate::ui::theme::{self, Mode};
 
 /// The on-disk UI settings (`settings.json`). Every field carries a
@@ -39,6 +40,9 @@ pub struct Settings {
     /// Colorblind-safe palette toggle.
     #[serde(default)]
     pub colorblind: bool,
+    /// Language setting for UI translations.
+    #[serde(default)]
+    pub language: LanguageSetting,
 }
 
 fn default_zoom() -> f32 {
@@ -52,6 +56,47 @@ impl Default for Settings {
             mode: ModeSetting::default(),
             accent: 0,
             colorblind: false,
+            language: LanguageSetting::default(),
+        }
+    }
+}
+
+/// Serde-friendly mirror of [`Language`] (which lives in the locales module and does
+/// not derive `Serialize`). Encodes as the lowercase strings `"en"` /
+/// `"zh-cn"`; an unknown string deserializes to `En`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LanguageSetting {
+    #[default]
+    #[serde(rename = "en")]
+    En,
+    #[serde(rename = "zh-cn")]
+    ZhCn,
+}
+
+impl From<Language> for LanguageSetting {
+    fn from(l: Language) -> Self {
+        match l {
+            Language::En => LanguageSetting::En,
+            Language::ZhCn => LanguageSetting::ZhCn,
+        }
+    }
+}
+
+impl From<LanguageSetting> for Language {
+    fn from(l: LanguageSetting) -> Self {
+        match l {
+            LanguageSetting::En => Language::En,
+            LanguageSetting::ZhCn => Language::ZhCn,
+        }
+    }
+}
+
+impl LanguageSetting {
+    pub fn display_name(&self) -> &str {
+        match self {
+            LanguageSetting::En => "English",
+            LanguageSetting::ZhCn => "简体中文",
         }
     }
 }

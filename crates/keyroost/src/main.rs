@@ -1690,14 +1690,15 @@ fn main() -> eframe::Result<()> {
                     mode: mode.into(),
                     accent: accent_idx,
                     colorblind,
+                    language: saved.language,
                 }),
                 worker: Some(Worker::spawn(cc.egui_ctx.clone())),
                 egui_ctx: Some(cc.egui_ctx.clone()),
                 devices_dirty,
                 reader_watch: Some(reader_watch),
                 mds: ui::mds::MdsDb::load_bundled(),
-                language: detect_language(),
-                translations: Translations::new(detect_language()),
+                language: saved.language.into(),
+                translations: Translations::new(saved.language.into()),
                 ..Default::default()
             };
             Ok(Box::new(app))
