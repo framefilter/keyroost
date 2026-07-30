@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod locales;
 mod otp_pane;
 #[cfg(feature = "qr")]
 mod qrscan;
@@ -14,6 +15,7 @@ mod qrscan;
 mod screengrab;
 mod settings;
 mod ui;
+use locales::locales::{detect_language, Language, Translations};
 use otp_pane::OtpState;
 use settings::Settings;
 use ui::device::{self, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
@@ -1694,6 +1696,8 @@ fn main() -> eframe::Result<()> {
                 devices_dirty,
                 reader_watch: Some(reader_watch),
                 mds: ui::mds::MdsDb::load_bundled(),
+                language: detect_language(),
+                translations: Translations::new(detect_language()),
                 ..Default::default()
             };
             Ok(Box::new(app))
@@ -1908,6 +1912,10 @@ struct App {
     /// selection change): an id must not be reused while a dialog opened for
     /// the previous key is still on screen.
     ssh_cert_next_id: u64,
+    /// Translations for the current language.
+    translations: Translations,
+    /// Current language setting.
+    language: Language,
 }
 
 /// Which path text field a resolved file-chooser result should populate. Keeps
@@ -7769,7 +7777,7 @@ impl eframe::App for App {
 
         // Help popover, painted last so it sits above everything.
         if let Some(topic) = self.help_open {
-            if ui::help_popover(ctx, &p, topic, self.help_anchor) {
+            if ui::help_popover(ctx, &p, topic, self.help_anchor, &self.translations) {
                 self.help_open = None;
             }
         }
@@ -7836,7 +7844,7 @@ impl eframe::App for App {
 impl App {
     /// Toggle the help popover for `topic`, anchored under the clicked "?" button.
     fn help_dot(&mut self, ui: &mut egui::Ui, p: &Palette, topic: &'static str) {
-        let r = ui::help_button(ui, p, self.help_open == Some(topic));
+        let r = ui::help_button(ui, p, self.help_open == Some(topic), &self.translations);
         if r.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }

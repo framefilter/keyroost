@@ -30,8 +30,8 @@ use theme::{f_bold, f_reg, Palette};
 /// always wrapped in a filled `Frame` (fill = palette.pop), which is the egui
 /// equivalent of the prototype bug where the popover rendered outside the themed
 /// container.
-pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui::Pos2) -> bool {
-    let Some(h) = help::help(topic) else {
+pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui::Pos2, translations: &crate::locales::locales::Translations) -> bool {
+    let Some(h) = help::help(topic, translations) else {
         return true; // unknown topic -> treat as closed
     };
 
@@ -90,8 +90,9 @@ pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui:
                 // no dedicated page, so they leave `slug` empty.
                 if !h.slug.is_empty() {
                     ui.add_space(10.0);
+                    let learn_text = translations.ui_string("learn_link").unwrap_or("Learn how to use this  ↗");
                     ui.hyperlink_to(
-                        egui::RichText::new("Learn how to use this  ↗")
+                        egui::RichText::new(learn_text)
                             .font(theme::f_sb(12.5))
                             .color(p.accent),
                         help::learn_url(h.slug),
@@ -127,7 +128,7 @@ fn badge_q(ui: &mut egui::Ui, p: &Palette) {
 ///   let r = help_button(ui, &p, help_open == Some("oath"));
 ///   if r.clicked() { anchor = r.rect.left_bottom();
 ///       help_open = if help_open == Some("oath") { None } else { Some("oath") }; }
-pub fn help_button(ui: &mut egui::Ui, p: &Palette, active: bool) -> egui::Response {
+pub fn help_button(ui: &mut egui::Ui, p: &Palette, active: bool, translations: &crate::locales::locales::Translations) -> egui::Response {
     let d = 17.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::click());
     let (fill, fg) = if active || resp.hovered() {
@@ -143,5 +144,6 @@ pub fn help_button(ui: &mut egui::Ui, p: &Palette, active: bool) -> egui::Respon
         theme::f_bold(10.5),
         fg,
     );
-    resp.on_hover_text("What's this?")
+    let what_is_this = translations.ui_string("what_is_this").unwrap_or("What's this?");
+    resp.on_hover_text(what_is_this)
 }
