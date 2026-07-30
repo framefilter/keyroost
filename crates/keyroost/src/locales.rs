@@ -423,6 +423,23 @@ impl Translations {
         ui_strings.insert("import_file", "导入文件...".to_string());
         ui_strings.insert("state_read_status", "状态：读取状态以查看此密钥".to_string());
         ui_strings.insert("signatures_made", "已签名次数".to_string());
+        ui_strings.insert("reset_applet", "重置小程序".to_string());
+        ui_strings.insert("reset_applet_confirm", "确认重置".to_string());
+        ui_strings.insert("reset_applet_warning", "此操作将清除小程序上的所有数据。此操作无法撤销。".to_string());
+        ui_strings.insert("retired_slots", "已停用插槽".to_string());
+        ui_strings.insert("retired_slot", "已停用插槽".to_string());
+        ui_strings.insert("slot_empty", "空".to_string());
+        ui_strings.insert("slot_has_key", "有密钥".to_string());
+        ui_strings.insert("slot_has_cert", "有证书".to_string());
+        ui_strings.insert("authenticator_tab", "身份验证器".to_string());
+        ui_strings.insert("openpgp_tab", "OpenPGP".to_string());
+        ui_strings.insert("piv_tab", "PIV".to_string());
+        ui_strings.insert("fido2_tab", "FIDO2".to_string());
+        ui_strings.insert("change_user_pin", "更改用户 PIN".to_string());
+        ui_strings.insert("change_admin_pin", "更改管理员 PIN".to_string());
+        ui_strings.insert("unblock_user_pin", "解锁用户 PIN".to_string());
+        ui_strings.insert("card_holder_name", "持卡人姓名".to_string());
+        ui_strings.insert("public_key_url", "公钥 URL".to_string());
 
         Self {
             help_titles,

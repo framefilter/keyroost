@@ -4718,7 +4718,7 @@ impl App {
 
                 // Bottom buttons
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
                         close = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5866,7 +5866,12 @@ impl App {
                             .filter(|d| d.kind == DeviceKind::Key && !d.serial.is_empty())
                             .map(|d| d.serial.as_str()),
                     );
-                    app.devices = devices;
+                    // Fix: Only update devices if the list actually changed to prevent flickering
+                    let devices_changed = app.devices.len() != devices.len()
+                        || app.devices.iter().zip(devices.iter()).any(|(a, b)| a.id != b.id);
+                    if devices_changed {
+                        app.devices = devices;
+                    }
                     if changed {
                         app.on_device_selected();
                     }
@@ -7811,6 +7816,9 @@ impl eframe::App for App {
         // kept, and `close_rename` requests a repaint, so the burst resumes
         // the moment the field closes — without keeping a 2 Hz wakeup loop
         // armed for the whole edit.
+        //
+        // Fix: Reduce repaint frequency to prevent flickering. Use a longer
+        // interval (1000ms instead of 500ms) and only repaint when necessary.
         if self.reset_arm.is_none() && self.pending_scans > 0 {
             let now = std::time::Instant::now();
             let due = self.next_scan_at.is_none_or(|t| now >= t);
@@ -7818,10 +7826,10 @@ impl eframe::App for App {
             if due && !self.busy() && !renaming {
                 self.refresh_devices();
                 self.pending_scans -= 1;
-                self.next_scan_at = Some(now + std::time::Duration::from_millis(1500));
+                self.next_scan_at = Some(now + std::time::Duration::from_millis(2000));
             }
             if self.pending_scans > 0 && !renaming {
-                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                ctx.request_repaint_after(std::time::Duration::from_millis(1000));
             }
         }
 
@@ -8597,7 +8605,7 @@ impl App {
                         ui.add_space(5.0);
                         self.help_dot(ui, p, "device");
                         ui.add_space(8.0);
-                        let label = if dev.name.is_some() { "重命名" } else { self.translations.ui_string("name_this_key").unwrap_or("Name this key") };
+                        let label = if dev.name.is_some() { self.translations.ui_string("rename").unwrap_or("Rename") } else { self.translations.ui_string("name_this_key").unwrap_or("Name this key") };
                         if ui
                             .add(
                                 egui::Label::new(egui::RichText::new(label).font(theme::f_sb(12.0)).color(p.accent))
@@ -12464,12 +12472,12 @@ impl App {
             Some(st) => {
                 let (algo, fpr) = selected.status_fields(st);
                 if fpr.iter().all(|&b| b == 0) {
-                    "no key".to_string()
+                    "无密钥".to_string()
                 } else {
                     format!("{} \u{00B7} fpr {}", algo_id_label(algo), hex_lower(fpr))
                 }
             }
-            None => "read status to view this key".to_string(),
+            None => self.translations.ui_string("state_read_status").unwrap_or("read status to view this key").to_string(),
         };
 
         // --- Key sub-tab strip ----------------------------------------------
@@ -12495,10 +12503,15 @@ impl App {
             ] {
                 let active = selected == key;
                 let color = if active { p.txt } else { p.txt3 };
+                let label = match key {
+                    OpenPgpSlotSel::Sign => self.translations.ui_string("signature").unwrap_or("Signature"),
+                    OpenPgpSlotSel::Decrypt => self.translations.ui_string("decryption").unwrap_or("Decryption"),
+                    OpenPgpSlotSel::Auth => self.translations.ui_string("authentication").unwrap_or("Authentication"),
+                };
                 let resp = ui
                     .add(
                         egui::Label::new(
-                            egui::RichText::new(key.tab_label())
+                            egui::RichText::new(label)
                                 .font(theme::f_sb(13.5))
                                 .color(color),
                         )
@@ -12953,10 +12966,11 @@ impl App {
         {
             let expanded = self.piv.retired_expanded;
             let caret = if expanded { "\u{25BE}" } else { "\u{25B8}" };
+            let retired_label = self.translations.ui_string("retired_slots").unwrap_or("Retired slots");
             let hdr = ui
                 .add(
                     egui::Label::new(
-                        egui::RichText::new(format!("{caret} Retired slots"))
+                        egui::RichText::new(format!("{caret} {}", retired_label))
                             .font(theme::f_sb(13.5))
                             .color(p.txt2),
                     )
@@ -12978,7 +12992,7 @@ impl App {
                             Some(PivCredKind::MoveKey)
                         );
                         if !occ.iter().any(|(_, has)| *has) && !move_open {
-                            note(ui, "No retired slots hold a key.");
+                            note(ui, "没有已停用插槽持有密钥。");
                         }
                         for (slot, has_key) in occ {
                             if !has_key && !move_open {
