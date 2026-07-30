@@ -157,11 +157,11 @@ impl Slot {
     #[must_use]
     pub fn label(self) -> String {
         match self {
-            Slot::Authentication => "authentication (9A)".into(),
-            Slot::Signature => "signature (9C)".into(),
-            Slot::KeyManagement => "key management (9D)".into(),
-            Slot::CardAuthentication => "card authentication (9E)".into(),
-            Slot::Retired(n) => format!("retired {n} ({:02X})", 0x81 + n),
+            Slot::Authentication => "身份认证 (9A)".into(),
+            Slot::Signature => "数字签名 (9C)".into(),
+            Slot::KeyManagement => "密钥管理 (9D)".into(),
+            Slot::CardAuthentication => "卡片认证 (9E)".into(),
+            Slot::Retired(n) => format!("已停用 {n} ({:02X})", 0x81 + n),
         }
     }
 

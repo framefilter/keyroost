@@ -1,0 +1,1787 @@
+_version: 2
+
+# Common UI
+settings:
+  en: Settings
+  zh-CN: 设置
+refresh:
+  en: Refresh
+  zh-CN: 刷新
+cancel:
+  en: Cancel
+  zh-CN: 取消
+ok:
+  en: OK
+  zh-CN: 确定
+save:
+  en: Save
+  zh-CN: 保存
+delete:
+  en: Delete
+  zh-CN: 删除
+add:
+  en: Add
+  zh-CN: 添加
+close:
+  en: Close
+  zh-CN: 关闭
+done:
+  en: Done
+  zh-CN: 完成
+copy:
+  en: Copy
+  zh-CN: 复制
+edit:
+  en: Edit
+  zh-CN: 编辑
+rename:
+  en: Rename
+  zh-CN: 重命名
+remove:
+  en: Remove
+  zh-CN: 移除
+reload:
+  en: Reload
+  zh-CN: 刷新
+load:
+  en: Load
+  zh-CN: 加载
+collapse:
+  en: Collapse
+  zh-CN: 折叠
+apply:
+  en: Apply
+  zh-CN: 应用
+toggle:
+  en: Toggle
+  zh-CN: 切换
+set:
+  en: "Set…"
+  zh-CN: "设置…"
+force:
+  en: "Force…"
+  zh-CN: "强制…"
+enable:
+  en: "Enable…"
+  zh-CN: "启用…"
+
+# FIDO2 Admin
+admin_rights_needed:
+  en: Administrator rights needed
+  zh-CN: 需要管理员权限
+fido2_tab_admin:
+  en: FIDO2 Settings tab needs administrator
+  zh-CN: FIDO2 设置选项卡需要管理员权限
+fido2_admin_desc:
+  en: A security key is connected, but managing its FIDO2 settings requires administrator rights.
+  zh-CN: 已连接安全密钥，但管理其 FIDO2 设置需要管理员权限。
+fido2_admin_hint:
+  en: Use Windows built-in security-key settings or restart as administrator.
+  zh-CN: 使用 Windows 内置安全密钥设置或以管理员身份重启。
+open_windows_settings:
+  en: Open Windows security-key settings
+  zh-CN: 打开 Windows 安全密钥设置
+restart_as_admin:
+  en: Restart as administrator
+  zh-CN: 以管理员身份重启
+
+# PIN Management
+create_pin:
+  en: Create a PIN
+  zh-CN: 创建 PIN
+change_pin:
+  en: Change PIN
+  zh-CN: 更改 PIN
+set_pin:
+  en: Set PIN
+  zh-CN: 设置 PIN
+new_pin:
+  en: New PIN
+  zh-CN: 新 PIN
+current_pin:
+  en: Current PIN
+  zh-CN: 当前 PIN
+confirm:
+  en: Confirm
+  zh-CN: 确认
+confirm_new_pin:
+  en: Confirm new PIN
+  zh-CN: 确认新 PIN
+set_pin_protect:
+  en: Set a PIN to protect this key and enable passkeys.
+  zh-CN: 设置 PIN 以保护此密钥并启用通行密钥。
+has_pin:
+  en: This key has a PIN.
+  zh-CN: 此密钥有 PIN。
+has_pin_unlock:
+  en: This key has a PIN. Unlock below to manage it.
+  zh-CN: 此密钥有 PIN。请在下方解锁以管理。
+no_pin_yet:
+  en: No PIN yet
+  zh-CN: 尚未设置 PIN
+no_pin_configured:
+  en: No PIN configured
+  zh-CN: 未配置 PIN
+no_pin_support:
+  en: No PIN support
+  zh-CN: 不支持 PIN
+pin_set:
+  en: PIN set
+  zh-CN: 已设置 PIN
+pin_set_status:
+  en: PIN set
+  zh-CN: 已设置 PIN
+pin_configured_ready:
+  en: PIN configured · ready for passkeys
+  zh-CN: PIN 已配置 · 准备使用通行密钥
+pin_length:
+  en: "4–63 characters."
+  zh-CN: "4–63 个字符。"
+pin_not_supported:
+  en: This key does not support a PIN.
+  zh-CN: 此密钥不支持 PIN。
+couldnt_read_key:
+  en: Couldn't read this key.
+  zh-CN: 无法读取此密钥。
+reading_key:
+  en: Reading key...
+  zh-CN: 读取密钥中...
+pin_sign_in:
+  en: PIN & sign-in
+  zh-CN: PIN 与登录
+lock:
+  en: Lock
+  zh-CN: 锁定
+unlock_to_change:
+  en: Unlock to change these.
+  zh-CN: 解锁以更改这些设置。
+
+# Device
+plug_key:
+  en: Insert your key into a USB port
+  zh-CN: 将密钥插入 USB 端口
+plug_key_desc:
+  en: keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens.
+  zh-CN: keyroost 管理 YubiKey、Nitrokey、SoloKeys 和 Token2 令牌。
+step1:
+  en: Insert your key into a USB port
+  zh-CN: 将密钥插入 USB 端口
+step2:
+  en: It appears in the Devices list automatically
+  zh-CN: 它会自动出现在设备列表中
+step3:
+  en: Select it to view and manage everything it can do
+  zh-CN: 选择它以查看和管理所有功能
+several_keys:
+  en: Several keys plugged in?
+  zh-CN: 插入了多个密钥？
+give_names:
+  en: Give them names
+  zh-CN: 为它们命名
+name_this_key:
+  en: Name this key
+  zh-CN: 命名此密钥
+connected:
+  en: Connected
+  zh-CN: 已连接
+supported_devices:
+  en: Supported devices
+  zh-CN: 支持的设备
+scan_devices:
+  en: Scan devices
+  zh-CN: 扫描设备
+
+# Overview
+overview:
+  en: Overview
+  zh-CN: 概览
+overview_tab:
+  en: Overview
+  zh-CN: 概览
+passkeys_signin:
+  en: Passkeys & sign-in (FIDO2)
+  zh-CN: 通行密钥与登录 (FIDO2)
+passkeys_manage:
+  en: Passkeys & sign-in (FIDO2)
+  zh-CN: 通行密钥 (FIDO2)
+manage_arrow:
+  en: "Manage →"
+  zh-CN: "管理 →"
+
+# FIDO2
+fido2_tab:
+  en: FIDO2
+  zh-CN: FIDO2
+fido2:
+  en: FIDO2
+  zh-CN: FIDO2
+passkeys_tab:
+  en: Passkeys
+  zh-CN: 通行密钥
+settings_tab:
+  en: Settings
+  zh-CN: 设置
+storage_tab:
+  en: Storage
+  zh-CN: 存储
+resident_passkeys:
+  en: Resident passkeys
+  zh-CN: 驻留通行密钥
+no_passkeys_stored:
+  en: No passkeys stored on this key yet.
+  zh-CN: 此密钥上尚未存储通行密钥。
+no_passkeys:
+  en: No passkeys stored on this key yet.
+  zh-CN: 此密钥上尚未存储通行密钥。
+unlock_this_key:
+  en: Unlock this key
+  zh-CN: 解锁此密钥
+enter_pin_unlock:
+  en: Enter PIN to unlock this key
+  zh-CN: 输入 PIN 以解锁此密钥
+unlock:
+  en: Unlock
+  zh-CN: 解锁
+fingerprints:
+  en: Fingerprints
+  zh-CN: 指纹
+click_reload_fingerprints:
+  en: Click Reload to read enrolled fingerprints.
+  zh-CN: 点击刷新以读取已注册的指纹。
+no_fingerprints:
+  en: No fingerprints enrolled yet.
+  zh-CN: 尚未注册指纹。
+fingerprint_enrolled:
+  en: "✓ Fingerprint enrolled"
+  zh-CN: "✓ 指纹已注册"
+enroll_new:
+  en: "Enroll new…"
+  zh-CN: "注册新指纹…"
+large_blob_storage:
+  en: Large blob storage
+  zh-CN: 大型数据存储
+add_text_note:
+  en: Add a text note
+  zh-CN: 添加文本笔记
+unlock_pin_save:
+  en: Unlock with your PIN to save.
+  zh-CN: 使用您的 PIN 解锁以保存。
+large_blob_empty:
+  en: The large-blob array is empty.
+  zh-CN: 大型数据数组为空。
+clear_all_storage:
+  en: Clear all storage
+  zh-CN: 清除所有存储
+delete_entry:
+  en: Delete entry
+  zh-CN: 删除条目
+export_entry:
+  en: "Export…"
+  zh-CN: "导出…"
+save_certificate:
+  en: "Save certificate…"
+  zh-CN: "保存证书…"
+copy_public_key:
+  en: Copy public key
+  zh-CN: 复制公钥
+security_policy:
+  en: Security policy
+  zh-CN: 安全策略
+always_require_uv:
+  en: Always require user verification
+  zh-CN: 始终要求用户验证
+min_pin_length:
+  en: Minimum PIN length
+  zh-CN: 最小 PIN 长度
+min_pin_length_hint:
+  en: Can only be raised, never lowered without a reset.
+  zh-CN: 只能增加，不能在不重置的情况下降低。
+force_pin_change:
+  en: Force PIN change on next use
+  zh-CN: 下次使用时强制更改 PIN
+force_pin_change_hint:
+  en: Useful before handing the key to someone else.
+  zh-CN: 在将密钥交给他人之前很有用。
+enable_enterprise:
+  en: Enable enterprise attestation
+  zh-CN: 启用企业证明
+enterprise_attestation:
+  en: Enterprise attestation
+  zh-CN: 企业证明
+new_min_length:
+  en: New minimum length
+  zh-CN: 新最小长度
+
+# OpenPGP
+openpgp_tab:
+  en: OpenPGP
+  zh-CN: OpenPGP
+openpgp:
+  en: OpenPGP
+  zh-CN: OpenPGP
+openpgp_card:
+  en: OpenPGP card
+  zh-CN: OpenPGP 卡片
+read_status:
+  en: Read status
+  zh-CN: 读取状态
+click_read_status:
+  en: Click Read status to read this card.
+  zh-CN: 点击「读取状态」以读取此卡片。
+open_openpgp_view:
+  en: Open OpenPGP and Read status to view key slots.
+  zh-CN: 打开 OpenPGP 并读取状态以查看密钥插槽。
+card_details:
+  en: Card details
+  zh-CN: 卡片详情
+site_name:
+  en: Name
+  zh-CN: 名称
+site_fw:
+  en: fw
+  zh-CN: 固件版本
+site_url:
+  en: URL
+  zh-CN: URL
+cardholder_name:
+  en: Cardholder name
+  zh-CN: 持卡人姓名
+public_key_url:
+  en: Public-key URL
+  zh-CN: 公钥 URL
+set_name:
+  en: Set name
+  zh-CN: 设置名称
+set_url:
+  en: Set URL
+  zh-CN: 设置 URL
+change_user_pin:
+  en: Change user PIN
+  zh-CN: 更改用户 PIN
+change_admin_pin:
+  en: Change admin PIN
+  zh-CN: 更改管理员 PIN
+unblock_user_pin:
+  en: Unblock user PIN
+  zh-CN: 解锁用户 PIN
+generate_on_card:
+  en: Generate on-card
+  zh-CN: 在卡片上生成
+generate_overwrites:
+  en: Generating OVERWRITES this key...
+  zh-CN: 生成将覆盖此密钥...
+import_rsa_2048:
+  en: Import RSA-2048
+  zh-CN: 导入 RSA-2048
+from_file:
+  en: From file
+  zh-CN: 从文件
+browse:
+  en: Browse
+  zh-CN: 浏览
+import_file:
+  en: Import file
+  zh-CN: 导入文件
+generate_import:
+  en: Generate & import
+  zh-CN: 生成并导入
+reset_applet:
+  en: Reset applet
+  zh-CN: 重置小程序
+reset_applet_desc:
+  en: Wipes ALL OpenPGP keys and restores default PINs.
+  zh-CN: 擦除所有 OpenPGP 密钥并恢复默认 PIN。
+generate:
+  en: Generate
+  zh-CN: 生成
+openpgp_signature:
+  en: Signature
+  zh-CN: 签名
+openpgp_decryption:
+  en: Decryption
+  zh-CN: 解密
+openpgp_authentication:
+  en: Authentication
+  zh-CN: 身份验证
+signature:
+  en: Signature
+  zh-CN: 签名
+decryption:
+  en: Decryption
+  zh-CN: 解密
+authentication:
+  en: Authentication
+  zh-CN: 身份验证
+signatures_made:
+  en: Signatures made
+  zh-CN: 已签名次数
+
+# OpenPGP Dialogs
+openpgp_change_user_pin:
+  en: Change user PIN
+  zh-CN: 更改用户 PIN
+openpgp_change_admin_pin:
+  en: Change admin PIN
+  zh-CN: 更改管理员 PIN
+openpgp_unblock_user_pin:
+  en: Unblock user PIN
+  zh-CN: 解锁用户 PIN
+openpgp_set_name:
+  en: Set cardholder name
+  zh-CN: 设置持卡人姓名
+openpgp_set_url:
+  en: Set public-key URL
+  zh-CN: 设置公钥 URL
+openpgp_generate_key:
+  en: Generate key on-card
+  zh-CN: 在卡片上生成密钥
+openpgp_generate_import:
+  en: Generate & import key
+  zh-CN: 生成并导入密钥
+openpgp_import_file:
+  en: Import key from file
+  zh-CN: 从文件导入密钥
+openpgp_reset:
+  en: Reset applet
+  zh-CN: 重置小程序
+openpgp_change_user_pin_busy:
+  en: "Changing user PIN…"
+  zh-CN: "更改用户 PIN 中…"
+openpgp_change_admin_pin_busy:
+  en: "Changing admin PIN…"
+  zh-CN: "更改管理员 PIN 中…"
+openpgp_unblock_user_pin_busy:
+  en: "Unblocking user PIN…"
+  zh-CN: "解锁用户 PIN 中…"
+openpgp_set_name_busy:
+  en: "Setting cardholder name…"
+  zh-CN: "设置持卡人姓名中…"
+openpgp_set_url_busy:
+  en: "Setting public-key URL…"
+  zh-CN: "设置公钥 URL 中…"
+openpgp_generate_key_busy:
+  en: "Generating key…"
+  zh-CN: "生成密钥中…"
+openpgp_generate_import_busy:
+  en: "Generating & importing key…"
+  zh-CN: "生成并导入密钥中…"
+openpgp_import_file_busy:
+  en: "Importing key from file…"
+  zh-CN: "从文件导入密钥中…"
+openpgp_reset_busy:
+  en: "Resetting OpenPGP applet…"
+  zh-CN: "重置 OpenPGP 小程序中…"
+openpgp_user_pin_changed:
+  en: User PIN changed
+  zh-CN: 用户 PIN 已更改
+openpgp_admin_pin_changed:
+  en: Admin PIN changed
+  zh-CN: 管理员 PIN 已更改
+openpgp_user_pin_unblocked:
+  en: User PIN unblocked
+  zh-CN: 用户 PIN 已解锁
+openpgp_name_set:
+  en: Cardholder name set
+  zh-CN: 持卡人姓名已设置
+openpgp_url_set:
+  en: Public-key URL set
+  zh-CN: 公钥 URL 已设置
+openpgp_key_generated:
+  en: Key generated
+  zh-CN: 密钥已生成
+openpgp_key_generated_imported:
+  en: Key generated and imported
+  zh-CN: 密钥已生成并导入
+openpgp_key_imported:
+  en: Key imported
+  zh-CN: 密钥已导入
+openpgp_applet_reset:
+  en: Applet reset
+  zh-CN: 小程序已重置
+openpgp_set_name_submit:
+  en: Set name
+  zh-CN: 设置名称
+openpgp_set_url_submit:
+  en: Set URL
+  zh-CN: 设置 URL
+openpgp_generate_submit:
+  en: Generate
+  zh-CN: 生成
+openpgp_generate_import_submit:
+  en: Generate & import
+  zh-CN: 生成并导入
+openpgp_import_submit:
+  en: Import
+  zh-CN: 导入
+openpgp_unblock_submit:
+  en: Unblock
+  zh-CN: 解锁
+openpgp_user_pin_note:
+  en: "User PIN (PW1): 6–127 characters."
+  zh-CN: "用户 PIN (PW1)：6–127 个字符。"
+openpgp_admin_pin_note:
+  en: "Admin PIN (PW3): 8–127 characters."
+  zh-CN: "管理员 PIN (PW3)：8–127 个字符。"
+openpgp_admin_pin_label:
+  en: Admin PIN
+  zh-CN: 管理员 PIN
+openpgp_current_pin:
+  en: Current PIN
+  zh-CN: 当前 PIN
+openpgp_new_pin:
+  en: New PIN
+  zh-CN: 新 PIN
+openpgp_authorizes_name:
+  en: Authorizes writing the cardholder name.
+  zh-CN: 授权写入持卡人姓名。
+openpgp_authorizes_url:
+  en: Authorizes writing the public-key URL.
+  zh-CN: 授权写入公钥 URL。
+openpgp_reset_desc:
+  en: Applet reset; keys wiped, PINs back to defaults.
+  zh-CN: 小程序已重置；密钥已擦除，PIN 已恢复默认值。
+openpgp_set_url_button:
+  en: "Set URL…"
+  zh-CN: "设置 URL…"
+openpgp_set_name_button:
+  en: "Set name…"
+  zh-CN: "设置名称…"
+openpgp_unblock_button:
+  en: "Unblock user PIN…"
+  zh-CN: "解锁用户 PIN…"
+openpgp_change_admin_button:
+  en: "Change admin PIN…"
+  zh-CN: "更改管理员 PIN…"
+openpgp_change_user_button:
+  en: "Change user PIN…"
+  zh-CN: "更改用户 PIN…"
+
+# PIV
+piv_tab:
+  en: PIV
+  zh-CN: PIV
+piv:
+  en: PIV
+  zh-CN: PIV
+piv_smart_card:
+  en: PIV smart card
+  zh-CN: PIV 智能卡
+applet_version:
+  en: Applet version
+  zh-CN: 小程序版本
+serial:
+  en: Serial
+  zh-CN: 序列号
+pin_retries:
+  en: PIN retries
+  zh-CN: PIN 重试次数
+pin_puk:
+  en: PIN & PUK
+  zh-CN: PIN 与 PUK
+pin_tries:
+  en: PIN tries
+  zh-CN: PIN 尝试次数
+puk_tries:
+  en: PUK tries
+  zh-CN: PUK 尝试次数
+change_puk:
+  en: Change PUK
+  zh-CN: 更改 PUK
+unblock_pin:
+  en: Unblock PIN
+  zh-CN: 解锁 PIN
+retry_counts:
+  en: Retry counts
+  zh-CN: 重试次数
+set_retry_counts:
+  en: Set retry counts
+  zh-CN: 设置重试次数
+management_key:
+  en: Management key
+  zh-CN: 管理密钥
+change_management_key:
+  en: Change management key
+  zh-CN: 更改管理密钥
+retired_slots:
+  en: Retired slots
+  zh-CN: 已停用插槽
+generate_key:
+  en: Generate key
+  zh-CN: 生成密钥
+certificate:
+  en: Certificate
+  zh-CN: 证书
+name:
+  en: Name
+  zh-CN: 名称
+valid_for:
+  en: Valid for
+  zh-CN: 有效期
+days:
+  en: days
+  zh-CN: 天
+csr_file:
+  en: CSR file
+  zh-CN: CSR 文件
+self_signed_slot:
+  en: Self-signed → slot
+  zh-CN: 自签名 → 插槽
+sign_save_csr:
+  en: Sign & save CSR
+  zh-CN: 签名并保存 CSR
+import_cert:
+  en: Import cert
+  zh-CN: 导入证书
+file:
+  en: File
+  zh-CN: 文件
+import_certificate:
+  en: Import certificate
+  zh-CN: 导入证书
+export_cert:
+  en: Export cert
+  zh-CN: 导出证书
+destination:
+  en: Destination
+  zh-CN: 目标路径
+export_certificate:
+  en: Export certificate
+  zh-CN: 导出证书
+delete_certificate:
+  en: Delete certificate
+  zh-CN: 删除证书
+delete_key:
+  en: Delete key
+  zh-CN: 删除密钥
+move_key:
+  en: Move key
+  zh-CN: 移动密钥
+delete_key_hint:
+  en: Key deletion needs YubiKey 5.7+.
+  zh-CN: 密钥删除需要 YubiKey 5.7+。
+no_retired_slots:
+  en: No retired slots hold a key.
+  zh-CN: 没有已停用插槽持有密钥。
+
+# PIV Dialogs
+piv_change_pin:
+  en: Change PIN
+  zh-CN: 更改 PIN
+piv_change_puk:
+  en: Change PUK
+  zh-CN: 更改 PUK
+piv_unblock_pin:
+  en: Unblock PIN
+  zh-CN: 解锁 PIN
+piv_generate_key:
+  en: Generate key
+  zh-CN: 生成密钥
+piv_import_cert:
+  en: Import certificate
+  zh-CN: 导入证书
+piv_self_sign:
+  en: Self-signed certificate
+  zh-CN: 自签名证书
+piv_request_csr:
+  en: Sign certificate request
+  zh-CN: 签名证书请求
+piv_set_retries:
+  en: Set retry counts
+  zh-CN: 设置重试次数
+piv_change_mgmt_key:
+  en: Change management key
+  zh-CN: 更改管理密钥
+piv_delete_cert:
+  en: Delete certificate
+  zh-CN: 删除证书
+piv_delete_key:
+  en: Delete key
+  zh-CN: 删除密钥
+piv_move_key:
+  en: Move key
+  zh-CN: 移动密钥
+piv_change_pin_busy:
+  en: "Changing PIV PIN…"
+  zh-CN: "更改 PIV PIN 中…"
+piv_change_puk_busy:
+  en: "Changing PUK…"
+  zh-CN: "更改 PUK 中…"
+piv_unblock_pin_busy:
+  en: "Unblocking PIN…"
+  zh-CN: "解锁 PIN 中…"
+piv_generate_key_busy:
+  en: "Generating key…"
+  zh-CN: "生成密钥中…"
+piv_import_cert_busy:
+  en: "Importing certificate…"
+  zh-CN: "导入证书中…"
+piv_self_sign_busy:
+  en: "Creating certificate…"
+  zh-CN: "创建证书中…"
+piv_request_csr_busy:
+  en: "Signing request…"
+  zh-CN: "签名请求中…"
+piv_set_retries_busy:
+  en: "Setting retry counts…"
+  zh-CN: "设置重试次数中…"
+piv_change_mgmt_key_busy:
+  en: "Changing management key…"
+  zh-CN: "更改管理密钥中…"
+piv_delete_cert_busy:
+  en: "Deleting certificate…"
+  zh-CN: "删除证书中…"
+piv_delete_key_busy:
+  en: "Deleting key…"
+  zh-CN: "删除密钥中…"
+piv_move_key_busy:
+  en: "Moving key…"
+  zh-CN: "移动密钥中…"
+piv_generate_submit:
+  en: Generate
+  zh-CN: 生成
+piv_import_submit:
+  en: Import
+  zh-CN: 导入
+piv_create_submit:
+  en: Create
+  zh-CN: 创建
+piv_sign_save_submit:
+  en: Sign & save
+  zh-CN: 签名并保存
+piv_set_retries_submit:
+  en: Set retry counts
+  zh-CN: 设置重试次数
+piv_change_key_submit:
+  en: Change key
+  zh-CN: 更改密钥
+piv_delete_submit:
+  en: Delete
+  zh-CN: 删除
+piv_move_submit:
+  en: Move
+  zh-CN: 移动
+
+# PIV Modal Content
+piv_done:
+  en: Done
+  zh-CN: 完成
+piv_current_pin:
+  en: Current PIN
+  zh-CN: 当前 PIN
+piv_new_pin:
+  en: New PIN
+  zh-CN: 新 PIN
+piv_confirm_new_pin:
+  en: Confirm new PIN
+  zh-CN: 确认新 PIN
+piv_current_puk:
+  en: Current PUK
+  zh-CN: 当前 PUK
+piv_new_puk:
+  en: New PUK
+  zh-CN: 新 PUK
+piv_confirm_new_puk:
+  en: Confirm new PUK
+  zh-CN: 确认新 PUK
+piv_pin_length:
+  en: "6–8 characters."
+  zh-CN: "6–8 个字符。"
+piv_puk_length:
+  en: "8 characters."
+  zh-CN: "8 个字符。"
+piv_unblock_note:
+  en: Recovers a blocked PIN without wiping any keys.
+  zh-CN: 恢复被阻止的 PIN 而不擦除任何密钥。
+piv_overwrite_warning:
+  en: "This OVERWRITES and destroys the existing key in {slot}. This cannot be undone."
+  zh-CN: "这将覆盖并销毁 {slot} 中的现有密钥。此操作无法撤销。"
+piv_authorizes_overwrite:
+  en: Authorizes overwriting the slot with a fresh key.
+  zh-CN: 授权用新密钥覆盖插槽。
+piv_replaces_cert:
+  en: "This replaces the certificate currently in {slot}."
+  zh-CN: "这将替换当前在 {slot} 中的证书。"
+piv_authorizes_write_cert:
+  en: Authorizes writing the certificate to the slot.
+  zh-CN: 授权将证书写入插槽。
+piv_mgmt_pin_signature:
+  en: "Management key authorizes the import; the PIN authorizes the on-card signature."
+  zh-CN: "管理密钥授权导入；PIN 授权卡上签名。"
+piv_pin_signature:
+  en: The PIN authorizes the on-card signature.
+  zh-CN: PIN 授权卡上签名。
+piv_resets_pin_puk:
+  en: "Resets PIN and PUK to factory defaults; needs the management key and the current PIN."
+  zh-CN: "将 PIN 和 PUK 重置为出厂默认值；需要管理密钥和当前 PIN。"
+piv_new_key:
+  en: New key
+  zh-CN: 新密钥
+piv_hex_hint:
+  en: hex (48/32/64 chars)
+  zh-CN: 十六进制 (48/32/64 字符)
+piv_enter_current_new:
+  en: Enter the current key, then the new key.
+  zh-CN: 输入当前密钥，然后输入新密钥。
+piv_removes_cert:
+  en: "Removes the certificate in {slot}. The private key in the slot remains. This cannot be undone."
+  zh-CN: "移除 {slot} 中的证书。插槽中的私钥保留。此操作无法撤销。"
+piv_erases_key:
+  en: "Permanently erases the private key in {slot}. This cannot be undone."
+  zh-CN: "永久擦除 {slot} 中的私钥。此操作无法撤销。"
+piv_mgmt_authorizes_delete:
+  en: The management key authorizes the deletion.
+  zh-CN: 管理密钥授权删除。
+piv_mgmt_authorizes_delete_57:
+  en: "The management key authorizes the deletion. Needs YubiKey 5.7 or newer."
+  zh-CN: "管理密钥授权删除。需要 YubiKey 5.7 或更新版本。"
+piv_move_key_to_slot:
+  en: "Move the key in {} to another slot."
+  zh-CN: "将 {} 中的密钥移动到另一个插槽。"
+piv_destination:
+  en: Destination
+  zh-CN: 目标
+piv_choose_slot:
+  en: "Choose a slot…"
+  zh-CN: "选择插槽..."
+piv_moves_only_key:
+  en: "Moves only the key; the certificate stays in the source slot. Needs YubiKey 5.7 or newer."
+  zh-CN: "仅移动密钥；证书保留在源插槽中。需要 YubiKey 5.7 或更新版本。"
+piv_overwrite_key:
+  en: Overwrite key
+  zh-CN: 覆盖密钥
+piv_cancel:
+  en: Cancel
+  zh-CN: 取消
+
+# OpenPGP Modal Content
+openpgp_user_pin_note:
+  en: "User PIN (PW1): 6–127 characters."
+  zh-CN: "用户 PIN (PW1)：6–127 个字符。"
+openpgp_admin_pin_note:
+  en: "Admin PIN (PW3): 8–127 characters."
+  zh-CN: "管理员 PIN (PW3)：8–127 个字符。"
+openpgp_authorizes_name:
+  en: Authorizes writing the cardholder name.
+  zh-CN: 授权写入持卡人姓名。
+openpgp_authorizes_url:
+  en: Authorizes writing the public-key URL.
+  zh-CN: 授权写入公钥 URL。
+openpgp_admin_pin_label:
+  en: Admin PIN
+  zh-CN: 管理员 PIN
+openpgp_current_pin:
+  en: Current PIN
+  zh-CN: 当前 PIN
+openpgp_new_pin:
+  en: New PIN
+  zh-CN: 新 PIN
+openpgp_applet_reset_desc:
+  en: Applet reset; keys wiped, PINs back to defaults.
+  zh-CN: 小程序已重置；密钥已擦除，PIN 已恢复默认值。
+
+# Status Messages
+credential_name_required:
+  en: credential name is required
+  zh-CN: 凭证名称是必需的
+secret_empty:
+  en: secret is empty
+  zh-CN: 密钥为空
+no_pcsc_oath:
+  en: no PC/SC reader for the OATH applet
+  zh-CN: 没有用于 OATH 小程序的 PC/SC 读卡器
+no_pcsc_openpgp:
+  en: no PC/SC reader for the OpenPGP applet
+  zh-CN: 没有用于 OpenPGP 小程序的 PC/SC 读卡器
+no_pcsc_piv:
+  en: no PC/SC reader for the PIV applet
+  zh-CN: 没有用于 PIV 小程序的 PC/SC 读卡器
+no_transport_otp:
+  en: no transport for the OTP applet
+  zh-CN: 没有用于 OTP 小程序的传输
+
+# UI Elements
+scan_qr:
+  en: Scan QR
+  zh-CN: 扫描二维码
+touch_sensor_begin:
+  en: "Touch the sensor to begin…"
+  zh-CN: "触摸传感器开始…"
+
+# OTP Pane
+more_actions:
+  en: More actions
+  zh-CN: 更多操作
+add_entry_button:
+  en: "+ Add entry"
+  zh-CN: "+ 添加条目"
+otp_add_title:
+  en: Add OTP entry
+  zh-CN: 添加 OTP 条目
+issuer_app:
+  en: Issuer / app
+  zh-CN: 发行者 / 应用
+account:
+  en: Account
+  zh-CN: 账户
+secret_base32:
+  en: Secret (Base32)
+  zh-CN: 密钥 (Base32)
+otp_type:
+  en: Type
+  zh-CN: 类型
+algorithm:
+  en: Algorithm
+  zh-CN: 算法
+digits:
+  en: Digits
+  zh-CN: 位数
+period_seconds:
+  en: Period (s)
+  zh-CN: 周期 (秒)
+require_touch:
+  en: Require touch
+  zh-CN: 需要触摸
+hide_hotp_title:
+  en: HID-HOTP (keystroke)
+  zh-CN: HID-HOTP（按键输入）
+hide_hotp_desc:
+  en: "The key types a fresh HOTP code as keyboard input when you touch it outside any session. One slot per key."
+  zh-CN: "当您在任何会话外触摸密钥时，密钥会将新的 HOTP 码作为键盘输入键入。每个密钥一个插槽。"
+seed_configured:
+  en: Seed configured
+  zh-CN: 种子已配置
+no_seed_configured:
+  en: No seed configured
+  zh-CN: 未配置种子
+slot_status_unknown:
+  en: Slot status unknown
+  zh-CN: 插槽状态未知
+seed_configured_hint:
+  en: "A seed is already set. Leave the secret blank and Save to change only the typing options; enter a new secret to replace the seed or change the digit length."
+  zh-CN: "种子已设置。留空密钥并保存以仅更改键入选项；输入新密钥以替换种子或更改位数。"
+slot_status_hint:
+  en: "Couldn't read the slot status from this key's config block. Provisioning still works; reload to retry."
+  zh-CN: "无法从密钥配置块读取插槽状态。配置仍然有效；刷新以重试。"
+new_secret_base32:
+  en: New secret (Base32)
+  zh-CN: 新密钥 (Base32)
+leave_blank_hint:
+  en: leave blank to keep current seed
+  zh-CN: 留空以保留当前种子
+send_enter:
+  en: Send Enter
+  zh-CN: 发送回车
+long_touch:
+  en: Long touch (2s)
+  zh-CN: 长触摸 (2秒)
+numeric_keypad:
+  en: Numeric keypad
+  zh-CN: 数字键盘
+clear_slot:
+  en: Clear slot
+  zh-CN: 清除插槽
+touch_the_key:
+  en: Touch the key to read this code
+  zh-CN: 触摸密钥以读取此码
+digit_length_hint:
+  en: "Digit length can only change when you set a new secret — the key has no command to change it on its own."
+  zh-CN: "位数长度只能在设置新密钥时更改 — 密钥没有单独更改它的命令。"
+otp_cannot_be_undone:
+  en: "Erase ALL OTP entries on this key? This cannot be undone."
+  zh-CN: "擦除此密钥上的所有 OTP 条目？此操作无法撤销。"
+otp_touch_sensor:
+  en: "After you confirm, touch the key's sensor to complete the erase — the device waits for a physical touch."
+  zh-CN: "确认后，触摸密钥的传感器以完成擦除 — 设备等待物理触摸。"
+otp_delete_entry:
+  en: Delete OTP entry
+  zh-CN: 删除 OTP 条目
+
+# Keyboard Confirm
+enable_hid_hotp_confirm:
+  en: Enable HID-HOTP (keyboard interface)?
+  zh-CN: 启用 HID-HOTP（键盘接口）？
+disable_hid_hotp_confirm:
+  en: Disable HID-HOTP (keyboard interface)?
+  zh-CN: 禁用 HID-HOTP（键盘接口）？
+keyboard_reconfigure_warning:
+  en: "This reconfigures the key's USB interfaces. The change takes effect after you re-plug the key. Disabling an interface removes the matching features until you re-enable it; if you disable the interface you are connected over, you may lose access to the key."
+  zh-CN: "这将重新配置密钥的 USB 接口。更改在重新插入密钥后生效。禁用接口会移除匹配的功能，直到您重新启用它；如果您禁用了当前连接的接口，可能会失去对密钥的访问。"
+type_change_interface:
+  en: "Type \u201Cchange interface\u201D to confirm:"
+  zh-CN: "输入「change interface」以确认："
+
+# Activity Log
+activity_log:
+  en: Activity log
+  zh-CN: 活动日志
+activity_log_header:
+  en: ACTIVITY LOG
+  zh-CN: 活动日志
+
+# Text Size
+text_size:
+  en: Text size
+  zh-CN: 文字大小
+text_size_tooltip:
+  en: Text size — scales the whole interface (Ctrl + / Ctrl − also work)
+  zh-CN: 文字大小 — 缩放整个界面（也可使用 Ctrl + / Ctrl −）
+reset:
+  en: Reset
+  zh-CN: 重置
+
+# Theme
+toggle_light_dark:
+  en: Toggle light / dark
+  zh-CN: 切换明暗主题
+colorblind_safe:
+  en: Colorblind-safe colors
+  zh-CN: 色盲安全颜色
+rescan:
+  en: Rescan
+  zh-CN: 重新扫描
+
+# Additional translations
+authenticator:
+  en: Authenticator
+  zh-CN: OATH
+factory_reset:
+  en: Factory reset
+  zh-CN: 出厂重置
+factory_reset_desc:
+  en: Resets every applet on this key to factory state.
+  zh-CN: 将此密钥上的所有小程序重置为出厂状态。
+language:
+  en: Language
+  zh-CN: 语言
+open_auth_view:
+  en: Open Authenticator to view live codes.
+  zh-CN: 打开身份验证器查看实时验证码。
+open_fido2_admin:
+  en: Open the FIDO2 tab to manage this key via Windows settings or restart as administrator.
+  zh-CN: 打开 FIDO2 选项卡通过 Windows 设置管理此密钥，或以管理员身份重启。
+open_otp_view:
+  en: Open On-device OTP to view stored entries.
+  zh-CN: 打开设备端 OTP 查看存储的条目。
+open_piv_view:
+  en: Open PIV to read certificate slots.
+  zh-CN: 打开 PIV 读取证书插槽。
+set_a_pin:
+  en: Set a PIN
+  zh-CN: 设置 PIN
+state_read_status:
+  en: read status to view this key
+  zh-CN: 读取状态以查看此密钥
+
+# OATH Modal
+new_credential:
+  en: New credential
+  zh-CN: 新凭证
+credential_added:
+  en: "✓ Credential added"
+  zh-CN: "✓ 凭证已添加"
+oath_name_label:
+  en: Name
+  zh-CN: 名称
+oath_type_label:
+  en: Type
+  zh-CN: 类型
+oath_secret_label:
+  en: Secret
+  zh-CN: 密钥
+oath_secret_hint:
+  en: base32 (behind the QR code)
+  zh-CN: base32（在二维码后面）
+oath_require_touch:
+  en: Require touch
+  zh-CN: 需要触摸
+oath_secret_note:
+  en: The secret is sent to the key, not written to disk by keyroost.
+  zh-CN: 密钥发送到设备，不会被 keyroost 写入磁盘。
+adding_credential:
+  en: "Adding credential…"
+  zh-CN: "添加凭证中…"
+reading_entries:
+  en: "Reading entries…"
+  zh-CN: "读取条目中…"
+no_otp_entries:
+  en: No OTP entries on this key.
+  zh-CN: 此密钥上没有 OTP 条目。
+no_oath_key:
+  en: no OATH key selected
+  zh-CN: 未选择 OATH 密钥
+
+# Reset Dialogs
+reset_security_key:
+  en: Reset security key?
+  zh-CN: 重置安全密钥？
+reset_wipes_all:
+  en: "This wipes ALL credentials and the PIN on {label}."
+  zh-CN: "这将擦除 {label} 上的所有凭证和 PIN。"
+cannot_be_undone:
+  en: This cannot be undone.
+  zh-CN: 此操作无法撤销。
+reset_large_blob_note:
+  en: "Note: a reset does not erase large-blob storage. Open the Storage tab"
+  zh-CN: "注意：重置不会擦除大型数据存储。打开存储选项卡"
+reset_large_blob_clear:
+  en: "and use \u201CClear all storage\u201D to wipe every entry there."
+  zh-CN: "并使用「清除所有存储」来擦除所有条目。"
+now_unplug:
+  en: Now unplug the key, then plug it back in.
+  zh-CN: 现在拔出密钥，然后重新插入。
+reset_reconnects:
+  en: "The reset is sent the instant it reconnects — then the"
+  zh-CN: "重置在重新连接时立即发送 — 然后"
+reset_blink_touch:
+  en: "key will blink. Touch it to finish the wipe."
+  zh-CN: "密钥会闪烁。触摸它以完成擦除。"
+reset_10_seconds:
+  en: "A key only accepts a reset within ~10 seconds of being"
+  zh-CN: "密钥仅在接受插入后约 10 秒内接受重置，"
+reset_reinsert:
+  en: "plugged in, so after you confirm you'll re-insert it."
+  zh-CN: "因此确认后您需要重新插入它。"
+type_reset_confirm:
+  en: "Type \u201Creset\u201D to confirm:"
+  zh-CN: "输入「reset」以确认："
+arm_reset:
+  en: Arm reset
+  zh-CN: 启动重置
+
+# Factory Reset
+factory_reset_this_key:
+  en: Factory reset this key?
+  zh-CN: 出厂重置此密钥？
+factory_reset_msg:
+  en: "Factory-reset {model} (serial {serial})?"
+  zh-CN: "出厂重置 {model}（序列号 {serial}）？"
+factory_reset_wipes:
+  en: Wipes
+  zh-CN: 擦除
+factory_reset_every_cred:
+  en: "Every credential, code, key, and PIN is erased. Each applet that completes comes back in factory condition, ready to set up again."
+  zh-CN: "每个凭证、验证码、密钥和 PIN 都将被擦除。每个完成的小程序都会恢复出厂状态，可以重新设置。"
+factory_reset_piv_note:
+  en: "PIV: the PIN and PUK are intentionally blocked, then the applet is wiped (the standard reset path). If the wipe stops after the blocking, PIV stays locked until a reset finishes — the report below the button says what state it's in."
+  zh-CN: "PIV：PIN 和 PUK 会被故意阻止，然后擦除小程序（标准重置路径）。如果擦除在阻止后停止，PIV 将保持锁定状态，直到重置完成 — 按钮下方的报告会显示当前状态。"
+factory_reset_fido_finish:
+  en: Finishes with a step to unplug the key, plug it back in, and touch it.
+  zh-CN: 最后需要拔出密钥，重新插入，然后触摸它。
+large_blob_store_readable:
+  en: "This store is readable by anyone holding the key and is meant for RP-encrypted data — not a place for plaintext secrets."
+  zh-CN: "此存储可被持有密钥的任何人读取，用于存储 RP 加密数据 — 不适合存储明文密钥。"
+fingerprint_abbr:
+  en: fpr
+  zh-CN: 指纹
+reset_wipes_all:
+  en: "This wipes ALL credentials and the PIN on {label}."
+  zh-CN: "这将擦除 {label} 上的所有凭证和 PIN。"
+stored_as_keyroost:
+  en: "Stored as a keyroost entry you can read back here. It is NOT encrypted and is visible to anyone holding the key."
+  zh-CN: "存储为 keyroost 条目，可在此读回。未加密，任何持有密钥的人都可以看到。"
+keyroost_text_note:
+  en: keyroost text note
+  zh-CN: keyroost 文本笔记
+view_bytes:
+  en: View bytes
+  zh-CN: 查看字节
+hide_bytes:
+  en: Hide bytes
+  zh-CN: 隐藏字节
+saved_entry_count:
+  en: "Saved. {} entry total."
+  zh-CN: "已保存。共 {} 个条目。"
+wipe_all_entries:
+  en: "Wipe all {} entries from this key? This erases every entry — including any relying-party data (e.g. SSH certificates, sign-in records), not just keyroost notes. Cannot be undone; requires your PIN."
+  zh-CN: "擦除此密钥上的所有 {} 个条目？这将擦除每个条目 — 包括所有依赖方数据（如 SSH 证书、登录记录），而不仅仅是 keyroost 笔记。无法撤销；需要您的 PIN。"
+confirm_wipe_entries:
+  en: "Confirm — wipe all {} entries"
+  zh-CN: "确认 — 擦除所有 {} 个条目"
+note_label:
+  en: Note
+  zh-CN: 备注
+kr_version:
+  en: "|KR1.1|"
+  zh-CN: "|KR1.1|"
+bytes_suffix:
+  en: bytes
+  zh-CN: 字节
+connected_count:
+  en: "{} connected"
+  zh-CN: "{} 已连接"
+fido_not_wiped_yet:
+  en: "{}  not wiped yet — waiting for the unplug, replug, and touch"
+  zh-CN: "{} 尚未擦除 — 等待拔出、重新插入和触摸"
+step_wiped:
+  en: "{}  wiped"
+  zh-CN: "{} 已擦除"
+step_failed:
+  en: "{}  failed: {}"
+  zh-CN: "{} 失败：{}"
+step_skipped:
+  en: "{}  skipped"
+  zh-CN: "{} 已跳过"
+yes_wipe:
+  en: Yes, wipe this key
+  zh-CN: 是，擦除此密钥
+yes_delete_seed:
+  en: Yes, delete seed
+  zh-CN: 是，删除种子
+yes_factory_reset:
+  en: Yes, factory reset
+  zh-CN: 是，出厂重置
+
+# Device Info
+device:
+  en: Device
+  zh-CN: 设备
+customer_key:
+  en: Customer key
+  zh-CN: 客户密钥
+customer_key_hint:
+  en: "Programming any slot first needs the token's customer key (blank = factory default)."
+  zh-CN: "编程任何插槽首先需要令牌的客户密钥（空白 = 出厂默认值）。"
+factory_reset_token:
+  en: "Factory-reset the token? This wipes all slots, then asks you to confirm with the ▲ button on the device itself."
+  zh-CN: "出厂重置令牌？这将擦除所有插槽，然后要求您在设备上用 ▲ 按钮确认。"
+program_slot:
+  en: Program a slot
+  zh-CN: 编程插槽
+program_slot_desc:
+  en: "Pick a slot and program it. Slot titles and occupancy are readable by anyone holding the token — no key needed — so don't put secrets in titles. Seeds and codes can't be read back; codes show on the device's own screen."
+  zh-CN: "选择一个插槽并编程它。插槽标题和占用情况可被持有令牌的任何人读取 — 无需密钥 — 因此不要在标题中放置密钥。种子和代码无法读回；代码显示在设备自己的屏幕上。"
+program_seed_config:
+  en: Program seed & configuration
+  zh-CN: 编程种子和配置
+seed_label:
+  en: "Seed:"
+  zh-CN: "种子："
+algorithm_label:
+  en: "Algorithm:"
+  zh-CN: "算法："
+time_step_label:
+  en: "Time step:"
+  zh-CN: "时间步长："
+sleep_label:
+  en: "Sleep:"
+  zh-CN: "休眠："
+burn_seed:
+  en: Burn seed
+  zh-CN: 写入种子
+write_to_slot:
+  en: Write to slot
+  zh-CN: 写入插槽
+write_title_only:
+  en: Write title only
+  zh-CN: 仅写入标题
+delete_seed:
+  en: "Delete seed…"
+  zh-CN: "删除种子…"
+import_otpauth:
+  en: "Import otpauth…"
+  zh-CN: "导入 otpauth…"
+sync_time:
+  en: Sync time
+  zh-CN: 同步时间
+sync_time_all:
+  en: Sync time on all
+  zh-CN: 同步所有时间
+bulk_import:
+  en: "Bulk import…"
+  zh-CN: "批量导入…"
+factory_reset_btn:
+  en: "Factory reset…"
+  zh-CN: "出厂重置…"
+authenticate:
+  en: Authenticate
+  zh-CN: 认证
+refresh_slots:
+  en: Refresh slots
+  zh-CN: 刷新插槽
+on_demand:
+  en: on demand
+  zh-CN: 按需
+touch:
+  en: touch
+  zh-CN: 触摸
+write_all_hint:
+  en: Write seed, title, and config for every entry
+  zh-CN: 为每个条目写入种子、标题和配置
+delete_tooltip:
+  en: Delete
+  zh-CN: 删除
+copy_code:
+  en: Copy code
+  zh-CN: 复制验证码
+
+# OATH Status Messages
+oath_protected:
+  en: This key's OATH applet is password-protected.
+  zh-CN: 此密钥的 OATH 小程序受密码保护。
+reading_oath_codes:
+  en: "读取验证码中..."
+  zh-CN: "读取验证码中..."
+reset_oath_title:
+  en: Reset OATH applet?
+  zh-CN: 重置 OATH 小程序？
+reset_oath_warning:
+  en: "Permanently wipe EVERY authenticator credential on this key and clear its password? This cannot be undone."
+  zh-CN: "永久擦除此密钥上的每个身份验证器凭证并清除其密码？此操作无法撤销。"
+reset_applet_button:
+  en: Reset applet
+  zh-CN: 重置小程序
+delete_credential_title:
+  en: Delete credential?
+  zh-CN: 删除凭证？
+delete_credential_warning:
+  en: "Permanently delete \u201C{name}\u201D from this key? This cannot be undone."
+  zh-CN: "从此密钥永久删除「{name}」？此操作无法撤销。"
+pin_puks_section:
+  en: PINs
+  zh-CN: PIN
+reading_piv_status:
+  en: "读取 PIV 状态中…"
+  zh-CN: "读取 PIV 状态中…"
+
+# Passkey Fields
+user_name:
+  en: User Name
+  zh-CN: 用户名
+display_name:
+  en: Display Name
+  zh-CN: 显示名称
+user_id:
+  en: User ID
+  zh-CN: 用户 ID
+credential_id:
+  en: Credential ID
+  zh-CN: 凭证 ID
+no_credentials:
+  en: "(no credentials)"
+  zh-CN: "（无凭证）"
+stored_room:
+  en: "{existing} stored · room for {max_remaining} more"
+  zh-CN: "{existing} 已存储 · 还可存储 {max_remaining} 个"
+
+# Help
+learn_link:
+  en: Learn how to use this
+  zh-CN: 了解如何使用此功能
+learn_arrow:
+  en: "Learn ↗"
+  zh-CN: "学习 ↗"
+what_is_this:
+  en: What's this?
+  zh-CN: 这是什么？
+on_device_otp:
+  en: On-device OTP
+  zh-CN: 设备端 OTP
+otp_tab:
+  en: On-device OTP
+  zh-CN: 设备端 OTP
+transport:
+  en: Transport
+  zh-CN: 传输
+add_entry:
+  en: Add entry
+  zh-CN: 添加条目
+read_code:
+  en: Read
+  zh-CN: 读取
+erase_all:
+  en: Erase all
+  zh-CN: 擦除全部
+configure_hid_hotp:
+  en: Configure HID-HOTP
+  zh-CN: 配置 HID-HOTP
+enable_hid_hotp:
+  en: Enable HID-HOTP
+  zh-CN: 启用 HID-HOTP
+disable_hid_hotp:
+  en: Disable HID-HOTP
+  zh-CN: 禁用 HID-HOTP
+devices:
+  en: DEVICES
+  zh-CN: 设备
+filter_keys:
+  en: Filter keys...
+  zh-CN: 筛选密钥...
+no_keys:
+  en: No keys detected yet.
+  zh-CN: 尚未检测到密钥。
+scanning_devices:
+  en: Scanning for devices...
+  zh-CN: 扫描设备中...
+type:
+  en: Type
+  zh-CN: 类型
+
+# Security Policy - Missing translations
+security_policy_desc:
+  en: "These change the key's security policy. Some are irreversible without a full reset — read each note before applying."
+  zh-CN: "这些更改密钥的安全策略。某些更改在没有完全重置的情况下是不可逆的 — 请在应用前阅读每条说明。"
+always_uv_on:
+  en: "Currently on — every sign-in needs PIN or biometric."
+  zh-CN: "当前已启用 — 每次登录都需要 PIN 或生物识别。"
+always_uv_off:
+  en: "Currently off."
+  zh-CN: "当前已关闭。"
+always_uv_unknown:
+  en: "State unknown."
+  zh-CN: "状态未知。"
+current_min_chars:
+  en: "Current minimum: {} characters"
+  zh-CN: "当前最小长度：{} 个字符"
+current_min_unknown:
+  en: "Current minimum: —"
+  zh-CN: "当前最小长度：—"
+enterprise_on:
+  en: "Currently on. Disabling it again requires a device reset."
+  zh-CN: "当前已启用。再次禁用需要设备重置。"
+enterprise_one_way:
+  en: "One-way: disabling it again requires a device reset."
+  zh-CN: "单向操作：再次禁用需要设备重置。"
+toggle_always_uv:
+  en: Toggle always-UV
+  zh-CN: 切换始终验证
+set_min_pin:
+  en: Set minimum PIN length
+  zh-CN: 设置最小 PIN 长度
+force_pin_change:
+  en: Force a PIN change
+  zh-CN: 强制更改 PIN
+enable_enterprise_attestation:
+  en: Enable enterprise attestation
+  zh-CN: 启用企业证明
+cannot_undone_full_reset:
+  en: "This cannot be undone without a full reset of the key."
+  zh-CN: "没有完全重置密钥，此操作无法撤销。"
+also_force_pin_change:
+  en: Also force a PIN change now
+  zh-CN: 同时强制立即更改 PIN
+enter_device_pin:
+  en: Enter the device PIN to apply this change.
+  zh-CN: 输入设备 PIN 以应用此更改。
+arm_reset:
+  en: Arm reset
+  zh-CN: 启动重置
+enabled_pill:
+  en: Enabled
+  zh-CN: 已启用
+pin_is_empty:
+  en: PIN is empty
+  zh-CN: PIN 为空
+read_each_note:
+  en: read each note before applying
+  zh-CN: 应用前请阅读每条说明
+force_pin_change_now:
+  en: Force a PIN change now
+  zh-CN: 强制立即更改 PIN
+force_pin_change_hint:
+  en: "Useful before handing the key to someone else."
+  zh-CN: "在将密钥交给他人之前很有用。"
+min_pin_length_hint:
+  en: "Can only be raised, never lowered without a reset."
+  zh-CN: "只能增加，不能在不重置的情况下降低。"
+current_min:
+  en: "Current minimum:"
+  zh-CN: "当前最小长度："
+enterprise_attestation:
+  en: Enterprise attestation
+  zh-CN: 企业证明
+enterprise_attestation_desc:
+  en: "Enables enterprise attestation for this key."
+  zh-CN: "为此密钥启用企业证明。"
+use_default_admin_pin:
+  en: "Use default admin PIN (PW3)"
+  zh-CN: "使用默认管理员 PIN (PW3)"
+use_default_mgmt_key:
+  en: "Use default management key"
+  zh-CN: "使用默认管理密钥"
+public_key_url_set:
+  en: "Public-key URL set."
+  zh-CN: "公钥 URL 已设置。"
+resets_blocked_pin:
+  en: "Resets a blocked user PIN using the admin PIN (PW3)."
+  zh-CN: "使用管理员 PIN (PW3) 重置被阻止的用户 PIN。"
+new_user_pin:
+  en: "New user PIN"
+  zh-CN: "新用户 PIN"
+overwrites_slot_fresh:
+  en: "OVERWRITES the slot with a fresh on-card key (clearable only by a full reset). May need a touch."
+  zh-CN: "将用新的卡上密钥覆盖插槽（只能通过完全重置清除）。可能需要触摸。"
+overwrites_slot_imported:
+  en: "OVERWRITES the slot with the imported key (clearable only by a full reset). May need a touch."
+  zh-CN: "将用导入的密钥覆盖插槽（只能通过完全重置清除）。可能需要触摸。"
+generating_key_touch:
+  en: "Generating key… (touch the key if it blinks)"
+  zh-CN: "正在生成密钥…（如果密钥闪烁请触摸）"
+generated:
+  en: "Generated"
+  zh-CN: "已生成"
+wipes_all_openpgp:
+  en: "Wipes ALL OpenPGP keys and restores default PINs. Works even if the PINs are forgotten. No PIN needed."
+  zh-CN: "擦除所有 OpenPGP 密钥并恢复默认 PIN。即使忘记 PIN 也可使用。无需 PIN。"
+management_key_label:
+  en: "Management key"
+  zh-CN: "管理密钥"
+resets_pin_puk_factory:
+  en: "Resets PIN and PUK to factory defaults; needs the management key and the current PIN."
+  zh-CN: "将 PIN 和 PUK 重置为出厂默认值；需要管理密钥和当前 PIN。"
+state_label:
+  en: "State"
+  zh-CN: "状态"
+empty_label:
+  en: "empty"
+  zh-CN: "空"
+key_present:
+  en: "key present"
+  zh-CN: "密钥存在"
+cert_present:
+  en: "certificate present"
+  zh-CN: "证书存在"
+example_name:
+  en: "e.g. Alice — or full CN=Alice,O=Example,C=US"
+  zh-CN: "例如 Alice — 或完整格式 CN=Alice,O=Example,C=US"
+mgmt_key_authorizes_import:
+  en: "Management key authorizes the import; the PIN authorizes the on-card signature."
+  zh-CN: "管理密钥授权导入；PIN 授权卡上签名。"
+removes_certificate:
+  en: "Removes the certificate in {slot}. The private key in the slot remains. This cannot be undone."
+  zh-CN: "移除 {slot} 中的证书。插槽中的私钥保留。此操作无法撤销。"
+permanently_erases_key:
+  en: "Permanently erases the private key in {slot}. This cannot be undone."
+  zh-CN: "永久擦除 {slot} 中的私钥。此操作无法撤销。"
+mgmt_key_authorizes_deletion:
+  en: "The management key authorizes the deletion. Needs YubiKey 5.7 or newer."
+  zh-CN: "管理密钥授权删除。需要 YubiKey 5.7 或更新版本。"
+wipes_all_piv:
+  en: "This wipes ALL PIV keys, certificates, and PINs."
+  zh-CN: "这将擦除所有 PIV 密钥、证书和 PIN。"
+only_works_blocked:
+  en: "Only works when the PIN and PUK are already blocked."
+  zh-CN: "仅在 PIN 和 PUK 已被阻止时有效。"
+enter_destination_path:
+  en: "enter a destination path for the certificate"
+  zh-CN: "输入证书的目标路径"
+enter_name_cert:
+  en: "enter a name for the certificate"
+  zh-CN: "输入证书名称"
+enter_name_csr:
+  en: "enter a name for the certificate request"
+  zh-CN: "输入证书请求名称"
+enter_destination_csr:
+  en: "enter a destination path for the request"
+  zh-CN: "输入请求的目标路径"
+loaded_entries:
+  en: "Loaded {} entries."
+  zh-CN: "已加载 {} 个条目。"
+more_entries:
+  en: "+{} more entries"
+  zh-CN: "+{} 更多条目"
+storage_cleared:
+  en: "Storage cleared. {} entries remaining."
+  zh-CN: "存储已清除。剩余 {} 个条目。"
+bytes_used:
+  en: "{used} of {max} bytes used · {free} free · {count} {label}"
+  zh-CN: "已使用 {used} / {max} 字节 · 空闲 {free} 字节 · {count} {label}"
+entry_single:
+  en: "entry"
+  zh-CN: "条"
+entry_plural:
+  en: "entries"
+  zh-CN: "条"
+more_codes:
+  en: "+{} more codes"
+  zh-CN: "+{} 更多验证码"
+edit_failed:
+  en: "Edit failed: {}"
+  zh-CN: "编辑失败：{}"
+load_failed:
+  en: "Load failed: {}"
+  zh-CN: "加载失败：{}"
+update_failed:
+  en: "Update failed: {}"
+  zh-CN: "更新失败：{}"
+clear_failed:
+  en: "Clear failed: {}"
+  zh-CN: "清除失败：{}"
+save_failed:
+  en: "Save failed: {}"
+  zh-CN: "保存失败：{}"
+delete_fingerprint:
+  en: "Delete fingerprint \"{}\"? This cannot be undone."
+  zh-CN: "删除指纹 \"{}\"？此操作无法撤销。"
+title_label:
+  en: "Title"
+  zh-CN: "标题"
+algorithm_label:
+  en: "Algorithm"
+  zh-CN: "算法"
+digits_label:
+  en: "Digits"
+  zh-CN: "位数"
+period_label:
+  en: "Period (s)"
+  zh-CN: "周期 (秒)"
+require_touch_label:
+  en: "Require touch"
+  zh-CN: "需要触摸"
+pin_label:
+  en: "PIN"
+  zh-CN: "PIN"
+secret_label:
+  en: "Secret"
+  zh-CN: "密钥"
+base32_hint:
+  en: "base32 (behind the QR code)"
+  zh-CN: "base32（在二维码后面）"
+secret_sent_note:
+  en: "The secret is sent to the key, not written to disk by keyroost."
+  zh-CN: "密钥发送到设备，不会被 keyroost 写入磁盘。"
+invalid_base32:
+  en: "invalid base32 secret: {}"
+  zh-CN: "无效的 base32 密钥：{}"
+permanently_wipe_oath:
+  en: "Permanently wipe EVERY authenticator credential on this key and clear its password? This cannot be undone."
+  zh-CN: "永久擦除此密钥上的每个身份验证器凭证并清除其密码？此操作无法撤销。"
+surname_given:
+  en: "Surname<<Given"
+  zh-CN: "姓<<名"
+use_default_admin_pw3:
+  en: "Use default admin PIN (PW3)"
+  zh-CN: "使用默认管理员 PIN (PW3)"
+public_key_url_set_msg:
+  en: "Public-key URL set."
+  zh-CN: "公钥 URL 已设置。"
+resets_blocked_user_pin:
+  en: "Resets a blocked user PIN using the admin PIN (PW3)."
+  zh-CN: "使用管理员 PIN (PW3) 重置被阻止的用户 PIN。"
+new_user_pin_label:
+  en: "New user PIN"
+  zh-CN: "新用户 PIN"
+overwrites_slot:
+  en: "OVERWRITES the slot with the imported key (clearable only by a full reset). May need a touch."
+  zh-CN: "将用导入的密钥覆盖插槽（只能通过完全重置清除）。可能需要触摸。"
+generating_key:
+  en: "Generating key… (touch the key if it blinks)"
+  zh-CN: "正在生成密钥…（如果密钥闪烁请触摸）"
+generated_key:
+  en: "Generated"
+  zh-CN: "已生成"
+wipes_all_openpgp_keys:
+  en: "Wipes ALL OpenPGP keys and restores default PINs. Works even if the PINs are forgotten. No PIN needed."
+  zh-CN: "擦除所有 OpenPGP 密钥并恢复默认 PIN。即使忘记 PIN 也可使用。无需 PIN。"
+management_key_field:
+  en: "Management key"
+  zh-CN: "管理密钥"
+resets_pin_puk:
+  en: "Resets PIN and PUK to factory defaults; needs the management key and the current PIN."
+  zh-CN: "将 PIN 和 PUK 重置为出厂默认值；需要管理密钥和当前 PIN。"
+state_field:
+  en: "State"
+  zh-CN: "状态"
+empty_value:
+  en: "empty"
+  zh-CN: "空"
+example_alice:
+  en: "e.g. Alice — or full CN=Alice,O=Example,C=US"
+  zh-CN: "例如 Alice — 或完整格式 CN=Alice,O=Example,C=US"
+mgmt_key_authorizes:
+  en: "Management key authorizes the import; the PIN authorizes the on-card signature."
+  zh-CN: "管理密钥授权导入；PIN 授权卡上签名。"
+removes_cert_slot:
+  en: "Removes the certificate in {}. The private key in the slot remains. This cannot be undone."
+  zh-CN: "移除 {} 中的证书。插槽中的私钥保留。此操作无法撤销。"
+erases_private_key:
+  en: "Permanently erases the private key in {}. This cannot be undone."
+  zh-CN: "永久擦除 {} 中的私钥。此操作无法撤销。"
+mgmt_key_deletion:
+  en: "The management key authorizes the deletion. Needs YubiKey 5.7 or newer."
+  zh-CN: "管理密钥授权删除。需要 YubiKey 5.7 或更新版本。"
+wipes_all_piv_keys:
+  en: "This wipes ALL PIV keys, certificates, and PINs."
+  zh-CN: "这将擦除所有 PIV 密钥、证书和 PIN。"
+only_works_puk_blocked:
+  en: "Only works when the PIN and PUK are already blocked."
+  zh-CN: "仅在 PIN 和 PUK 已被阻止时有效。"
+enter_dest_path:
+  en: "enter a destination path for the certificate"
+  zh-CN: "输入证书的目标路径"
+
+# PIV Success Messages
+piv_pin_changed:
+  en: "PIN changed"
+  zh-CN: "PIN 已更改"
+piv_puk_changed:
+  en: "PUK changed"
+  zh-CN: "PUK 已更改"
+piv_pin_unblocked:
+  en: "PIN unblocked and reset"
+  zh-CN: "PIN 已解锁并重置"
+piv_key_generated:
+  en: "Key generated"
+  zh-CN: "密钥已生成"
+piv_cert_imported:
+  en: "Certificate imported"
+  zh-CN: "证书已导入"
+piv_cert_created:
+  en: "Certificate created"
+  zh-CN: "证书已创建"
+piv_request_signed:
+  en: "Request signed and saved"
+  zh-CN: "请求已签名并保存"
+piv_retries_set:
+  en: "Retry counts set"
+  zh-CN: "重试次数已设置"
+piv_mgmt_key_changed:
+  en: "Management key changed"
+  zh-CN: "管理密钥已更改"
+piv_cert_deleted:
+  en: "Certificate deleted"
+  zh-CN: "证书已删除"
+piv_key_deleted:
+  en: "Key deleted"
+  zh-CN: "密钥已删除"
+piv_key_moved:
+  en: "Key moved"
+  zh-CN: "密钥已移动"
+reset_piv_title:
+  en: "Reset PIV applet?"
+  zh-CN: "重置 PIV 小程序？"
+only_works_blocked:
+  en: "Only works when the PIN and PUK are already blocked."
+  zh-CN: "仅在 PIN 和 PUK 已被阻止时有效。"
+no_cert_ready:
+  en: "no certificate was ready to write"
+  zh-CN: "没有可写入的证书"
+saved_cert_to:
+  en: "Saved certificate to"
+  zh-CN: "已将证书保存到"
+permanently_delete:
+  en: "Permanently delete"
+  zh-CN: "永久删除"
+title_label:
+  en: "Title"
+  zh-CN: "标题"
+delete_fingerprint:
+  en: "Delete fingerprint \"{}\"? This cannot be undone."
+  zh-CN: "删除指纹 \"{}\"？此操作无法撤销。"
+more_entries:
+  en: "+{} more entries"
+  zh-CN: "+{} 更多条目"
+more_codes:
+  en: "+{} more codes"
+  zh-CN: "+{} 更多验证码"
+edit_failed:
+  en: "Edit failed: {}"
+  zh-CN: "编辑失败：{}"
+update_failed:
+  en: "Update failed: {}"
+  zh-CN: "更新失败：{}"
+clear_failed:
+  en: "Clear failed: {}"
+  zh-CN: "清除失败：{}"
+save_failed:
+  en: "Save failed: {}"
+  zh-CN: "保存失败：{}"

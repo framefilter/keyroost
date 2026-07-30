@@ -7,6 +7,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Initialize rust-i18n
+#[macro_use]
+extern crate rust_i18n;
+i18n!("locales", fallback = "en");
+
 mod locales;
 mod otp_pane;
 #[cfg(feature = "qr")]
@@ -15,7 +20,7 @@ mod qrscan;
 mod screengrab;
 mod settings;
 mod ui;
-use locales::{detect_language, Language, Translations};
+use locales::{Language, Translations};
 use otp_pane::OtpState;
 use settings::Settings;
 use ui::device::{self, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
@@ -268,7 +273,7 @@ impl Default for EnrollProgress {
         EnrollProgress {
             total: 0,
             captured: 0,
-            last_message: "Touch the sensor to begin\u{2026}".into(),
+            last_message: t!("touch_sensor_begin").to_string().into(),
             done: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -471,12 +476,12 @@ impl OathAddDialog {
     fn validate(&self) -> Result<(String, Vec<u8>), String> {
         let name = self.name.trim().to_owned();
         if name.is_empty() {
-            return Err("credential name is required".into());
+            return Err(t!("credential_name_required").to_string().into());
         }
         match keyroost_proto::codec::base32_decode(self.secret.trim()) {
             Ok(s) if !s.is_empty() => Ok((name, s)),
-            Ok(_) => Err("secret is empty".into()),
-            Err(e) => Err(format!("invalid base32 secret: {e}")),
+            Ok(_) => Err(t!("secret_empty").to_string().into()),
+            Err(e) => Err(format!("{}: {}", t!("invalid_base32").to_string(), e)),
         }
     }
 }
@@ -570,62 +575,62 @@ enum OpenPgpCredKind {
 
 impl OpenPgpCredKind {
     /// Modal title, matching the FIDO/PIV dialogs' title style.
-    fn title(self) -> &'static str {
+    fn title(self) -> String {
         match self {
-            OpenPgpCredKind::ChangeUserPin => "Change user PIN",
-            OpenPgpCredKind::ChangeAdminPin => "Change admin PIN",
-            OpenPgpCredKind::UnblockUserPin => "Unblock user PIN",
-            OpenPgpCredKind::SetName => "Set cardholder name",
-            OpenPgpCredKind::SetUrl => "Set public-key URL",
-            OpenPgpCredKind::GenerateKey => "Generate key on-card",
-            OpenPgpCredKind::GenerateImportKey => "Generate & import key",
-            OpenPgpCredKind::ImportKeyFile => "Import key from file",
-            OpenPgpCredKind::Reset => "Reset applet",
+            OpenPgpCredKind::ChangeUserPin => t!("openpgp_change_user_pin").to_string(),
+            OpenPgpCredKind::ChangeAdminPin => t!("openpgp_change_admin_pin").to_string(),
+            OpenPgpCredKind::UnblockUserPin => t!("openpgp_unblock_user_pin").to_string(),
+            OpenPgpCredKind::SetName => t!("openpgp_set_name").to_string(),
+            OpenPgpCredKind::SetUrl => t!("openpgp_set_url").to_string(),
+            OpenPgpCredKind::GenerateKey => t!("openpgp_generate_key").to_string(),
+            OpenPgpCredKind::GenerateImportKey => t!("openpgp_generate_import").to_string(),
+            OpenPgpCredKind::ImportKeyFile => t!("openpgp_import_file").to_string(),
+            OpenPgpCredKind::Reset => t!("openpgp_reset").to_string(),
         }
     }
     /// Label for the modal's primary Submit button. Shorter than the title for
     /// the verbose flows so the button doesn't overflow.
-    fn submit_label(self) -> &'static str {
+    fn submit_label(self) -> String {
         match self {
-            OpenPgpCredKind::ChangeUserPin => "Change user PIN",
-            OpenPgpCredKind::ChangeAdminPin => "Change admin PIN",
-            OpenPgpCredKind::UnblockUserPin => "Unblock",
-            OpenPgpCredKind::SetName => "Set name",
-            OpenPgpCredKind::SetUrl => "Set URL",
-            OpenPgpCredKind::GenerateKey => "Generate",
-            OpenPgpCredKind::GenerateImportKey => "Generate & import",
-            OpenPgpCredKind::ImportKeyFile => "Import",
-            OpenPgpCredKind::Reset => "Reset applet",
+            OpenPgpCredKind::ChangeUserPin => t!("change_user_pin").to_string(),
+            OpenPgpCredKind::ChangeAdminPin => t!("change_admin_pin").to_string(),
+            OpenPgpCredKind::UnblockUserPin => t!("openpgp_unblock_submit").to_string(),
+            OpenPgpCredKind::SetName => t!("openpgp_set_name_submit").to_string(),
+            OpenPgpCredKind::SetUrl => t!("openpgp_set_url_submit").to_string(),
+            OpenPgpCredKind::GenerateKey => t!("openpgp_generate_submit").to_string(),
+            OpenPgpCredKind::GenerateImportKey => t!("openpgp_generate_import_submit").to_string(),
+            OpenPgpCredKind::ImportKeyFile => t!("openpgp_import_submit").to_string(),
+            OpenPgpCredKind::Reset => t!("openpgp_reset").to_string(),
         }
     }
     /// Spinner caption shown while this flow's op runs.
-    fn busy_label(self) -> &'static str {
+    fn busy_label(self) -> String {
         match self {
-            OpenPgpCredKind::ChangeUserPin => "Changing user PIN\u{2026}",
-            OpenPgpCredKind::ChangeAdminPin => "Changing admin PIN\u{2026}",
-            OpenPgpCredKind::UnblockUserPin => "Unblocking user PIN\u{2026}",
-            OpenPgpCredKind::SetName => "Setting cardholder name\u{2026}",
-            OpenPgpCredKind::SetUrl => "Setting public-key URL\u{2026}",
-            OpenPgpCredKind::GenerateKey => "Generating key\u{2026}",
-            OpenPgpCredKind::GenerateImportKey => "Generating & importing key\u{2026}",
-            OpenPgpCredKind::ImportKeyFile => "Importing key from file\u{2026}",
-            OpenPgpCredKind::Reset => "Resetting OpenPGP applet\u{2026}",
+            OpenPgpCredKind::ChangeUserPin => t!("openpgp_change_user_pin_busy").to_string(),
+            OpenPgpCredKind::ChangeAdminPin => t!("openpgp_change_admin_pin_busy").to_string(),
+            OpenPgpCredKind::UnblockUserPin => t!("openpgp_unblock_user_pin_busy").to_string(),
+            OpenPgpCredKind::SetName => t!("openpgp_set_name_busy").to_string(),
+            OpenPgpCredKind::SetUrl => t!("openpgp_set_url_busy").to_string(),
+            OpenPgpCredKind::GenerateKey => t!("openpgp_generate_key_busy").to_string(),
+            OpenPgpCredKind::GenerateImportKey => t!("openpgp_generate_import_busy").to_string(),
+            OpenPgpCredKind::ImportKeyFile => t!("openpgp_import_file_busy").to_string(),
+            OpenPgpCredKind::Reset => t!("openpgp_reset_busy").to_string(),
         }
     }
     /// In-modal success confirmation text. The key flows whose *detailed* result
     /// (the new fingerprint) still surfaces in the pane only need a generic
     /// confirmation here.
-    fn success(self) -> &'static str {
+    fn success(self) -> String {
         match self {
-            OpenPgpCredKind::ChangeUserPin => "User PIN changed",
-            OpenPgpCredKind::ChangeAdminPin => "Admin PIN changed",
-            OpenPgpCredKind::UnblockUserPin => "User PIN unblocked",
-            OpenPgpCredKind::SetName => "Cardholder name set",
-            OpenPgpCredKind::SetUrl => "Public-key URL set",
-            OpenPgpCredKind::GenerateKey => "Key generated",
-            OpenPgpCredKind::GenerateImportKey => "Key generated and imported",
-            OpenPgpCredKind::ImportKeyFile => "Key imported",
-            OpenPgpCredKind::Reset => "Applet reset",
+            OpenPgpCredKind::ChangeUserPin => t!("openpgp_user_pin_changed").to_string(),
+            OpenPgpCredKind::ChangeAdminPin => t!("openpgp_admin_pin_changed").to_string(),
+            OpenPgpCredKind::UnblockUserPin => t!("openpgp_user_pin_unblocked").to_string(),
+            OpenPgpCredKind::SetName => t!("openpgp_name_set").to_string(),
+            OpenPgpCredKind::SetUrl => t!("openpgp_url_set").to_string(),
+            OpenPgpCredKind::GenerateKey => t!("openpgp_key_generated").to_string(),
+            OpenPgpCredKind::GenerateImportKey => t!("openpgp_key_generated_imported").to_string(),
+            OpenPgpCredKind::ImportKeyFile => t!("openpgp_key_imported").to_string(),
+            OpenPgpCredKind::Reset => t!("openpgp_applet_reset").to_string(),
         }
     }
     /// True when this flow collects the *admin* PIN (PW3) — i.e. it shows the
@@ -772,23 +777,21 @@ fn factory_reset_confirm_summary(
         .collect::<Vec<_>>()
         .join(", ");
     let mut msg = format!(
-        "Factory-reset {model} (serial {serial})?\n\nWipes: {applets}.\nEvery \
-         credential, code, key, and PIN is erased. Each applet that completes \
-         comes back in factory condition, ready to set up again."
+        "{}\n\n{}: {applets}。\n{}",
+        t!("factory_reset_msg").replace("{model}", model).replace("{serial}", serial),
+        t!("factory_reset_wipes"),
+        t!("factory_reset_every_cred")
     );
     if plan.contains(&ResetStep::Piv) {
         // Don't promise the key "stays fully usable": the PIV path blocks the
         // PIN and PUK on purpose, so a wipe that stops between the blocking and
         // the RESET leaves that applet locked. The step report says which.
         msg.push_str(
-            "\n\nPIV: the PIN and PUK are intentionally blocked, then the applet \
-             is wiped (the standard reset path). If the wipe stops after the \
-             blocking, PIV stays locked until a reset finishes \u{2014} the report \
-             below the button says what state it's in.",
+            &format!("\n\n{}", t!("factory_reset_piv_note")),
         );
     }
     if plan.contains(&ResetStep::Fido) {
-        msg.push_str("\n\nFinishes with a step to unplug the key, plug it back in, and touch it.");
+        msg.push_str(&format!("\n\n{}", t!("factory_reset_fido_finish")));
     }
     msg
 }
@@ -830,16 +833,13 @@ fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
     use keyroost_resolve::StepOutcome;
     match row {
         FactoryResetRow::FidoPending => (
-            format!(
-                "{}  not wiped yet \u{2014} waiting for the unplug, replug, and touch",
-                keyroost_resolve::ResetStep::Fido.label()
-            ),
+            t!("fido_not_wiped_yet").replace("{}", keyroost_resolve::ResetStep::Fido.label()),
             RowTone::Waiting,
         ),
         FactoryResetRow::Step(r) => match &r.outcome {
-            StepOutcome::Wiped => (format!("{}  wiped", r.step.label()), RowTone::Done),
-            StepOutcome::Failed(e) => (format!("{}  failed: {e}", r.step.label()), RowTone::Bad),
-            StepOutcome::Skipped => (format!("{}  skipped", r.step.label()), RowTone::Muted),
+            StepOutcome::Wiped => (t!("step_wiped").replace("{}", r.step.label()), RowTone::Done),
+            StepOutcome::Failed(e) => (t!("step_failed").replace("{}", r.step.label()).replace("{}", e), RowTone::Bad),
+            StepOutcome::Skipped => (t!("step_skipped").replace("{}", r.step.label()), RowTone::Muted),
         },
     }
 }
@@ -940,19 +940,19 @@ fn run_card_reset_step(
     let run = || -> Result<(), String> {
         match step {
             ResetStep::Oath => {
-                let name = reader.ok_or("no PC/SC reader for the OATH applet")?;
+                let name = reader.ok_or(t!("no_pcsc_oath").to_string())?;
                 let mut s =
                     keyroost_transport::OathSession::open(name).map_err(|e| e.to_string())?;
                 s.factory_reset().map_err(|e| e.to_string())?;
             }
             ResetStep::OpenPgp => {
-                let name = reader.ok_or("no PC/SC reader for the OpenPGP applet")?;
+                let name = reader.ok_or(t!("no_pcsc_openpgp").to_string())?;
                 let mut s =
                     keyroost_transport::OpenPgpSession::open(name).map_err(|e| e.to_string())?;
                 s.factory_reset().map_err(|e| e.to_string())?;
             }
             ResetStep::Piv => {
-                let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
+                let name = reader.ok_or(t!("no_pcsc_piv").to_string())?;
                 let mut s =
                     keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
                 s.force_reset().map_err(piv_force_reset_message)?;
@@ -988,7 +988,7 @@ fn run_card_reset_step(
                         keyroost_transport::Token2OtpSession::open_pcsc_reader(name, false)
                             .map_err(|e| e.to_string())?
                     }
-                    (None, None) => return Err("no transport for the OTP applet".to_string()),
+                    (None, None) => return Err(t!("no_transport_otp").to_string().to_string()),
                 };
                 s.erase_all().map_err(|e| e.to_string())?;
             }
@@ -1152,12 +1152,12 @@ fn guard_secret_field(ctx: &egui::Context, resp: &egui::Response) {
     }
 }
 
-/// The shared "Scan QR" button: a Default button with the QR glyph painted into
+/// The shared t!("scan_qr").to_string() button: a Default button with the QR glyph painted into
 /// it. Returns `true` when clicked. Collapses the repeated
 /// `button_with_icon` + `paint_qr_icon` block at every scan-QR call site.
 #[cfg(feature = "qr")]
 pub(crate) fn scan_qr_button(ui: &mut egui::Ui, p: &Palette) -> bool {
-    let (resp, icon_center, fg) = theme::button_with_icon(ui, p, BtnKind::Default, "Scan QR", 14.0);
+    let (resp, icon_center, fg) = theme::button_with_icon(ui, p, BtnKind::Default, t!("scan_qr").to_string(), 14.0);
     paint_qr_icon(ui, icon_center, fg);
     resp.clicked()
 }
@@ -1189,19 +1189,19 @@ impl OpenPgpSlotSel {
             OpenPgpSlotSel::Auth => keyroost_transport::KeyCrt::Auth,
         }
     }
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            OpenPgpSlotSel::Sign => "signature",
-            OpenPgpSlotSel::Decrypt => "decryption",
-            OpenPgpSlotSel::Auth => "authentication",
+            OpenPgpSlotSel::Sign => t!("openpgp_signature").to_string(),
+            OpenPgpSlotSel::Decrypt => t!("openpgp_decryption").to_string(),
+            OpenPgpSlotSel::Auth => t!("openpgp_authentication").to_string(),
         }
     }
     /// Capitalized tab label for the sub-tab strip (mirrors PIV slot tabs).
-    fn tab_label(self) -> &'static str {
+    fn tab_label(self) -> String {
         match self {
-            OpenPgpSlotSel::Sign => "Signature",
-            OpenPgpSlotSel::Decrypt => "Decryption",
-            OpenPgpSlotSel::Auth => "Authentication",
+            OpenPgpSlotSel::Sign => t!("openpgp_signature").to_string(),
+            OpenPgpSlotSel::Decrypt => t!("openpgp_decryption").to_string(),
+            OpenPgpSlotSel::Auth => t!("openpgp_authentication").to_string(),
         }
     }
     /// This key's algorithm id and fingerprint out of an `OpenPgpStatus`,
@@ -1240,54 +1240,54 @@ enum PivCredKind {
 
 impl PivCredKind {
     /// Modal title, matching the FIDO dialogs' title style.
-    fn title(self) -> &'static str {
+    fn title(self) -> String {
         match self {
-            PivCredKind::ChangePin => "Change PIN",
-            PivCredKind::ChangePuk => "Change PUK",
-            PivCredKind::UnblockPin => "Unblock PIN",
-            PivCredKind::GenerateKey => "Generate key",
-            PivCredKind::ImportCert => "Import certificate",
-            PivCredKind::SelfSign => "Self-signed certificate",
-            PivCredKind::RequestCsr => "Sign certificate request",
-            PivCredKind::SetRetries => "Set retry counts",
-            PivCredKind::ChangeMgmtKey => "Change management key",
-            PivCredKind::DeleteCert => "Delete certificate",
-            PivCredKind::DeleteKey => "Delete key",
-            PivCredKind::MoveKey => "Move key",
+            PivCredKind::ChangePin => t!("piv_change_pin").to_string(),
+            PivCredKind::ChangePuk => t!("piv_change_puk").to_string(),
+            PivCredKind::UnblockPin => t!("piv_unblock_pin").to_string(),
+            PivCredKind::GenerateKey => t!("piv_generate_key").to_string(),
+            PivCredKind::ImportCert => t!("piv_import_cert").to_string(),
+            PivCredKind::SelfSign => t!("piv_self_sign").to_string(),
+            PivCredKind::RequestCsr => t!("piv_request_csr").to_string(),
+            PivCredKind::SetRetries => t!("piv_set_retries").to_string(),
+            PivCredKind::ChangeMgmtKey => t!("piv_change_mgmt_key").to_string(),
+            PivCredKind::DeleteCert => t!("piv_delete_cert").to_string(),
+            PivCredKind::DeleteKey => t!("piv_delete_key").to_string(),
+            PivCredKind::MoveKey => t!("piv_move_key").to_string(),
         }
     }
     /// Label for the modal's primary Submit button. Shorter than the title for
     /// the verbose flows so the button doesn't overflow.
-    fn submit_label(self) -> &'static str {
+    fn submit_label(self) -> String {
         match self {
-            PivCredKind::GenerateKey => "Generate",
-            PivCredKind::ImportCert => "Import",
-            PivCredKind::SelfSign => "Create",
-            PivCredKind::RequestCsr => "Sign & save",
-            PivCredKind::SetRetries => "Set retry counts",
-            PivCredKind::ChangeMgmtKey => "Change key",
-            PivCredKind::DeleteCert => "Delete",
-            PivCredKind::DeleteKey => "Delete",
-            PivCredKind::MoveKey => "Move",
+            PivCredKind::GenerateKey => t!("piv_generate_submit").to_string(),
+            PivCredKind::ImportCert => t!("piv_import_submit").to_string(),
+            PivCredKind::SelfSign => t!("piv_create_submit").to_string(),
+            PivCredKind::RequestCsr => t!("piv_sign_save_submit").to_string(),
+            PivCredKind::SetRetries => t!("piv_set_retries_submit").to_string(),
+            PivCredKind::ChangeMgmtKey => t!("piv_change_key_submit").to_string(),
+            PivCredKind::DeleteCert => t!("piv_delete_submit").to_string(),
+            PivCredKind::DeleteKey => t!("piv_delete_submit").to_string(),
+            PivCredKind::MoveKey => t!("piv_move_submit").to_string(),
             _ => self.title(),
         }
     }
     /// Spinner caption shown while this flow's op runs (matches the busy label
     /// the underlying `spawn_job` op uses).
-    fn busy_label(self) -> &'static str {
+    fn busy_label(self) -> String {
         match self {
-            PivCredKind::ChangePin => "Changing PIV PIN\u{2026}",
-            PivCredKind::ChangePuk => "Changing PUK\u{2026}",
-            PivCredKind::UnblockPin => "Unblocking PIN\u{2026}",
-            PivCredKind::GenerateKey => "Generating key\u{2026}",
-            PivCredKind::ImportCert => "Importing certificate\u{2026}",
-            PivCredKind::SelfSign => "Creating certificate\u{2026}",
-            PivCredKind::RequestCsr => "Signing request\u{2026}",
-            PivCredKind::SetRetries => "Setting retry counts\u{2026}",
-            PivCredKind::ChangeMgmtKey => "Changing management key\u{2026}",
-            PivCredKind::DeleteCert => "Deleting certificate\u{2026}",
-            PivCredKind::DeleteKey => "Deleting key\u{2026}",
-            PivCredKind::MoveKey => "Moving key\u{2026}",
+            PivCredKind::ChangePin => t!("piv_change_pin_busy").to_string(),
+            PivCredKind::ChangePuk => t!("piv_change_puk_busy").to_string(),
+            PivCredKind::UnblockPin => t!("piv_unblock_pin_busy").to_string(),
+            PivCredKind::GenerateKey => t!("piv_generate_key_busy").to_string(),
+            PivCredKind::ImportCert => t!("piv_import_cert_busy").to_string(),
+            PivCredKind::SelfSign => t!("piv_self_sign_busy").to_string(),
+            PivCredKind::RequestCsr => t!("piv_request_csr_busy").to_string(),
+            PivCredKind::SetRetries => t!("piv_set_retries_busy").to_string(),
+            PivCredKind::ChangeMgmtKey => t!("piv_change_mgmt_key_busy").to_string(),
+            PivCredKind::DeleteCert => t!("piv_delete_cert_busy").to_string(),
+            PivCredKind::DeleteKey => t!("piv_delete_key_busy").to_string(),
+            PivCredKind::MoveKey => t!("piv_move_key_busy").to_string(),
         }
     }
     /// True when this flow collects the *current* management key (and therefore
@@ -1701,6 +1701,11 @@ fn main() -> eframe::Result<()> {
                 translations: Translations::new(saved.language.into()),
                 ..Default::default()
             };
+            // Set the rust-i18n locale based on saved language
+            match saved.language {
+                settings::LanguageSetting::En => rust_i18n::set_locale("en"),
+                settings::LanguageSetting::ZhCn => rust_i18n::set_locale("zh-CN"),
+            }
             Ok(Box::new(app))
         }),
     )
@@ -2083,16 +2088,15 @@ impl App {
                                 let pending =
                                     take_pending_cert(&mut self.security_keys.ssh_cert_pending, id);
                                 self.security_keys.ssh_cert_status = Some(match pending {
-                                    None => "Save failed: no certificate was ready \
-                                             to write"
-                                        .to_string(),
+                                    None => t!("save_failed").to_string() + ": " + &t!("no_cert_ready").to_string(),
                                     Some(pending) => {
                                         match std::fs::write(&path, pending.cert_pub.as_bytes()) {
                                             Ok(()) => format!(
-                                                "Saved certificate to {text}\n{}",
+                                                "{} {text}\n{}",
+                                                t!("saved_cert_to").to_string(),
                                                 pending.summary
                                             ),
-                                            Err(e) => format!("Save failed: {e}"),
+                                            Err(e) => format!("{}: {}", t!("save_failed").to_string(), e),
                                         }
                                     }
                                 });
@@ -3134,7 +3138,7 @@ impl App {
         };
         let pin = std::mem::take(&mut self.security_keys.pin_input);
         if pin.is_empty() {
-            self.security_keys.error = Some("PIN is empty".into());
+            self.security_keys.error = Some(t!("pin_is_empty").to_string());
             return;
         }
         let for_device = self.selected_device.clone();
@@ -3702,7 +3706,7 @@ impl App {
             return;
         }
         if pin.is_empty() {
-            self.security_keys.error = Some("Enter the device PIN to apply this change.".into());
+            self.security_keys.error = Some(t!("enter_device_pin").to_string());
             return;
         }
 
@@ -4378,17 +4382,17 @@ impl App {
         let mut want_submit = false;
         let mut want_close = false;
 
-        let closed = Self::modal_window(ctx, p, "oath_add", "New credential", |ui| {
+        let closed = Self::modal_window(ctx, p, "oath_add", &t!("new_credential").to_string(), |ui| {
             match &result {
                 Some(Ok(())) => {
                     // Success: confirmation + a single Done that dismisses.
                     ui.label(
-                        egui::RichText::new("\u{2713} Credential added")
+                        egui::RichText::new(t!("credential_added").to_string())
                             .font(theme::f_sb(13.0))
                             .color(p.ok),
                     );
                     ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                    if theme::button(ui, p, BtnKind::Primary, &t!("piv_done").to_string()).clicked() {
                         want_close = true;
                     }
                 }
@@ -4399,14 +4403,14 @@ impl App {
                         ui.add_sized(
                             [96.0, 22.0],
                             egui::Label::new(
-                                egui::RichText::new("Name")
+                                egui::RichText::new(t!("name").to_string())
                                     .font(theme::f_reg(13.0))
                                     .color(p.txt2),
                             ),
                         );
                         ui.add(
                             egui::TextEdit::singleline(&mut self.oath.add.name)
-                                .hint_text("issuer:account")
+                                .hint_text(&format!("{}:{}", t!("issuer_app").to_string(), t!("account").to_string()))
                                 .desired_width(300.0),
                         );
                     });
@@ -4414,9 +4418,9 @@ impl App {
                     secret_field(
                         ui,
                         p,
-                        "Secret",
+                        &t!("secret_label").to_string(),
                         &mut self.oath.add.secret,
-                        "base32 (behind the QR code)",
+                        &t!("base32_hint").to_string(),
                         300.0,
                     );
                     #[cfg(feature = "qr")]
@@ -4433,7 +4437,7 @@ impl App {
                         ui.add_sized(
                             [96.0, 22.0],
                             egui::Label::new(
-                                egui::RichText::new("Type")
+                                egui::RichText::new(t!("type").to_string())
                                     .font(theme::f_reg(13.0))
                                     .color(p.txt2),
                             ),
@@ -4442,11 +4446,11 @@ impl App {
                         ui.selectable_value(&mut self.oath.add.totp, false, "HOTP");
                     });
                     ui.add_space(4.0);
-                    ui.checkbox(&mut self.oath.add.require_touch, "Require touch");
+                    ui.checkbox(&mut self.oath.add.require_touch, &t!("require_touch").to_string());
                     card_note(
                         ui,
                         p,
-                        "The secret is sent to the key, not written to disk by keyroost.",
+                        &t!("secret_sent_note").to_string(),
                     );
 
                     if let Some(Err(e)) = &result {
@@ -4459,16 +4463,16 @@ impl App {
                         if busy {
                             ui.add(egui::Spinner::new());
                             ui.label(
-                                egui::RichText::new("Adding credential\u{2026}")
+                                egui::RichText::new(t!("adding_credential").to_string())
                                     .font(theme::f_reg(12.5))
                                     .color(p.txt2),
                             );
                         } else {
-                            if theme::button(ui, p, BtnKind::Primary, "Add").clicked() {
+                            if theme::button(ui, p, BtnKind::Primary, &t!("add").to_string()).clicked() {
                                 want_submit = true;
                             }
                             ui.add_space(8.0);
-                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                            if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                                 want_close = true;
                             }
                         }
@@ -4518,21 +4522,20 @@ impl App {
             return;
         }
         let mut decision: Option<bool> = None;
-        egui::Window::new("Delete credential?")
+        egui::Window::new(&t!("delete_credential_title").to_string())
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Permanently delete \u{201c}{name}\u{201d} from this key? \
-                     This cannot be undone."
-                ));
+                ui.label(
+                    &format!("{} {} {}", t!("permanently_delete").to_string(), name, t!("cannot_be_undone").to_string()),
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
+                    if ui.button(&t!("delete").to_string()).clicked() {
                         decision = Some(true);
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(&t!("cancel").to_string()).clicked() {
                         decision = Some(false);
                     }
                 });
@@ -4550,7 +4553,7 @@ impl App {
     /// Modal confirmation before factory-resetting the OATH applet. Same
     /// device binding as the delete confirmation (KEY-008): a stale
     /// confirmation is dropped, never rendered over the new selection.
-    fn render_oath_reset_confirm(&mut self, ctx: &egui::Context) {
+    fn render_oath_reset_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(for_device) = self.oath.confirm_reset.clone() else {
             return;
         };
@@ -4559,25 +4562,23 @@ impl App {
             return;
         }
         let mut decision: Option<bool> = None;
-        egui::Window::new("Reset OATH applet?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(
-                    "Permanently wipe EVERY authenticator credential on this key \
-                     and clear its password? This cannot be undone.",
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Reset applet").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
+        let closed = Self::modal_window(ctx, p, "oath_reset", &t!("reset_oath_title").to_string(), |ui| {
+            ui.label(
+                &t!("permanently_wipe_oath").to_string(),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Danger, &t!("reset_applet_button").to_string()).clicked() {
+                    decision = Some(true);
+                }
+                if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
+                    decision = Some(false);
+                }
             });
+        });
+        if closed {
+            decision = Some(false);
+        }
         match decision {
             Some(true) => {
                 self.oath.confirm_reset = None;
@@ -4644,22 +4645,21 @@ impl App {
             }
         };
         let mut decision: Option<bool> = None;
-        egui::Window::new("Factory reset this key?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(summary);
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
+        let closed = Self::modal_window(ctx, p, "factory_reset", &t!("factory_reset_this_key").to_string(), |ui| {
+            ui.label(summary);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if theme::button(ui, p, BtnKind::Danger, &t!("yes_wipe").to_string()).clicked() {
+                    decision = Some(true);
+                }
+                if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
+                    decision = Some(false);
+                }
             });
+        });
+        if closed {
+            decision = Some(false);
+        }
         match decision {
             Some(true) => {
                 if self.run_factory_reset_gui() {
@@ -4718,11 +4718,11 @@ impl App {
 
                 // Bottom buttons
                 ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                    if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                         close = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "OK").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &t!("ok").to_string()).clicked() {
                             close = true;
                             apply = true;
                         }
@@ -4738,6 +4738,11 @@ impl App {
         if apply && new_language != self.language {
             self.language = new_language;
             self.translations = Translations::new(new_language);
+            // Set the rust-i18n locale
+            match new_language {
+                Language::En => rust_i18n::set_locale("en"),
+                Language::ZhCn => rust_i18n::set_locale("zh-CN"),
+            }
             self.persist_settings();
         }
     }
@@ -4889,7 +4894,7 @@ impl App {
 
     /// Reset confirmation: wiping a key is irreversible, so require the user to
     /// type `reset` before the button activates, then a physical touch.
-    fn render_reset_dialog(&mut self, ctx: &egui::Context) {
+    fn render_reset_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         if !self.security_keys.reset.open {
             return;
         }
@@ -4911,7 +4916,6 @@ impl App {
             .and_then(|i| i.option("largeBlobs"))
             == Some(true);
 
-        let mut window_open = true;
         let mut arm = false;
         let mut cancel = false;
         // Device-scoped, not app-global: this dialog may belong to a different
@@ -4921,76 +4925,68 @@ impl App {
         let waiting = self.reset_arm.as_ref().is_some_and(|arm| {
             completion_still_valid(arm.for_device.as_ref(), self.selected_device.as_ref())
         });
-        egui::Window::new("Reset security key?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut window_open)
-            .show(ctx, |ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 110, 110),
-                    format!("This wipes ALL credentials and the PIN on {label}."),
-                );
-                ui.label("This cannot be undone.");
-                if has_large_blobs {
-                    ui.add_space(6.0);
-                    let muted = egui::Color32::from_rgb(150, 150, 150);
-                    ui.colored_label(
-                        muted,
-                        "Note: a reset does not erase large-blob storage. Open the Storage tab",
-                    );
-                    ui.colored_label(
-                        muted,
-                        "and use \u{201c}Clear all storage\u{201d} to wipe every entry there.",
-                    );
-                }
+        let closed = Self::modal_window(ctx, p, "reset_key", &t!("reset_security_key").to_string(), |ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 110, 110),
+                &t!("reset_wipes_all").replace("{label}", &label),
+            );
+            ui.label(t!("cannot_be_undone").to_string());
+            if has_large_blobs {
                 ui.add_space(6.0);
-                if waiting {
-                    // Armed: the clock starts when the key is re-inserted, so we
-                    // wait for the unplug/replug and fire the moment it returns.
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new("Now unplug the key, then plug it back in.")
-                                .strong(),
-                        );
-                    });
-                    ui.label("The reset is sent the instant it reconnects \u{2014} then the");
-                    ui.label("key will blink. Touch it to finish the wipe.");
-                    ui.add_space(6.0);
-                    if ui.button("Cancel").clicked() {
+                let muted = egui::Color32::from_rgb(150, 150, 150);
+                ui.colored_label(
+                    muted,
+                    &t!("reset_large_blob_note").to_string(),
+                );
+                ui.colored_label(
+                    muted,
+                    &t!("reset_large_blob_clear").to_string(),
+                );
+            }
+            ui.add_space(6.0);
+            if waiting {
+                // Armed: the clock starts when the key is re-inserted, so we
+                // wait for the unplug/replug and fire the moment it returns.
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new(t!("now_unplug").to_string())
+                            .strong(),
+                    );
+                });
+                ui.label(t!("reset_reconnects").to_string());
+                ui.label(t!("reset_blink_touch").to_string());
+                ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
+                    cancel = true;
+                }
+            } else {
+                ui.label(t!("reset_10_seconds").to_string());
+                ui.label(t!("reset_reinsert").to_string());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(t!("type_reset_confirm").to_string());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.security_keys.reset.confirm_input)
+                            .desired_width(120.0),
+                    );
+                });
+                ui.add_space(6.0);
+                let ready = self.security_keys.reset.confirm_input.trim() == "reset";
+                ui.horizontal(|ui| {
+                    if theme::button(ui, p, BtnKind::Danger, &t!("arm_reset").to_string()).clicked() && ready {
+                        arm = true;
+                    }
+                    if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                         cancel = true;
                     }
-                } else {
-                    ui.label("A key only accepts a reset within ~10 seconds of being");
-                    ui.label("plugged in, so after you confirm you'll re-insert it.");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Type \u{201c}reset\u{201d} to confirm:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.security_keys.reset.confirm_input)
-                                .desired_width(120.0),
-                        );
-                    });
-                    ui.add_space(6.0);
-                    let ready = self.security_keys.reset.confirm_input.trim() == "reset";
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(ready, egui::Button::new("Arm reset"))
-                            .clicked()
-                        {
-                            arm = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                }
-            });
+                });
+            }
+        });
         if arm {
             self.arm_fido_reset();
-        } else if cancel || !window_open {
+        } else if cancel || closed {
             // Cancel button, or the window's [x] close.
             self.security_keys.reset = ResetDialog::default();
             self.reset_arm = None;
@@ -5332,7 +5328,7 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                Self::apply_openpgp_write(app, result, "Public-key URL set.".into())
+                Self::apply_openpgp_write(app, result, t!("public_key_url_set").to_string())
             })
         });
     }
@@ -5544,12 +5540,13 @@ impl App {
     }
 
     /// The reset confirmation modal for the PIV pane.
-    fn render_piv_confirms(&mut self, ctx: &egui::Context) {
+    fn render_piv_confirms(&mut self, ctx: &egui::Context, p: &Palette) {
         if typed_reset_modal(
             ctx,
-            "Reset PIV applet?",
-            "This wipes ALL PIV keys, certificates, and PINs.",
-            &["Only works when the PIN and PUK are already blocked."],
+            p,
+            &t!("reset_piv_title").to_string(),
+            &t!("wipes_all_piv_keys").to_string(),
+            &[&t!("only_works_blocked").to_string()],
             &mut self.piv.confirm_reset,
         ) && self.piv_reset()
         {
@@ -5565,6 +5562,7 @@ impl App {
 /// swallow a confirmed destructive click.
 fn typed_reset_modal(
     ctx: &egui::Context,
+    p: &Palette,
     title: &str,
     warning: &str,
     extra_lines: &[&str],
@@ -5575,31 +5573,61 @@ fn typed_reset_modal(
     };
     let mut do_it = false;
     let mut cancel = false;
-    let mut window_open = true;
     let mut buf = typed;
+    let mut closed = false;
     egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut window_open)
+        .frame(egui::Frame {
+            inner_margin: egui::Margin::same(20),
+            corner_radius: egui::CornerRadius::same(13),
+            fill: p.pop,
+            stroke: egui::Stroke::new(1.0, p.line),
+            shadow: egui::epaint::Shadow {
+                offset: [0, 12],
+                blur: 40,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(115),
+            },
+            ..Default::default()
+        })
         .show(ctx, |ui| {
+            ui.set_max_width(300.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(theme::f_sb(13.0))
+                        .color(p.txt),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (xr, xresp) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                    let xcolor = if xresp.hovered() { p.txt } else { p.txt3 };
+                    paint_x_icon(ui, xr.center(), xcolor);
+                    if xresp.clicked() {
+                        closed = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
             ui.colored_label(egui::Color32::from_rgb(220, 110, 110), warning);
             for line in extra_lines {
                 ui.label(*line);
             }
-            ui.label("This cannot be undone.");
+            ui.label(t!("cannot_be_undone").to_string());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("Type \u{201c}reset\u{201d} to confirm:");
+                ui.label(t!("type_reset_confirm").to_string());
                 ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let armed = buf.trim() == "reset";
-                if ui.add_enabled(armed, egui::Button::new("Reset")).clicked() {
+                if theme::button(ui, p, BtnKind::Danger, &t!("reset").to_string()).clicked() && armed {
                     do_it = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });
@@ -5607,7 +5635,7 @@ fn typed_reset_modal(
     if do_it {
         true
     } else {
-        if cancel || !window_open {
+        if cancel || closed {
             *confirm = None;
         } else {
             *confirm = Some(buf);
@@ -6680,7 +6708,7 @@ impl App {
         };
         let path = self.piv.csr_path.trim().to_owned();
         if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the request".into());
+            self.piv.error = Some(t!("enter_destination_csr").to_string());
             return;
         }
         if std::path::Path::new(&path).exists() {
@@ -6729,7 +6757,7 @@ impl App {
         let slot = self.piv.selected_slot.to_slot();
         let path = self.piv.export_path.trim().to_owned();
         if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the certificate".into());
+            self.piv.error = Some(t!("enter_dest_path").to_string());
             return;
         }
         // Refuse to clobber an existing file — the user can delete it or pick
@@ -7087,20 +7115,20 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
 /// management-key-gated flows whose *detailed* result (e.g. the generated
 /// public-key PEM) still surfaces in the pane only need a generic confirmation
 /// here — the pane keeps showing the rich outcome.
-fn piv_cred_success(kind: PivCredKind) -> &'static str {
+fn piv_cred_success(kind: PivCredKind) -> String {
     match kind {
-        PivCredKind::ChangePin => "PIN changed",
-        PivCredKind::ChangePuk => "PUK changed",
-        PivCredKind::UnblockPin => "PIN unblocked and reset",
-        PivCredKind::GenerateKey => "Key generated",
-        PivCredKind::ImportCert => "Certificate imported",
-        PivCredKind::SelfSign => "Certificate created",
-        PivCredKind::RequestCsr => "Request signed and saved",
-        PivCredKind::SetRetries => "Retry counts set",
-        PivCredKind::ChangeMgmtKey => "Management key changed",
-        PivCredKind::DeleteCert => "Certificate deleted",
-        PivCredKind::DeleteKey => "Key deleted",
-        PivCredKind::MoveKey => "Key moved",
+        PivCredKind::ChangePin => t!("piv_pin_changed").to_string(),
+        PivCredKind::ChangePuk => t!("piv_puk_changed").to_string(),
+        PivCredKind::UnblockPin => t!("piv_pin_unblocked").to_string(),
+        PivCredKind::GenerateKey => t!("piv_key_generated").to_string(),
+        PivCredKind::ImportCert => t!("piv_cert_imported").to_string(),
+        PivCredKind::SelfSign => t!("piv_cert_created").to_string(),
+        PivCredKind::RequestCsr => t!("piv_request_signed").to_string(),
+        PivCredKind::SetRetries => t!("piv_retries_set").to_string(),
+        PivCredKind::ChangeMgmtKey => t!("piv_mgmt_key_changed").to_string(),
+        PivCredKind::DeleteCert => t!("piv_cert_deleted").to_string(),
+        PivCredKind::DeleteKey => t!("piv_key_deleted").to_string(),
+        PivCredKind::MoveKey => t!("piv_key_moved").to_string(),
     }
 }
 
@@ -7841,18 +7869,18 @@ impl eframe::App for App {
         self.central(root_ui, &p);
 
         // Modal dialogs (reused from the per-applet logic) + Molto2 import dialogs.
-        self.render_reset_dialog(ctx);
+        self.render_reset_dialog(ctx, &p);
         self.render_advanced_confirm(ctx, &p);
         self.render_enroll_dialog(ctx, &p);
         if let Some(id) = self.render_fp_delete_confirm(ctx, &p) {
             self.delete_fingerprint(id);
         }
         self.render_oath_delete_confirm(ctx);
-        self.render_oath_reset_confirm(ctx);
+        self.render_oath_reset_confirm(ctx, &p);
         self.render_factory_reset_confirm(ctx, &p);
         self.render_oath_add_modal(ctx, &p);
         self.render_openpgp_cred_modal(ctx, &p);
-        self.render_piv_confirms(ctx);
+        self.render_piv_confirms(ctx, &p);
         self.render_piv_cred_modal(ctx, &p);
         self.molto_dialogs(ctx, &p);
 
@@ -7966,7 +7994,7 @@ impl App {
                     theme::status_dot(ui, p.ok, 7.0);
                     ui.add_space(5.0);
                     ui.label(
-                        egui::RichText::new(format!("{} connected", self.devices.len()))
+                        egui::RichText::new(t!("connected_count").to_string().replace("{}", &self.devices.len().to_string()))
                             .font(theme::f_reg(12.0))
                             .color(p.txt2),
                     );
@@ -8002,7 +8030,7 @@ impl App {
                         if ui
                             .add(
                                 egui::Label::new(
-                                    egui::RichText::new("Activity log")
+                                    egui::RichText::new(t!("activity_log").to_string())
                                         .font(theme::f_sb(12.5))
                                         .color(log_color),
                                 )
@@ -8015,7 +8043,7 @@ impl App {
                         }
                         ui.add_space(10.0);
                         ui.hyperlink_to(
-                            egui::RichText::new("Learn \u{2197}")
+                            egui::RichText::new(t!("learn_arrow").to_string())
                                 .font(theme::f_sb(12.5))
                                 .color(p.txt2),
                             ui::help::LEARN_BASE,
@@ -8025,7 +8053,7 @@ impl App {
                             ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                         paint_theme_icon(ui, trect.center(), 7.0, p.txt2);
                         if tresp
-                            .on_hover_text("Toggle light / dark")
+                            .on_hover_text(t!("toggle_light_dark").to_string())
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
@@ -8044,7 +8072,7 @@ impl App {
                             if self.colorblind { p.accent } else { p.txt2 },
                         );
                         if eresp
-                            .on_hover_text("Colorblind-safe colors")
+                            .on_hover_text(t!("colorblind_safe").to_string())
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
@@ -8209,7 +8237,7 @@ impl App {
             self.zoom_commit_at = None;
         }
         let resp = resp
-            .on_hover_text("Text size — scales the whole interface (Ctrl + / Ctrl − also work)");
+            .on_hover_text(t!("text_size_tooltip").to_string());
 
         ui.add_space(4.0);
         // [−] (leftmost of the trio). Preview-only like [+].
@@ -8244,7 +8272,7 @@ impl App {
 
         // Label.
         ui.label(
-            egui::RichText::new("Text size")
+            egui::RichText::new(t!("text_size").to_string())
                 .font(theme::f_reg(12.0))
                 .color(p.txt2),
         );
@@ -8256,7 +8284,7 @@ impl App {
             if ui
                 .add(
                     egui::Label::new(
-                        egui::RichText::new("Reset")
+                        egui::RichText::new(t!("reset").to_string())
                             .font(theme::f_sb(12.0))
                             .color(p.accent),
                     )
@@ -8292,7 +8320,7 @@ impl App {
                             ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                         paint_refresh_icon(ui, rrect.center(), 6.5, p.txt2);
                         if rresp
-                            .on_hover_text("Rescan")
+                            .on_hover_text(t!("rescan").to_string())
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
@@ -8374,18 +8402,18 @@ impl App {
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("ACTIVITY LOG")
+                        egui::RichText::new(t!("activity_log_header").to_string())
                             .font(theme::f_bold(11.0))
                             .color(p.txt3),
                     );
                     ui.add_space(6.0);
                     theme::pill(ui, "live", p.ok, p.ok_soft());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Ghost, "Collapse").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &t!("collapse").to_string()).clicked() {
                             self.log_open = false;
                         }
                         ui.add_space(4.0);
-                        if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &t!("copy").to_string()).clicked() {
                             let all = self
                                 .log
                                 .iter()
@@ -8590,14 +8618,14 @@ impl App {
                             [200.0, 32.0],
                             egui::TextEdit::singleline(&mut self.rename_input)
                                 .vertical_align(egui::Align::Center)
-                                .hint_text("friendly-name"),
+                                .hint_text(&t!("name").to_string())
                         );
                         let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter {
+                        if theme::button(ui, p, BtnKind::Primary, &t!("save").to_string()).clicked() || enter {
                             do_save = true;
                         }
                         ui.add_space(4.0);
-                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                             do_cancel = true;
                         }
                     } else {
@@ -8718,7 +8746,7 @@ impl App {
                 if ui
                     .add(
                         egui::Label::new(
-                            egui::RichText::new("Manage \u{2192}")
+                            egui::RichText::new(t!("manage_arrow").to_string())
                                 .font(theme::f_sb(12.5))
                                 .color(p.accent),
                         )
@@ -8986,9 +9014,11 @@ impl App {
                         }
                         if total > 2 {
                             ui.label(
-                                egui::RichText::new(format!("+{} more codes", total - 2))
-                                    .font(theme::f_reg(12.5))
-                                    .color(p.txt3),
+                                egui::RichText::new(
+                                    t!("more_codes").to_string().replace("{}", &(total - 2).to_string()),
+                                )
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt3),
                             );
                         }
                         if let Some((name, code)) = copy {
@@ -9107,9 +9137,11 @@ impl App {
                         }
                         if total > 2 {
                             ui.label(
-                                egui::RichText::new(format!("+{} more entries", total - 2))
-                                    .font(theme::f_reg(12.5))
-                                    .color(p.txt3),
+                                egui::RichText::new(
+                                    t!("more_entries").to_string().replace("{}", &(total - 2).to_string()),
+                                )
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt3),
                             );
                         }
                     } else {
@@ -9612,17 +9644,22 @@ impl App {
             // Passkey management is its own capability (credMgmt, or the
             // pre-2.1 preview) — a CTAP2 key without it gets no Passkeys tab
             // rather than a tab whose only content errors at runtime.
+            let passkeys_label = t!("passkeys_tab").to_string();
+            let fingerprints_label = t!("fingerprints").to_string();
+            let settings_label = t!("settings_tab").to_string();
+            let storage_label = t!("storage_tab").to_string();
+            
             if has_cred_mgmt {
-                tabs.push((FidoSubview::Passkeys, "Passkeys"));
+                tabs.push((FidoSubview::Passkeys, &passkeys_label));
             }
             if has_bio {
-                tabs.push((FidoSubview::Fingerprints, "Fingerprints"));
+                tabs.push((FidoSubview::Fingerprints, &fingerprints_label));
             }
             if settings_available {
-                tabs.push((FidoSubview::Settings, "Settings"));
+                tabs.push((FidoSubview::Settings, &settings_label));
             }
             if has_large_blobs {
-                tabs.push((FidoSubview::LargeBlobs, "Storage"));
+                tabs.push((FidoSubview::LargeBlobs, &storage_label));
             }
             // The persisted pick can be stale (it outlives selection changes,
             // and the newly selected key may not offer the old tab): snap it
@@ -9693,14 +9730,14 @@ impl App {
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Resident passkeys")
+                        egui::RichText::new(t!("resident_passkeys").to_string())
                             .font(theme::f_sb(14.5))
                             .color(p.txt),
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "passkeys");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &t!("reload").to_string()).clicked() {
                             reload = true;
                         }
                     });
@@ -9715,16 +9752,18 @@ impl App {
                 });
                 if let Some((existing, max_remaining, rps)) = session_info {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{existing} stored \u{00B7} room for {max_remaining} more"
-                        ))
+                        egui::RichText::new(
+                            t!("stored_room").to_string()
+                                .replace("{existing}", &existing.to_string())
+                                .replace("{max_remaining}", &max_remaining.to_string()),
+                        )
                         .font(theme::f_reg(12.5))
                         .color(p.txt2),
                     );
                     ui.add_space(6.0);
                     if rps.is_empty() {
                         ui.label(
-                            egui::RichText::new("No passkeys stored on this key yet.")
+                            egui::RichText::new(t!("no_passkeys").to_string())
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -9742,7 +9781,7 @@ impl App {
                                 };
                             ui.collapsing(header, |ui| {
                                 if creds.is_empty() {
-                                    ui.label("(no credentials)");
+                                    ui.label(&t!("no_credentials").to_string());
                                 }
                                 for c in creds {
                                     // Right-to-left so the Remove button claims its
@@ -9752,7 +9791,7 @@ impl App {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Min),
                                         |ui| {
-                                            if theme::button(ui, p, BtnKind::Ghost, "Remove")
+                                            if theme::button(ui, p, BtnKind::Ghost, &t!("remove").to_string())
                                                 .clicked()
                                             {
                                                 delete = Some(c.credential_id.clone());
@@ -9817,13 +9856,13 @@ impl App {
                                                 };
                                                 row(
                                                     ui,
-                                                    "User Name",
+                                                    &t!("user_name").to_string(),
                                                     c.user.name.clone().unwrap_or_default(),
                                                     false,
                                                 );
                                                 row(
                                                     ui,
-                                                    "Display Name",
+                                                    &t!("display_name").to_string(),
                                                     c.user.display_name.clone().unwrap_or_default(),
                                                     false,
                                                 );
@@ -9841,10 +9880,10 @@ impl App {
                                                 } else {
                                                     hex_full(&c.user.id)
                                                 };
-                                                row(ui, "User ID", uid, true);
+                                                row(ui, &t!("user_id").to_string(), uid, true);
                                                 row(
                                                     ui,
-                                                    "Credential ID",
+                                                    &t!("credential_id").to_string(),
                                                     hex_full(&c.credential_id),
                                                     true,
                                                 );
@@ -9895,14 +9934,14 @@ impl App {
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Fingerprints")
+                        egui::RichText::new(t!("fingerprints").to_string())
                             .font(theme::f_sb(14.5))
                             .color(p.txt),
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "fingerprint");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &t!("reload").to_string()).clicked() {
                             do_refresh_fp = true;
                         }
                     });
@@ -9919,14 +9958,14 @@ impl App {
                     match &self.security_keys.fingerprints {
                         None => {
                             ui.label(
-                                egui::RichText::new("Click Reload to read enrolled fingerprints.")
+                                egui::RichText::new(t!("click_reload_fingerprints").to_string())
                                     .font(theme::f_reg(13.0))
                                     .color(p.txt3),
                             );
                         }
                         Some(list) if list.is_empty() => {
                             ui.label(
-                                egui::RichText::new("No fingerprints enrolled yet.")
+                                egui::RichText::new(t!("no_fingerprints").to_string())
                                     .font(theme::f_reg(13.0))
                                     .color(p.txt3),
                             );
@@ -9952,7 +9991,7 @@ impl App {
                                                     .vertical_align(egui::Align::Center),
                                             );
                                         }
-                                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
+                                        if theme::button(ui, p, BtnKind::Primary, &t!("save").to_string()).clicked()
                                         {
                                             if let Some((rid, buf)) =
                                                 self.security_keys.fp_rename.take()
@@ -9960,7 +9999,7 @@ impl App {
                                                 fp_rename_commit = Some((rid, buf));
                                             }
                                         }
-                                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked()
+                                        if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked()
                                         {
                                             self.security_keys.fp_rename = None;
                                         }
@@ -9971,13 +10010,13 @@ impl App {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if theme::button(ui, p, BtnKind::Ghost, "Delete")
+                                                if theme::button(ui, p, BtnKind::Ghost, &t!("delete").to_string())
                                                     .clicked()
                                                 {
                                                     self.security_keys.fp_confirm_delete =
                                                         Some(id.clone());
                                                 }
-                                                if theme::button(ui, p, BtnKind::Ghost, "Rename")
+                                                if theme::button(ui, p, BtnKind::Ghost, &t!("rename").to_string())
                                                     .clicked()
                                                 {
                                                     self.security_keys.fp_rename = Some((
@@ -10002,9 +10041,9 @@ impl App {
                             [160.0, 32.0],
                             egui::TextEdit::singleline(&mut self.security_keys.fp_new_name)
                                 .vertical_align(egui::Align::Center)
-                                .hint_text("name (optional)"),
+                                .hint_text(&format!("{} ({})", t!("name").to_string(), ""))
                         );
-                        if theme::button(ui, p, BtnKind::Primary, "Enroll new\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Primary, &t!("enroll_new").to_string()).clicked() {
                             do_enroll = true;
                         }
                     });
@@ -10159,14 +10198,15 @@ impl App {
                         app.security_keys.lb_capacity = Some(cap);
                         app.security_keys.lb_new_text.clear();
                         app.security_keys.lb_show_add = false;
-                        app.security_keys.lb_status = Some(format!(
-                            "Saved. {n} entr{} total.",
-                            if n == 1 { "y" } else { "ies" }
-                        ));
+                        app.security_keys.lb_status = Some(
+                            t!("saved_entry_count").to_string().replace("{}", &n.to_string()),
+                        );
                         app.security_keys.error = None;
                     }
                     Err(e) => {
-                        app.security_keys.lb_status = Some(format!("Save failed: {e}"));
+                        app.security_keys.lb_status = Some(
+                            format!("{}: {}", t!("save_failed").to_string(), e),
+                        );
                     }
                 }
             })
@@ -10243,7 +10283,9 @@ impl App {
                         app.security_keys.error = None;
                     }
                     Err(e) => {
-                        app.security_keys.lb_status = Some(format!("Edit failed: {e}"));
+                        app.security_keys.lb_status = Some(
+                            format!("{}: {}", t!("edit_failed").to_string(), e),
+                        );
                     }
                 }
             })
@@ -10280,13 +10322,14 @@ impl App {
                 self.security_keys.large_blobs = Some(array);
                 self.security_keys.lb_capacity = Some(cap);
                 self.security_keys.lb_selected = None;
-                self.security_keys.lb_status = Some(format!(
-                    "Loaded {n} entr{}.",
-                    if n == 1 { "y" } else { "ies" }
-                ));
+                self.security_keys.lb_status = Some(
+                    t!("loaded_entries").to_string().replace("{}", &n.to_string()),
+                );
             }
             Err(e) => {
-                self.security_keys.lb_status = Some(format!("Load failed: {e}"));
+                self.security_keys.lb_status = Some(
+                    format!("{}: {}", t!("load_failed").to_string(), e),
+                );
             }
         }
     }
@@ -10384,7 +10427,9 @@ impl App {
                         app.security_keys.error = None;
                     }
                     Err(e) => {
-                        app.security_keys.lb_status = Some(format!("Update failed: {e}"));
+                        app.security_keys.lb_status = Some(
+                            format!("{}: {}", t!("update_failed").to_string(), e),
+                        );
                     }
                 }
             })
@@ -10463,11 +10508,16 @@ impl App {
                         app.security_keys.lb_capacity = Some(cap);
                         app.security_keys.lb_selected = None;
                         app.security_keys.lb_status =
-                            Some(format!("Storage cleared. {n} entries remaining."));
+                            Some(
+                                t!("storage_cleared").to_string()
+                                    .replace("{}", &n.to_string()),
+                            );
                         app.security_keys.error = None;
                     }
                     Err(e) => {
-                        app.security_keys.lb_status = Some(format!("Clear failed: {e}"));
+                        app.security_keys.lb_status = Some(
+                            format!("{}: {}", t!("clear_failed").to_string(), e),
+                        );
                     }
                 }
             })
@@ -10496,7 +10546,7 @@ impl App {
         let mut do_load = false;
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Large blob storage")
+                egui::RichText::new(t!("large_blob_storage").to_string())
                     .font(theme::f_sb(14.5))
                     .color(p.txt),
             );
@@ -10504,20 +10554,20 @@ impl App {
             self.help_dot(ui, p, "large_blobs");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = if self.security_keys.large_blobs.is_some() {
-                    "Reload"
+                    t!("reload").to_string()
                 } else {
-                    "Load"
+                    t!("load").to_string()
                 };
-                if theme::button(ui, p, BtnKind::Ghost, label).clicked() {
+                if theme::button(ui, p, BtnKind::Ghost, &label).clicked() {
                     do_load = true;
                 }
                 ui.add_space(8.0);
                 let add_label = if self.security_keys.lb_show_add {
-                    "Close"
+                    t!("close").to_string()
                 } else {
-                    "Add"
+                    t!("add").to_string()
                 };
-                if theme::button(ui, p, BtnKind::Ghost, add_label).clicked() {
+                if theme::button(ui, p, BtnKind::Ghost, &add_label).clicked() {
                     self.security_keys.lb_show_add = !self.security_keys.lb_show_add;
                 }
                 // "Clear all storage" wipes every entry — the only way to erase
@@ -10534,7 +10584,7 @@ impl App {
                 let unlocked = self.security_keys.session.is_some();
                 if entry_count > 0 && unlocked {
                     ui.add_space(8.0);
-                    if theme::button(ui, p, BtnKind::Danger, "Clear all storage").clicked() {
+                    if theme::button(ui, p, BtnKind::Danger, &t!("clear_all_storage").to_string()).clicked() {
                         self.security_keys.lb_confirm_clear = true;
                     }
                 }
@@ -10543,8 +10593,7 @@ impl App {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "This store is readable by anyone holding the key and is meant for \
-                 RP-encrypted data \u{2014} not a place for plaintext secrets.",
+                &t!("large_blob_store_readable").to_string(),
             )
             .font(theme::f_reg(11.5))
             .color(p.txt3),
@@ -10564,19 +10613,20 @@ impl App {
                         .desired_height(8.0),
                 );
                 ui.add_space(8.0);
+                let entry_label = if cap.entry_count == 1 {
+                    t!("entry_single").to_string()
+                } else {
+                    t!("entry_plural").to_string()
+                };
                 ui.label(
-                    egui::RichText::new(format!(
-                        "{} of {} bytes used \u{00b7} {} free \u{00b7} {} {}",
-                        cap.used_bytes,
-                        cap.max_bytes,
-                        cap.free_bytes,
-                        cap.entry_count,
-                        if cap.entry_count == 1 {
-                            "entry"
-                        } else {
-                            "entries"
-                        },
-                    ))
+                    egui::RichText::new(
+                        t!("bytes_used").to_string()
+                            .replace("{used}", &cap.used_bytes.to_string())
+                            .replace("{max}", &cap.max_bytes.to_string())
+                            .replace("{free}", &cap.free_bytes.to_string())
+                            .replace("{count}", &cap.entry_count.to_string())
+                            .replace("{label}", &entry_label),
+                    )
                     .font(theme::f_reg(11.5))
                     .color(p.txt2),
                 );
@@ -10603,15 +10653,14 @@ impl App {
             ui.add_space(12.0);
             theme::card_frame(p).show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("Add a text note")
+                    egui::RichText::new(t!("add_text_note").to_string())
                         .font(theme::f_sb(13.0))
                         .color(p.txt),
                 );
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "Stored as a keyroost entry you can read back here. It is NOT \
-                         encrypted and is visible to anyone holding the key.",
+                        &t!("stored_as_keyroost").to_string(),
                     )
                     .font(theme::f_reg(11.0))
                     .color(p.txt3),
@@ -10621,20 +10670,20 @@ impl App {
                     egui::TextEdit::multiline(&mut self.security_keys.lb_new_text)
                         .desired_rows(2)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Type a note to store on the key\u{2026}"),
+                        .hint_text(&t!("add_text_note").to_string())
                 );
                 ui.add_space(6.0);
                 let unlocked = self.security_keys.session.is_some();
                 let has_text = !self.security_keys.lb_new_text.trim().is_empty();
                 ui.horizontal(|ui| {
-                    let add = theme::button(ui, p, BtnKind::Primary, "Add note");
+                    let add = theme::button(ui, p, BtnKind::Primary, &t!("add_text_note").to_string());
                     if add.clicked() && unlocked && has_text {
                         let text = self.security_keys.lb_new_text.clone();
                         self.add_large_blob_note(text);
                     }
                     if !unlocked {
                         ui.label(
-                            egui::RichText::new("Unlock with your PIN to save.")
+                            egui::RichText::new(t!("unlock_pin_save").to_string())
                                 .font(theme::f_reg(11.0))
                                 .color(p.txt3),
                         );
@@ -10651,7 +10700,7 @@ impl App {
         ui.add_space(10.0);
         if array.entries.is_empty() {
             ui.label(
-                egui::RichText::new("The large-blob array is empty.")
+                egui::RichText::new(t!("large_blob_empty").to_string())
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
             );
@@ -10685,7 +10734,7 @@ impl App {
                     );
                     ui.add_space(8.0);
                     let meta = match &classification {
-                        EntryKind::Note(_) => "keyroost text note".to_string(),
+                        EntryKind::Note(_) => t!("keyroost_text_note").to_string(),
                         EntryKind::SshCert { .. } => format!(
                             "ssh-cert \u{00b7} {} bytes \u{00b7} relying-party data",
                             entry.ciphertext.len(),
@@ -10703,25 +10752,25 @@ impl App {
                             .color(p.txt3),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &t!("delete").to_string()).clicked() {
                             delete_request = Some(idx);
                         }
                         let is_open = selected == Some(idx);
-                        let toggle = if is_open { "Hide bytes" } else { "View bytes" };
-                        if theme::button(ui, p, BtnKind::Ghost, toggle).clicked() {
+                        let toggle = if is_open { t!("hide_bytes").to_string() } else { t!("view_bytes").to_string() };
+                        if theme::button(ui, p, BtnKind::Ghost, &toggle).clicked() {
                             self.security_keys.lb_selected =
                                 if is_open { None } else { Some(idx) };
                         }
                         // Edit only applies to keyroost's own notes.
                         if note_text.is_some()
                             && editing != Some(idx)
-                            && theme::button(ui, p, BtnKind::Ghost, "Edit").clicked()
+                            && theme::button(ui, p, BtnKind::Ghost, &t!("edit").to_string()).clicked()
                         {
                             start_edit = Some((idx, note_text.clone().unwrap_or_default()));
                         }
                         // Export is read-only, so it's always available
                         // regardless of session lock state.
-                        if theme::button(ui, p, BtnKind::Ghost, "Export\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &format!("{}\u{2026}", t!("export_entry").to_string())).clicked() {
                             let is_cert =
                                 matches!(classification, EntryKind::SshCert { .. });
                             let default_name = if is_cert {
@@ -10755,18 +10804,18 @@ impl App {
                     let has_text =
                         !self.security_keys.lb_edit_text.trim().is_empty();
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked()
+                        if theme::button(ui, p, BtnKind::Primary, &t!("save").to_string()).clicked()
                             && unlocked
                             && has_text
                         {
                             save_edit = Some((idx, self.security_keys.lb_edit_text.clone()));
                         }
-                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                             cancel_edit = true;
                         }
                         if !unlocked {
                             ui.label(
-                                egui::RichText::new("Unlock with your PIN to save.")
+                                egui::RichText::new(t!("unlock_pin_save").to_string())
                                     .font(theme::f_reg(11.0))
                                     .color(p.txt3),
                             );
@@ -10878,11 +10927,11 @@ impl App {
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete entry").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &t!("delete_entry").to_string()).clicked() {
                             self.security_keys.lb_confirm_delete = None;
                             self.delete_large_blob_entry(idx);
                         }
-                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                             self.security_keys.lb_confirm_delete = None;
                         }
                     });
@@ -10898,12 +10947,9 @@ impl App {
                 .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Wipe all {n} entr{} from this key? This erases every entry \u{2014} \
-                             including any relying-party data (e.g. SSH certificates, sign-in \
-                             records), not just keyroost notes. Cannot be undone; requires your PIN.",
-                            if n == 1 { "y" } else { "ies" },
-                        ))
+                        egui::RichText::new(
+                            t!("wipe_all_entries").to_string().replace("{}", &n.to_string()),
+                        )
                         .font(theme::f_reg(12.5))
                         .color(p.txt),
                     );
@@ -10913,17 +10959,14 @@ impl App {
                             ui,
                             p,
                             BtnKind::Danger,
-                            &format!(
-                                "Confirm \u{2014} wipe all {n} entr{}",
-                                if n == 1 { "y" } else { "ies" }
-                            ),
+                            &t!("confirm_wipe_entries").to_string().replace("{}", &n.to_string()),
                         )
                         .clicked()
                         {
                             self.security_keys.lb_confirm_clear = false;
                             self.clear_large_blob_storage();
                         }
-                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                             self.security_keys.lb_confirm_clear = false;
                         }
                     });
@@ -10996,7 +11039,7 @@ impl App {
         theme::card_frame(p).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Security policy")
+                    egui::RichText::new(t!("security_policy").to_string())
                         .font(theme::f_sb(14.5))
                         .color(p.txt),
                 );
@@ -11006,8 +11049,7 @@ impl App {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "These change the key's security policy. Some are irreversible \
-                     without a full reset \u{2014} read each note before applying.",
+                    t!("security_policy_desc").to_string(),
                 )
                 .font(theme::f_reg(12.0))
                 .color(p.txt3),
@@ -11021,14 +11063,14 @@ impl App {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("Always require user verification")
+                        egui::RichText::new(t!("always_require_uv").to_string())
                             .font(theme::f_sb(13.0))
                             .color(p.txt),
                     );
                     let state = match always_uv {
-                        Some(true) => "Currently on \u{2014} every sign-in needs PIN or biometric.",
-                        Some(false) => "Currently off.",
-                        None => "State unknown.",
+                        Some(true) => t!("always_uv_on").to_string(),
+                        Some(false) => t!("always_uv_off").to_string(),
+                        None => t!("always_uv_unknown").to_string(),
                     };
                     ui.label(
                         egui::RichText::new(state)
@@ -11037,7 +11079,7 @@ impl App {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Toggle").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &t!("toggle").to_string()).clicked() {
                         arm = Some(AdvancedAction::ToggleAlwaysUv);
                     }
                 });
@@ -11048,18 +11090,18 @@ impl App {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("Set minimum PIN length")
+                        egui::RichText::new(t!("min_pin_length").to_string())
                             .font(theme::f_sb(13.0))
                             .color(p.txt),
                     );
                     ui.label(
-                        egui::RichText::new("Can only be raised, never lowered without a reset.")
+                        egui::RichText::new(t!("min_pin_length_hint").to_string())
                             .font(theme::f_reg(11.5))
                             .color(p.txt3),
                     );
                     let current = match min_pin_length {
-                        Some(n) => format!("Current minimum: {} characters", n),
-                        None => "Current minimum: \u{2014}".to_string(),
+                        Some(n) => format!("{} {}", t!("current_min").to_string(), n),
+                        None => t!("current_min_unknown").to_string(),
                     };
                     ui.label(
                         egui::RichText::new(current)
@@ -11068,7 +11110,7 @@ impl App {
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Set\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &t!("set").to_string()).clicked() {
                         arm = Some(AdvancedAction::SetMinPin);
                     }
                 });
@@ -11079,18 +11121,18 @@ impl App {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("Force PIN change on next use")
+                        egui::RichText::new(t!("force_pin_change").to_string())
                             .font(theme::f_sb(13.0))
                             .color(p.txt),
                     );
                     ui.label(
-                        egui::RichText::new("Useful before handing the key to someone else.")
+                        egui::RichText::new(t!("force_pin_change_hint").to_string())
                             .font(theme::f_reg(11.5))
                             .color(p.txt3),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Force\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &t!("force").to_string()).clicked() {
                         arm = Some(AdvancedAction::ForcePinChange);
                     }
                 });
@@ -11102,14 +11144,14 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new("Enable enterprise attestation")
+                            egui::RichText::new(t!("enable_enterprise").to_string())
                                 .font(theme::f_sb(13.0))
                                 .color(p.txt),
                         );
                         let note = if ep_enabled {
-                            "Currently on. Disabling it again requires a device reset."
+                            t!("enterprise_on").to_string()
                         } else {
-                            "One-way: disabling it again requires a device reset."
+                            t!("enterprise_one_way").to_string()
                         };
                         ui.label(
                             egui::RichText::new(note)
@@ -11120,8 +11162,8 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ep_enabled {
                             // Already enabled: nothing actionable, show a pill.
-                            theme::pill(ui, "Enabled", p.ok, p.ok_soft());
-                        } else if theme::button(ui, p, BtnKind::Danger, "Enable\u{2026}").clicked()
+                            theme::pill(ui, &t!("enabled_pill").to_string(), p.ok, p.ok_soft());
+                        } else if theme::button(ui, p, BtnKind::Danger, &t!("enable").to_string()).clicked()
                         {
                             arm = Some(AdvancedAction::EnterpriseAttestation);
                         }
@@ -11254,27 +11296,27 @@ impl App {
                             .color(p.txt2),
                     );
                     ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                         want_cancel = true;
                     }
                 }
                 Some(Ok(())) => {
                     ui.label(
-                        egui::RichText::new("\u{2713} Fingerprint enrolled")
+                        egui::RichText::new(t!("fingerprint_enrolled").to_string())
                             .font(theme::f_sb(13.0))
                             .color(p.ok),
                     );
                     ui.add_space(8.0);
                     ui.add(egui::ProgressBar::new(1.0).desired_width(280.0));
                     ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                    if theme::button(ui, p, BtnKind::Primary, &t!("piv_done").to_string()).clicked() {
                         want_done = true;
                     }
                 }
                 Some(Err(e)) => {
                     ui.colored_label(p.err, format!("Enrollment failed: {e}"));
                     ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Default, "Close").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &t!("close").to_string()).clicked() {
                         want_done = true;
                     }
                 }
@@ -11317,19 +11359,19 @@ impl App {
         let mut cancel = false;
         let closed = Self::modal_window(ctx, p, "fp_delete", "Delete fingerprint?", |ui| {
             ui.label(
-                egui::RichText::new(format!(
-                    "Delete fingerprint \u{201c}{label}\u{201d}? This cannot be undone."
-                ))
+                egui::RichText::new(
+                    t!("delete_fingerprint").to_string().replace("{}", &label),
+                )
                 .font(theme::f_reg(12.5))
                 .color(p.txt),
             );
             ui.add_space(16.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
+                if theme::button(ui, p, BtnKind::Danger, &t!("delete").to_string()).clicked() {
                     confirm = true;
                 }
                 ui.add_space(8.0);
-                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });
@@ -11360,10 +11402,10 @@ impl App {
         }
 
         let (title, irreversible) = match action {
-            AdvancedAction::ToggleAlwaysUv => ("Toggle always-UV", false),
-            AdvancedAction::SetMinPin => ("Set minimum PIN length", true),
-            AdvancedAction::ForcePinChange => ("Force a PIN change", false),
-            AdvancedAction::EnterpriseAttestation => ("Enable enterprise attestation", true),
+            AdvancedAction::ToggleAlwaysUv => (t!("toggle_always_uv").to_string(), false),
+            AdvancedAction::SetMinPin => (t!("set_min_pin").to_string(), true),
+            AdvancedAction::ForcePinChange => (t!("force_pin_change").to_string(), false),
+            AdvancedAction::EnterpriseAttestation => (t!("enable_enterprise_attestation").to_string(), true),
             AdvancedAction::None => return,
         };
 
@@ -11373,7 +11415,7 @@ impl App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel = true;
         }
-        egui::Window::new(title)
+        egui::Window::new(&title)
             .collapsible(false)
             .resizable(false)
             .title_bar(false)
@@ -11397,7 +11439,7 @@ impl App {
                 // bar is dropped via title_bar(false), so render our own).
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(title)
+                        egui::RichText::new(&title)
                             .font(theme::f_sb(13.0))
                             .color(p.txt),
                     );
@@ -11415,7 +11457,7 @@ impl App {
                 if irreversible {
                     ui.label(
                         egui::RichText::new(
-                            "This cannot be undone without a full reset of the key.",
+                            t!("cannot_undone_full_reset").to_string(),
                         )
                         .font(theme::f_reg(12.0))
                         .color(p.warn),
@@ -11425,24 +11467,24 @@ impl App {
 
                 if action == AdvancedAction::SetMinPin {
                     ui.horizontal(|ui| {
-                        ui.label("New minimum length");
+                        ui.label(t!("new_min_length").to_string());
                         if let Some(d) = self.security_keys.advanced.as_mut() {
                             ui.add(
                                 egui::TextEdit::singleline(&mut d.min_pin_input)
                                     .desired_width(64.0)
-                                    .hint_text("e.g. 6"),
+                                    .hint_text("6")
                             );
                         }
                     });
                     ui.add_space(8.0);
                     if let Some(d) = self.security_keys.advanced.as_mut() {
-                        ui.checkbox(&mut d.force_change, "Also force a PIN change now");
+                        ui.checkbox(&mut d.force_change, &t!("also_force_pin_change").to_string());
                     }
                     ui.add_space(12.0);
                 }
 
                 ui.horizontal(|ui| {
-                    ui.label("Device PIN");
+                    ui.label(t!("current_pin").to_string());
                     if let Some(d) = self.security_keys.advanced.as_mut() {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut d.pin_input)
@@ -11460,11 +11502,11 @@ impl App {
                     } else {
                         BtnKind::Primary
                     };
-                    if theme::button(ui, p, kind, "Apply").clicked() {
+                    if theme::button(ui, p, kind, &t!("apply").to_string()).clicked() {
                         apply = true;
                     }
                     ui.add_space(8.0);
-                    if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                         cancel = true;
                     }
                 });
@@ -11498,14 +11540,14 @@ impl App {
         if !kind.needs_mgmt_key() {
             return;
         }
-        ui.checkbox(&mut self.piv.use_default_mgmt, "Use default management key");
+        ui.checkbox(&mut self.piv.use_default_mgmt, &t!("use_default_mgmt_key").to_string());
         if !self.piv.use_default_mgmt {
             secret_field(
                 ui,
                 p,
-                "Management key",
+                &t!("management_key_label").to_string(),
                 &mut self.piv.mgmt_key_input,
-                "hex (48/32/64 chars)",
+                &t!("piv_hex_hint").to_string(),
                 300.0,
             );
         }
@@ -11573,7 +11615,7 @@ impl App {
             Vec::new()
         };
 
-        let closed = Self::modal_window(ctx, p, "piv_cred", kind.title(), |ui| {
+        let closed = Self::modal_window(ctx, p, "piv_cred", &kind.title(), |ui| {
             match &result {
                 Some(Ok(())) => {
                     // Success: confirmation + a single Done that dismisses.
@@ -11583,7 +11625,7 @@ impl App {
                             .color(p.ok),
                     );
                     ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                    if theme::button(ui, p, BtnKind::Primary, &t!("piv_done").to_string()).clicked() {
                         want_close = true;
                     }
                 }
@@ -11592,21 +11634,21 @@ impl App {
                     // user can retry without losing the dialog).
                     match kind {
                         PivCredKind::ChangePin => {
-                            pin_field(ui, p, "Current PIN", &mut self.piv.pin_old);
-                            pin_field(ui, p, "New PIN", &mut self.piv.pin_new);
-                            pin_field(ui, p, "Confirm new PIN", &mut self.piv.pin_confirm);
-                            card_note(ui, p, "6\u{2013}8 characters.");
+                            pin_field(ui, p, &t!("piv_current_pin").to_string(), &mut self.piv.pin_old);
+                            pin_field(ui, p, &t!("piv_new_pin").to_string(), &mut self.piv.pin_new);
+                            pin_field(ui, p, &t!("piv_confirm_new_pin").to_string(), &mut self.piv.pin_confirm);
+                            card_note(ui, p, &t!("piv_pin_length").to_string());
                         }
                         PivCredKind::ChangePuk => {
-                            pin_field(ui, p, "Current PUK", &mut self.piv.puk_old);
-                            pin_field(ui, p, "New PUK", &mut self.piv.puk_new);
-                            pin_field(ui, p, "Confirm new PUK", &mut self.piv.puk_confirm);
-                            card_note(ui, p, "8 characters.");
+                            pin_field(ui, p, &t!("piv_current_puk").to_string(), &mut self.piv.puk_old);
+                            pin_field(ui, p, &t!("piv_new_puk").to_string(), &mut self.piv.puk_new);
+                            pin_field(ui, p, &t!("piv_confirm_new_puk").to_string(), &mut self.piv.puk_confirm);
+                            card_note(ui, p, &t!("piv_puk_length").to_string());
                         }
                         PivCredKind::UnblockPin => {
                             pin_field(ui, p, "PUK", &mut self.piv.unblock_puk);
-                            pin_field(ui, p, "New PIN", &mut self.piv.unblock_new_pin);
-                            card_note(ui, p, "Recovers a blocked PIN without wiping any keys.");
+                            pin_field(ui, p, &t!("piv_new_pin").to_string(), &mut self.piv.unblock_new_pin);
+                            card_note(ui, p, &t!("piv_unblock_note").to_string());
                         }
                         // Management-key-gated flows: only the *secrets* live here;
                         // their non-secret parameters stay inline in the pane.
@@ -11619,16 +11661,16 @@ impl App {
                                 let slot = self.piv.selected_slot.to_slot().label();
                                 ui.colored_label(
                                     p.err,
-                                    egui::RichText::new(format!(
-                                        "This OVERWRITES and destroys the existing key in \
-                                         {slot}. This cannot be undone."
-                                    ))
+                                    egui::RichText::new(
+                                        t!("piv_overwrite_warning").to_string()
+                                            .replace("{slot}", &slot),
+                                    )
                                     .font(theme::f_sb(12.5)),
                                 );
                                 ui.add_space(6.0);
                             }
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
+                            card_note(ui, p, &t!("piv_authorizes_overwrite").to_string());
                         }
                         PivCredKind::ImportCert => {
                             self.piv_modal_mgmt_field(ui, p, kind);
@@ -11640,10 +11682,11 @@ impl App {
                                 card_note(
                                     ui,
                                     p,
-                                    &format!("This replaces the certificate currently in {slot}."),
+                                    &t!("piv_replaces_cert").to_string()
+                                        .replace("{slot}", &slot),
                                 );
                             }
-                            card_note(ui, p, "Authorizes writing the certificate to the slot.");
+                            card_note(ui, p, &t!("piv_authorizes_write_cert").to_string());
                         }
                         PivCredKind::SelfSign => {
                             self.piv_modal_mgmt_field(ui, p, kind);
@@ -11651,22 +11694,20 @@ impl App {
                             card_note(
                                 ui,
                                 p,
-                                "Management key authorizes the import; the PIN authorizes \
-                                 the on-card signature.",
+                                &t!("mgmt_key_authorizes").to_string(),
                             );
                         }
                         PivCredKind::RequestCsr => {
                             pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
-                            card_note(ui, p, "The PIN authorizes the on-card signature.");
+                            card_note(ui, p, &t!("piv_pin_signature").to_string());
                         }
                         PivCredKind::SetRetries => {
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            pin_field(ui, p, "Current PIN", &mut self.piv.retries_pin_auth);
+                            pin_field(ui, p, &t!("piv_current_pin").to_string(), &mut self.piv.retries_pin_auth);
                             card_note(
                                 ui,
                                 p,
-                                "Resets PIN and PUK to factory defaults; needs the \
-                                 management key and the current PIN.",
+                                &t!("resets_pin_puk_factory").to_string(),
                             );
                         }
                         PivCredKind::ChangeMgmtKey => {
@@ -11674,35 +11715,35 @@ impl App {
                             secret_field(
                                 ui,
                                 p,
-                                "New key",
+                                &t!("piv_new_key").to_string(),
                                 &mut self.piv.new_mgmt_key_input,
-                                "hex (48/32/64 chars)",
+                                &t!("piv_hex_hint").to_string(),
                                 300.0,
                             );
-                            card_note(ui, p, "Enter the current key, then the new key.");
+                            card_note(ui, p, &t!("piv_enter_current_new").to_string());
                         }
                         PivCredKind::DeleteCert => {
                             let slot = self.piv.selected_slot.label();
                             ui.colored_label(
                                 p.err,
-                                egui::RichText::new(format!(
-                                    "Removes the certificate in {slot}. The private key in \
-                                     the slot remains. This cannot be undone."
-                                ))
+                                egui::RichText::new(
+                                    t!("removes_cert_slot").to_string()
+                                        .replace("{}", &slot),
+                                )
                                 .font(theme::f_sb(12.5)),
                             );
                             ui.add_space(6.0);
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            card_note(ui, p, "The management key authorizes the deletion.");
+                            card_note(ui, p, &t!("piv_mgmt_authorizes_delete").to_string());
                         }
                         PivCredKind::DeleteKey => {
                             let slot = self.piv.selected_slot.label();
                             ui.colored_label(
                                 p.err,
-                                egui::RichText::new(format!(
-                                    "Permanently erases the private key in {slot}. This \
-                                     cannot be undone."
-                                ))
+                                egui::RichText::new(
+                                    t!("permanently_erases_key").to_string()
+                                        .replace("{}", &slot),
+                                )
                                 .font(theme::f_sb(12.5)),
                             );
                             ui.add_space(6.0);
@@ -11710,23 +11751,22 @@ impl App {
                             card_note(
                                 ui,
                                 p,
-                                "The management key authorizes the deletion. Needs \
-                                 YubiKey 5.7 or newer.",
+                                &t!("mgmt_key_deletion").to_string(),
                             );
                         }
                         PivCredKind::MoveKey => {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "Move the key in {} to another slot.",
-                                    move_src.label()
-                                ))
+                                egui::RichText::new(
+                                    t!("piv_move_key_to_slot").to_string()
+                                        .replace("{}", &move_src.label()),
+                                )
                                 .font(theme::f_reg(12.5))
                                 .color(p.txt2),
                             );
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new("Destination")
+                                    egui::RichText::new(&t!("piv_destination").to_string())
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt2),
                                 );
@@ -11735,7 +11775,7 @@ impl App {
                                     .piv
                                     .move_dest
                                     .map(|d| d.label())
-                                    .unwrap_or_else(|| "Choose a slot\u{2026}".to_string());
+                                    .unwrap_or_else(|| t!("piv_choose_slot").to_string());
                                 egui::ComboBox::from_id_salt("piv-move-dest")
                                     .selected_text(sel_text)
                                     .show_ui(ui, |ui| {
@@ -11783,17 +11823,17 @@ impl App {
                             // when the target slot is occupied; the op itself is
                             // unchanged.
                             let submit = if kind == PivCredKind::GenerateKey && selected_occupied {
-                                "Overwrite key"
+                                t!("piv_overwrite_key").to_string()
                             } else {
                                 kind.submit_label()
                             };
-                            if theme::button(ui, p, BtnKind::Primary, submit).clicked()
+                            if theme::button(ui, p, BtnKind::Primary, &submit).clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
                             }
                             ui.add_space(8.0);
-                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                            if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                                 want_close = true;
                             }
                         }
@@ -11885,10 +11925,10 @@ impl App {
         }
         ui.checkbox(
             &mut self.openpgp.use_default_admin,
-            "Use default admin PIN (PW3)",
+            &t!("use_default_admin_pin").to_string(),
         );
         if !self.openpgp.use_default_admin {
-            pin_field(ui, p, "Admin PIN", &mut self.openpgp.admin_pin);
+            pin_field(ui, p, &t!("openpgp_admin_pin_label").to_string(), &mut self.openpgp.admin_pin);
         }
     }
 
@@ -11924,7 +11964,7 @@ impl App {
         // for shape parity with the PIV modal).
         let mismatch = openpgp_cred_mismatch(&self.openpgp, kind);
 
-        let closed = Self::modal_window(ctx, p, "openpgp_cred", kind.title(), |ui| {
+        let closed = Self::modal_window(ctx, p, "openpgp_cred", &kind.title(), |ui| {
             match &result {
                 Some(Ok(())) => {
                     // Success: confirmation + a single Done that dismisses.
@@ -11934,7 +11974,7 @@ impl App {
                             .color(p.ok),
                     );
                     ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                    if theme::button(ui, p, BtnKind::Primary, &t!("piv_done").to_string()).clicked() {
                         want_close = true;
                     }
                 }
@@ -11943,39 +11983,38 @@ impl App {
                     // user can retry without losing the dialog).
                     match kind {
                         OpenPgpCredKind::ChangeUserPin => {
-                            pin_field(ui, p, "Current PIN", &mut self.openpgp.user_pin_old);
-                            pin_field(ui, p, "New PIN", &mut self.openpgp.user_pin_new);
-                            card_note(ui, p, "User PIN (PW1): 6\u{2013}127 characters.");
+                            pin_field(ui, p, &t!("openpgp_current_pin").to_string(), &mut self.openpgp.user_pin_old);
+                            pin_field(ui, p, &t!("openpgp_new_pin").to_string(), &mut self.openpgp.user_pin_new);
+                            card_note(ui, p, &t!("openpgp_user_pin_note").to_string());
                         }
                         OpenPgpCredKind::ChangeAdminPin => {
-                            pin_field(ui, p, "Current PIN", &mut self.openpgp.admin_pin_old);
-                            pin_field(ui, p, "New PIN", &mut self.openpgp.admin_pin_new);
-                            card_note(ui, p, "Admin PIN (PW3): 8\u{2013}127 characters.");
+                            pin_field(ui, p, &t!("openpgp_current_pin").to_string(), &mut self.openpgp.admin_pin_old);
+                            pin_field(ui, p, &t!("openpgp_new_pin").to_string(), &mut self.openpgp.admin_pin_new);
+                            card_note(ui, p, &t!("openpgp_admin_pin_note").to_string());
                         }
                         OpenPgpCredKind::UnblockUserPin => {
                             self.openpgp_modal_admin_field(ui, p, kind);
-                            pin_field(ui, p, "New user PIN", &mut self.openpgp.unblock_new);
+                            pin_field(ui, p, &t!("new_user_pin").to_string(), &mut self.openpgp.unblock_new);
                             card_note(
                                 ui,
                                 p,
-                                "Resets a blocked user PIN using the admin PIN (PW3).",
+                                &t!("resets_blocked_pin").to_string(),
                             );
                         }
                         OpenPgpCredKind::SetName => {
                             self.openpgp_modal_admin_field(ui, p, kind);
-                            card_note(ui, p, "Authorizes writing the cardholder name.");
+                            card_note(ui, p, &t!("openpgp_authorizes_name").to_string());
                         }
                         OpenPgpCredKind::SetUrl => {
                             self.openpgp_modal_admin_field(ui, p, kind);
-                            card_note(ui, p, "Authorizes writing the public-key URL.");
+                            card_note(ui, p, &t!("openpgp_authorizes_url").to_string());
                         }
                         OpenPgpCredKind::GenerateKey => {
                             self.openpgp_modal_admin_field(ui, p, kind);
                             card_note(
                                 ui,
                                 p,
-                                "OVERWRITES the slot with a fresh on-card key (clearable \
-                                 only by a full reset). May need a touch.",
+                                &t!("overwrites_slot_fresh").to_string(),
                             );
                         }
                         OpenPgpCredKind::GenerateImportKey | OpenPgpCredKind::ImportKeyFile => {
@@ -11983,16 +12022,14 @@ impl App {
                             card_note(
                                 ui,
                                 p,
-                                "OVERWRITES the slot with the imported key (clearable only \
-                                 by a full reset). May need a touch.",
+                                &t!("overwrites_slot_imported").to_string(),
                             );
                         }
                         OpenPgpCredKind::Reset => {
                             card_note(
                                 ui,
                                 p,
-                                "Wipes ALL OpenPGP keys and restores default PINs. Works \
-                                 even if the PINs are forgotten. No PIN needed.",
+                                &t!("wipes_all_openpgp").to_string(),
                             );
                         }
                     }
@@ -12022,13 +12059,13 @@ impl App {
                             } else {
                                 BtnKind::Primary
                             };
-                            if theme::button(ui, p, btn, kind.submit_label()).clicked()
+                            if theme::button(ui, p, btn, &kind.submit_label()).clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
                             }
                             ui.add_space(8.0);
-                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                            if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                                 want_close = true;
                             }
                         }
@@ -12142,7 +12179,7 @@ impl App {
         if self.oath.locked {
             theme::card_frame(p).show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("This key's OATH applet is password-protected.")
+                    egui::RichText::new(t!("oath_protected").to_string())
                         .font(theme::f_reg(13.0))
                         .color(p.txt),
                 );
@@ -12174,7 +12211,7 @@ impl App {
         }
         if !self.oath.loaded {
             ui.label(
-                egui::RichText::new("读取验证码中...")
+                egui::RichText::new(t!("reading_oath_codes").to_string())
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
@@ -12396,18 +12433,18 @@ impl App {
             // PIN (PW3) in a dialog.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Card details")
+                    egui::RichText::new(t!("card_details").to_string())
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pgp-card-details");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Set URL\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_set_url").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::SetUrl);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Set name\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_set_name").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::SetName);
                     }
                 });
@@ -12416,9 +12453,9 @@ impl App {
             text_field(
                 ui,
                 p,
-                "Name",
+                &t!("name").to_string(),
                 &mut self.openpgp.name_input,
-                "Surname<<Given",
+                &t!("surname_given").to_string(),
                 200.0,
             );
             ui.add_space(4.0);
@@ -12436,24 +12473,24 @@ impl App {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("PINs")
+                    egui::RichText::new(t!("pin_puks_section").to_string())
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Unblock user PIN\u{2026}").clicked()
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_unblock_user_pin").to_string())).clicked()
                     {
                         open_modal = Some(OpenPgpCredKind::UnblockUserPin);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change admin PIN\u{2026}").clicked()
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_change_admin_pin").to_string())).clicked()
                     {
                         open_modal = Some(OpenPgpCredKind::ChangeAdminPin);
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change user PIN\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("openpgp_change_user_pin").to_string())).clicked() {
                         open_modal = Some(OpenPgpCredKind::ChangeUserPin);
                     }
                 });
@@ -12470,7 +12507,7 @@ impl App {
                 if fpr.iter().all(|&b| b == 0) {
                     "无密钥".to_string()
                 } else {
-                    format!("{} \u{00B7} fpr {}", algo_id_label(algo), hex_lower(fpr))
+                    format!("{} \u{00B7} {} {}", algo_id_label(algo), t!("fingerprint_abbr"), hex_lower(fpr))
                 }
             }
             None => self.translations.ui_string("state_read_status").unwrap_or("read status to view this key").to_string(),
@@ -12533,7 +12570,7 @@ impl App {
         // --- Selected key content (single column under the strip) -----------
         ui.add_space(14.0);
         ui.label(
-            egui::RichText::new(format!("State: {sel_state}"))
+            egui::RichText::new(format!("{}: {sel_state}", t!("state_label").to_string()))
                 .font(theme::f_reg(12.5))
                 .color(p.txt2),
         );
@@ -12741,7 +12778,7 @@ impl App {
                 );
             } else if self.piv.error.is_none() {
                 ui.label(
-                    egui::RichText::new("读取 PIV 状态中\u{2026}")
+                    egui::RichText::new(t!("reading_piv_status").to_string())
                         .font(theme::f_reg(13.0))
                         .color(p.txt3),
                 );
@@ -12847,10 +12884,10 @@ impl App {
                 .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
                 .map(|(_, has)| *has);
             match has_key {
-                Some(true) => "key present".to_string(),
+                Some(true) => t!("key_present").to_string(),
                 // Cache reports empty, or hasn't loaded yet for this slot:
                 // fall back to the same "empty" wording used elsewhere.
-                _ => "empty".to_string(),
+                _ => t!("empty_label").to_string(),
             }
         } else {
             let sel_slot = selected.to_slot();
@@ -12865,11 +12902,11 @@ impl App {
             let alg = entry.and_then(|(_, a, _)| *a);
             let dn = entry.and_then(|(_, _, d)| d.as_deref());
             let base = if cert_present {
-                "certificate present"
+                t!("cert_present").to_string()
             } else if alg.is_some() {
-                "key present, no certificate"
+                format!("{} · {}", t!("key_present").to_string(), t!("empty_label").to_string())
             } else {
-                "empty"
+                t!("empty_label").to_string()
             };
             let mut s = base.to_string();
             if let Some(a) = alg {
@@ -13035,7 +13072,7 @@ impl App {
         // cards (unchanged from the old detail column) in single-column flow.
         ui.add_space(14.0);
         ui.label(
-            egui::RichText::new(format!("State: {sel_state}"))
+            egui::RichText::new(format!("{}: {sel_state}", t!("state_label").to_string()))
                 .font(theme::f_reg(12.5))
                 .color(p.txt2),
         );
@@ -13071,7 +13108,7 @@ impl App {
                 );
                 ui.add_space(4.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
+                    if theme::button(ui, p, BtnKind::Ghost, &t!("copy_public_key").to_string()).clicked() {
                         copy_pem = Some(pem.clone());
                     }
                 });
@@ -13095,7 +13132,7 @@ impl App {
                 p,
                 self.translations.ui_string("name").unwrap_or("Name"),
                 &mut self.piv.cert_subject,
-                "e.g. Alice — or full CN=Alice,O=Example,C=US",
+                &t!("example_name").to_string(),
                 300.0,
             );
             ui.horizontal(|ui| {
@@ -13204,7 +13241,7 @@ impl App {
                 text_field(
                     ui,
                     p,
-                    self.translations.ui_string("destination").unwrap_or("Destination"),
+                    self.translations.ui_string("destination").unwrap_or(&t!("piv_destination").to_string()),
                     &mut self.piv.export_path,
                     "/path/to/out.der",
                     240.0,
@@ -13425,14 +13462,14 @@ impl App {
                                     [200.0, 32.0],
                                     egui::TextEdit::singleline(&mut self.rename_input)
                                         .vertical_align(egui::Align::Center)
-                                        .hint_text("friendly-name"),
+                                        .hint_text(&t!("name").to_string())
                                 );
                                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                if theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter {
+                                if theme::button(ui, p, BtnKind::Primary, &t!("save").to_string()).clicked() || enter {
                                     do_save = true;
                                 }
                                 ui.add_space(4.0);
-                                if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                                if theme::button(ui, p, BtnKind::Ghost, &t!("cancel").to_string()).clicked() {
                                     do_cancel = true;
                                 }
                             } else {
@@ -13487,7 +13524,7 @@ impl App {
             .show(ui, |ui| {
                 theme::card_frame(p).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Device").font(theme::f_sb(14.5)).color(p.txt));
+                        ui.label(egui::RichText::new(t!("device").to_string()).font(theme::f_sb(14.5)).color(p.txt));
                         ui.add_space(6.0);
                         self.help_dot(ui, p, "molto");
                     });
@@ -13495,7 +13532,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [104.0, 22.0],
-                            egui::Label::new(egui::RichText::new("Customer key").font(theme::f_reg(13.0)).color(p.txt2)),
+                            egui::Label::new(egui::RichText::new(t!("customer_key").to_string()).font(theme::f_reg(13.0)).color(p.txt2)),
                         );
                         self.help_dot(ui, p, "custkey");
                         ui.add_space(6.0);
@@ -13511,7 +13548,7 @@ impl App {
                         );
                         self.secret_reveal.insert("customer-key", rev);
                         ui.checkbox(&mut self.customer_key_hex, "hex");
-                        if theme::button(ui, p, BtnKind::Default, "Authenticate").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &t!("authenticate").to_string()).clicked() {
                             self.authenticate();
                         }
                         if self.authenticated {
@@ -13520,7 +13557,7 @@ impl App {
                     });
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Programming any slot first needs the token's customer key (blank = factory default).")
+                        egui::RichText::new(t!("customer_key_hint").to_string())
                             .font(theme::f_reg(11.5))
                             .color(p.txt3),
                     );
@@ -13529,20 +13566,20 @@ impl App {
                         // Re-read every slot's public block on demand — keyless,
                         // so it works without authenticating. Covers a factory
                         // reset (which clears the list) and a failed open-sweep.
-                        if theme::button(ui, p, BtnKind::Default, "Refresh slots").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &t!("refresh_slots").to_string()).clicked() {
                             self.resweep_slot_meta();
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &t!("sync_time_all").to_string()).clicked() {
                             self.sync_time_all();
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Default, "Bulk import\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("bulk_import").to_string())).clicked() {
                             self.bulk_dialog.open = true;
                             self.bulk_dialog.start = self.slot;
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Danger, "Factory reset\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("factory_reset").to_string())).clicked() {
                             self.molto_reset_confirm = true;
                         }
                     });
@@ -13554,18 +13591,18 @@ impl App {
                             .corner_radius(egui::CornerRadius::same(8))
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new("Factory-reset the token? This wipes all slots, then asks you to confirm with the \u{25B2} button on the device itself.")
+                                    egui::RichText::new(t!("factory_reset_token").to_string())
                                         .font(theme::f_reg(12.5))
                                         .color(p.txt),
                                 );
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
-                                    if theme::button(ui, p, BtnKind::Danger, "Yes, factory reset").clicked() {
+                                    if theme::button(ui, p, BtnKind::Danger, &t!("yes_factory_reset").to_string()).clicked() {
                                         self.molto_reset_confirm = false;
                                         self.factory_reset();
                                     }
                                     ui.add_space(6.0);
-                                    if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                                    if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                                         self.molto_reset_confirm = false;
                                     }
                                 });
@@ -13579,10 +13616,10 @@ impl App {
             .inner_margin(egui::Margin::symmetric(26, 4))
             .show(ui, |ui| {
                 theme::card_frame(p).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Program a slot").font(theme::f_sb(14.5)).color(p.txt));
+                    ui.label(egui::RichText::new(t!("program_slot").to_string()).font(theme::f_sb(14.5)).color(p.txt));
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Pick a slot and program it. Slot titles and occupancy are readable by anyone holding the token \u{2014} no key needed \u{2014} so don't put secrets in titles. Seeds and codes can't be read back; codes show on the device's own screen.")
+                        egui::RichText::new(t!("program_slot_desc").to_string())
                             .font(theme::f_reg(11.5))
                             .color(p.txt3),
                     );
@@ -13659,7 +13696,7 @@ impl App {
                             ui.label(egui::RichText::new(format!("SLOT {:02}", self.slot)).font(theme::f_bold(11.0)).color(p.brand));
                             ui.add_space(10.0);
                             editor_row(ui, p, "Title", |ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(360.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text(&format!("\u{2264} 12 {}", t!("digits").to_string())).desired_width(360.0));
                             });
                             editor_row(ui, p, "Secret", |ui| {
                                 let mut rev = self
@@ -13736,19 +13773,19 @@ impl App {
                             });
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                if theme::button(ui, p, BtnKind::Primary, "Write to slot").clicked() {
+                                if theme::button(ui, p, BtnKind::Primary, &t!("write_to_slot").to_string()).clicked() {
                                     self.apply_draft();
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, "Write title only").clicked() {
+                                if theme::button(ui, p, BtnKind::Default, &t!("write_title_only").to_string()).clicked() {
                                     self.apply_title_only();
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Danger, "Delete seed\u{2026}").clicked() {
+                                if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("delete_seed").to_string())).clicked() {
                                     self.molto_delete_confirm = true;
                                 }
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, "Import otpauth\u{2026}").clicked() {
+                                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", t!("import_otpauth").to_string())).clicked() {
                                     self.import_dialog.open = true;
                                 }
                                 ui.add_space(6.0);
@@ -13760,7 +13797,7 @@ impl App {
                                 }
                                 #[cfg(feature = "qr")]
                                 ui.add_space(6.0);
-                                if theme::button(ui, p, BtnKind::Default, "Sync time").clicked() {
+                                if theme::button(ui, p, BtnKind::Default, &t!("sync_time").to_string()).clicked() {
                                     self.sync_time_selected();
                                 }
                             });
@@ -13781,12 +13818,12 @@ impl App {
                                         );
                                         ui.add_space(8.0);
                                         ui.horizontal(|ui| {
-                                            if theme::button(ui, p, BtnKind::Danger, "Yes, delete seed").clicked() {
+                                            if theme::button(ui, p, BtnKind::Danger, &t!("yes_delete_seed").to_string()).clicked() {
                                                 self.molto_delete_confirm = false;
                                                 self.delete_seed_selected();
                                             }
                                             ui.add_space(6.0);
-                                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                                            if theme::button(ui, p, BtnKind::Default, &t!("piv_cancel").to_string()).clicked() {
                                                 self.molto_delete_confirm = false;
                                             }
                                         });
@@ -13852,7 +13889,7 @@ impl App {
             .inner_margin(egui::Margin::symmetric(26, 12))
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("Program seed & configuration")
+                    egui::RichText::new(t!("program_seed_config").to_string())
                         .font(theme::f_sb(14.0))
                         .color(p.txt),
                 );
@@ -13860,7 +13897,7 @@ impl App {
 
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Seed:")
+                        egui::RichText::new(t!("seed_label").to_string())
                             .font(theme::f_reg(12.5))
                             .color(p.txt2),
                     );
@@ -13878,7 +13915,7 @@ impl App {
 
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Algorithm:")
+                        egui::RichText::new(t!("algorithm_label").to_string())
                             .font(theme::f_reg(12.5))
                             .color(p.txt2),
                     );
@@ -13894,7 +13931,7 @@ impl App {
                         });
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("Time step:")
+                        egui::RichText::new(t!("time_step_label").to_string())
                             .font(theme::f_reg(12.5))
                             .color(p.txt2),
                     );
@@ -13906,7 +13943,7 @@ impl App {
                         });
                     ui.add_space(12.0);
                     ui.label(
-                        egui::RichText::new("Sleep:")
+                        egui::RichText::new(t!("sleep_label").to_string())
                             .font(theme::f_reg(12.5))
                             .color(p.txt2),
                     );
@@ -13925,7 +13962,7 @@ impl App {
                 let can_burn = !busy && !self.prog_seed_input.trim().is_empty();
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(can_burn, |ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Burn seed").clicked() {
+                        if theme::button(ui, p, BtnKind::Primary, &t!("burn_seed").to_string()).clicked() {
                             self.prog_burn();
                         }
                     });
@@ -14151,20 +14188,20 @@ impl App {
             let mut open = self.bulk_dialog.open;
             let mut do_load = false;
             let mut do_apply = false;
-            egui::Window::new("Bulk import")
+            egui::Window::new(&t!("bulk_import").to_string())
                 .open(&mut open)
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .default_width(560.0)
                 .show(ctx, |ui| {
-                    ui.label("Export file path (Aegis JSON [plain or encrypted], 2FAS JSON, or otpauth:// list):");
+                    ui.label(t!("file").to_string() + ":");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.bulk_dialog.path)
                             .desired_width(540.0)
                             .hint_text("/path/to/export.json"),
                     );
                     if self.bulk_dialog.needs_password {
-                        ui.label("Aegis vault password:");
+                        ui.label(t!("current_pin").to_string() + ":");
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.bulk_dialog.password)
                                 .password(true)
@@ -14186,13 +14223,13 @@ impl App {
                                 ui.label(label.as_str());
                             }
                         }
-                        ui.label("Start at profile:");
+                        ui.label(t!("destination").to_string() + ":");
                         ui.add(
                             egui::DragValue::new(&mut self.bulk_dialog.start)
                                 .clamp_existing_to_range(true)
                                 .range(0..=99u8),
                         );
-                        ui.label("Display timeout:");
+                        ui.label(t!("destination").to_string() + ":");
                         egui::ComboBox::from_id_salt("bulk-timeout")
                             .selected_text(match self.bulk_dialog.display_timeout {
                                 TimeoutChoice::S15 => "15s",
@@ -14260,12 +14297,12 @@ impl App {
                             let can_apply = self.authenticated && !self.import_busy();
                             if ui
                                 .add_enabled(can_apply, egui::Button::new("Program all"))
-                                .on_hover_text("Write seed, title, and config for every entry")
+                                .on_hover_text(t!("write_all_hint").to_string())
                                 .clicked()
                             {
                                 do_apply = true;
                             }
-                            if ui.button("Close").clicked() {
+                            if ui.button(&t!("close").to_string()).clicked() {
                                 self.bulk_dialog.open = false;
                             }
                         });
@@ -14296,7 +14333,7 @@ impl App {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label("Paste an otpauth:// URI:");
+                    ui.label(t!("file").to_string() + ":");
                     ui.add(
                         egui::TextEdit::multiline(&mut self.import_dialog.uri)
                             .desired_rows(3)
@@ -14305,10 +14342,10 @@ impl App {
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Parse & populate fields").clicked() {
+                        if ui.button(&format!("{} {}", t!("add").to_string(), t!("otp_type").to_string())).clicked() {
                             should_apply = true;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(&t!("cancel").to_string()).clicked() {
                             self.import_dialog.open = false;
                             self.import_dialog.uri.clear();
                         }
@@ -14374,7 +14411,7 @@ fn oath_row(
                 let (xr, xresp) =
                     ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                 paint_x_icon(ui, xr.center(), p.txt3);
-                if xresp.on_hover_text("Delete").clicked() {
+                if xresp.on_hover_text(t!("delete_tooltip").to_string()).clicked() {
                     delete = true;
                 }
                 ui.add_space(8.0);
@@ -14385,12 +14422,12 @@ fn oath_row(
                 // nothing to copy.) The compact overview card doesn't handle
                 // the click, so it gets a passive label instead of a button.
                 if with_delete {
-                    if theme::button(ui, p, BtnKind::Ghost, "Read code").clicked() {
+                    if theme::button(ui, p, BtnKind::Ghost, &t!("read_code").to_string()).clicked() {
                         read = true;
                     }
                 } else {
                     ui.label(
-                        egui::RichText::new("on demand")
+                        egui::RichText::new(t!("on_demand").to_string())
                             .font(theme::f_reg(13.0))
                             .color(p.txt3),
                     );
@@ -14403,7 +14440,7 @@ fn oath_row(
             } else {
                 paint_copy_icon(ui, cr.center(), p.txt3);
             }
-            if cresp.on_hover_text("Copy code").clicked() {
+            if cresp.on_hover_text(t!("copy_code").to_string()).clicked() {
                 if let Some(c) = code {
                     copy = Some(c.to_string());
                 }
@@ -15633,11 +15670,11 @@ mod tests {
         ];
         let titles: Vec<_> = kinds.iter().map(|k| k.title()).collect();
         assert_eq!(titles, ["Change PIN", "Change PUK", "Unblock PIN"]);
-        assert_eq!(piv_cred_success(PivCredKind::ChangePin), "PIN changed");
-        assert_eq!(piv_cred_success(PivCredKind::ChangePuk), "PUK changed");
+        assert_eq!(piv_cred_success(PivCredKind::ChangePin), "PIN 已更改");
+        assert_eq!(piv_cred_success(PivCredKind::ChangePuk), "PUK 已更改");
         assert_eq!(
             piv_cred_success(PivCredKind::UnblockPin),
-            "PIN unblocked and reset"
+            "PIN 已解锁并重置"
         );
         // Busy captions are non-empty and unique.
         let busy: Vec<_> = kinds.iter().map(|k| k.busy_label()).collect();
@@ -15830,12 +15867,12 @@ mod tests {
         let mut d = OathAddDialog::opened();
         d.name = "  ".into();
         d.secret = "JBSWY3DPEHPK3PXP".into();
-        assert_eq!(d.validate().unwrap_err(), "credential name is required");
+        assert_eq!(d.validate().unwrap_err(), t!("credential_name_required").to_string());
 
         // Empty secret → error.
         d.name = "acme:alice".into();
         d.secret = String::new();
-        assert_eq!(d.validate().unwrap_err(), "secret is empty");
+        assert_eq!(d.validate().unwrap_err(), t!("secret_empty").to_string());
 
         // Non-base32 secret → "invalid base32 secret: …".
         d.secret = "not base32!!".into();

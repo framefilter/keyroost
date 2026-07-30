@@ -356,7 +356,7 @@ impl App {
             );
         }
         let for_device = self.selected_device.clone();
-        self.spawn_job("Reading OTP entries\u{2026}", move || {
+        self.spawn_job(&t!("reading_entries").to_string(), move || {
             let result =
                 (|| -> Result<OtpLoad, OtpTransportError> {
                     let mut session = target.open()?;
@@ -505,7 +505,7 @@ impl App {
             return;
         }
         if self.otp.add.secret.trim().is_empty() {
-            self.otp.error = Some("Enter a Base32 secret for this entry.".into());
+            self.otp.error = Some(t!("secret_empty").to_string().into());
             return;
         }
         let secret = zeroize::Zeroizing::new(self.otp.add.secret.clone());
@@ -523,7 +523,7 @@ impl App {
         };
         let for_device = self.selected_device.clone();
 
-        self.spawn_job("Adding OTP entry\u{2026}", move || {
+        self.spawn_job(&format!("{}…", t!("adding_credential").to_string()), move || {
             let result = (|| -> Result<(), String> {
                 let seed = keyroost_token2otp::decode_base32_seed(secret.trim())
                     .map_err(|m| format!("invalid Base32 secret: {m}"))?;
@@ -598,7 +598,7 @@ impl App {
         };
         let for_device = self.selected_device.clone();
 
-        self.spawn_job("Setting touch HOTP\u{2026}", move || {
+        self.spawn_job(&format!("{}…", t!("configure_hid_hotp").to_string()), move || {
             let result = (|| -> Result<(), String> {
                 let seed = keyroost_token2otp::decode_base32_seed(secret.trim())
                     .map_err(|m| format!("invalid Base32 secret: {m}"))?;
@@ -614,7 +614,7 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.otp.button_hotp = ButtonHotpDialog::default();
-                        app.otp.info = Some("Touch HOTP configured.".into());
+                        app.otp.info = Some(t!("seed_configured").to_string() + ".");
                         // Re-read the config so the "seed configured" status and
                         // the settings-only editor reflect the new slot.
                         app.load_otp_entries();
@@ -665,7 +665,7 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job("Updating interfaces\u{2026}", move || {
+        self.spawn_job(&format!("{}…", t!("toggle").to_string()), move || {
             let result = (|| -> Result<(), String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 session.set_device_type(disable).map_err(|e| e.to_string())
@@ -677,8 +677,7 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.otp.info = Some(
-                            "Interface updated. Re-plug the key for the change to take effect."
-                                .into(),
+                            t!("keyboard_reconfigure_warning").to_string(),
                         );
                         // Reflect the change locally; a refresh re-reads from hardware.
                         app.otp.iface = Some(next);
@@ -700,7 +699,7 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job("Clearing touch HOTP\u{2026}", move || {
+        self.spawn_job(&format!("{}…", t!("clear_slot").to_string()), move || {
             let result = (|| -> Result<(), String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 session.delete_button_hotp().map_err(|e| e.to_string())
@@ -711,7 +710,7 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some("Touch HOTP cleared.".into());
+                        app.otp.info = Some(t!("no_seed_configured").to_string() + ".");
                         app.load_otp_entries();
                     }
                     Err(e) => app.otp.error = Some(e.to_string()),
@@ -731,7 +730,7 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job("Deleting OTP entry\u{2026}", move || {
+        self.spawn_job(&format!("{}…", t!("delete").to_string()), move || {
             let result = (|| -> Result<(), OtpTransportError> {
                 let mut session = target.open()?;
                 session.delete_entry(&app_name, &account_name)
@@ -766,7 +765,7 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         let key = (app_name.clone(), account_name.clone());
-        self.spawn_job("Reading code \u{2014} touch your key\u{2026}", move || {
+        self.spawn_job(&format!("{} \u{2014} {}", t!("read_code").to_string(), t!("touch_the_key").to_string()), move || {
             let result = (|| -> Result<Option<String>, String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 let now = unix_now();
@@ -809,7 +808,7 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job("Updating touch HOTP options\u{2026}", move || {
+        self.spawn_job(&format!("{}…", t!("toggle").to_string()), move || {
             let result = (|| -> Result<(), String> {
                 let mut session = target.open().map_err(|e| e.to_string())?;
                 session
@@ -822,7 +821,7 @@ impl App {
                 }
                 match result {
                     Ok(()) => {
-                        app.otp.info = Some("Touch HOTP options updated.".into());
+                        app.otp.info = Some(t!("seed_configured").to_string() + ".");
                         if let Some(st) = app.otp.button_hotp_status.as_mut() {
                             st.send_enter = send_enter;
                             st.long_touch = long_touch;
@@ -847,7 +846,7 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         self.spawn_job(
-            "Erasing all OTP entries \u{2014} touch your key\u{2026}",
+            &format!("{} \u{2014} {}", t!("erase_all").to_string(), t!("touch_the_key").to_string()),
             move || {
                 let result = (|| -> Result<(), OtpTransportError> {
                     let mut session = target.open()?;
@@ -859,7 +858,7 @@ impl App {
                     }
                     match result {
                         Ok(()) => {
-                            app.otp.info = Some("All OTP entries erased.".into());
+                            app.otp.info = Some(t!("erase_all").to_string() + ".");
                             app.load_otp_entries();
                         }
                         Err(e) => app.otp.error = Some(e.to_string()),
@@ -879,7 +878,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("On-device OTP")
+                egui::RichText::new(t!("on_device_otp").to_string())
                     .font(theme::f_sb(14.5))
                     .color(p.txt),
             );
@@ -897,7 +896,7 @@ impl App {
                 let mut new_transport: Option<OtpTransportSel> = None;
 
                 let menu_btn =
-                    theme::button(ui, p, BtnKind::Default, "...").on_hover_text("More actions");
+                    theme::button(ui, p, BtnKind::Default, "...").on_hover_text(t!("more_actions").to_string());
                 let menu_id = ui.make_persistent_id("otp_more_menu");
                 egui::Popup::menu(&menu_btn)
                     .id(menu_id)
@@ -907,7 +906,7 @@ impl App {
 
                         // Transport selector.
                         ui.label(
-                            egui::RichText::new("Transport")
+                            egui::RichText::new(t!("transport").to_string())
                                 .font(theme::f_reg(11.0))
                                 .color(p.txt3),
                         );
@@ -929,7 +928,7 @@ impl App {
                         // keyboard interface is off or unsupported.
                         let touch_blocked = self.otp.touch_hotp_ok == Some(false);
                         ui.add_enabled_ui(!touch_blocked, |ui| {
-                            let r = ui.selectable_label(false, "Configure HID-HOTP\u{2026}");
+                            let r = ui.selectable_label(false, t!("configure_hid_hotp").to_string() + "\u{2026}");
                             let r = match self.otp.touch_hotp_why {
                                 Some(why) if touch_blocked => r.on_disabled_hover_text(why),
                                 _ => r,
@@ -942,9 +941,9 @@ impl App {
                         // Enable/Disable the keyboard-HID interface.
                         if let Some(iface) = self.otp.iface {
                             let (label, target) = if iface.keyboard {
-                                ("Disable HID-HOTP", false)
+                                (t!("disable_hid_hotp").to_string(), false)
                             } else {
-                                ("Enable HID-HOTP", true)
+                                (t!("enable_hid_hotp").to_string(), true)
                             };
                             let would_underflow = !target && {
                                 let after = IfaceState {
@@ -1009,7 +1008,7 @@ impl App {
                 // Primary actions, to the left of the overflow menu (added after
                 // it so they sit left of it in this right-to-left layout).
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Primary, "+ Add entry").clicked() {
+                if theme::button(ui, p, BtnKind::Primary, &format!("{} {}", "+", t!("add_entry").to_string())).clicked() {
                     // OtpAddDialog has a Drop impl (wipes the typed seed), so
                     // `..Default` struct-update isn't allowed; build via default()
                     // then flip `open`.
@@ -1021,7 +1020,7 @@ impl App {
                     self.secret_reveal.insert("otp-add-secret", false);
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
+                if theme::button(ui, p, BtnKind::Default, &t!("refresh").to_string()).clicked() {
                     self.otp.active = None;
                     self.otp.serial = None;
                     self.load_otp_entries();
@@ -1062,7 +1061,7 @@ impl App {
 
         if !self.otp.loaded {
             ui.label(
-                egui::RichText::new("Reading entries\u{2026}")
+                egui::RichText::new(t!("reading_entries").to_string())
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
@@ -1070,7 +1069,7 @@ impl App {
         }
         if self.otp.rows.is_empty() && self.otp.error.is_none() {
             ui.label(
-                egui::RichText::new("No OTP entries on this key.")
+                egui::RichText::new(t!("no_otp_entries").to_string())
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
@@ -1104,13 +1103,13 @@ impl App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Delete").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &t!("delete").to_string()).clicked() {
                             delete = Some((row.app_name.clone(), row.account_name.clone()));
                         }
                         ui.add_space(8.0);
                         match &row.code {
                             Some(code) => {
-                                if theme::button(ui, p, BtnKind::Default, "Copy").clicked() {
+                                if theme::button(ui, p, BtnKind::Default, &t!("copy").to_string()).clicked() {
                                     copy = Some(code.clone());
                                 }
                                 ui.add_space(8.0);
@@ -1154,7 +1153,7 @@ impl App {
                                     // Already read on touch this session — show it
                                     // (TOTP touch entries still have a window, but
                                     // the device gives no countdown for them here).
-                                    if theme::button(ui, p, BtnKind::Default, "Copy").clicked() {
+                                    if theme::button(ui, p, BtnKind::Default, &t!("copy").to_string()).clicked() {
                                         copy = Some(code.clone());
                                     }
                                     ui.add_space(8.0);
@@ -1164,8 +1163,8 @@ impl App {
                                             .color(p.txt),
                                     );
                                 } else if row.button_required {
-                                    if theme::button(ui, p, BtnKind::Default, "Read")
-                                        .on_hover_text("Touch the key to read this code")
+                                    if theme::button(ui, p, BtnKind::Default, &t!("read_code").to_string())
+                                        .on_hover_text(t!("touch_the_key").to_string())
                                         .clicked()
                                     {
                                         read_touch = Some(rkey);
@@ -1196,7 +1195,7 @@ impl App {
 
         ui.add_space(10.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::button(ui, p, BtnKind::Danger, "Erase all\u{2026}").clicked() {
+            if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", t!("erase_all").to_string())).clicked() {
                 self.otp.confirm_delete = Some((String::new(), String::new())); // sentinel = erase-all
             }
         });
@@ -1222,7 +1221,7 @@ impl App {
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             ui.label(
-                egui::RichText::new("Add OTP entry")
+                egui::RichText::new(t!("otp_add_title").to_string())
                     .font(theme::f_sb(13.5))
                     .color(p.txt),
             );
@@ -1231,15 +1230,15 @@ impl App {
                 .num_columns(2)
                 .spacing([10.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Issuer / app");
+                    ui.label(t!("issuer_app").to_string());
                     ui.text_edit_singleline(&mut self.otp.add.app_name);
                     ui.end_row();
 
-                    ui.label("Account");
+                    ui.label(t!("account").to_string());
                     ui.text_edit_singleline(&mut self.otp.add.account_name);
                     ui.end_row();
 
-                    ui.label("Secret (Base32)");
+                    ui.label(t!("secret_base32").to_string());
                     {
                         let mut rev = self
                             .secret_reveal
@@ -1260,41 +1259,41 @@ impl App {
                         ui.end_row();
                     }
 
-                    ui.label("Type");
+                    ui.label(t!("otp_type").to_string());
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.otp.add.totp, true, "TOTP");
                         ui.selectable_value(&mut self.otp.add.totp, false, "HOTP");
                     });
                     ui.end_row();
 
-                    ui.label("Algorithm");
+                    ui.label(t!("algorithm").to_string());
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.otp.add.sha256, false, "SHA1");
                         ui.selectable_value(&mut self.otp.add.sha256, true, "SHA256");
                     });
                     ui.end_row();
 
-                    ui.label("Digits");
+                    ui.label(t!("digits").to_string());
                     ui.add(egui::DragValue::new(&mut self.otp.add.digits).range(4..=10));
                     ui.end_row();
 
                     if self.otp.add.totp {
-                        ui.label("Period (s)");
+                        ui.label(t!("period_seconds").to_string());
                         ui.add(egui::DragValue::new(&mut self.otp.add.period).range(1..=120));
                         ui.end_row();
                     }
 
-                    ui.label("Require touch");
+                    ui.label(t!("require_touch").to_string());
                     ui.checkbox(&mut self.otp.add.require_touch, "");
                     ui.end_row();
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Primary, "Add").clicked() {
+                if theme::button(ui, p, BtnKind::Primary, &t!("add").to_string()).clicked() {
                     submit = true;
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });
@@ -1320,7 +1319,7 @@ impl App {
         theme::card_frame(p).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("HID-HOTP (keystroke)")
+                    egui::RichText::new(t!("hide_hotp_title").to_string())
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -1330,43 +1329,33 @@ impl App {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "The key types a fresh HOTP code as keyboard input when you touch it \
-                     outside any session. One slot per key.",
+                    t!("hide_hotp_desc").to_string(),
                 )
                 .font(theme::f_reg(11.5))
                 .color(p.txt3),
             );
             ui.add_space(8.0);
-            // Show whether a seed is already provisioned in the slot, read from
-            // the device config on load.
             match self.otp.button_hotp_status {
                 Some(st) if st.configured => {
-                    theme::pill(ui, "Seed configured", p.ok, p.ok_soft());
+                    theme::pill(ui, &t!("seed_configured").to_string(), p.ok, p.ok_soft());
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
-                            "A seed is already set. Leave the secret blank and Save \
-                             to change only the typing options; enter a new secret to \
-                             replace the seed or change the digit length.",
+                            t!("seed_configured_hint").to_string(),
                         )
                         .font(theme::f_reg(11.0))
                         .color(p.txt3),
                     );
                 }
                 Some(_) => {
-                    theme::pill(ui, "No seed configured", p.txt3, p.line);
+                    theme::pill(ui, &t!("no_seed_configured").to_string(), p.txt3, p.line);
                 }
                 None => {
-                    // Couldn't read the device config — most often because the
-                    // full config block is only served over USB-HID, which
-                    // Windows restricts for FIDO-class devices unless elevated.
-                    // Don't claim "no seed"; say we can't tell.
-                    theme::pill(ui, "Slot status unknown", p.txt3, p.line);
+                    theme::pill(ui, &t!("slot_status_unknown").to_string(), p.txt3, p.line);
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
-                            "Couldn't read the slot status from this key's config \
-                             block. Provisioning still works; reload to retry.",
+                            t!("slot_status_hint").to_string(),
                         )
                         .font(theme::f_reg(11.0))
                         .color(p.txt3),
@@ -1383,14 +1372,14 @@ impl App {
                         Some(st) if st.configured
                     );
                     ui.label(if configured {
-                        "New secret (Base32)"
+                        t!("new_secret_base32").to_string()
                     } else {
-                        "Secret (Base32)"
+                        t!("secret_base32").to_string()
                     });
                     let bh_hint = if configured {
-                        "leave blank to keep current seed"
+                        t!("leave_blank_hint").to_string()
                     } else {
-                        ""
+                        "".to_string()
                     };
                     {
                         let mut rev = self
@@ -1403,7 +1392,7 @@ impl App {
                             p,
                             &mut self.otp.button_hotp.secret,
                             &mut rev,
-                            bh_hint,
+                            &bh_hint,
                             260.0,
                         );
                         self.secret_reveal.insert("otp-buttonhotp-secret", rev);
@@ -1415,7 +1404,7 @@ impl App {
                     // only editable when a secret is being entered — with a blank
                     // secret (options-only Save) the existing length is kept.
                     let seed_present = !self.otp.button_hotp.secret.trim().is_empty();
-                    ui.label("Digits");
+                    ui.label(t!("digits").to_string());
                     ui.add_enabled_ui(seed_present, |ui| {
                         ui.horizontal(|ui| {
                             ui.selectable_value(&mut self.otp.button_hotp.digits, 6u8, "6");
@@ -1424,34 +1413,33 @@ impl App {
                     })
                     .response
                     .on_disabled_hover_text(
-                        "Digit length can only change when you set a new secret \u{2014} \
-                         the key has no command to change it on its own.",
+                        t!("digit_length_hint").to_string(),
                     );
                     ui.end_row();
 
-                    ui.label("Send Enter");
+                    ui.label(t!("send_enter").to_string());
                     ui.checkbox(&mut self.otp.button_hotp.send_enter, "");
                     ui.end_row();
 
-                    ui.label("Long touch (2s)");
+                    ui.label(t!("long_touch").to_string());
                     ui.checkbox(&mut self.otp.button_hotp.long_touch, "");
                     ui.end_row();
 
-                    ui.label("Numeric keypad");
+                    ui.label(t!("numeric_keypad").to_string());
                     ui.checkbox(&mut self.otp.button_hotp.numpad, "");
                     ui.end_row();
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if theme::button(ui, p, BtnKind::Primary, "Save").clicked() {
+                if theme::button(ui, p, BtnKind::Primary, &t!("save").to_string()).clicked() {
                     submit = true;
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
                     cancel = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Clear slot").clicked() {
+                    if theme::button(ui, p, BtnKind::Danger, &t!("clear_slot").to_string()).clicked() {
                         clear = true;
                     }
                 });
@@ -1482,25 +1470,22 @@ impl App {
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             let title = if enable {
-                "Enable HID-HOTP (keyboard interface)?"
+                t!("enable_hid_hotp_confirm").to_string()
             } else {
-                "Disable HID-HOTP (keyboard interface)?"
+                t!("disable_hid_hotp_confirm").to_string()
             };
             ui.colored_label(p.err, title);
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "This reconfigures the key's USB interfaces. The change takes effect \
-                     after you re-plug the key. Disabling an interface removes the matching \
-                     features until you re-enable it; if you disable the interface you are \
-                     connected over, you may lose access to the key.",
+                    t!("keyboard_reconfigure_warning").to_string(),
                 )
                 .font(theme::f_reg(11.5))
                 .color(p.txt3),
             );
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new(format!("Type \u{201c}{PHRASE}\u{201d} to confirm:"))
+                egui::RichText::new(t!("type_change_interface").to_string())
                     .font(theme::f_reg(12.0))
                     .color(p.txt2),
             );
@@ -1515,12 +1500,12 @@ impl App {
                 .is_some_and(|t| t.typed.trim() == PHRASE);
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(matched, |ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Apply").clicked() {
+                    if theme::button(ui, p, BtnKind::Danger, &t!("apply").to_string()).clicked() {
                         apply = true;
                     }
                 });
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });
@@ -1544,19 +1529,18 @@ impl App {
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
             let msg = if erase_all {
-                "Erase ALL OTP entries on this key? This cannot be undone.".to_string()
+                t!("otp_cannot_be_undone").to_string()
             } else if app_name.is_empty() {
-                format!("Delete OTP entry \"{account_name}\"?")
+                format!("{} \"{}\"", t!("otp_delete_entry").to_string(), account_name)
             } else {
-                format!("Delete OTP entry \"{app_name}:{account_name}\"?")
+                format!("{} \"{}:{}\"", t!("otp_delete_entry").to_string(), app_name, account_name)
             };
             ui.colored_label(p.err, msg);
             if erase_all {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "After you confirm, touch the key's sensor to complete the erase \
-                         — the device waits for a physical touch.",
+                        t!("otp_touch_sensor").to_string(),
                     )
                     .font(theme::f_reg(11.5))
                     .color(p.txt3),
@@ -1564,12 +1548,12 @@ impl App {
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let label = if erase_all { "Erase all" } else { "Delete" };
+                let label = if erase_all { &t!("erase_all").to_string() } else { &t!("delete").to_string() };
                 if theme::button(ui, p, BtnKind::Danger, label).clicked() {
                     confirm = true;
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                if theme::button(ui, p, BtnKind::Default, &t!("cancel").to_string()).clicked() {
                     cancel = true;
                 }
             });

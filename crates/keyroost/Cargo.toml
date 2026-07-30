@@ -18,6 +18,7 @@ name = "keyroost"
 path = "src/main.rs"
 
 [dependencies]
+rust-i18n = "3"
 keyroost-proto = { path = "../keyroost-proto", version = "0.7.6" }
 keyroost-transport = { path = "../keyroost-transport", version = "0.7.6" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.7.6" }
@@ -126,3 +127,8 @@ pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-macos-u
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/keyroost-v{ version }-windows-x86_64{ archive-suffix }"
 pkg-fmt = "zip"
+
+[package.metadata.i18n]
+available-locales = ["en", "zh-CN"]
+default-locale = "en"
+load-path = "locales"
