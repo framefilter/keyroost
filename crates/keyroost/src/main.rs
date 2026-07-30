@@ -1917,6 +1917,8 @@ struct App {
     translations: Translations,
     /// Current language setting.
     language: Language,
+    /// Whether the settings dialog is open.
+    settings_open: bool,
 }
 
 /// Which path text field a resolved file-chooser result should populate. Keeps
@@ -4668,6 +4670,65 @@ impl App {
             }
             Some(false) => self.factory_reset_confirm = None,
             None => {}
+        }
+    }
+
+    /// Settings dialog for language selection and other preferences.
+    fn render_settings_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let mut close = false;
+        let mut new_language = self.language;
+
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Language")
+                        .font(theme::f_bold(14.0))
+                        .color(p.txt),
+                );
+                ui.add_space(4.0);
+
+                // Language selection
+                ui.horizontal(|ui| {
+                    let en_selected = self.language == Language::En;
+                    let zh_selected = self.language == Language::ZhCn;
+
+                    if ui
+                        .selectable_label(en_selected, "English")
+                        .clicked()
+                    {
+                        new_language = Language::En;
+                    }
+                    if ui
+                        .selectable_label(zh_selected, "\u{7b80}\u{4f53}\u{4e2d}\u{6587}")
+                        .clicked()
+                    {
+                        new_language = Language::ZhCn;
+                    }
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Close button
+                if theme::button(ui, p, BtnKind::Default, "Close").clicked() {
+                    close = true;
+                }
+            });
+
+        if close {
+            self.settings_open = false;
+        }
+
+        // Apply language change if needed
+        if new_language != self.language {
+            self.language = new_language;
+            self.translations = Translations::new(new_language);
+            self.persist_settings();
         }
     }
 
@@ -7777,6 +7838,11 @@ impl eframe::App for App {
         self.render_piv_cred_modal(ctx, &p);
         self.molto_dialogs(ctx, &p);
 
+        // Settings dialog
+        if self.settings_open {
+            self.render_settings_dialog(ctx, &p);
+        }
+
         // Help popover, painted last so it sits above everything.
         if let Some(topic) = self.help_open {
             if ui::help_popover(ctx, &p, topic, self.help_anchor, &self.translations) {
@@ -7907,6 +7973,24 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
                             self.schedule_scan_burst();
+                        }
+                        ui.add_space(4.0);
+                        // Settings button
+                        let settings_color = if self.settings_open { p.accent } else { p.txt2 };
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new("\u{2699}")  // gear icon
+                                        .font(theme::f_sb(14.0))
+                                        .color(settings_color),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Settings")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            self.settings_open = !self.settings_open;
                         }
                         ui.add_space(4.0);
                         let log_color = if self.log_open { p.accent } else { p.txt2 };
