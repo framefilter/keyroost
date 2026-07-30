@@ -4682,6 +4682,7 @@ impl App {
         egui::Window::new(self.translations.ui_string("settings").unwrap_or("Settings"))
             .collapsible(false)
             .resizable(false)
+            .max_width(250.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.add_space(8.0);
@@ -4690,7 +4691,7 @@ impl App {
                         .font(theme::f_bold(14.0))
                         .color(p.txt),
                 );
-                ui.add_space(4.0);
+                ui.add_space(8.0);
 
                 // Language selection
                 ui.horizontal(|ui| {
@@ -4704,7 +4705,7 @@ impl App {
                         new_language = Language::En;
                     }
                     if ui
-                        .selectable_label(zh_selected, "\u{7b80}\u{4f53}\u{4e2d}\u{6587}")
+                        .selectable_label(zh_selected, "简体中文")
                         .clicked()
                     {
                         new_language = Language::ZhCn;
@@ -4715,8 +4716,8 @@ impl App {
                 ui.separator();
                 ui.add_space(8.0);
 
-                // Bottom buttons: Cancel on left, OK on right
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // Bottom buttons
+                ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         close = true;
                     }
@@ -8596,7 +8597,7 @@ impl App {
                         ui.add_space(5.0);
                         self.help_dot(ui, p, "device");
                         ui.add_space(8.0);
-                        let label = if dev.name.is_some() { "Rename" } else { "Name this key" };
+                        let label = if dev.name.is_some() { "重命名" } else { self.translations.ui_string("name_this_key").unwrap_or("Name this key") };
                         if ui
                             .add(
                                 egui::Label::new(egui::RichText::new(label).font(theme::f_sb(12.0)).color(p.accent))
@@ -8910,13 +8911,10 @@ impl App {
                     #[cfg(not(windows))]
                     let non_admin = false;
                     if non_admin {
-                        theme::pill(ui, "Administrator rights needed", p.warn, p.warn_soft());
+                        theme::pill(ui, self.translations.ui_string("admin_rights_needed").unwrap_or("Administrator rights needed"), p.warn, p.warn_soft());
                         ui.add_space(6.0);
                         ui.label(
-                            egui::RichText::new(
-                                "Open the FIDO2 tab to manage this key via Windows \
-                                 settings or restart as administrator.",
-                            )
+                            egui::RichText::new(self.translations.ui_string("open_fido2_admin").unwrap_or("Open the FIDO2 tab to manage this key via Windows settings or restart as administrator."))
                             .font(theme::f_reg(13.0))
                             .color(p.txt2),
                         );
@@ -8929,23 +8927,21 @@ impl App {
                         {
                             Some(true) => {
                                 ui.horizontal(|ui| {
-                                    theme::pill(ui, "PIN set", p.ok, p.ok_soft());
+                                    theme::pill(ui, self.translations.ui_string("pin_set").unwrap_or("PIN set"), p.ok, p.ok_soft());
                                     ui.add_space(8.0);
                                     ui.label(
-                                        egui::RichText::new(
-                                            "PIN configured \u{00B7} ready for passkeys",
-                                        )
+                                        egui::RichText::new(self.translations.ui_string("pin_configured_ready").unwrap_or("PIN configured · ready for passkeys"))
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt2),
                                     );
                                 });
                             }
                             Some(false) => {
-                                theme::pill(ui, "No PIN configured", p.warn, p.warn_soft());
+                                theme::pill(ui, self.translations.ui_string("no_pin_configured").unwrap_or("No PIN configured"), p.warn, p.warn_soft());
                             }
                             None => {
                                 ui.label(
-                                    egui::RichText::new("Reading key\u{2026}")
+                                    egui::RichText::new(self.translations.ui_string("reading_key").unwrap_or("Reading key..."))
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt3),
                                 );
@@ -8994,7 +8990,7 @@ impl App {
                         }
                     } else {
                         ui.label(
-                            egui::RichText::new("Open Authenticator to view live codes.")
+                            egui::RichText::new(self.translations.ui_string("open_auth_view").unwrap_or("Open Authenticator to view live codes."))
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -9041,7 +9037,7 @@ impl App {
                         });
                     } else {
                         ui.label(
-                            egui::RichText::new("Open OpenPGP and Read status to view key slots.")
+                            egui::RichText::new(self.translations.ui_string("open_openpgp_view").unwrap_or("Open OpenPGP and Read status to view key slots."))
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -9069,7 +9065,7 @@ impl App {
                         });
                     } else {
                         ui.label(
-                            egui::RichText::new("Open PIV to read certificate slots.")
+                            egui::RichText::new(self.translations.ui_string("open_piv_view").unwrap_or("Open PIV to read certificate slots."))
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -9110,7 +9106,7 @@ impl App {
                         }
                     } else {
                         ui.label(
-                            egui::RichText::new("Open On-device OTP to view stored entries.")
+                            egui::RichText::new(self.translations.ui_string("open_otp_view").unwrap_or("Open On-device OTP to view stored entries."))
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -9192,27 +9188,19 @@ impl App {
     fn fido2_non_admin_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
         theme::card_frame(p).show(ui, |ui| {
             ui.label(
-                egui::RichText::new("Administrator rights needed")
+                egui::RichText::new(self.translations.ui_string("fido2_tab_admin").unwrap_or("Administrator rights needed"))
                     .font(theme::f_sb(14.5))
                     .color(p.txt),
             );
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new(
-                    "A security key is connected, but managing its FIDO2 settings \
-                     (PIN, passkeys, reset, fingerprints) in this app requires \
-                     administrator rights on Windows.",
-                )
+                egui::RichText::new(self.translations.ui_string("fido2_admin_desc").unwrap_or("A security key is connected, but managing its FIDO2 settings (PIN, passkeys, reset, fingerprints) in this app requires administrator rights on Windows."))
                 .font(theme::f_reg(13.0))
                 .color(p.txt2),
             );
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(
-                    "Change the PIN, manage biometrics or reset the key without \
-                     admin rights using Windows' built-in security-key settings, \
-                     or restart this app as administrator for full management here.",
-                )
+                egui::RichText::new(self.translations.ui_string("fido2_admin_hint").unwrap_or("Change the PIN, manage biometrics or reset the key without admin rights using Windows' built-in security-key settings, or restart this app as administrator for full management here."))
                 .font(theme::f_reg(13.0))
                 .color(p.txt2),
             );
@@ -9222,7 +9210,7 @@ impl App {
                     ui,
                     p,
                     BtnKind::Primary,
-                    "Open Windows security-key settings",
+                    self.translations.ui_string("open_windows_settings").unwrap_or("Open Windows security-key settings"),
                 )
                 .clicked()
                 {
@@ -9231,7 +9219,7 @@ impl App {
                             Some(format!("Couldn't open Windows security-key settings: {e}"));
                     }
                 }
-                if theme::button(ui, p, BtnKind::Default, "Restart as administrator").clicked() {
+                if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("restart_as_admin").unwrap_or("Restart as administrator")).clicked() {
                     match keyroost_winwebauthn::relaunch_as_admin() {
                         // Elevated instance requested: exit this non-elevated one
                         // so only the admin process remains.
@@ -9269,7 +9257,7 @@ impl App {
         theme::card_frame(p).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("PIN & sign-in")
+                    egui::RichText::new(self.translations.ui_string("pin_sign_in").unwrap_or("PIN & sign-in"))
                         .font(theme::f_sb(14.5))
                         .color(p.txt),
                 );
@@ -9277,8 +9265,8 @@ impl App {
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (kind, label) = match pin {
-                        PinSupport::Set => (BtnKind::Default, "Change PIN"),
-                        PinSupport::NotSet => (BtnKind::Primary, "Set a PIN"),
+                        PinSupport::Set => (BtnKind::Default, self.translations.ui_string("change_pin").unwrap_or("Change PIN")),
+                        PinSupport::NotSet => (BtnKind::Primary, self.translations.ui_string("set_a_pin").unwrap_or("Set a PIN")),
                         // Unknown (still reading) or no PIN feature at all:
                         // nothing to offer.
                         PinSupport::Unknown | PinSupport::Unsupported => return,
@@ -9296,7 +9284,7 @@ impl App {
                     // settings alike, so it doesn't belong inside one panel.
                     if self.security_keys.session.is_some() {
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Ghost, "Lock").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("lock").unwrap_or("Lock")).clicked() {
                             self.lock_session();
                         }
                     }
@@ -9306,14 +9294,14 @@ impl App {
             match pin {
                 PinSupport::Set => {
                     ui.horizontal(|ui| {
-                        theme::pill(ui, "PIN set", p.ok, p.ok_soft());
+                        theme::pill(ui, self.translations.ui_string("pin_set_status").unwrap_or("PIN set"), p.ok, p.ok_soft());
                         ui.add_space(8.0);
                         // Reflect whether the key is already unlocked: once a
                         // session is open, the "unlock below" prompt is stale.
                         let hint = if self.security_keys.session.is_some() {
-                            "This key has a PIN."
+                            self.translations.ui_string("has_pin").unwrap_or("This key has a PIN.")
                         } else {
-                            "This key has a PIN. Unlock below to manage it."
+                            self.translations.ui_string("has_pin_unlock").unwrap_or("This key has a PIN. Unlock below to manage it.")
                         };
                         ui.label(
                             egui::RichText::new(hint)
@@ -9324,12 +9312,10 @@ impl App {
                 }
                 PinSupport::NotSet => {
                     ui.horizontal(|ui| {
-                        theme::pill(ui, "No PIN yet", p.warn, p.warn_soft());
+                        theme::pill(ui, self.translations.ui_string("no_pin_yet").unwrap_or("No PIN yet"), p.warn, p.warn_soft());
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(
-                                "Set a PIN to protect this key and turn on passkeys.",
-                            )
+                            egui::RichText::new(self.translations.ui_string("set_pin_protect").unwrap_or("Set a PIN to protect this key and turn on passkeys."))
                             .font(theme::f_reg(13.0))
                             .color(p.txt2),
                         );
@@ -9341,10 +9327,10 @@ impl App {
                     // fall into the None arm below and read "Reading key…"
                     // forever.
                     ui.horizontal(|ui| {
-                        theme::pill(ui, "No PIN support", p.txt2, p.raised2);
+                        theme::pill(ui, self.translations.ui_string("no_pin_support").unwrap_or("No PIN support"), p.txt2, p.raised2);
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new("This key does not support a PIN.")
+                            egui::RichText::new(self.translations.ui_string("pin_not_supported").unwrap_or("This key does not support a PIN."))
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt2),
                         );
@@ -9352,7 +9338,7 @@ impl App {
                 }
                 PinSupport::Unknown => {
                     let msg = if self.security_keys.error.is_some() {
-                        "Couldn't read this key."
+                        self.translations.ui_string("couldnt_read_key").unwrap_or("Couldn't read this key.")
                     } else {
                         // The initial read can be dropped if the worker was
                         // busy at selection time; retry rather than showing
@@ -9360,7 +9346,7 @@ impl App {
                         if self.security_keys.info.is_none() && !self.busy() {
                             self.fetch_selected_info();
                         }
-                        "Reading key\u{2026}"
+                        self.translations.ui_string("reading_key").unwrap_or("Reading key...")
                     };
                     ui.label(
                         egui::RichText::new(msg)
@@ -9380,24 +9366,24 @@ impl App {
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(if setting {
-                                "Create a PIN"
+                                self.translations.ui_string("create_pin").unwrap_or("Create a PIN")
                             } else {
-                                "Change PIN"
+                                self.translations.ui_string("change_pin").unwrap_or("Change PIN")
                             })
                             .font(theme::f_sb(13.0))
                             .color(p.txt),
                         );
                         ui.add_space(8.0);
                         if setting {
-                            pin_field(ui, p, "New PIN", &mut self.security_keys.change_pin.new);
-                            pin_field(ui, p, "Confirm", &mut self.security_keys.change_pin.confirm);
+                            pin_field(ui, p, self.translations.ui_string("new_pin").unwrap_or("New PIN"), &mut self.security_keys.change_pin.new);
+                            pin_field(ui, p, self.translations.ui_string("confirm").unwrap_or("Confirm"), &mut self.security_keys.change_pin.confirm);
                         } else {
-                            pin_field(ui, p, "Current PIN", &mut self.security_keys.change_pin.old);
-                            pin_field(ui, p, "New PIN", &mut self.security_keys.change_pin.new);
+                            pin_field(ui, p, self.translations.ui_string("current_pin").unwrap_or("Current PIN"), &mut self.security_keys.change_pin.old);
+                            pin_field(ui, p, self.translations.ui_string("new_pin").unwrap_or("New PIN"), &mut self.security_keys.change_pin.new);
                             pin_field(
                                 ui,
                                 p,
-                                "Confirm new PIN",
+                                self.translations.ui_string("confirm_new_pin").unwrap_or("Confirm new PIN"),
                                 &mut self.security_keys.change_pin.confirm,
                             );
                         }
@@ -9407,7 +9393,7 @@ impl App {
                                 ui,
                                 p,
                                 BtnKind::Primary,
-                                if setting { "Set PIN" } else { "Change PIN" },
+                                if setting { self.translations.ui_string("set_pin").unwrap_or("Set PIN") } else { self.translations.ui_string("change_pin").unwrap_or("Change PIN") },
                             )
                             .clicked()
                             {
@@ -9418,13 +9404,13 @@ impl App {
                                 }
                             }
                             ui.add_space(6.0);
-                            if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
+                            if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("cancel").unwrap_or("Cancel")).clicked() {
                                 cancel = true;
                             }
                         });
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("4\u{2013}63 characters.")
+                            egui::RichText::new(self.translations.ui_string("pin_length").unwrap_or("4–63 characters."))
                                 .font(theme::f_reg(11.5))
                                 .color(p.txt3),
                         );
@@ -12337,14 +12323,14 @@ impl App {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("OpenPGP card")
+                    egui::RichText::new(self.translations.ui_string("openpgp_card").unwrap_or("OpenPGP card"))
                         .font(theme::f_sb(14.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pgp");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Read status").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("read_status").unwrap_or("Read status")).clicked() {
                         do_refresh = true;
                     }
                 });
@@ -12370,8 +12356,9 @@ impl App {
                     .map_or("\u{2014}".to_string(), |n| n.to_string());
                 ui.label(
                     egui::RichText::new(format!(
-                        "AID {} \u{00B7} Serial {serial}",
-                        hex_lower(&status.aid)
+                        "AID {} \u{00B7} {} {serial}",
+                        hex_lower(&status.aid),
+                        self.translations.ui_string("serial").unwrap_or("Serial"),
                     ))
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
@@ -12379,15 +12366,17 @@ impl App {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(format!(
-                        "PIN retries PW1={} RC={} PW3={} \u{00B7} Signatures made {sigs}",
-                        status.tries_pw1, status.tries_rc, status.tries_pw3
+                        "{} PW1={} RC={} PW3={} \u{00B7} {} {sigs}",
+                        self.translations.ui_string("pin_retries").unwrap_or("PIN retries"),
+                        status.tries_pw1, status.tries_rc, status.tries_pw3,
+                        self.translations.ui_string("signatures_made").unwrap_or("Signatures made"),
                     ))
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
                 );
             } else if self.openpgp.error.is_none() {
                 ui.label(
-                    egui::RichText::new("Click Read status to read this card (no PIN or touch).")
+                    egui::RichText::new(self.translations.ui_string("click_read_status").unwrap_or("Click Read status to read this card (no PIN or touch)."))
                         .font(theme::f_reg(13.0))
                         .color(p.txt3),
                 );
@@ -12702,14 +12691,14 @@ impl App {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("PIV smart card")
+                    egui::RichText::new(self.translations.ui_string("piv_smart_card").unwrap_or("PIV smart card"))
                         .font(theme::f_sb(14.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("refresh").unwrap_or("Refresh")).clicked() {
                         do_refresh = true;
                     }
                 });
@@ -12735,14 +12724,17 @@ impl App {
                     .map_or("\u{2014}".to_string(), |n| n.to_string());
                 ui.label(
                     egui::RichText::new(format!(
-                        "Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
+                        "{} {ver} \u{00B7} {} {serial} \u{00B7} {} {retries}",
+                        self.translations.ui_string("applet_version").unwrap_or("Applet"),
+                        self.translations.ui_string("serial").unwrap_or("Serial"),
+                        self.translations.ui_string("pin_retries").unwrap_or("PIN retries"),
                     ))
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
                 );
             } else if self.piv.error.is_none() {
                 ui.label(
-                    egui::RichText::new("Reading PIV status\u{2026}")
+                    egui::RichText::new("读取 PIV 状态中\u{2026}")
                         .font(theme::f_reg(13.0))
                         .color(p.txt3),
                 );
@@ -12756,22 +12748,22 @@ impl App {
             // PIN & PUK: bold label + help left, the three actions right.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("PIN & PUK")
+                    egui::RichText::new(self.translations.ui_string("pin_puk").unwrap_or("PIN & PUK"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("unblock_pin").unwrap_or("Unblock PIN"))).clicked() {
                         open_unblock = true;
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_puk").unwrap_or("Change PUK"))).clicked() {
                         open_change_puk = true;
                     }
                     ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_pin").unwrap_or("Change PIN"))).clicked() {
                         open_change_pin = true;
                     }
                 });
@@ -12782,28 +12774,28 @@ impl App {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Retry counts")
+                    egui::RichText::new(self.translations.ui_string("retry_counts").unwrap_or("Retry counts"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}").clicked()
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("set_retry_counts").unwrap_or("Set retry counts"))).clicked()
                     {
                         open_set_retries = true;
                     }
                     ui.add_space(8.0);
                     ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
                     ui.label(
-                        egui::RichText::new("PUK tries")
+                        egui::RichText::new(self.translations.ui_string("puk_tries").unwrap_or("PUK tries"))
                             .font(theme::f_reg(13.0))
                             .color(p.txt2),
                     );
                     ui.add_space(8.0);
                     ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
                     ui.label(
-                        egui::RichText::new("PIN tries")
+                        egui::RichText::new(self.translations.ui_string("pin_tries").unwrap_or("PIN tries"))
                             .font(theme::f_reg(13.0))
                             .color(p.txt2),
                     );
@@ -12815,14 +12807,14 @@ impl App {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Management key")
+                    egui::RichText::new(self.translations.ui_string("management_key").unwrap_or("Management key"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-admin");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("change_management_key").unwrap_or("Change management key")))
                         .clicked()
                     {
                         open_change_mgmt = true;
@@ -13047,14 +13039,14 @@ impl App {
             // and primary button pinned right (FIDO2 setting-row shape).
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Generate key")
+                    egui::RichText::new(self.translations.ui_string("generate_key").unwrap_or("Generate key"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-generate");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
                         open_generate = true;
                     }
                     ui.add_space(8.0);
@@ -13082,7 +13074,7 @@ impl App {
             // issue actions each right-aligned on their own row.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Certificate")
+                    egui::RichText::new(self.translations.ui_string("certificate").unwrap_or("Certificate"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -13093,24 +13085,24 @@ impl App {
             text_field(
                 ui,
                 p,
-                "Name",
+                self.translations.ui_string("name").unwrap_or("Name"),
                 &mut self.piv.cert_subject,
                 "e.g. Alice — or full CN=Alice,O=Example,C=US",
                 300.0,
             );
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Valid for")
+                    egui::RichText::new(self.translations.ui_string("valid_for").unwrap_or("Valid for"))
                         .font(theme::f_reg(13.0))
                         .color(p.txt2),
                 );
                 ui.add(
                     egui::DragValue::new(&mut self.piv.cert_days)
                         .range(1..=3650u32)
-                        .suffix(" days"),
+                        .suffix(&format!(" {}", self.translations.ui_string("days").unwrap_or("days"))),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
+                    if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("self_signed_slot").unwrap_or("Self-signed → slot")).clicked()
                     {
                         open_self_sign = true;
                     }
@@ -13122,17 +13114,17 @@ impl App {
                 text_field(
                     ui,
                     p,
-                    "CSR file",
+                    self.translations.ui_string("csr_file").unwrap_or("CSR file"),
                     &mut self.piv.csr_path,
                     "/path/to/request.csr",
                     240.0,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("sign_save_csr").unwrap_or("Sign & save CSR")).clicked() {
                         open_csr = true;
                     }
                     ui.add_space(8.0);
-                    save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                    save_csr = theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("save").unwrap_or("Save"))).clicked();
                 });
             });
             if save_csr {
@@ -13148,7 +13140,7 @@ impl App {
             // --- Import cert: file path + Browse/Import right-aligned.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Import cert")
+                    egui::RichText::new(self.translations.ui_string("import_cert").unwrap_or("Import cert"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -13161,18 +13153,18 @@ impl App {
                 text_field(
                     ui,
                     p,
-                    "File",
+                    self.translations.ui_string("file").unwrap_or("File"),
                     &mut self.piv.cert_path,
                     "/path/to/cert.pem",
                     240.0,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("import_certificate").unwrap_or("Import certificate")).clicked() {
                         open_import = true;
                     }
                     ui.add_space(8.0);
                     browse_cert =
-                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+                        theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
                 });
             });
             if browse_cert {
@@ -13191,7 +13183,7 @@ impl App {
             // --- Export cert: destination path + Save/Export right.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Export cert")
+                    egui::RichText::new(self.translations.ui_string("export_cert").unwrap_or("Export cert"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -13204,17 +13196,17 @@ impl App {
                 text_field(
                     ui,
                     p,
-                    "Destination",
+                    self.translations.ui_string("destination").unwrap_or("Destination"),
                     &mut self.piv.export_path,
                     "/path/to/out.der",
                     240.0,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("export_certificate").unwrap_or("Export certificate")).clicked() {
                         go_export = true;
                     }
                     ui.add_space(8.0);
-                    save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                    save_export = theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("save").unwrap_or("Save"))).clicked();
                 });
             });
             if save_export {
@@ -13235,7 +13227,7 @@ impl App {
             // actions right-aligned (Delete key is Danger, gated 5.7+).
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Delete")
+                    egui::RichText::new(self.translations.ui_string("delete").unwrap_or("Delete"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -13245,18 +13237,18 @@ impl App {
                     // Move key: relocate the slot's key to an empty slot. Needs
                     // 5.7+ (same gate as delete) and a key in the active slot.
                     if can_delete_key && selected_has_key {
-                        if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", "移动密钥")).clicked() {
                             open_move_key = true;
                         }
                         ui.add_space(6.0);
                     }
                     if can_delete_key {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("delete_key").unwrap_or("Delete key"))).clicked() {
                             open_delete_key = true;
                         }
                         ui.add_space(6.0);
                     }
-                    if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("delete_certificate").unwrap_or("Delete certificate")))
                         .clicked()
                     {
                         open_delete_cert = true;
@@ -13265,7 +13257,7 @@ impl App {
             });
             if !can_delete_key {
                 ui.add_space(4.0);
-                note(ui, "Key deletion needs YubiKey 5.7+.");
+                note(ui, "密钥删除需要 YubiKey 5.7+。");
             }
         });
         ui.add_space(12.0);
@@ -13279,23 +13271,21 @@ impl App {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Reset applet")
+                        egui::RichText::new(self.translations.ui_string("reset_applet").unwrap_or("Reset applet"))
                             .font(theme::f_sb(14.5))
                             .color(p.err),
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "reset");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("reset_applet").unwrap_or("Reset applet"))).clicked() {
                             arm_reset = true;
                         }
                     });
                 });
                 ui.label(
-                    egui::RichText::new(
-                        "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
-                         the PIN and PUK are already blocked.",
-                    )
+                    egui::RichText::new(self.translations.ui_string("reset_applet_desc").unwrap_or("Wipes ALL PIV keys, certificates, and PINs. Only works when both the PIN and PUK are already blocked."))
+
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
                 );
