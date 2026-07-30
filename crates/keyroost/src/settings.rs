@@ -17,7 +17,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::locales::locales::Language;
+use crate::locales::Language;
 use crate::ui::theme::{self, Mode};
 
 /// The on-disk UI settings (`settings.json`). Every field carries a
@@ -240,6 +240,7 @@ mod tests {
             mode: ModeSetting::Light,
             accent: 2,
             colorblind: true,
+            language: LanguageSetting::En,
         };
         let json = serde_json::to_string_pretty(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -314,6 +315,7 @@ mod tests {
             mode: ModeSetting::Light,
             accent: 1,
             colorblind: true,
+            language: LanguageSetting::En,
         };
         s.save_to(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();

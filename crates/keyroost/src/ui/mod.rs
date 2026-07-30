@@ -30,7 +30,7 @@ use theme::{f_bold, f_reg, Palette};
 /// always wrapped in a filled `Frame` (fill = palette.pop), which is the egui
 /// equivalent of the prototype bug where the popover rendered outside the themed
 /// container.
-pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui::Pos2, translations: &crate::locales::locales::Translations) -> bool {
+pub fn help_popover(ctx: &egui::Context, p: &Palette, topic: &str, anchor: egui::Pos2, translations: &crate::locales::Translations) -> bool {
     let Some(h) = help::help(topic, translations) else {
         return true; // unknown topic -> treat as closed
     };
@@ -128,7 +128,7 @@ fn badge_q(ui: &mut egui::Ui, p: &Palette) {
 ///   let r = help_button(ui, &p, help_open == Some("oath"));
 ///   if r.clicked() { anchor = r.rect.left_bottom();
 ///       help_open = if help_open == Some("oath") { None } else { Some("oath") }; }
-pub fn help_button(ui: &mut egui::Ui, p: &Palette, active: bool, translations: &crate::locales::locales::Translations) -> egui::Response {
+pub fn help_button(ui: &mut egui::Ui, p: &Palette, active: bool, translations: &crate::locales::Translations) -> egui::Response {
     let d = 17.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::click());
     let (fill, fg) = if active || resp.hovered() {

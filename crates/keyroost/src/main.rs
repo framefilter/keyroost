@@ -15,7 +15,7 @@ mod qrscan;
 mod screengrab;
 mod settings;
 mod ui;
-use locales::locales::{detect_language, Language, Translations};
+use locales::{detect_language, Language, Translations};
 use otp_pane::OtpState;
 use settings::Settings;
 use ui::device::{self, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
@@ -5689,6 +5689,7 @@ impl App {
             mode: self.mode.into(),
             accent: self.accent_idx,
             colorblind: self.colorblind,
+            language: self.language.into(),
         };
         if self.last_saved_settings.as_ref() == Some(&current) {
             return;
