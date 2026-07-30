@@ -7818,7 +7818,7 @@ impl eframe::App for App {
         // armed for the whole edit.
         //
         // Fix: Reduce repaint frequency to prevent flickering. Use a longer
-        // interval (1000ms instead of 500ms) and only repaint when necessary.
+        // interval (3000ms instead of 1500ms) and only repaint when necessary.
         if self.reset_arm.is_none() && self.pending_scans > 0 {
             let now = std::time::Instant::now();
             let due = self.next_scan_at.is_none_or(|t| now >= t);
@@ -7826,10 +7826,10 @@ impl eframe::App for App {
             if due && !self.busy() && !renaming {
                 self.refresh_devices();
                 self.pending_scans -= 1;
-                self.next_scan_at = Some(now + std::time::Duration::from_millis(2000));
+                self.next_scan_at = Some(now + std::time::Duration::from_millis(3000));
             }
             if self.pending_scans > 0 && !renaming {
-                ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+                ctx.request_repaint_after(std::time::Duration::from_millis(2000));
             }
         }
 
@@ -8350,12 +8350,12 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             ui.label(
-                                egui::RichText::new("Several keys plugged in?")
+                                egui::RichText::new(self.translations.ui_string("several_keys").unwrap_or("Several keys plugged in?"))
                                     .font(theme::f_reg(12.0))
                                     .color(p.txt3),
                             );
                             ui.hyperlink_to(
-                                egui::RichText::new("Give them names")
+                                egui::RichText::new(self.translations.ui_string("give_names").unwrap_or("Give them names"))
                                     .font(theme::f_sb(12.0))
                                     .color(p.accent),
                                 ui::help::learn_url("/naming"),
@@ -8636,7 +8636,7 @@ impl App {
                 ui.label(egui::RichText::new(meta).font(theme::f_reg(12.5)).color(p.txt2));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new("Connected").font(theme::f_sb(12.5)).color(p.txt2));
+                ui.label(egui::RichText::new(self.translations.ui_string("connected").unwrap_or("Connected")).font(theme::f_sb(12.5)).color(p.txt2));
                 ui.add_space(5.0);
                 theme::status_dot(ui, p.ok, 8.0);
             });
@@ -9473,7 +9473,7 @@ impl App {
             theme::card_frame(p).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Unlock this key")
+                        egui::RichText::new(self.translations.ui_string("unlock_this_key").unwrap_or("Unlock this key"))
                             .font(theme::f_sb(14.5))
                             .color(p.txt),
                     );
@@ -9487,10 +9487,10 @@ impl App {
                         egui::TextEdit::singleline(&mut self.security_keys.pin_input)
                             .vertical_align(egui::Align::Center)
                             .password(true)
-                            .hint_text("Enter PIN to unlock this key"),
+                            .hint_text(self.translations.ui_string("enter_pin_unlock").unwrap_or("Enter PIN to unlock this key")),
                     );
                     guard_secret_field(ui.ctx(), &resp);
-                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    let submit = theme::button(ui, p, BtnKind::Primary, self.translations.ui_string("unlock").unwrap_or("Unlock")).clicked();
                     if submit
                         || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     {
@@ -9498,14 +9498,14 @@ impl App {
                     }
                 });
                 let extras = match (has_bio, settings_available) {
-                    (true, true) => "passkeys, fingerprints, and settings",
-                    (true, false) => "passkeys and fingerprints",
-                    (false, true) => "passkeys and settings",
-                    (false, false) => "passkeys",
+                    (true, true) => "通行密钥、指纹和设置",
+                    (true, false) => "通行密钥和指纹",
+                    (false, true) => "通行密钥和设置",
+                    (false, false) => "通行密钥",
                 };
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("Unlock to manage {extras}."))
+                    egui::RichText::new(format!("解锁以管理{}。", extras))
                         .font(theme::f_reg(11.5))
                         .color(p.txt3),
                 );
@@ -9528,7 +9528,7 @@ impl App {
                 ui.add_space(14.0);
                 theme::card_frame(p).show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("Security policy")
+                        egui::RichText::new(self.translations.ui_string("security_policy").unwrap_or("Security policy"))
                             .font(theme::f_sb(14.5))
                             .color(p.txt),
                     );
@@ -9556,17 +9556,17 @@ impl App {
 
                     row(
                         ui,
-                        "Always require user verification",
+                        self.translations.ui_string("always_require_uv").unwrap_or("Always require user verification"),
                         match always_uv {
-                            Some(true) => "On".to_string(),
-                            Some(false) => "Off".to_string(),
+                            Some(true) => "开启".to_string(),
+                            Some(false) => "关闭".to_string(),
                             None => "\u{2014}".to_string(),
                         },
                     );
                     ui.add_space(4.0);
                     row(
                         ui,
-                        "Minimum PIN length",
+                        self.translations.ui_string("min_pin_length").unwrap_or("Minimum PIN length"),
                         match min_pin {
                             Some(n) => n.to_string(),
                             None => "\u{2014}".to_string(),
@@ -9574,20 +9574,20 @@ impl App {
                     );
                     if force_change == Some(true) {
                         ui.add_space(4.0);
-                        row(ui, "Force PIN change", "Required on next use".to_string());
+                        row(ui, "强制更改 PIN", "下次使用时必需".to_string());
                     }
                     if let Some(ep) = ep {
                         ui.add_space(4.0);
                         row(
                             ui,
-                            "Enterprise attestation",
-                            if ep { "Enabled" } else { "Supported" }.to_string(),
+                            self.translations.ui_string("enterprise_attestation").unwrap_or("Enterprise attestation"),
+                            if ep { "已启用" } else { "已支持" }.to_string(),
                         );
                     }
 
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("Unlock to change these.")
+                        egui::RichText::new(self.translations.ui_string("unlock_to_change").unwrap_or("Unlock to change these."))
                             .font(theme::f_reg(11.5))
                             .color(p.txt3),
                     );
@@ -10063,22 +10063,20 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Reset this key")
+                        egui::RichText::new(self.translations.ui_string("reset_this_key").unwrap_or("Reset this key"))
                             .font(theme::f_sb(14.5))
                             .color(p.err),
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "reset");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset key\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("reset_key").unwrap_or("Reset key"))).clicked() {
                             arm_reset = true;
                         }
                     });
                 });
                 ui.label(
-                    egui::RichText::new(
-                        "Wipes every passkey and the PIN on this key. Cannot be undone.",
-                    )
+                    egui::RichText::new(self.translations.ui_string("reset_key_desc").unwrap_or("Wipes every passkey and the PIN on this key. Cannot be undone."))
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
                 );
@@ -12118,20 +12116,20 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Authenticator codes")
+                egui::RichText::new(self.translations.ui_string("auth_codes_oath").unwrap_or("Authenticator codes"))
                     .font(theme::f_sb(14.5))
                     .color(p.txt),
             );
             ui.add_space(6.0);
             self.help_dot(ui, p, "oath");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::button(ui, p, BtnKind::Primary, "+ Add credential").clicked() {
+                if theme::button(ui, p, BtnKind::Primary, &format!("+ {}", self.translations.ui_string("add_credential").unwrap_or("Add credential"))).clicked() {
                     // Opens the centered "New credential" modal (rendered in the
                     // update loop alongside the other credential modals).
                     self.oath.add = OathAddDialog::opened();
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
+                if theme::button(ui, p, BtnKind::Default, self.translations.ui_string("refresh").unwrap_or("Refresh")).clicked() {
                     self.load_oath_creds();
                 }
             });
@@ -12157,7 +12155,7 @@ impl App {
                             .password(true),
                     );
                     guard_secret_field(ui.ctx(), &resp);
-                    let submit = theme::button(ui, p, BtnKind::Primary, "Unlock").clicked();
+                    let submit = theme::button(ui, p, BtnKind::Primary, self.translations.ui_string("unlock").unwrap_or("Unlock")).clicked();
                     // Enter in the field submits too, matching the FIDO2 unlock card
                     // and the other inline credential fields in this redesign.
                     if submit
@@ -12176,7 +12174,7 @@ impl App {
         }
         if !self.oath.loaded {
             ui.label(
-                egui::RichText::new("Reading codes\u{2026}")
+                egui::RichText::new("读取验证码中...")
                     .font(theme::f_reg(13.0))
                     .color(p.txt3),
             );
@@ -12201,7 +12199,7 @@ impl App {
         if self.oath.creds.is_empty() {
             if self.oath.skipped == 0 {
                 ui.label(
-                    egui::RichText::new("No authenticator codes on this key.")
+                    egui::RichText::new(self.translations.ui_string("no_auth_codes").unwrap_or("No authenticator codes on this key."))
                         .font(theme::f_reg(13.0))
                         .color(p.txt3),
                 );
@@ -12283,21 +12281,19 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Reset applet")
+                        egui::RichText::new(self.translations.ui_string("reset_applet").unwrap_or("Reset applet"))
                             .font(theme::f_sb(14.5))
                             .color(p.err),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("reset_applet").unwrap_or("Reset applet"))).clicked() {
                             arm = true;
                         }
                     });
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Wipes every authenticator credential and clears the password. \
-                         Works without the password — this is the recovery for a \
-                         forgotten one. Cannot be undone.",
+                        "擦除所有身份验证器凭证并清除密码。无需密码即可使用——这是遗忘密码时的恢复方式。此操作无法撤销。",
                     )
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
@@ -12548,22 +12544,21 @@ impl App {
             // Generate on-card: label + help left, Generate pinned right.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Generate on-card")
+                    egui::RichText::new(self.translations.ui_string("generate_on_card").unwrap_or("Generate on-card"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "pgp-keys");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
+                    if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate").unwrap_or("Generate"))).clicked() {
                         open_modal = Some(OpenPgpCredKind::GenerateKey);
                     }
                 });
             });
             note(
                 ui,
-                "Generating OVERWRITES this key (clearable only by a full reset). \
-                 Prompts for the admin PIN; touch the key if it blinks.",
+                &self.translations.ui_string("generate_overwrites").unwrap_or("Generating OVERWRITES this key (clearable only by a full reset). Prompts for the admin PIN; touch the key if it blinks."),
             );
 
             ui.add_space(12.0);
@@ -12571,7 +12566,7 @@ impl App {
             // pinned right.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Import RSA-2048")
+                    egui::RichText::new(self.translations.ui_string("import_rsa_2048").unwrap_or("Import RSA-2048"))
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -12583,26 +12578,26 @@ impl App {
                 text_field(
                     ui,
                     p,
-                    "From file",
+                    self.translations.ui_string("from_file").unwrap_or("From file"),
                     &mut self.openpgp.import_path,
                     "/path/to/key.pem (PKCS#1/8, PEM or DER)",
                     240.0,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     browse_import_key =
-                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+                        theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("browse").unwrap_or("Browse"))).clicked();
                 });
             });
             let have_path = !self.openpgp.import_path.trim().is_empty();
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked()
+                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("import_file").unwrap_or("Import file"))).clicked()
                     && have_path
                 {
                     open_modal = Some(OpenPgpCredKind::ImportKeyFile);
                 }
                 ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Generate & import\u{2026}").clicked() {
+                if theme::button(ui, p, BtnKind::Default, &format!("{}\u{2026}", self.translations.ui_string("generate_import").unwrap_or("Generate & import"))).clicked() {
                     open_modal = Some(OpenPgpCredKind::GenerateImportKey);
                 }
             });
@@ -12618,22 +12613,21 @@ impl App {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Reset applet")
+                        egui::RichText::new(self.translations.ui_string("reset_applet").unwrap_or("Reset applet"))
                             .font(theme::f_sb(14.5))
                             .color(p.err),
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "reset");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
+                        if theme::button(ui, p, BtnKind::Danger, &format!("{}\u{2026}", self.translations.ui_string("reset_applet").unwrap_or("Reset applet"))).clicked() {
                             open_modal = Some(OpenPgpCredKind::Reset);
                         }
                     });
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Wipes ALL OpenPGP keys and restores default PINs. Works even if \
-                         the PINs are forgotten.",
+                        "擦除所有 OpenPGP 密钥并恢复默认 PIN。即使 PIN 已遗忘也可使用。",
                     )
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
@@ -13479,7 +13473,7 @@ impl App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("Connected").font(theme::f_sb(12.5)).color(p.txt2));
+                        ui.label(egui::RichText::new(self.translations.ui_string("connected").unwrap_or("Connected")).font(theme::f_sb(12.5)).color(p.txt2));
                         ui.add_space(5.0);
                         theme::status_dot(ui, p.ok, 8.0);
                     });
