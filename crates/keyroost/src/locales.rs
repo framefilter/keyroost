@@ -111,6 +111,19 @@ impl Translations {
         ui_strings.insert("learn_link", "Learn how to use this  ↗".to_string());
         ui_strings.insert("what_is_this", "What's this?".to_string());
         ui_strings.insert("touch_to_begin", "Touch the sensor to begin…".to_string());
+        ui_strings.insert("plug_key", "Plug in a security key to begin".to_string());
+        ui_strings.insert("plug_key_desc", "keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens.\nConnect one over USB and it shows up in the list on the left.".to_string());
+        ui_strings.insert("step1", "Insert your key into a USB port".to_string());
+        ui_strings.insert("step2", "It appears in the Devices list automatically".to_string());
+        ui_strings.insert("step3", "Select it to view and manage everything it can do".to_string());
+        ui_strings.insert("scan_devices", "Scan for devices".to_string());
+        ui_strings.insert("supported_devices", "Supported devices".to_string());
+        ui_strings.insert("settings", "Settings".to_string());
+        ui_strings.insert("language", "Language".to_string());
+        ui_strings.insert("refresh", "Refresh".to_string());
+        ui_strings.insert("devices", "DEVICES".to_string());
+        ui_strings.insert("no_keys", "No keys detected yet.".to_string());
+        ui_strings.insert("filter_keys", "Filter keys...".to_string());
 
         Self {
             help_titles,
@@ -178,6 +191,19 @@ impl Translations {
         ui_strings.insert("learn_link", "了解如何使用此功能  ↗".to_string());
         ui_strings.insert("what_is_this", "这是什么？".to_string());
         ui_strings.insert("touch_to_begin", "触摸传感器开始…".to_string());
+        ui_strings.insert("plug_key", "插入安全密钥以开始".to_string());
+        ui_strings.insert("plug_key_desc", "keyroost 管理 YubiKey、Nitrokey、SoloKeys 和 Token2 令牌。\n通过 USB 连接后，它会出现在左侧的列表中。".to_string());
+        ui_strings.insert("step1", "将密钥插入 USB 端口".to_string());
+        ui_strings.insert("step2", "它会自动出现在设备列表中".to_string());
+        ui_strings.insert("step3", "选择它以查看和管理所有功能".to_string());
+        ui_strings.insert("scan_devices", "扫描设备".to_string());
+        ui_strings.insert("supported_devices", "支持的设备".to_string());
+        ui_strings.insert("settings", "设置".to_string());
+        ui_strings.insert("language", "语言".to_string());
+        ui_strings.insert("refresh", "刷新".to_string());
+        ui_strings.insert("devices", "设备".to_string());
+        ui_strings.insert("no_keys", "尚未检测到密钥。".to_string());
+        ui_strings.insert("filter_keys", "筛选密钥...".to_string());
 
         Self {
             help_titles,

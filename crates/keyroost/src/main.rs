@@ -4678,14 +4678,14 @@ impl App {
         let mut close = false;
         let mut new_language = self.language;
 
-        egui::Window::new("Settings")
+        egui::Window::new(self.translations.ui_string("settings").unwrap_or("Settings"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("Language")
+                    egui::RichText::new(self.translations.ui_string("language").unwrap_or("Language"))
                         .font(theme::f_bold(14.0))
                         .color(p.txt),
                 );
@@ -7973,13 +7973,12 @@ impl App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("refresh").unwrap_or("Refresh")).clicked() {
                             self.schedule_scan_burst();
                         }
                         ui.add_space(4.0);
                         // Settings button
-                        let settings_color = if self.settings_open { p.accent } else { p.txt2 };
-                        if theme::button(ui, p, BtnKind::Ghost, "Settings").clicked() {
+                        if theme::button(ui, p, BtnKind::Ghost, self.translations.ui_string("settings").unwrap_or("Settings")).clicked() {
                             self.settings_open = !self.settings_open;
                         }
                         ui.add_space(4.0);
@@ -8266,7 +8265,7 @@ impl App {
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("DEVICES")
+                        egui::RichText::new(self.translations.ui_string("devices").unwrap_or("DEVICES"))
                             .font(theme::f_bold(11.0))
                             .color(p.txt3),
                     );
@@ -8288,7 +8287,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Filter keys\u{2026}")
+                        .hint_text(self.translations.ui_string("filter_keys").unwrap_or("Filter keys..."))
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(8.0);
@@ -8306,7 +8305,7 @@ impl App {
                             ui.add_space(12.0);
                             ui.vertical_centered(|ui| {
                                 ui.label(
-                                    egui::RichText::new("No keys detected yet.")
+                                    egui::RichText::new(self.translations.ui_string("no_keys").unwrap_or("No keys detected yet."))
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt3),
                                 );
@@ -8495,11 +8494,11 @@ impl App {
                         p.txt3,
                     );
                     ui.add_space(18.0);
-                    ui.label(egui::RichText::new("Plug in a security key to begin").font(theme::f_bold(19.0)).color(p.txt));
+                    ui.label(egui::RichText::new(self.translations.ui_string("plug_key").unwrap_or("Plug in a security key to begin")).font(theme::f_bold(19.0)).color(p.txt));
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens. Connect one over USB and it shows up in the list on the left.",
+                            self.translations.ui_string("plug_key_desc").unwrap_or("keyroost manages YubiKeys, Nitrokeys, SoloKeys and Token2 tokens. Connect one over USB and it shows up in the list on the left."),
                         )
                         .font(theme::f_reg(13.0))
                         .color(p.txt2),
@@ -8508,9 +8507,9 @@ impl App {
                     // Numbered steps: left-aligned within the centered column.
                     ui.allocate_ui_with_layout(egui::vec2(360.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                         for (n, step) in [
-                            "Insert your key into a USB port",
-                            "It appears in the Devices list automatically",
-                            "Select it to view and manage everything it can do",
+                            self.translations.ui_string("step1").unwrap_or("Insert your key into a USB port"),
+                            self.translations.ui_string("step2").unwrap_or("It appears in the Devices list automatically"),
+                            self.translations.ui_string("step3").unwrap_or("Select it to view and manage everything it can do"),
                         ]
                         .iter()
                         .enumerate()
@@ -8533,12 +8532,12 @@ impl App {
                     });
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Scan for devices").clicked() {
+                        if theme::button(ui, p, BtnKind::Primary, self.translations.ui_string("scan_devices").unwrap_or("Scan for devices")).clicked() {
                             self.schedule_scan_burst();
                         }
                         ui.add_space(8.0);
                         ui.hyperlink_to(
-                            egui::RichText::new("Supported devices \u{2197}").font(theme::f_sb(12.5)).color(p.accent),
+                            egui::RichText::new(format!("{} \u{2197}", self.translations.ui_string("supported_devices").unwrap_or("Supported devices"))).font(theme::f_sb(12.5)).color(p.accent),
                             ui::help::learn_url("/devices"),
                         );
                     });
