@@ -80,7 +80,7 @@ pollster = "0.4"
 # single frame. (ashpd needs Rust 1.92 — but so does this GUI crate via egui 0.35,
 # so `qr` adds no MSRV burden beyond the crate's own rust-version above.)
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", optional = true }
+x11rb = { version = "0.14", optional = true }
 # `screenshot` is the portal we use; `async-io` drives it on zbus's async-io
 # runtime (no tokio), which `pollster::block_on` can run. `trash` is only here to
 # work around an ashpd 0.13.12 bug: its `screenshot` feature references
