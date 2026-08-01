@@ -64,7 +64,7 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "w
 # Tiny pure-Rust executor used only to drive rfd's async portal dialogs to
 # completion on a throwaway helper thread. Already in the tree via rfd; declared
 # directly so `pollster::block_on` is callable.
-pollster = "0.4"
+pollster = "1.0"
 
 # QR-from-screen (optional; `--features qr`): a lightweight, STILL-only screen
 # grab that keeps the one-click UX without a video-capture stack. Decoding
