@@ -54,7 +54,7 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 # Raw-DEFLATE inflate for the compressed largeBlob plaintext. Pure Rust;
 # already transitively in the tree.
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 
 # Auto-select the hidapi I/O backend on macOS / Windows (Linux keeps the
 # dependency-free hidraw File backend).
