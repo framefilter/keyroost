@@ -312,11 +312,59 @@ struct ResetArm {
     /// key" prompt above all — has to check that this is still the key on
     /// screen before saying anything.
     for_device: Option<DeviceId>,
-    /// FIDO HID paths present at the previous poll, to diff against (path mode).
-    prev_paths: Vec<std::path::PathBuf>,
+    /// FIDO HID devices present at the previous poll, to diff against (path
+    /// mode) — see [`HidIdentity`] for why this isn't a plain `Vec<PathBuf>`.
+    prev_devices: Vec<HidIdentity>,
     /// True once the armed key has been unplugged; the next fresh insertion then
     /// fires the reset.
     saw_removal: bool,
+}
+
+/// One HID device's physical-connection identity at a poll, used to tell a
+/// genuine reinsertion apart from a device that was there all along.
+///
+/// `/dev/hidrawN` paths are not proof of "the same still-connected device":
+/// the kernel reuses a freed hidraw minor number, so an unplug immediately
+/// followed by a replug can hand the reinserted key the very same path the
+/// old one had (`hidraw0` -> disconnect -> `hidraw0` again), even though the
+/// USB device number underneath it advanced (observed on hardware: `usb 1-3:
+/// USB disconnect, device number 8` followed by `new full-speed USB device
+/// number 9` — same `hidraw0`, different device). A path-only diff then reads
+/// the reinserted key as "not fresh" — it's still in the previous snapshot by
+/// that path — and the armed reset never fires; the touch prompt waits
+/// forever for a replug the code already missed.
+///
+/// `usb_bus`/`usb_address` (sysfs `busnum`/`devnum`) are the kernel's own
+/// per-attach counters, so they're what [`same_hid_connection`] compares
+/// first. `hidapi` (macOS/Windows) doesn't expose USB topology, so identity
+/// there falls back to the path — no better than before on those platforms,
+/// but no worse either.
+#[derive(Clone)]
+struct HidIdentity {
+    path: std::path::PathBuf,
+    usb_bus: Option<u8>,
+    usb_address: Option<u8>,
+}
+
+impl HidIdentity {
+    fn of(d: &FidoHid) -> Self {
+        HidIdentity {
+            path: d.path.clone(),
+            usb_bus: d.usb_bus,
+            usb_address: d.usb_address,
+        }
+    }
+}
+
+/// Whether `a` and `b` are the same physical USB attach, for telling a
+/// reinserted key apart from one that never left. Bus+address decide it when
+/// both sides have them; otherwise this falls back to path equality, all the
+/// hidapi backend can offer.
+fn same_hid_connection(a: &HidIdentity, b: &HidIdentity) -> bool {
+    match (a.usb_bus, a.usb_address, b.usb_bus, b.usb_address) {
+        (Some(ab), Some(aa), Some(bb), Some(ba)) => ab == bb && aa == ba,
+        _ => a.path == b.path,
+    }
 }
 
 /// The device an open rename field is bound to, pinned when the field opens so
@@ -353,6 +401,11 @@ struct FidoHid {
     path: std::path::PathBuf,
     serial: Option<String>,
     ids: (u16, u16),
+    /// USB bus/device-address of the underlying device (Linux sysfs backend
+    /// only; `None` on the hidapi backend). Used by [`same_hid_connection`] to
+    /// tell a reinserted key apart from a recycled `/dev/hidrawN` path.
+    usb_bus: Option<u8>,
+    usb_address: Option<u8>,
 }
 
 #[derive(Default)]
@@ -4990,7 +5043,7 @@ impl App {
                 target_ids,
                 target_effective_serial,
                 for_device: self.selected_device.clone(),
-                prev_paths: devices.into_iter().map(|d| d.path).collect(),
+                prev_devices: devices.iter().map(HidIdentity::of).collect(),
                 saw_removal: false,
             });
         }
@@ -5009,23 +5062,44 @@ impl App {
                 path: h.path,
                 serial: h.serial_number,
                 ids: (h.vendor_id, h.product_id),
+                usb_bus: h.usb_bus,
+                usb_address: h.usb_address,
             })
             .collect()
     }
 
-    /// The resolver's stable identity for the FIDO HID device at `path`: its
-    /// USB iSerialNumber, else a CCID-read YubiKey serial. `None` when the
-    /// device is gone or the identity can't be read *yet* (a just-replugged
-    /// key's CCID interface takes a beat to register with pcscd) — callers
-    /// retry on the next poll rather than guessing.
+    /// The resolver's stable identity for the FIDO HID device at `path`, read
+    /// the same way `target_effective_serial` was captured at arm time: the
+    /// full `keyroost_resolve` correlation (HID + PC/SC probe), not just a
+    /// USB iSerialNumber or a YubiKey CCID serial.
+    ///
+    /// This used to call [`keyroost_resolve::read_effective_serial`], which
+    /// only ever resolves a HID `iSerialNumber` or — for `VID_YUBICO`
+    /// specifically — a YubiKey CCID serial; every other card-derived serial
+    /// (a Token2 PIN+/Bio3 key's OpenPGP-applet serial among them) made it
+    /// return `Err` unconditionally. `target_effective_serial`, by contrast,
+    /// comes from `self.selected_device()`, i.e. the *full* `correlate()`
+    /// merge that `keyroost_resolve::enumerate()` runs — which pulls a
+    /// serial from whichever applet a probed reader exposes, not only
+    /// YubiKey's. So a serial-less Token2 FIDO+PGP key would arm (find a
+    /// non-empty `target_effective_serial` from that merge) but could then
+    /// never re-match on reinsertion (this function permanently returning
+    /// `None` for it) — the reset dispatched at arm time was live, but the
+    /// touch prompt never fires because `reset_reinsert_matches` never sees
+    /// two `Some`s to compare. Matches the CLI's `fido_reset_after_replug`,
+    /// which resolves the reinserted key with the identical
+    /// `keyroost_resolve::enumerate()` call for exactly this reason.
+    ///
+    /// `None` when the device is gone or the identity can't be read *yet* (a
+    /// just-replugged key's CCID interface takes a beat to register with
+    /// pcscd) — callers retry on the next poll rather than guessing.
     fn fido_effective_serial(path: &std::path::Path) -> Option<String> {
-        let dev = keyroost_hid::enumerate()
+        keyroost_resolve::enumerate()
             .unwrap_or_default()
             .into_iter()
-            .find(|d| d.path == path)?;
-        keyroost_resolve::read_effective_serial(&dev)
-            .ok()
-            .map(|(serial, _)| serial)
+            .find(|d| d.hid_path.as_deref() == Some(path))
+            .map(|d| d.serial)
+            .filter(|s| !s.is_empty())
     }
 
     /// Poll the live FIDO list while a reset is armed: once the armed key has
@@ -5069,10 +5143,13 @@ impl App {
                 }
             } else {
                 // Effective-serial mode (no HID serial, e.g. most YubiKeys):
-                // the armed path leaving is the unplug; a fresh path is
-                // accepted as the re-insert only when its stable identity
-                // matches the armed key's. The CCID probe runs only for a
-                // model-matching fresh path, and only after removal.
+                // the armed path leaving is the unplug; a fresh *connection*
+                // (see `HidIdentity` — not just a path unseen before, since a
+                // hidraw minor number can be recycled straight back onto the
+                // replugged key) is accepted as the re-insert only when its
+                // stable identity matches the armed key's. The CCID probe
+                // runs only for a model-matching fresh connection, and only
+                // after removal.
                 let present = |p: &std::path::PathBuf| current.iter().any(|d| &d.path == p);
                 match &arm.target_path {
                     Some(t) if !present(t) => arm.saw_removal = true,
@@ -5082,7 +5159,10 @@ impl App {
                     fire = current
                         .iter()
                         .filter(|d| arm.target_ids.is_none() || arm.target_ids == Some(d.ids))
-                        .filter(|d| !arm.prev_paths.contains(&d.path))
+                        .filter(|d| {
+                            let id = HidIdentity::of(d);
+                            !arm.prev_devices.iter().any(|p| same_hid_connection(p, &id))
+                        })
                         .find(|d| {
                             let cand_eff = Self::fido_effective_serial(&d.path);
                             reset_reinsert_matches(
@@ -5102,8 +5182,9 @@ impl App {
             Some(path) => {
                 // The replug window is one-shot. If the worker is mid-job the
                 // submission is refused — keep the arm (and the stale
-                // prev_paths, so the fresh path still counts as new) and let
-                // the next poll retry instead of silently losing the reset.
+                // prev_devices, so the fresh connection still counts as new)
+                // and let the next poll retry instead of silently losing the
+                // reset.
                 if self.submit_reset_path(path) {
                     self.reset_arm = None;
                     self.security_keys.reset = ResetDialog::default();
@@ -5112,11 +5193,11 @@ impl App {
             None => {
                 if let Some(arm) = self.reset_arm.as_mut() {
                     // Refresh the snapshot only until the unplug. After
-                    // removal it must stay frozen: a fresh path whose CCID
+                    // removal it must stay frozen: a fresh connection whose CCID
                     // serial isn't readable yet has to still count as fresh
                     // on the next poll, or the retry could never fire.
                     if !arm.saw_removal {
-                        arm.prev_paths = current.into_iter().map(|d| d.path).collect();
+                        arm.prev_devices = current.iter().map(HidIdentity::of).collect();
                     }
                 }
             }
@@ -14929,7 +15010,7 @@ mod tests {
             target_ids: None,
             target_effective_serial: Some("AAA".into()),
             for_device: app.selected_device.clone(),
-            prev_paths: Vec::new(),
+            prev_devices: Vec::new(),
             saw_removal: true,
         });
 
@@ -14959,7 +15040,7 @@ mod tests {
             target_ids: None,
             target_effective_serial: Some("AAA".into()),
             for_device: Some(for_device.into()),
-            prev_paths: Vec::new(),
+            prev_devices: Vec::new(),
             saw_removal: true,
         }
     }
@@ -16342,6 +16423,72 @@ mod tests {
             Some("15731286"),
             (0x20a0, 0x42b2)
         ));
+    }
+
+    /// The bug this guards against: the kernel reuses a freed hidraw minor
+    /// number, so a replug can hand the reinserted key the exact same
+    /// `/dev/hidrawN` path the unplugged one had, while its USB device number
+    /// (bus/address) has moved on. Reproduced on hardware: `hidraw0` before
+    /// and after, `usb 1-3: ... device number 8` then `device number 9`. A
+    /// path-only diff would call this candidate "not fresh" and the armed
+    /// reset would never fire — the GUI hangs on the touch prompt forever.
+    #[test]
+    fn same_hid_connection_tells_a_recycled_path_apart_from_the_old_device() {
+        let before = HidIdentity {
+            path: "/dev/hidraw0".into(),
+            usb_bus: Some(1),
+            usb_address: Some(8),
+        };
+        let after_replug = HidIdentity {
+            path: "/dev/hidraw0".into(), // recycled by the kernel
+            usb_bus: Some(1),
+            usb_address: Some(9), // advanced: a genuinely new attach
+        };
+        assert!(
+            !same_hid_connection(&before, &after_replug),
+            "same path, different device number: must count as a fresh connection"
+        );
+    }
+
+    /// A device that never left keeps its bus/address, even if some unrelated
+    /// churn elsewhere reshuffled other devices' hidraw paths.
+    #[test]
+    fn same_hid_connection_recognises_a_device_that_never_left() {
+        let seen_before = HidIdentity {
+            path: "/dev/hidraw1".into(),
+            usb_bus: Some(1),
+            usb_address: Some(4),
+        };
+        let seen_again = HidIdentity {
+            path: "/dev/hidraw1".into(),
+            usb_bus: Some(1),
+            usb_address: Some(4),
+        };
+        assert!(same_hid_connection(&seen_before, &seen_again));
+    }
+
+    /// Without USB topology (the hidapi backend on macOS/Windows exposes
+    /// none), identity falls back to the path — the pre-fix behaviour, kept
+    /// as the best available signal on those platforms.
+    #[test]
+    fn same_hid_connection_falls_back_to_path_without_usb_topology() {
+        let a = HidIdentity {
+            path: "/dev/hidraw0".into(),
+            usb_bus: None,
+            usb_address: None,
+        };
+        let b = HidIdentity {
+            path: "/dev/hidraw0".into(),
+            usb_bus: None,
+            usb_address: None,
+        };
+        let c = HidIdentity {
+            path: "/dev/hidraw1".into(),
+            usb_bus: None,
+            usb_address: None,
+        };
+        assert!(same_hid_connection(&a, &b));
+        assert!(!same_hid_connection(&a, &c));
     }
 }
 
