@@ -635,6 +635,62 @@ fn build_apdu_ext(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8], le: Option<u16>
     out
 }
 
+/// Split `data` into an ISO 7816-4 command-chaining sequence: every chunk but
+/// the last carries the chaining class bit (`CLA` `0x10`), the final chunk
+/// clears it and (if `final_le` is given) appends a one-byte short-form `Le`.
+/// Each chunk is a case-3/case-4 APDU `cla[|0x10] ins p1 p2 Lc <chunk> [Le]`
+/// with a plain one-byte `Lc` — chaining links are always short-form, that's
+/// the whole point of the fallback. The card reassembles the chunks into one
+/// logical command whose data field is byte-identical to what a single
+/// extended-length APDU (see [`build_apdu_ext`]) would have carried.
+///
+/// This is the fallback for cards/readers that reject a single extended-`Lc`
+/// APDU outright but parse ISO 7816-4 chaining fine — see
+/// [`general_auth_sign_chained`] / [`put_data_chained`].
+///
+/// # Panics
+/// Panics if `max_chunk` is 0 or greater than 255 (a single-byte `Lc` can't
+/// exceed 255).
+fn chain_apdu(
+    cla: u8,
+    ins: u8,
+    p1: u8,
+    p2: u8,
+    data: &[u8],
+    max_chunk: usize,
+    final_le: Option<u8>,
+) -> Vec<Vec<u8>> {
+    assert!(
+        (1..=255).contains(&max_chunk),
+        "command-chaining chunk size must be 1..=255"
+    );
+    if data.is_empty() {
+        let mut apdu = vec![cla, ins, p1, p2, 0x00];
+        if let Some(le) = final_le {
+            apdu.push(le);
+        }
+        return vec![apdu];
+    }
+    let chunks: Vec<&[u8]> = data.chunks(max_chunk).collect();
+    let last = chunks.len() - 1;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let chained_cla = if i < last { cla | 0x10 } else { cla };
+            let mut apdu = Vec::with_capacity(5 + chunk.len() + 1);
+            apdu.extend_from_slice(&[chained_cla, ins, p1, p2, chunk.len() as u8]);
+            apdu.extend_from_slice(chunk);
+            if i == last {
+                if let Some(le) = final_le {
+                    apdu.push(le);
+                }
+            }
+            apdu
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Write / auth APDU builders
 // ---------------------------------------------------------------------------
@@ -681,24 +737,63 @@ pub fn general_auth_mutual(
     )
 }
 
+/// The GENERAL AUTHENTICATE dynamic-authentication template body shared by
+/// [`general_auth_sign`] (single extended-length APDU) and
+/// [`general_auth_sign_chained`] (ISO 7816-4 command chaining): `7C L 82 00
+/// 81 <l> <payload>`.
+fn general_auth_sign_data(payload: &[u8]) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(payload.len() + 6);
+    inner.extend_from_slice(&[0x82, 0x00]); // response tag, empty: "give me the answer"
+    push_tlv(&mut inner, &[0x81], payload); // challenge / data to sign
+    let mut data = Vec::with_capacity(inner.len() + 4);
+    push_tlv(&mut data, &[TAG_DYN_AUTH], &inner);
+    data
+}
+
 /// GENERAL AUTHENTICATE in signing mode: ask a key slot to sign/decrypt
 /// `payload` (a PKCS#1 block for RSA, or a raw hash for ECC). The card replies
 /// with `7C L 82 <l> <result>`. `key_alg` is the slot's algorithm (P1),
 /// `key_ref` its slot (P2).
 #[must_use]
 pub fn general_auth_sign(key_alg: KeyAlg, key_ref: u8, payload: &[u8]) -> Vec<u8> {
-    let mut inner = Vec::with_capacity(payload.len() + 6);
-    inner.extend_from_slice(&[0x82, 0x00]); // response tag, empty: "give me the answer"
-    push_tlv(&mut inner, &[0x81], payload); // challenge / data to sign
-    let mut data = Vec::with_capacity(inner.len() + 4);
-    push_tlv(&mut data, &[TAG_DYN_AUTH], &inner);
     build_apdu_ext(
         0x00,
         Instruction::GeneralAuthenticate.code(),
         key_alg.id(),
         key_ref,
-        &data,
+        &general_auth_sign_data(payload),
         Some(0), // large RSA result: request the lot
+    )
+}
+
+/// Command-chaining form of [`general_auth_sign`]: the same dynamic-auth
+/// template, emitted as a sequence of chained `0x87` GENERAL AUTHENTICATE
+/// APDUs (see [`chain_apdu`]) instead of one extended-length APDU. The final
+/// chunk requests a short-form `Le` of `0x00` ("up to 256 bytes"); a reply
+/// longer than that still chains normally through `61xx`/GET RESPONSE, which
+/// is unaffected by how the *command* was sent.
+///
+/// This is the fallback for cards/readers that reject a single extended-`Lc`
+/// GENERAL AUTHENTICATE outright — observed on a Token2 PIV token's contact
+/// interface, which answers such a command with `SW=6A80` for both an
+/// RSA-2048 signature (256-byte payload) and (see
+/// [`put_data_chained`]) a PUT DATA certificate import, while accepting the
+/// identical data chained.
+#[must_use]
+pub fn general_auth_sign_chained(
+    key_alg: KeyAlg,
+    key_ref: u8,
+    payload: &[u8],
+    max_chunk: usize,
+) -> Vec<Vec<u8>> {
+    chain_apdu(
+        0x00,
+        Instruction::GeneralAuthenticate.code(),
+        key_alg.id(),
+        key_ref,
+        &general_auth_sign_data(payload),
+        max_chunk,
+        Some(0x00),
     )
 }
 
@@ -732,20 +827,47 @@ pub fn generate_key(
     )
 }
 
+/// The PUT DATA body shared by [`put_data`] (single extended-length APDU) and
+/// [`put_data_chained`] (ISO 7816-4 command chaining): `5C <tag> 53 <value>`.
+fn put_data_body(tag: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(tag.len() + value.len() + 8);
+    push_tlv(&mut data, &[TAG_OBJECT_SELECTOR], tag); // 5C <tag>
+    push_tlv(&mut data, &[TAG_DATA_TEMPLATE], value); // 53 <value>
+    data
+}
+
 /// PUT DATA for the 3-byte object `tag`, writing `value` wrapped in the `0x53`
 /// template. Used to import a slot certificate (see [`encode_certificate`]).
 /// Requires management-key authentication.
 #[must_use]
 pub fn put_data(tag: &[u8], value: &[u8]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(tag.len() + value.len() + 8);
-    push_tlv(&mut data, &[TAG_OBJECT_SELECTOR], tag); // 5C <tag>
-    push_tlv(&mut data, &[TAG_DATA_TEMPLATE], value); // 53 <value>
     build_apdu_ext(
         0x00,
         Instruction::PutData.code(),
         GET_DATA_P1,
         GET_DATA_P2,
-        &data,
+        &put_data_body(tag, value),
+        None,
+    )
+}
+
+/// Command-chaining form of [`put_data`]: the same `5C`/`53` body, emitted as
+/// a sequence of chained `0xDB` PUT DATA APDUs (see [`chain_apdu`]) instead of
+/// one extended-length APDU. PUT DATA returns no data, so no chunk requests an
+/// `Le`.
+///
+/// This is the fallback for cards/readers that reject a single extended-`Lc`
+/// PUT DATA outright — see [`general_auth_sign_chained`] for the confirmed
+/// Token2 PIV case this addresses.
+#[must_use]
+pub fn put_data_chained(tag: &[u8], value: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
+    chain_apdu(
+        0x00,
+        Instruction::PutData.code(),
+        GET_DATA_P1,
+        GET_DATA_P2,
+        &put_data_body(tag, value),
+        max_chunk,
         None,
     )
 }
@@ -1401,6 +1523,47 @@ mod tests {
     }
 
     #[test]
+    fn put_data_chained_single_chunk_clears_chain_bit() {
+        let value = vec![0xDE, 0xAD];
+        let tag = Slot::Signature.cert_object_tag();
+        let chunks = put_data_chained(&tag, &value, 254);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0][0], 0x00); // no chaining bit: fits in one link
+        assert_eq!(chunks[0][1], 0xDB); // PUT DATA
+    }
+
+    #[test]
+    fn put_data_chained_reassembles_to_extended_body() {
+        // The chained chunks' data fields must concatenate to exactly the
+        // same body a single extended-length PUT DATA would carry.
+        let der = vec![0x11u8; 1024];
+        let value = encode_certificate(&der);
+        let tag = Slot::Signature.cert_object_tag();
+
+        let extended = put_data(&tag, &value);
+        // Extended form: 00 DB 3F FF 00 <2-byte Lc> <body>.
+        let ext_lc = ((extended[5] as usize) << 8) | extended[6] as usize;
+        let ext_body = &extended[7..7 + ext_lc];
+
+        let chunks = put_data_chained(&tag, &value, 254);
+        assert!(chunks.len() > 1); // 1024+ bytes doesn't fit one 254-byte link
+        let last = chunks.len() - 1;
+        let mut reassembled = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected_cla = if i < last { 0x10 } else { 0x00 };
+            assert_eq!(chunk[0], expected_cla);
+            assert_eq!(chunk[1], 0xDB);
+            let lc = chunk[4] as usize;
+            assert!(lc <= 254);
+            reassembled.extend_from_slice(&chunk[5..5 + lc]);
+            if i == last {
+                assert_eq!(chunk.len(), 5 + lc); // PUT DATA requests no Le
+            }
+        }
+        assert_eq!(reassembled, ext_body);
+    }
+
+    #[test]
     fn encode_certificate_wraps_der() {
         let der = [0xAB, 0xCD, 0xEF];
         // 70 03 AB CD EF 71 01 00 FE 00
@@ -1511,6 +1674,50 @@ mod tests {
         assert_eq!(&apdu[7..11], &[0x7C, 0x82, 0x01, 0x06]);
         assert_eq!(&apdu[apdu.len() - 2..], &[0x00, 0x00]);
         assert_eq!(apdu.len(), 7 + lc + 2);
+    }
+
+    #[test]
+    fn general_auth_sign_chained_single_chunk_keeps_le() {
+        let chunks =
+            general_auth_sign_chained(KeyAlg::EccP256, 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD], 254);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0],
+            vec![
+                0x00, 0x87, 0x11, 0x9A, 0x0A, 0x7C, 0x08, 0x82, 0x00, 0x81, 0x04, 0xAA, 0xBB, 0xCC,
+                0xDD, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn general_auth_sign_chained_reassembles_to_extended_body() {
+        // The chained chunks' bodies must reassemble to exactly the same
+        // dynamic-auth template a single extended-length APDU would carry,
+        // and only the final chunk carries Le.
+        let payload = [0x55u8; 256]; // RSA-2048 prepared block
+        let extended = general_auth_sign(KeyAlg::Rsa2048, 0x9A, &payload);
+        let ext_lc = ((extended[5] as usize) << 8) | extended[6] as usize;
+        let ext_body = &extended[7..7 + ext_lc];
+
+        let chunks = general_auth_sign_chained(KeyAlg::Rsa2048, 0x9A, &payload, 254);
+        assert!(chunks.len() > 1);
+        let last = chunks.len() - 1;
+        let mut reassembled = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let expected_cla = if i < last { 0x10 } else { 0x00 };
+            assert_eq!(chunk[0], expected_cla);
+            assert_eq!(&chunk[1..4], &[0x87, 0x07, 0x9A]); // INS, P1 (RSA-2048), P2
+            let lc = chunk[4] as usize;
+            assert!(lc <= 254);
+            reassembled.extend_from_slice(&chunk[5..5 + lc]);
+            if i == last {
+                assert_eq!(&chunk[5 + lc..], &[0x00]); // short-form Le on the final link only
+            } else {
+                assert_eq!(chunk.len(), 5 + lc); // no Le on intermediate links
+            }
+        }
+        assert_eq!(reassembled, ext_body);
     }
 
     #[test]

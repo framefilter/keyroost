@@ -532,9 +532,41 @@ impl PivSession {
 
     /// Import a DER-encoded X.509 certificate into `slot`. Requires prior
     /// management-key auth.
+    ///
+    /// Tries a single extended-length PUT DATA first; a cert big enough to
+    /// need one (any real X.509 cert typically is) that gets rejected falls
+    /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why.
     pub fn import_certificate(&mut self, slot: Slot, der: &[u8]) -> Result<(), TransportError> {
         let value = piv::encode_certificate(der);
-        let (_, sw) = self.transmit_full(&piv::put_data(&slot.cert_object_tag(), &value))?;
+        let tag = slot.cert_object_tag();
+        let apdu = piv::put_data(&tag, &value);
+        let sw = if force_chaining() {
+            if self.debug {
+                eprintln!("! piv import certificate: forcing command chaining (env override)");
+            }
+            self.transmit_chain(
+                "piv import certificate",
+                &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
+            )?
+            .1
+        } else {
+            let (_, sw) = self.transmit_full(&apdu)?;
+            if sw == piv::SW_OK || !uses_extended_length(&apdu) {
+                sw
+            } else {
+                if self.debug {
+                    eprintln!(
+                        "! piv import certificate: extended length rejected (SW={sw:04X}); \
+                         retrying with command chaining"
+                    );
+                }
+                self.transmit_chain(
+                    "piv import certificate",
+                    &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
+                )?
+                .1
+            }
+        };
         ok_or_write("piv import certificate", sw)
     }
 
@@ -671,14 +703,52 @@ impl PivSession {
     /// PIN-per-use. ECDSA signatures come back DER-encoded (`SEQUENCE{r,s}`),
     /// RSA/Ed25519 as raw blocks — either drops verbatim into an X.509
     /// signature BIT STRING.
+    ///
+    /// Tries a single extended-length GENERAL AUTHENTICATE first; for a key
+    /// large enough to need one (RSA-2048+, or Ed25519 with a long enough
+    /// TBS) that gets rejected falls back to ISO 7816-4 command chaining —
+    /// confirmed necessary on a Token2 PIV token's contact interface, which
+    /// answers a well-formed extended-`Lc` GENERAL AUTHENTICATE/PUT DATA with
+    /// `SW=6A80` (unlike the `6700`/`6883` YubiKey's OpenPGP applet uses for
+    /// the same condition — see
+    /// [`OpenPgpSession::import_key`](crate::OpenPgpSession::import_key)) but
+    /// accepts the identical data chained. The fallback only fires when the
+    /// first attempt actually used extended-length encoding, so a genuine
+    /// error on a short-form command (bad PIN state, wrong key, …) isn't
+    /// retried.
     pub fn sign(
         &mut self,
         slot: Slot,
         alg: KeyAlg,
         prepared: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
-        let (data, sw) =
-            self.transmit_full(&piv::general_auth_sign(alg, slot.key_ref(), prepared))?;
+        let key_ref = slot.key_ref();
+        let apdu = piv::general_auth_sign(alg, key_ref, prepared);
+        let (data, sw) = if force_chaining() {
+            if self.debug {
+                eprintln!("! piv sign: forcing command chaining (env override)");
+            }
+            self.transmit_chain(
+                "piv sign",
+                &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
+            )?
+        } else {
+            let (data, sw) = self.transmit_full(&apdu)?;
+            if sw == piv::SW_OK || !uses_extended_length(&apdu) {
+                (data, sw)
+            } else {
+                if self.debug {
+                    eprintln!(
+                        "! piv sign: extended length rejected (SW={sw:04X}); retrying with \
+                         command chaining"
+                    );
+                }
+                self.transmit_chain(
+                    "piv sign",
+                    &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
+                )?
+            }
+        };
         ok_or_write("piv sign", sw)?;
         piv::parse_general_auth(&data, 0x82)
             .map(<[u8]>::to_vec)
@@ -988,6 +1058,59 @@ impl PivSession {
             resp_sensitive,
         )
     }
+
+    /// Transmit an ISO 7816-4 command-chaining sequence (see
+    /// [`keyroost_piv::general_auth_sign_chained`] /
+    /// [`keyroost_piv::put_data_chained`]): every intermediate chunk must be
+    /// accepted with `9000` or the chain aborts; the final chunk's status
+    /// word and (already `61xx`-reassembled) response payload are returned
+    /// as-is for the caller to interpret. Mirrors
+    /// [`OpenPgpSession::transmit_chain`](crate::OpenPgpSession), added here
+    /// for the same reason: extended-length rejection ([`Self::sign`],
+    /// [`Self::import_certificate`]).
+    fn transmit_chain(
+        &mut self,
+        label: &'static str,
+        chunks: &[Vec<u8>],
+    ) -> Result<(Vec<u8>, u16), TransportError> {
+        let last = chunks.len().saturating_sub(1);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let (data, sw) = self.transmit_full(chunk)?;
+            if i == last {
+                return Ok((data, sw));
+            }
+            // An intermediate chain link the card didn't accept (anything but
+            // 9000) aborts the chain.
+            if sw != piv::SW_OK {
+                return Err(TransportError::Apdu {
+                    label,
+                    sw1: (sw >> 8) as u8,
+                    sw2: sw as u8,
+                });
+            }
+        }
+        Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
+    }
+}
+
+/// Chunk size for the command-chaining fallback, matching the 254-byte chunks
+/// [`keyroost-openpgp`](keyroost_openpgp)'s equivalent fallback uses (GnuPG's
+/// `exmode = -254`, one byte short of the short-form `Lc` ceiling).
+const CHAIN_CHUNK: usize = 254;
+
+/// Whether `apdu` — built by [`piv::general_auth_sign`] or [`piv::put_data`],
+/// whose data field is never empty — used extended-length encoding. Both
+/// always emit a non-zero short-form `Lc` for a body that fits in one byte,
+/// so byte 4 being the `0x00` extended-length marker is unambiguous.
+fn uses_extended_length(apdu: &[u8]) -> bool {
+    apdu.get(4) == Some(&0x00)
+}
+
+/// `KEYROOST_PIV_FORCE_CHAINING` forces the command-chaining path (so the
+/// fallback can be exercised on a card that also accepts extended length —
+/// mirrors `KEYROOST_OPENPGP_FORCE_CHAINING`).
+fn force_chaining() -> bool {
+    std::env::var_os("KEYROOST_PIV_FORCE_CHAINING").is_some()
 }
 
 /// Turn to-be-signed bytes into the block the card's GENERAL AUTHENTICATE
