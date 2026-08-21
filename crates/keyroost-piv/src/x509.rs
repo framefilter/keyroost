@@ -178,9 +178,24 @@ impl SubjectName {
     }
 }
 
+/// Latest `unix_secs` [`der_time`] can encode without producing a malformed
+/// (5+-digit-year) GeneralizedTime: the last second of
+/// `crate::MAX_EXPIRATION_YEAR`-12-31 — the same ceiling
+/// [`crate::chuid_expiration_in_days`] clamps to, so a CHUID and a
+/// certificate's validity period saturate at the identical date.
+fn max_der_time_unix_secs() -> i64 {
+    crate::days_from_civil(crate::MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+}
+
 /// `Time` per RFC 5280: UTCTime (`YYMMDDHHMMSSZ`) for dates through 2049,
-/// GeneralizedTime (`YYYYMMDDHHMMSSZ`) from 2050 on.
+/// GeneralizedTime (`YYYYMMDDHHMMSSZ`) from 2050 on. `unix_secs` is clamped
+/// to [`max_der_time_unix_secs`] first — not just the resulting year — so an
+/// out-of-range input saturates cleanly at that date instead of leaking an
+/// unclamped month/day/time that could read as *earlier* than a smaller
+/// input produces (see [`crate::chuid_expiration_in_days`]'s doc comment for
+/// why a year-only clamp is the wrong shape).
 fn der_time(unix_secs: i64) -> Vec<u8> {
+    let unix_secs = unix_secs.min(max_der_time_unix_secs());
     let (y, mo, d, h, mi, s) = civil_from_unix(unix_secs);
     if (1950..2050).contains(&y) {
         let yy = (y % 100) as u32;
@@ -348,6 +363,18 @@ mod tests {
         assert_eq!(der_time(1_781_222_400), der_tlv(0x17, b"260612000000Z"));
         // 2050-01-01 00:00:00 UTC = 2524608000 → GeneralizedTime.
         assert_eq!(der_time(2_524_608_000), der_tlv(0x18, b"20500101000000Z"));
+    }
+
+    #[test]
+    fn der_time_clamps_to_the_last_second_of_9999() {
+        let max = max_der_time_unix_secs();
+        assert_eq!(der_time(max), der_tlv(0x18, b"99991231235959Z"));
+        // Anything beyond the ceiling saturates at the same value — not a
+        // 5+-digit-year GeneralizedTime, and not an earlier-looking date
+        // from an unclamped month/day (the failure mode a year-only clamp
+        // would have).
+        assert_eq!(der_time(max + 1), der_tlv(0x18, b"99991231235959Z"));
+        assert_eq!(der_time(i64::MAX), der_tlv(0x18, b"99991231235959Z"));
     }
 
     #[test]

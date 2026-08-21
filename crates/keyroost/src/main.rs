@@ -1296,6 +1296,7 @@ enum PivCredKind {
     DeleteCert,
     DeleteKey,
     MoveKey,
+    NewChuid,
 }
 
 impl PivCredKind {
@@ -1314,6 +1315,7 @@ impl PivCredKind {
             PivCredKind::DeleteCert => "Delete certificate",
             PivCredKind::DeleteKey => "Delete key",
             PivCredKind::MoveKey => "Move key",
+            PivCredKind::NewChuid => "New CHUID",
         }
     }
     /// Label for the modal's primary Submit button. Shorter than the title for
@@ -1329,6 +1331,7 @@ impl PivCredKind {
             PivCredKind::DeleteCert => "Delete",
             PivCredKind::DeleteKey => "Delete",
             PivCredKind::MoveKey => "Move",
+            PivCredKind::NewChuid => "Write",
             _ => self.title(),
         }
     }
@@ -1348,6 +1351,7 @@ impl PivCredKind {
             PivCredKind::DeleteCert => "Deleting certificate\u{2026}",
             PivCredKind::DeleteKey => "Deleting key\u{2026}",
             PivCredKind::MoveKey => "Moving key\u{2026}",
+            PivCredKind::NewChuid => "Writing a new CHUID\u{2026}",
         }
     }
     /// True when this flow collects the *current* management key (and therefore
@@ -1363,6 +1367,7 @@ impl PivCredKind {
                 | PivCredKind::DeleteCert
                 | PivCredKind::DeleteKey
                 | PivCredKind::MoveKey
+                | PivCredKind::NewChuid
         )
     }
 }
@@ -1473,6 +1478,15 @@ struct PivState {
     cert_days: u32,
     sign_pin: String,
     csr_path: String,
+    /// New CHUID: validity in days from now (same shape and default as
+    /// `cert_days`), fed to [`keyroost_piv::chuid_expiration_in_days`].
+    chuid_valid_days: u32,
+    /// New CHUID: the GUID input, hex (canonical `8-4-4-4-12` dashed form as
+    /// pre-filled, but [`keyroost_piv::parse_guid_hex`] accepts plain hex
+    /// too). Pre-filled with a fresh [`keyroost_transport::random_chuid_guid`]
+    /// each time the dialog opens, refreshable there, and editable so the
+    /// user can substitute their own.
+    chuid_guid: String,
     /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
     confirm_reset: Option<String>,
     /// Credential-entry modal for PIN/PUK changes + unblock (open iff `Some`).
@@ -1560,6 +1574,10 @@ impl Default for PivState {
             cert_days: 365,
             sign_pin: String::new(),
             csr_path: String::new(),
+            chuid_valid_days: 365,
+            chuid_guid: keyroost_transport::random_chuid_guid()
+                .map(|g| keyroost_piv::format_guid(&g))
+                .unwrap_or_default(),
             confirm_reset: None,
             cred_modal: None,
             move_dest: None,
@@ -4524,7 +4542,7 @@ impl App {
         let mut want_submit = false;
         let mut want_close = false;
 
-        let closed = Self::modal_window(ctx, p, "oath_add", "New credential", |ui| {
+        let closed = Self::modal_window(ctx, p, "oath_add", "New credential", 300.0, |ui| {
             match &result {
                 Some(Ok(())) => {
                     // Success: confirmation + a single Done that dismisses.
@@ -4563,6 +4581,7 @@ impl App {
                         "Secret",
                         &mut self.oath.add.secret,
                         "base32 (behind the QR code)",
+                        96.0,
                         300.0,
                     );
                     #[cfg(feature = "qr")]
@@ -6650,6 +6669,66 @@ impl App {
         });
     }
 
+    /// Regenerate the "New CHUID" GUID input with a fresh random value —
+    /// called when the dialog opens and by its "Refresh" button. Host-side
+    /// only (no card I/O); leaves the field as-is on the vanishingly rare RNG
+    /// failure rather than blanking a value the user may already be editing.
+    fn piv_refresh_chuid_guid(&mut self) {
+        if let Ok(guid) = keyroost_transport::random_chuid_guid() {
+            self.piv.chuid_guid = keyroost_piv::format_guid(&guid);
+        }
+    }
+
+    /// Write a CHUID — the GUID from `chuid_guid` (a fresh random default,
+    /// or whatever the user overwrote it with). Management-key authorized;
+    /// applet-wide, not tied to any slot. Mirrors `piv_import_cert`'s shape:
+    /// open \u{2192} authenticate \u{2192} call the transport method \u{2192} re-read status.
+    /// Windows' PIV minidriver caches a card's contents by its CHUID's GUID,
+    /// so this is what makes it notice a slot's certificate/key actually
+    /// changed.
+    fn piv_new_chuid(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let mgmt = match self.piv_current_mgmt_key() {
+            Ok(b) => b,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
+        };
+        let guid = match keyroost_piv::parse_guid_hex(&self.piv.chuid_guid) {
+            Some(g) => g,
+            None => {
+                self.piv.error = Some(
+                    "GUID must be 16 bytes of hex, dashes optional (e.g. \
+                     aabbccdd-eeff-1122-3344-556677889900)"
+                        .into(),
+                );
+                return;
+            }
+        };
+        let expiration = keyroost_piv::chuid_expiration_in_days(
+            u64::from(unix_now()),
+            self.piv.chuid_valid_days,
+        );
+        self.piv.notice = None;
+        self.spawn_job("Writing a new CHUID\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let mut s = keyroost_transport::PivSession::open(&name)?;
+                let mgmt_alg = s.management_key_algorithm();
+                s.authenticate_management(mgmt_alg, &mgmt)?;
+                s.new_chuid(&guid, &expiration)?;
+                s.status()
+            })();
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.mgmt_key_input);
+                Self::apply_piv_write(app, result, "New CHUID written.".into());
+                Self::apply_piv_cred_result(app);
+            })
+        });
+    }
+
     /// Permanently delete (erase) the private key in the selected slot.
     /// Management-key authorized. Needs YubiKey firmware 5.7+; the transport
     /// version-gates and surfaces `PivFirmwareTooOld` as the error on older
@@ -6833,12 +6912,17 @@ impl App {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
                     let mgmt_alg = s.management_key_algorithm();
                     s.authenticate_management(mgmt_alg, &mgmt)?;
-                    s.verify_pin(pin.as_bytes())?;
                     if let Some((alg, key)) = known_key {
                         s.remember_pubkey(slot, alg, key);
                     }
                     let now = i64::from(unix_now());
-                    s.self_signed_certificate(slot, &subject, now, now + days * 86_400)?;
+                    s.self_signed_certificate(
+                        slot,
+                        &subject,
+                        now,
+                        now + days * 86_400,
+                        pin.as_bytes(),
+                    )?;
                     s.status()
                 })();
                 Box::new(move |app: &mut App| {
@@ -6886,11 +6970,10 @@ impl App {
             move || {
                 let result = (|| -> Result<(), TransportError> {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
-                    s.verify_pin(pin.as_bytes())?;
                     if let Some((alg, key)) = known_key {
                         s.remember_pubkey(slot, alg, key);
                     }
-                    let pem = s.generate_csr(slot, &subject)?;
+                    let pem = s.generate_csr(slot, &subject, pin.as_bytes())?;
                     std::fs::write(&path, pem.as_bytes()).map_err(|_| {
                         TransportError::MalformedResponse("cannot write destination file")
                     })?;
@@ -7272,7 +7355,8 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
         | PivCredKind::ChangeMgmtKey
         | PivCredKind::DeleteCert
         | PivCredKind::DeleteKey
-        | PivCredKind::MoveKey => return None,
+        | PivCredKind::MoveKey
+        | PivCredKind::NewChuid => return None,
     };
     if confirm.is_empty() || new == confirm {
         None
@@ -7299,6 +7383,7 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
         PivCredKind::DeleteCert => "Certificate deleted",
         PivCredKind::DeleteKey => "Key deleted",
         PivCredKind::MoveKey => "Key moved",
+        PivCredKind::NewChuid => "New CHUID written",
     }
 }
 
@@ -7368,10 +7453,18 @@ fn pin_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String) {
 /// Like [`pin_field`] but with a hint and custom width — for secrets that are
 /// longer than a PIN (the PIV management key). Masked: a management key is a
 /// card-write credential and shouldn't sit readable on screen.
-fn secret_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hint: &str, w: f32) {
+fn secret_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    buf: &mut String,
+    hint: &str,
+    label_w: f32,
+    w: f32,
+) {
     ui.horizontal(|ui| {
         ui.add_sized(
-            [96.0, 22.0],
+            [label_w, 22.0],
             egui::Label::new(
                 egui::RichText::new(label)
                     .font(theme::f_reg(13.0))
@@ -7469,6 +7562,48 @@ fn text_field(ui: &mut egui::Ui, p: &Palette, label: &str, buf: &mut String, hin
         );
     });
     ui.add_space(4.0);
+}
+
+/// Width for the New CHUID dialog's GUID input (and, to keep the two fields
+/// visually aligned, its management-key input): the actually-rendered width
+/// of a representative 36-character canonical GUID in the dialog's body
+/// font, plus a little slack for the text edit's own internal padding and
+/// for whatever font it ends up drawing with. Measured instead of a fixed
+/// guess so the field tracks real font metrics rather than drifting from
+/// them (and the dialog stops reserving space nothing actually needs).
+fn chuid_guid_field_width(ctx: &egui::Context) -> f32 {
+    // All-zero digits and dashes: close to the widest a canonical GUID gets
+    // in most fonts, without needing per-character metrics.
+    let sample = "00000000-0000-0000-0000-000000000000";
+    let w = ctx
+        .fonts_mut(|f| {
+            f.layout_no_wrap(sample.to_owned(), theme::f_reg(13.0), egui::Color32::WHITE)
+        })
+        .size()
+        .x;
+    w + 24.0
+}
+
+/// Label-column width for the New CHUID dialog's rows: the rendered width of
+/// "Management key" (the longest of the three row labels there — "GUID" and
+/// "Valid for" both fit inside it) plus a little padding. Every other
+/// dialog's `secret_field`/`text_field` label sits in a fixed 96px column,
+/// which is too narrow for "Management key" specifically — it overflowed
+/// into the field next to it, which then started at a different x than the
+/// GUID row's input did. Measured for the same reason
+/// [`chuid_guid_field_width`] is: correct regardless of font metrics.
+fn chuid_label_width(ctx: &egui::Context) -> f32 {
+    let w = ctx
+        .fonts_mut(|f| {
+            f.layout_no_wrap(
+                "Management key".to_owned(),
+                theme::f_reg(13.0),
+                egui::Color32::WHITE,
+            )
+        })
+        .size()
+        .x;
+    w + 8.0
 }
 
 /// A PIV slot picker combo.
@@ -11407,13 +11542,19 @@ impl App {
     /// and enrollment dialogs so they all look identical: no native title bar,
     /// a custom frame (pop fill, line stroke, drop shadow, 20px padding), a
     /// title at button-font size with a painted X close, and Esc-to-dismiss.
-    /// `body` draws the dialog contents. Returns true if the X or Esc was used
-    /// (the caller dismisses its own state).
+    /// `body` draws the dialog contents. `width` is the dialog's max content
+    /// width (300.0 is the shape every other caller uses; a caller with
+    /// wider content — e.g. a GUID that needs to stay on one line — passes a
+    /// larger value so the title row, and the close X pinned to its right
+    /// edge, actually span the content instead of clipping/misaligning
+    /// against it). Returns true if the X or Esc was used (the caller
+    /// dismisses its own state).
     fn modal_window(
         ctx: &egui::Context,
         p: &Palette,
         id: &str,
         title: &str,
+        width: f32,
         body: impl FnOnce(&mut egui::Ui),
     ) -> bool {
         let mut closed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
@@ -11436,7 +11577,7 @@ impl App {
                 ..Default::default()
             })
             .show(ctx, |ui| {
-                ui.set_max_width(300.0);
+                ui.set_max_width(width);
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(title)
@@ -11483,57 +11624,59 @@ impl App {
 
         let mut want_cancel = false;
         let mut want_done = false;
-        let closed = Self::modal_window(
-            ctx,
-            p,
-            "fp_enroll",
-            "Enroll fingerprint",
-            |ui| match &done {
-                None => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Enrolling \u{2014} sample {} of {}",
-                            captured.min(total),
-                            total
-                        ))
-                        .font(theme::f_sb(13.0))
-                        .color(p.accent),
-                    );
-                    ui.add_space(8.0);
-                    ui.add(egui::ProgressBar::new(frac).desired_width(280.0));
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!("\u{1F446} {last_message}"))
-                            .font(theme::f_reg(12.0))
-                            .color(p.txt2),
-                    );
-                    ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
-                        want_cancel = true;
-                    }
-                }
-                Some(Ok(())) => {
-                    ui.label(
-                        egui::RichText::new("\u{2713} Fingerprint enrolled")
+        let closed =
+            Self::modal_window(
+                ctx,
+                p,
+                "fp_enroll",
+                "Enroll fingerprint",
+                300.0,
+                |ui| match &done {
+                    None => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Enrolling \u{2014} sample {} of {}",
+                                captured.min(total),
+                                total
+                            ))
                             .font(theme::f_sb(13.0))
-                            .color(p.ok),
-                    );
-                    ui.add_space(8.0);
-                    ui.add(egui::ProgressBar::new(1.0).desired_width(280.0));
-                    ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
-                        want_done = true;
+                            .color(p.accent),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(egui::ProgressBar::new(frac).desired_width(280.0));
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("\u{1F446} {last_message}"))
+                                .font(theme::f_reg(12.0))
+                                .color(p.txt2),
+                        );
+                        ui.add_space(16.0);
+                        if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                            want_cancel = true;
+                        }
                     }
-                }
-                Some(Err(e)) => {
-                    ui.colored_label(p.err, format!("Enrollment failed: {e}"));
-                    ui.add_space(16.0);
-                    if theme::button(ui, p, BtnKind::Default, "Close").clicked() {
-                        want_done = true;
+                    Some(Ok(())) => {
+                        ui.label(
+                            egui::RichText::new("\u{2713} Fingerprint enrolled")
+                                .font(theme::f_sb(13.0))
+                                .color(p.ok),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(egui::ProgressBar::new(1.0).desired_width(280.0));
+                        ui.add_space(16.0);
+                        if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                            want_done = true;
+                        }
                     }
-                }
-            },
-        );
+                    Some(Err(e)) => {
+                        ui.colored_label(p.err, format!("Enrollment failed: {e}"));
+                        ui.add_space(16.0);
+                        if theme::button(ui, p, BtnKind::Default, "Close").clicked() {
+                            want_done = true;
+                        }
+                    }
+                },
+            );
 
         if want_cancel {
             // Signal the worker to abort the capture between samples.
@@ -11569,7 +11712,7 @@ impl App {
 
         let mut confirm = false;
         let mut cancel = false;
-        let closed = Self::modal_window(ctx, p, "fp_delete", "Delete fingerprint?", |ui| {
+        let closed = Self::modal_window(ctx, p, "fp_delete", "Delete fingerprint?", 300.0, |ui| {
             ui.label(
                 egui::RichText::new(format!(
                     "Delete fingerprint \u{201c}{label}\u{201d}? This cannot be undone."
@@ -11754,13 +11897,28 @@ impl App {
         }
         ui.checkbox(&mut self.piv.use_default_mgmt, "Use default management key");
         if !self.piv.use_default_mgmt {
+            // Match the New CHUID dialog's GUID row so the two fields line
+            // up — same field width *and* same label-column width ("GUID"
+            // is short enough to fit the shared 96px label box, but
+            // "Management key" isn't, so both rows need the wider,
+            // measured column or their inputs start at different x).
+            // Every other flow keeps the narrower defaults.
+            let (label_w, width) = if kind == PivCredKind::NewChuid {
+                (
+                    chuid_label_width(ui.ctx()),
+                    chuid_guid_field_width(ui.ctx()),
+                )
+            } else {
+                (96.0, 300.0)
+            };
             secret_field(
                 ui,
                 p,
                 "Management key",
                 &mut self.piv.mgmt_key_input,
                 "hex (48/32/64 chars)",
-                300.0,
+                label_w,
+                width,
             );
         }
     }
@@ -11827,7 +11985,19 @@ impl App {
             Vec::new()
         };
 
-        let closed = Self::modal_window(ctx, p, "piv_cred", kind.title(), |ui| {
+        // New CHUID's GUID field needs to stay on one line at its full
+        // canonical `8-4-4-4-12` width (36 characters); every other flow
+        // fits the default. Sized from the same measured field width the
+        // GUID/management-key inputs use, not a separate fixed guess, so
+        // the dialog doesn't reserve space nothing in it actually needs:
+        // label column + spacing + field + spacing + refresh icon + a
+        // little breathing room before the edge.
+        let width = if kind == PivCredKind::NewChuid {
+            chuid_label_width(ctx) + 8.0 + chuid_guid_field_width(ctx) + 6.0 + 22.0 + 12.0
+        } else {
+            300.0
+        };
+        let closed = Self::modal_window(ctx, p, "piv_cred", kind.title(), width, |ui| {
             match &result {
                 Some(Ok(())) => {
                     // Success: confirmation + a single Done that dismisses.
@@ -11965,6 +12135,7 @@ impl App {
                                 "New key",
                                 &mut self.piv.new_mgmt_key_input,
                                 "hex (48/32/64 chars)",
+                                96.0,
                                 300.0,
                             );
                             card_note(ui, p, "Enter the current key, then the new key.");
@@ -12045,6 +12216,61 @@ impl App {
                                  source slot. Needs YubiKey 5.7 or newer.",
                             );
                         }
+                        PivCredKind::NewChuid => {
+                            self.piv_modal_mgmt_field(ui, p, kind);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [chuid_label_width(ui.ctx()), 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("GUID")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    ),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.piv.chuid_guid)
+                                        .hint_text("hex, dashes optional")
+                                        .desired_width(chuid_guid_field_width(ui.ctx())),
+                                );
+                                ui.add_space(6.0);
+                                let (rrect, rresp) = ui.allocate_exact_size(
+                                    egui::vec2(22.0, 22.0),
+                                    egui::Sense::click(),
+                                );
+                                paint_refresh_icon(ui, rrect.center(), 7.0, p.txt2);
+                                if rresp
+                                    .on_hover_text("Generate a new random GUID")
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    self.piv_refresh_chuid_guid();
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Valid for")
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt2),
+                                );
+                                ui.add(
+                                    egui::DragValue::new(&mut self.piv.chuid_valid_days)
+                                        .range(
+                                            1..=keyroost_piv::max_valid_days(u64::from(unix_now())),
+                                        )
+                                        .suffix(" days"),
+                                );
+                            });
+                            card_note(
+                                ui,
+                                p,
+                                "Writes a fresh card ID. Windows' generic smartcard \
+                                 minidriver caches PIV data by the CHUID's GUID, so this \
+                                 is what makes it notice a key or certificate actually \
+                                 changed. The expiration date is informational only — it \
+                                 has no technical implications.",
+                            );
+                        }
                     }
 
                     // Inline error/result line: the new==confirm mismatch, then
@@ -12121,6 +12347,7 @@ impl App {
                 PivCredKind::DeleteCert => self.piv_delete_cert(),
                 PivCredKind::DeleteKey => self.piv_delete_key(),
                 PivCredKind::MoveKey => self.piv_move_key(),
+                PivCredKind::NewChuid => self.piv_new_chuid(),
             }
             // If the op didn't actually queue, unstick the modal. This happens
             // either because the worker was busy (no error set — just retry on
@@ -12214,7 +12441,7 @@ impl App {
         // for shape parity with the PIV modal).
         let mismatch = openpgp_cred_mismatch(&self.openpgp, kind);
 
-        let closed = Self::modal_window(ctx, p, "openpgp_cred", kind.title(), |ui| {
+        let closed = Self::modal_window(ctx, p, "openpgp_cred", kind.title(), 300.0, |ui| {
             match &result {
                 Some(Ok(())) => {
                     // Success: confirmation + a single Done that dismisses.
@@ -12967,6 +13194,7 @@ impl App {
         let mut open_delete_cert = false;
         let mut open_delete_key = false;
         let mut open_move_key = false;
+        let mut open_new_chuid = false;
         let mut click_retired_tab = false;
         let mut arm_reset = false;
         let mut copy_pem: Option<String> = None;
@@ -13022,6 +13250,22 @@ impl App {
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
                 );
+                // CHUID — GUID and expiration only. FASC-N carries no
+                // information worth showing here (it's a fixed filler, not
+                // real card data — see keyroost_piv::encode_chuid) and stays
+                // out of the UI; `keyroostctl piv status` still prints it.
+                // The signature and LRC fields are omitted everywhere.
+                if let Some(chuid) = &st.chuid {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "CHUID: GUID {} \u{00B7} Expires {}",
+                            chuid.guid_display(),
+                            chuid.expiration_display()
+                        ))
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                    );
+                }
             } else if self.piv.error.is_none() {
                 ui.label(
                     egui::RichText::new("Reading PIV status\u{2026}")
@@ -13111,6 +13355,23 @@ impl App {
                     }
                     ui.add_space(8.0);
                     piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
+                });
+            });
+
+            // CHUID: label + help left, the write action right-aligned.
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("CHUID")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "piv-admin");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "New CHUID\u{2026}").clicked() {
+                        open_new_chuid = true;
+                    }
                 });
             });
         });
@@ -13439,7 +13700,7 @@ impl App {
                 );
                 ui.add(
                     egui::DragValue::new(&mut self.piv.cert_days)
-                        .range(1..=3650u32)
+                        .range(1..=keyroost_piv::max_valid_days(u64::from(unix_now())))
                         .suffix(" days"),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -13722,6 +13983,11 @@ impl App {
             if self.piv.retired_occupancy.is_none() {
                 let _ = self.load_piv_retired_occupancy();
             }
+        }
+        if open_new_chuid {
+            self.piv_cred_modal_close();
+            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::NewChuid));
+            self.piv_refresh_chuid_guid();
         }
         if click_retired_tab {
             // Opening the tab has to land on a concrete slot, because every
@@ -16058,6 +16324,7 @@ mod tests {
             version: None,
             serial: None,
             pin_retries: None,
+            chuid: None,
             slots: vec![],
         };
         App::apply_piv_write(&mut app, Ok(status), "did a thing".into());
@@ -16079,6 +16346,7 @@ mod tests {
             version: None,
             serial: None,
             pin_retries: None,
+            chuid: None,
             slots: vec![],
         };
         App::apply_piv_write(&mut app, Ok(status), "did a thing".into());

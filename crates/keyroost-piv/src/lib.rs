@@ -27,9 +27,24 @@ pub mod spki;
 pub mod x509;
 pub mod x509_parse;
 
-/// PIV card-application AID (the 5-byte RID/PIX prefix; the card matches on it).
-/// Full PIV AID is `A0 00 00 03 08 00 00 10 00 01 00`; selecting by the prefix
-/// is what `yubikey-piv-tool` / `ykman` do and the card resolves it.
+/// The NIST SP 800-73-4 / FIPS 201 standardized PIV Card Application AID —
+/// RID `A0 00 00 03 08` + PIX `00 00 10 00 01 00`. Every spec-compliant PIV
+/// card (YubiKey included) registers under exactly this AID; it's what
+/// [`select_full`] sends first.
+pub const AID_FULL: [u8; 11] = [
+    0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00,
+];
+
+/// PIV card-application AID, truncated to the 5-byte RID/PIX prefix. This is
+/// what `yubikey-piv-tool` / `ykman` send, relying on YubiKey's open-ended
+/// AID-prefix matching — not something the spec requires. [`select`] builds
+/// this short form; it exists only as [`select_full`]'s fallback, for cards
+/// that (hypothetically) reject the full AID. Nitrokey's `piv-authenticator`
+/// firmware needs the opposite treatment: it registers its AID as
+/// `Aid::new_truncatable(<full 11 bytes>, 9)`, which matches only an *exact*
+/// 9- or 11-byte SELECT, not this arbitrary 5-byte prefix — a bare `select()`
+/// against it comes back `SW_NOT_FOUND` even though the applet is present,
+/// which is why [`select_full`] is tried first.
 pub const AID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x08];
 
 /// Status word: success.
@@ -495,8 +510,28 @@ impl std::error::Error for PinLengthError {}
 // APDU builders
 // ---------------------------------------------------------------------------
 
-/// SELECT the PIV application by AID (case 4: a trailing `Le` requests the
-/// application property template the card returns on success).
+/// SELECT the PIV application by its full, spec-mandated AID ([`AID_FULL`]).
+/// Case 4 — a trailing `Le` requests the application property template the
+/// card returns on success. Try this before [`select`]: it's what every
+/// spec-compliant PIV card recognizes, including cards (like Nitrokey's)
+/// that don't answer the short RID-only prefix.
+#[must_use]
+pub fn select_full() -> Vec<u8> {
+    let mut apdu = build_apdu(
+        0x00,
+        Instruction::Select.code(),
+        INS_SELECT_P1_BY_AID,
+        0x00,
+        &AID_FULL,
+    );
+    apdu.push(0x00); // case-4 Le
+    apdu
+}
+
+/// SELECT the PIV application by its short RID/PIX-prefix AID ([`AID`]).
+/// Case 4 — a trailing `Le` requests the application property template the
+/// card returns on success. Fallback for [`select_full`]; see [`AID`]'s doc
+/// comment for why both exist.
 #[must_use]
 pub fn select() -> Vec<u8> {
     let mut apdu = build_apdu(
@@ -759,6 +794,237 @@ pub fn encode_certificate(der: &[u8]) -> Vec<u8> {
     push_tlv(&mut out, &[0x71], &[0x00]); // CertInfo: 0 = uncompressed
     push_tlv(&mut out, &[0xFE], &[]); // LRC (empty)
     out
+}
+
+/// FASC-N filler for a CHUID that doesn't represent a real federal employee —
+/// the same 25 BCD/odd-parity-encoded bytes `yubico-piv-tool`'s own
+/// `set-chuid` uses (`lib/util.c`'s `CHUID_TMPL`, bytes 2..27). Not meaningful
+/// to hand-decode; kept byte-identical to known-good tooling rather than
+/// inventing a different filler.
+const CHUID_FASC_N: [u8; 25] = [
+    0xD4, 0xE7, 0x39, 0xDA, 0x73, 0x9C, 0xED, 0x39, 0xCE, 0x73, 0x9D, 0x83, 0x68, 0x58, 0x21, 0x08,
+    0x42, 0x10, 0x84, 0x21, 0xC8, 0x42, 0x10, 0xC3, 0xEB,
+];
+
+/// Civil (year, month, day) from a day count since the Unix epoch. Howard
+/// Hinnant's `civil_from_days` algorithm — proleptic Gregorian, correct for
+/// any non-negative `z` (i.e. any date on or after 1970-01-01, which every
+/// realistic [`chuid_expiration_in_days`] call is). Vendored again here
+/// rather than pulled in from `keyroost-ctap` (which has its own copy behind
+/// SSH certificate timestamp formatting): each protocol crate in this
+/// workspace stays free-standing rather than depending on a sibling for one
+/// small function.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// Day count since the Unix epoch for a given (year, month, day). Howard
+/// Hinnant's `days_from_civil` — the exact inverse of [`civil_from_days`]
+/// (round-trip tested below), proleptic Gregorian.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let doy = (153 * (i64::from(m) + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// The latest year [`chuid_expiration_in_days`]'s clamp — and
+/// [`x509::tbs_certificate`]'s own validity encoding — treat as meaningful:
+/// `9999`, the conventional ceiling for a 4-digit-year date (ASN.1
+/// GeneralizedTime included).
+const MAX_EXPIRATION_YEAR: i64 = 9999;
+
+/// The largest "valid for N days from now" a CHUID expiration or a
+/// certificate's validity period can actually represent: the day count from
+/// `now_unix_secs` to `9999-12-31`, the ceiling both
+/// [`chuid_expiration_in_days`] and [`x509::tbs_certificate`] clamp to. Meant
+/// to size a "Valid for" input's upper bound with the field's real capacity
+/// rather than an arbitrary fixed number — and unlike a fixed cap, this one
+/// keeps making sense as "now" moves forward across the calendar.
+#[must_use]
+pub fn max_valid_days(now_unix_secs: u64) -> u32 {
+    let now_days = (now_unix_secs / 86_400) as i64;
+    let max_days = days_from_civil(MAX_EXPIRATION_YEAR, 12, 31);
+    (max_days - now_days).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// Compute a CHUID expiration date (tag `0x35`, ASCII `YYYYMMDD`) as
+/// `now_unix_secs` plus `valid_days` days — the same "valid for N days"
+/// shape [`x509::tbs_certificate`]'s own validity period uses, rather than a
+/// freeform date a caller would have to validate. The day count itself
+/// (not just the resulting year) is clamped to [`MAX_EXPIRATION_YEAR`]'s
+/// last day, so the result is always exactly 8 bytes and saturates cleanly
+/// at `9999-12-31` regardless of how large `valid_days` is — clamping only
+/// the year would leave an unclamped month/day from whatever the
+/// out-of-range date actually landed on, which can read as an *earlier*
+/// date than a smaller `valid_days` produces (e.g. year 10000's January 1st
+/// clamped to "9999" reads as `9999-01-01`, earlier than `9999-12-31`). No
+/// realistic caller ([`max_valid_days`]-bounded) comes anywhere near this.
+#[must_use]
+pub fn chuid_expiration_in_days(now_unix_secs: u64, valid_days: u32) -> [u8; 8] {
+    let expiry_secs = now_unix_secs.saturating_add(u64::from(valid_days).saturating_mul(86_400));
+    let days = (expiry_secs / 86_400) as i64;
+    let days = days.min(days_from_civil(MAX_EXPIRATION_YEAR, 12, 31));
+    let (y, m, d) = civil_from_days(days);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(format!("{y:04}{m:02}{d:02}").as_bytes());
+    out
+}
+
+/// Encode a CHUID data-object value (PIV object [`OBJECT_CHUID`], `5F C1 02`)
+/// around a 16-byte card GUID and an 8-byte `YYYYMMDD` expiration date (see
+/// [`chuid_expiration_in_days`]): `30 <FASC-N> 34 <guid> 35 <expiration> 3E
+/// 00 FE 00`. Byte-identical in shape to `yubico-piv-tool`'s `set-chuid`
+/// (`ykpiv_util_set_cardid`'s `CHUID_TMPL`) — same fixed FASC-N filler, only
+/// the GUID and expiration vary. A fresh random `guid` here is exactly what
+/// `set-chuid` does: Windows' PIV minidriver caches by CHUID, so writing a
+/// new one is what makes it notice a card's contents changed.
+#[must_use]
+pub fn encode_chuid(guid: &[u8; 16], expiration: &[u8; 8]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(2 + CHUID_FASC_N.len() + 2 + guid.len() + 2 + expiration.len() + 2 + 2);
+    push_tlv(&mut out, &[0x30], &CHUID_FASC_N); // FASC-N (filler, not a real one)
+    push_tlv(&mut out, &[0x34], guid); // GUID — the part that actually varies
+    push_tlv(&mut out, &[0x35], expiration); // Expiration Date
+    push_tlv(&mut out, &[0x3E], &[]); // Issuer Asymmetric Signature (empty)
+    push_tlv(&mut out, &[0xFE], &[]); // LRC (empty)
+    out
+}
+
+/// A CHUID read back off a card: FASC-N, GUID, expiration date, signature,
+/// and LRC (tags `0x3E`/`0xFE` — see [`encode_chuid`]). The signature and LRC
+/// carry no information worth surfacing in a UI (this crate's own
+/// [`encode_chuid`] always writes both empty), but a caller displaying raw
+/// protocol detail (e.g. `keyroostctl piv status`) may still want them, so
+/// [`parse_chuid`] keeps all five rather than silently dropping two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chuid {
+    /// FASC-N (tag `0x30`), raw bytes — typically the 25-byte filler this
+    /// crate itself writes ([`encode_chuid`]'s doc comment covers why it's
+    /// not meaningful to hand-decode).
+    pub fasc_n: Vec<u8>,
+    /// GUID (tag `0x34`), raw bytes — typically 16.
+    pub guid: Vec<u8>,
+    /// Expiration date (tag `0x35`), raw bytes — typically 8 ASCII `YYYYMMDD`.
+    pub expiration: Vec<u8>,
+    /// Issuer Asymmetric Signature (tag `0x3E`), raw bytes — empty in every
+    /// CHUID this crate writes. Unlike FASC-N/GUID/expiration, its absence
+    /// doesn't make [`parse_chuid`] fail: an empty `Vec` either way.
+    pub signature: Vec<u8>,
+    /// LRC / error detection code (tag `0xFE`), raw bytes — empty in every
+    /// CHUID this crate writes. Same optional treatment as `signature`.
+    pub lrc: Vec<u8>,
+}
+
+impl Chuid {
+    /// FASC-N as plain lowercase hex.
+    #[must_use]
+    pub fn fasc_n_display(&self) -> String {
+        keyroost_proto::codec::hex_encode(&self.fasc_n)
+    }
+
+    /// GUID as canonical lowercase `8-4-4-4-12` hex (the conventional
+    /// GUID/UUID text form), or plain hex when it isn't the standard 16
+    /// bytes — a CHUID from a card this crate didn't write is under no
+    /// obligation to be.
+    #[must_use]
+    pub fn guid_display(&self) -> String {
+        format_guid(&self.guid)
+    }
+
+    /// Expiration as `YYYY-MM-DD`, or the raw bytes decoded lossily as text
+    /// when they aren't 8 ASCII digits.
+    #[must_use]
+    pub fn expiration_display(&self) -> String {
+        if self.expiration.len() == 8 && self.expiration.iter().all(u8::is_ascii_digit) {
+            let s = std::str::from_utf8(&self.expiration).expect("validated ASCII digits above");
+            format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8])
+        } else {
+            String::from_utf8_lossy(&self.expiration).into_owned()
+        }
+    }
+
+    /// Signature as plain lowercase hex (empty string when absent).
+    #[must_use]
+    pub fn signature_display(&self) -> String {
+        keyroost_proto::codec::hex_encode(&self.signature)
+    }
+
+    /// LRC as plain lowercase hex (empty string when absent).
+    #[must_use]
+    pub fn lrc_display(&self) -> String {
+        keyroost_proto::codec::hex_encode(&self.lrc)
+    }
+}
+
+/// Format a byte slice as canonical lowercase `8-4-4-4-12` hex (the
+/// conventional GUID/UUID text form) when it's exactly 16 bytes, or plain
+/// hex otherwise. Used for [`Chuid::guid_display`] and for pre-filling a
+/// "New CHUID" GUID input with a freshly-generated value before it's ever
+/// been through a [`Chuid`].
+#[must_use]
+pub fn format_guid(bytes: &[u8]) -> String {
+    if bytes.len() != 16 {
+        return keyroost_proto::codec::hex_encode(bytes);
+    }
+    let mut s = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Parse a user-typed GUID — hex, optionally with UUID-style dashes and/or
+/// surrounding whitespace, case-insensitive — into the 16 raw bytes
+/// [`encode_chuid`] writes verbatim into tag `0x34`. `None` for anything that
+/// isn't exactly 32 hex digits once dashes and whitespace are stripped, so a
+/// caller (the "New CHUID" GUID input) can tell a bad manual override apart
+/// from a usable one without duplicating hex parsing itself.
+#[must_use]
+pub fn parse_guid_hex(s: &str) -> Option<[u8; 16]> {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    keyroost_proto::codec::hex_decode(&cleaned)
+        .ok()?
+        .try_into()
+        .ok()
+}
+
+/// Parse a CHUID data-object value (what `PivSession::read_chuid` in
+/// `keyroost-transport` reads back, or what [`encode_chuid`] builds) into its
+/// FASC-N, GUID, and expiration fields.
+///
+/// `None` when any of the three tags is missing entirely — an emptied
+/// (deleted) CHUID object, or a non-PIV data blob — treated the same as "no
+/// CHUID" rather than an error; a read-only display shouldn't fail the whole
+/// status read over a card that answers something unexpected.
+#[must_use]
+pub fn parse_chuid(value: &[u8]) -> Option<Chuid> {
+    Some(Chuid {
+        fasc_n: find_tlv(value, 0x30)?.to_vec(),
+        guid: find_tlv(value, 0x34)?.to_vec(),
+        expiration: find_tlv(value, 0x35)?.to_vec(),
+        // Optional: their absence doesn't invalidate an otherwise-well-formed
+        // CHUID, unlike the three mandatory fields above.
+        signature: find_tlv(value, 0x3E).unwrap_or(&[]).to_vec(),
+        lrc: find_tlv(value, 0xFE).unwrap_or(&[]).to_vec(),
+    })
 }
 
 /// CHANGE REFERENCE DATA: change the PIN (`PIN_REF_APPLICATION`) or PUK
@@ -1043,6 +1309,18 @@ mod tests {
         assert_eq!(
             select(),
             vec![0x00, 0xA4, 0x04, 0x00, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08, 0x00]
+        );
+    }
+
+    #[test]
+    fn select_full_bytes() {
+        // 00 A4 04 00 0B A0 00 00 03 08 00 00 10 00 01 00 00
+        assert_eq!(
+            select_full(),
+            vec![
+                0x00, 0xA4, 0x04, 0x00, 0x0B, 0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00,
+                0x01, 0x00, 0x00
+            ]
         );
     }
 
@@ -1408,6 +1686,258 @@ mod tests {
             encode_certificate(&der),
             vec![0x70, 0x03, 0xAB, 0xCD, 0xEF, 0x71, 0x01, 0x00, 0xFE, 0x00]
         );
+    }
+
+    #[test]
+    fn encode_chuid_matches_yubico_piv_tool_template() {
+        // Known-answer: `yubico-piv-tool`'s own CHUID_TMPL (lib/util.c,
+        // ykpiv_util_set_cardid), reproduced byte-for-byte with the template's
+        // own all-zero GUID placeholder substituted in, to pin agreement with
+        // an independent reference implementation rather than just this
+        // crate's own encoder logic.
+        #[rustfmt::skip]
+        const CHUID_TMPL: [u8; 59] = [
+            0x30, 0x19, 0xD4, 0xE7, 0x39, 0xDA, 0x73, 0x9C, 0xED, 0x39, 0xCE, 0x73, 0x9D,
+            0x83, 0x68, 0x58, 0x21, 0x08, 0x42, 0x10, 0x84, 0x21, 0xC8, 0x42, 0x10, 0xC3,
+            0xEB, 0x34, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x35, 0x08, 0x32, 0x30, 0x33, 0x30, 0x30,
+            0x31, 0x30, 0x31, 0x3E, 0x00, 0xFE, 0x00,
+        ];
+        let default_expiration = chuid_expiration_in_days(0, 21_915); // 1970-01-01 + 21915d = 2030-01-01
+        assert_eq!(&default_expiration, b"20300101");
+        assert_eq!(encode_chuid(&[0u8; 16], &default_expiration), CHUID_TMPL);
+    }
+
+    #[test]
+    fn encode_chuid_places_guid_at_the_yubico_offset() {
+        // CHUID_GUID_OFFS in yubico-piv-tool is 29; a distinctive GUID must
+        // land exactly there, with the fixed filler on both sides untouched.
+        let guid = [
+            0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0x00,
+        ];
+        let value = encode_chuid(&guid, b"20300101");
+        assert_eq!(&value[29..45], &guid);
+    }
+
+    #[test]
+    fn encode_chuid_places_expiration_after_the_guid() {
+        let expiration = *b"20991231";
+        let value = encode_chuid(&[0u8; 16], &expiration);
+        // Tag/length (35 08) at offset 45 (29 + 16), value right after.
+        assert_eq!(&value[45..47], &[0x35, 0x08]);
+        assert_eq!(&value[47..55], &expiration);
+    }
+
+    #[test]
+    fn chuid_expiration_in_days_zero_days_is_today() {
+        // Known-answer timestamps shared with keyroost-ctap's
+        // format_timestamp tests (ssh_cert.rs): 0 = 1970-01-01,
+        // 1767225600 = 2026-01-01 — same civil_from_days algorithm, cross-
+        // checked against an independent test of it.
+        assert_eq!(&chuid_expiration_in_days(0, 0), b"19700101");
+        assert_eq!(&chuid_expiration_in_days(1_767_225_600, 0), b"20260101");
+    }
+
+    #[test]
+    fn chuid_expiration_in_days_adds_whole_days() {
+        // +1 day from epoch.
+        assert_eq!(&chuid_expiration_in_days(0, 1), b"19700102");
+        // +365 days from a non-leap year's Jan 1 lands on the next Jan 1.
+        assert_eq!(&chuid_expiration_in_days(1_767_225_600, 365), b"20270101");
+        // Crosses a leap-year February (2028): 2026-01-01 + 730d = 2028-01-01
+        // (365 + 365, neither 2026 nor 2027 is a leap year); +790d lands
+        // 31+29 days into 2028 (a leap year), i.e. 2028-03-01.
+        assert_eq!(&chuid_expiration_in_days(1_767_225_600, 730), b"20280101");
+        assert_eq!(&chuid_expiration_in_days(1_767_225_600, 790), b"20280301");
+    }
+
+    #[test]
+    fn chuid_expiration_in_days_extreme_valid_days_does_not_panic() {
+        // A caller-supplied day count far beyond any realistic UI bound must
+        // degrade (via the year clamp), not panic building the output.
+        let out = chuid_expiration_in_days(0, u32::MAX);
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(u8::is_ascii_digit));
+    }
+
+    #[test]
+    fn days_from_civil_round_trips_civil_from_days() {
+        // The exact known-answer pairs format_timestamp's tests in
+        // keyroost-ctap already pin (ssh_cert.rs): 0 = 1970-01-01,
+        // 1767225600 secs = 2026-01-01 -> day 20454. Round-tripping through
+        // both directions of the same algorithm is the strongest available
+        // check without an external date library to compare against.
+        for days in [0i64, 1, 365, 20_454, 2_932_896, 3_652_364] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "round-trip for day {days}");
+        }
+    }
+
+    #[test]
+    fn max_valid_days_reaches_exactly_9999_12_31() {
+        let now = 0u64; // 1970-01-01
+        let days = max_valid_days(now);
+        let expiration = chuid_expiration_in_days(now, days);
+        assert_eq!(&expiration, b"99991231");
+        // One day more must clamp rather than overshoot into a 5-digit year.
+        let expiration = chuid_expiration_in_days(now, days + 1);
+        assert_eq!(&expiration, b"99991231");
+    }
+
+    #[test]
+    fn max_valid_days_shrinks_as_now_advances() {
+        assert!(max_valid_days(1_767_225_600) < max_valid_days(0)); // 2026-01-01 vs 1970-01-01
+    }
+
+    #[test]
+    fn max_valid_days_never_negative_past_the_year_9999_line() {
+        // "now" already past 9999-12-31: saturates at 0, not a huge unsigned
+        // wraparound from a negative subtraction.
+        let far_future_secs = u64::MAX / 2;
+        assert_eq!(max_valid_days(far_future_secs), 0);
+    }
+
+    #[test]
+    fn parse_chuid_round_trips_encode_chuid() {
+        let guid = [
+            0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0x00,
+        ];
+        let expiration = *b"20300101";
+        let value = encode_chuid(&guid, &expiration);
+        let chuid = parse_chuid(&value).expect("well-formed CHUID must parse");
+        assert_eq!(chuid.fasc_n, CHUID_FASC_N.to_vec());
+        assert_eq!(chuid.guid, guid.to_vec());
+        assert_eq!(chuid.expiration, expiration.to_vec());
+        // encode_chuid always writes both tags present but empty.
+        assert_eq!(chuid.signature, Vec::<u8>::new());
+        assert_eq!(chuid.lrc, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parse_chuid_tolerates_a_missing_signature_and_lrc() {
+        // Only the three mandatory tags — a foreign card is under no
+        // obligation to include an (always-empty, in this crate's own
+        // writes) signature or LRC tag at all.
+        let mut value = Vec::new();
+        push_tlv(&mut value, &[0x30], &CHUID_FASC_N);
+        push_tlv(&mut value, &[0x34], &[0u8; 16]);
+        push_tlv(&mut value, &[0x35], b"20300101");
+        let chuid = parse_chuid(&value).expect("the three mandatory tags are present");
+        assert_eq!(chuid.signature, Vec::<u8>::new());
+        assert_eq!(chuid.lrc, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn chuid_signature_and_lrc_display_are_plain_hex() {
+        let chuid = Chuid {
+            fasc_n: vec![],
+            guid: vec![],
+            expiration: vec![],
+            signature: vec![0xAB, 0xCD],
+            lrc: vec![0x12],
+        };
+        assert_eq!(chuid.signature_display(), "abcd");
+        assert_eq!(chuid.lrc_display(), "12");
+        // Absent (empty Vec) displays as an empty string, not a placeholder.
+        let empty = Chuid {
+            fasc_n: vec![],
+            guid: vec![],
+            expiration: vec![],
+            signature: vec![],
+            lrc: vec![],
+        };
+        assert_eq!(empty.signature_display(), "");
+        assert_eq!(empty.lrc_display(), "");
+    }
+
+    #[test]
+    fn parse_chuid_missing_a_tag_is_none_not_an_error() {
+        // An emptied (deleted) CHUID object: SW_OK, zero-length `53 00` body
+        // (see the analogous cert_status_from_reply regression in
+        // keyroost-transport) — no FASC-N/GUID/expiration tags at all.
+        assert_eq!(parse_chuid(&[]), None);
+        // Only a GUID tag present — still not a usable CHUID.
+        let mut partial = vec![0x34, 0x02];
+        partial.extend_from_slice(&[0xAB, 0xCD]);
+        assert_eq!(parse_chuid(&partial), None);
+    }
+
+    #[test]
+    fn chuid_guid_display_is_canonical_dashed_hex() {
+        let chuid = Chuid {
+            fasc_n: vec![],
+            guid: vec![
+                0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                0x99, 0x00,
+            ],
+            expiration: vec![],
+            signature: vec![],
+            lrc: vec![],
+        };
+        assert_eq!(chuid.guid_display(), "aabbccdd-eeff-1122-3344-556677889900");
+    }
+
+    #[test]
+    fn chuid_guid_display_falls_back_to_plain_hex_for_non_16_bytes() {
+        let chuid = Chuid {
+            fasc_n: vec![],
+            guid: vec![0xAB, 0xCD],
+            expiration: vec![],
+            signature: vec![],
+            lrc: vec![],
+        };
+        assert_eq!(chuid.guid_display(), "abcd");
+    }
+
+    #[test]
+    fn parse_guid_hex_round_trips_format_guid() {
+        let bytes: [u8; 16] = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0x00,
+        ];
+        let dashed = format_guid(&bytes);
+        assert_eq!(dashed, "aabbccdd-eeff-1122-3344-556677889900");
+        assert_eq!(parse_guid_hex(&dashed), Some(bytes));
+        // Bare hex, no dashes, uppercase, with stray surrounding whitespace.
+        assert_eq!(
+            parse_guid_hex("  AABBCCDDEEFF112233445566778899 00 "),
+            Some(bytes)
+        );
+    }
+
+    #[test]
+    fn parse_guid_hex_rejects_wrong_length_and_non_hex() {
+        assert_eq!(parse_guid_hex(""), None);
+        assert_eq!(parse_guid_hex("aabb"), None);
+        assert_eq!(parse_guid_hex("not-hex-at-all-not-hex-at-all-x"), None);
+    }
+
+    #[test]
+    fn chuid_expiration_display_inserts_dashes() {
+        let chuid = Chuid {
+            fasc_n: vec![],
+            guid: vec![],
+            expiration: b"20300101".to_vec(),
+            signature: vec![],
+            lrc: vec![],
+        };
+        assert_eq!(chuid.expiration_display(), "2030-01-01");
+    }
+
+    #[test]
+    fn chuid_expiration_display_falls_back_to_lossy_text_for_non_digits() {
+        let chuid = Chuid {
+            fasc_n: vec![],
+            guid: vec![],
+            expiration: vec![0xFF, 0xFE],
+            signature: vec![],
+            lrc: vec![],
+        };
+        // Not asserting the exact replacement-character text, only that it
+        // doesn't panic and returns something.
+        assert!(!chuid.expiration_display().is_empty());
     }
 
     #[test]

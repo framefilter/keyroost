@@ -136,6 +136,10 @@ pub struct PivStatus {
     pub pin_retries: Option<u8>,
     /// Per-slot certificate presence, in canonical slot order.
     pub slots: Vec<PivSlotStatus>,
+    /// The card's CHUID (FASC-N, GUID, expiration), when it has one. A
+    /// read-only, best-effort read: a transport failure degrades to `None`
+    /// rather than failing the whole status snapshot (see [`PivSession::status`]).
+    pub chuid: Option<keyroost_piv::Chuid>,
 }
 
 /// Whether a given PIV key slot holds a certificate (and its size).
@@ -233,6 +237,16 @@ fn move_key_supported(version: Option<(u8, u8, u8)>) -> bool {
     }
 }
 
+/// A fresh, random 16-byte CHUID GUID — host-side only, no card I/O. For
+/// pre-filling (and, via a "refresh" action, regenerating) a "New CHUID"
+/// GUID input before [`PivSession::new_chuid`] writes whatever the user
+/// settled on — their own manual value included — to the card.
+pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
+    let mut guid = [0u8; 16];
+    getrandom::getrandom(&mut guid).map_err(|_| TransportError::HostRngFailed)?;
+    Ok(guid)
+}
+
 impl PivSession {
     /// Connect to `reader_name` and SELECT the PIV application. Returns
     /// [`TransportError::NoPivApplet`] when the card has no PIV applet.
@@ -285,19 +299,34 @@ impl PivSession {
     }
 
     fn select(&mut self) -> Result<(), TransportError> {
-        let (_, sw) = self.transmit_full(&piv::select())?;
+        // Try the full, spec-mandated AID first — some PIV implementations
+        // (Nitrokey's `piv-authenticator`) only answer an exact-length AID
+        // match and reject the short RID-only prefix `select()` sends. Fall
+        // back to the short prefix only on a specific "not found", so a real
+        // fault on the full-AID attempt still surfaces immediately rather
+        // than being masked by a second, unrelated SELECT. See `piv::AID`'s
+        // doc comment for the full story.
+        let (_, sw) = self.transmit_full(&piv::select_full())?;
         if sw == piv::SW_NOT_FOUND {
-            return Err(TransportError::NoPivApplet);
+            let (_, sw) = self.transmit_full(&piv::select())?;
+            if sw == piv::SW_NOT_FOUND {
+                return Err(TransportError::NoPivApplet);
+            }
+            return ok_or_apdu("select piv applet (short aid)", sw);
         }
         ok_or_apdu("select piv applet", sw)
     }
 
-    /// Read a read-only status snapshot: version, serial, PIN retries, and which
-    /// slots hold a certificate. No PIN, no touch.
+    /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
+    /// and which slots hold a certificate. No PIN, no touch.
     pub fn status(&mut self) -> Result<PivStatus, TransportError> {
         let version = self.version();
         let serial = self.serial();
         let pin_retries = self.pin_retries();
+        // Best-effort: a transport hiccup reading the CHUID shouldn't fail
+        // the whole status snapshot, any more than an unsupported GET
+        // VERSION/SERIAL does above.
+        let chuid = self.read_chuid().unwrap_or_default();
         let mut slots = Vec::with_capacity(4);
         for slot in piv::Slot::all() {
             slots.push(self.slot_status(slot)?);
@@ -307,6 +336,7 @@ impl PivSession {
             serial,
             pin_retries,
             slots,
+            chuid,
         })
     }
 
@@ -538,6 +568,45 @@ impl PivSession {
         ok_or_write("piv import certificate", sw)
     }
 
+    /// Write a CHUID (Card Holder Unique Identifier) to the card: `guid` is
+    /// the 16-byte GUID (tag `0x34`) — see [`random_chuid_guid`] for a
+    /// host-side-only, no-card-I/O way to generate one a caller can pre-fill
+    /// an input with and let the user overwrite — and `expiration` is the
+    /// `YYYYMMDD` expiration date (tag `0x35`; see
+    /// [`keyroost_piv::chuid_expiration_in_days`]). Requires prior
+    /// management-key auth ([`authenticate_management`]).
+    ///
+    /// Mirrors `yubico-piv-tool`'s `set-chuid` (see [`keyroost_piv::encode_chuid`]
+    /// for the byte-for-byte template match): Windows' PIV minidriver caches
+    /// a card's contents by its CHUID, so after writing a new certificate or
+    /// key it may keep showing stale data until the CHUID changes — this is
+    /// the standard fix, not a workaround specific to any one vendor's card.
+    ///
+    /// [`authenticate_management`]: PivSession::authenticate_management
+    pub fn new_chuid(
+        &mut self,
+        guid: &[u8; 16],
+        expiration: &[u8; 8],
+    ) -> Result<(), TransportError> {
+        let value = piv::encode_chuid(guid, expiration);
+        let (_, sw) = self.transmit_full(&piv::put_data(&piv::OBJECT_CHUID, &value))?;
+        ok_or_write("piv new chuid", sw)
+    }
+
+    /// Read the card's CHUID: FASC-N, GUID, and expiration date (the
+    /// signature and LRC fields are parsed away — see
+    /// [`keyroost_piv::parse_chuid`]). `None` when the object is empty/absent
+    /// or doesn't parse as a CHUID. No PIN required — CHUID is a public data
+    /// object, like a certificate.
+    pub fn read_chuid(&mut self) -> Result<Option<keyroost_piv::Chuid>, TransportError> {
+        let (data, sw) = self.transmit_full(&piv::get_data(&piv::OBJECT_CHUID))?;
+        if sw != piv::SW_OK {
+            return Ok(None);
+        }
+        let inner = piv::unwrap_data_object(&data).map_err(TransportError::PivParse)?;
+        Ok(piv::parse_chuid(inner))
+    }
+
     /// Clear `slot`'s certificate object (standard PIV; universal across
     /// firmware). Removes only the X.509 certificate; the slot's private key
     /// persists. Requires prior management-key auth ([`authenticate_management`]).
@@ -686,9 +755,9 @@ impl PivSession {
     }
 
     /// The algorithm and public key of the key stored in `slot`: from GET
-    /// METADATA (firmware 5.3+) when the card answers it, else from this
-    /// session's in-memory key cache. That cache is populated only by a prior
-    /// [`Self::generate_key`] on `slot` in *this* session, or by a caller
+    /// METADATA (firmware 5.3+) when the card actually names both, else from
+    /// this session's in-memory key cache. That cache is populated only by a
+    /// prior [`Self::generate_key`] on `slot` in *this* session, or by a caller
     /// explicitly carrying the key material forward via [`Self::remember_pubkey`]
     /// — that's what lets CSR/self-sign work right after generation on cards
     /// that don't support GET METADATA (older YubiKeys, non-Yubico PIV
@@ -697,31 +766,43 @@ impl PivSession {
     /// told us what it made, and this crate keeps no on-disk or
     /// cross-process copy of that on its own (see [`Self::remember_pubkey`]).
     ///
-    /// Errors when the slot is empty, the firmware predates GET METADATA
-    /// *and* nothing was generated into `slot` in this session (nor handed to
-    /// it via `remember_pubkey`), or a cached entry was invalidated by a later
-    /// delete/move/reset.
+    /// GET METADATA answering `SW_OK` is not by itself treated as authoritative
+    /// — some implementations (Nitrokey's `piv-authenticator`) accept the
+    /// instruction but reply with an empty body for slots they haven't wired
+    /// reporting up for yet, rather than failing it outright. That's
+    /// functionally identical to "no GET METADATA support" for our purposes,
+    /// so [`metadata_key_material`] is the single gate for "does this reply
+    /// actually name the key", and only a `Some` from it short-circuits the
+    /// cache fallback below.
+    ///
+    /// Called by [`Self::generate_csr`]/[`Self::self_signed_certificate`]
+    /// *before* they verify the PIN — GET METADATA is an unauthenticated
+    /// read (confirmed against real hardware: it succeeds before any PIN
+    /// VERIFY in the same session), so resolving the key first and verifying
+    /// right before the signing GENERAL AUTHENTICATE keeps that VERIFY the
+    /// last command before the signature on every card, rather than risking
+    /// a metadata probe sitting in between — some cards (Nitrokey's
+    /// `piv-authenticator` observed so far) don't tolerate any intervening
+    /// APDU between a PIN verify and the signing operation it authorizes.
+    ///
+    /// Errors when the slot is empty, GET METADATA doesn't name this slot's
+    /// key *and* nothing was generated into `slot` in this session (nor
+    /// handed to it via `remember_pubkey`), or a cached entry was invalidated
+    /// by a later delete/move/reset.
     pub fn slot_key(&mut self, slot: Slot) -> Result<(KeyAlg, PublicKey), TransportError> {
         let key_ref = slot.key_ref();
         if let Some(md) = self.metadata(key_ref) {
-            let alg =
-                md.algorithm
-                    .and_then(KeyAlg::from_id)
-                    .ok_or(TransportError::MalformedResponse(
-                        "slot metadata carries no key algorithm",
-                    ))?;
-            let raw = md.public_key.ok_or(TransportError::MalformedResponse(
-                "slot metadata carries no public key",
-            ))?;
-            let key = public_key_from_metadata(&raw).map_err(TransportError::PivParse)?;
-            return Ok((alg, key));
+            if let Some((alg, raw)) = metadata_key_material(&md) {
+                let key = public_key_from_metadata(raw).map_err(TransportError::PivParse)?;
+                return Ok((alg, key));
+            }
         }
         if let Some(cached) = self.pubkey_cache.get(key_ref).cloned() {
             return Ok(cached);
         }
         Err(TransportError::MalformedResponse(
-            "slot has no key, or the firmware lacks GET METADATA and the key \
-             material wasn't handed to this session — run `piv generate-key` \
+            "slot has no key, or GET METADATA doesn't name this slot's key and \
+             the key material wasn't handed to this session — run `piv generate-key` \
              on this slot in this same session, or pass its previously saved \
              key material to this command, so it can be cached for \
              CSR/self-sign",
@@ -730,14 +811,23 @@ impl PivSession {
 
     /// Build a PKCS#10 certificate-signing request for the key in `slot`,
     /// signed on the card, returned as PEM. The slot must hold a key
-    /// (generated or imported) and the PIN must already be verified.
-    pub fn generate_csr(&mut self, slot: Slot, subject: &str) -> Result<String, TransportError> {
+    /// (generated or imported). Verifies `pin` itself, deliberately placed
+    /// *after* resolving the slot's key material ([`Self::slot_key`]) and
+    /// *immediately* before the signing [`Self::sign`] call — see
+    /// `slot_key`'s doc comment for why that ordering matters.
+    pub fn generate_csr(
+        &mut self,
+        slot: Slot,
+        subject: &str,
+        pin: &[u8],
+    ) -> Result<String, TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
         let spki = piv::spki::subject_public_key_info(&key, alg)
             .map_err(|_| TransportError::MalformedResponse("slot key/algorithm mismatch"))?;
         let cri = piv::x509::csr_info(&subject, &spki);
         let prepared = prepared_block(alg, &cri)?;
+        self.verify_pin(pin)?;
         let sig = self.sign(slot, alg, &prepared)?;
         let der = piv::x509::assemble(&cri, alg, &sig).map_err(TransportError::X509)?;
         Ok(piv::x509::pem_csr(&der))
@@ -745,14 +835,18 @@ impl PivSession {
 
     /// Create a self-signed certificate for the key in `slot` (validity in
     /// unix seconds), sign it on the card, **import it into the slot**, and
-    /// return the DER. Requires a verified PIN (for the signature) and prior
-    /// management-key auth (for the import).
+    /// return the DER. Requires prior management-key auth (for the import).
+    /// Verifies `pin` itself, deliberately placed *after* resolving the
+    /// slot's key material ([`Self::slot_key`]) and *immediately* before the
+    /// signing [`Self::sign`] call — see `slot_key`'s doc comment for why
+    /// that ordering matters.
     pub fn self_signed_certificate(
         &mut self,
         slot: Slot,
         subject: &str,
         not_before: i64,
         not_after: i64,
+        pin: &[u8],
     ) -> Result<Vec<u8>, TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
@@ -765,6 +859,7 @@ impl PivSession {
         let tbs = piv::x509::tbs_certificate(&serial, alg, &subject, not_before, not_after, &spki)
             .map_err(TransportError::X509)?;
         let prepared = prepared_block(alg, &tbs)?;
+        self.verify_pin(pin)?;
         let sig = self.sign(slot, alg, &prepared)?;
         let der = piv::x509::assemble(&tbs, alg, &sig).map_err(TransportError::X509)?;
         self.import_certificate(slot, &der)?;
@@ -943,14 +1038,8 @@ impl PivSession {
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
     fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
         let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
-        let (cert_present, cert_len) = if sw == piv::SW_OK {
-            // The object is a 0x53 template; report the inner value length.
-            let len = piv::unwrap_data_object(&data).map(<[u8]>::len).unwrap_or(0);
-            (true, len)
-        } else {
-            // 6A82 (not found) and friends just mean the slot is empty.
-            (false, 0)
-        };
+        let raw = (sw == piv::SW_OK).then_some(data.as_slice());
+        let (cert_present, cert_len) = cert_status_from_reply(raw);
         Ok(PivSlotStatus {
             slot,
             cert_present,
@@ -1013,6 +1102,46 @@ fn prepared_block(alg: KeyAlg, tbs: &[u8]) -> Result<Vec<u8>, TransportError> {
         SigHash::Sha384 => Ok(keyroost_proto::sha512::sha384(tbs).to_vec()),
         SigHash::None => Ok(tbs.to_vec()),
     }
+}
+
+/// `(algorithm, raw public key)` from a GET METADATA response, only when it
+/// actually carries both — the single gate [`PivSession::slot_key`] uses to
+/// decide whether a metadata reply is usable or whether to fall back to the
+/// session's pubkey cache. Split out as a pure, card-free function (same seam
+/// style as [`PubkeyCache`]) so the "is this metadata usable" rule is
+/// unit-testable without a card: some PIV implementations answer GET METADATA
+/// with `SW_OK` but an empty or partial body for slots they haven't wired
+/// reporting up for yet (observed on Nitrokey's `piv-authenticator`, whose
+/// `GetMetadata` handler is a stub for every slot but card-authentication) —
+/// functionally the same as "no GET METADATA support" for our purposes, not a
+/// malformed response worth erroring the caller over.
+fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
+    let alg = md.algorithm.and_then(KeyAlg::from_id)?;
+    let raw = md.public_key.as_deref()?;
+    Some((alg, raw))
+}
+
+/// `(cert_present, cert_len)` from a certificate-slot GET DATA reply: `raw` is
+/// the response body when the card answered `SW_OK`, `None` when it didn't
+/// (`6A82` and friends, which just mean the slot is empty).
+///
+/// `SW_OK` alone doesn't mean a certificate is there: some cards (Nitrokey's
+/// `piv-authenticator`, observed after `delete-cert`) answer a deleted slot
+/// with `53 00` — the `0x53` data-object template present, but with a
+/// zero-length value — rather than `6A82`. An empty value is exactly as
+/// absent as no object at all, so this gates on the unwrapped length, not
+/// just the status word; [`PivSession::read_certificate`] already reaches the
+/// same conclusion in its own way (an empty inner buffer has no `0x70` TLV to
+/// find). A body that fails to unwrap as a `0x53` template at all — not
+/// expected from a real card, but not a caller-visible error either — reports
+/// the same as empty rather than panicking or bubbling a parse error up
+/// through a read-only status call.
+fn cert_status_from_reply(raw: Option<&[u8]>) -> (bool, usize) {
+    let len = raw
+        .and_then(|d| piv::unwrap_data_object(d).ok())
+        .map(<[u8]>::len)
+        .unwrap_or(0);
+    (len > 0, len)
 }
 
 /// Decode the public key carried in GET METADATA tag `0x04`. Yubico encodes it
@@ -1276,6 +1405,97 @@ mod tests {
         cache.remember(0x82, KeyAlg::Ed25519, ecc(3));
         cache.clear();
         assert!(cache.0.is_empty());
+    }
+
+    // --- metadata-vs-cache fallback gate ---------------------------------
+    //
+    // `slot_key` treats GET METADATA as usable only when it actually names
+    // both the algorithm and the public key; anything short of that (empty,
+    // algorithm-only, pubkey-only — e.g. Nitrokey's piv-authenticator, whose
+    // GetMetadata handler is a stub for every slot but card-authentication
+    // and answers SW_OK with nothing) must fall through to the pubkey cache
+    // instead of erroring the caller.
+
+    #[test]
+    fn metadata_with_neither_field_is_not_usable() {
+        // The stub-firmware case: SW_OK, empty body.
+        assert_eq!(metadata_key_material(&Metadata::default()), None);
+    }
+
+    #[test]
+    fn metadata_with_only_algorithm_is_not_usable() {
+        let md = Metadata {
+            algorithm: Some(KeyAlg::EccP256.id()),
+            ..Metadata::default()
+        };
+        assert_eq!(metadata_key_material(&md), None);
+    }
+
+    #[test]
+    fn metadata_with_only_public_key_is_not_usable() {
+        let md = Metadata {
+            public_key: Some(vec![0x86, 0x01, 0x04]),
+            ..Metadata::default()
+        };
+        assert_eq!(metadata_key_material(&md), None);
+    }
+
+    #[test]
+    fn metadata_with_an_unrecognized_algorithm_id_is_not_usable() {
+        // A byte GET METADATA reported that this crate's KeyAlg doesn't cover.
+        let md = Metadata {
+            algorithm: Some(0xFF),
+            public_key: Some(vec![0x86, 0x01, 0x04]),
+            ..Metadata::default()
+        };
+        assert_eq!(metadata_key_material(&md), None);
+    }
+
+    #[test]
+    fn metadata_with_both_fields_is_usable() {
+        let md = Metadata {
+            algorithm: Some(KeyAlg::EccP256.id()),
+            public_key: Some(vec![0x86, 0x01, 0x04]),
+            ..Metadata::default()
+        };
+        assert_eq!(
+            metadata_key_material(&md),
+            Some((KeyAlg::EccP256, &[0x86, 0x01, 0x04][..]))
+        );
+    }
+
+    // --- certificate-slot occupancy from a GET DATA reply -----------------
+    //
+    // `cert_status_from_reply` is what `slot_status` uses to decide whether a
+    // slot reports as holding a certificate. The regression this guards: a
+    // deleted slot answering SW_OK with an empty `53 00` template (Nitrokey's
+    // piv-authenticator, observed with `piv status` after `piv delete-cert`)
+    // must report as empty, not "cert present (0 bytes)".
+
+    #[test]
+    fn cert_status_not_found_is_absent() {
+        // 6A82 and friends: `slot_status` passes `None` for anything but SW_OK.
+        assert_eq!(cert_status_from_reply(None), (false, 0));
+    }
+
+    #[test]
+    fn cert_status_empty_template_is_absent() {
+        // `53 00`: object present, zero-length value — the Nitrokey case.
+        assert_eq!(cert_status_from_reply(Some(&[0x53, 0x00])), (false, 0));
+    }
+
+    #[test]
+    fn cert_status_populated_template_is_present() {
+        // `53 03 70 01 AB`: a (fake, minimal) 3-byte value wrapping a `70` TLV.
+        let data = [0x53, 0x03, 0x70, 0x01, 0xAB];
+        assert_eq!(cert_status_from_reply(Some(&data)), (true, 3));
+    }
+
+    #[test]
+    fn cert_status_unparseable_body_is_absent_not_a_panic() {
+        // Not a `0x53` template at all — shouldn't happen on a real card, but
+        // a read-only status call must degrade gracefully, not panic or error.
+        assert_eq!(cert_status_from_reply(Some(&[0xFF, 0x00])), (false, 0));
     }
 
     #[test]

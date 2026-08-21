@@ -134,7 +134,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "piv-admin" => &Help {
             title: "Card administration",
-            body: "These settings — the PIN and PUK, how many tries they allow, the management key, and a full reset — apply to the whole PIV applet, not to a single slot.",
+            body: "These settings — the PIN and PUK, how many tries they allow, the management key, a full reset, and the card's CHUID — apply to the whole PIV applet, not to a single slot.",
             slug: "/piv#admin",
         },
         "molto" => &Help {

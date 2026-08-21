@@ -145,7 +145,21 @@ mod json_out {
         pub version: Option<String>,
         pub serial: Option<u32>,
         pub pin_retries: Option<u8>,
+        pub chuid: Option<PivChuidJson>,
         pub slots: Vec<PivSlotJson>,
+    }
+
+    /// The card's CHUID — FASC-N, GUID, expiration, signature, and LRC. The
+    /// CLI is the one place that prints signature/LRC (empty hex in every
+    /// CHUID this crate itself writes); the GUI status line omits both, and
+    /// FASC-N besides.
+    #[derive(Serialize)]
+    pub struct PivChuidJson {
+        pub fasc_n: String,
+        pub guid: String,
+        pub expiration: String,
+        pub signature: String,
+        pub lrc: String,
     }
 
     /// One PIV key slot in the status output.
@@ -876,6 +890,27 @@ enum PivCmd {
         /// the slot's key material.
         #[arg(long, value_name = "PATH")]
         load_pubkey: Option<std::path::PathBuf>,
+    },
+    /// Write a fresh, randomly-generated CHUID (Card Holder Unique
+    /// Identifier). Needs the management key. Windows' PIV minidriver caches
+    /// a card's contents by its CHUID's GUID, so after writing a new
+    /// certificate or key it may keep showing stale data until the GUID
+    /// changes — this forces that.
+    NewChuid {
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        mgmt_key_env: Option<String>,
+        #[arg(long)]
+        mgmt_key_stdin: bool,
+        /// CHUID expiration, in days from now. Informational only — it has no
+        /// technical implications. Same default as self-sign's certificate
+        /// validity.
+        #[arg(long, value_name = "N", default_value_t = 365)]
+        days: u32,
+        /// GUID, hex (dashes optional). Omit to use random GUID.
+        #[arg(long, value_name = "HEX")]
+        guid: Option<String>,
     },
     /// Reset the PIV application to factory defaults. Only works when BOTH the
     /// PIN and PUK are already blocked. Wipes all keys, certs, and PINs.
@@ -2311,6 +2346,26 @@ fn unix_now() -> u32 {
             0
         }
     }
+}
+
+/// Reject a `piv self-sign`/`piv new-chuid` `--days` value beyond what a
+/// certificate's validity period or a CHUID's expiration date can actually
+/// represent ([`keyroost_piv::max_valid_days`]), instead of letting it
+/// silently saturate deep in the encoder (`der_time`/`chuid_expiration_in_days`
+/// both clamp to the same `9999-12-31` ceiling on their own, but a caller
+/// asking for more than that deserves a clear error, not a silently
+/// shorter validity period than what they typed).
+fn check_valid_days(days: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
+    if days > max {
+        return Err(format!(
+            "--days {days} exceeds the largest representable value ({max} days \
+             from now) — a CHUID/certificate date is a 4-digit year, capped at \
+             9999-12-31"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Load a bulk-import file, transparently decrypting an Aegis encrypted
@@ -5597,6 +5652,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     version: status.version.map(|(a, b, c)| format!("{a}.{b}.{c}")),
                     serial: status.serial,
                     pin_retries: status.pin_retries,
+                    chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
+                        fasc_n: c.fasc_n_display(),
+                        guid: c.guid_display(),
+                        expiration: c.expiration_display(),
+                        signature: c.signature_display(),
+                        lrc: c.lrc_display(),
+                    }),
                     slots: status
                         .slots
                         .iter()
@@ -5622,6 +5684,21 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 Some(0) => println!("PIN retries: 0 (blocked)"),
                 Some(n) => println!("PIN retries: {}", n),
                 None => println!("PIN retries: (unavailable)"),
+            }
+            match &status.chuid {
+                Some(c) => {
+                    // Signature/LRC are empty in every CHUID this crate
+                    // itself writes — "empty" reads clearer than a blank
+                    // value after the label.
+                    let or_empty = |s: String| if s.is_empty() { "empty".to_string() } else { s };
+                    println!("CHUID:");
+                    println!("  FASC-N:      {}", c.fasc_n_display());
+                    println!("  GUID:        {}", c.guid_display());
+                    println!("  Expiration:  {}", c.expiration_display());
+                    println!("  Signature:   {}", or_empty(c.signature_display()));
+                    println!("  LRC:         {}", or_empty(c.lrc_display()));
+                }
+                None => println!("CHUID:       (unavailable)"),
             }
             println!("Slots:");
             for s in &status.slots {
@@ -5851,13 +5928,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             let mut s = open_piv(reader.as_deref(), debug)?;
-            s.verify_pin(pin.as_bytes())?;
             if let Some(path) = load_pubkey {
                 let (alg, key) = load_pubkey_material(path)?;
                 s.remember_pubkey(slot.to_slot(), alg, key);
             }
             eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
-            let pem = s.generate_csr(slot.to_slot(), subject)?;
+            let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes())?;
             match file {
                 Some(path) => {
                     std::fs::write(path, pem.as_bytes())
@@ -5887,12 +5963,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             if *days == 0 {
                 return Err("validity must be at least 1 day".into());
             }
+            check_valid_days(*days)?;
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             // Management-key auth covers the certificate import; the PIN
             // covers the signature itself.
             let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.verify_pin(pin.as_bytes())?;
             if let Some(path) = load_pubkey {
                 let (alg, key) = load_pubkey_material(path)?;
                 s.remember_pubkey(slot.to_slot(), alg, key);
@@ -5904,6 +5980,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 subject,
                 now,
                 now + i64::from(*days) * 86_400,
+                pin.as_bytes(),
             )?;
             println!(
                 "Self-signed certificate ({} bytes, {} days) created and stored in {}.",
@@ -5916,6 +5993,28 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     .map_err(|e| format!("write {}: {}", path.display(), e))?;
                 eprintln!("PEM copy written to {}.", path.display());
             }
+        }
+
+        PivCmd::NewChuid {
+            reader,
+            mgmt_key_env,
+            mgmt_key_stdin,
+            days,
+            guid,
+        } => {
+            check_valid_days(*days)?;
+            let guid = match guid {
+                Some(hex) => keyroost_piv::parse_guid_hex(hex).ok_or(
+                    "--guid must be 16 bytes of hex, dashes optional \
+                     (e.g. aabbccdd-eeff-1122-3344-556677889900)",
+                )?,
+                None => keyroost_transport::random_chuid_guid()?,
+            };
+            let expiration = keyroost_piv::chuid_expiration_in_days(u64::from(unix_now()), *days);
+            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
+            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            s.new_chuid(&guid, &expiration)?;
+            println!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
         }
 
         PivCmd::Reset { reader, yes } => {
@@ -9356,6 +9455,50 @@ mod cli_tests {
     }
 
     #[test]
+    fn piv_new_chuid_default_days_matches_self_sign() {
+        // `new-chuid --days` and `self-sign --days` are two separate clap
+        // literal defaults (365 each) — pin them equal so a future change to
+        // one doesn't silently drift from the other.
+        let chuid_days = match parse(&["keyroostctl", "piv", "new-chuid"]).unwrap().command {
+            Some(Cmd::Piv {
+                cmd: PivCmd::NewChuid { days, .. },
+            }) => days,
+            _ => panic!("expected piv new-chuid"),
+        };
+        let cert_days = match parse(&[
+            "keyroostctl",
+            "piv",
+            "self-sign",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::SelfSign { days, .. },
+            }) => days,
+            _ => panic!("expected piv self-sign"),
+        };
+        assert_eq!(chuid_days, cert_days);
+    }
+
+    #[test]
+    fn check_valid_days_accepts_the_default_and_the_actual_ceiling() {
+        assert!(check_valid_days(365).is_ok());
+        assert!(check_valid_days(keyroost_piv::max_valid_days(u64::from(unix_now()))).is_ok());
+    }
+
+    #[test]
+    fn check_valid_days_rejects_one_past_the_ceiling() {
+        let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
+        let err = check_valid_days(max + 1).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
     fn piv_policy_values_map_one_to_one_onto_the_byte_layer() {
         use keyroost_piv::{PinPolicy, TouchPolicy};
         for (cli, lib) in [
@@ -9474,13 +9617,20 @@ mod cli_tests {
             version: Some("5.4.3".into()),
             serial: Some(12345678),
             pin_retries: Some(3),
+            chuid: Some(json_out::PivChuidJson {
+                fasc_n: "d4e739da...".into(),
+                guid: "aabbccdd-eeff-1122-3344-556677889900".into(),
+                expiration: "2030-01-01".into(),
+                signature: "".into(),
+                lrc: "".into(),
+            }),
             slots: vec![json_out::PivSlotJson {
                 slot: "9a (Authentication)".into(),
                 cert_present: true,
                 cert_len: 800,
             }],
         };
-        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "slots"]);
+        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
     }
 
     #[test]

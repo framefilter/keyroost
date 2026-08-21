@@ -40,7 +40,7 @@ mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
 mod piv;
-pub use piv::{PivSession, PivSlotStatus, PivStatus};
+pub use piv::{random_chuid_guid, PivSession, PivSlotStatus, PivStatus};
 
 mod token2otp;
 pub use token2otp::{
@@ -814,7 +814,14 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             };
             probe.has_oath = answers("oath", keyroost_oath::select());
             probe.has_openpgp = answers("openpgp", keyroost_openpgp::select());
-            probe.has_piv = answers("piv", keyroost_piv::select());
+            // Full AID first — the spec-mandated identifier every compliant
+            // card recognizes, including Nitrokey's `piv-authenticator`,
+            // which (unlike YubiKey) rejects the short RID-only prefix.
+            // `answers` short-circuits, so the fallback SELECT only goes out
+            // when the full-AID one didn't answer. See `piv::AID`'s doc
+            // comment in keyroost-piv for the full story.
+            probe.has_piv = answers("piv", keyroost_piv::select_full())
+                || answers("piv (short aid)", keyroost_piv::select());
             // FIDO2/U2F: a SELECT of the FIDO applet that the card accepts means
             // a security key is reachable over this reader (NFC or contact), to
             // be driven by CtapPcscDevice.
