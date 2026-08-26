@@ -30,6 +30,10 @@ pub struct OpenPgpStatus {
     pub dec_algo_id: Option<u8>,
     /// Algorithm id of the authentication key.
     pub aut_algo_id: Option<u8>,
+    /// Raw algorithm attributes (`C1`/`C2`/`C3`); render with [`algorithm_label`](Self::algorithm_label).
+    pub sig_attrs: Vec<u8>,
+    pub dec_attrs: Vec<u8>,
+    pub aut_attrs: Vec<u8>,
     /// Signature, decryption, and authentication key fingerprints (20 bytes each;
     /// all-zero when no key occupies that slot).
     pub fingerprint_sig: pgp::Fingerprint,
@@ -52,6 +56,18 @@ impl OpenPgpStatus {
         self.aid
             .get(10..14)
             .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Human label of the algorithm in `crt`'s slot (`RSA-2048`, `EdDSA
+    /// Ed25519`, …), or `none` for an empty attributes object. Never fails.
+    #[must_use]
+    pub fn algorithm_label(&self, crt: pgp::KeyCrt) -> String {
+        let attrs = match crt {
+            pgp::KeyCrt::Sign => &self.sig_attrs,
+            pgp::KeyCrt::Decrypt => &self.dec_attrs,
+            pgp::KeyCrt::Auth => &self.aut_attrs,
+        };
+        pgp::describe_algorithm_attributes(attrs)
     }
 }
 
@@ -133,6 +149,9 @@ impl OpenPgpSession {
             sig_algo_id: ard.sig_algo_id(),
             dec_algo_id: ard.dec_algo_id(),
             aut_algo_id: ard.aut_algo_id(),
+            sig_attrs: ard.algo_attr_sig,
+            dec_attrs: ard.algo_attr_dec,
+            aut_attrs: ard.algo_attr_aut,
             aid: ard.aid,
             fingerprint_sig: ard.fingerprint_sig,
             fingerprint_dec: ard.fingerprint_dec,
@@ -260,7 +279,28 @@ impl OpenPgpSession {
     /// public key. **Destructive** — overwrites any existing key in that slot.
     /// Requires the admin PIN (PW3) to have been verified first via
     /// [`verify_pin`](Self::verify_pin); on a YubiKey it also needs a touch.
-    pub fn generate_key(&mut self, crt: pgp::KeyCrt) -> Result<pgp::PublicKey, TransportError> {
+    ///
+    /// `alg`: `Some` sets the slot's algorithm first when it differs (the
+    /// attribute write is only issued when needed, since it wipes the slot —
+    /// which the GENERATE overwrites anyway); `None` generates whatever the
+    /// slot's current attributes say.
+    pub fn generate_key(
+        &mut self,
+        crt: pgp::KeyCrt,
+        alg: Option<pgp::KeyAlg>,
+    ) -> Result<pgp::PublicKey, TransportError> {
+        if let Some(alg) = alg {
+            let current = self.algorithm_attributes(crt)?;
+            if needs_attribute_write(&current, alg) {
+                if self.debug {
+                    eprintln!(
+                        "! openpgp generate: setting {crt:?} slot algorithm to {}",
+                        alg.label()
+                    );
+                }
+                self.set_algorithm(crt, alg)?;
+            }
+        }
         let (data, sw) = self.transmit_full(&pgp::generate_key(crt))?;
         ok_or_apdu("openpgp generate key", sw)?;
         pgp::parse_generated_public_key(&data).map_err(TransportError::OpenPgpParse)
@@ -363,23 +403,74 @@ impl OpenPgpSession {
         Ok(Vec::new()) // unreachable for a non-empty chunk list
     }
 
-    /// Read and parse the RSA algorithm attributes for `crt`'s slot from the
-    /// Application Related Data (`6E`). Errors if the slot isn't RSA.
-    fn rsa_attributes(&mut self, crt: pgp::KeyCrt) -> Result<pgp::RsaAttributes, TransportError> {
+    /// Raw algorithm attributes (`C1`/`C2`/`C3`) of `crt`'s slot, from a fresh
+    /// Application Related Data read. Read-only; no PIN.
+    pub fn algorithm_attributes(&mut self, crt: pgp::KeyCrt) -> Result<Vec<u8>, TransportError> {
         let (ard_bytes, sw) = self.transmit_full(&pgp::get_application_related_data())?;
         ok_or_apdu("get application related data", sw)?;
         let ard = pgp::parse_application_related_data(&ard_bytes)
             .map_err(TransportError::OpenPgpParse)?;
-        let attr = match crt {
-            pgp::KeyCrt::Sign => &ard.algo_attr_sig,
-            pgp::KeyCrt::Decrypt => &ard.algo_attr_dec,
-            pgp::KeyCrt::Auth => &ard.algo_attr_aut,
-        };
-        pgp::parse_rsa_algorithm_attributes(attr).map_err(TransportError::OpenPgpParse)
+        Ok(match crt {
+            pgp::KeyCrt::Sign => ard.algo_attr_sig,
+            pgp::KeyCrt::Decrypt => ard.algo_attr_dec,
+            pgp::KeyCrt::Auth => ard.algo_attr_aut,
+        })
+    }
+
+    /// Set `crt`'s slot to `alg` (PUT DATA of the algorithm attributes).
+    /// **Destructive**: cards wipe the slot's key when its algorithm changes.
+    /// Requires PW3 verified first. A slot/algorithm combination that doesn't
+    /// exist (Ed25519 in the decryption slot, X25519 elsewhere) is
+    /// [`TransportError::OpenPgpSlotMismatch`]; a card that doesn't allow the
+    /// change (or that algorithm) answers with an APDU error, surfaced as-is.
+    pub fn set_algorithm(
+        &mut self,
+        crt: pgp::KeyCrt,
+        alg: pgp::KeyAlg,
+    ) -> Result<(), TransportError> {
+        let attr = alg
+            .attributes(crt)
+            .map_err(TransportError::OpenPgpSlotMismatch)?;
+        let (_, sw) = self.transmit_full(&pgp::put_algorithm_attributes(crt, &attr))?;
+        ok_or_apdu("openpgp set algorithm attributes", sw)
+    }
+
+    /// The algorithms the card reports each slot accepts (Algorithm Information,
+    /// `FA`), or `Ok(None)` when the card doesn't publish it (pre-3.4 cards) —
+    /// callers then offer every algorithm and let the card's status word
+    /// answer. Read-only; no PIN.
+    pub fn supported_algorithms(
+        &mut self,
+    ) -> Result<Option<pgp::AlgorithmInformation>, TransportError> {
+        let (bytes, sw) = self.transmit_full(&pgp::get_algorithm_information())?;
+        if sw != pgp::SW_OK {
+            if self.debug {
+                eprintln!(
+                    "! openpgp: card has no Algorithm Information object (SW={sw:04X}); \
+                     offering every algorithm"
+                );
+            }
+            return Ok(None);
+        }
+        Ok(pgp::parse_algorithm_information(&bytes).ok())
+    }
+
+    /// Read and parse the RSA algorithm attributes for `crt`'s slot. Errors if
+    /// the slot isn't RSA.
+    fn rsa_attributes(&mut self, crt: pgp::KeyCrt) -> Result<pgp::RsaAttributes, TransportError> {
+        let attr = self.algorithm_attributes(crt)?;
+        match pgp::parse_algorithm_attributes(&attr) {
+            Ok(pgp::AlgorithmAttributes::Rsa(r)) => Ok(r),
+            Ok(_) => Err(TransportError::OpenPgpParse(
+                pgp::ParseError::UnsupportedAlgorithm,
+            )),
+            Err(e) => Err(TransportError::OpenPgpParse(e)),
+        }
     }
 
     /// Read the public key currently in `crt`'s slot. Read-only; no PIN. Returns
-    /// an `OpenPgpParse` error if the slot is empty or holds a non-RSA key.
+    /// an `OpenPgpParse` error if the slot is empty or holds a key of a kind
+    /// this crate can't parse.
     pub fn read_public_key(&mut self, crt: pgp::KeyCrt) -> Result<pgp::PublicKey, TransportError> {
         let (data, sw) = self.transmit_full(&pgp::read_public_key(crt))?;
         ok_or_apdu("openpgp read public key", sw)?;
@@ -414,21 +505,42 @@ impl OpenPgpSession {
     /// card applies the private key and strips the PKCS#1 padding. Requires PW1
     /// verified in the "other"/decipher context ([`keyroost_openpgp::PW1_OTHER`]);
     /// on a YubiKey it also needs a touch.
-    ///
-    /// The RSA cipher DO is a `0x00` padding-indicator byte followed by the
-    /// cryptogram (257 bytes for RSA-2048), which exceeds the short-APDU limit,
-    /// so this sends an extended-length APDU and falls back to ISO command
-    /// chaining on `6700` / `6883` — the same strategy as
-    /// [`import_key`](Self::import_key). `KEYROOST_OPENPGP_FORCE_CHAINING` forces
-    /// the chaining path for testing.
     pub fn decrypt(&mut self, cryptogram: &[u8]) -> Result<Vec<u8>, TransportError> {
         // RSA cipher DO: 0x00 padding-indicator byte + the cryptogram.
         let mut data = Vec::with_capacity(1 + cryptogram.len());
         data.push(0x00);
         data.extend_from_slice(cryptogram);
+        self.decipher(&data)
+    }
 
+    /// ECDH with the on-card decryption key (PSO:DECIPHER, `A6` template):
+    /// returns the shared secret the card derives from `ephemeral_point` (the
+    /// sender's ephemeral public point — `04||X||Y` for Weierstrass curves, 32
+    /// raw bytes for X25519; a leading OpenPGP `0x40` is stripped here). The
+    /// RFC 6637 KDF / key unwrap is the OpenPGP tool's job, matching the RSA
+    /// path's raw contract. Requires PW1 in the "other" context; on a YubiKey
+    /// also a touch.
+    pub fn decrypt_ecdh(&mut self, ephemeral_point: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let point = match ephemeral_point {
+            [0x40, rest @ ..] if rest.len() == 32 => rest,
+            p => p,
+        };
+        let cipher_do = pgp::ecdh_cipher_do(point);
+        self.decipher(&cipher_do)
+    }
+
+    /// Send a PSO:DECIPHER `cipher_do` (either the RSA `0x00||cryptogram` form
+    /// or the ECDH `A6` template) and return the recovered plaintext / shared
+    /// secret.
+    ///
+    /// `cipher_do` can exceed the short-APDU limit (257 bytes for RSA-2048),
+    /// so this sends an extended-length APDU and falls back to ISO command
+    /// chaining on `6700` / `6883` — the same strategy as
+    /// [`import_key`](Self::import_key). `KEYROOST_OPENPGP_FORCE_CHAINING` forces
+    /// the chaining path for testing.
+    fn decipher(&mut self, cipher_do: &[u8]) -> Result<Vec<u8>, TransportError> {
         if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
-            let (plain, sw) = self.transmit_full(&pgp::pso_decipher(&data))?;
+            let (plain, sw) = self.transmit_full(&pgp::pso_decipher(cipher_do))?;
             if sw == pgp::SW_OK {
                 return Ok(plain);
             }
@@ -447,7 +559,7 @@ impl OpenPgpSession {
             eprintln!("! openpgp decipher: forcing command chaining (env override)");
         }
 
-        let chunks = pgp::pso_decipher_chained(&data, 254);
+        let chunks = pgp::pso_decipher_chained(cipher_do, 254);
         self.transmit_chain("openpgp decipher", &chunks)
     }
 
@@ -480,8 +592,12 @@ impl OpenPgpSession {
         crt: pgp::KeyCrt,
         creation_time: u32,
     ) -> Result<[u8; 20], TransportError> {
+        let attrs = self.algorithm_attributes(crt)?;
+        let attrs =
+            pgp::parse_algorithm_attributes(&attrs).map_err(TransportError::OpenPgpParse)?;
         let key = self.read_public_key(crt)?;
-        let fpr = pgp::rsa_v4_fingerprint_from(&key, creation_time);
+        let fpr = pgp::v4_fingerprint(&key, &attrs, creation_time)
+            .map_err(TransportError::OpenPgpParse)?;
         let (_, sw) = self.transmit_full(&pgp::put_generation_time(crt, creation_time))?;
         ok_or_apdu("openpgp put generation time", sw)?;
         let (_, sw) = self.transmit_full(&pgp::put_fingerprint(crt, &fpr))?;
@@ -585,5 +701,65 @@ fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
             sw1: (sw >> 8) as u8,
             sw2: sw as u8,
         })
+    }
+}
+
+/// Whether generating `alg` in a slot whose attributes currently read `current`
+/// requires writing new attributes first. Equal algorithms skip the write —
+/// an attribute write wipes the slot, and the card may echo RSA attributes back
+/// with its own import-format byte, so compare by parsed algorithm, not bytes.
+fn needs_attribute_write(current: &[u8], alg: pgp::KeyAlg) -> bool {
+    pgp::parse_algorithm_attributes(current)
+        .ok()
+        .and_then(|a| a.key_alg())
+        != Some(alg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_attribute_write_only_when_the_slot_differs() {
+        // Same algorithm: no write (a write would wipe the slot for nothing).
+        let cur = pgp::KeyAlg::Ed25519.attributes(pgp::KeyCrt::Sign).unwrap();
+        assert!(!needs_attribute_write(&cur, pgp::KeyAlg::Ed25519));
+        // RSA-2048 reported with the card's own import-format byte still counts as RSA-2048.
+        assert!(!needs_attribute_write(
+            &[0x01, 0x08, 0x00, 0x00, 0x20, 0x02],
+            pgp::KeyAlg::Rsa2048
+        ));
+        // Different algorithm, unknown attributes, or garbage: write.
+        assert!(needs_attribute_write(&cur, pgp::KeyAlg::X25519));
+        assert!(needs_attribute_write(
+            &[0x16, 0x2B, 0x65, 0x70],
+            pgp::KeyAlg::Ed25519
+        ));
+        assert!(needs_attribute_write(&[], pgp::KeyAlg::Rsa2048));
+    }
+
+    #[test]
+    fn status_algorithm_labels_come_from_the_raw_attributes() {
+        let st = OpenPgpStatus {
+            aid: vec![],
+            sig_algo_id: Some(0x16),
+            dec_algo_id: Some(0x12),
+            aut_algo_id: None,
+            sig_attrs: vec![0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+            dec_attrs: vec![
+                0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+            ],
+            aut_attrs: vec![],
+            fingerprint_sig: [0; 20],
+            fingerprint_dec: [0; 20],
+            fingerprint_aut: [0; 20],
+            tries_pw1: 3,
+            tries_rc: 0,
+            tries_pw3: 3,
+            signature_count: None,
+        };
+        assert_eq!(st.algorithm_label(pgp::KeyCrt::Sign), "EdDSA Ed25519");
+        assert_eq!(st.algorithm_label(pgp::KeyCrt::Decrypt), "ECDH X25519");
+        assert_eq!(st.algorithm_label(pgp::KeyCrt::Auth), "none");
     }
 }
