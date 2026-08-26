@@ -140,6 +140,7 @@
             packages = with pkgs; [
               nixfmt
               nixd
+              rust-analyzer
             ];
           };
         };
