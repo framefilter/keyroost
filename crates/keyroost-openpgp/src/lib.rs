@@ -209,6 +209,10 @@ pub const TAG_FINGERPRINTS: u16 = 0x00C5;
 pub const TAG_CA_FINGERPRINTS: u16 = 0x00C6;
 /// Key generation timestamps.
 pub const TAG_GENERATION_TIMES: u16 = 0x00CD;
+/// Algorithm Information (`FA`, spec v3.4 §4.4.3.11): the algorithm-attribute
+/// values each slot *accepts*, as repeated `C1`/`C2`/`C3` objects. Optional —
+/// cards before 3.4 don't have it.
+pub const TAG_ALGORITHM_INFORMATION: u16 = 0x00FA;
 
 /// Fingerprint — signature key (`C7`, 20 bytes); a standalone PUT DATA target.
 pub const TAG_FPR_SIGN: u16 = 0x00C7;
@@ -267,6 +271,12 @@ pub fn get_data(tag: u16) -> Vec<u8> {
 #[must_use]
 pub fn get_application_related_data() -> Vec<u8> {
     get_data(TAG_APPLICATION_RELATED_DATA)
+}
+
+/// `GET DATA 00FA` — the Algorithm Information object: `00 CA 00 FA 00`.
+#[must_use]
+pub fn get_algorithm_information() -> Vec<u8> {
+    get_data(TAG_ALGORITHM_INFORMATION)
 }
 
 /// `GET DATA 00C4` — the standalone PW status bytes: `00 CA 00 C4 00`.
@@ -1910,6 +1920,69 @@ pub fn parse_application_related_data(buf: &[u8]) -> Result<AppRelatedData, Pars
     })
 }
 
+/// The algorithms a card reports each slot accepts (from `FA`), as raw
+/// attribute values in the card's order. This is the device-driven answer to
+/// "what can I generate here" — no vendor table is consulted anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AlgorithmInformation {
+    pub sig: Vec<Vec<u8>>,
+    pub dec: Vec<Vec<u8>>,
+    pub aut: Vec<Vec<u8>>,
+}
+
+impl AlgorithmInformation {
+    /// Raw attribute values the card listed for `crt`'s slot.
+    #[must_use]
+    pub fn raw(&self, crt: KeyCrt) -> &[Vec<u8>] {
+        match crt {
+            KeyCrt::Sign => &self.sig,
+            KeyCrt::Decrypt => &self.dec,
+            KeyCrt::Auth => &self.aut,
+        }
+    }
+
+    /// The modelled [`KeyAlg`]s among them, deduplicated, in card order.
+    /// Entries keyroost can't offer (an unmodelled curve, RSA-1024) are left
+    /// out here but remain visible via [`raw`](Self::raw).
+    #[must_use]
+    pub fn key_algs(&self, crt: KeyCrt) -> Vec<KeyAlg> {
+        let mut out: Vec<KeyAlg> = Vec::new();
+        for attr in self.raw(crt) {
+            if let Some(alg) = parse_algorithm_attributes(attr)
+                .ok()
+                .and_then(|a| a.key_alg())
+            {
+                if !out.contains(&alg) {
+                    out.push(alg);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Parse the Algorithm Information (`FA`) object. `buf` may be the bare value
+/// or the full `FA` envelope. An object with no `C1`/`C2`/`C3` entries at all is
+/// reported as [`ParseError::MissingTag`] for [`TAG_ALGORITHM_INFORMATION`].
+pub fn parse_algorithm_information(buf: &[u8]) -> Result<AlgorithmInformation, ParseError> {
+    let top = parse_tlvs(buf)?;
+    let inner: &[u8] = find_tag(&top, TAG_ALGORITHM_INFORMATION).unwrap_or(buf);
+    let tlvs = parse_tlvs(inner)?;
+    let mut info = AlgorithmInformation::default();
+    for t in &tlvs {
+        match t.tag {
+            TAG_ALGO_ATTR_SIG => info.sig.push(t.value.to_vec()),
+            TAG_ALGO_ATTR_DEC => info.dec.push(t.value.to_vec()),
+            TAG_ALGO_ATTR_AUT => info.aut.push(t.value.to_vec()),
+            _ => {}
+        }
+    }
+    if info.sig.is_empty() && info.dec.is_empty() && info.aut.is_empty() {
+        return Err(ParseError::MissingTag(TAG_ALGORITHM_INFORMATION));
+    }
+    Ok(info)
+}
+
 /// Parse the digital-signature counter from a Security Support Template (`7A`).
 ///
 /// The counter is a 3-byte big-endian value carried in the `93` object nested
@@ -3206,5 +3279,68 @@ mod manufacturer_tests {
         assert_eq!(&apdu[5..], &attr[..]);
         assert_eq!(KeyCrt::Sign.algo_attr_tag(), TAG_ALGO_ATTR_SIG);
         assert_eq!(KeyCrt::Auth.algo_attr_tag(), TAG_ALGO_ATTR_AUT);
+    }
+
+    #[test]
+    fn algorithm_information_parses_per_slot_lists() {
+        // FA { C1 rsa2048, C1 ed25519, C2 rsa2048, C2 x25519, C2 p256-ecdh, C3 ed25519, C3 rsa1024 }
+        let mut v = Vec::new();
+        let mut add = |tag: u8, val: &[u8]| {
+            v.push(tag);
+            v.push(val.len() as u8);
+            v.extend_from_slice(val);
+        };
+        add(0xC1, &[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]);
+        add(
+            0xC1,
+            &[0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+        );
+        add(0xC2, &[0x01, 0x08, 0x00, 0x00, 0x20, 0x00]);
+        add(
+            0xC2,
+            &[
+                0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+            ],
+        );
+        add(
+            0xC2,
+            &[0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+        );
+        add(
+            0xC3,
+            &[0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+        );
+        add(0xC3, &[0x01, 0x04, 0x00, 0x00, 0x20, 0x00]); // RSA-1024: reported raw, not a KeyAlg
+        let mut blob = vec![0xFA, v.len() as u8];
+        blob.extend_from_slice(&v);
+
+        let info = parse_algorithm_information(&blob).unwrap();
+        assert_eq!(info.sig.len(), 2);
+        assert_eq!(info.dec.len(), 3);
+        assert_eq!(info.aut.len(), 2);
+        assert_eq!(
+            info.key_algs(KeyCrt::Sign),
+            vec![KeyAlg::Rsa2048, KeyAlg::Ed25519]
+        );
+        assert_eq!(
+            info.key_algs(KeyCrt::Decrypt),
+            vec![KeyAlg::Rsa2048, KeyAlg::X25519, KeyAlg::NistP256]
+        );
+        assert_eq!(info.key_algs(KeyCrt::Auth), vec![KeyAlg::Ed25519]);
+        assert_eq!(
+            info.raw(KeyCrt::Auth)[1],
+            vec![0x01, 0x04, 0x00, 0x00, 0x20, 0x00]
+        );
+        // Bare value (no FA envelope) parses the same.
+        assert_eq!(parse_algorithm_information(&v).unwrap(), info);
+        // Nothing usable: error.
+        assert_eq!(
+            parse_algorithm_information(&[0x99, 0x01, 0x00]),
+            Err(ParseError::MissingTag(TAG_ALGORITHM_INFORMATION))
+        );
+        assert_eq!(
+            get_algorithm_information(),
+            vec![0x00, 0xCA, 0x00, 0xFA, 0x00]
+        );
     }
 }
