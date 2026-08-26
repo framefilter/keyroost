@@ -570,6 +570,25 @@ pub fn pso_decipher_chained(data: &[u8], max_chunk: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Cipher DO tag for ECDH decipher: the `A6` template (spec v3.4 §7.2.11).
+const TAG_CIPHER_DO_ECDH: u16 = 0x00A6;
+
+/// The ECDH cipher Data Object for PSO:DECIPHER — `A6 { 7F49 { 86 <point> } }`,
+/// where `ephemeral_point` is the sender's ephemeral public point (raw, as the
+/// card wants it: `04||X||Y` for Weierstrass curves, the bare 32 bytes for
+/// X25519 — a leading OpenPGP `0x40` prefix must be stripped by the caller).
+/// The card returns the shared secret (the x-coordinate / the 32-byte X25519
+/// output); the RFC 6637 KDF and key unwrap are the OpenPGP tool's job, as
+/// with the RSA path, where the card returns the raw PKCS#1 payload.
+/// Feed the result to [`pso_decipher`] — there is no `0x00` padding-indicator
+/// byte in the ECDH form.
+#[must_use]
+pub fn ecdh_cipher_do(ephemeral_point: &[u8]) -> Vec<u8> {
+    let point = ber_tlv(TAG_EC_PUBLIC_POINT, ephemeral_point);
+    let pk = ber_tlv(TAG_PUBLIC_KEY, &point);
+    ber_tlv(TAG_CIPHER_DO_ECDH, &pk)
+}
+
 /// `CHANGE REFERENCE DATA` (INS `24`) — change a PIN from `old` to `new`.
 ///
 /// `pw_ref` is the password reference in P2: [`PW1_SIGN`] (`0x81`) changes PW1,
@@ -2483,6 +2502,26 @@ mod tests {
         let mut body = chunks[0][5..].to_vec();
         body.extend_from_slice(&chunks[1][5..chunks[1].len() - 1]);
         assert_eq!(body, data);
+    }
+
+    #[test]
+    fn ecdh_cipher_do_exact_bytes() {
+        // A6 25 { 7F49 22 { 86 20 <32-byte point> } }
+        let point = [0x33u8; 32];
+        let d = ecdh_cipher_do(&point);
+        assert_eq!(&d[..2], &[0xA6, 0x25]);
+        assert_eq!(&d[2..5], &[0x7F, 0x49, 0x22]);
+        assert_eq!(&d[5..7], &[0x86, 0x20]);
+        assert_eq!(&d[7..], &point[..]);
+        assert_eq!(d.len(), 0x27);
+        // A 65-byte uncompressed P-256 point: A6 46 { 7F49 43 { 86 41 ... } }
+        let mut p256 = vec![0x04];
+        p256.extend_from_slice(&[0x55; 64]);
+        let d = ecdh_cipher_do(&p256);
+        assert_eq!(&d[..7], &[0xA6, 0x46, 0x7F, 0x49, 0x43, 0x86, 0x41]);
+        // The DO stays inside a short APDU: pso_decipher must emit the short form.
+        assert!(pso_decipher(&d).len() < 200);
+        assert_eq!(pso_decipher(&d)[4], d.len() as u8);
     }
 
     #[test]
