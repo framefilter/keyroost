@@ -101,23 +101,27 @@
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
       <p>Read card status and a slot's <strong>public key</strong>, and <strong>verify</strong>
-        a PIN without changing anything; <strong>generate</strong> or <strong>import</strong>
-        RSA keys — RSA-2048 on a factory card, since on-card generation follows the slot's own
-        algorithm attributes — by host keygen or from a PKCS#1/PKCS#8 PEM/DER file, for the
-        sign, encrypt, or <strong>auth</strong> slot (<code>--slot auth</code>);
-        <strong>sign</strong> (SHA-256 or
+        a PIN without changing anything; <strong>generate</strong> keys on-card in any
+        algorithm the card accepts — RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
+        secp256k1, brainpool — the choice offered from the card's own algorithm list
+        (<code>keyroostctl openpgp algorithms</code>), or <strong>import</strong> an RSA key by
+        host keygen or from a PKCS#1/PKCS#8 PEM/DER file, for the sign, encrypt, or
+        <strong>auth</strong> slot (<code>--slot auth</code>); <strong>sign</strong> (SHA-256 or
         SHA-1), <strong>decrypt</strong>, and <strong>authenticate</strong> (client/SSH
         signature with the Authentication key); set cardholder name / URL; register a key for
         GnuPG; <strong>change the user or admin PIN</strong> and <strong>unblock a
         locked PIN</strong> (via the admin PIN / PW3); and factory-reset the applet.</p>
     </div>
 <pre><code>keyroostctl openpgp status --reader yubikey
+keyroostctl openpgp generate-key --slot sign --algorithm ed25519 --yes --admin-pin-stdin --reader yubikey
 keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey
 keyroostctl openpgp authenticate --in chal.bin --pin-stdin --reader yubikey
 keyroostctl openpgp change-pin --old-pin-stdin --new-pin-stdin --reader yubikey</code></pre>
     <p class="kr-muted">The card byte layer is a pure-Rust, in-tree implementation of the
       OpenPGP Card spec (APDU + BER-TLV); RSA keygen/parsing is the one scoped host-side
-      dependency.</p>
+      dependency. Host-side import of ECC keys and local signature verification are not
+      offered; they would need new cryptographic dependencies, which this project adds only
+      deliberately.</p>
   </section>
 
   <section class="kr-section kr-res-section">

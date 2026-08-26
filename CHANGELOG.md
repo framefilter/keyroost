@@ -6,6 +6,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **OpenPGP keys in modern algorithms.** `openpgp generate-key --algorithm`
+  (and the GUI's Generate dialog) can set a slot to Ed25519, X25519, NIST
+  P-256/384/521, secp256k1, brainpool 256/384/512, or RSA 2048/3072/4096
+  before generating; previously a slot could only ever produce its factory
+  default (RSA-2048). The menu comes from the card's own algorithm list
+  (`openpgp algorithms`, new) when it publishes one. `sign`/`authenticate`
+  frame input correctly for ECC slots, `decrypt` performs ECDH on an ECDH
+  slot, and `status` names the curve. Verified on a YubiKey 5.7. Requested
+  by @mdedonno1337. ([#106])
+
+### Changed
+- Library API (`keyroost-openpgp`, `keyroost-transport`): `PublicKey` is now
+  an enum (`Rsa` / `Ecc`), `OpenPgpSession::generate_key` takes an optional
+  algorithm, `rsa_v4_fingerprint_from` is replaced by `v4_fingerprint`, and
+  `OpenPgpStatus` carries each slot's raw algorithm attributes. The CLI's
+  `openpgp status` (and its `--json` `*_algo` fields) now report
+  `RSA-2048` / `EdDSA Ed25519` rather than the bare family name.
+
 ### Fixed
 - **Identiv uTrust FIDO2 PIV cards can now be managed.** Their PIV applet
   answers management-key authentication without the final card-to-host
@@ -916,6 +935,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
 [#104]: https://github.com/framefilter/keyroost/pull/104
+[#106]: https://github.com/framefilter/keyroost/issues/106
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8

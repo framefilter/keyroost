@@ -51,13 +51,15 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   applet (`oath reset --yes`) — the recovery path for a forgotten password. In
   the GUI, secret fields have a reveal (eye) toggle so you can check an OTP
   secret before committing it.
-- **OpenPGP card (v3.4)** — read status; generate or import RSA-2048 keys (host
-  keygen or a PKCS#1/PKCS#8 PEM/DER file) for the signature, encryption, or
-  authentication slot — each writes the v4 fingerprint and a generation timestamp
-  so GnuPG recognizes the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a
-  client/SSH signature with the Authentication key via INTERNAL AUTHENTICATE);
-  set cardholder name / URL; change the user / admin PIN and unblock a locked
-  PIN; factory-reset the applet.
+- **OpenPGP card (v3.4)** — read status; generate keys on-card in any algorithm
+  the card accepts (RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
+  secp256k1, brainpool) for the signature, encryption, or authentication slot,
+  or import an RSA-2048 key (host keygen or a PKCS#1/PKCS#8 PEM/DER file) —
+  each writes the v4 fingerprint and a generation timestamp so GnuPG recognizes
+  the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a client/SSH
+  signature with the Authentication key via INTERNAL AUTHENTICATE); set
+  cardholder name / URL; change the user / admin PIN and unblock a locked PIN;
+  factory-reset the applet.
 - **PIV (SP 800-73-4)** — full management: status (applet/firmware version,
   serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
   generation, certificate import / export, self-signed certs or a CSR for a CA,
