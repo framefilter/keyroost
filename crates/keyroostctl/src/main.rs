@@ -1003,12 +1003,19 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
-    /// Read the public key from a slot (read-only; no PIN). RSA keys print their
-    /// modulus and exponent in hex.
+    /// Read the public key from a slot (read-only; no PIN). RSA keys print
+    /// modulus and exponent, ECC keys the public point, in hex.
     PublicKey {
         /// Which key slot: `sign`, `decrypt`, or `auth`.
         #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
+    },
+    /// List the key algorithms this card reports accepting per slot (read-only;
+    /// no PIN). Cards that don't publish the list accept any attempt and answer
+    /// with an error if they can't.
+    Algorithms {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
@@ -1049,14 +1056,21 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
-    /// Generate a fresh key pair in a slot. DESTRUCTIVE — overwrites any existing
-    /// key in that slot. Requires the admin PIN (PW3) and `--yes`; on a YubiKey a
-    /// touch is also required. Also writes the key's v4 fingerprint and a
-    /// generation timestamp so an OpenPGP tool (e.g. gpg) recognizes the key.
+    /// Generate a fresh key pair in a slot, optionally switching the slot's
+    /// algorithm first. DESTRUCTIVE — overwrites any existing key in that slot.
+    /// Requires the admin PIN (PW3) and `--yes`; on a YubiKey a touch is also
+    /// required. Also writes the key's v4 fingerprint and a generation
+    /// timestamp so an OpenPGP tool (e.g. gpg) recognizes the key.
     GenerateKey {
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
         #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
+        /// Key algorithm to generate. Omit to keep the slot's current algorithm
+        /// (RSA-2048 on a factory card). Ed25519 fits the sign/auth slots,
+        /// X25519 the decrypt slot; the NIST/brainpool/secp256k1 curves fit any.
+        /// See `openpgp algorithms` for what this card accepts.
+        #[arg(long, value_enum)]
+        algorithm: Option<CliOpenpgpKeyAlg>,
         /// Confirm you really want to overwrite the slot.
         #[arg(long)]
         yes: bool,
@@ -1101,9 +1115,9 @@ enum OpenpgpCmd {
         reader: Option<String>,
     },
     /// Sign a file with the on-card signature key (PSO:CDS). Hashes the input
-    /// (SHA-256 by default, or SHA-1 via `--hash`), wraps it in a PKCS#1
-    /// DigestInfo, and has the card produce an RSA signature. Requires the
-    /// signing PIN (PW1) and, on a YubiKey, a touch.
+    /// (SHA-256 by default, or SHA-1 via `--hash`). RSA slots sign a PKCS#1
+    /// DigestInfo; ECC slots sign the bare digest. Requires the signing PIN
+    /// (PW1) and, on a YubiKey, a touch.
     Sign {
         /// File whose contents to sign.
         #[arg(long, value_name = "FILE")]
@@ -1125,17 +1139,16 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
-    /// Decrypt a file with the on-card decryption key (PSO:DECIPHER). The input
-    /// is a raw RSA cryptogram — for RSA-2048, the 256-byte value produced by
-    /// RSA-encrypting a PKCS#1 v1.5 block under the decryption slot's public
-    /// key. The card applies the private key, strips the padding, and returns
-    /// the plaintext. Requires the user PIN (PW1) and, on a YubiKey, a touch.
+    /// Decrypt a file with the on-card decryption key (PSO:DECIPHER). Requires
+    /// the user PIN (PW1) and, on a YubiKey, a touch.
     Decrypt {
-        /// File holding the raw RSA cryptogram to decrypt.
+        /// For an RSA slot `--in` is the raw cryptogram; for an ECDH slot it is
+        /// the sender's ephemeral public point (`04||X||Y`, or 32 raw bytes for
+        /// X25519) and the output is the shared secret.
         #[arg(long, value_name = "FILE")]
         r#in: std::path::PathBuf,
-        /// Write the recovered plaintext here. Without it, the plaintext is
-        /// printed as hex to stdout.
+        /// Write the recovered plaintext (or, for ECDH, the shared secret)
+        /// here. Without it, the bytes are printed as hex to stdout.
         #[arg(long, value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         /// Read the user PIN (PW1) from the named environment variable.
@@ -1148,9 +1161,10 @@ enum OpenpgpCmd {
         reader: Option<String>,
     },
     /// Produce a client/SSH authentication signature with the on-card
-    /// Authentication key (INTERNAL AUTHENTICATE). Hashes the input, wraps it in
-    /// a PKCS#1 DigestInfo, and has the card sign it. Requires the user PIN (PW1)
-    /// and, on a YubiKey, a touch.
+    /// Authentication key (INTERNAL AUTHENTICATE). Hashes the input (SHA-256 by
+    /// default, or SHA-1 via `--hash`). RSA slots sign a PKCS#1 DigestInfo; ECC
+    /// slots sign the bare digest. Requires the user PIN (PW1) and, on a
+    /// YubiKey, a touch.
     Authenticate {
         /// File whose contents to authenticate-sign.
         #[arg(long, value_name = "FILE")]
@@ -1273,6 +1287,15 @@ impl SignHash {
             SignHash::Sha256 => "SHA-256",
         }
     }
+
+    /// The bare digest of `data` — no DigestInfo wrapper. ECDSA and EdDSA
+    /// slots sign this directly.
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            SignHash::Sha1 => keyroost_proto::sha1::sha1(data).to_vec(),
+            SignHash::Sha256 => keyroost_proto::sha256::sha256(data).to_vec(),
+        }
+    }
 }
 impl OpenpgpSlot {
     fn to_crt(self) -> keyroost_openpgp::KeyCrt {
@@ -1287,6 +1310,51 @@ impl OpenpgpSlot {
             OpenpgpSlot::Sign => "signature",
             OpenpgpSlot::Decrypt => "decryption",
             OpenpgpSlot::Auth => "authentication",
+        }
+    }
+}
+
+/// Key algorithm for `openpgp generate-key --algorithm`. Names follow GnuPG's
+/// (`cv25519` is accepted as an alias of `x25519`).
+#[derive(Copy, Clone, ValueEnum)]
+enum CliOpenpgpKeyAlg {
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    Ed25519,
+    #[value(alias = "cv25519")]
+    X25519,
+    #[value(name = "nistp256")]
+    NistP256,
+    #[value(name = "nistp384")]
+    NistP384,
+    #[value(name = "nistp521")]
+    NistP521,
+    Secp256k1,
+    #[value(name = "brainpoolp256")]
+    BrainpoolP256r1,
+    #[value(name = "brainpoolp384")]
+    BrainpoolP384r1,
+    #[value(name = "brainpoolp512")]
+    BrainpoolP512r1,
+}
+
+impl CliOpenpgpKeyAlg {
+    fn to_alg(self) -> keyroost_openpgp::KeyAlg {
+        use keyroost_openpgp::KeyAlg::*;
+        match self {
+            CliOpenpgpKeyAlg::Rsa2048 => Rsa2048,
+            CliOpenpgpKeyAlg::Rsa3072 => Rsa3072,
+            CliOpenpgpKeyAlg::Rsa4096 => Rsa4096,
+            CliOpenpgpKeyAlg::Ed25519 => Ed25519,
+            CliOpenpgpKeyAlg::X25519 => X25519,
+            CliOpenpgpKeyAlg::NistP256 => NistP256,
+            CliOpenpgpKeyAlg::NistP384 => NistP384,
+            CliOpenpgpKeyAlg::NistP521 => NistP521,
+            CliOpenpgpKeyAlg::Secp256k1 => Secp256k1,
+            CliOpenpgpKeyAlg::BrainpoolP256r1 => BrainpoolP256r1,
+            CliOpenpgpKeyAlg::BrainpoolP384r1 => BrainpoolP384r1,
+            CliOpenpgpKeyAlg::BrainpoolP512r1 => BrainpoolP512r1,
         }
     }
 }
@@ -5278,6 +5346,34 @@ fn oath_algo_str(a: keyroost_oath::Algorithm) -> &'static str {
     }
 }
 
+/// What to hand the card for a signature: RSA slots take a PKCS#1 DigestInfo;
+/// ECDSA and EdDSA slots take the bare digest (the card signs those bytes
+/// directly — GnuPG does the same). Attributes that don't parse are treated
+/// as RSA, the only kind that existed before #106.
+fn openpgp_sign_input(slot_attrs: &[u8], hash: SignHash, data: &[u8]) -> Vec<u8> {
+    match keyroost_openpgp::parse_algorithm_attributes(slot_attrs) {
+        Ok(keyroost_openpgp::AlgorithmAttributes::Ecc { .. }) => hash.digest(data),
+        _ => hash.digest_info(data),
+    }
+}
+
+/// Print a public key read from (or freshly generated into) an OpenPGP slot:
+/// RSA prints modulus and exponent, ECC the public point, both in hex.
+fn print_openpgp_public_key(slot_label: &str, attrs: &[u8], key: &keyroost_openpgp::PublicKey) {
+    println!(
+        "{} key ({}):",
+        slot_label,
+        keyroost_openpgp::describe_algorithm_attributes(attrs)
+    );
+    match key {
+        keyroost_openpgp::PublicKey::Rsa { modulus, exponent } => {
+            println!("  modulus:  {}", hex_encode(modulus));
+            println!("  exponent: {}", hex_encode(exponent));
+        }
+        keyroost_openpgp::PublicKey::Ecc { point } => println!("  point:    {}", hex_encode(point)),
+    }
+}
+
 fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         OpenpgpCmd::Status { reader } => {
@@ -5297,9 +5393,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 emit_json(&json_out::OpenpgpStatusJson {
                     aid: hex_encode(&status.aid),
                     serial: status.serial(),
-                    sig_algo: algo_id_str(status.sig_algo_id).to_string(),
-                    dec_algo: algo_id_str(status.dec_algo_id).to_string(),
-                    aut_algo: algo_id_str(status.aut_algo_id).to_string(),
+                    sig_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Sign),
+                    dec_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
+                    aut_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
                     fingerprint_sig: fpr(&status.fingerprint_sig),
                     fingerprint_dec: fpr(&status.fingerprint_dec),
                     fingerprint_aut: fpr(&status.fingerprint_aut),
@@ -5319,9 +5415,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             }
             println!(
                 "Key algorithms: sig={} dec={} aut={}",
-                algo_id_str(status.sig_algo_id),
-                algo_id_str(status.dec_algo_id),
-                algo_id_str(status.aut_algo_id),
+                status.algorithm_label(keyroost_openpgp::KeyCrt::Sign),
+                status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
+                status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
             );
             print_fingerprint("Signature  fpr", &status.fingerprint_sig);
             print_fingerprint("Decryption fpr", &status.fingerprint_dec);
@@ -5348,10 +5444,32 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::PublicKey { slot, reader } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
+            let attrs = session.algorithm_attributes(slot.to_crt())?;
             let key = session.read_public_key(slot.to_crt())?;
-            println!("{} key (RSA):", slot.label());
-            println!("  modulus:  {}", hex_encode(&key.modulus));
-            println!("  exponent: {}", hex_encode(&key.exponent));
+            print_openpgp_public_key(slot.label(), &attrs, &key);
+        }
+        OpenpgpCmd::Algorithms { reader } => {
+            let mut session = open_openpgp(reader.as_deref(), debug)?;
+            match session.supported_algorithms()? {
+                None => println!(
+                    "This card does not publish an algorithm list (pre-3.4 OpenPGP card). \
+                     Any --algorithm may be tried; the card rejects what it cannot do."
+                ),
+                Some(info) => {
+                    for (name, crt) in [
+                        ("sign", keyroost_openpgp::KeyCrt::Sign),
+                        ("decrypt", keyroost_openpgp::KeyCrt::Decrypt),
+                        ("auth", keyroost_openpgp::KeyCrt::Auth),
+                    ] {
+                        let labels: Vec<String> = info
+                            .raw(crt)
+                            .iter()
+                            .map(|a| keyroost_openpgp::describe_algorithm_attributes(a))
+                            .collect();
+                        println!("{:<8} {}", format!("{name}:"), labels.join(", "));
+                    }
+                }
+            }
         }
         OpenpgpCmd::Reset { yes, reader } => {
             // Resolve and identify the target *before* the --yes gate, so the
@@ -5379,6 +5497,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::GenerateKey {
             slot,
+            algorithm,
             yes,
             admin_pin_env,
             admin_pin_stdin,
@@ -5402,10 +5521,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 "Generating {} key — touch the key if it blinks…",
                 slot.label()
             );
-            let key = session.generate_key(slot.to_crt())?;
-            println!("Generated {} key (RSA):", slot.label());
-            println!("  modulus:  {}", hex_encode(&key.modulus));
-            println!("  exponent: {}", hex_encode(&key.exponent));
+            let key = session.generate_key(slot.to_crt(), algorithm.map(|a| a.to_alg()))?;
+            let attrs = session.algorithm_attributes(slot.to_crt())?;
+            print_openpgp_public_key(&format!("Generated {}", slot.label()), &attrs, &key);
             // Register the key (fingerprint + creation timestamp) so gpg and
             // other OpenPGP tools recognize it. Use the host's current time as
             // the key's creation time; the card stores both, so read-back is
@@ -5516,15 +5634,15 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         } => {
             let data = std::fs::read(r#in)
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
-            // PKCS#1 v1.5 DigestInfo (SHA-256 by default, SHA-1 on request): the
-            // card wraps it in EMSA padding and RSA-signs it. Both hashes are
-            // in-tree (keyroost-proto); the card signs whatever DigestInfo it gets.
-            let digest_info = hash.digest_info(&data);
             let pin = read_secret("signing PIN (PW1)", pin_env.as_deref(), *pin_stdin)?;
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             session.verify_pin(keyroost_openpgp::PW1_SIGN, pin.as_bytes())?;
+            // RSA slots want a PKCS#1 v1.5 DigestInfo (the card EMSA-pads and
+            // RSA-signs it); ECDSA/EdDSA slots want the bare digest.
+            let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Sign)?;
+            let input = openpgp_sign_input(&attrs, *hash, &data);
             eprintln!("Signing ({}) — touch the key if it blinks…", hash.label());
-            let sig = session.sign(&digest_info)?;
+            let sig = session.sign(&input)?;
             match out {
                 Some(path) => {
                     write_private_file(path, &sig)
@@ -5548,17 +5666,26 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // Decryption authorizes under PW1 in the "other"/decipher context
             // (ref 0x82), not the signing context (0x81).
             session.verify_pin(keyroost_openpgp::PW1_OTHER, pin.as_bytes())?;
-            eprintln!("Decrypting — touch the key if it blinks…");
-            let plain = session.decrypt(&cryptogram)?;
+            let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Decrypt)?;
+            let is_ecdh = matches!(
+                keyroost_openpgp::parse_algorithm_attributes(&attrs),
+                Ok(keyroost_openpgp::AlgorithmAttributes::Ecc {
+                    kind: keyroost_openpgp::EccKind::Ecdh,
+                    ..
+                })
+            );
+            let (plain, noun) = if is_ecdh {
+                eprintln!("Deriving shared secret — touch the key if it blinks…");
+                (session.decrypt_ecdh(&cryptogram)?, "shared-secret")
+            } else {
+                eprintln!("Decrypting — touch the key if it blinks…");
+                (session.decrypt(&cryptogram)?, "plaintext")
+            };
             match out {
                 Some(path) => {
                     write_private_file(path, &plain)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!(
-                        "Wrote {} plaintext bytes to {}",
-                        plain.len(),
-                        path.display()
-                    );
+                    eprintln!("Wrote {} {} bytes to {}", plain.len(), noun, path.display());
                 }
                 None => println!("{}", hex_encode(&plain)),
             }
@@ -5573,19 +5700,20 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         } => {
             let data = std::fs::read(r#in)
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
-            // PKCS#1 v1.5 DigestInfo (SHA-256 by default, SHA-1 on request): the
-            // card wraps it in EMSA padding and RSA-signs it with the Auth key.
-            let digest_info = hash.digest_info(&data);
             let pin = read_secret("user PIN (PW1)", pin_env.as_deref(), *pin_stdin)?;
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             // INTERNAL AUTHENTICATE authorizes under PW1 in the "other" context
             // (ref 0x82) — the same context as decipher, not the signing context.
             session.verify_pin(keyroost_openpgp::PW1_OTHER, pin.as_bytes())?;
+            // RSA slots want a PKCS#1 v1.5 DigestInfo; ECDSA/EdDSA slots want
+            // the bare digest.
+            let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Auth)?;
+            let input = openpgp_sign_input(&attrs, *hash, &data);
             eprintln!(
                 "Authenticating ({}) — touch the key if it blinks…",
                 hash.label()
             );
-            let sig = session.internal_authenticate(&digest_info)?;
+            let sig = session.internal_authenticate(&input)?;
             match out {
                 Some(path) => {
                     write_private_file(path, &sig)
@@ -6341,18 +6469,6 @@ fn load_pubkey_material(
             )
         })?;
     Ok((alg, key))
-}
-
-/// Map an OpenPGP algorithm id (first attribute byte) to a short label.
-fn algo_id_str(id: Option<u8>) -> &'static str {
-    match id {
-        Some(0x01) => "RSA",
-        Some(0x12) => "ECDH",
-        Some(0x13) => "ECDSA",
-        Some(0x16) => "EdDSA",
-        Some(_) => "other",
-        None => "none",
-    }
 }
 
 /// Print a key fingerprint, rendering an all-zero (no key) slot as "(none)".
@@ -9350,6 +9466,71 @@ mod cli_tests {
     }
 
     #[test]
+    fn openpgp_generate_key_algorithm_is_optional_and_named_like_gpg() {
+        // No --algorithm: None — generate whatever the slot's attributes say
+        // (the pre-#106 behaviour, unchanged for scripts).
+        match parse(&["keyroostctl", "openpgp", "generate-key", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Openpgp {
+                cmd: OpenpgpCmd::GenerateKey { algorithm, .. },
+            }) => assert!(algorithm.is_none()),
+            _ => panic!("expected openpgp generate-key"),
+        }
+        for (name, want) in [
+            ("ed25519", keyroost_openpgp::KeyAlg::Ed25519),
+            ("x25519", keyroost_openpgp::KeyAlg::X25519),
+            ("cv25519", keyroost_openpgp::KeyAlg::X25519),
+            ("nistp256", keyroost_openpgp::KeyAlg::NistP256),
+            ("brainpoolp512", keyroost_openpgp::KeyAlg::BrainpoolP512r1),
+            ("rsa4096", keyroost_openpgp::KeyAlg::Rsa4096),
+        ] {
+            match parse(&[
+                "keyroostctl",
+                "openpgp",
+                "generate-key",
+                "--yes",
+                "--algorithm",
+                name,
+            ])
+            .unwrap()
+            .command
+            {
+                Some(Cmd::Openpgp {
+                    cmd:
+                        OpenpgpCmd::GenerateKey {
+                            algorithm: Some(a), ..
+                        },
+                }) => assert_eq!(a.to_alg(), want, "{name}"),
+                _ => panic!("expected openpgp generate-key --algorithm {name}"),
+            }
+        }
+        assert!(parse(&["keyroostctl", "openpgp", "algorithms"]).is_ok());
+    }
+
+    #[test]
+    fn openpgp_sign_input_framing_follows_the_slot_algorithm() {
+        let data = b"hello";
+        // RSA: PKCS#1 DigestInfo. ECC (ECDSA/EdDSA): the bare digest.
+        let rsa = [0x01, 0x08, 0x00, 0x00, 0x20, 0x02];
+        let ed = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+        assert_eq!(
+            openpgp_sign_input(&rsa, SignHash::Sha256, data),
+            SignHash::Sha256.digest_info(data)
+        );
+        assert_eq!(
+            openpgp_sign_input(&ed, SignHash::Sha256, data),
+            keyroost_proto::sha256::sha256(data).to_vec()
+        );
+        // Unknown attributes: assume RSA (the pre-#106 behaviour).
+        assert_eq!(
+            openpgp_sign_input(&[], SignHash::Sha1, data),
+            SignHash::Sha1.digest_info(data)
+        );
+    }
+
+    #[test]
     fn molto_is_nested() {
         assert!(parse(&["keyroostctl", "molto", "info"]).is_ok());
         assert!(parse(&[
@@ -9662,9 +9843,9 @@ mod cli_tests {
         let o = json_out::OpenpgpStatusJson {
             aid: "d2760001240103040006...".into(),
             serial: Some(12345678),
-            sig_algo: "RSA".into(),
-            dec_algo: "RSA".into(),
-            aut_algo: "RSA".into(),
+            sig_algo: "RSA-2048".into(),
+            dec_algo: "RSA-2048".into(),
+            aut_algo: "RSA-2048".into(),
             fingerprint_sig: Some("aabb...".into()),
             fingerprint_dec: None,
             fingerprint_aut: None,
