@@ -379,6 +379,18 @@ impl KeyCrt {
             KeyCrt::Auth => TAG_TIME_AUTH,
         }
     }
+
+    /// The data-object tag of this slot's algorithm attributes (`C1`/`C2`/`C3`),
+    /// the target for a [`put_algorithm_attributes`] PUT DATA (and the tag
+    /// under which the card reports them inside `6E`/`73`).
+    #[must_use]
+    pub const fn algo_attr_tag(self) -> u16 {
+        match self {
+            KeyCrt::Sign => TAG_ALGO_ATTR_SIG,
+            KeyCrt::Decrypt => TAG_ALGO_ATTR_DEC,
+            KeyCrt::Auth => TAG_ALGO_ATTR_AUT,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +735,316 @@ pub fn rsa_v4_fingerprint(modulus: &[u8], exponent: &[u8], creation_time: u32) -
 #[must_use]
 pub fn rsa_v4_fingerprint_from(key: &PublicKey, creation_time: u32) -> [u8; 20] {
     rsa_v4_fingerprint(&key.modulus, &key.exponent, creation_time)
+}
+
+// ---------------------------------------------------------------------------
+// Key algorithms (algorithm attributes, OpenPGP Card spec v3.4 §4.4.3.9-11)
+// ---------------------------------------------------------------------------
+
+/// An elliptic curve an OpenPGP card can hold a key on, identified on the wire
+/// by its bare OID body (no DER `06 len` header) inside the slot's algorithm
+/// attributes. The 25519 pair is split by *use* — Ed25519 signs, X25519 agrees
+/// keys — so each is its own curve here, as in the OID registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Curve {
+    Ed25519,
+    X25519,
+    NistP256,
+    NistP384,
+    NistP521,
+    Secp256k1,
+    BrainpoolP256r1,
+    BrainpoolP384r1,
+    BrainpoolP512r1,
+}
+
+impl Curve {
+    /// Every curve this crate models, in display order.
+    pub const ALL: [Curve; 9] = [
+        Curve::Ed25519,
+        Curve::X25519,
+        Curve::NistP256,
+        Curve::NistP384,
+        Curve::NistP521,
+        Curve::Secp256k1,
+        Curve::BrainpoolP256r1,
+        Curve::BrainpoolP384r1,
+        Curve::BrainpoolP512r1,
+    ];
+
+    /// The curve's OID body as the card stores it after the algorithm id.
+    #[must_use]
+    pub const fn oid(self) -> &'static [u8] {
+        match self {
+            // 1.3.6.1.4.1.11591.15.1
+            Curve::Ed25519 => &[0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+            // 1.3.6.1.4.1.3029.1.5.1
+            Curve::X25519 => &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01],
+            // 1.2.840.10045.3.1.7
+            Curve::NistP256 => &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+            // 1.3.132.0.34
+            Curve::NistP384 => &[0x2B, 0x81, 0x04, 0x00, 0x22],
+            // 1.3.132.0.35
+            Curve::NistP521 => &[0x2B, 0x81, 0x04, 0x00, 0x23],
+            // 1.3.132.0.10
+            Curve::Secp256k1 => &[0x2B, 0x81, 0x04, 0x00, 0x0A],
+            // 1.3.36.3.3.2.8.1.1.7 / .11 / .13
+            Curve::BrainpoolP256r1 => &[0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07],
+            Curve::BrainpoolP384r1 => &[0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0B],
+            Curve::BrainpoolP512r1 => &[0x2B, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0D],
+        }
+    }
+
+    /// Resolve a bare OID body to a curve.
+    #[must_use]
+    pub fn from_oid(oid: &[u8]) -> Option<Curve> {
+        Curve::ALL.into_iter().find(|c| c.oid() == oid)
+    }
+
+    /// Human label (GnuPG's spelling where it has one).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Curve::Ed25519 => "Ed25519",
+            Curve::X25519 => "X25519",
+            Curve::NistP256 => "NIST P-256",
+            Curve::NistP384 => "NIST P-384",
+            Curve::NistP521 => "NIST P-521",
+            Curve::Secp256k1 => "secp256k1",
+            Curve::BrainpoolP256r1 => "brainpoolP256r1",
+            Curve::BrainpoolP384r1 => "brainpoolP384r1",
+            Curve::BrainpoolP512r1 => "brainpoolP512r1",
+        }
+    }
+
+    /// Field size in bits — selects the RFC 6637 ECDH KDF parameters.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        match self {
+            Curve::Ed25519 | Curve::X25519 => 255,
+            Curve::NistP256 | Curve::Secp256k1 | Curve::BrainpoolP256r1 => 256,
+            Curve::NistP384 | Curve::BrainpoolP384r1 => 384,
+            Curve::NistP521 => 521,
+            Curve::BrainpoolP512r1 => 512,
+        }
+    }
+
+    /// Whether the public point is the 32-byte 25519 form (which the OpenPGP
+    /// packet prefixes with `0x40`) rather than an uncompressed `04||X||Y`.
+    #[must_use]
+    pub const fn is_25519(self) -> bool {
+        matches!(self, Curve::Ed25519 | Curve::X25519)
+    }
+}
+
+/// The ECC algorithm id an attributes object starts with — which of the three
+/// ECC operations the slot performs. The values coincide with the OpenPGP
+/// public-key algorithm ids (RFC 4880 §9.1 / RFC 6637 §5), so the same byte
+/// goes into the v4 fingerprint packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EccKind {
+    /// `0x12` — ECDH (decryption slot).
+    Ecdh,
+    /// `0x13` — ECDSA (signature / authentication slots, Weierstrass curves).
+    Ecdsa,
+    /// `0x16` — EdDSA (signature / authentication slots, Ed25519).
+    EdDsa,
+}
+
+impl EccKind {
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            EccKind::Ecdh => 0x12,
+            EccKind::Ecdsa => 0x13,
+            EccKind::EdDsa => 0x16,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_id(id: u8) -> Option<EccKind> {
+        match id {
+            0x12 => Some(EccKind::Ecdh),
+            0x13 => Some(EccKind::Ecdsa),
+            0x16 => Some(EccKind::EdDsa),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            EccKind::Ecdh => "ECDH",
+            EccKind::Ecdsa => "ECDSA",
+            EccKind::EdDsa => "EdDSA",
+        }
+    }
+}
+
+/// A key algorithm a user can ask a slot to be set to. RSA sizes plus every
+/// [`Curve`]; the ECC *kind* (ECDH vs ECDSA/EdDSA) follows from the slot, see
+/// [`KeyAlg::attributes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAlg {
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    Ed25519,
+    X25519,
+    NistP256,
+    NistP384,
+    NistP521,
+    Secp256k1,
+    BrainpoolP256r1,
+    BrainpoolP384r1,
+    BrainpoolP512r1,
+}
+
+/// The requested algorithm cannot live in the requested slot: Ed25519 is a
+/// signing curve (signature / authentication only) and X25519 a key-agreement
+/// curve (decryption only). Reported rather than silently substituted, because
+/// the substitute would be a different key than the one asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotMismatch {
+    pub alg: KeyAlg,
+    pub crt: KeyCrt,
+}
+
+impl core::fmt::Display for SlotMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.alg {
+            KeyAlg::Ed25519 => write!(
+                f,
+                "Ed25519 is a signing curve and cannot go in the decryption slot; use X25519 there"
+            ),
+            KeyAlg::X25519 => write!(
+                f,
+                "X25519 is a key-agreement curve and only fits the decryption slot; use Ed25519 for signing or authentication"
+            ),
+            _ => write!(f, "{} cannot be used in the {:?} slot", self.alg.label(), self.crt),
+        }
+    }
+}
+
+impl std::error::Error for SlotMismatch {}
+
+impl KeyAlg {
+    /// Every algorithm, in menu order: RSA sizes first, then the curves.
+    pub const ALL: [KeyAlg; 12] = [
+        KeyAlg::Rsa2048,
+        KeyAlg::Rsa3072,
+        KeyAlg::Rsa4096,
+        KeyAlg::Ed25519,
+        KeyAlg::X25519,
+        KeyAlg::NistP256,
+        KeyAlg::NistP384,
+        KeyAlg::NistP521,
+        KeyAlg::Secp256k1,
+        KeyAlg::BrainpoolP256r1,
+        KeyAlg::BrainpoolP384r1,
+        KeyAlg::BrainpoolP512r1,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            KeyAlg::Rsa2048 => "RSA-2048",
+            KeyAlg::Rsa3072 => "RSA-3072",
+            KeyAlg::Rsa4096 => "RSA-4096",
+            KeyAlg::Ed25519 => Curve::Ed25519.label(),
+            KeyAlg::X25519 => Curve::X25519.label(),
+            KeyAlg::NistP256 => Curve::NistP256.label(),
+            KeyAlg::NistP384 => Curve::NistP384.label(),
+            KeyAlg::NistP521 => Curve::NistP521.label(),
+            KeyAlg::Secp256k1 => Curve::Secp256k1.label(),
+            KeyAlg::BrainpoolP256r1 => Curve::BrainpoolP256r1.label(),
+            KeyAlg::BrainpoolP384r1 => Curve::BrainpoolP384r1.label(),
+            KeyAlg::BrainpoolP512r1 => Curve::BrainpoolP512r1.label(),
+        }
+    }
+
+    /// The curve, for the ECC algorithms; `None` for RSA.
+    #[must_use]
+    pub const fn curve(self) -> Option<Curve> {
+        match self {
+            KeyAlg::Rsa2048 | KeyAlg::Rsa3072 | KeyAlg::Rsa4096 => None,
+            KeyAlg::Ed25519 => Some(Curve::Ed25519),
+            KeyAlg::X25519 => Some(Curve::X25519),
+            KeyAlg::NistP256 => Some(Curve::NistP256),
+            KeyAlg::NistP384 => Some(Curve::NistP384),
+            KeyAlg::NistP521 => Some(Curve::NistP521),
+            KeyAlg::Secp256k1 => Some(Curve::Secp256k1),
+            KeyAlg::BrainpoolP256r1 => Some(Curve::BrainpoolP256r1),
+            KeyAlg::BrainpoolP384r1 => Some(Curve::BrainpoolP384r1),
+            KeyAlg::BrainpoolP512r1 => Some(Curve::BrainpoolP512r1),
+        }
+    }
+
+    /// Modulus size, for the RSA algorithms; `None` for the curves.
+    #[must_use]
+    pub const fn rsa_bits(self) -> Option<u16> {
+        match self {
+            KeyAlg::Rsa2048 => Some(2048),
+            KeyAlg::Rsa3072 => Some(3072),
+            KeyAlg::Rsa4096 => Some(4096),
+            _ => None,
+        }
+    }
+
+    /// Which ECC operation this algorithm performs in `crt`'s slot: ECDH in the
+    /// decryption slot, EdDSA for Ed25519 elsewhere, ECDSA for the Weierstrass
+    /// curves elsewhere. Errors for RSA (no ECC kind) are not possible — RSA is
+    /// handled by [`KeyAlg::attributes`] directly; this returns [`SlotMismatch`]
+    /// for the 25519 curve/slot combinations that don't exist.
+    pub fn ecc_kind(self, crt: KeyCrt) -> Result<EccKind, SlotMismatch> {
+        let mismatch = SlotMismatch { alg: self, crt };
+        match (self, crt) {
+            (KeyAlg::Ed25519, KeyCrt::Decrypt) | (KeyAlg::X25519, KeyCrt::Sign | KeyCrt::Auth) => {
+                Err(mismatch)
+            }
+            (KeyAlg::Ed25519, _) => Ok(EccKind::EdDsa),
+            (_, KeyCrt::Decrypt) => Ok(EccKind::Ecdh),
+            (_, _) => Ok(EccKind::Ecdsa),
+        }
+    }
+
+    /// The algorithm-attributes value to PUT DATA into `crt`'s `C1`/`C2`/`C3`
+    /// so the next GENERATE produces this kind of key.
+    ///
+    /// RSA: `01 | n_bits(2) | e_bits = 0x0020 | format = 0x00` — the shape GnuPG
+    /// writes; the card may answer a later read with its own import-format
+    /// byte, which [`parse_algorithm_attributes`] reports faithfully. ECC:
+    /// `<ecc kind id> | <curve OID body>`.
+    pub fn attributes(self, crt: KeyCrt) -> Result<Vec<u8>, SlotMismatch> {
+        if let Some(bits) = self.rsa_bits() {
+            return Ok(vec![
+                0x01,
+                (bits >> 8) as u8,
+                (bits & 0xFF) as u8,
+                0x00,
+                0x20,
+                0x00,
+            ]);
+        }
+        let kind = self.ecc_kind(crt)?;
+        let curve = self.curve().expect("non-RSA KeyAlg has a curve");
+        let mut out = Vec::with_capacity(1 + curve.oid().len());
+        out.push(kind.id());
+        out.extend_from_slice(curve.oid());
+        Ok(out)
+    }
+}
+
+/// `PUT DATA C1`/`C2`/`C3` — write the algorithm attributes of `crt`'s slot
+/// (see [`KeyCrt::algo_attr_tag`]; build `attr` with [`KeyAlg::attributes`]).
+///
+/// Requires PW3. **Changing a slot's algorithm wipes the key in that slot** on
+/// every card that allows the change at all (OpenPGP Card spec v3.4 §4.4.3.9);
+/// the transport only does this immediately before a GENERATE that overwrites
+/// the slot anyway. Cards that don't allow it answer with an error status.
+#[must_use]
+pub fn put_algorithm_attributes(crt: KeyCrt, attr: &[u8]) -> Vec<u8> {
+    put_data(crt.algo_attr_tag(), attr)
 }
 
 // ---------------------------------------------------------------------------
@@ -2612,5 +2934,90 @@ mod manufacturer_tests {
         assert_eq!(manufacturer_name(0x0000), None); // test card
         assert_eq!(manufacturer_name(0xFFFF), None); // test card
         assert_eq!(manufacturer_name(0xFF42), None); // unmanaged S/N range
+    }
+
+    // --- Key algorithms: curves, attribute bytes ------------------------
+
+    #[test]
+    fn curve_oids_round_trip() {
+        for c in Curve::ALL {
+            assert_eq!(Curve::from_oid(c.oid()), Some(c), "{}", c.label());
+        }
+        assert_eq!(Curve::from_oid(&[0x2B, 0x65, 0x70]), None); // Ed448: not modelled
+        assert_eq!(Curve::from_oid(&[]), None);
+    }
+
+    #[test]
+    fn key_alg_attribute_bytes_exact() {
+        // EdDSA (16) + Ed25519 OID in the signature slot.
+        assert_eq!(
+            KeyAlg::Ed25519.attributes(KeyCrt::Sign).unwrap(),
+            vec![0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01]
+        );
+        // ECDH (12) + cv25519 OID in the decryption slot — the exact bytes of
+        // the in-tree ARD fixture's C2.
+        assert_eq!(
+            KeyAlg::X25519.attributes(KeyCrt::Decrypt).unwrap(),
+            vec![0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01]
+        );
+        // NIST curves: ECDSA (13) for sign/auth, ECDH (12) for decrypt.
+        assert_eq!(
+            KeyAlg::NistP256.attributes(KeyCrt::Auth).unwrap(),
+            vec![0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+        );
+        assert_eq!(
+            KeyAlg::NistP256.attributes(KeyCrt::Decrypt).unwrap(),
+            vec![0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+        );
+        assert_eq!(
+            KeyAlg::NistP384.attributes(KeyCrt::Sign).unwrap(),
+            vec![0x13, 0x2B, 0x81, 0x04, 0x00, 0x22]
+        );
+        // RSA: 01 | n_bits | e_bits=0020 | format=00 (standard), as GnuPG writes it.
+        assert_eq!(
+            KeyAlg::Rsa3072.attributes(KeyCrt::Sign).unwrap(),
+            vec![0x01, 0x0C, 0x00, 0x00, 0x20, 0x00]
+        );
+        assert_eq!(
+            KeyAlg::Rsa4096.attributes(KeyCrt::Decrypt).unwrap(),
+            vec![0x01, 0x10, 0x00, 0x00, 0x20, 0x00]
+        );
+    }
+
+    #[test]
+    fn key_alg_slot_mismatch_is_an_error_not_a_guess() {
+        // Ed25519 only signs; X25519 only agrees keys. Silently swapping one
+        // for the other would generate a different key than asked for.
+        let e = KeyAlg::Ed25519.attributes(KeyCrt::Decrypt).unwrap_err();
+        assert_eq!(
+            e,
+            SlotMismatch {
+                alg: KeyAlg::Ed25519,
+                crt: KeyCrt::Decrypt
+            }
+        );
+        assert!(e.to_string().contains("X25519"));
+        assert!(KeyAlg::X25519.attributes(KeyCrt::Sign).is_err());
+        assert!(KeyAlg::X25519.attributes(KeyCrt::Auth).is_err());
+        // Every other algorithm fits every slot.
+        for alg in KeyAlg::ALL {
+            if matches!(alg, KeyAlg::Ed25519 | KeyAlg::X25519) {
+                continue;
+            }
+            for crt in [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth] {
+                assert!(alg.attributes(crt).is_ok(), "{} in {:?}", alg.label(), crt);
+            }
+        }
+    }
+
+    #[test]
+    fn put_algorithm_attributes_bytes() {
+        // 00 DA 00 C2 <Lc> <attr>
+        let attr = KeyAlg::X25519.attributes(KeyCrt::Decrypt).unwrap();
+        let apdu = put_algorithm_attributes(KeyCrt::Decrypt, &attr);
+        assert_eq!(&apdu[..5], &[0x00, 0xDA, 0x00, 0xC2, 0x0B]);
+        assert_eq!(&apdu[5..], &attr[..]);
+        assert_eq!(KeyCrt::Sign.algo_attr_tag(), TAG_ALGO_ATTR_SIG);
+        assert_eq!(KeyCrt::Auth.algo_attr_tag(), TAG_ALGO_ATTR_AUT);
     }
 }
