@@ -6170,6 +6170,8 @@ impl App {
         self.openpgp.notice = None;
         self.openpgp.name_input.clear();
         self.openpgp.url_input.clear();
+        self.openpgp.supported = None;
+        self.openpgp.gen_alg = OpenPgpKeyAlgSel::CardDefault;
         self.piv = PivState::default();
         // Typed secrets must never survive a selection change — a PIN entered
         // for one key would otherwise be sent to another (the OATH pane even
