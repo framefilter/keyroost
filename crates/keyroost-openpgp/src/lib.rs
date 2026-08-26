@@ -689,9 +689,10 @@ pub fn put_fingerprint(crt: KeyCrt, fpr: &[u8; 20]) -> Vec<u8> {
 /// `PUT DATA CE`/`CF`/`D0` — write the 4-byte big-endian Unix generation
 /// timestamp of the key in `crt`'s slot (see [`KeyCrt::time_tag`]).
 ///
-/// This timestamp *must* match the `creation_time` fed to
-/// [`rsa_v4_fingerprint`]: the v4 fingerprint hashes the creation time, so a
-/// mismatch yields a fingerprint the card and `gpg` disagree on.
+/// This timestamp *must* match the `creation_time` fed to [`v4_fingerprint`]
+/// (RSA: [`rsa_v4_fingerprint`]; ECC: [`ecc_v4_fingerprint`]): the v4
+/// fingerprint hashes the creation time, so a mismatch yields a fingerprint
+/// the card and `gpg` disagree on.
 #[must_use]
 pub fn put_generation_time(crt: KeyCrt, unix_time: u32) -> Vec<u8> {
     put_data(crt.time_tag(), &unix_time.to_be_bytes())
@@ -1333,15 +1334,25 @@ pub fn parse_algorithm_attributes(attr: &[u8]) -> Result<AlgorithmAttributes, Pa
         return parse_rsa_algorithm_attributes(attr).map(AlgorithmAttributes::Rsa);
     }
     let kind = EccKind::from_id(id).ok_or(ParseError::UnsupportedAlgorithm)?;
-    let mut oid = &attr[1..];
-    let mut import_with_public_key = false;
-    // The optional import-format byte is only FF; a curve OID never ends in FF
-    // (OID last arcs are < 0x80), so stripping it is unambiguous.
-    if let Some((&0xFF, rest)) = oid.split_last() {
-        oid = rest;
-        import_with_public_key = true;
-    }
-    let curve = Curve::from_oid(oid).ok_or(ParseError::UnsupportedAlgorithm)?;
+    let oid = &attr[1..];
+    // The optional trailing import-format byte is `00` or `FF` (spec
+    // §4.4.3.10); GnuPG (scd/app-openpgp.c) strips either, and its YubiKey
+    // branch additionally tolerates a bogus trailing byte on 5.2 firmware by
+    // retrying with the last byte dropped. Mirror that: try the OID as-is
+    // first, and only if that fails, retry with the last byte dropped —
+    // remembering "with public key" only when the dropped byte was actually
+    // `FF`. No modelled OID ends in `00` or `FF` (OID last arcs are < 0x80),
+    // so neither strip is ambiguous.
+    let (curve, import_with_public_key) = match Curve::from_oid(oid) {
+        Some(curve) => (curve, false),
+        None => {
+            let Some((&last, rest)) = oid.split_last() else {
+                return Err(ParseError::UnsupportedAlgorithm);
+            };
+            let curve = Curve::from_oid(rest).ok_or(ParseError::UnsupportedAlgorithm)?;
+            (curve, last == 0xFF)
+        }
+    };
     Ok(AlgorithmAttributes::Ecc {
         kind,
         curve,
@@ -3043,7 +3054,33 @@ mod tests {
                 format: RsaImportFormat::Crt
             })
         );
-        // Unknown curve, unknown id, empty: errors, never panics.
+        // Optional trailing import-format byte 00 ("import without public key",
+        // the standard PKCS#8-ish form) parses the same as no trailing byte.
+        let c1_00 = [0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x00];
+        assert_eq!(
+            parse_algorithm_attributes(&c1_00).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::Ecdsa,
+                curve: Curve::NistP256,
+                import_with_public_key: false
+            }
+        );
+        // A bogus trailing byte (neither 00 nor FF, as seen on some YubiKey
+        // 5.2 firmware) is still tolerated by dropping it, per GnuPG.
+        let c3_bogus = [
+            0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01, 0x2A,
+        ];
+        assert_eq!(
+            parse_algorithm_attributes(&c3_bogus).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::EdDsa,
+                curve: Curve::Ed25519,
+                import_with_public_key: false
+            }
+        );
+        // Unknown curve, unknown id, empty: errors, never panics. Ed448
+        // (2B 65 70) stays unsupported even after the trailing-byte retry:
+        // dropping 70 leaves 2B 65, which is also not a modelled OID.
         assert_eq!(
             parse_algorithm_attributes(&[0x16, 0x2B, 0x65, 0x70]),
             Err(ParseError::UnsupportedAlgorithm)
