@@ -257,6 +257,58 @@ pub struct KbdToggle {
     pub typed: String,
 }
 
+/// Which OTP-PIN management action a [`PinDialog`] performs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PinDialogKind {
+    /// Set a PIN on a currently-unprotected key.
+    Set,
+    /// Change the PIN (needs the current PIN + a new one).
+    Change,
+    /// Remove the PIN (needs the current PIN).
+    Remove,
+}
+
+/// A modal for setting / changing / removing the OTP PIN. `current`/`new` are
+/// masked inputs; which are shown depends on `kind`. Wiped on drop.
+#[derive(Default)]
+pub struct PinDialog {
+    pub kind_set: bool,
+    pub kind_remove: bool,
+    pub current: String,
+    pub new: String,
+    pub confirm: String,
+}
+
+impl Drop for PinDialog {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.current.zeroize();
+        self.new.zeroize();
+        self.confirm.zeroize();
+    }
+}
+
+impl PinDialog {
+    fn for_kind(kind: PinDialogKind) -> Self {
+        PinDialog {
+            kind_set: kind == PinDialogKind::Set,
+            kind_remove: kind == PinDialogKind::Remove,
+            current: String::new(),
+            new: String::new(),
+            confirm: String::new(),
+        }
+    }
+    fn kind(&self) -> PinDialogKind {
+        if self.kind_set {
+            PinDialogKind::Set
+        } else if self.kind_remove {
+            PinDialogKind::Remove
+        } else {
+            PinDialogKind::Change
+        }
+    }
+}
+
 /// Result of a successful OTP-pane load: the entry rows plus the device facts the
 /// pane shows (transport label, serial, touch-HOTP availability, interface state).
 struct OtpLoad {
@@ -287,6 +339,19 @@ pub struct OtpState {
     /// Dialog for the HOTP-on-touch keystroke slot.
     pub button_hotp: ButtonHotpDialog,
     pub confirm_delete: Option<(String, String)>,
+    /// PIN entry buffer for a protected (R3.4+) key. Held only while unlocking.
+    pub pin_input: String,
+    /// Set when the last read reported the key is PIN-protected and no valid PIN
+    /// has been entered yet — drives the unlock prompt instead of the list.
+    pub pin_required: bool,
+    /// The verified PIN for the current selection, reused across refreshes so the
+    /// user isn't re-prompted every reload. Cleared when the device changes.
+    pub pin: Option<zeroize::Zeroizing<String>>,
+    /// Open PIN-management dialog (set / change / remove), if any.
+    pub pin_dialog: Option<PinDialog>,
+    /// Whether the key currently has an OTP PIN set (R3.4+). `None` until known.
+    /// Drives which PIN menu items appear (Set vs Change/Remove/Lock).
+    pub pin_set: Option<bool>,
     /// Active transport label after a successful open (for the status line).
     pub active: Option<&'static str>,
     /// Device serial number (hex), read alongside the entry list when available.
@@ -395,6 +460,11 @@ impl App {
             );
         }
         let for_device = self.selected_device.clone();
+        // Move the (already-verified) PIN, if any, into the read job so a
+        // protected key's codes decrypt. `None` means "unprotected, or not yet
+        // unlocked" — enumerate_pinned then reports PinRequired for a protected
+        // key, which the completion handler turns into the unlock prompt.
+        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
         self.spawn_job("Reading OTP entries\u{2026}", move || {
             let result =
                 (|| -> Result<OtpLoad, OtpTransportError> {
@@ -430,7 +500,7 @@ impl App {
                     // Carries the config read across both arms below so a failed
                     // enumerate doesn't cost a second READ_CONFIG.
                     let mut dev_info: Option<keyroost_token2otp::DeviceInfo> = None;
-                    let rows: Vec<OtpRow> = match session.enumerate(now) {
+                    let rows: Vec<OtpRow> = match session.enumerate_pinned(now, pin.as_deref()) {
                         Ok(entries) => entries
                             .into_iter()
                             .map(|e| OtpRow {
@@ -547,10 +617,42 @@ impl App {
                         // drop them so the freshly-loaded list governs display.
                         app.otp.touch_codes.clear();
                         app.otp.error = None;
+                        // A successful read means either the key isn't protected
+                        // or the stored PIN worked — leave the prompt state off.
+                        app.otp.pin_required = false;
+                        // If the read succeeded using a stored PIN, the key is
+                        // protected; if it succeeded with no PIN, it isn't.
+                        app.otp.pin_set = Some(app.otp.pin.is_some());
                     }
                     Err(e) => {
-                        app.otp.error = Some(e.to_string());
-                        app.otp.loaded = true;
+                        if std::env::var_os("KEYROOST_OTP_DEBUG").is_some() {
+                            eprintln!("[otp gui] load error variant: {e:?}");
+                        }
+                        // A protected key with no (or a wrong) PIN: flip the pane
+                        // into its unlock prompt rather than showing a raw error.
+                        if matches!(e, keyroost_transport::OtpTransportError::PinRequired) {
+                            app.otp.pin_required = true;
+                            app.otp.pin_set = Some(true);
+                            app.otp.rows.clear();
+                            app.otp.loaded = true;
+                            app.otp.error = None;
+                        } else {
+                            // A wrong PIN invalidates the stored one so the prompt
+                            // reappears instead of silently failing every refresh.
+                            if matches!(
+                                e,
+                                keyroost_transport::OtpTransportError::Applet(
+                                    keyroost_token2otp::OtpError::PinInvalid
+                                ) | keyroost_transport::OtpTransportError::Applet(
+                                    keyroost_token2otp::OtpError::PinInvalidRetries(_)
+                                )
+                            ) {
+                                app.otp.pin = None;
+                                app.otp.pin_required = true;
+                            }
+                            app.otp.error = Some(e.to_string());
+                            app.otp.loaded = true;
+                        }
                     }
                 }
             })
@@ -584,6 +686,9 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
+        // Carry the verified PIN (if the key is protected and already unlocked)
+        // so the write takes the session-key path the device requires.
+        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
 
         self.spawn_job("Adding OTP entry\u{2026}", move || {
             let result = (|| -> Result<(), String> {
@@ -608,7 +713,9 @@ impl App {
                     account_name: &account_name,
                     seed: &seed,
                 };
-                session.write_entry(&entry).map_err(|e| e.to_string())
+                session
+                    .write_entry_pinned(&entry, pin.as_deref())
+                    .map_err(|e| e.to_string())
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
@@ -793,10 +900,11 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
+        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
         self.spawn_job("Deleting OTP entry\u{2026}", move || {
             let result = (|| -> Result<(), OtpTransportError> {
                 let mut session = target.open()?;
-                session.delete_entry(&app_name, &account_name)
+                session.delete_entry_pinned(&app_name, &account_name, pin.as_deref())
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
@@ -813,8 +921,217 @@ impl App {
         });
     }
 
-    /// Read a touch-required TOTP entry's current code: the device requires a
-    /// button press, so `read_entry` waits for the touch (the transport fires
+    /// Lock the OTP PIN window now, clearing the cached PIN so the next read
+    /// re-prompts.
+    pub(crate) fn lock_otp_pin(&mut self) {
+        self.otp.error = None;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
+        let for_device = self.selected_device.clone();
+        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
+        self.spawn_job("Locking OTP PIN\u{2026}", move || {
+            let result = (|| -> Result<(), OtpTransportError> {
+                let mut session = target.open()?;
+                // Re-verify to hold the window, then close it explicitly.
+                if let Some(p) = pin.as_deref() {
+                    session.verify_pin(p)?;
+                }
+                session.lock_pin()
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                app.otp.pin = None;
+                app.otp.pin_required = true;
+                app.otp.rows.clear();
+                match result {
+                    Ok(()) => app.otp.info = Some("OTP PIN locked.".into()),
+                    Err(e) => app.otp.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
+    /// Apply a set / change / remove PIN action from the [`PinDialog`].
+    pub(crate) fn apply_pin_dialog(&mut self, kind: PinDialogKind) {
+        self.otp.error = None;
+        let dlg = match &self.otp.pin_dialog {
+            Some(d) => d,
+            None => return,
+        };
+        let current = dlg.current.clone();
+        let newpin = dlg.new.clone();
+        let confirm = dlg.confirm.clone();
+
+        // Client-side checks before any device I/O.
+        match kind {
+            PinDialogKind::Set | PinDialogKind::Change => {
+                if newpin != confirm {
+                    self.otp.error = Some("New PIN and confirmation do not match.".into());
+                    return;
+                }
+                if let Err(m) = keyroost_token2otp::validate_otp_pin(&newpin) {
+                    self.otp.error = Some(format!("PIN policy: {m}"));
+                    return;
+                }
+            }
+            PinDialogKind::Remove => {}
+        }
+
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Updating OTP PIN\u{2026}", move || {
+            let result = (|| -> Result<Option<String>, OtpTransportError> {
+                let mut session = target.open()?;
+                match kind {
+                    PinDialogKind::Set => {
+                        session.set_pin(&newpin)?;
+                        Ok(Some(newpin.clone()))
+                    }
+                    PinDialogKind::Change => {
+                        session.change_pin(&current, &newpin)?;
+                        Ok(Some(newpin.clone()))
+                    }
+                    PinDialogKind::Remove => {
+                        session.remove_pin(&current)?;
+                        Ok(None)
+                    }
+                }
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(new_pin) => {
+                        app.otp.pin_dialog = None;
+                        match kind {
+                            PinDialogKind::Set => {
+                                app.otp.pin = new_pin.map(zeroize::Zeroizing::new);
+                                app.otp.pin_set = Some(true);
+                                app.otp.info = Some("OTP PIN set.".into());
+                            }
+                            PinDialogKind::Change => {
+                                app.otp.pin = new_pin.map(zeroize::Zeroizing::new);
+                                app.otp.pin_set = Some(true);
+                                app.otp.info = Some("OTP PIN changed.".into());
+                            }
+                            PinDialogKind::Remove => {
+                                app.otp.pin = None;
+                                app.otp.pin_set = Some(false);
+                                app.otp.pin_required = false;
+                                app.otp.info = Some("OTP PIN removed.".into());
+                            }
+                        }
+                        app.load_otp_entries();
+                    }
+                    Err(e) => app.otp.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
+    /// Render the set / change / remove PIN modal when open.
+    fn render_pin_dialog(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let kind = match &self.otp.pin_dialog {
+            Some(d) => d.kind(),
+            None => return,
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        theme::card_frame(p).show(ui, |ui| {
+            let title = match kind {
+                PinDialogKind::Set => "Set OTP PIN",
+                PinDialogKind::Change => "Change OTP PIN",
+                PinDialogKind::Remove => "Remove OTP PIN",
+            };
+            ui.label(
+                egui::RichText::new(title)
+                    .font(theme::f_sb(14.0))
+                    .color(p.txt),
+            );
+            ui.add_space(8.0);
+            if let Some(dlg) = &mut self.otp.pin_dialog {
+                if matches!(kind, PinDialogKind::Change | PinDialogKind::Remove) {
+                    ui.label(
+                        egui::RichText::new("Current PIN")
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dlg.current)
+                            .password(true)
+                            .desired_width(220.0),
+                    );
+                    ui.add_space(6.0);
+                }
+                if matches!(kind, PinDialogKind::Set | PinDialogKind::Change) {
+                    ui.label(
+                        egui::RichText::new("New PIN")
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dlg.new)
+                            .password(true)
+                            .desired_width(220.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Confirm new PIN")
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt2),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dlg.confirm)
+                            .password(true)
+                            .desired_width(220.0),
+                    );
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Numeric PINs need 6+ digits (no trivial sequences); \
+                     alphanumeric PINs need 10+ characters.",
+                )
+                .font(theme::f_reg(11.0))
+                .color(p.txt3),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let action = match kind {
+                    PinDialogKind::Set => "Set PIN",
+                    PinDialogKind::Change => "Change PIN",
+                    PinDialogKind::Remove => "Remove PIN",
+                };
+                if theme::button(ui, p, BtnKind::Primary, action).clicked() {
+                    submit = true;
+                }
+                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.otp.pin_dialog = None;
+        } else if submit {
+            self.apply_pin_dialog(kind);
+        }
+    }
+
     /// the button-prompt). The returned code is stashed in `touch_codes` and
     /// shown in place of "touch to view" until the next list reload.
     pub(crate) fn read_touch_otp_entry(&mut self, app_name: String, account_name: String) {
@@ -957,6 +1274,8 @@ impl App {
                 let mut open_touch = false;
                 let mut kbd_target: Option<bool> = None;
                 let mut new_transport: Option<OtpTransportSel> = None;
+                let mut pin_dialog_open: Option<PinDialogKind> = None;
+                let mut pin_lock = false;
 
                 let menu_btn =
                     theme::button(ui, p, BtnKind::Default, "...").on_hover_text("More actions");
@@ -1041,6 +1360,40 @@ impl App {
                                 }
                             });
                         }
+
+                        // --- OTP PIN (R3.4+ privacy protection) ---
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("OTP PIN")
+                                .font(theme::f_reg(11.0))
+                                .color(p.txt3),
+                        );
+                        match self.otp.pin_set {
+                            Some(false) => {
+                                if ui.selectable_label(false, "Set PIN\u{2026}").clicked() {
+                                    pin_dialog_open = Some(PinDialogKind::Set);
+                                }
+                            }
+                            Some(true) => {
+                                if ui.selectable_label(false, "Change PIN\u{2026}").clicked() {
+                                    pin_dialog_open = Some(PinDialogKind::Change);
+                                }
+                                if ui.selectable_label(false, "Remove PIN\u{2026}").clicked() {
+                                    pin_dialog_open = Some(PinDialogKind::Remove);
+                                }
+                                // Lock is only meaningful once unlocked this session.
+                                ui.add_enabled_ui(self.otp.pin.is_some(), |ui| {
+                                    if ui.selectable_label(false, "Lock now").clicked() {
+                                        pin_lock = true;
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.add_enabled_ui(false, |ui| {
+                                    let _ = ui.selectable_label(false, "PIN state unknown");
+                                });
+                            }
+                        }
                     });
 
                 // Apply menu selections after the closure.
@@ -1068,6 +1421,12 @@ impl App {
                         enable: target,
                         typed: String::new(),
                     });
+                }
+                if let Some(kind) = pin_dialog_open {
+                    self.otp.pin_dialog = Some(PinDialog::for_kind(kind));
+                }
+                if pin_lock {
+                    self.lock_otp_pin();
                 }
 
                 // Primary actions, to the left of the overflow menu (added after
@@ -1125,6 +1484,7 @@ impl App {
         }
 
         self.render_otp_add_form(ui, p);
+        self.render_pin_dialog(ui, p);
         self.render_button_hotp_form(ui, p);
         self.render_keyboard_confirm(ui, p);
         self.render_otp_delete_confirm(ui, p);
@@ -1165,6 +1525,58 @@ impl App {
             });
             return;
         }
+        // Protected (R3.4+) key with no valid PIN yet: show the unlock prompt
+        // instead of the (empty) list. Entering the PIN and unlocking reloads
+        // the entries via the stored PIN.
+        if self.otp.pin_required {
+            let mut do_unlock = false;
+            theme::card_frame(p).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("This key's OTP codes are PIN-protected")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Enter the OTP PIN to view and manage codes.")
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                );
+                ui.add_space(8.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.otp.pin_input)
+                        .password(true)
+                        .hint_text("OTP PIN")
+                        .desired_width(220.0),
+                );
+                let entered =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if theme::button(ui, p, BtnKind::Primary, "Unlock").clicked() || entered {
+                        do_unlock = true;
+                    }
+                });
+                if let Some(err) = &self.otp.error {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(err)
+                            .font(theme::f_reg(12.0))
+                            .color(p.err),
+                    );
+                }
+            });
+            if do_unlock && !self.otp.pin_input.trim().is_empty() {
+                self.otp.pin =
+                    Some(zeroize::Zeroizing::new(self.otp.pin_input.trim().to_owned()));
+                self.otp.pin_input.clear();
+                self.otp.pin_required = false;
+                self.otp.error = None;
+                self.load_otp_entries();
+            }
+            return;
+        }
+
         if self.otp.rows.is_empty() && self.otp.error.is_none() {
             ui.label(
                 egui::RichText::new("No OTP entries on this key.")
