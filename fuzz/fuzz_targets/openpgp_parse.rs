@@ -9,4 +9,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_openpgp::parse_signature_counter(data);
     let _ = keyroost_openpgp::parse_generated_public_key(data);
     let _ = keyroost_openpgp::parse_rsa_algorithm_attributes(data);
+    let _ = keyroost_openpgp::parse_algorithm_attributes(data);
+    let _ = keyroost_openpgp::describe_algorithm_attributes(data);
 });

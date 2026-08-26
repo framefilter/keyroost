@@ -1166,6 +1166,104 @@ pub fn parse_rsa_algorithm_attributes(attr: &[u8]) -> Result<RsaAttributes, Pars
     })
 }
 
+/// A slot's algorithm attributes (`C1`/`C2`/`C3`), decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlgorithmAttributes {
+    /// `01 | n_bits | e_bits | [format]`.
+    Rsa(RsaAttributes),
+    /// `<12|13|16> | <curve OID body> | [FF]`. The optional trailing `FF` means
+    /// the card wants ECC private-key imports to carry the public point too
+    /// (spec §4.4.3.10) — recorded, not acted on: ECC import is not in this
+    /// crate.
+    Ecc {
+        kind: EccKind,
+        curve: Curve,
+        import_with_public_key: bool,
+    },
+}
+
+impl AlgorithmAttributes {
+    /// The [`KeyAlg`] this is, if it's one keyroost offers (RSA 2048/3072/4096
+    /// or a modelled curve); `None` for e.g. RSA-1024.
+    #[must_use]
+    pub fn key_alg(&self) -> Option<KeyAlg> {
+        match *self {
+            AlgorithmAttributes::Rsa(r) => match r.n_bits {
+                2048 => Some(KeyAlg::Rsa2048),
+                3072 => Some(KeyAlg::Rsa3072),
+                4096 => Some(KeyAlg::Rsa4096),
+                _ => None,
+            },
+            AlgorithmAttributes::Ecc { curve, .. } => {
+                KeyAlg::ALL.into_iter().find(|a| a.curve() == Some(curve))
+            }
+        }
+    }
+
+    /// Display form: `RSA-2048`, `EdDSA Ed25519`, `ECDH X25519`, `ECDSA NIST P-256`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            AlgorithmAttributes::Rsa(r) => format!("RSA-{}", r.n_bits),
+            AlgorithmAttributes::Ecc { kind, curve, .. } => {
+                format!("{} {}", kind.label(), curve.label())
+            }
+        }
+    }
+}
+
+/// Parse a slot's algorithm attributes of any algorithm this crate models.
+///
+/// Errors: [`ParseError::UnexpectedLength`] for an empty object or a short RSA
+/// one; [`ParseError::UnsupportedAlgorithm`] for an unknown algorithm id or an
+/// ECC OID that isn't a modelled [`Curve`]. Use
+/// [`describe_algorithm_attributes`] where a failure must still render.
+pub fn parse_algorithm_attributes(attr: &[u8]) -> Result<AlgorithmAttributes, ParseError> {
+    let Some(&id) = attr.first() else {
+        return Err(ParseError::UnexpectedLength);
+    };
+    if id == 0x01 {
+        return parse_rsa_algorithm_attributes(attr).map(AlgorithmAttributes::Rsa);
+    }
+    let kind = EccKind::from_id(id).ok_or(ParseError::UnsupportedAlgorithm)?;
+    let mut oid = &attr[1..];
+    let mut import_with_public_key = false;
+    // The optional import-format byte is only FF; a curve OID never ends in FF
+    // (OID last arcs are < 0x80), so stripping it is unambiguous.
+    if let Some((&0xFF, rest)) = oid.split_last() {
+        oid = rest;
+        import_with_public_key = true;
+    }
+    let curve = Curve::from_oid(oid).ok_or(ParseError::UnsupportedAlgorithm)?;
+    Ok(AlgorithmAttributes::Ecc {
+        kind,
+        curve,
+        import_with_public_key,
+    })
+}
+
+/// Best-effort display of raw algorithm attributes for status lines: the
+/// [`AlgorithmAttributes::label`] when they parse, otherwise an honest
+/// "unknown" rendering (`ECDSA (unknown curve <hex>)`, `algorithm 0x2A`), and
+/// `none` for an empty object.
+#[must_use]
+pub fn describe_algorithm_attributes(attr: &[u8]) -> String {
+    if let Ok(a) = parse_algorithm_attributes(attr) {
+        return a.label();
+    }
+    match attr.first() {
+        None => "none".to_string(),
+        Some(&id) => match EccKind::from_id(id) {
+            Some(kind) => {
+                let hex: String = attr[1..].iter().map(|b| format!("{b:02x}")).collect();
+                format!("{} (unknown curve {})", kind.label(), hex)
+            }
+            None if id == 0x01 => "RSA (malformed attributes)".to_string(),
+            None => format!("algorithm 0x{id:02X}"),
+        },
+    }
+}
+
 /// Encode `n` as a minimal big-endian byte sequence (no leading zeros).
 ///
 /// `0` encodes as a single `0x00` byte. Used to build BER length octets.
@@ -2595,6 +2693,95 @@ mod tests {
             parse_rsa_algorithm_attributes(&[0x16, 0x2B]),
             Err(ParseError::UnsupportedAlgorithm)
         );
+    }
+
+    #[test]
+    fn algorithm_attributes_parse_ecc_and_rsa() {
+        // The in-tree ARD fixture's C2 (ECDH cv25519) and C3 (EdDSA Ed25519).
+        let c2 = [
+            0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+        ];
+        assert_eq!(
+            parse_algorithm_attributes(&c2).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::Ecdh,
+                curve: Curve::X25519,
+                import_with_public_key: false
+            }
+        );
+        let c3 = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+        assert_eq!(
+            parse_algorithm_attributes(&c3).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::EdDsa,
+                curve: Curve::Ed25519,
+                import_with_public_key: false
+            }
+        );
+        // Optional trailing import-format byte FF ("import with public key").
+        let c1 = [0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0xFF];
+        assert_eq!(
+            parse_algorithm_attributes(&c1).unwrap(),
+            AlgorithmAttributes::Ecc {
+                kind: EccKind::Ecdsa,
+                curve: Curve::NistP256,
+                import_with_public_key: true
+            }
+        );
+        // RSA still goes through the RSA parser.
+        let rsa = [0x01, 0x08, 0x00, 0x00, 0x20, 0x02];
+        assert_eq!(
+            parse_algorithm_attributes(&rsa).unwrap(),
+            AlgorithmAttributes::Rsa(RsaAttributes {
+                n_bits: 2048,
+                e_bits: 32,
+                format: RsaImportFormat::Crt
+            })
+        );
+        // Unknown curve, unknown id, empty: errors, never panics.
+        assert_eq!(
+            parse_algorithm_attributes(&[0x16, 0x2B, 0x65, 0x70]),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+        assert_eq!(
+            parse_algorithm_attributes(&[0x2A, 0x00]),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+        assert_eq!(
+            parse_algorithm_attributes(&[]),
+            Err(ParseError::UnexpectedLength)
+        );
+        assert_eq!(
+            parse_algorithm_attributes(&[0x16]),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn algorithm_attributes_key_alg_and_labels() {
+        let a = parse_algorithm_attributes(&[0x12, 0x2B, 0x81, 0x04, 0x00, 0x22]).unwrap();
+        assert_eq!(a.key_alg(), Some(KeyAlg::NistP384));
+        assert_eq!(a.label(), "ECDH NIST P-384");
+        let r = parse_algorithm_attributes(&[0x01, 0x10, 0x00, 0x00, 0x20, 0x00]).unwrap();
+        assert_eq!(r.key_alg(), Some(KeyAlg::Rsa4096));
+        assert_eq!(r.label(), "RSA-4096");
+        // An RSA size we don't offer still labels honestly, just isn't a KeyAlg.
+        let odd = parse_algorithm_attributes(&[0x01, 0x04, 0x00, 0x00, 0x20, 0x00]).unwrap();
+        assert_eq!(odd.key_alg(), None);
+        assert_eq!(odd.label(), "RSA-1024");
+        // describe() never fails: the status line must render any card.
+        assert_eq!(
+            describe_algorithm_attributes(&[
+                0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01
+            ]),
+            "EdDSA Ed25519"
+        );
+        assert_eq!(
+            describe_algorithm_attributes(&[0x13, 0x2B, 0x65, 0x70]),
+            "ECDSA (unknown curve 2b6570)"
+        );
+        assert_eq!(describe_algorithm_attributes(&[0x2A]), "algorithm 0x2A");
+        assert_eq!(describe_algorithm_attributes(&[]), "none");
     }
 
     #[test]
