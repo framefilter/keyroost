@@ -566,6 +566,12 @@ struct OpenPgpState {
     /// Every per-key action — generate on-card, import — targets this key, the
     /// same way the PIV pane's `selected_slot` drives its per-slot cards.
     selected_key: OpenPgpSlotSel,
+    /// Algorithm chosen in the Generate-key modal for the selected slot.
+    gen_alg: OpenPgpKeyAlgSel,
+    /// The card's own Algorithm Information (`FA`) object, when it publishes
+    /// one — feeds the Generate-key modal's algorithm choices. `None` means
+    /// the card didn't publish one (pre-3.4 cards), not that it has none.
+    supported: Option<keyroost_transport::AlgorithmInformation>,
     /// Path to an RSA key file for import-from-file (text-entered).
     import_path: String,
     /// Change-user-PIN (PW1) old/new entries. Cleared after use.
@@ -1264,14 +1270,61 @@ impl OpenPgpSlotSel {
             OpenPgpSlotSel::Auth => "Authentication",
         }
     }
-    /// This key's algorithm id and fingerprint out of an `OpenPgpStatus`,
-    /// so the per-key state line can read directly from the selected key.
-    fn status_fields(self, st: &keyroost_transport::OpenPgpStatus) -> (Option<u8>, &[u8; 20]) {
+    /// This key's raw algorithm attributes and fingerprint out of an
+    /// `OpenPgpStatus`, so the per-key state line can read directly from the
+    /// selected key.
+    fn status_fields(self, st: &keyroost_transport::OpenPgpStatus) -> (&[u8], &[u8; 20]) {
         match self {
-            OpenPgpSlotSel::Sign => (st.sig_algo_id, &st.fingerprint_sig),
-            OpenPgpSlotSel::Decrypt => (st.dec_algo_id, &st.fingerprint_dec),
-            OpenPgpSlotSel::Auth => (st.aut_algo_id, &st.fingerprint_aut),
+            OpenPgpSlotSel::Sign => (&st.sig_attrs, &st.fingerprint_sig),
+            OpenPgpSlotSel::Decrypt => (&st.dec_attrs, &st.fingerprint_dec),
+            OpenPgpSlotSel::Auth => (&st.aut_attrs, &st.fingerprint_aut),
         }
+    }
+}
+
+/// OpenPGP key-generation algorithm selector: the slot's current algorithm
+/// ("card default"), or an explicit one.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum OpenPgpKeyAlgSel {
+    #[default]
+    CardDefault,
+    Alg(keyroost_transport::OpenPgpKeyAlg),
+}
+
+impl OpenPgpKeyAlgSel {
+    fn to_alg(self) -> Option<keyroost_transport::OpenPgpKeyAlg> {
+        match self {
+            OpenPgpKeyAlgSel::CardDefault => None,
+            OpenPgpKeyAlgSel::Alg(a) => Some(a),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            OpenPgpKeyAlgSel::CardDefault => "Card default",
+            OpenPgpKeyAlgSel::Alg(a) => a.label(),
+        }
+    }
+    /// The menu for `crt`'s slot: what the card lists in its Algorithm
+    /// Information when it publishes one for that slot, else every algorithm
+    /// that fits the slot — unknown means offer the surface and let the card
+    /// answer, never a vendor table.
+    fn choices(
+        supported: Option<&keyroost_transport::AlgorithmInformation>,
+        crt: keyroost_transport::KeyCrt,
+    ) -> Vec<OpenPgpKeyAlgSel> {
+        let mut out = vec![OpenPgpKeyAlgSel::CardDefault];
+        let listed = supported.map(|i| i.key_algs(crt)).unwrap_or_default();
+        if !listed.is_empty() {
+            out.extend(listed.into_iter().map(OpenPgpKeyAlgSel::Alg));
+        } else {
+            out.extend(
+                keyroost_transport::OpenPgpKeyAlg::ALL
+                    .into_iter()
+                    .filter(|a| a.attributes(crt).is_ok())
+                    .map(OpenPgpKeyAlgSel::Alg),
+            );
+        }
+        out
     }
 }
 
@@ -5380,17 +5433,26 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OpenPGP status\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+            let result = (|| -> Result<
+                (
+                    keyroost_transport::OpenPgpStatus,
+                    Option<keyroost_transport::AlgorithmInformation>,
+                ),
+                TransportError,
+            > {
                 let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
-                session.status()
+                let status = session.status()?;
+                let supported = session.supported_algorithms().unwrap_or(None);
+                Ok((status, supported))
             })();
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok(status) => {
+                    Ok((status, supported)) => {
                         app.openpgp.status = Some(status);
+                        app.openpgp.supported = supported;
                         app.openpgp.loaded = true;
                     }
                     Err(e) => app.openpgp.error = Some(e.to_string()),
@@ -5508,12 +5570,13 @@ impl App {
         };
         let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
         let slot = self.openpgp.selected_key;
+        let alg = self.openpgp.gen_alg.to_alg();
         let creation_time = unix_now();
         self.openpgp.notice = None;
         self.spawn_job("Generating key… (touch the key if it blinks)", move || {
             let result = (|| -> Result<(keyroost_transport::OpenPgpStatus, [u8; 20]), TransportError> {
                 let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                let _ = s.generate_key(slot.to_crt())?;
+                let _ = s.generate_key(slot.to_crt(), alg)?;
                 let fpr = s.register_key(slot.to_crt(), creation_time)?;
                 Ok((s.status()?, fpr))
             })();
@@ -5774,18 +5837,6 @@ fn typed_reset_modal(
             *confirm = Some(buf);
         }
         false
-    }
-}
-
-/// Map an OpenPGP algorithm id (first attribute byte) to a short label.
-fn algo_id_label(id: Option<u8>) -> &'static str {
-    match id {
-        Some(0x01) => "RSA",
-        Some(0x12) => "ECDH",
-        Some(0x13) => "ECDSA",
-        Some(0x16) => "EdDSA",
-        Some(_) => "other",
-        None => "none",
     }
 }
 
@@ -7619,6 +7670,23 @@ fn piv_keyalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivKeyAlgSel) {
         });
 }
 
+/// An OpenPGP key-algorithm picker combo, restricted to `choices` (the card's
+/// own Algorithm Information menu, or every algorithm that fits the slot).
+fn openpgp_keyalg_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    sel: &mut OpenPgpKeyAlgSel,
+    choices: &[OpenPgpKeyAlgSel],
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for &opt in choices {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
+}
+
 /// A PIV PIN/touch policy value selectable in the Generate key modal's combo
 /// boxes: its display label and the full set of choices, in menu order.
 /// `Default` is always first — it's the initial selection, and the plain PIV
@@ -9414,7 +9482,7 @@ impl App {
                                 ui,
                                 &format!(
                                     "Signature \u{00B7} {}",
-                                    slot_summary(st.sig_algo_id, &st.fingerprint_sig)
+                                    slot_summary(&st.sig_attrs, &st.fingerprint_sig)
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -9423,7 +9491,7 @@ impl App {
                                 ui,
                                 &format!(
                                     "Encryption \u{00B7} {}",
-                                    slot_summary(st.dec_algo_id, &st.fingerprint_dec)
+                                    slot_summary(&st.dec_attrs, &st.fingerprint_dec)
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -9432,7 +9500,7 @@ impl App {
                                 ui,
                                 &format!(
                                     "Auth \u{00B7} {}",
-                                    slot_summary(st.aut_algo_id, &st.fingerprint_aut)
+                                    slot_summary(&st.aut_attrs, &st.fingerprint_aut)
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -12513,6 +12581,34 @@ impl App {
                             card_note(ui, p, "Authorizes writing the public-key URL.");
                         }
                         OpenPgpCredKind::GenerateKey => {
+                            let crt = self.openpgp.selected_key.to_crt();
+                            let choices =
+                                OpenPgpKeyAlgSel::choices(self.openpgp.supported.as_ref(), crt);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [96.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("Algorithm")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    ),
+                                );
+                                openpgp_keyalg_combo(
+                                    ui,
+                                    "openpgp-gen-alg",
+                                    &mut self.openpgp.gen_alg,
+                                    &choices,
+                                );
+                            });
+                            ui.add_space(4.0);
+                            if self.openpgp.supported.is_none() {
+                                card_note(
+                                    ui,
+                                    p,
+                                    "This card does not list its algorithms; the card \
+                                     rejects any it cannot do.",
+                                );
+                            }
                             self.openpgp_modal_admin_field(ui, p, kind);
                             card_note(
                                 ui,
@@ -13008,11 +13104,15 @@ impl App {
         // self.
         let sel_state: String = match &self.openpgp.status {
             Some(st) => {
-                let (algo, fpr) = selected.status_fields(st);
+                let (attrs, fpr) = selected.status_fields(st);
                 if fpr.iter().all(|&b| b == 0) {
                     "no key".to_string()
                 } else {
-                    format!("{} \u{00B7} fpr {}", algo_id_label(algo), hex_lower(fpr))
+                    format!(
+                        "{} \u{00B7} fpr {}",
+                        keyroost_transport::describe_algorithm_attributes(attrs),
+                        hex_lower(fpr)
+                    )
                 }
             }
             None => "read status to view this key".to_string(),
@@ -13176,6 +13276,7 @@ impl App {
         // Apply collected intents now that the card borrows have ended.
         if let Some(key) = clicked_key {
             self.openpgp.selected_key = key;
+            self.openpgp.gen_alg = OpenPgpKeyAlgSel::CardDefault;
         }
         if do_refresh {
             self.load_openpgp_status();
@@ -15122,17 +15223,48 @@ fn editor_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut
 }
 
 /// Summarize an OpenPGP key slot: its algorithm label, or "empty" when no key.
-fn slot_summary(algo: Option<u8>, fpr: &[u8; 20]) -> &'static str {
+fn slot_summary(attrs: &[u8], fpr: &[u8; 20]) -> String {
     if fpr.iter().all(|&b| b == 0) {
-        "empty"
+        "empty".to_string()
     } else {
-        algo_id_label(algo)
+        keyroost_transport::describe_algorithm_attributes(attrs)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openpgp_algorithm_choices_are_the_cards_list_or_everything() {
+        use keyroost_transport::{KeyCrt, OpenPgpKeyAlg};
+        // No FA: card default + every algorithm that fits the slot.
+        let all = OpenPgpKeyAlgSel::choices(None, KeyCrt::Decrypt);
+        assert_eq!(all[0], OpenPgpKeyAlgSel::CardDefault);
+        assert!(all.contains(&OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::X25519)));
+        assert!(!all.contains(&OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Ed25519)));
+        assert!(OpenPgpKeyAlgSel::choices(None, KeyCrt::Sign)
+            .contains(&OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Ed25519)));
+        // FA present: exactly what the card listed (modelled entries), in card order.
+        let info = keyroost_transport::AlgorithmInformation {
+            sig: vec![
+                vec![0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01],
+                vec![0x01, 0x08, 0x00, 0x00, 0x20, 0x00],
+            ],
+            dec: vec![],
+            aut: vec![],
+        };
+        assert_eq!(
+            OpenPgpKeyAlgSel::choices(Some(&info), KeyCrt::Sign),
+            vec![
+                OpenPgpKeyAlgSel::CardDefault,
+                OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Ed25519),
+                OpenPgpKeyAlgSel::Alg(OpenPgpKeyAlg::Rsa2048)
+            ]
+        );
+        // A slot the card lists nothing for still offers everything (unknown ≠ none).
+        assert!(OpenPgpKeyAlgSel::choices(Some(&info), KeyCrt::Auth).len() > 1);
+    }
 
     /// #98: the top bar's version chip is the only place the running app
     /// states its version — keep it a well-formed "vX.Y.Z" so it never
