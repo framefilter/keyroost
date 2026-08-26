@@ -678,8 +678,9 @@ pub fn put_url(url: &[u8]) -> Vec<u8> {
 ///
 /// After an on-card GENERATE the applet knows the key material but not the
 /// OpenPGP v4 fingerprint (which folds in the host-chosen creation timestamp);
-/// the host computes it with [`rsa_v4_fingerprint`] and registers it here so
-/// that `gpg` and the card agree on the key's identity.
+/// the host computes it with [`v4_fingerprint`] (RSA: [`rsa_v4_fingerprint`];
+/// ECC: [`ecc_v4_fingerprint`]) and registers it here so that `gpg` and the
+/// card agree on the key's identity.
 #[must_use]
 pub fn put_fingerprint(crt: KeyCrt, fpr: &[u8; 20]) -> Vec<u8> {
     put_data(crt.fpr_tag(), fpr)
@@ -749,21 +750,98 @@ pub fn rsa_v4_fingerprint(modulus: &[u8], exponent: &[u8], creation_time: u32) -
     body.extend_from_slice(&m);
     body.extend_from_slice(&e);
 
+    v4_fingerprint_envelope(&body)
+}
+
+/// Wrap a v4 public-key packet `body` in the old-format CTB envelope and
+/// hash it: `SHA1(0x99 || len16 || body)`. Shared by [`rsa_v4_fingerprint`]
+/// and [`ecc_v4_fingerprint`].
+fn v4_fingerprint_envelope(body: &[u8]) -> [u8; 20] {
     let len = body.len() as u16;
     let mut hashed = Vec::with_capacity(3 + body.len());
     hashed.push(0x99); // old-format CTB: public-key packet, two-octet length
     hashed.push((len >> 8) as u8);
     hashed.push((len & 0xFF) as u8);
-    hashed.extend_from_slice(&body);
+    hashed.extend_from_slice(body);
 
     keyroost_proto::sha1::sha1(&hashed)
 }
 
-/// Convenience wrapper around [`rsa_v4_fingerprint`] taking a parsed
-/// [`PublicKey`] (e.g. straight from [`parse_generated_public_key`]).
+/// RFC 6637 §9 KDF parameters an ECDH key's public-key packet carries:
+/// `03 01 <hash id> <cipher id>`, chosen by curve size exactly as GnuPG's
+/// `ecdh_params()` does (SHA-256/AES-128 up to 256 bits, SHA-384/AES-192 up
+/// to 384, SHA-512/AES-256 above). The card does not store these, yet the v4
+/// fingerprint hashes them — so keyroost must pick what gpg will pick, or the
+/// two disagree on the key's identity.
 #[must_use]
-pub fn rsa_v4_fingerprint_from(key: &PublicKey, creation_time: u32) -> [u8; 20] {
-    rsa_v4_fingerprint(&key.modulus, &key.exponent, creation_time)
+pub const fn ecdh_kdf_params(curve: Curve) -> [u8; 4] {
+    let bits = curve.bits();
+    if bits <= 256 {
+        [0x03, 0x01, 0x08, 0x07]
+    } else if bits <= 384 {
+        [0x03, 0x01, 0x09, 0x08]
+    } else {
+        [0x03, 0x01, 0x0A, 0x09]
+    }
+}
+
+/// Compute the OpenPGP **v4 fingerprint** of an ECC public key.
+///
+/// Body: `04` || creation time || algorithm id ([`EccKind::id`]) || OID length
+/// || curve OID || MPI(point) || (ECDH only) [`ecdh_kdf_params`]. For the
+/// 25519 curves the MPI is over `0x40 || point` (RFC 7748 form as OpenPGP
+/// carries it); a `point` that already starts with `0x40` and is 33 bytes is
+/// used as-is. The envelope (`SHA1(0x99 || len16 || body)`) is shared with
+/// [`rsa_v4_fingerprint`].
+#[must_use]
+pub fn ecc_v4_fingerprint(
+    kind: EccKind,
+    curve: Curve,
+    point: &[u8],
+    creation_time: u32,
+) -> [u8; 20] {
+    let packet_point: Vec<u8> = if curve.is_25519() && point.len() == 32 {
+        let mut p = Vec::with_capacity(33);
+        p.push(0x40);
+        p.extend_from_slice(point);
+        p
+    } else {
+        point.to_vec()
+    };
+    let oid = curve.oid();
+    let p = mpi(&packet_point);
+    let mut body = Vec::with_capacity(1 + 4 + 1 + 1 + oid.len() + p.len() + 4);
+    body.push(0x04);
+    body.extend_from_slice(&creation_time.to_be_bytes());
+    body.push(kind.id());
+    body.push(oid.len() as u8);
+    body.extend_from_slice(oid);
+    body.extend_from_slice(&p);
+    if kind == EccKind::Ecdh {
+        body.extend_from_slice(&ecdh_kdf_params(curve));
+    }
+    v4_fingerprint_envelope(&body)
+}
+
+/// Fingerprint of `key` under the slot's `attrs`: RSA via
+/// [`rsa_v4_fingerprint`], ECC via [`ecc_v4_fingerprint`]. A key whose shape
+/// doesn't match the attributes (an RSA key with ECC attributes or vice
+/// versa) is [`ParseError::UnsupportedAlgorithm`] — a wrong fingerprint must
+/// never be written to the card.
+pub fn v4_fingerprint(
+    key: &PublicKey,
+    attrs: &AlgorithmAttributes,
+    creation_time: u32,
+) -> Result<[u8; 20], ParseError> {
+    match (key, attrs) {
+        (PublicKey::Rsa { modulus, exponent }, AlgorithmAttributes::Rsa(_)) => {
+            Ok(rsa_v4_fingerprint(modulus, exponent, creation_time))
+        }
+        (PublicKey::Ecc { point }, AlgorithmAttributes::Ecc { kind, curve, .. }) => {
+            Ok(ecc_v4_fingerprint(*kind, *curve, point, creation_time))
+        }
+        _ => Err(ParseError::UnsupportedAlgorithm),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2017,36 +2095,36 @@ pub fn parse_signature_counter(buf: &[u8]) -> Result<u32, ParseError> {
     Ok((u32::from(v[0]) << 16) | (u32::from(v[1]) << 8) | u32::from(v[2]))
 }
 
-/// The RSA public key parsed from a GENERATE / READ PUBLIC KEY response.
-///
-/// The card returns a `7F49` constructed object; for an RSA key it carries the
-/// modulus *n* (tag `81`) and the public exponent *e* (tag `82`). Both are kept
-/// as raw big-endian bytes (a 2048-bit modulus is 256 bytes — note the card may
-/// or may not include a leading zero byte; we surface the value verbatim).
+/// The public key parsed from a GENERATE / READ PUBLIC KEY response (`7F49`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicKey {
-    /// RSA modulus *n* (`81`), big-endian.
-    pub modulus: Vec<u8>,
-    /// RSA public exponent *e* (`82`), big-endian (commonly `01 00 01`).
-    pub exponent: Vec<u8>,
+pub enum PublicKey {
+    /// RSA: modulus *n* (`81`) and public exponent *e* (`82`), big-endian
+    /// (the card may or may not include a leading zero byte; surfaced verbatim).
+    Rsa { modulus: Vec<u8>, exponent: Vec<u8> },
+    /// ECC: the public point (`86`) — uncompressed `04 || X || Y` for the
+    /// Weierstrass curves, the raw 32-byte point for Ed25519 / X25519.
+    Ecc { point: Vec<u8> },
 }
 
 /// Parse the public key from a GENERATE / READ PUBLIC KEY response.
 ///
 /// `buf` may be either the raw value of the `7F49` object *or* the full `7F49`
-/// envelope; both are accepted. Only the **RSA** case is decoded: the `81`
-/// modulus and `82` exponent are pulled out (a 2048-bit modulus forces a
-/// long-form `82` length, which [`parse_tlvs`] handles).
-///
-/// An ECC key carries an `86` public point instead of `81`/`82`; that case is
-/// reported as [`ParseError::MissingTag`] for [`TAG_RSA_MODULUS`] — callers that
-/// expect ECC should read the raw `86` value via [`parse_tlvs`]/[`find_nested`]
-/// against [`TAG_EC_PUBLIC_POINT`].
+/// envelope; both are accepted. An ECC key carries an `86` public point, which
+/// takes priority if present; otherwise the `81` modulus and `82` exponent of
+/// an RSA key are pulled out (a 2048-bit modulus forces a long-form `82`
+/// length, which [`parse_tlvs`] handles). Neither shape present is
+/// [`ParseError::MissingTag`] for [`TAG_RSA_MODULUS`].
 pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
     let top = parse_tlvs(buf)?;
     // Accept either the bare value or the wrapping 7F49 envelope.
     let inner: &[u8] = find_tag(&top, TAG_PUBLIC_KEY).unwrap_or(buf);
     let tlvs = parse_tlvs(inner)?;
+
+    if let Some(point) = find_nested(&tlvs, TAG_EC_PUBLIC_POINT) {
+        return Ok(PublicKey::Ecc {
+            point: point.to_vec(),
+        });
+    }
 
     let modulus = find_nested(&tlvs, TAG_RSA_MODULUS)
         .ok_or(ParseError::MissingTag(TAG_RSA_MODULUS))?
@@ -2055,7 +2133,7 @@ pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
         .ok_or(ParseError::MissingTag(TAG_RSA_EXPONENT))?
         .to_vec();
 
-    Ok(PublicKey { modulus, exponent })
+    Ok(PublicKey::Rsa { modulus, exponent })
 }
 
 #[cfg(test)]
@@ -2587,17 +2665,33 @@ mod tests {
         blob.extend_from_slice(&inner);
 
         let pk = parse_generated_public_key(&blob).expect("RSA public key parses");
-        assert_eq!(pk.modulus, modulus);
-        assert_eq!(pk.exponent, exponent.to_vec());
+        match pk {
+            PublicKey::Rsa {
+                modulus: m,
+                exponent: e,
+            } => {
+                assert_eq!(m, modulus);
+                assert_eq!(e, exponent.to_vec());
+            }
+            PublicKey::Ecc { .. } => panic!("expected RSA key"),
+        }
 
         // Bare value (without the 7F49 envelope) also works.
         let pk2 = parse_generated_public_key(&inner).expect("bare value parses");
-        assert_eq!(pk2.modulus, modulus);
-        assert_eq!(pk2.exponent, exponent.to_vec());
+        match pk2 {
+            PublicKey::Rsa {
+                modulus: m,
+                exponent: e,
+            } => {
+                assert_eq!(m, modulus);
+                assert_eq!(e, exponent.to_vec());
+            }
+            PublicKey::Ecc { .. } => panic!("expected RSA key"),
+        }
     }
 
     #[test]
-    fn parse_generated_public_key_ecc_reports_missing_modulus() {
+    fn parse_generated_public_key_ecc_point() {
         // An ECC key carries 86 (public point) instead of 81/82.
         let mut inner = Vec::new();
         inner.push(0x86);
@@ -2610,6 +2704,13 @@ mod tests {
         blob.extend_from_slice(&inner);
         assert_eq!(
             parse_generated_public_key(&blob),
+            Ok(PublicKey::Ecc {
+                point: vec![0x04; 32]
+            })
+        );
+        // A 7F49 with neither an RSA modulus nor an EC point is still an error.
+        assert_eq!(
+            parse_generated_public_key(&[0x7F, 0x49, 0x02, 0x99, 0x00]),
             Err(ParseError::MissingTag(TAG_RSA_MODULUS))
         );
     }
@@ -2727,12 +2828,104 @@ mod tests {
             ]
         );
 
-        // The PublicKey convenience wrapper agrees.
-        let key = PublicKey {
+        // The generic wrapper agrees when the attributes say RSA.
+        let key = PublicKey::Rsa {
             modulus: modulus.to_vec(),
             exponent: exponent.to_vec(),
         };
-        assert_eq!(rsa_v4_fingerprint_from(&key, 0x5D2C_0B00), fpr);
+        let attrs = AlgorithmAttributes::Rsa(RsaAttributes {
+            n_bits: 64,
+            e_bits: 17,
+            format: RsaImportFormat::Standard,
+        });
+        assert_eq!(v4_fingerprint(&key, &attrs, 0x5D2C_0B00), Ok(fpr));
+        // Key/attribute shape mismatch is an error, never a wrong fingerprint.
+        let ecc_attrs = AlgorithmAttributes::Ecc {
+            kind: EccKind::EdDsa,
+            curve: Curve::Ed25519,
+            import_with_public_key: false,
+        };
+        assert_eq!(
+            v4_fingerprint(&key, &ecc_attrs, 0),
+            Err(ParseError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn mpi_of_25519_point_has_263_bits() {
+        // 0x40 || 32 bytes: top byte 0x40 has 7 significant bits -> 7 + 256.
+        let mut p = vec![0x40];
+        p.extend_from_slice(&[0x42; 32]);
+        let m = mpi(&p);
+        assert_eq!(&m[..2], &[0x01, 0x07]);
+        assert_eq!(&m[2..], &p[..]);
+    }
+
+    #[test]
+    fn ecdh_kdf_params_follow_gnupg() {
+        assert_eq!(ecdh_kdf_params(Curve::X25519), [0x03, 0x01, 0x08, 0x07]);
+        assert_eq!(ecdh_kdf_params(Curve::NistP256), [0x03, 0x01, 0x08, 0x07]);
+        assert_eq!(ecdh_kdf_params(Curve::NistP384), [0x03, 0x01, 0x09, 0x08]);
+        assert_eq!(
+            ecdh_kdf_params(Curve::BrainpoolP512r1),
+            [0x03, 0x01, 0x0A, 0x09]
+        );
+        assert_eq!(ecdh_kdf_params(Curve::NistP521), [0x03, 0x01, 0x0A, 0x09]);
+    }
+
+    #[test]
+    fn ecc_v4_fingerprint_known_answers() {
+        // Vectors computed independently (SHA-1 over the RFC 4880 §12.2 packet
+        // with the RFC 6637 §9 field layout) — not derived from this code.
+        let t = 0x5D2C_0B00;
+        let p25519 = [0x42u8; 32]; // raw card form; packet form is 40||point
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::EdDsa, Curve::Ed25519, &p25519, t),
+            hex20("221e61835aa5b9db5f50718f35bf850566eec58a")
+        );
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::Ecdh, Curve::X25519, &p25519, t),
+            hex20("31645415dcaad2114d282ef24c8eded03d76cab6")
+        );
+        // A card that already prefixes 0x40 yields the same fingerprint.
+        let mut prefixed = vec![0x40];
+        prefixed.extend_from_slice(&p25519);
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::EdDsa, Curve::Ed25519, &prefixed, t),
+            hex20("221e61835aa5b9db5f50718f35bf850566eec58a")
+        );
+        let mut p256 = vec![0x04];
+        p256.extend_from_slice(&[0x11; 32]);
+        p256.extend_from_slice(&[0x22; 32]);
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::Ecdsa, Curve::NistP256, &p256, t),
+            hex20("01059cf3677f627f7b04600559ba4ab49e9e94ba")
+        );
+        assert_eq!(
+            ecc_v4_fingerprint(EccKind::Ecdh, Curve::NistP256, &p256, t),
+            hex20("d8d15006bb31e1366679a954494a35bea0a3541e")
+        );
+        // The generic wrapper routes by attributes.
+        let key = PublicKey::Ecc {
+            point: p25519.to_vec(),
+        };
+        let attrs = AlgorithmAttributes::Ecc {
+            kind: EccKind::Ecdh,
+            curve: Curve::X25519,
+            import_with_public_key: false,
+        };
+        assert_eq!(
+            v4_fingerprint(&key, &attrs, t),
+            Ok(hex20("31645415dcaad2114d282ef24c8eded03d76cab6"))
+        );
+    }
+
+    fn hex20(s: &str) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
     }
 
     // --- Key import: BER helpers -----------------------------------------
