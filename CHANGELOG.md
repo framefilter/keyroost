@@ -24,6 +24,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OpenPgpStatus` carries each slot's raw algorithm attributes. The CLI's
   `openpgp status` (and its `--json` `*_algo` fields) now report
   `RSA-2048` / `EdDSA Ed25519` rather than the bare family name.
+  `TransportError` gains two new variants — `OpenPgpSlotMismatch` (a
+  requested algorithm that can't live in the requested slot) and
+  `OpenPgpSlotNotRsa` (an RSA-only operation, i.e. key import, run against a
+  slot that holds an ECC key) — so an exhaustive match over `TransportError`
+  needs new arms.
 
 ### Fixed
 - **Identiv uTrust FIDO2 PIV cards can now be managed.** Their PIV applet

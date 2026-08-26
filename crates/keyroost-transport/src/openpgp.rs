@@ -452,18 +452,28 @@ impl OpenPgpSession {
             }
             return Ok(None);
         }
-        Ok(pgp::parse_algorithm_information(&bytes).ok())
+        let parsed = pgp::parse_algorithm_information(&bytes).ok();
+        if parsed.is_none() && self.debug {
+            eprintln!(
+                "! openpgp: Algorithm Information object did not parse; offering every algorithm"
+            );
+        }
+        Ok(parsed)
     }
 
-    /// Read and parse the RSA algorithm attributes for `crt`'s slot. Errors if
-    /// the slot isn't RSA.
+    /// Read and parse the RSA algorithm attributes for `crt`'s slot. Errors
+    /// with [`TransportError::OpenPgpSlotNotRsa`] if the slot holds an ECC
+    /// key instead.
     fn rsa_attributes(&mut self, crt: pgp::KeyCrt) -> Result<pgp::RsaAttributes, TransportError> {
         let attr = self.algorithm_attributes(crt)?;
         match pgp::parse_algorithm_attributes(&attr) {
             Ok(pgp::AlgorithmAttributes::Rsa(r)) => Ok(r),
-            Ok(_) => Err(TransportError::OpenPgpParse(
-                pgp::ParseError::UnsupportedAlgorithm,
-            )),
+            Ok(ecc @ pgp::AlgorithmAttributes::Ecc { .. }) => {
+                Err(TransportError::OpenPgpSlotNotRsa {
+                    slot: crt_flag_name(crt),
+                    label: ecc.label(),
+                })
+            }
             Err(e) => Err(TransportError::OpenPgpParse(e)),
         }
     }
@@ -688,6 +698,16 @@ impl OpenPgpSession {
             cmd_sensitive,
             resp_sensitive,
         )
+    }
+}
+
+/// The `--slot` value the CLI accepts for `crt`, for use in a "run this
+/// command" hint in an error message.
+fn crt_flag_name(crt: pgp::KeyCrt) -> &'static str {
+    match crt {
+        pgp::KeyCrt::Sign => "sign",
+        pgp::KeyCrt::Decrypt => "decrypt",
+        pgp::KeyCrt::Auth => "auth",
     }
 }
 
