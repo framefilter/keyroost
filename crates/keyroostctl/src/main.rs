@@ -1117,7 +1117,9 @@ enum OpenpgpCmd {
     /// Sign a file with the on-card signature key (PSO:CDS). Hashes the input
     /// (SHA-256 by default, or SHA-1 via `--hash`). RSA slots sign a PKCS#1
     /// DigestInfo; ECC slots sign the bare digest. Requires the signing PIN
-    /// (PW1) and, on a YubiKey, a touch.
+    /// (PW1) and, on a YubiKey, a touch. The output is the card's raw
+    /// signature: PKCS#1 for RSA, `r||s` (not DER) for ECDSA, `R||S` for
+    /// Ed25519.
     Sign {
         /// File whose contents to sign.
         #[arg(long, value_name = "FILE")]
@@ -1164,7 +1166,8 @@ enum OpenpgpCmd {
     /// Authentication key (INTERNAL AUTHENTICATE). Hashes the input (SHA-256 by
     /// default, or SHA-1 via `--hash`). RSA slots sign a PKCS#1 DigestInfo; ECC
     /// slots sign the bare digest. Requires the user PIN (PW1) and, on a
-    /// YubiKey, a touch.
+    /// YubiKey, a touch. The output is the card's raw signature: PKCS#1 for
+    /// RSA, `r||s` (not DER) for ECDSA, `R||S` for Ed25519.
     Authenticate {
         /// File whose contents to authenticate-sign.
         #[arg(long, value_name = "FILE")]
@@ -5346,14 +5349,38 @@ fn oath_algo_str(a: keyroost_oath::Algorithm) -> &'static str {
     }
 }
 
-/// What to hand the card for a signature: RSA slots take a PKCS#1 DigestInfo;
-/// ECDSA and EdDSA slots take the bare digest (the card signs those bytes
-/// directly — GnuPG does the same). Attributes that don't parse are treated
-/// as RSA, the only kind that existed before #106.
-fn openpgp_sign_input(slot_attrs: &[u8], hash: SignHash, data: &[u8]) -> Vec<u8> {
-    match keyroost_openpgp::parse_algorithm_attributes(slot_attrs) {
-        Ok(keyroost_openpgp::AlgorithmAttributes::Ecc { .. }) => hash.digest(data),
-        _ => hash.digest_info(data),
+/// What to hand the card for a signature: RSA slots (algorithm id `0x01`)
+/// take a PKCS#1 DigestInfo; ECDSA/EdDSA slots (`0x12`/`0x13`/`0x16`) take the
+/// bare digest (the card signs those bytes directly — GnuPG does the same).
+/// Framing is keyed off the algorithm-id byte alone; attributes this crate
+/// can't identify (including an empty object) are an error, not a guess.
+fn openpgp_sign_input(
+    slot_label: &str,
+    slot_attrs: &[u8],
+    hash: SignHash,
+    data: &[u8],
+) -> Result<Vec<u8>, String> {
+    match slot_attrs.first() {
+        Some(0x01) => Ok(hash.digest_info(data)),
+        Some(0x12 | 0x13 | 0x16) => {
+            let is_ecc = matches!(
+                keyroost_openpgp::parse_algorithm_attributes(slot_attrs),
+                Ok(keyroost_openpgp::AlgorithmAttributes::Ecc { .. })
+            );
+            if is_ecc && matches!(hash, SignHash::Sha1) {
+                return Err(
+                    "SHA-1 cannot be used with an ECC signing key (OpenPGP requires a \
+                     256-bit or wider hash for Ed25519/ECDSA); use --hash sha256"
+                        .to_string(),
+                );
+            }
+            Ok(hash.digest(data))
+        }
+        _ => Err(format!(
+            "cannot tell the {slot_label} slot's algorithm from the card's attributes ({}); \
+             refusing to guess how to frame the input",
+            hex_encode(slot_attrs)
+        )),
     }
 }
 
@@ -5510,6 +5537,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 )
                 .into());
             }
+            if let Some(a) = algorithm {
+                a.to_alg().attributes(slot.to_crt())?;
+            }
             let admin_pin = read_secret(
                 "admin PIN (PW3)",
                 admin_pin_env.as_deref(),
@@ -5640,7 +5670,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // RSA slots want a PKCS#1 v1.5 DigestInfo (the card EMSA-pads and
             // RSA-signs it); ECDSA/EdDSA slots want the bare digest.
             let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Sign)?;
-            let input = openpgp_sign_input(&attrs, *hash, &data);
+            let input = openpgp_sign_input("signature", &attrs, *hash, &data)?;
             eprintln!("Signing ({}) — touch the key if it blinks…", hash.label());
             let sig = session.sign(&input)?;
             match out {
@@ -5667,19 +5697,26 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // (ref 0x82), not the signing context (0x81).
             session.verify_pin(keyroost_openpgp::PW1_OTHER, pin.as_bytes())?;
             let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Decrypt)?;
-            let is_ecdh = matches!(
-                keyroost_openpgp::parse_algorithm_attributes(&attrs),
-                Ok(keyroost_openpgp::AlgorithmAttributes::Ecc {
-                    kind: keyroost_openpgp::EccKind::Ecdh,
-                    ..
-                })
-            );
-            let (plain, noun) = if is_ecdh {
-                eprintln!("Deriving shared secret — touch the key if it blinks…");
-                (session.decrypt_ecdh(&cryptogram)?, "shared-secret")
-            } else {
-                eprintln!("Decrypting — touch the key if it blinks…");
-                (session.decrypt(&cryptogram)?, "plaintext")
+            // Framing is keyed off the algorithm-id byte alone: 0x12 (ECDH)
+            // derives a shared secret, 0x01 (RSA) decrypts. Anything else
+            // (including empty attributes) is refused rather than guessed.
+            let (plain, noun) = match attrs.first() {
+                Some(0x12) => {
+                    eprintln!("Deriving shared secret — touch the key if it blinks…");
+                    (session.decrypt_ecdh(&cryptogram)?, "shared-secret")
+                }
+                Some(0x01) => {
+                    eprintln!("Decrypting — touch the key if it blinks…");
+                    (session.decrypt(&cryptogram)?, "plaintext")
+                }
+                _ => {
+                    return Err(format!(
+                        "cannot tell the decryption slot's algorithm from the card's \
+                         attributes ({}); refusing to guess how to frame the input",
+                        hex_encode(&attrs)
+                    )
+                    .into());
+                }
             };
             match out {
                 Some(path) => {
@@ -5708,7 +5745,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // RSA slots want a PKCS#1 v1.5 DigestInfo; ECDSA/EdDSA slots want
             // the bare digest.
             let attrs = session.algorithm_attributes(keyroost_openpgp::KeyCrt::Auth)?;
-            let input = openpgp_sign_input(&attrs, *hash, &data);
+            let input = openpgp_sign_input("authentication", &attrs, *hash, &data)?;
             eprintln!(
                 "Authenticating ({}) — touch the key if it blinks…",
                 hash.label()
@@ -9514,19 +9551,31 @@ mod cli_tests {
         let data = b"hello";
         // RSA: PKCS#1 DigestInfo. ECC (ECDSA/EdDSA): the bare digest.
         let rsa = [0x01, 0x08, 0x00, 0x00, 0x20, 0x02];
+        let ecdsa = [0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
         let ed = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
         assert_eq!(
-            openpgp_sign_input(&rsa, SignHash::Sha256, data),
+            openpgp_sign_input("signature", &rsa, SignHash::Sha256, data).unwrap(),
             SignHash::Sha256.digest_info(data)
         );
         assert_eq!(
-            openpgp_sign_input(&ed, SignHash::Sha256, data),
+            openpgp_sign_input("signature", &ecdsa, SignHash::Sha256, data).unwrap(),
             keyroost_proto::sha256::sha256(data).to_vec()
         );
-        // Unknown attributes: assume RSA (the pre-#106 behaviour).
         assert_eq!(
-            openpgp_sign_input(&[], SignHash::Sha1, data),
-            SignHash::Sha1.digest_info(data)
+            openpgp_sign_input("signature", &ed, SignHash::Sha256, data).unwrap(),
+            keyroost_proto::sha256::sha256(data).to_vec()
+        );
+        // Unknown / empty attributes: refuse to guess rather than assume RSA.
+        let err = openpgp_sign_input("signature", &[], SignHash::Sha1, data).unwrap_err();
+        assert!(
+            err.contains("cannot tell the signature slot's algorithm"),
+            "{err}"
+        );
+        // SHA-1 is refused on an ECC signing key.
+        let err = openpgp_sign_input("signature", &ed, SignHash::Sha1, data).unwrap_err();
+        assert!(
+            err.contains("SHA-1 cannot be used with an ECC signing key"),
+            "{err}"
         );
     }
 
