@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **PIV cards that answer GET VERSION with more than three bytes can now be
+  managed.** The Swissbit iShield Key 2 Pro replies to the Yubico version
+  extension with four bytes; keyroost rejected the reply and with it the
+  card. The version is now kept as the card sent it and shown as-is (dotted
+  for up to four bytes, hex beyond), and the firmware checks that gate
+  YubiKey-specific behaviour compare the leading bytes exactly as before.
+  Contributed by @episource. ([#110])
+
 ## [0.8.0] - 2026-08-24
 
 **Why 0.8.0 and not 0.7.9:** this release changes the published library
@@ -906,6 +915,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#98]: https://github.com/framefilter/keyroost/issues/98
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
+[#110]: https://github.com/framefilter/keyroost/pull/110
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8

@@ -1040,8 +1040,10 @@ impl PivSession {
         // no way back from the blocked PIN and PUK this path deliberately
         // creates. GET VERSION and GET SERIAL come from the same extension
         // family, so a card that answers neither is exactly the card that must
-        // be refused. Decide here, before the first wrong VERIFY: afterwards the
-        // damage is already done.
+        // be refused. Any-length answers count: a card that replies to GET
+        // VERSION with four bytes (Swissbit iShield Key 2 Pro) is still speaking
+        // the extension family, which is what this gate is asking. Decide here,
+        // before the first wrong VERIFY: afterwards the damage is already done.
         let st = self.status()?;
         if st.version.is_none() && st.serial.is_none() {
             return Err(TransportError::PivForceResetUnsupported);

@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let _ = keyroost_piv::unwrap_data_object(data);
-    let _ = keyroost_piv::parse_version(data);
+    let _ = keyroost_piv::format_version_bytes(data);
     let _ = keyroost_piv::parse_serial(data);
     // Write-path response parsers: GENERAL AUTHENTICATE templates, generated
     // public keys, and GET METADATA — all carry attacker-influenceable BER.

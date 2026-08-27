@@ -9663,16 +9663,7 @@ mod cli_tests {
                 cert_len: 800,
             }],
         };
-        assert_json_has_keys(
-            &p,
-            &[
-                "version",
-                "serial",
-                "pin_retries",
-                "chuid",
-                "slots",
-            ],
-        );
+        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
     }
 
     #[test]
