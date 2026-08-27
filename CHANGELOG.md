@@ -6,6 +6,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **OTP codes on a Token2 key can be put behind a PIN.** Keys running the
+  R3.4 OTP applet can require a PIN before they hand out codes: `otp
+  set-pin` protects a key, `otp verify` opens the read window,
+  `otp change-pin` / `otp remove-pin` manage it, `otp pin-status` reports
+  whether one is set and how many attempts remain, and `list` / `add` /
+  `delete` take `--pin-env` or `--pin-stdin` to unlock in passing (the
+  PIN is never an argument). The GUI's OTP pane grows an unlock prompt, a
+  set/change/remove dialog and a "Lock now" action. The PIN travels
+  encrypted under a per-connection ECDH session and is never sent in the
+  clear. Two things to know before setting one: there is no reset — an
+  exhausted retry counter is recoverable only by erasing every OTP entry
+  on the key — and keyroost does not verify the device's P-521 agreement
+  signature, so over NFC an attacker who runs the key agreement can take
+  one verify blob away and brute-force a numeric PIN offline without
+  touching the retry counter. Keys without the feature are unaffected:
+  they answer the capability probe with "no such command" and everything
+  behaves exactly as before. Contributed by @token2. ([#107])
+
 ## [0.8.0] - 2026-08-24
 
 **Why 0.8.0 and not 0.7.9:** this release changes the published library
@@ -906,6 +925,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#98]: https://github.com/framefilter/keyroost/issues/98
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
+[#107]: https://github.com/framefilter/keyroost/issues/107
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
