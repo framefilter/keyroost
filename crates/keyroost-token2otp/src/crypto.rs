@@ -13,6 +13,7 @@
 //! The two IVs are **constants** by design (spec §7.2). Randomizing them breaks
 //! device-side decryption.
 
+use crate::cmd::{PIN_ALG_AES256, PIN_DEFAULT_MAX_RETRY};
 use aes::Aes256;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
@@ -47,6 +48,12 @@ pub enum EncryptError {
     BadCiphertext,
     /// A session HMAC authentication tag did not match.
     BadAuthTag,
+    /// An input to a PIN-proof builder was the wrong size: a PIN longer than
+    /// the single length byte the block format carries, or a challenge that is
+    /// not a whole number of AES blocks. Returned rather than panicking,
+    /// because both values can arrive from a device on the other end of a
+    /// cable and these builders are public API.
+    BadLength,
 }
 
 impl std::fmt::Display for EncryptError {
@@ -58,6 +65,12 @@ impl std::fmt::Display for EncryptError {
             EncryptError::RngFailed => write!(f, "host RNG failed generating ephemeral key"),
             EncryptError::BadCiphertext => write!(f, "session ciphertext failed to decrypt"),
             EncryptError::BadAuthTag => write!(f, "session HMAC authentication tag mismatch"),
+            EncryptError::BadLength => {
+                write!(
+                    f,
+                    "PIN or challenge length is out of range for this command"
+                )
+            }
         }
     }
 }
@@ -254,22 +267,50 @@ pub fn derive_session_keys(
     })
 }
 
-/// Generate a host ephemeral P-256 keypair and derive session keys against the
-/// device's 64-byte agreement pubkey. Returns the host public key as raw
-/// `X || Y` (to send in `READ_AGREEMENT_PUBKEY`) and the derived keys.
+/// A host-side ephemeral keypair for one PIN session, held across the two
+/// halves of the `READ_AGREEMENT_PUBKEY` exchange.
 ///
-/// Convenience wrapper around [`derive_session_keys`] for callers that do not
-/// need to keep the secret around; `transport` uses the split form so the
-/// pubkey it sends matches the keys it derives.
-pub fn establish_session(
-    device_agreement_xy: &[u8],
-) -> Result<([u8; 64], SessionKeys), EncryptError> {
-    let host_secret = SecretKey::random(&mut OsRng);
-    let keys = derive_session_keys(&host_secret, device_agreement_xy)?;
-    let host_point = host_secret.public_key().to_encoded_point(false);
-    let mut host_xy = [0u8; 64];
-    host_xy.copy_from_slice(&host_point.as_bytes()[1..]);
-    Ok((host_xy, keys))
+/// The exchange is inherently two-step — the host must send its public half
+/// *before* the device answers with its own — so a one-shot "generate and
+/// derive" function cannot express it: the keys would be derived against a
+/// different keypair than the one the device saw. Keeping the secret here lets
+/// the transport stay free of any curve arithmetic; it holds an opaque handle
+/// between the two transmits.
+pub struct HostAgreement {
+    secret: SecretKey,
+    public_xy: [u8; 64],
+}
+
+impl HostAgreement {
+    /// Generate a fresh ephemeral P-256 keypair for one session.
+    pub fn new() -> Self {
+        let secret = SecretKey::random(&mut OsRng);
+        let point = secret.public_key().to_encoded_point(false);
+        let mut public_xy = [0u8; 64];
+        public_xy.copy_from_slice(&point.as_bytes()[1..]);
+        Self { secret, public_xy }
+    }
+
+    /// The host public key as raw `X || Y` — the body of the
+    /// `READ_AGREEMENT_PUBKEY` command.
+    pub fn public_xy(&self) -> &[u8; 64] {
+        &self.public_xy
+    }
+
+    /// Finish the exchange: derive the session keys against the device's
+    /// 64-byte agreement pubkey from the same round trip.
+    pub fn establish_session(
+        &self,
+        device_agreement_xy: &[u8],
+    ) -> Result<SessionKeys, EncryptError> {
+        derive_session_keys(&self.secret, device_agreement_xy)
+    }
+}
+
+impl Default for HostAgreement {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// AES-256-CBC encrypt `cleartext` (PKCS#7) under the session key with an
@@ -285,8 +326,12 @@ pub fn session_encrypt(key: &[u8; 32], iv: &[u8; 16], cleartext: &[u8]) -> Vec<u
         .to_vec()
 }
 
-/// AES-256-CBC decrypt WITHOUT unpadding — for diagnostics only, so debug
-/// output can show the raw plaintext even when PKCS#7 would reject it.
+/// AES-256-CBC decrypt WITHOUT unpadding.
+///
+/// The PIN challenge (`Rand`) is exactly one block and carries no PKCS#7
+/// trailer, so unpadding would reject it; this is the production path that
+/// recovers it, not a debug aid. Returns an empty vector for input that is not
+/// a whole number of blocks — callers check the recovered length.
 pub fn session_decrypt_raw(key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Vec<u8> {
     if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return Vec::new();
@@ -323,7 +368,12 @@ pub fn session_auth_tag(mac_key: &[u8; 32], data: &[u8]) -> [u8; 16] {
     tag
 }
 
-/// Constant-time-ish check of a 16-byte session auth tag.
+/// Check a 16-byte session auth tag with a branch-free byte compare: every byte
+/// is XOR-folded into one accumulator, so the comparison takes the same path
+/// whatever the tag is. Rust makes no guarantee the optimizer keeps it that
+/// way, hence "branch-free as written" rather than a hard constant-time claim —
+/// the tag is over device-supplied ciphertext, so a timing leak reveals nothing
+/// secret either way.
 pub fn verify_auth_tag(mac_key: &[u8; 32], data: &[u8], tag: &[u8]) -> Result<(), EncryptError> {
     if tag.len() != 16 {
         return Err(EncryptError::BadAuthTag);
@@ -340,8 +390,6 @@ pub fn verify_auth_tag(mac_key: &[u8; 32], data: &[u8], tag: &[u8]) -> Result<()
     }
 }
 
-/// Build the `SET_OTP_PIN` data field: `IV || NewPinEnc || NewPinAuth`, where
-/// `NewPin = alg(0x07) || retry(0x64) || pinLen || pin`, PKCS#7-padded to 16.
 /// Build the data field for a **PIN-protected seed write** (`WRITE_SEED` while a
 /// PIN window is open). Unlike an unprotected write — which is an ECDH blob keyed
 /// by a fresh `GET_ECDH_PUBKEY` — a protected write reuses the verified PIN
@@ -362,12 +410,25 @@ pub fn build_protected_write_data(keys: &SessionKeys, cleartext: &[u8]) -> Vec<u
     out
 }
 
-pub fn build_set_pin_data(keys: &SessionKeys, pin: &[u8], retry: u8) -> Vec<u8> {
+/// Build the `SET_OTP_PIN` data field: `IV || NewPinEnc || NewPinAuth`, where
+/// `NewPin = alg(0x07) || retry || pinLen || pin`, PKCS#7-padded to 16 by
+/// [`session_encrypt`].
+///
+/// The cleartext `NewPin` block is held in a [`Zeroizing`] buffer: it is the
+/// only place the PIN exists in the clear on this side of the wire.
+pub fn build_set_pin_data(
+    keys: &SessionKeys,
+    pin: &[u8],
+    retry: u8,
+) -> Result<Vec<u8>, EncryptError> {
+    // The block carries the PIN length in one byte; a longer PIN cannot be
+    // expressed and must not be silently truncated into a different PIN.
+    let pin_len = u8::try_from(pin.len()).map_err(|_| EncryptError::BadLength)?;
     let iv = random_iv();
-    let mut newpin = Vec::with_capacity(3 + pin.len());
-    newpin.push(0x07); // AlgId = AES256
+    let mut newpin = Zeroizing::new(Vec::with_capacity(3 + pin.len()));
+    newpin.push(PIN_ALG_AES256);
     newpin.push(retry);
-    newpin.push(pin.len() as u8);
+    newpin.push(pin_len);
     newpin.extend_from_slice(pin);
     let enc = session_encrypt(&keys.enc, &iv, &newpin);
     let auth = session_auth_tag(&keys.mac, &enc);
@@ -375,7 +436,7 @@ pub fn build_set_pin_data(keys: &SessionKeys, pin: &[u8], retry: u8) -> Vec<u8> 
     out.extend_from_slice(&iv);
     out.extend_from_slice(&enc);
     out.extend_from_slice(&auth);
-    out
+    Ok(out)
 }
 
 /// Build the `VERIFY_OTP_PIN` data field, matching the Token2 reference client:
@@ -390,24 +451,32 @@ pub fn build_set_pin_data(keys: &SessionKeys, pin: &[u8], retry: u8) -> Vec<u8> 
 /// ```
 ///
 /// `rand` is the 16-byte challenge recovered from the `Lc=0x29` flag read
-/// (`Rand = AES-256-CBC-dec(SessionEncKey, flag.IV, flag.EncRand)`).
-pub fn build_verify_pin_data(keys: &SessionKeys, pin: &[u8], rand: &[u8]) -> Vec<u8> {
+/// (`Rand = AES-256-CBC-dec(SessionEncKey, flag.IV, flag.EncRand)`). A `rand`
+/// that is not a whole number of blocks is rejected with
+/// [`EncryptError::BadLength`] — it arrives from the device, so it is not a
+/// caller bug to assert on.
+pub fn build_verify_pin_data(
+    keys: &SessionKeys,
+    pin: &[u8],
+    rand: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
     // Inner layer: key = SHA256(pin) (32 bytes => AES-256), IV = SHA256(rand)[:16].
-    let pin_hash = sha256(pin);
+    // Both derive straight from the PIN, so both are wiped on the way out.
+    let pin_hash = Zeroizing::new(sha256(pin));
     let iv2_full = sha256(rand);
     let mut iv2 = [0u8; 16];
     iv2.copy_from_slice(&iv2_full[..16]);
     // Encrypt exactly the 16-byte Rand (no padding: it is already one block).
-    let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, rand);
+    let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, rand)?;
 
     // Outer layer under the session key with a fresh IV.
     let iv = random_iv();
-    let outer = aes256_cbc_encrypt_nopad(keys.enc.as_slice().try_into().unwrap(), &iv, &inner);
+    let outer = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &inner)?;
 
     let mut out = Vec::with_capacity(16 + outer.len());
     out.extend_from_slice(&iv);
     out.extend_from_slice(&outer);
-    out
+    Ok(out)
 }
 
 /// Build the `CHANGE_OTP_PIN` data field, matching the Token2 reference client:
@@ -422,26 +491,48 @@ pub fn build_verify_pin_data(keys: &SessionKeys, pin: &[u8], rand: &[u8]) -> Vec
 /// NewPinAuth     = HMAC(SessionMacKey, NewPinEnc || OldPinHashEnc)[0:16]
 /// data field     = IV || NewPinEnc || NewPinAuth || OldPinHashEnc
 /// ```
+///
+/// Note the single IV shared by `NewPinEnc` and `OldPinHashEnc`: that is what
+/// the reference client sends and what the applet expects, so it is not a
+/// choice we can make differently. It is recorded here as a protocol caveat —
+/// CBC under one key with one IV means identical first blocks encrypt
+/// identically, which is why the *old* PIN is hashed before it is encrypted.
+///
+/// `rand` is read from the same `Lc=0x29` challenge round trip that `verify`
+/// uses, but nothing in the block above binds it: the change proof authenticates
+/// the new PIN block and the old PIN hash, not the device's fresh challenge.
+/// The argument is kept so the signature does not have to change if the binding
+/// turns out to be required.
+// TODO(token2): confirm whether the change proof must bind Rand. If it must,
+// the block layout above is incomplete and CHANGE is replayable within a
+// session; if it must not, the transport's challenge read before a change can
+// go away entirely.
 pub fn build_change_pin_data(
     keys: &SessionKeys,
     new_pin: &[u8],
     current_pin: &[u8],
     _rand: &[u8],
-) -> Vec<u8> {
-    let enc_key: &[u8; 32] = keys.enc.as_slice().try_into().unwrap();
-    let mut body = Vec::with_capacity(3 + new_pin.len());
-    body.push(0x07);
-    body.push(0x64);
-    body.push(new_pin.len() as u8);
+) -> Result<Vec<u8>, EncryptError> {
+    // One length byte, as in SET: a longer PIN cannot be expressed here.
+    let new_len = u8::try_from(new_pin.len()).map_err(|_| EncryptError::BadLength)?;
+    let mut body = Zeroizing::new(Vec::with_capacity(3 + new_pin.len()));
+    body.push(PIN_ALG_AES256);
+    // The max-retry byte is rewritten by every change, so a device configured
+    // with a non-default counter is reset to the default here. We keep the
+    // reference client's fixed value because nothing in the protocol material
+    // we have says whether the applet would honour a different one, and a wrong
+    // guess writes a smaller retry budget onto a live key. See TODO above.
+    body.push(PIN_DEFAULT_MAX_RETRY);
+    body.push(new_len);
     body.extend_from_slice(new_pin);
     let body = pkcs7_pad16(&body);
 
     let iv = random_iv();
-    let new_pin_enc = aes256_cbc_encrypt_nopad(enc_key, &iv, &body);
+    let new_pin_enc = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &body)?;
 
-    let old_hash_full = sha256(current_pin);
+    let old_hash_full = Zeroizing::new(sha256(current_pin));
     let old_pin_hash = &old_hash_full[..16]; // 16 bytes, one block
-    let old_pin_hash_enc = aes256_cbc_encrypt_nopad(enc_key, &iv, old_pin_hash);
+    let old_pin_hash_enc = aes256_cbc_encrypt_nopad(&keys.enc, &iv, old_pin_hash)?;
 
     let mut mac_input = Vec::with_capacity(new_pin_enc.len() + old_pin_hash_enc.len());
     mac_input.extend_from_slice(&new_pin_enc);
@@ -453,7 +544,7 @@ pub fn build_change_pin_data(
     out.extend_from_slice(&new_pin_enc);
     out.extend_from_slice(&new_pin_auth);
     out.extend_from_slice(&old_pin_hash_enc);
-    out
+    Ok(out)
 }
 
 /// SHA-256 convenience.
@@ -464,26 +555,32 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// AES-256-CBC encrypt data that is already a whole number of 16-byte blocks,
-/// with NO padding added. Panics if `data` is not block-aligned.
-fn aes256_cbc_encrypt_nopad(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
-    assert!(
-        !data.is_empty() && data.len() % 16 == 0,
-        "aes256_cbc_encrypt_nopad needs block-aligned input"
-    );
+/// with NO padding added. Misaligned or empty input is an
+/// [`EncryptError::BadLength`], not a panic: one caller feeds this a challenge
+/// the device chose.
+fn aes256_cbc_encrypt_nopad(
+    key: &[u8; 32],
+    iv: &[u8; 16],
+    data: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
+    if data.is_empty() || data.len() % 16 != 0 {
+        return Err(EncryptError::BadLength);
+    }
     let mut buf = data.to_vec();
     let n = buf.len();
     // encrypt_padded_mut with NoPadding requires buf already block-aligned.
-    Aes256CbcEnc::new(key.into(), iv.into())
+    Ok(Aes256CbcEnc::new(key.into(), iv.into())
         .encrypt_padded_mut::<cbc::cipher::block_padding::NoPadding>(&mut buf, n)
-        .expect("block-aligned, NoPadding")
-        .to_vec()
+        .map_err(|_| EncryptError::BadLength)?
+        .to_vec())
 }
 
-/// PKCS#7 pad to a 16-byte boundary (always adds 1..=16 bytes).
-fn pkcs7_pad16(data: &[u8]) -> Vec<u8> {
+/// PKCS#7 pad to a 16-byte boundary (always adds 1..=16 bytes). The result is
+/// wiped on drop — its only caller pads a block holding a cleartext PIN.
+fn pkcs7_pad16(data: &[u8]) -> Zeroizing<Vec<u8>> {
     let n = 16 - (data.len() % 16);
-    let mut out = data.to_vec();
-    out.extend(std::iter::repeat(n as u8).take(n));
+    let mut out = Zeroizing::new(data.to_vec());
+    out.extend(std::iter::repeat_n(n as u8, n));
     out
 }
 

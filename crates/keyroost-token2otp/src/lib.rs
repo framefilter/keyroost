@@ -204,13 +204,28 @@ impl OtpError {
             sw::PIN_CONDITIONS_NOT_SATISFIED => Err(OtpError::PinConditionsNotSatisfied),
             sw::PIN_INVALID => Err(OtpError::PinInvalid),
             sw::PIN_LOCKED => Err(OtpError::PinLocked),
+            other => Err(OtpError::BadStatusCode(other)),
+        }
+    }
+
+    /// [`check`](OtpError::check) for the commands that can answer `63NN`.
+    ///
+    /// Only the PIN commands (set / verify / change) return a retry counter, so
+    /// only they get the `63NN` reading. ISO 7816 gives `63xx` a much broader
+    /// meaning — "state of non-volatile memory changed", with `63Cx` the
+    /// counter form — and the "low byte is the literal remaining count"
+    /// interpretation is Token2's. Applying it crate-wide would make an
+    /// unrelated `63xx` from, say, a seed write report "wrong OTP PIN — N
+    /// attempts remaining", which is worse than an unexplained status word.
+    pub fn check_pin(sw: u16) -> Result<(), OtpError> {
+        match sw {
             // `63NN` — wrong PIN, low byte = attempts remaining before lockout.
             // Token2 firmware counts the literal remaining count here (e.g.
             // 0x6362 -> 98 left, 0x6300 -> 0 left). Surface the count instead of
             // an opaque "unexpected status word". A 0-count means the next state
             // is locked, but the applet still signalled it via 63xx here.
             0x6300..=0x63FF => Err(OtpError::PinInvalidRetries((sw & 0x00FF) as u8)),
-            other => Err(OtpError::BadStatusCode(other)),
+            other => OtpError::check(other),
         }
     }
 
@@ -274,8 +289,11 @@ impl std::fmt::Display for OtpError {
                 write!(f, "wrong OTP PIN (or authentication tag mismatch)")
             }
             OtpError::PinInvalidRetries(n) => {
-                write!(f, "wrong OTP PIN — {n} attempt{} remaining before lockout",
-                    if *n == 1 { "" } else { "s" })
+                write!(
+                    f,
+                    "wrong OTP PIN — {n} attempt{} remaining before lockout",
+                    if *n == 1 { "" } else { "s" }
+                )
             }
             OtpError::PinLocked => write!(
                 f,
@@ -302,7 +320,7 @@ impl std::error::Error for OtpError {}
 pub fn read_otp_pin_flag(len: u8) -> Vec<u8> {
     let mut v = cmd::READ_OTP_PIN_FLAG.to_vec();
     v.push(len);
-    v.extend(std::iter::repeat(0x00).take(len as usize));
+    v.extend(std::iter::repeat_n(0x00, len as usize));
     v
 }
 
@@ -367,70 +385,49 @@ impl PinFlag {
     }
 }
 
-/// Enforce the client-side OTP-PIN policy (protocol doc §9). Mirrors the rules
-/// the firmware rejects with `6A80`, surfaced here as a clear message before we
-/// hit the wire. Returns the PIN's byte length on success.
-pub fn validate_otp_pin(pin: &str) -> Result<u8, &'static str> {
+/// An advisory note about a PIN the user is about to set — never a gate.
+///
+/// The applet decides what it accepts and answers with a status word when it
+/// declines; keyroost does not keep a second copy of that policy, because a
+/// host-side copy can only be wrong in one of two directions (rejecting a PIN
+/// the key would have taken, or blessing one it won't) and it drifts with every
+/// firmware revision. So this returns a *hint* to show alongside the entry
+/// field, and the attempt still goes to the device either way.
+///
+/// `None` means nothing worth saying. The wording describes what Token2 keys
+/// have been observed to want, not a rule this crate enforces.
+#[must_use]
+pub fn otp_pin_hint(pin: &str) -> Option<&'static str> {
     let bytes = pin.as_bytes();
+    if bytes.is_empty() {
+        return Some("the PIN is empty");
+    }
     if bytes.len() > 255 {
-        return Err("PIN is too long");
+        return Some("the PIN is longer than the 255 bytes the command can carry");
     }
-    let all_digits = !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_digit());
+    let all_digits = bytes.iter().all(|b| b.is_ascii_digit());
     if all_digits {
-        validate_numeric_pin(bytes)?;
-    } else {
-        validate_alphanumeric_pin(pin)?;
-    }
-    Ok(bytes.len() as u8)
-}
-
-fn validate_numeric_pin(b: &[u8]) -> Result<(), &'static str> {
-    if b.len() < 6 {
-        return Err("numeric PIN must be at least 6 digits");
-    }
-    if b.iter().all(|&c| c == b[0]) {
-        return Err("numeric PIN must not be all the same digit");
-    }
-    let asc = b.windows(2).all(|w| w[1] == w[0] + 1);
-    let desc = b.windows(2).all(|w| w[0] == w[1] + 1);
-    if asc || desc {
-        return Err("numeric PIN must not be a simple ascending/descending sequence");
-    }
-    if b.iter().eq(b.iter().rev()) {
-        return Err("numeric PIN must not be a palindrome");
-    }
-    for d in b'0'..=b'9' {
-        if b.iter().filter(|&&c| c == d).count() > 3 {
-            return Err("numeric PIN repeats a single digit too many times");
+        if bytes.len() < 6 {
+            return Some("keys typically want a numeric PIN of at least 6 digits");
         }
+        if bytes.iter().all(|&c| c == bytes[0]) {
+            return Some("keys typically reject a PIN that is one repeated digit");
+        }
+        let asc = bytes.windows(2).all(|w| w[1] == w[0] + 1);
+        let desc = bytes.windows(2).all(|w| w[0] == w[1] + 1);
+        if asc || desc {
+            return Some("keys typically reject a straight ascending/descending run");
+        }
+    } else if pin.chars().count() < 10 {
+        return Some("keys typically want a non-numeric PIN of at least 10 characters");
     }
-    Ok(())
+    None
 }
 
-fn validate_alphanumeric_pin(pin: &str) -> Result<(), &'static str> {
-    if pin.chars().count() < 10 {
-        return Err("alphanumeric PIN must be at least 10 characters");
-    }
-    let mut classes = 0;
-    if pin.chars().any(|c| c.is_ascii_uppercase()) {
-        classes += 1;
-    }
-    if pin.chars().any(|c| c.is_ascii_lowercase()) {
-        classes += 1;
-    }
-    if pin.chars().any(|c| c.is_ascii_digit()) {
-        classes += 1;
-    }
-    if pin.chars().any(|c| !c.is_ascii_alphanumeric() && !c.is_whitespace()) {
-        classes += 1;
-    }
-    if classes < 2 {
-        return Err("alphanumeric PIN must mix at least two of: upper, lower, digit, symbol");
-    }
-    Ok(())
-}
-
-
+/// Build an extended-length APDU: `CLA INS P1 P2 00 Lc_hi Lc_lo data...`
+/// (spec §3). Used for every command except the PC/SC SELECT, which is
+/// short-form via [`build_select`], and the PIN-flag read, which the applet
+/// wants in short form with a placeholder body (see [`read_otp_pin_flag`]).
 ///
 /// The device ignores Le and returns whatever it has, so none is appended.
 pub fn build_apdu(header: [u8; 4], data: &[u8]) -> Vec<u8> {

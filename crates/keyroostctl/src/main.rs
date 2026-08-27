@@ -238,6 +238,21 @@ mod json_out {
         pub touch_required: bool,
     }
 
+    /// `keyroostctl otp --json pin-status` — the R3.4 OTP-PIN state.
+    ///
+    /// `supported: false` means the key never answered the flag read, so the
+    /// three PIN fields are `null`: the feature is not there to report on.
+    #[derive(Serialize)]
+    pub struct OtpPinStatusJson {
+        pub supported: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub pin_set: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub retries_left: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub max_retries: Option<u8>,
+    }
+
     /// `keyroostctl otp --json get` — a single read OTP code.
     #[derive(Serialize)]
     pub struct OtpGetJson {
@@ -2113,7 +2128,7 @@ enum OtpCmd {
         #[arg(long)]
         seed_stdin: bool,
         /// OTP PIN for a protected (R3.4+) key, from this env var.
-        #[arg(long, value_name = "VAR")]
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         /// Read the OTP PIN from stdin (SECOND line, after the seed) to unlock a
         /// protected key.
@@ -2199,6 +2214,10 @@ enum OtpCmd {
     /// Set an OTP PIN on a currently-unprotected key. After this, codes are
     /// readable only after `verify`. The PIN is read from stdin or an env var —
     /// never argv.
+    ///
+    /// There is no PIN reset: wrong attempts count down a retry counter, and a
+    /// blocked PIN is recoverable only by erasing every OTP entry on the key
+    /// (`otp erase-all`). Keep a record of the PIN somewhere you trust.
     SetPin {
         /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -5111,32 +5130,34 @@ fn run_otp(
                 return Err("--digits must be between 4 and 10".into());
             }
             // On stdin the seed is line 1 and (if --pin-stdin) the PIN is line 2.
-            let (seed_b32, pin): (zeroize::Zeroizing<String>, Option<zeroize::Zeroizing<String>>) =
-                if *seed_stdin && *pin_stdin {
-                    use std::io::BufRead;
-                    let stdin = std::io::stdin();
-                    let mut lines = stdin.lock().lines();
-                    let seed = lines
-                        .next()
-                        .transpose()?
-                        .ok_or("expected base32 seed on stdin line 1")?;
-                    let pin = lines
-                        .next()
-                        .transpose()?
-                        .ok_or("expected OTP PIN on stdin line 2")?;
-                    (
-                        zeroize::Zeroizing::new(seed),
-                        Some(zeroize::Zeroizing::new(pin)),
-                    )
+            let (seed_b32, pin): (
+                zeroize::Zeroizing<String>,
+                Option<zeroize::Zeroizing<String>>,
+            ) = if *seed_stdin && *pin_stdin {
+                use std::io::BufRead;
+                let stdin = std::io::stdin();
+                let mut lines = stdin.lock().lines();
+                let seed = lines
+                    .next()
+                    .transpose()?
+                    .ok_or("expected base32 seed on stdin line 1")?;
+                let pin = lines
+                    .next()
+                    .transpose()?
+                    .ok_or("expected OTP PIN on stdin line 2")?;
+                (
+                    zeroize::Zeroizing::new(seed),
+                    Some(zeroize::Zeroizing::new(pin)),
+                )
+            } else {
+                let seed = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
+                let pin = if pin_env.is_some() || *pin_stdin {
+                    Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
                 } else {
-                    let seed = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
-                    let pin = if pin_env.is_some() || *pin_stdin {
-                        Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
-                    } else {
-                        None
-                    };
-                    (seed, pin)
+                    None
                 };
+                (seed, pin)
+            };
             let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
             let mut session = open_otp(transport, debug)?;
@@ -5370,14 +5391,27 @@ fn run_otp(
         OtpCmd::PinStatus => {
             let mut session = open_otp(transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            // `None` = the key never answered the flag read, i.e. it has no
+            // OTP-PIN feature. That is a fact about the key, not a failure.
             let flag = session.pin_status()?;
-            if flag.is_set() {
-                println!(
+            if json_output() {
+                emit_json(&json_out::OtpPinStatusJson {
+                    supported: flag.is_some(),
+                    pin_set: flag.as_ref().map(|f| f.is_set()),
+                    retries_left: flag.as_ref().map(|f| f.retries_left),
+                    max_retries: flag.as_ref().map(|f| f.max_retries),
+                })?;
+                return Ok(());
+            }
+            match flag {
+                Some(f) if f.is_set() => println!(
                     "OTP PIN: set  (retries left: {}, max: {})",
-                    flag.retries_left, flag.max_retries
-                );
-            } else {
-                println!("OTP PIN: not set");
+                    f.retries_left, f.max_retries
+                ),
+                Some(_) => println!("OTP PIN: not set"),
+                None => println!(
+                    "OTP PIN: not offered by this key (the OTP-PIN feature arrived with R3.4)"
+                ),
             }
         }
         OtpCmd::SetPin { pin_env, pin_stdin } => {

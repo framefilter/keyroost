@@ -90,9 +90,10 @@ pub enum OtpTransportError {
     /// The key has an OTP PIN set, but no PIN was supplied for an operation that
     /// needs one (the caller — CLI or GUI — should prompt for it and retry).
     PinRequired,
-    /// A supplied PIN failed the client-side policy check (before it was sent to
-    /// the device); the message describes which rule.
-    InvalidPin(&'static str),
+    /// A PIN operation needed the ECDH session keys and none were cached. An
+    /// internal ordering fault, distinct from a short or malformed device
+    /// response — which is what reusing `Parse(Truncated)` for it used to say.
+    PinSessionMissing,
 }
 
 impl std::fmt::Display for OtpTransportError {
@@ -145,7 +146,9 @@ impl std::fmt::Display for OtpTransportError {
                 f,
                 "this key's OTP codes are PIN-protected; supply the OTP PIN to unlock them"
             ),
-            OtpTransportError::InvalidPin(m) => write!(f, "invalid OTP PIN: {}", m),
+            OtpTransportError::PinSessionMissing => {
+                write!(f, "no OTP-PIN session was established before a PIN command")
+            }
         }
     }
 }
@@ -746,6 +749,10 @@ pub struct Token2OtpSession {
     /// Whether a successful `VERIFY_OTP_PIN` has opened the device read window on
     /// this connection.
     pin_verified: bool,
+    /// What the most recent flag read on this connection said: `Some(true)` a
+    /// PIN is set, `Some(false)` the feature is there and no PIN is set, `None`
+    /// nothing has asked yet or the key does not offer the feature.
+    pin_present: Option<bool>,
 }
 
 /// Host-owned caps on the `ENUM_CODES` pagination loop (audit KEY-009). Both
@@ -886,6 +893,7 @@ impl Token2OtpSession {
                         is_pcsc: false,
                         pin_session: None,
                         pin_verified: false,
+                        pin_present: None,
                     }),
                     Err((probe_err, _)) => {
                         // HID present but the applet didn't accept the probe
@@ -897,6 +905,7 @@ impl Token2OtpSession {
                                 is_pcsc: true,
                                 pin_session: None,
                                 pin_verified: false,
+                                pin_present: None,
                             }),
                             // No CCID either. Both outcomes matter now: which
                             // kind of HID failure it was, and why CCID could
@@ -913,6 +922,7 @@ impl Token2OtpSession {
                     is_pcsc: true,
                     pin_session: None,
                     pin_verified: false,
+                    pin_present: None,
                 })
             }
             Err(e) => Err(e),
@@ -930,6 +940,7 @@ impl Token2OtpSession {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         })
     }
 
@@ -941,6 +952,7 @@ impl Token2OtpSession {
             is_pcsc: true,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         })
     }
 
@@ -955,6 +967,7 @@ impl Token2OtpSession {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         })
     }
 
@@ -967,6 +980,7 @@ impl Token2OtpSession {
             is_pcsc: true,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         })
     }
 
@@ -977,6 +991,7 @@ impl Token2OtpSession {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         }
     }
 
@@ -987,6 +1002,7 @@ impl Token2OtpSession {
             is_pcsc: true,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         }
     }
 
@@ -1053,7 +1069,7 @@ impl Token2OtpSession {
         let keys = self
             .pin_session
             .as_ref()
-            .ok_or(OtpTransportError::Parse(ParseError::Truncated))?;
+            .ok_or(OtpTransportError::PinSessionMissing)?;
         if data.len() < 16 + 16 + 16 {
             return Err(OtpTransportError::Parse(ParseError::Truncated));
         }
@@ -1069,16 +1085,49 @@ impl Token2OtpSession {
 
     /// Read the PIN flag (base form): reports whether a PIN is set, retry counts.
     /// Needs no session.
-    pub fn pin_status(&mut self) -> Result<t2::PinFlag, OtpTransportError> {
+    ///
+    /// `Ok(None)` means **the key does not offer the OTP-PIN feature** — not an
+    /// error. keyroost keeps no firmware-version table; it offers the surface
+    /// and lets the attempt report the truth. A key whose applet predates R3.4
+    /// has never heard of `80 C5 05 04` and says so with a status word (`6A81`,
+    /// `6D00`, `6A86`, `6AF8` — the exact one varies by model and channel), and
+    /// a key that answers with a body too short to parse has told us just as
+    /// little. Both mean "no PIN here", and every caller must carry on exactly
+    /// as it did before this feature existed: an unprotected key's list, add and
+    /// delete are not allowed to start failing because a capability probe came
+    /// back negative.
+    ///
+    /// A genuine I/O failure still propagates — that is the transport breaking,
+    /// not the applet declining.
+    pub fn pin_status(&mut self) -> Result<Option<t2::PinFlag>, OtpTransportError> {
         let apdu = t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_BASE);
         let (data, sw) = self.transport.transmit(&apdu, false)?;
-        OtpError::check(sw)?;
-        Ok(t2::PinFlag::parse(&data)?)
+        let flag = if sw == t2::sw::OK {
+            t2::PinFlag::parse(&data).ok()
+        } else {
+            None
+        };
+        self.pin_present = flag.as_ref().map(|f| f.is_set());
+        Ok(flag)
     }
 
-    /// True if the key currently has an OTP PIN set.
+    /// True if the key currently has an OTP PIN set. A key without the PIN
+    /// feature reports `false` — see [`pin_status`](Self::pin_status).
     pub fn pin_is_set(&mut self) -> Result<bool, OtpTransportError> {
-        Ok(self.pin_status()?.is_set())
+        Ok(self.pin_status()?.is_some_and(|f| f.is_set()))
+    }
+
+    /// Whether the last flag read on this connection found a PIN set, without
+    /// spending another round trip. `None` until one has run, and after one that
+    /// found no PIN feature at all.
+    ///
+    /// Only ever filled by [`pin_status`](Self::pin_status), which every
+    /// `*_pinned` call runs first, so a caller that has just enumerated is
+    /// reading what the key said moments ago on this same connection — not a
+    /// value carried across devices or sessions.
+    #[must_use]
+    pub fn pin_set_cached(&self) -> Option<bool> {
+        self.pin_present
     }
 
     /// Establish an authenticated ECDH session and cache the derived keys.
@@ -1091,10 +1140,6 @@ impl Token2OtpSession {
     /// *authenticity* is not cryptographically checked — see the reference
     /// client's identical caveat.
     pub fn open_session(&mut self) -> Result<(), OtpTransportError> {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        use p256::SecretKey;
-        use rand_core::OsRng;
-
         // The reference sequence reads the PIN flag FIRST (Lc=09) before the
         // handshake — this primes the device PIN state. Skipping it makes a
         // subsequent SET fail with 6985.
@@ -1102,12 +1147,11 @@ impl Token2OtpSession {
         let (_pdata, psw) = self.transport.transmit(&prime, false)?;
         OtpError::check(psw)?;
 
-        let host_secret = SecretKey::random(&mut OsRng);
-        let host_point = host_secret.public_key().to_encoded_point(false);
-        let mut host_xy = [0u8; 64];
-        host_xy.copy_from_slice(&host_point.as_bytes()[1..]);
-
-        let apdu = t2::read_agreement_pubkey(&host_xy);
+        // The ephemeral keypair and every curve operation live in the byte
+        // layer, which is where this crate's split puts the crypto; the
+        // transport only carries the two halves of the exchange.
+        let agreement = t2::crypto::HostAgreement::new();
+        let apdu = t2::read_agreement_pubkey(agreement.public_xy());
         let (data, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check(sw)?;
         // Response: devPub(64) || sig(132). We consume devPub; sig is unverified.
@@ -1116,7 +1160,7 @@ impl Token2OtpSession {
         }
         let dev_xy = &data[..64];
 
-        let keys = t2::crypto::derive_session_keys(&host_secret, dev_xy)?;
+        let keys = agreement.establish_session(dev_xy)?;
         self.pin_session = Some(keys);
         self.pin_verified = false;
         Ok(())
@@ -1131,14 +1175,21 @@ impl Token2OtpSession {
     }
 
     /// Set an OTP PIN on a currently-unprotected key.
+    ///
+    /// The PIN is not screened here: the applet owns that policy and reports
+    /// what it will not take (`keyroost_token2otp::otp_pin_hint` exists to
+    /// *advise* a user before they commit, not to gate the attempt).
     pub fn set_pin(&mut self, pin: &str) -> Result<(), OtpTransportError> {
-        t2::validate_otp_pin(pin).map_err(OtpTransportError::InvalidPin)?;
         self.ensure_session()?;
-        let keys = self.pin_session.as_ref().expect("session ensured above");
-        let data = t2::crypto::build_set_pin_data(keys, pin.as_bytes(), t2::cmd::PIN_DEFAULT_MAX_RETRY);
+        let keys = self
+            .pin_session
+            .as_ref()
+            .ok_or(OtpTransportError::PinSessionMissing)?;
+        let data =
+            t2::crypto::build_set_pin_data(keys, pin.as_bytes(), t2::cmd::PIN_DEFAULT_MAX_RETRY)?;
         let apdu = t2::build_apdu(t2::cmd::SET_OTP_PIN, &data);
         let (_, sw) = self.transport.transmit(&apdu, false)?;
-        OtpError::check(sw)?;
+        OtpError::check_pin(sw)?;
         Ok(())
     }
 
@@ -1149,7 +1200,7 @@ impl Token2OtpSession {
         // Fetch the verify challenge: IV || EncRand (Lc = 0x29).
         let flag_apdu = t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
         let (data, sw) = self.transport.transmit(&flag_apdu, false)?;
-        OtpError::check(sw)?;
+        OtpError::check_pin(sw)?;
         let flag = t2::PinFlag::parse(&data)?;
         if !flag.is_set() {
             return Err(OtpTransportError::PinRequired);
@@ -1158,24 +1209,27 @@ impl Token2OtpSession {
             .challenge
             .ok_or(OtpTransportError::Parse(ParseError::Truncated))?;
 
-        let keys = self.pin_session.as_ref().expect("session ensured above");
+        let keys = self
+            .pin_session
+            .as_ref()
+            .ok_or(OtpTransportError::PinSessionMissing)?;
         // Rand is a raw 16-byte block with NO PKCS#7 padding.
         let rand = t2::crypto::session_decrypt_raw(&keys.enc, &iv, &enc_rand);
         if rand.len() != 16 {
             return Err(OtpTransportError::Encrypt(EncryptError::BadCiphertext));
         }
 
-        let data_field = t2::crypto::build_verify_pin_data(keys, pin.as_bytes(), &rand);
+        let data_field = t2::crypto::build_verify_pin_data(keys, pin.as_bytes(), &rand)?;
         let apdu = t2::build_apdu(t2::cmd::VERIFY_OTP_PIN, &data_field);
         let (_, sw) = self.transport.transmit(&apdu, false)?;
-        OtpError::check(sw)?;
+        OtpError::check_pin(sw)?;
         self.pin_verified = true;
         Ok(())
     }
 
-    /// Change the OTP PIN (requires the current PIN).
+    /// Change the OTP PIN (requires the current PIN). The new PIN is not
+    /// screened here — see [`set_pin`](Self::set_pin).
     pub fn change_pin(&mut self, current: &str, new: &str) -> Result<(), OtpTransportError> {
-        t2::validate_otp_pin(new).map_err(OtpTransportError::InvalidPin)?;
         self.change_pin_inner(current, Some(new))
     }
 
@@ -1190,25 +1244,32 @@ impl Token2OtpSession {
         new: Option<&str>,
     ) -> Result<(), OtpTransportError> {
         self.ensure_session()?;
-        // The change proof binds the current PIN to the fresh Rand, like verify.
+        // The reference sequence reads the challenge before a change, and the
+        // Rand it yields is passed on to the builder — but nothing in the change
+        // block binds it (see the TODO on `build_change_pin_data`). The read is
+        // kept because it is what the applet has been observed to expect; it is
+        // deliberately NOT described here as a binding the bytes don't perform.
         let flag_apdu = t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
         let (data, sw) = self.transport.transmit(&flag_apdu, false)?;
-        OtpError::check(sw)?;
+        OtpError::check_pin(sw)?;
         let flag = t2::PinFlag::parse(&data)?;
         let (iv, enc_rand) = flag
             .challenge
             .ok_or(OtpTransportError::Parse(ParseError::Truncated))?;
-        let keys = self.pin_session.as_ref().expect("session ensured above");
+        let keys = self
+            .pin_session
+            .as_ref()
+            .ok_or(OtpTransportError::PinSessionMissing)?;
         let rand = t2::crypto::session_decrypt_raw(&keys.enc, &iv, &enc_rand);
         if rand.len() != 16 {
             return Err(OtpTransportError::Encrypt(EncryptError::BadCiphertext));
         }
         let new_bytes = new.map(|s| s.as_bytes()).unwrap_or(&[]);
         let data_field =
-            t2::crypto::build_change_pin_data(keys, new_bytes, current.as_bytes(), &rand);
+            t2::crypto::build_change_pin_data(keys, new_bytes, current.as_bytes(), &rand)?;
         let apdu = t2::build_apdu(t2::cmd::CHANGE_OTP_PIN, &data_field);
         let (_, sw) = self.transport.transmit(&apdu, false)?;
-        OtpError::check(sw)?;
+        OtpError::check_pin(sw)?;
         self.pin_verified = false;
         Ok(())
     }
@@ -1719,6 +1780,7 @@ mod enumerate_bounds_tests {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         };
         let res = session.enumerate(0);
         assert!(
@@ -1759,6 +1821,7 @@ mod enumerate_bounds_tests {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            pin_present: None,
         };
         let entries = session.enumerate(0).expect("two pages must enumerate");
         assert_eq!(entries.len(), 2);

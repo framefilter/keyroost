@@ -969,15 +969,14 @@ impl App {
         let newpin = dlg.new.clone();
         let confirm = dlg.confirm.clone();
 
-        // Client-side checks before any device I/O.
+        // The only host-side gate is the one the host owns: the two typed
+        // fields must agree, because only this dialog knows they were meant to.
+        // Whether the key accepts the PIN is the key's call — it answers with a
+        // status word, and that answer is what the user is shown.
         match kind {
             PinDialogKind::Set | PinDialogKind::Change => {
                 if newpin != confirm {
                     self.otp.error = Some("New PIN and confirmation do not match.".into());
-                    return;
-                }
-                if let Err(m) = keyroost_token2otp::validate_otp_pin(&newpin) {
-                    self.otp.error = Some(format!("PIN policy: {m}"));
                     return;
                 }
             }
@@ -1549,8 +1548,7 @@ impl App {
                         .hint_text("OTP PIN")
                         .desired_width(220.0),
                 );
-                let entered =
-                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if theme::button(ui, p, BtnKind::Primary, "Unlock").clicked() || entered {
@@ -1567,8 +1565,9 @@ impl App {
                 }
             });
             if do_unlock && !self.otp.pin_input.trim().is_empty() {
-                self.otp.pin =
-                    Some(zeroize::Zeroizing::new(self.otp.pin_input.trim().to_owned()));
+                self.otp.pin = Some(zeroize::Zeroizing::new(
+                    self.otp.pin_input.trim().to_owned(),
+                ));
                 self.otp.pin_input.clear();
                 self.otp.pin_required = false;
                 self.otp.error = None;

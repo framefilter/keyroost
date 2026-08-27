@@ -22,12 +22,6 @@ keyroost-hid = { path = "../keyroost-hid", version = "0.8.0" }
 # implements it so FIDO2 commands can run over a smart-card reader, not just USB-HID.
 keyroost-ctap = { path = "../keyroost-ctap", version = "0.8.0" }
 pcsc = "2"
-# P-256 ECDH + OS RNG for the OTP-PIN session handshake (READ_AGREEMENT_PUBKEY):
-# the host generates an ephemeral keypair, sends its public half, and derives the
-# session keys against the device's agreement key. Same versions as
-# keyroost-token2otp, which owns the key-derivation itself.
-p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdh"] }
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 # hidapi backs the Token2 OTP USB-HID transport on macOS / Windows; Linux uses
 # the dependency-free hidraw `File` path (same split as keyroost-ctap). Optional
 # + cfg-gated so a default Linux build pulls nothing extra.
