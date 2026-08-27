@@ -1972,3 +1972,251 @@ mod declined_probe_is_not_an_unusable_interface {
         }
     }
 }
+
+/// A key that has never heard of the OTP-PIN command must behave exactly as it
+/// did before the feature existed.
+///
+/// The PIN-flag read now runs ahead of every list, add and delete, so the way
+/// an older applet answers it decides whether those still work. Firmware before
+/// R3.4 answers `80 C5 05 04` with whatever its dispatcher says for an unknown
+/// instruction — the exact status word varies by model and channel — and none
+/// of those may become a failure the user sees.
+#[cfg(test)]
+mod pre_r34_keys_are_unaffected {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The `ENUM_CODES` READ_ALL APDU as `main` builds it, byte for byte: the
+    /// short-Lc 9-byte body carrying the subcommand and a big-endian timestamp.
+    /// Pinned here rather than rebuilt, so a change to the builder shows up as a
+    /// diff in *this* test too.
+    const ENUM_READ_ALL_AT_T0: [u8; 14] = [
+        0x80, 0xC5, 0x05, 0x00, // ENUM_CODES
+        0x09, // short Lc
+        0x03, // SUB_READ_ALL
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp 0
+    ];
+
+    /// One valid single-entry page (spec §10.1), never encrypted.
+    fn cleartext_page() -> Vec<u8> {
+        let mut payload = vec![0x01, 0xC1, 0x00, 0x1E, 0x06, 0x00, 0x04];
+        payload.extend_from_slice(b"Test");
+        payload.push(0x05);
+        payload.extend_from_slice(b"alice");
+        payload.push(0x06);
+        payload.extend_from_slice(b"123456");
+        payload
+    }
+
+    /// The P-256 generator, as the raw `X || Y` a `GET_ECDH_PUBKEY` answers
+    /// with. Any valid point does; this one needs no key generation in a test.
+    const DEVICE_PUB_XY: [u8; 64] = [
+        0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40,
+        0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0, 0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98,
+        0xC2, 0x96, 0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A, 0x7C,
+        0x0F, 0x9E, 0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE, 0xCB, 0xB6, 0x40, 0x68,
+        0x37, 0xBF, 0x51, 0xF5,
+    ];
+
+    /// Stands in for pre-R3.4 firmware: the PIN-flag instruction gets `sw`, and
+    /// everything else answers the way it always has. Records every APDU.
+    struct OldFirmware {
+        flag_sw: u16,
+        sent: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl OtpTransport for OldFirmware {
+        fn transmit(
+            &mut self,
+            apdu: &[u8],
+            _detect_button_wait: bool,
+        ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+            self.sent.borrow_mut().push(apdu.to_vec());
+            match apdu.get(..4) {
+                Some(h) if h == t2::cmd::READ_OTP_PIN_FLAG => Ok((Vec::new(), self.flag_sw)),
+                Some(h) if h == t2::cmd::GET_ECDH_PUBKEY => Ok((DEVICE_PUB_XY.to_vec(), 0x9000)),
+                Some(h) if h == t2::cmd::ENUM_CODES => Ok((cleartext_page(), 0x9000)),
+                _ => Ok((Vec::new(), 0x9000)),
+            }
+        }
+    }
+
+    fn old_key(flag_sw: u16) -> (Token2OtpSession, Rc<RefCell<Vec<Vec<u8>>>>) {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let session = Token2OtpSession {
+            transport: Box::new(OldFirmware {
+                flag_sw,
+                sent: sent.clone(),
+            }),
+            is_pcsc: false,
+            pin_session: None,
+            pin_verified: false,
+            pin_present: None,
+        };
+        (session, sent)
+    }
+
+    /// Every status word an applet has been seen to use for "I don't know that
+    /// instruction", plus the generic wrong-length and wrong-P1P2 answers.
+    const UNKNOWN_INSTRUCTION_ANSWERS: [u16; 6] = [
+        0x6A81, // function not supported in the current state
+        0x6D00, // instruction not supported
+        0x6A86, // incorrect P1/P2
+        0x6AF8, // what R3.4 itself answers a bodyless flag read
+        0x6700, // wrong length
+        0x6E00, // class not supported
+    ];
+
+    #[test]
+    fn listing_still_works_and_sends_the_same_bytes_as_before() {
+        for sw in UNKNOWN_INSTRUCTION_ANSWERS {
+            let (mut session, sent) = old_key(sw);
+            let entries = session
+                .enumerate_pinned(0, None)
+                .unwrap_or_else(|e| panic!("a key answering {sw:#06X} must still list: {e}"));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].account_name, "alice");
+            assert_eq!(entries[0].code.as_deref(), Some("123456"));
+
+            // The only new traffic is the capability probe itself; the
+            // enumeration is byte-identical to what shipped before the PIN work.
+            let sent = sent.borrow();
+            assert_eq!(sent.len(), 2, "one flag read, then the enumeration");
+            assert_eq!(&sent[0][..4], &t2::cmd::READ_OTP_PIN_FLAG);
+            assert_eq!(sent[1], ENUM_READ_ALL_AT_T0);
+        }
+    }
+
+    #[test]
+    fn writing_and_deleting_still_work() {
+        for sw in UNKNOWN_INSTRUCTION_ANSWERS {
+            let (mut session, sent) = old_key(sw);
+            let entry = WriteEntry {
+                otp_type: t2::OtpType::Totp,
+                algorithm: t2::Algorithm::Sha1,
+                timestep: 30,
+                code_length: 6,
+                button_required: false,
+                app_name: "Test",
+                account_name: "alice",
+                seed: &[0u8; 20],
+            };
+            session
+                .write_entry_pinned(&entry, None)
+                .unwrap_or_else(|e| panic!("a key answering {sw:#06X} must still write: {e}"));
+            // The unprotected write still goes out as an ECDH-sealed blob —
+            // the session-key path is only for a verified PIN window.
+            let seen = sent.borrow().clone();
+            assert!(seen.iter().any(|a| a[..4] == t2::cmd::GET_ECDH_PUBKEY));
+            assert!(seen.iter().any(|a| a[..4] == t2::cmd::WRITE_SEED));
+
+            let (mut session, _) = old_key(sw);
+            session
+                .delete_entry_pinned("Test", "alice", None)
+                .unwrap_or_else(|e| panic!("a key answering {sw:#06X} must still delete: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_pin_state_reads_as_absent_rather_than_as_an_error() {
+        for sw in UNKNOWN_INSTRUCTION_ANSWERS {
+            let (mut session, _) = old_key(sw);
+            assert!(
+                session.pin_status().expect("not an error").is_none(),
+                "{sw:#06X} means the feature is not there"
+            );
+            assert!(!session.pin_is_set().unwrap());
+            assert_eq!(session.pin_set_cached(), None);
+        }
+    }
+
+    #[test]
+    fn a_body_too_short_to_parse_is_also_just_absent() {
+        // A key that answers 9000 with nothing useful has told us as little as
+        // one that declined outright.
+        struct EmptyOk;
+        impl OtpTransport for EmptyOk {
+            fn transmit(
+                &mut self,
+                apdu: &[u8],
+                _b: bool,
+            ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+                if apdu[..4] == t2::cmd::READ_OTP_PIN_FLAG {
+                    Ok((vec![0x07, 0x64], 0x9000)) // under the 4-byte head
+                } else {
+                    Ok((cleartext_page(), 0x9000))
+                }
+            }
+        }
+        let mut session = Token2OtpSession {
+            transport: Box::new(EmptyOk),
+            is_pcsc: false,
+            pin_session: None,
+            pin_verified: false,
+            pin_present: None,
+        };
+        assert!(session.pin_status().unwrap().is_none());
+        assert_eq!(session.enumerate_pinned(0, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_transport_failure_is_still_a_failure() {
+        // Degrading on a status word must not swallow a broken cable: the
+        // applet declining and the interface not working are different facts.
+        struct Dead;
+        impl OtpTransport for Dead {
+            fn transmit(
+                &mut self,
+                _a: &[u8],
+                _b: bool,
+            ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+                Err(OtpTransportError::EmptyResponse)
+            }
+        }
+        let mut session = Token2OtpSession {
+            transport: Box::new(Dead),
+            is_pcsc: false,
+            pin_session: None,
+            pin_verified: false,
+            pin_present: None,
+        };
+        assert!(matches!(
+            session.pin_status(),
+            Err(OtpTransportError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn a_protected_key_with_no_pin_supplied_asks_for_one() {
+        // The other side of the same branch: a key that DOES answer the flag
+        // read, and reports a PIN, must not silently list nothing.
+        struct Protected;
+        impl OtpTransport for Protected {
+            fn transmit(
+                &mut self,
+                apdu: &[u8],
+                _b: bool,
+            ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+                if apdu[..4] == t2::cmd::READ_OTP_PIN_FLAG {
+                    // AlgId, retries left, PIN length 6, max retries.
+                    Ok((vec![0x07, 0x64, 0x06, 0x64], 0x9000))
+                } else {
+                    Ok((cleartext_page(), 0x9000))
+                }
+            }
+        }
+        let mut session = Token2OtpSession {
+            transport: Box::new(Protected),
+            is_pcsc: false,
+            pin_session: None,
+            pin_verified: false,
+            pin_present: None,
+        };
+        assert!(matches!(
+            session.enumerate_pinned(0, None),
+            Err(OtpTransportError::PinRequired)
+        ));
+        assert_eq!(session.pin_set_cached(), Some(true));
+    }
+}

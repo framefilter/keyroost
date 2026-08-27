@@ -590,3 +590,280 @@ fn random_iv() -> [u8; 16] {
     OsRng.fill_bytes(&mut iv);
     iv
 }
+
+/// The PIN session crypto, pinned byte-for-byte.
+///
+/// No R3.4 key was available while this was written, so these tests are the
+/// only oracle the layout has: they fix what keyroost sends, so a later change
+/// to the ladder or to any data field has to be a deliberate, argued one rather
+/// than a silent re-framing. Each builder is checked by taking the device's
+/// side — deriving the same keys, decrypting what was sent, and comparing the
+/// recovered plaintext against the exact bytes the protocol calls for.
+#[cfg(test)]
+mod pin_crypto_tests {
+    use super::*;
+    use cbc::cipher::block_padding::NoPadding;
+
+    /// Two fixed scalars, so the whole ladder is deterministic. Values chosen
+    /// only for being valid, in-range P-256 private keys.
+    const HOST_SCALAR: [u8; 32] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+        0x1F, 0x20,
+    ];
+    const DEVICE_SCALAR: [u8; 32] = [
+        0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+        0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE,
+        0xBF, 0xC0,
+    ];
+
+    fn fixed_pair() -> (SecretKey, Vec<u8>) {
+        let host = SecretKey::from_slice(&HOST_SCALAR).expect("valid P-256 scalar");
+        let device = SecretKey::from_slice(&DEVICE_SCALAR).expect("valid P-256 scalar");
+        let pt = device.public_key().to_encoded_point(false);
+        (host, pt.as_bytes()[1..].to_vec())
+    }
+
+    fn fixed_keys() -> SessionKeys {
+        let (host, device_xy) = fixed_pair();
+        derive_session_keys(&host, &device_xy).expect("fixed vector must derive")
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Decrypt as the device would: session key, caller's IV, no unpadding.
+    fn dec_nopad(key: &[u8; 32], iv: &[u8; 16], ct: &[u8]) -> Vec<u8> {
+        let mut buf = ct.to_vec();
+        Aes256CbcDec::new(key.into(), iv.into())
+            .decrypt_padded_mut::<NoPadding>(&mut buf)
+            .expect("block-aligned")
+            .to_vec()
+    }
+
+    #[test]
+    fn session_key_ladder_against_a_fixed_ecdh_vector() {
+        let keys = fixed_keys();
+        // Pinned from the ladder as documented on `SessionKeys`:
+        //   pu1PRKey      = HMAC(0x00*32, sharedX)
+        //   SessionEncKey = HMAC(pu1PRKey, "TOTP AES key"  || 0x01)
+        //   SessionMacKey = HMAC(pu1PRKey, "TOTP HMAC key" || 0x01)
+        assert_eq!(
+            hex(&*keys.enc),
+            "6dd62146130f4f4a162b48ac4e222a6536eccdaac56008d020390e74c5efa9b8"
+        );
+        assert_eq!(
+            hex(&*keys.mac),
+            "175cdcb14128c03413a80403459b512fd5f23d71533276e991a25503ac77a091"
+        );
+    }
+
+    #[test]
+    fn the_ladder_is_a_real_ecdh_both_sides_can_walk() {
+        // The device runs the same ladder from its own private key and the
+        // host's public half; if the two disagree, nothing decrypts on-device.
+        let (host, device_xy) = fixed_pair();
+        let device = SecretKey::from_slice(&DEVICE_SCALAR).unwrap();
+        let host_pt = host.public_key().to_encoded_point(false);
+        let host_xy = &host_pt.as_bytes()[1..];
+
+        let from_host = derive_session_keys(&host, &device_xy).unwrap();
+        let from_device = derive_session_keys(&device, host_xy).unwrap();
+        assert_eq!(*from_host.enc, *from_device.enc);
+        assert_eq!(*from_host.mac, *from_device.mac);
+    }
+
+    #[test]
+    fn agreement_public_half_is_the_raw_xy_the_command_wants() {
+        let a = HostAgreement::new();
+        // 64 bytes, no SEC1 0x04 tag, and a real point (the device rebuilds it).
+        assert_eq!(a.public_xy().len(), 64);
+        let mut sec1 = [0u8; 65];
+        sec1[0] = 0x04;
+        sec1[1..].copy_from_slice(a.public_xy());
+        assert!(PublicKey::from_sec1_bytes(&sec1).is_ok());
+        // A wrong-length device answer is rejected, not assumed. (SessionKeys
+        // has no Debug/PartialEq on purpose — key material does not print.)
+        assert!(matches!(
+            a.establish_session(&[0u8; 63]),
+            Err(EncryptError::BadDevicePubkey)
+        ));
+    }
+
+    #[test]
+    fn set_pin_data_field_layout() {
+        let keys = fixed_keys();
+        let pin = b"246813";
+        let out = build_set_pin_data(&keys, pin, PIN_DEFAULT_MAX_RETRY).unwrap();
+
+        // IV(16) || NewPinEnc(32: a 9-byte block PKCS#7-padded to 16 -> 16) || auth(16)
+        assert_eq!(out.len(), 16 + 16 + 16, "IV || NewPinEnc || NewPinAuth");
+        let iv: [u8; 16] = out[..16].try_into().unwrap();
+        let enc = &out[16..32];
+        let auth = &out[32..];
+
+        // The cleartext block, byte for byte: AlgId, retry, len, pin, PKCS#7.
+        let plain = dec_nopad(&keys.enc, &iv, enc);
+        assert_eq!(
+            plain,
+            vec![
+                0x07, // AlgId = AES256
+                0x64, // max retry
+                0x06, // pin length
+                b'2', b'4', b'6', b'8', b'1', b'3', // the PIN
+                0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, // PKCS#7 to 16
+            ]
+        );
+        assert_eq!(auth, session_auth_tag(&keys.mac, enc));
+    }
+
+    #[test]
+    fn verify_pin_data_field_is_the_two_layer_proof() {
+        let keys = fixed_keys();
+        let pin = b"246813";
+        let rand = [0x5Au8; 16];
+        let out = build_verify_pin_data(&keys, pin, &rand).unwrap();
+
+        assert_eq!(out.len(), 16 + 16, "IV || PinHashEnc2");
+        let iv: [u8; 16] = out[..16].try_into().unwrap();
+
+        // Outer layer off with the session key…
+        let inner = dec_nopad(&keys.enc, &iv, &out[16..]);
+        // …inner layer off with the key the PIN itself derives, IV = SHA256(Rand)[:16].
+        let pin_key = sha256(pin);
+        let iv2_full = sha256(&rand);
+        let iv2: [u8; 16] = iv2_full[..16].try_into().unwrap();
+        let recovered = dec_nopad(&pin_key, &iv2, &inner);
+        // What the device gets back is exactly its own challenge — the proof.
+        assert_eq!(recovered, rand.to_vec());
+    }
+
+    #[test]
+    fn change_pin_data_field_layout() {
+        let keys = fixed_keys();
+        let out = build_change_pin_data(&keys, b"975312", b"246813", &[0u8; 16]).unwrap();
+
+        // IV(16) || NewPinEnc(16) || NewPinAuth(16) || OldPinHashEnc(16)
+        assert_eq!(out.len(), 64);
+        let iv: [u8; 16] = out[..16].try_into().unwrap();
+        let new_pin_enc = &out[16..32];
+        let auth = &out[32..48];
+        let old_hash_enc = &out[48..64];
+
+        assert_eq!(
+            dec_nopad(&keys.enc, &iv, new_pin_enc),
+            vec![
+                0x07, 0x64, 0x06, b'9', b'7', b'5', b'3', b'1', b'2', //
+                0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+            ]
+        );
+        // The old PIN goes over as SHA256(old)[:16], never in the clear.
+        assert_eq!(
+            dec_nopad(&keys.enc, &iv, old_hash_enc),
+            sha256(b"246813")[..16].to_vec()
+        );
+        // The tag covers both ciphertexts, in that order.
+        let mut mac_input = new_pin_enc.to_vec();
+        mac_input.extend_from_slice(old_hash_enc);
+        assert_eq!(auth, session_auth_tag(&keys.mac, &mac_input));
+    }
+
+    #[test]
+    fn removing_a_pin_is_a_change_to_length_zero() {
+        let keys = fixed_keys();
+        let out = build_change_pin_data(&keys, b"", b"246813", &[0u8; 16]).unwrap();
+        let iv: [u8; 16] = out[..16].try_into().unwrap();
+        // 3-byte body pads to one block; length byte says 0 => no PIN.
+        assert_eq!(
+            dec_nopad(&keys.enc, &iv, &out[16..32]),
+            vec![0x07, 0x64, 0x00, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13]
+        );
+    }
+
+    #[test]
+    fn the_change_proof_does_not_bind_rand() {
+        // Pins the behaviour the code actually has, so the open question stays
+        // visible: two changes differing only in the device challenge produce
+        // the same protected content. See the TODO on `build_change_pin_data`.
+        let keys = fixed_keys();
+        let a = build_change_pin_data(&keys, b"975312", b"246813", &[0x11u8; 16]).unwrap();
+        let b = build_change_pin_data(&keys, b"975312", b"246813", &[0x22u8; 16]).unwrap();
+        // The IVs differ (they are random), so compare what is under them.
+        let iv_a: [u8; 16] = a[..16].try_into().unwrap();
+        let iv_b: [u8; 16] = b[..16].try_into().unwrap();
+        assert_eq!(
+            dec_nopad(&keys.enc, &iv_a, &a[16..32]),
+            dec_nopad(&keys.enc, &iv_b, &b[16..32]),
+        );
+    }
+
+    #[test]
+    fn protected_write_data_field_layout() {
+        let keys = fixed_keys();
+        let cleartext = [0xABu8; 23];
+        let out = build_protected_write_data(&keys, &cleartext);
+
+        // IV(16) || AES-CBC(EncKey, IV, pt)(32 after PKCS#7) || HMAC[:16]
+        assert_eq!(out.len(), 16 + 32 + 16);
+        let iv: [u8; 16] = out[..16].try_into().unwrap();
+        let enc = &out[16..48];
+        assert_eq!(&out[48..], &session_auth_tag(&keys.mac, enc)[..]);
+        let plain = session_decrypt(&keys.enc, &iv, enc).unwrap();
+        assert_eq!(&*plain, &cleartext[..]);
+    }
+
+    #[test]
+    fn a_tag_over_other_bytes_does_not_verify() {
+        let keys = fixed_keys();
+        let tag = session_auth_tag(&keys.mac, b"page");
+        assert!(verify_auth_tag(&keys.mac, b"page", &tag).is_ok());
+        assert_eq!(
+            verify_auth_tag(&keys.mac, b"pagf", &tag),
+            Err(EncryptError::BadAuthTag)
+        );
+        // A short tag is refused rather than compared against a prefix.
+        assert_eq!(
+            verify_auth_tag(&keys.mac, b"page", &tag[..15]),
+            Err(EncryptError::BadAuthTag)
+        );
+    }
+
+    #[test]
+    fn out_of_range_inputs_are_errors_not_panics() {
+        // These builders are public API on a published crate, and both of the
+        // values below can arrive from the other end of a cable.
+        let keys = fixed_keys();
+        let long = vec![b'1'; 256];
+        assert_eq!(
+            build_set_pin_data(&keys, &long, 0x64),
+            Err(EncryptError::BadLength)
+        );
+        assert_eq!(
+            build_change_pin_data(&keys, &long, b"246813", &[0u8; 16]),
+            Err(EncryptError::BadLength)
+        );
+        // A challenge that is not a whole AES block (device-supplied).
+        for bad in [&[][..], &[0u8; 15][..], &[0u8; 17][..]] {
+            assert_eq!(
+                build_verify_pin_data(&keys, b"246813", bad),
+                Err(EncryptError::BadLength)
+            );
+        }
+    }
+
+    #[test]
+    fn session_decrypt_rejects_misaligned_or_empty_input() {
+        let keys = fixed_keys();
+        assert_eq!(
+            session_decrypt(&keys.enc, &[0u8; 16], &[]),
+            Err(EncryptError::BadCiphertext)
+        );
+        assert_eq!(
+            session_decrypt(&keys.enc, &[0u8; 16], &[0u8; 17]),
+            Err(EncryptError::BadCiphertext)
+        );
+        // The unpadded form used for Rand answers empty rather than panicking.
+        assert!(session_decrypt_raw(&keys.enc, &[0u8; 16], &[0u8; 17]).is_empty());
+    }
+}

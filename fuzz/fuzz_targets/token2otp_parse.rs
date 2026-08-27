@@ -1,7 +1,8 @@
 //! Token2 OTP-on-FIDO response parsers — fed raw bytes a (possibly malicious
 //! or buggy) Token2 key could return: the variable-tail enumerate-page parser,
-//! the single-entry read parser, the device-info decoder, and the serial-number
-//! decoder. None of these may panic on arbitrary input.
+//! the single-entry read parser, the device-info decoder, the serial-number
+//! decoder, and the R3.4 PIN-flag decoder. None of these may panic on
+//! arbitrary input.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
@@ -12,4 +13,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_token2otp::entry::parse_read_one(data);
     let _ = keyroost_token2otp::DeviceInfo::parse(data);
     let _ = keyroost_token2otp::parse_serial(data);
+    // The PIN-flag response: a fixed 4-byte head plus an optional challenge
+    // sliced from fixed offsets 9..25 and 25..41, so every length boundary
+    // between 0 and 41 is a chance to index off the end.
+    let _ = keyroost_token2otp::PinFlag::parse(data);
 });

@@ -990,3 +990,153 @@ mod vendor_status_words {
         }
     }
 }
+
+/// The R3.4 OTP-PIN command set, pinned byte-for-byte.
+///
+/// The vendor's announcement (#107) describes the feature, not the wire, and no
+/// R3.4 key was on hand when this landed — so these tests are the record of
+/// what keyroost sends. A later edit to any of these builders has to change a
+/// test and say why, rather than quietly re-framing a command.
+#[cfg(test)]
+mod otp_pin_wire_tests {
+    use super::*;
+
+    #[test]
+    fn pin_flag_read_is_short_lc_with_a_zero_placeholder_body() {
+        // `CLA INS P1 P2 len || len*00` — the applet reads `len`, overwrites the
+        // placeholder, and answers with `len` bytes. NOT build_apdu's form.
+        assert_eq!(
+            read_otp_pin_flag(cmd::PIN_FLAG_LC_BASE),
+            vec![0x80, 0xC5, 0x05, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00]
+        );
+
+        let prime = read_otp_pin_flag(cmd::PIN_FLAG_LC_PRIME);
+        assert_eq!(&prime[..5], &[0x80, 0xC5, 0x05, 0x04, 0x09]);
+        assert_eq!(prime.len(), 5 + 9);
+        assert!(prime[5..].iter().all(|&b| b == 0x00));
+
+        let challenge = read_otp_pin_flag(cmd::PIN_FLAG_LC_CHALLENGE);
+        assert_eq!(&challenge[..5], &[0x80, 0xC5, 0x05, 0x04, 0x29]);
+        assert_eq!(challenge.len(), 5 + 41);
+        assert!(challenge[5..].iter().all(|&b| b == 0x00));
+
+        // Lc = 0 is a bodyless read, which R3.4 rejects with 6AF8; the builder
+        // still produces the honest 5-byte form rather than inventing a body.
+        assert_eq!(read_otp_pin_flag(0), vec![0x80, 0xC5, 0x05, 0x04, 0x00]);
+    }
+
+    #[test]
+    fn lock_is_the_verify_header_with_a_single_zero_byte() {
+        assert_eq!(lock_otp_pin(), vec![0x80, 0xC5, 0x05, 0x06, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn agreement_pubkey_carries_the_raw_64_byte_host_key() {
+        let host_xy = [0xAAu8; 64];
+        let apdu = read_agreement_pubkey(&host_xy);
+        assert_eq!(&apdu[..4], &[0x80, 0xC5, 0x05, 0x09]);
+        assert_eq!(apdu[4], 0x40, "short-form Lc = 64");
+        assert_eq!(&apdu[5..], &host_xy[..]);
+        assert_eq!(apdu.len(), 5 + 64);
+    }
+
+    /// A `Lc = 0x29` flag response: the 9-byte head, then IV(16) || EncRand(16).
+    fn challenge_response() -> Vec<u8> {
+        let mut v = vec![0x07, 0x62, 0x06, 0x64, 0x00, 0x00, 0x01, 0x12, 0x34];
+        v.extend_from_slice(&[0x11u8; 16]); // IV
+        v.extend_from_slice(&[0x22u8; 16]); // EncRand
+        v
+    }
+
+    #[test]
+    fn pin_flag_head_and_challenge_parse_at_the_documented_offsets() {
+        let flag = PinFlag::parse(&challenge_response()).unwrap();
+        assert_eq!(flag.alg_id, 0x07);
+        assert_eq!(flag.retries_left, 0x62);
+        assert_eq!(flag.pin_len, 0x06);
+        assert_eq!(flag.max_retries, 0x64);
+        assert!(flag.is_set());
+        let (iv, enc) = flag.challenge.expect("41 bytes carries the challenge");
+        assert_eq!(iv, [0x11u8; 16]);
+        assert_eq!(enc, [0x22u8; 16]);
+    }
+
+    #[test]
+    fn a_pin_length_of_zero_means_no_pin_is_set() {
+        let flag = PinFlag::parse(&[0x07, 0x64, 0x00, 0x64]).unwrap();
+        assert!(!flag.is_set());
+        assert!(
+            flag.challenge.is_none(),
+            "the short read carries no challenge"
+        );
+    }
+
+    #[test]
+    fn short_and_truncated_flag_responses_are_errors_not_panics() {
+        // Under the 4-byte head: nothing to report.
+        for n in 0..4 {
+            assert_eq!(PinFlag::parse(&vec![0u8; n]), Err(ParseError::Truncated));
+        }
+        // Head present, challenge partially there: the head still parses and the
+        // challenge is simply absent rather than sliced out of bounds.
+        for n in 4..41 {
+            let flag = PinFlag::parse(&vec![0x07u8; n]).expect("head is complete");
+            assert!(
+                flag.challenge.is_none(),
+                "{n} bytes cannot hold a challenge"
+            );
+        }
+        // Longer than expected: trailing bytes are ignored, not misread.
+        let mut long = challenge_response();
+        long.extend_from_slice(&[0xFFu8; 32]);
+        assert_eq!(
+            PinFlag::parse(&long).unwrap(),
+            PinFlag::parse(&challenge_response()).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_retry_count_reading_belongs_to_the_pin_commands_only() {
+        // Token2 firmware puts the literal remaining count in the low byte…
+        assert_eq!(
+            OtpError::check_pin(0x6362),
+            Err(OtpError::PinInvalidRetries(98))
+        );
+        assert_eq!(
+            OtpError::check_pin(0x6300),
+            Err(OtpError::PinInvalidRetries(0))
+        );
+        // …but 63xx means far more than that in ISO 7816, so a command that
+        // cannot be answering about a PIN keeps the raw status word.
+        assert_eq!(
+            OtpError::check(0x6362),
+            Err(OtpError::BadStatusCode(0x6362))
+        );
+        assert_eq!(
+            OtpError::check(0x63C2),
+            Err(OtpError::BadStatusCode(0x63C2))
+        );
+        // Everything else is unchanged between the two.
+        for sw_ in [
+            sw::OK,
+            sw::PIN_INVALID,
+            sw::PIN_LOCKED,
+            sw::FUNCTION_NOT_SUPPORTED,
+        ] {
+            assert_eq!(OtpError::check_pin(sw_), OtpError::check(sw_));
+        }
+    }
+
+    #[test]
+    fn the_pin_hint_advises_and_never_decides() {
+        // It returns text, not a verdict the caller must obey — the device is
+        // the only thing that gets to reject a PIN.
+        assert!(otp_pin_hint("246813").is_none());
+        assert!(otp_pin_hint("correct horse battery").is_none());
+        assert!(otp_pin_hint("12345").is_some()); // short numeric
+        assert!(otp_pin_hint("111111").is_some()); // one repeated digit
+        assert!(otp_pin_hint("123456").is_some()); // straight run
+        assert!(otp_pin_hint("").is_some());
+        assert!(otp_pin_hint(&"1".repeat(300)).is_some());
+    }
+}
