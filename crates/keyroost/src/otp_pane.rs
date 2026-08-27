@@ -325,6 +325,10 @@ struct OtpLoad {
     totp_supported: Option<bool>,
     iface: Option<IfaceState>,
     button_hotp_status: Option<ButtonHotpStatus>,
+    /// What the key itself said about its OTP PIN during this read: `Some(true)`
+    /// a PIN is set, `Some(false)` the feature is present and unset, `None` the
+    /// key does not offer the feature at all.
+    pin_set: Option<bool>,
 }
 
 /// Per-selection state for the OTP pane.
@@ -384,6 +388,17 @@ pub struct OtpState {
     /// `None` until read. Drives the "seed configured" indicator and the
     /// settings-only editor.
     pub button_hotp_status: Option<ButtonHotpStatus>,
+}
+
+impl Drop for OtpState {
+    /// Scrub the PIN entry buffer when the pane state is torn down — which is
+    /// what a device switch does (`self.otp = OtpState::default()`), so a PIN
+    /// typed for one key must not survive into the next selection's memory.
+    /// The `pin` field is `Zeroizing` and wipes itself; `pin_input` is a plain
+    /// `String` because egui edits it in place, so it needs this.
+    fn drop(&mut self) {
+        wipe(&mut self.pin_input);
+    }
 }
 
 fn unix_now() -> u64 {
@@ -464,7 +479,10 @@ impl App {
         // protected key's codes decrypt. `None` means "unprotected, or not yet
         // unlocked" — enumerate_pinned then reports PinRequired for a protected
         // key, which the completion handler turns into the unlock prompt.
-        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
+        // Clone as `Zeroizing`, not `String`: this copy travels into a worker
+        // thread and is dropped there, so a plain clone would leave the PIN in
+        // that thread's heap with nothing left to wipe it.
+        let pin: Option<zeroize::Zeroizing<String>> = self.otp.pin.clone();
         self.spawn_job("Reading OTP entries\u{2026}", move || {
             let result =
                 (|| -> Result<OtpLoad, OtpTransportError> {
@@ -500,7 +518,7 @@ impl App {
                     // Carries the config read across both arms below so a failed
                     // enumerate doesn't cost a second READ_CONFIG.
                     let mut dev_info: Option<keyroost_token2otp::DeviceInfo> = None;
-                    let rows: Vec<OtpRow> = match session.enumerate_pinned(now, pin.as_deref()) {
+                    let rows: Vec<OtpRow> = match session.enumerate_pinned(now, pin.as_ref().map(|p| p.as_str())) {
                         Ok(entries) => entries
                             .into_iter()
                             .map(|e| OtpRow {
@@ -585,9 +603,15 @@ impl App {
                             numpad: info.hotp_uses_numpad(),
                         })
                     });
+                    // The flag read that `enumerate_pinned` already performed,
+                    // read back off the same connection — no extra round trip,
+                    // and it is the key's answer rather than an inference from
+                    // whether we happened to hold a PIN.
+                    let pin_set = session.pin_set_cached();
                     Ok(OtpLoad {
                         rows,
                         active,
+                        pin_set,
                         serial,
                         touch_ok,
                         touch_why,
@@ -620,9 +644,12 @@ impl App {
                         // A successful read means either the key isn't protected
                         // or the stored PIN worked — leave the prompt state off.
                         app.otp.pin_required = false;
-                        // If the read succeeded using a stored PIN, the key is
-                        // protected; if it succeeded with no PIN, it isn't.
-                        app.otp.pin_set = Some(app.otp.pin.is_some());
+                        // Straight from the device's flag read. Inferring it
+                        // from `app.otp.pin.is_some()` got this wrong whenever
+                        // the key's own window was already open: the read
+                        // succeeded without a PIN, so the pane reported "no PIN"
+                        // and hid Change / Remove / Lock on a protected key.
+                        app.otp.pin_set = load.pin_set;
                     }
                     Err(e) => {
                         if std::env::var_os("KEYROOST_OTP_DEBUG").is_some() {
@@ -688,7 +715,10 @@ impl App {
         let for_device = self.selected_device.clone();
         // Carry the verified PIN (if the key is protected and already unlocked)
         // so the write takes the session-key path the device requires.
-        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
+        // Clone as `Zeroizing`, not `String`: this copy travels into a worker
+        // thread and is dropped there, so a plain clone would leave the PIN in
+        // that thread's heap with nothing left to wipe it.
+        let pin: Option<zeroize::Zeroizing<String>> = self.otp.pin.clone();
 
         self.spawn_job("Adding OTP entry\u{2026}", move || {
             let result = (|| -> Result<(), String> {
@@ -714,7 +744,7 @@ impl App {
                     seed: &seed,
                 };
                 session
-                    .write_entry_pinned(&entry, pin.as_deref())
+                    .write_entry_pinned(&entry, pin.as_ref().map(|p| p.as_str()))
                     .map_err(|e| e.to_string())
             })();
             Box::new(move |app: &mut App| {
@@ -900,11 +930,18 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
+        // Clone as `Zeroizing`, not `String`: this copy travels into a worker
+        // thread and is dropped there, so a plain clone would leave the PIN in
+        // that thread's heap with nothing left to wipe it.
+        let pin: Option<zeroize::Zeroizing<String>> = self.otp.pin.clone();
         self.spawn_job("Deleting OTP entry\u{2026}", move || {
             let result = (|| -> Result<(), OtpTransportError> {
                 let mut session = target.open()?;
-                session.delete_entry_pinned(&app_name, &account_name, pin.as_deref())
+                session.delete_entry_pinned(
+                    &app_name,
+                    &account_name,
+                    pin.as_ref().map(|p| p.as_str()),
+                )
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
@@ -933,15 +970,34 @@ impl App {
             }
         };
         let for_device = self.selected_device.clone();
-        let pin: Option<String> = self.otp.pin.as_ref().map(|p| p.to_string());
+        // Clone as `Zeroizing`, not `String`: this copy travels into a worker
+        // thread and is dropped there, so a plain clone would leave the PIN in
+        // that thread's heap with nothing left to wipe it.
+        let pin: Option<zeroize::Zeroizing<String>> = self.otp.pin.clone();
         self.spawn_job("Locking OTP PIN\u{2026}", move || {
             let result = (|| -> Result<(), OtpTransportError> {
                 let mut session = target.open()?;
-                // Re-verify to hold the window, then close it explicitly.
-                if let Some(p) = pin.as_deref() {
-                    session.verify_pin(p)?;
+                // Ask to close the window first. The window is device-side
+                // state, and the lock form of VERIFY carries no PIN, so on a
+                // key that accepts it bare this costs nothing. Verifying first
+                // — as this did — spends one of a finite number of retries
+                // every time the user presses Lock, and spends it on a cached
+                // PIN that may since have been changed on another host.
+                match session.lock_pin() {
+                    // The one answer that means "there was no session to close
+                    // this way": open one with the PIN we hold and lock again.
+                    Err(OtpTransportError::Applet(
+                        keyroost_token2otp::OtpError::PinConditionsNotSatisfied,
+                    )) => {
+                        if let Some(p) = pin.as_deref() {
+                            session.verify_pin(p)?;
+                            session.lock_pin()
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    other => other,
                 }
-                session.lock_pin()
             })();
             Box::new(move |app: &mut App| {
                 if app.selected_device != for_device {
@@ -965,9 +1021,11 @@ impl App {
             Some(d) => d,
             None => return,
         };
-        let current = dlg.current.clone();
-        let newpin = dlg.new.clone();
-        let confirm = dlg.confirm.clone();
+        // The dialog wipes its own fields on drop; these copies must too, or
+        // the PIN outlives the modal in the worker thread's heap.
+        let current = zeroize::Zeroizing::new(dlg.current.clone());
+        let newpin = zeroize::Zeroizing::new(dlg.new.clone());
+        let confirm = zeroize::Zeroizing::new(dlg.confirm.clone());
 
         // The only host-side gate is the one the host owns: the two typed
         // fields must agree, because only this dialog knows they were meant to.
@@ -992,7 +1050,7 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         self.spawn_job("Updating OTP PIN\u{2026}", move || {
-            let result = (|| -> Result<Option<String>, OtpTransportError> {
+            let result = (|| -> Result<Option<zeroize::Zeroizing<String>>, OtpTransportError> {
                 let mut session = target.open()?;
                 match kind {
                     PinDialogKind::Set => {
@@ -1018,12 +1076,12 @@ impl App {
                         app.otp.pin_dialog = None;
                         match kind {
                             PinDialogKind::Set => {
-                                app.otp.pin = new_pin.map(zeroize::Zeroizing::new);
+                                app.otp.pin = new_pin.clone();
                                 app.otp.pin_set = Some(true);
                                 app.otp.info = Some("OTP PIN set.".into());
                             }
                             PinDialogKind::Change => {
-                                app.otp.pin = new_pin.map(zeroize::Zeroizing::new);
+                                app.otp.pin = new_pin.clone();
                                 app.otp.pin_set = Some(true);
                                 app.otp.info = Some("OTP PIN changed.".into());
                             }
@@ -1101,14 +1159,27 @@ impl App {
                 }
             }
             ui.add_space(6.0);
+            // Advice, not a rule: the key decides what it accepts and says so.
             ui.label(
                 egui::RichText::new(
-                    "Numeric PINs need 6+ digits (no trivial sequences); \
-                     alphanumeric PINs need 10+ characters.",
+                    "Keys typically want 6+ digits (no trivial sequences), or \
+                     10+ characters if the PIN isn't all digits.",
                 )
                 .font(theme::f_reg(11.0))
                 .color(p.txt3),
             );
+            if matches!(kind, PinDialogKind::Set | PinDialogKind::Change) {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "There is no PIN reset. Wrong attempts count down a retry \
+                         counter, and once it reaches zero the only way back is to \
+                         erase every OTP entry on this key.",
+                    )
+                    .font(theme::f_reg(11.0))
+                    .color(p.warn),
+                );
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let action = match kind {
@@ -1568,7 +1639,10 @@ impl App {
                 self.otp.pin = Some(zeroize::Zeroizing::new(
                     self.otp.pin_input.trim().to_owned(),
                 ));
-                self.otp.pin_input.clear();
+                // `.clear()` only sets the length to zero — the PIN would stay
+                // in the buffer verbatim. `wipe` is the helper the rest of the
+                // GUI's secret fields use.
+                wipe(&mut self.otp.pin_input);
                 self.otp.pin_required = false;
                 self.otp.error = None;
                 self.load_otp_entries();
