@@ -1311,11 +1311,26 @@ pub fn unwrap_data_object(buf: &[u8]) -> Result<&[u8], ParseError> {
     buf.get(start..end).ok_or(ParseError::Truncated)
 }
 
-/// Parse a Yubico GET VERSION reply (exactly 3 bytes) into `(major, minor, patch)`.
-pub fn parse_version(buf: &[u8]) -> Result<(u8, u8, u8), ParseError> {
-    match buf {
-        [a, b, c] => Ok((*a, *b, *c)),
-        _ => Err(ParseError::BadResponse("version is not 3 bytes")),
+/// Format a Yubico `GET VERSION` reply for display — tolerant of any
+/// non-empty length. Feature gates on the transport side (`move_key_supported`
+/// et al.) compare the same raw bytes directly as a slice rather than parsing
+/// them into a fixed-width tuple first, so there's no separate strict parse
+/// to defer to here either. Up to 4 bytes still reads as a version number, so
+/// it's dot-joined as decimal (`major.minor.patch[...]`, covering both real
+/// Yubico firmware's 3 bytes and small vendor variants like a 4-byte reply
+/// observed from a Swissbit OpenFIPS201 build). Past 4 bytes, dot-joining
+/// stops being a meaningful "version" and just obscures the actual bytes, so
+/// it falls back to plain lowercase hex.
+#[must_use]
+pub fn format_version_bytes(bytes: &[u8]) -> String {
+    if bytes.len() <= 4 {
+        bytes
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        keyroost_proto::codec::hex_encode(bytes)
     }
 }
 
@@ -1552,11 +1567,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_version_and_serial_values() {
-        assert_eq!(parse_version(&[5, 7, 1]).unwrap(), (5, 7, 1));
-        assert!(parse_version(&[5, 7]).is_err());
+    fn parse_serial_values() {
         assert_eq!(parse_serial(&[0x02, 0x40, 0x8A, 0x1B]).unwrap(), 0x02408A1B);
         assert!(parse_serial(&[0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn format_version_bytes_dots_up_to_four_bytes() {
+        assert_eq!(format_version_bytes(&[5, 7, 1]), "5.7.1");
+        assert_eq!(format_version_bytes(&[1, 0, 0, 0]), "1.0.0.0");
+        assert_eq!(format_version_bytes(&[9]), "9");
+        assert_eq!(format_version_bytes(&[]), "");
+    }
+
+    #[test]
+    fn format_version_bytes_falls_back_to_hex_past_four_bytes() {
+        assert_eq!(
+            format_version_bytes(&[0x01, 0x02, 0x03, 0x04, 0x05]),
+            "0102030405"
+        );
+        assert_eq!(
+            format_version_bytes(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]),
+            "deadbeefcafe"
+        );
     }
 
     #[test]

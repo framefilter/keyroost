@@ -148,6 +148,8 @@ mod json_out {
     /// `keyroostctl piv --json status`.
     #[derive(Serialize)]
     pub struct PivStatusJson {
+        /// Yubico GET VERSION's raw reply, dotted (or hex past 4 bytes),
+        /// tolerant of any non-empty byte count.
         pub version: Option<String>,
         pub serial: Option<u32>,
         pub pin_retries: Option<u8>,
@@ -5661,7 +5663,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
             if json_output() {
                 emit_json(&json_out::PivStatusJson {
-                    version: status.version.map(|(a, b, c)| format!("{a}.{b}.{c}")),
+                    version: status
+                        .version
+                        .as_deref()
+                        .map(keyroost_piv::format_version_bytes),
                     serial: status.serial,
                     pin_retries: status.pin_retries,
                     chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
@@ -5684,8 +5689,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 return Ok(());
             }
 
-            match status.version {
-                Some((a, b, c)) => println!("Version:     {}.{}.{}", a, b, c),
+            // Tolerant of any non-empty GET VERSION reply, not just real
+            // Yubico firmware's 3 bytes — some third-party PIV applets that
+            // answer this vendor extension at all use a different byte count
+            // (observed: a Swissbit iShield Key 2 Pro replies with 4).
+            match status.version.as_deref() {
+                Some(v) => println!("Version:     {}", keyroost_piv::format_version_bytes(v)),
                 None => println!("Version:     (unavailable)"),
             }
             match status.serial {
@@ -9654,7 +9663,16 @@ mod cli_tests {
                 cert_len: 800,
             }],
         };
-        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
+        assert_json_has_keys(
+            &p,
+            &[
+                "version",
+                "serial",
+                "pin_retries",
+                "chuid",
+                "slots",
+            ],
+        );
     }
 
     #[test]
