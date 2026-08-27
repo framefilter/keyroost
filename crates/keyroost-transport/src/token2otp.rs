@@ -1177,8 +1177,7 @@ impl Token2OtpSession {
     /// Set an OTP PIN on a currently-unprotected key.
     ///
     /// The PIN is not screened here: the applet owns that policy and reports
-    /// what it will not take (`keyroost_token2otp::otp_pin_hint` exists to
-    /// *advise* a user before they commit, not to gate the attempt).
+    /// what it will not take.
     pub fn set_pin(&mut self, pin: &str) -> Result<(), OtpTransportError> {
         self.ensure_session()?;
         let keys = self

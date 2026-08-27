@@ -1460,7 +1460,7 @@ impl App {
                             }
                             None => {
                                 ui.add_enabled_ui(false, |ui| {
-                                    let _ = ui.selectable_label(false, "PIN state unknown");
+                                    let _ = ui.selectable_label(false, "No PIN feature reported");
                                 });
                             }
                         }

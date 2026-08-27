@@ -25,6 +25,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   they answer the capability probe with "no such command" and everything
   behaves exactly as before. Contributed by @token2. ([#107])
 
+### Changed
+- Library API (`keyroost-token2otp`): `EncryptError` gains a `BadLength`
+  variant (an exhaustive `match` needs a new arm).
+
 ## [0.8.0] - 2026-08-24
 
 **Why 0.8.0 and not 0.7.9:** this release changes the published library

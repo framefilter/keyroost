@@ -385,45 +385,6 @@ impl PinFlag {
     }
 }
 
-/// An advisory note about a PIN the user is about to set — never a gate.
-///
-/// The applet decides what it accepts and answers with a status word when it
-/// declines; keyroost does not keep a second copy of that policy, because a
-/// host-side copy can only be wrong in one of two directions (rejecting a PIN
-/// the key would have taken, or blessing one it won't) and it drifts with every
-/// firmware revision. So this returns a *hint* to show alongside the entry
-/// field, and the attempt still goes to the device either way.
-///
-/// `None` means nothing worth saying. The wording describes what Token2 keys
-/// have been observed to want, not a rule this crate enforces.
-#[must_use]
-pub fn otp_pin_hint(pin: &str) -> Option<&'static str> {
-    let bytes = pin.as_bytes();
-    if bytes.is_empty() {
-        return Some("the PIN is empty");
-    }
-    if bytes.len() > 255 {
-        return Some("the PIN is longer than the 255 bytes the command can carry");
-    }
-    let all_digits = bytes.iter().all(|b| b.is_ascii_digit());
-    if all_digits {
-        if bytes.len() < 6 {
-            return Some("keys typically want a numeric PIN of at least 6 digits");
-        }
-        if bytes.iter().all(|&c| c == bytes[0]) {
-            return Some("keys typically reject a PIN that is one repeated digit");
-        }
-        let asc = bytes.windows(2).all(|w| w[1] == w[0] + 1);
-        let desc = bytes.windows(2).all(|w| w[0] == w[1] + 1);
-        if asc || desc {
-            return Some("keys typically reject a straight ascending/descending run");
-        }
-    } else if pin.chars().count() < 10 {
-        return Some("keys typically want a non-numeric PIN of at least 10 characters");
-    }
-    None
-}
-
 /// Build an extended-length APDU: `CLA INS P1 P2 00 Lc_hi Lc_lo data...`
 /// (spec §3). Used for every command except the PC/SC SELECT, which is
 /// short-form via [`build_select`], and the PIN-flag read, which the applet
@@ -1125,18 +1086,5 @@ mod otp_pin_wire_tests {
         ] {
             assert_eq!(OtpError::check_pin(sw_), OtpError::check(sw_));
         }
-    }
-
-    #[test]
-    fn the_pin_hint_advises_and_never_decides() {
-        // It returns text, not a verdict the caller must obey — the device is
-        // the only thing that gets to reject a PIN.
-        assert!(otp_pin_hint("246813").is_none());
-        assert!(otp_pin_hint("correct horse battery").is_none());
-        assert!(otp_pin_hint("12345").is_some()); // short numeric
-        assert!(otp_pin_hint("111111").is_some()); // one repeated digit
-        assert!(otp_pin_hint("123456").is_some()); // straight run
-        assert!(otp_pin_hint("").is_some());
-        assert!(otp_pin_hint(&"1".repeat(300)).is_some());
     }
 }
