@@ -17,6 +17,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   slot, and `status` names the curve. Verified on a YubiKey 5.7. Requested
   by @mdedonno1337. ([#106])
 
+- **OTP codes on a Token2 key can be put behind a PIN.** Keys running the
+  R3.4 OTP applet can require a PIN before they hand out codes: `otp
+  set-pin` protects a key, `otp verify` opens the read window,
+  `otp change-pin` / `otp remove-pin` manage it, `otp pin-status` reports
+  whether one is set and how many attempts remain, and `list` / `add` /
+  `delete` take `--pin-env` or `--pin-stdin` to unlock in passing (the
+  PIN is never an argument). The GUI's OTP pane grows an unlock prompt, a
+  set/change/remove dialog and a "Lock now" action. The PIN travels
+  encrypted under a per-connection ECDH session and is never sent in the
+  clear. Two things to know before setting one: there is no reset — an
+  exhausted retry counter is recoverable only by erasing every OTP entry
+  on the key — and keyroost does not verify the device's P-521 agreement
+  signature, so over NFC an attacker who runs the key agreement can take
+  one verify blob away and brute-force a numeric PIN offline without
+  touching the retry counter. Keys without the feature are unaffected:
+  they answer the capability probe with "no such command" and everything
+  behaves exactly as before. Contributed by @token2. ([#107])
+
 ### Changed
 - Library API (`keyroost-openpgp`, `keyroost-transport`): `PublicKey` is now
   an enum (`Rsa` / `Ecc`), `OpenPgpSession::generate_key` takes an optional
@@ -30,7 +48,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   slot that holds an ECC key) — so an exhaustive match over `TransportError`
   needs new arms.
 
+- Library API (`keyroost-token2otp`): `EncryptError` gains a `BadLength`
+  variant (an exhaustive `match` needs a new arm).
+
 ### Fixed
+- **PIV cards that answer GET VERSION with more than three bytes can now be
+  managed.** The Swissbit iShield Key 2 Pro replies to the Yubico version
+  extension with four bytes; keyroost rejected the reply and with it the
+  card. The version is now kept as the card sent it and shown as-is (dotted
+  for up to four bytes, hex beyond), and the firmware checks that gate
+  YubiKey-specific behaviour compare the leading bytes exactly as before.
+  Contributed by @episource. ([#110])
 - **Identiv uTrust FIDO2 PIV cards can now be managed.** Their PIV applet
   answers management-key authentication without the final card-to-host
   proof, which keyroost treated as a failure. A card that accepts the
@@ -941,6 +969,8 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#102]: https://github.com/framefilter/keyroost/pull/102
 [#104]: https://github.com/framefilter/keyroost/pull/104
 [#106]: https://github.com/framefilter/keyroost/issues/106
+[#107]: https://github.com/framefilter/keyroost/issues/107
+[#110]: https://github.com/framefilter/keyroost/pull/110
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8

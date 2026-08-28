@@ -126,9 +126,18 @@ fn map_reset_stage_error(e: TransportError) -> TransportError {
 /// A read-only snapshot of a PIV application's state.
 #[derive(Debug, Clone)]
 pub struct PivStatus {
-    /// Applet/firmware version `(major, minor, patch)` from the Yubico GET
-    /// VERSION extension, if the card supports it.
-    pub version: Option<(u8, u8, u8)>,
+    /// Reply to Yubico's proprietary `GET VERSION` extension (`INS FD`), raw
+    /// bytes, any non-empty length. Real Yubico firmware answers with exactly
+    /// 3 (`major.minor.patch`) — but this extension is implemented by many
+    /// devices beyond genuine YubiKeys (observed: a Swissbit iShield Key 2
+    /// Pro, an OpenFIPS201 build, answering `9000` with 4 bytes that don't
+    /// trace back to anything in OpenFIPS201's own source), so a reply here
+    /// means "answers this Yubico extension," not "is a YubiKey." `None` if
+    /// the card doesn't answer it, or answers empty. Feature gates (e.g.
+    /// [`move_key_supported`]) compare this directly as a byte slice rather
+    /// than requiring an exact 3-byte shape. See
+    /// [`keyroost_piv::format_version_bytes`] for display formatting.
+    pub version: Option<Vec<u8>>,
     /// Device serial (Yubico GET SERIAL; firmware 5+), if supported.
     pub serial: Option<u32>,
     /// Remaining PIN tries from a no-op VERIFY (`63 Cx`); `Some(0)` when blocked,
@@ -227,12 +236,17 @@ impl PubkeyCache {
     }
 }
 
-/// Whether MOVE KEY is available given the reported firmware `(major, minor, _)`.
-/// fw 5.7+ (Yubico). Unknown version → allow the attempt; the card refuses if
-/// it truly can't (belt-and-suspenders with the pre-check).
-fn move_key_supported(version: Option<(u8, u8, u8)>) -> bool {
+/// Whether MOVE KEY is available given the reported firmware version — fw
+/// 5.7+ (Yubico). Compared as a plain byte slice, not a fixed 3-part tuple:
+/// [`PivStatus::version`] isn't guaranteed to be exactly 3 bytes, and slice
+/// order gets a length mismatch right on its own (`[5, 7] < [5, 7, 0] <
+/// [5, 7, 1] < [5, 8]`), so `[5, 7]` alone is a correct "5.7 or newer"
+/// threshold without needing a trailing zero. Unknown version → allow the
+/// attempt; the card refuses if it truly can't (belt-and-suspenders with the
+/// pre-check).
+fn move_key_supported(version: Option<&[u8]>) -> bool {
     match version {
-        Some((major, minor, _)) => major > 5 || (major == 5 && minor >= 7),
+        Some(v) => v >= [5, 7].as_slice(),
         None => true,
     }
 }
@@ -340,13 +354,16 @@ impl PivSession {
         })
     }
 
-    /// Yubico GET VERSION; `None` if the card doesn't support the extension.
-    fn version(&mut self) -> Option<(u8, u8, u8)> {
+    /// Yubico's proprietary GET VERSION extension (`INS FD`), raw reply
+    /// bytes, tolerant of any non-empty length — see [`PivStatus::version`]
+    /// for why. `None` if the command errors, the card answers a non-`9000`
+    /// status, or the reply is empty. Feature gates (`move_key_supported`,
+    /// the `new_enough` check in [`Self::delete_key`]) call this directly and
+    /// compare the raw bytes as a slice, rather than requiring an exact
+    /// 3-byte shape like real Yubico firmware's.
+    fn version(&mut self) -> Option<Vec<u8>> {
         let (data, sw) = self.transmit_full(&piv::get_version()).ok()?;
-        if sw != piv::SW_OK {
-            return None;
-        }
-        piv::parse_version(&data).ok()
+        (sw == piv::SW_OK && !data.is_empty()).then_some(data)
     }
 
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
@@ -690,7 +707,10 @@ impl PivSession {
     /// [`authenticate_management`]: PivSession::authenticate_management
     pub fn delete_key(&mut self, slot: Slot) -> Result<(), TransportError> {
         // Version-gate: MOVE/DELETE KEY landed in YubiKey firmware 5.7.
-        let new_enough = matches!(self.version(), Some(v) if v >= (5, 7, 0));
+        // Compared as a byte slice, not a fixed 3-part tuple — see
+        // `move_key_supported`'s doc for why `[5, 7]` alone is the right
+        // threshold.
+        let new_enough = matches!(self.version(), Some(v) if v.as_slice() >= [5, 7].as_slice());
         if !new_enough {
             return Err(TransportError::PivFirmwareTooOld(
                 "deleting a key requires YubiKey firmware 5.7 or newer (older cards can only overwrite the slot)",
@@ -983,7 +1003,7 @@ impl PivSession {
                 "source and destination slots are the same",
             ));
         }
-        if !move_key_supported(self.version()) {
+        if !move_key_supported(self.version().as_deref()) {
             return Err(TransportError::PivFirmwareTooOld(
                 "moving a key requires YubiKey firmware 5.7 or newer",
             ));
@@ -1052,8 +1072,10 @@ impl PivSession {
         // no way back from the blocked PIN and PUK this path deliberately
         // creates. GET VERSION and GET SERIAL come from the same extension
         // family, so a card that answers neither is exactly the card that must
-        // be refused. Decide here, before the first wrong VERIFY: afterwards the
-        // damage is already done.
+        // be refused. Any-length answers count: a card that replies to GET
+        // VERSION with four bytes (Swissbit iShield Key 2 Pro) is still speaking
+        // the extension family, which is what this gate is asking. Decide here,
+        // before the first wrong VERIFY: afterwards the damage is already done.
         let st = self.status()?;
         if st.version.is_none() && st.serial.is_none() {
             return Err(TransportError::PivForceResetUnsupported);
@@ -1438,10 +1460,15 @@ mod tests {
     #[test]
     fn move_key_firmware_gate() {
         // MOVE KEY needs fw 5.7+. Below that -> refuse.
-        assert!(!move_key_supported(Some((5, 6, 0))));
-        assert!(move_key_supported(Some((5, 7, 0))));
-        assert!(move_key_supported(Some((5, 7, 4))));
-        assert!(move_key_supported(Some((6, 0, 0))));
+        assert!(!move_key_supported(Some(&[5, 6, 0])));
+        assert!(move_key_supported(Some(&[5, 7, 0])));
+        assert!(move_key_supported(Some(&[5, 7, 4])));
+        assert!(move_key_supported(Some(&[6, 0, 0])));
+        // A bare [5, 7] itself clears the bar too — slice order puts a
+        // shorter-but-otherwise-equal reply below anything with a 3rd byte,
+        // not above it (`[5, 7] < [5, 7, 0]`), so the threshold has to be
+        // written as [5, 7] rather than [5, 7, 0] to include it.
+        assert!(move_key_supported(Some(&[5, 7])));
         // Unknown version -> allow the attempt (card will reject if unsupported).
         assert!(move_key_supported(None));
     }

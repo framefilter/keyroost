@@ -13365,9 +13365,16 @@ impl App {
             // Status body: version / serial / PIN retries collapsed onto one
             // dotted line.
             if let Some(st) = &self.piv.status {
+                // Tolerant of any non-empty GET VERSION reply, not just real
+                // Yubico firmware's 3 bytes — some third-party PIV applets
+                // that answer this vendor extension at all use a different
+                // byte count (observed: a Swissbit iShield Key 2 Pro replies
+                // with 4).
                 let ver = st
                     .version
-                    .map_or("\u{2014}".to_string(), |(a, b, c)| format!("{a}.{b}.{c}"));
+                    .as_deref()
+                    .map(keyroost_piv::format_version_bytes)
+                    .unwrap_or_else(|| "\u{2014}".to_string());
                 let serial = st.serial.map_or("\u{2014}".to_string(), |s| s.to_string());
                 let retries = st
                     .pin_retries
@@ -13594,8 +13601,8 @@ impl App {
         // explain) when the loaded status reports an older — or unknown —
         // version. Clearing a certificate works everywhere.
         let can_delete_key = matches!(
-            self.piv.status.as_ref().and_then(|s| s.version),
-            Some(v) if v >= (5, 7, 0)
+            self.piv.status.as_ref().and_then(|s| s.version.as_deref()),
+            Some(v) if v >= [5, 7].as_slice()
         );
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
