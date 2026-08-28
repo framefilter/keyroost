@@ -14,6 +14,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for up to four bytes, hex beyond), and the firmware checks that gate
   YubiKey-specific behaviour compare the leading bytes exactly as before.
   Contributed by @episource. ([#110])
+- **Identiv uTrust FIDO2 PIV cards can now be managed.** Their PIV applet
+  answers management-key authentication without the final card-to-host
+  proof, which keyroost treated as a failure. A card that accepts the
+  host's proof but sends none of its own is now accepted; every card that
+  does send its proof is verified exactly as before. The reduced assurance
+  on such cards is reported in `--debug` output. Contributed by @episource.
+  ([#104])
 
 ## [0.8.0] - 2026-08-24
 
@@ -915,6 +922,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#98]: https://github.com/framefilter/keyroost/issues/98
 [#101]: https://github.com/framefilter/keyroost/pull/101
 [#102]: https://github.com/framefilter/keyroost/pull/102
+[#104]: https://github.com/framefilter/keyroost/pull/104
 [#110]: https://github.com/framefilter/keyroost/pull/110
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
