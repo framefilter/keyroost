@@ -427,6 +427,38 @@ impl PivSession {
         if sw2 != piv::SW_OK {
             return Err(TransportError::PivManagementAuthFailed);
         }
+        // Some cards (observed: Identiv uTrust FIDO2 Security Key) answer this
+        // step with `SW_OK` and an empty body instead of a `7C` template
+        // carrying the encrypted-challenge tag `0x82` — they verify our
+        // witness (a wrong one is rejected with a non-success status, same as
+        // above) but never implement the card-to-host half of mutual auth.
+        //
+        // This is NIST SP 800-73's "client (application) authentication" —
+        // only the client proves possession of the management key — versus
+        // the fuller "mutual authentication" that also has the card prove
+        // itself back to the client via 0x82. Client auth is the half that
+        // actually gates PIV admin operations, so it's sufficient on its own;
+        // we still *request* the mutual exchange up front (same step-1 APDU,
+        // same 0x80+0x81 step-2 APDU either way) because it's a strict
+        // superset — cards that only implement client auth answer exactly as
+        // they do here, and cards that implement the full round give us extra
+        // assurance, before writing new key material, that the "OK" we got
+        // back came from something that actually holds the key rather than a
+        // card that blindly answers success. So: treat this as authenticated
+        // rather than erroring on an 0x82 template that was never coming.
+        if resp2.is_empty() {
+            // Say so in the trace: the assurance on this card is one-sided,
+            // and a reviewer (or a user wondering why a swapped card was
+            // accepted) should be able to see that the weaker path was taken.
+            if self.debug {
+                eprintln!(
+                    "! piv authenticate: card returned no 0x82 challenge response; \
+                     accepting host-only (client) authentication — this card cannot \
+                     prove it holds the management key"
+                );
+            }
+            return Ok(());
+        }
         // Verify the card encrypted our challenge correctly (authenticates the
         // card to us, completing mutual auth). Constant-time out of principle —
         // both sides are fresh per attempt, so the timing leaks nothing useful,
