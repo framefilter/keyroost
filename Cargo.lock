@@ -2047,6 +2047,7 @@ version = "0.8.0"
 dependencies = [
  "aes",
  "cbc",
+ "hmac",
  "p256",
  "rand_core 0.6.4",
  "sha2",

@@ -107,6 +107,48 @@
       the seed, enter a new secret and Save; to remove it, use <strong>Clear slot</strong>.</p>
   </section>
 
+  <section class="kr-section" id="otp-pin">
+    <h2>Putting codes behind a PIN (R3.4+)</h2>
+    <p>Keys running the R3.4 OTP applet can require a <strong>PIN</strong> before they hand
+      out any codes. Set one and the entry list stays sealed until you unlock it; the key
+      keeps the window open for a few minutes and then closes it again. Older keys simply
+      don't have the feature &mdash; they answer the capability question with "no such
+      command", and everything on this page works exactly as it always did.</p>
+    <p>In the GUI, the <strong>On-device OTP</strong> tab shows an unlock prompt in place of
+      the list, and the pane's <strong>&hellip;</strong> menu grows <strong>Set PIN&hellip;</strong>,
+      <strong>Change PIN&hellip;</strong>, <strong>Remove PIN&hellip;</strong> and
+      <strong>Lock now</strong>.</p>
+    <p>On the command line:</p>
+<pre><code>keyroostctl otp pin-status              # is a PIN set, and how many tries are left
+keyroostctl otp set-pin --pin-stdin     # protect this key (PIN on stdin, never argv)
+keyroostctl otp verify --pin-stdin      # open the read window for this connection
+keyroostctl otp change-pin --pin-stdin  # current PIN on line 1, new PIN on line 2
+keyroostctl otp remove-pin --pin-stdin  # back to unprotected
+keyroostctl otp list --pin-stdin        # unlock in passing; same for add and delete</code></pre>
+    <p class="kr-muted">The PIN is read from stdin (<code>--pin-stdin</code>) or from a named
+      environment variable (<code>--pin-env</code>) &mdash; never from the command line, where
+      it would land in your shell history and in the process list. <code>list</code>,
+      <code>add</code> and <code>delete</code> all take both flags.</p>
+    <div class="kr-callout danger">
+      <div class="kr-callout-title danger">A blocked PIN costs every code on the key</div>
+      <p>There is no PIN reset. Wrong attempts count down a retry counter, and once it
+        reaches zero the applet refuses the PIN for good &mdash; the only way back is
+        <code>keyroostctl otp erase-all</code>, which destroys every OTP entry on the key.
+        Keep a record of the PIN somewhere you trust before you set one.</p>
+    </div>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">What the PIN does and does not protect</div>
+      <p>The PIN never travels in the clear: host and key agree a session key first, and the
+        PIN is only ever sent encrypted under it. But the key also signs that agreement with
+        a P-521 key, and <strong>keyroost does not verify that signature</strong> &mdash; so the
+        session is confidential, not authenticated. Over NFC in particular, something that
+        can run the key agreement itself can capture one unlock attempt and try PINs against
+        it offline, at its own pace, without ever touching the key's retry counter. A short
+        numeric PIN does not survive that. Treat the PIN as protection against someone
+        picking up your key, not against someone standing between you and it.</p>
+    </div>
+  </section>
+
   <section class="kr-section">
     <h2>Command line</h2>
 <pre><code>keyroostctl otp list                  # stored entries

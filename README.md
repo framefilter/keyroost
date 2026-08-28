@@ -88,6 +88,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   directly on a Token2 FIDO security key and read their codes over USB-HID, NFC,
   or CCID; configure the single HOTP-on-touch keystroke slot; read the serial;
   and enable / disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
+  On R3.4+ keys the codes can be put behind an OTP PIN (`otp set-pin`,
+  `otp verify`, `otp change-pin`, `otp remove-pin`, `otp pin-status`); note
+  there is no PIN reset — a blocked PIN is recoverable only by erasing every
+  OTP entry.
 - **One-shot factory reset** — `keyroostctl factory-reset --yes` (and a card on
   the GUI device Overview tab) resets every resettable applet on a key in turn:
   OATH, OpenPGP, PIV, Token2 OTP, then FIDO2. On a USB key the FIDO2 step ends
@@ -176,7 +180,10 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   and QR-from-screen import ([#50](https://github.com/framefilter/keyroost/pull/50));
   and the OTP secret-reveal toggle plus a Windows key-naming / anti-spoofing
   fix ([#52](https://github.com/framefilter/keyroost/pull/52),
-  [#56](https://github.com/framefilter/keyroost/pull/56)). Signs the Windows
+  [#56](https://github.com/framefilter/keyroost/pull/56)); and OTP-PIN
+  protection for R3.4+ keys, in the CLI and the GUI
+  ([#107](https://github.com/framefilter/keyroost/issues/107),
+  [#108](https://github.com/framefilter/keyroost/pull/108)). Signs the Windows
   and macOS release builds out-of-band.
 - **[@Algoritter](https://github.com/Algoritter)** — the project's first
   external code contribution: found, fixed and hardware-verified two
@@ -620,7 +627,7 @@ old script.
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM | `zeroize` |
-| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption, `zeroize` |
+| `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | none |
