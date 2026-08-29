@@ -7505,6 +7505,13 @@ impl App {
     }
 }
 
+/// `ViewportId` of the popped-out activity-log window — shared by the code that
+/// spawns it (`App::activity_log_window`) and the code that brings it to the
+/// front (the top bar's "Activity log" link while detached).
+fn activity_log_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("activity-log")
+}
+
 /// Current unix time as a float (for the OATH "copied" flash window).
 fn now_secs_f64() -> f64 {
     SystemTime::now()
@@ -8743,12 +8750,17 @@ impl App {
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
-                            self.log_open = !self.log_open;
-                            // Closing from here always resets to the docked
-                            // drawer, so reopening never springs a stale
-                            // popped-out window back to life.
-                            if !self.log_open {
-                                self.log_detached = false;
+                            if self.log_detached {
+                                // The log is popped out into its own window;
+                                // the link brings that window forward rather
+                                // than toggling (and closing) the drawer that
+                                // isn't showing.
+                                ctx.send_viewport_cmd_to(
+                                    activity_log_viewport_id(),
+                                    egui::ViewportCommand::Focus,
+                                );
+                            } else {
+                                self.log_open = !self.log_open;
                             }
                         }
                         ui.add_space(10.0);
@@ -9126,7 +9138,7 @@ impl App {
     fn activity_log_window(&mut self, ctx: &egui::Context, p: &Palette) {
         let mut close_requested = false;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("activity-log"),
+            activity_log_viewport_id(),
             egui::ViewportBuilder::default()
                 .with_title("keyroost \u{2014} Activity log")
                 .with_inner_size([620.0, 340.0])
