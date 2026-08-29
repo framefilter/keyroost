@@ -499,14 +499,10 @@ pub fn build_verify_pin_data(
 /// identically, which is why the *old* PIN is hashed before it is encrypted.
 ///
 /// `rand` is read from the same `Lc=0x29` challenge round trip that `verify`
-/// uses, but nothing in the block above binds it: the change proof authenticates
-/// the new PIN block and the old PIN hash, not the device's fresh challenge.
-/// The argument is kept so the signature does not have to change if the binding
-/// turns out to be required.
-// TODO(token2): confirm whether the change proof must bind Rand. If it must,
-// the block layout above is incomplete and CHANGE is replayable within a
-// session; if it must not, the transport's challenge read before a change can
-// go away entirely.
+/// uses, but the change proof does not bind it: it authenticates the current
+/// PIN via `SHA256(current)[..16]` plus the session MAC, which Token2 confirmed
+/// is what the firmware and the reference client do. The argument is kept so
+/// the signature matches `verify`'s.
 pub fn build_change_pin_data(
     keys: &SessionKeys,
     new_pin: &[u8],

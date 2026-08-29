@@ -863,6 +863,19 @@ fn probe_hid(t: &mut HidOtpTransport) -> Result<(), OtpTransportError> {
     Ok(())
 }
 
+/// Status words that mean "this applet has no PIN command at all" — the ISO
+/// unknown-instruction family, plus `6AF8`, which R3.4 firmware itself answers a
+/// bodyless flag read with. Every other non-`9000` answer to the flag read is a
+/// real PIN state (Token2 confirmed `6982`/`6983`/`6985`/`6A81`/`63xx` are) and
+/// is surfaced, never mistaken for "no feature".
+const NO_PIN_FEATURE_ANSWERS: [u16; 5] = [
+    0x6D00, // instruction not supported
+    0x6E00, // class not supported
+    0x6A86, // incorrect P1/P2
+    0x6AF8, // what R3.4 itself answers a bodyless flag read
+    0x6700, // wrong length
+];
+
 impl Token2OtpSession {
     /// Open the OTP applet, trying USB-HID first and falling back to PC/SC.
     ///
@@ -1104,7 +1117,12 @@ impl Token2OtpSession {
         let (data, sw) = self.transport.transmit(&apdu, false)?;
         let flag = if sw == t2::sw::OK {
             t2::PinFlag::parse(&data).ok()
+        } else if NO_PIN_FEATURE_ANSWERS.contains(&sw) {
+            None
         } else {
+            // Anything else is the applet reporting a real PIN state — a
+            // locked PIN answers 6983 here — and must reach the caller.
+            t2::OtpError::check(sw)?;
             None
         };
         self.pin_present = flag.as_ref().map(|f| f.is_set());
@@ -2056,16 +2074,28 @@ mod pre_r34_keys_are_unaffected {
         (session, sent)
     }
 
-    /// Every status word an applet has been seen to use for "I don't know that
-    /// instruction", plus the generic wrong-length and wrong-P1P2 answers.
-    const UNKNOWN_INSTRUCTION_ANSWERS: [u16; 6] = [
-        0x6A81, // function not supported in the current state
-        0x6D00, // instruction not supported
-        0x6A86, // incorrect P1/P2
-        0x6AF8, // what R3.4 itself answers a bodyless flag read
-        0x6700, // wrong length
-        0x6E00, // class not supported
-    ];
+    /// The answers that mean "no PIN command here" — shared with the probe so a
+    /// word added there is exercised here.
+    const UNKNOWN_INSTRUCTION_ANSWERS: [u16; 5] = super::NO_PIN_FEATURE_ANSWERS;
+
+    #[test]
+    fn a_locked_pin_is_reported_not_hidden() {
+        // 6983 on the flag read is the applet saying "PIN locked", not "no PIN
+        // feature" — listing must stop with that state, never proceed as if
+        // the key were unprotected. 6A81 is likewise a real state per Token2.
+        for sw in [0x6983u16, 0x6982, 0x6985, 0x6A81] {
+            let (mut session, _) = old_key(sw);
+            let err = session
+                .pin_status()
+                .expect_err("a real PIN state must not be swallowed");
+            assert!(
+                matches!(err, OtpTransportError::Applet(_)),
+                "{sw:#06X} surfaced as {err:?}"
+            );
+            let (mut session, _) = old_key(sw);
+            assert!(session.enumerate_pinned(0, None).is_err(), "{sw:#06X}");
+        }
+    }
 
     #[test]
     fn listing_still_works_and_sends_the_same_bytes_as_before() {
