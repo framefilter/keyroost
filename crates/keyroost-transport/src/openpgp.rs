@@ -693,6 +693,7 @@ impl OpenPgpSession {
             label: "openpgp",
             more_data_sw: pgp::SW_MORE_DATA,
             get_response: pgp::get_response,
+            describe: None,
         };
         crate::transmit_applet(
             &self.card,

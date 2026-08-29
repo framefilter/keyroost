@@ -1186,10 +1186,16 @@ impl PivSession {
         // returns recovered plaintext — redact uniformly so a future caller
         // can't leak through a trace.
         let resp_sensitive = apdu.get(1) == Some(&0x87);
+        // `describe` makes `transmit_applet` bracket every transmitted APDU —
+        // the caller's command and each GET RESPONSE / Le-corrected reissue —
+        // with a `>` line naming the command and a `<` line reading its status
+        // word. The CLI's `--debug` output and the GUI activity log both take
+        // this straight from `trace`, so it covers both.
         const IO: crate::AppletIo = crate::AppletIo {
             label: "piv",
             more_data_sw: piv::SW_MORE_DATA,
             get_response: piv::get_response,
+            describe: Some(describe_apdu),
         };
         crate::transmit_applet(
             &self.card,
@@ -1246,6 +1252,73 @@ const CHAIN_CHUNK: usize = 254;
 /// so byte 4 being the `0x00` extended-length marker is unambiguous.
 fn uses_extended_length(apdu: &[u8]) -> bool {
     apdu.get(4) == Some(&0x00)
+}
+
+/// The command-name string that precedes a PIV APDU in a `--debug` /
+/// activity-log trace. Resolves `apdu[1]` via [`piv::Instruction`], names the
+/// data object GET DATA / PUT DATA is aimed at, sharpens two more cases the INS
+/// byte alone leaves ambiguous, and falls back to the raw INS for an
+/// instruction this crate never builds.
+fn describe_apdu(apdu: &[u8]) -> String {
+    let Some(&ins) = apdu.get(1) else {
+        return "(malformed APDU)".to_string();
+    };
+    match piv::Instruction::from_code(ins) {
+        // GET DATA / PUT DATA both open their body with a `5C <len> <tag>`
+        // object selector — name what's being read/written, or show the raw
+        // tag when it's one we don't have a name for. (A chained PUT DATA's
+        // continuation chunks carry no selector and stay bare.)
+        Some(verb @ (piv::Instruction::GetData | piv::Instruction::PutData)) => {
+            let verb = verb.name();
+            match object_selector_tag(apdu) {
+                Some(tag) => {
+                    let hex = crate::hex_dump(tag);
+                    match piv::data_object_name(tag) {
+                        // Raw tag first, then its name — the tag is always shown
+                        // so an unfamiliar reader can cross-check the spec.
+                        Some(name) => format!("{verb} ({hex} \u{2192} {name})"),
+                        None => format!("{verb} ({hex})"),
+                    }
+                }
+                None => verb.to_string(),
+            }
+        }
+        // 0xF6 is MOVE KEY, or DELETE KEY when P1 is the 0xFF sentinel
+        // (`piv::delete_key` builds `00 F6 FF <slot>`).
+        Some(piv::Instruction::MoveKey) if apdu.get(2) == Some(&0xFF) => {
+            "DELETE KEY (yubico extension)".to_string()
+        }
+        // A bodyless VERIFY (`00 20 00 80`, no Lc) queries the PIN retry
+        // counter rather than presenting a PIN.
+        Some(piv::Instruction::Verify) if apdu.len() <= 4 => {
+            "VERIFY (retry-counter query)".to_string()
+        }
+        Some(known) => known.name().to_string(),
+        None => format!("INS {ins:#04X}"),
+    }
+}
+
+/// The data field of an APDU, handling both the short (`Lc` in one byte) and
+/// extended (`00 Lc_hi Lc_lo`) length encodings. Any trailing `Le` is ignored.
+fn command_data(apdu: &[u8]) -> Option<&[u8]> {
+    match apdu.get(4..)? {
+        [] => None,
+        // Extended length: 0x00 marker, then a two-byte Lc, then the body.
+        [0x00, hi, lo, rest @ ..] if !rest.is_empty() => {
+            rest.get(..(usize::from(*hi) << 8 | usize::from(*lo)))
+        }
+        // Short form: one Lc byte, then the body (possibly with a trailing Le).
+        [lc, rest @ ..] => rest.get(..usize::from(*lc)).or(Some(rest)),
+    }
+}
+
+/// The `5C <len> <tag>` object selector at the head of a GET DATA / PUT DATA
+/// body, if present.
+fn object_selector_tag(apdu: &[u8]) -> Option<&[u8]> {
+    match command_data(apdu)? {
+        [0x5C, len, rest @ ..] => rest.get(..usize::from(*len)),
+        _ => None,
+    }
 }
 
 /// `KEYROOST_PIV_FORCE_CHAINING` forces the command-chaining path (so the
@@ -1455,6 +1528,51 @@ fn block_crypt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_apdu_names_the_command() {
+        assert_eq!(describe_apdu(&piv::select_full()), "SELECT");
+        assert_eq!(
+            describe_apdu(&piv::get_version()),
+            "GET VERSION (yubico extension)"
+        );
+        // GET DATA / PUT DATA name the object in their 5C selector; an
+        // unknown tag falls back to raw hex; both length encodings parse.
+        assert_eq!(
+            describe_apdu(&piv::get_data(&Slot::Authentication.cert_object_tag())),
+            "GET DATA (5F C1 05 \u{2192} X.509 Certificate for PIV Authentication)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::get_data(&[0x5F, 0xC1, 0x99])),
+            "GET DATA (5F C1 99)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::put_data(&Slot::Signature.cert_object_tag(), &[0x53, 0x00])),
+            "PUT DATA (5F C1 0A \u{2192} X.509 Certificate for Digital Signature)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::put_data_chained(&[0x5F, 0xC1, 0x0C], &[0x01], 254)[0]),
+            "PUT DATA (5F C1 0C \u{2192} Key History Object)"
+        );
+        // 0xF6 with the P1 == 0xFF sentinel is DELETE, not MOVE.
+        assert_eq!(
+            describe_apdu(&piv::delete_key(Slot::Signature)),
+            "DELETE KEY (yubico extension)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::move_key(Slot::Retired(1), Slot::Authentication)),
+            "MOVE KEY (yubico extension)"
+        );
+        // Bodyless VERIFY is a retry-counter query.
+        assert_eq!(
+            describe_apdu(&piv::verify_pin_status()),
+            "VERIFY (retry-counter query)"
+        );
+        assert!(describe_apdu(&piv::verify_pin(b"12345678").unwrap()).starts_with("VERIFY"));
+        // Unknown / malformed fall back rather than panic.
+        assert_eq!(describe_apdu(&[0x00, 0x99, 0x00, 0x00]), "INS 0x99");
+        assert_eq!(describe_apdu(&[]), "(malformed APDU)");
+    }
 
     #[test]
     fn move_key_firmware_gate() {

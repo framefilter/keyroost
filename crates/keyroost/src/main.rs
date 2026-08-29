@@ -2642,6 +2642,27 @@ impl App {
     }
 
     fn log_kind(&mut self, severity: Severity, kind: LogKind, text: impl Into<String>) {
+        // The activity log is device-centric: nearly every entry reports
+        // something read from or done to the token currently in focus — a
+        // status sweep, a write, an auth attempt. Prefix that token's display
+        // name so the log stays legible when a session touches several keys.
+        // Fleet-level lines (device-scan counts, "selection moved on" reset
+        // notices) go through `log_global`, which skips the prefix.
+        let text = match self.selected_device() {
+            Some(d) => format!("{}: {}", d.title(), text.into()),
+            None => text.into(),
+        };
+        self.push_log(severity, kind, text);
+    }
+
+    /// Log without the selected-token prefix `log_kind` adds — for entries that
+    /// are about the device *fleet* or about a key that is no longer the
+    /// selection (so its name would be the wrong one to show).
+    fn log_global(&mut self, severity: Severity, kind: LogKind, text: impl Into<String>) {
+        self.push_log(severity, kind, text.into());
+    }
+
+    fn push_log(&mut self, severity: Severity, kind: LogKind, text: String) {
         // The trace captured for whichever job's apply closure is running
         // right now (see `Worker::spawn`), if any — attached to the first log
         // line that closure produces, then consumed so a later, unrelated log
@@ -2650,7 +2671,7 @@ impl App {
         self.log.push(LogLine {
             severity,
             kind,
-            text: text.into(),
+            text,
             trace,
         });
         // Keep the log bounded; oldest entries are least interesting.
@@ -5049,8 +5070,9 @@ impl App {
             } else {
                 String::new()
             };
-            app.log(
+            app.log_global(
                 Severity::Warn,
+                LogKind::User,
                 format!(
                     "a factory reset finished after the selection moved on \u{2014} wiped: \
                      {wiped_txt}; not wiped: {failed_txt}.{fido_txt} Re-select that key to see \
@@ -5438,8 +5460,9 @@ impl App {
             completion_still_valid(arm.for_device.as_ref(), self.selected_device.as_ref())
         }) {
             if self.reset_arm.take().is_some() {
-                self.log(
+                self.log_global(
                     Severity::Warn,
+                    LogKind::User,
                     "the armed reset was cancelled \u{2014} the key it was armed for is no longer \
                      the one selected. Re-open \u{201C}Reset key\u{201D} on the key you want to \
                      wipe.",
@@ -6187,8 +6210,9 @@ impl App {
                     // staggered burst that follows any of them (`pending_scans`)
                     // makes "which scan did the user actually ask for" moot in
                     // practice, so all of them log at the same, muted weight.
-                    app.log_bg(
+                    app.log_global(
                         Severity::Info,
+                        LogKind::Background,
                         format!(
                             "device scan: {} device{} found",
                             devices.len(),
@@ -6201,7 +6225,11 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    app.log_bg(Severity::Warn, format!("device scan failed: {e}"));
+                    app.log_global(
+                        Severity::Warn,
+                        LogKind::Background,
+                        format!("device scan failed: {e}"),
+                    );
                     App::apply_device_scan_failure(app, e);
                 }
             })
@@ -6321,8 +6349,9 @@ impl App {
         // key — and the outcome would land in whatever report is on screen.
         // An armed ceremony must not outlive the selection it was armed for.
         if self.reset_arm.take().is_some() {
-            self.log(
+            self.log_global(
                 Severity::Warn,
+                LogKind::User,
                 "the armed reset was cancelled \u{2014} selecting another key ends the ceremony. \
                  Re-open \u{201C}Reset key\u{201D} on the key you want to wipe.",
             );
@@ -7409,11 +7438,18 @@ impl App {
                 return; // keep the field open so the user can correct it
             }
         }
-        let vendor = self
-            .devices
-            .iter()
-            .find(|d| d.serial == target.serial)
-            .map(|d| d.vendor.to_ascii_lowercase());
+        let live = self.devices.iter().find(|d| d.serial == target.serial);
+        let vendor = live.map(|d| d.vendor.to_ascii_lowercase());
+        // A key without an explicit friendly name still shows one — its model
+        // (see `DeviceView::title`). Resolving both sides of the change to a
+        // concrete display name means one message covers rename, first naming
+        // and clearing alike, with no special cases.
+        let implicit = live
+            .map(|d| d.model.clone())
+            .unwrap_or_else(|| "this key".to_string());
+        let old_display = target.name_at_open.clone().unwrap_or_else(|| implicit.clone());
+        let cleared = name.is_empty();
+        let new_display = if cleared { implicit } else { name.clone() };
         let mut keyring = keyroost_keyring::Keyring::load_default().unwrap_or_default();
         // Drop the target's prior name — by the name pinned at open, then by
         // serial as a belt-and-braces (covers a name changed under us). This
@@ -7440,7 +7476,18 @@ impl App {
             }
         }
         match keyring.save_default() {
-            Ok(_) => self.log(Severity::Ok, "name saved"),
+            // Name the before and after explicitly rather than leaning on the
+            // usual selected-token prefix: the device list still holds the old
+            // name here (the refresh below is what picks up the change), so the
+            // auto-prefix would show the pre-rename name.
+            Ok(_) => self.log_global(
+                Severity::Ok,
+                LogKind::User,
+                format!(
+                    "{new_display}: name {}, was {old_display}",
+                    if cleared { "cleared" } else { "saved" }
+                ),
+            ),
             Err(e) => self.log(Severity::Err, format!("save names: {e}")),
         }
         self.close_rename();

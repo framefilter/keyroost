@@ -123,6 +123,59 @@ impl Instruction {
     pub const fn code(self) -> u8 {
         self as u8
     }
+
+    /// Recognise a raw INS byte. `None` for any instruction this crate does not
+    /// build. Note `0xF6` (MOVE KEY) doubles as DELETE KEY via a `P1 == 0xFF`
+    /// sentinel — the byte alone can't tell them apart; see the `--debug` trace
+    /// labelling in `keyroost-transport` for that distinction.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0xA4 => Self::Select,
+            0x20 => Self::Verify,
+            0xCB => Self::GetData,
+            0xC0 => Self::GetResponse,
+            0x87 => Self::GeneralAuthenticate,
+            0x47 => Self::GenerateKeyPair,
+            0xDB => Self::PutData,
+            0x24 => Self::ChangeReference,
+            0x2C => Self::ResetRetryCounter,
+            0xFD => Self::GetVersion,
+            0xF8 => Self::GetSerial,
+            0xF7 => Self::GetMetadata,
+            0xF6 => Self::MoveKey,
+            0xFF => Self::SetManagementKey,
+            0xFA => Self::SetPinRetries,
+            0xFB => Self::Reset,
+            0xF9 => Self::Attest,
+            _ => return None,
+        })
+    }
+
+    /// Human-readable command name, for the `--debug` / activity-log APDU trace.
+    /// Yubico's proprietary instructions are marked as such.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Select => "SELECT",
+            Self::Verify => "VERIFY",
+            Self::GetData => "GET DATA",
+            Self::GetResponse => "GET RESPONSE",
+            Self::GeneralAuthenticate => "GENERAL AUTHENTICATE",
+            Self::GenerateKeyPair => "GENERATE ASYMMETRIC KEY PAIR",
+            Self::PutData => "PUT DATA",
+            Self::ChangeReference => "CHANGE REFERENCE DATA",
+            Self::ResetRetryCounter => "RESET RETRY COUNTER",
+            Self::GetVersion => "GET VERSION (yubico extension)",
+            Self::GetSerial => "GET SERIAL (yubico extension)",
+            Self::GetMetadata => "GET METADATA (yubico extension)",
+            Self::MoveKey => "MOVE KEY (yubico extension)",
+            Self::SetManagementKey => "SET MANAGEMENT KEY (yubico extension)",
+            Self::SetPinRetries => "SET PIN RETRIES (yubico extension)",
+            Self::Reset => "RESET (yubico extension)",
+            Self::Attest => "ATTEST (yubico extension)",
+        }
+    }
 }
 
 const INS_SELECT_P1_BY_AID: u8 = 0x04;
@@ -570,6 +623,49 @@ pub fn get_data(tag: &[u8]) -> Vec<u8> {
     );
     apdu.push(0x00); // case-4 Le
     apdu
+}
+
+/// Human-readable name for a PIV data-object tag — the BER tag a GET DATA / PUT
+/// DATA command carries in its `5C` field. Covers the SP 800-73-4 Part 1
+/// objects and the Yubico extension objects that PivApplet / OpenFIPS201 also
+/// follow; `None` for a tag with no assigned name, which the caller renders as
+/// raw hex. Diagnostic only (activity-log / `--debug` trace labelling).
+#[must_use]
+pub fn data_object_name(tag: &[u8]) -> Option<String> {
+    // Numbered ranges first: retired key-management certs 1..20 sit at
+    // `5F C1 0D..=5F C1 20` (Slot::Retired(n) -> 5F C1 0C+n), and Yubico's
+    // MSROOTS 1..5 at `5F FF 11..=5F FF 15`.
+    if let [0x5F, 0xC1, n @ 0x0D..=0x20] = tag {
+        return Some(format!(
+            "Retired X.509 Certificate for Key Management {}",
+            n - 0x0C
+        ));
+    }
+    if let [0x5F, 0xFF, n @ 0x11..=0x15] = tag {
+        return Some(format!("Yubico MSROOTS {}", n - 0x10));
+    }
+    let name = match tag {
+        [0x7E] => "Discovery Object",
+        [0x5F, 0xC1, 0x01] => "X.509 Certificate for Card Authentication",
+        [0x5F, 0xC1, 0x02] => "Card Holder Unique Identifier",
+        [0x5F, 0xC1, 0x03] => "Cardholder Fingerprints",
+        [0x5F, 0xC1, 0x05] => "X.509 Certificate for PIV Authentication",
+        [0x5F, 0xC1, 0x06] => "Security Object",
+        [0x5F, 0xC1, 0x07] => "Card Capability Container",
+        [0x5F, 0xC1, 0x08] => "Cardholder Facial Image",
+        [0x5F, 0xC1, 0x09] => "Printed Information",
+        [0x5F, 0xC1, 0x0A] => "X.509 Certificate for Digital Signature",
+        [0x5F, 0xC1, 0x0B] => "X.509 Certificate for Key Management",
+        [0x5F, 0xC1, 0x0C] => "Key History Object",
+        [0x5F, 0xC1, 0x21] => "Cardholder Iris Images",
+        [0x5F, 0xC1, 0x22] => "Biometric Information Templates Group Template",
+        [0x5F, 0xC1, 0x23] => "Secure Messaging Certificate Signer",
+        [0x5F, 0xC1, 0x24] => "Pairing Code Reference Data Container",
+        [0x5F, 0xFF, 0x01] => "Yubico PIV Attestation Certificate",
+        [0x5F, 0xFF, 0x10] => "Yubico MSCMAP",
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 /// VERIFY the application PIN. The PIN is padded to 8 bytes with `0xFF` per
@@ -1453,6 +1549,66 @@ mod tests {
             select(),
             vec![0x00, 0xA4, 0x04, 0x00, 0x05, 0xA0, 0x00, 0x00, 0x03, 0x08, 0x00]
         );
+    }
+
+    #[test]
+    fn instruction_code_round_trips_to_a_name() {
+        // Every instruction this crate builds decodes from its own byte and
+        // carries a non-empty human name; Yubico extensions say so.
+        for ins in [
+            Instruction::Select,
+            Instruction::Verify,
+            Instruction::GetData,
+            Instruction::GetResponse,
+            Instruction::GeneralAuthenticate,
+            Instruction::GenerateKeyPair,
+            Instruction::PutData,
+            Instruction::ChangeReference,
+            Instruction::ResetRetryCounter,
+            Instruction::GetVersion,
+            Instruction::GetSerial,
+            Instruction::GetMetadata,
+            Instruction::MoveKey,
+            Instruction::SetManagementKey,
+            Instruction::SetPinRetries,
+            Instruction::Reset,
+            Instruction::Attest,
+        ] {
+            assert_eq!(Instruction::from_code(ins.code()), Some(ins));
+            assert!(!ins.name().is_empty());
+        }
+        assert_eq!(Instruction::GetVersion.name(), "GET VERSION (yubico extension)");
+        assert_eq!(Instruction::Select.name(), "SELECT");
+        assert_eq!(Instruction::from_code(0x00), None);
+    }
+
+    #[test]
+    fn data_object_names() {
+        assert_eq!(
+            data_object_name(&[0x5F, 0xC1, 0x05]).as_deref(),
+            Some("X.509 Certificate for PIV Authentication")
+        );
+        assert_eq!(data_object_name(&[0x7E]).as_deref(), Some("Discovery Object"));
+        // Numbered ranges: 5F C1 0D..20 -> Retired 1..20; 5F FF 11..15 -> MSROOTS 1..5.
+        assert_eq!(
+            data_object_name(&Slot::Retired(1).cert_object_tag()).as_deref(),
+            Some("Retired X.509 Certificate for Key Management 1")
+        );
+        assert_eq!(
+            data_object_name(&Slot::Retired(20).cert_object_tag()).as_deref(),
+            Some("Retired X.509 Certificate for Key Management 20")
+        );
+        assert_eq!(
+            data_object_name(&[0x5F, 0xFF, 0x13]).as_deref(),
+            Some("Yubico MSROOTS 3")
+        );
+        assert_eq!(
+            data_object_name(&[0x5F, 0xFF, 0x01]).as_deref(),
+            Some("Yubico PIV Attestation Certificate")
+        );
+        // Unassigned tags have no name.
+        assert_eq!(data_object_name(&[0x5F, 0xC1, 0x99]), None);
+        assert_eq!(data_object_name(&[]), None);
     }
 
     #[test]

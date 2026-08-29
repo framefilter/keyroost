@@ -241,6 +241,7 @@ impl OathSession {
             label: "oath",
             more_data_sw: oath::SW_MORE_DATA,
             get_response: oath::send_remaining,
+            describe: None,
         };
         crate::transmit_applet(
             &self.card,

@@ -1240,6 +1240,39 @@ pub(crate) fn sw_tries_remaining(sw: u16) -> Option<u8> {
     ((sw & 0xFFF0) == 0x63C0).then_some((sw & 0x000F) as u8)
 }
 
+/// A short plain-language reading of an ISO 7816-4 status word, for the trace's
+/// `< … << SW = …` annotation line (emitted only for applets that opt into
+/// command labelling via [`AppletIo::describe`]). Covers the status words the
+/// PIV applets actually return; anything else is reported as non-standard
+/// rather than guessed at.
+pub(crate) fn iso_sw_summary(sw1: u8, sw2: u8) -> &'static str {
+    match (sw1, sw2) {
+        (0x90, 0x00) => "success",
+        (0x61, _) => "success — more response bytes pending, GET RESPONSE needed",
+        (0x63, 0x00) => "verification failed",
+        (0x63, n) if n & 0xF0 == 0xC0 => {
+            "verification failed — retries remaining in SW2 low nibble"
+        }
+        (0x69, 0x82) => "security status not satisfied — authenticate first",
+        (0x69, 0x83) => "authentication method blocked",
+        (0x69, 0x85) => "conditions of use not satisfied",
+        (0x69, 0x86) => "command not allowed",
+        (0x6A, 0x80) => "incorrect parameters in the command data field",
+        (0x6A, 0x81) => "function not supported",
+        (0x6A, 0x82) => "file or application not found",
+        (0x6A, 0x84) => "not enough memory",
+        (0x6A, 0x86) => "incorrect P1/P2",
+        (0x6A, 0x88) => "referenced data not found",
+        (0x67, 0x00) => "wrong length",
+        (0x6C, _) => "wrong Le — reissue with the length in SW2",
+        (0x6D, 0x00) => "instruction not supported or invalid",
+        (0x6E, 0x00) => "class not supported",
+        (0x68, 0x82) => "secure messaging not supported",
+        (0x6F, 0x00) => "no precise diagnosis",
+        _ => "non-standard status word",
+    }
+}
+
 /// Decode the remaining-attempts counter from SW2 of a Molto2 `63xx`
 /// auth-failure.
 ///
@@ -1268,11 +1301,18 @@ pub(crate) fn dump_resp(resp: &[u8], sensitive: bool) -> String {
 }
 
 /// Static per-applet plumbing for [`transmit_applet`]: the trace label, the
-/// SW1 byte that signals more data pending, and the continuation-APDU builder.
+/// SW1 byte that signals more data pending, the continuation-APDU builder, and
+/// an optional command-namer.
 pub(crate) struct AppletIo {
     pub label: &'static str,
     pub more_data_sw: u8,
     pub get_response: fn() -> Vec<u8>,
+    /// When set, each transmitted APDU (the caller's command *and* every GET
+    /// RESPONSE / Le-corrected reissue) gets two extra trace lines: a `>` line
+    /// naming the command via this function, and a `<` line reading its status
+    /// word ([`iso_sw_summary`]). `None` leaves the applet's trace as bare
+    /// `>`/`<` hex.
+    pub describe: Option<fn(&[u8]) -> String>,
 }
 
 /// What [`transmit_applet`] should do after one exchange, given the status word.
@@ -1384,6 +1424,9 @@ pub(crate) fn transmit_applet(
     let mut to_send = zeroize::Zeroizing::new(apdu.to_vec());
     let mut chunks = 0usize;
     loop {
+        if let Some(describe) = io.describe {
+            trace::line(debug, || format!("> {:>14} >> {}", io.label, describe(&to_send)));
+        }
         trace::line(debug, || {
             format!(
                 "> {:>14} >> {}",
@@ -1404,6 +1447,16 @@ pub(crate) fn transmit_applet(
             });
         }
         let (data, sw) = resp.split_at(resp.len() - 2);
+        if io.describe.is_some() {
+            let (sw1, sw2) = (sw[0], sw[1]);
+            trace::line(debug, || {
+                format!(
+                    "< {:>14} << SW = {sw1:02X} {sw2:02X} ({})",
+                    io.label,
+                    iso_sw_summary(sw1, sw2)
+                )
+            });
+        }
         chunks += 1;
         if chunks > MAX_RESPONSE_CHUNKS {
             return Err(TransportError::MalformedResponse(
@@ -1450,6 +1503,17 @@ mod redaction_tests {
         assert_eq!(classify_sw(0x90, 0x61, 0x00), SwAction::Done); // 9000 OK
         assert_eq!(classify_sw(0x6A, 0x61, 0x82), SwAction::Done); // 6A82 not found
         assert_eq!(classify_sw(0x69, 0x61, 0x83), SwAction::Done); // 6983 blocked
+    }
+
+    #[test]
+    fn iso_sw_summary_reads_common_status_words() {
+        assert_eq!(iso_sw_summary(0x90, 0x00), "success");
+        assert_eq!(iso_sw_summary(0x6A, 0x82), "file or application not found");
+        assert_eq!(iso_sw_summary(0x69, 0x82), "security status not satisfied — authenticate first");
+        assert!(iso_sw_summary(0x61, 0x11).starts_with("success"));
+        assert!(iso_sw_summary(0x63, 0xC3).starts_with("verification failed"));
+        assert!(iso_sw_summary(0x6C, 0x20).starts_with("wrong Le"));
+        assert_eq!(iso_sw_summary(0x12, 0x34), "non-standard status word");
     }
 
     /// A `6Cxx` on the case-2 GET DATA APDU that OpenPGP `status()` sends
