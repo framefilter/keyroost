@@ -2010,6 +2010,11 @@ struct App {
     colorblind: bool,
     /// Whether the activity-log drawer is open.
     log_open: bool,
+    /// Whether the activity log is popped out into its own OS window (viewport)
+    /// instead of the docked bottom drawer. Set by the header's detach icon,
+    /// cleared by "Reattach"; the window's own close button clears this *and*
+    /// `log_open` (collapsing the log). Only meaningful while `log_open` is true.
+    log_detached: bool,
     /// Open help topic id, or `None` when the popover is closed.
     help_open: Option<&'static str>,
     /// Anchor point (the clicked "?" button's left-bottom) for the popover.
@@ -8163,6 +8168,57 @@ fn paint_x_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     );
 }
 
+/// The window body shared by the detach / reattach pair: a square shifted to the
+/// bottom-left with its top-right corner left open for the arrow. Drawn
+/// identically by both so the glyphs read as one control in two states. Of the
+/// 8pt top and right edges only 3pt is drawn — a deep `5.0` corner cut — so the
+/// frame stays well clear of the arrow that crosses that corner.
+fn paint_window_body(painter: &egui::Painter, center: egui::Pos2, s: egui::Stroke) {
+    let b = egui::Rect::from_min_size(center + egui::vec2(-6.0, -2.0), egui::vec2(8.0, 8.0));
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(b.right() - 5.0, b.top()),
+            b.left_top(),
+            b.left_bottom(),
+            b.right_bottom(),
+            egui::pos2(b.right(), b.top() + 5.0),
+        ],
+        s,
+    ));
+}
+
+/// A window frame with an arrow leaving its top-right corner — "pop this pane
+/// out into its own window". Mirrors the external-link affordance the top bar's
+/// "Learn \u{2197}" uses.
+fn paint_detach_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.3, color);
+    let painter = ui.painter();
+    paint_window_body(painter, center, s);
+    // Diagonal arrow crossing that corner, pointing out to the top-right.
+    let tip = center + egui::vec2(6.0, -6.0);
+    painter.line_segment([center + egui::vec2(-1.0, 1.0), tip], s);
+    painter.add(egui::Shape::line(
+        vec![tip + egui::vec2(-4.5, 0.0), tip, tip + egui::vec2(0.0, 4.5)],
+        s,
+    ));
+}
+
+/// The mirror of [`paint_detach_icon`]: same window frame, but the arrow flies
+/// *in* through the open corner — "dock this back into the main window". Its tip
+/// rests at the glyph centre, inside the body, pointing down-left; the head
+/// keeps the same clearance from the frame that the detach arrow does.
+fn paint_reattach_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    let s = egui::Stroke::new(1.3, color);
+    let painter = ui.painter();
+    paint_window_body(painter, center, s);
+    let tip = center;
+    painter.line_segment([center + egui::vec2(6.0, -6.0), tip], s);
+    painter.add(egui::Shape::line(
+        vec![tip + egui::vec2(4.5, 0.0), tip, tip + egui::vec2(0.0, -4.5)],
+        s,
+    ));
+}
+
 /// Paint one selectable device row. The whole row is a single painter-drawn
 /// click target (no nested widgets), so clicking anywhere in it selects the
 /// device — fixing the "only the gaps are clickable" inconsistency.
@@ -8459,10 +8515,17 @@ impl eframe::App for App {
 
         self.top_bar(root_ui, &p);
         self.device_sidebar(root_ui, &p);
-        if self.log_open {
+        if self.log_open && !self.log_detached {
             self.activity_log(root_ui, &p);
         }
         self.central(root_ui, &p);
+
+        // Popped-out activity log: its own OS window, rendered every frame while
+        // detached. "Reattach" docks it back into the bottom drawer; the
+        // window's close button collapses the log entirely.
+        if self.log_open && self.log_detached {
+            self.activity_log_window(ctx, &p);
+        }
 
         // Modal dialogs (reused from the per-applet logic) + Molto2 import dialogs.
         self.render_reset_dialog(ctx);
@@ -8634,6 +8697,12 @@ impl App {
                             .clicked()
                         {
                             self.log_open = !self.log_open;
+                            // Closing from here always resets to the docked
+                            // drawer, so reopening never springs a stale
+                            // popped-out window back to life.
+                            if !self.log_open {
+                                self.log_detached = false;
+                            }
                         }
                         ui.add_space(10.0);
                         ui.hyperlink_to(
@@ -8999,104 +9068,171 @@ impl App {
             .size_range(96.0..=560.0)
             .frame(panel_frame(p.bar, 16.0, 10.0))
             .show(root_ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("ACTIVITY LOG")
-                            .font(theme::f_bold(11.0))
-                            .color(p.txt3),
-                    );
+                self.activity_log_body(ui, p, false);
+            });
+    }
+
+    /// Popped-out activity log: the same body rendered in its own OS window.
+    /// Shown every frame while `log_detached`. Closing the window collapses the
+    /// log entirely (same end state as the docked "Collapse" button); the
+    /// header's "Reattach" button docks it back into the drawer instead.
+    fn activity_log_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        let mut close_requested = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("activity-log"),
+            egui::ViewportBuilder::default()
+                .with_title("keyroost \u{2014} Activity log")
+                .with_inner_size([620.0, 340.0])
+                .with_min_inner_size([340.0, 140.0]),
+            |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(panel_frame(p.bar, 16.0, 10.0))
+                    .show(ctx, |ui| {
+                        self.activity_log_body(ui, p, true);
+                    });
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
+                }
+            },
+        );
+        if close_requested {
+            // The window's close button collapses the log outright, rather
+            // than dropping it back into the docked drawer.
+            self.log_open = false;
+            self.log_detached = false;
+        }
+    }
+
+    /// The activity log's contents — header row plus the scrolling entry list —
+    /// shared by the docked drawer and the popped-out window. `detached` picks
+    /// the outer-right window control: the detach icon (plus "Collapse") when
+    /// docked, its mirror image — the reattach icon — when popped out.
+    fn activity_log_body(&mut self, ui: &mut egui::Ui, p: &Palette, detached: bool) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("ACTIVITY LOG")
+                    .font(theme::f_bold(11.0))
+                    .color(p.txt3),
+            );
+            ui.add_space(6.0);
+            theme::pill(ui, "live", p.ok, p.ok_soft());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Window control at the outer right in both states: an icon-only
+                // affordance (detach glyph / its mirror) rather than a verb in
+                // the row of text actions. The hit box is a full button-height
+                // 32px tall so `Align::Center` lines the 18px glyph up with the
+                // adjacent buttons and the "APDU trace" checkbox — a bare 18px
+                // rect, allocated first in this row, centres against the row
+                // before the buttons have grown it and ends up sitting high.
+                let (wrect, wresp) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 32.0), egui::Sense::click());
+                if detached {
+                    paint_reattach_icon(ui, wrect.center(), p.txt2);
+                    if wresp
+                        .on_hover_text("Dock back into the main window")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.log_detached = false;
+                    }
+                } else {
+                    paint_detach_icon(ui, wrect.center(), p.txt2);
+                    if wresp
+                        .on_hover_text("Open in a separate window")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.log_detached = true;
+                    }
                     ui.add_space(6.0);
-                    theme::pill(ui, "live", p.ok, p.ok_soft());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Ghost, "Collapse").clicked() {
-                            self.log_open = false;
-                        }
-                        ui.add_space(4.0);
-                        if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
-                            // Traces ride along, indented under the entry they
-                            // belong to — the point of the APDU trace is
-                            // having the exact wire exchange to paste, not
-                            // just the summary.
-                            let all = self
-                                .log
-                                .iter()
-                                .map(|l| match &l.trace {
-                                    Some(t) if !t.is_empty() => format!(
-                                        "{}\n{}",
-                                        l.text,
-                                        t.iter()
-                                            .map(|apdu| format!("    {apdu}"))
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    ),
-                                    _ => l.text.clone(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            ui.ctx().copy_text(all);
-                            // The user copied non-secret log text over the
-                            // code; a pending auto-clear would clobber it.
-                            self.clipboard_clear_at = None;
-                        }
-                        ui.add_space(10.0);
-                        // Runtime toggle for the worker thread's APDU capture
-                        // (see `Worker::spawn`) — no CLI flag, no restart:
-                        // flip it, and the very next device operation's trace
-                        // shows up under its log entry.
-                        let mut trace_on =
-                            self.apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
-                        if ui.checkbox(&mut trace_on, "APDU trace").changed() {
-                            self.apdu_trace
-                                .store(trace_on, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for line in self.log.iter_mut() {
-                            let base = match line.severity {
-                                Severity::Ok => p.ok,
-                                Severity::Warn => p.warn,
-                                Severity::Err => p.err,
-                                Severity::Info => p.txt2,
-                            };
-                            // User actions render exactly as every explicit
-                            // Molto2 action always has: full-strength severity
-                            // color, no prefix. Background entries — a device
-                            // scan, a tab's initial status sweep, a re-read
-                            // that follows a write — are alpha-muted toward
-                            // the panel and get a leading "·", so the
-                            // distinction survives colorblind palettes too and
-                            // never reads as though the user just did
-                            // something.
-                            let (color, prefix, size) = match line.kind {
-                                LogKind::User => (base, "", 12.0),
-                                LogKind::Background => (theme::tint(base, 130), "\u{b7} ", 11.5),
-                            };
+                    if theme::button(ui, p, BtnKind::Ghost, "Collapse").clicked() {
+                        self.log_open = false;
+                    }
+                }
+                ui.add_space(4.0);
+                if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
+                    // Traces ride along, indented under the entry they
+                    // belong to — the point of the APDU trace is
+                    // having the exact wire exchange to paste, not
+                    // just the summary.
+                    let all = self
+                        .log
+                        .iter()
+                        .map(|l| match &l.trace {
+                            Some(t) if !t.is_empty() => format!(
+                                "{}\n{}",
+                                l.text,
+                                t.iter()
+                                    .map(|apdu| format!("    {apdu}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
+                            _ => l.text.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.ctx().copy_text(all);
+                    // The user copied non-secret log text over the
+                    // code; a pending auto-clear would clobber it.
+                    self.clipboard_clear_at = None;
+                }
+                ui.add_space(10.0);
+                // Runtime toggle for the worker thread's APDU capture
+                // (see `Worker::spawn`) — no CLI flag, no restart:
+                // flip it, and the very next device operation's trace
+                // shows up under its log entry.
+                let mut trace_on = self.apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
+                if ui.checkbox(&mut trace_on, "APDU trace").changed() {
+                    self.apdu_trace
+                        .store(trace_on, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        });
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for line in self.log.iter_mut() {
+                    let base = match line.severity {
+                        Severity::Ok => p.ok,
+                        Severity::Warn => p.warn,
+                        Severity::Err => p.err,
+                        Severity::Info => p.txt2,
+                    };
+                    // User actions render exactly as every explicit
+                    // Molto2 action always has: full-strength severity
+                    // color, no prefix. Background entries — a device
+                    // scan, a tab's initial status sweep, a re-read
+                    // that follows a write — are alpha-muted toward
+                    // the panel and get a leading "·", so the
+                    // distinction survives colorblind palettes too and
+                    // never reads as though the user just did
+                    // something.
+                    let (color, prefix, size) = match line.kind {
+                        LogKind::User => (base, "", 12.0),
+                        LogKind::Background => (theme::tint(base, 130), "\u{b7} ", 11.5),
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{prefix}{}", line.text))
+                            .font(theme::f_mono(size))
+                            .color(color),
+                    );
+                    // APDU trace ("APDU trace" checkbox above):
+                    // printed exactly like the CLI's own `--debug`
+                    // output — the same formatted lines, captured
+                    // verbatim (see `keyroost_transport::trace`) —
+                    // indented under the entry they belong to.
+                    if let Some(trace) = line.trace.as_ref() {
+                        for apdu in trace {
                             ui.label(
-                                egui::RichText::new(format!("{prefix}{}", line.text))
-                                    .font(theme::f_mono(size))
-                                    .color(color),
+                                egui::RichText::new(format!("    {apdu}"))
+                                    .font(theme::f_mono(10.5))
+                                    .color(p.txt3),
                             );
-                            // APDU trace ("APDU trace" checkbox above):
-                            // printed exactly like the CLI's own `--debug`
-                            // output — the same formatted lines, captured
-                            // verbatim (see `keyroost_transport::trace`) —
-                            // indented under the entry they belong to.
-                            if let Some(trace) = line.trace.as_ref() {
-                                for apdu in trace {
-                                    ui.label(
-                                        egui::RichText::new(format!("    {apdu}"))
-                                            .font(theme::f_mono(10.5))
-                                            .color(p.txt3),
-                                    );
-                                }
-                            }
                         }
-                    });
+                    }
+                }
             });
     }
 
