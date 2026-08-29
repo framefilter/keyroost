@@ -9150,6 +9150,12 @@ impl App {
                     }
                 }
                 ui.add_space(4.0);
+                if theme::button(ui, p, BtnKind::Ghost, "Clear").clicked() {
+                    // Drop every entry (and its APDU trace); the next device
+                    // operation starts the log fresh.
+                    self.log.clear();
+                }
+                ui.add_space(4.0);
                 if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
                     // Traces ride along, indented under the entry they
                     // belong to — the point of the APDU trace is
