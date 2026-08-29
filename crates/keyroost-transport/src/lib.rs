@@ -48,6 +48,11 @@ pub use token2otp::{
     Token2OtpSession,
 };
 
+/// Opt-in per-thread APDU trace capture, for front ends that want the wire
+/// exchange behind one operation rather than only a stderr stream. See the
+/// module doc for why this is thread-local instead of a passed-in sink.
+pub mod trace;
+
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{
@@ -426,18 +431,18 @@ impl Session {
     /// Send a pre-built Command and return the response payload (without the SW1/SW2 trailer).
     /// Returns an error if the device responds with anything other than `9000`.
     fn transmit(&mut self, cmd: &Command) -> Result<Vec<u8>, TransportError> {
-        if self.debug {
-            eprintln!(
+        trace::line(self.debug, || {
+            format!(
                 "> {:>20} >> {}",
                 cmd.label,
                 dump_cmd(&cmd.apdu, molto2_cmd_sensitive(&cmd.apdu))
-            );
-        }
+            )
+        });
         let mut buf = [0u8; 2048];
         let response = self.card.transmit(&cmd.apdu, &mut buf)?;
-        if self.debug {
-            eprintln!("< {:>20} << {}", cmd.label, hex_dump(response));
-        }
+        trace::line(self.debug, || {
+            format!("< {:>20} << {}", cmd.label, hex_dump(response))
+        });
         if response.len() < 2 {
             return Err(TransportError::ShortResponse {
                 label: cmd.label,
@@ -465,18 +470,18 @@ impl Session {
     /// Send a Command but allow non-9000 status words. Returns `(data, sw1, sw2)`.
     /// Used for the probing subcommand.
     pub fn transmit_raw(&mut self, cmd: &Command) -> Result<(Vec<u8>, u8, u8), TransportError> {
-        if self.debug {
-            eprintln!(
+        trace::line(self.debug, || {
+            format!(
                 "> {:>20} >> {}",
                 cmd.label,
                 dump_cmd(&cmd.apdu, molto2_cmd_sensitive(&cmd.apdu))
-            );
-        }
+            )
+        });
         let mut buf = [0u8; 2048];
         let response = self.card.transmit(&cmd.apdu, &mut buf)?;
-        if self.debug {
-            eprintln!("< {:>20} << {}", cmd.label, hex_dump(response));
-        }
+        trace::line(self.debug, || {
+            format!("< {:>20} << {}", cmd.label, hex_dump(response))
+        });
         if response.len() < 2 {
             return Err(TransportError::ShortResponse {
                 label: cmd.label,
@@ -1379,18 +1384,18 @@ pub(crate) fn transmit_applet(
     let mut to_send = zeroize::Zeroizing::new(apdu.to_vec());
     let mut chunks = 0usize;
     loop {
-        if debug {
-            eprintln!(
+        trace::line(debug, || {
+            format!(
                 "> {:>14} >> {}",
                 io.label,
                 dump_cmd(&to_send, cmd_sensitive)
-            );
-        }
+            )
+        });
         let mut buf = [0u8; 4096];
         let resp = card.transmit(&to_send, &mut buf)?;
-        if debug {
-            eprintln!("< {:>14} << {}", io.label, dump_resp(resp, resp_sensitive));
-        }
+        trace::line(debug, || {
+            format!("< {:>14} << {}", io.label, dump_resp(resp, resp_sensitive))
+        });
         if resp.len() < 2 {
             return Err(TransportError::ShortResponse {
                 label: io.label,

@@ -9,7 +9,7 @@
 //! PIN/PUK change and unblock, set-pin-retries, set-management-key, key
 //! generation, certificate import/export, and applet reset.
 
-use crate::TransportError;
+use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
@@ -467,13 +467,12 @@ impl PivSession {
             // Say so in the trace: the assurance on this card is one-sided,
             // and a reviewer (or a user wondering why a swapped card was
             // accepted) should be able to see that the weaker path was taken.
-            if self.debug {
-                eprintln!(
-                    "! piv authenticate: card returned no 0x82 challenge response; \
-                     accepting host-only (client) authentication — this card cannot \
-                     prove it holds the management key"
-                );
-            }
+            trace::line(self.debug, || {
+                "! piv authenticate: card returned no 0x82 challenge response; \
+                 accepting host-only (client) authentication — this card cannot \
+                 prove it holds the management key"
+                    .to_string()
+            });
             return Ok(());
         }
         // Verify the card encrypted our challenge correctly (authenticates the
@@ -620,9 +619,9 @@ impl PivSession {
         let tag = slot.cert_object_tag();
         let apdu = piv::put_data(&tag, &value);
         let sw = if force_chaining() {
-            if self.debug {
-                eprintln!("! piv import certificate: forcing command chaining (env override)");
-            }
+            trace::line(self.debug, || {
+                "! piv import certificate: forcing command chaining (env override)".to_string()
+            });
             self.transmit_chain(
                 "piv import certificate",
                 &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
@@ -633,12 +632,12 @@ impl PivSession {
             if sw == piv::SW_OK || !uses_extended_length(&apdu) {
                 sw
             } else {
-                if self.debug {
-                    eprintln!(
+                trace::line(self.debug, || {
+                    format!(
                         "! piv import certificate: extended length rejected (SW={sw:04X}); \
                          retrying with command chaining"
-                    );
-                }
+                    )
+                });
                 self.transmit_chain(
                     "piv import certificate",
                     &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
@@ -846,9 +845,9 @@ impl PivSession {
         let key_ref = slot.key_ref();
         let apdu = piv::general_auth_sign(alg, key_ref, prepared);
         let (data, sw) = if force_chaining() {
-            if self.debug {
-                eprintln!("! piv sign: forcing command chaining (env override)");
-            }
+            trace::line(self.debug, || {
+                "! piv sign: forcing command chaining (env override)".to_string()
+            });
             self.transmit_chain(
                 "piv sign",
                 &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),
@@ -858,12 +857,12 @@ impl PivSession {
             if sw == piv::SW_OK || !uses_extended_length(&apdu) {
                 (data, sw)
             } else {
-                if self.debug {
-                    eprintln!(
+                trace::line(self.debug, || {
+                    format!(
                         "! piv sign: extended length rejected (SW={sw:04X}); retrying with \
                          command chaining"
-                    );
-                }
+                    )
+                });
                 self.transmit_chain(
                     "piv sign",
                     &piv::general_auth_sign_chained(alg, key_ref, prepared, CHAIN_CHUNK),

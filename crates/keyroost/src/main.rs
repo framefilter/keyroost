@@ -1754,13 +1754,29 @@ struct Worker {
 }
 
 impl Worker {
-    fn spawn(ctx: egui::Context) -> Self {
+    /// `apdu_trace`: shared with the "APDU trace" checkbox in the activity
+    /// log pane (see `App::activity_log`), read fresh at the start of every
+    /// job rather than fixed at spawn time, so toggling it takes effect on
+    /// the very next device operation. When on for a given job, that job's
+    /// APDU trace is captured (see `keyroost_transport::trace`) and handed to
+    /// its apply closure via `App::pending_trace`, for the next `log`/`log_bg`
+    /// call inside it to attach. One capture per job — this thread runs jobs
+    /// one at a time, start to finish, so "everything recorded between begin
+    /// and take" is exactly "everything this job's device I/O did".
+    fn spawn(
+        ctx: egui::Context,
+        apdu_trace: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let (result_tx, result_rx) = std::sync::mpsc::channel::<ApplyFn>();
         std::thread::Builder::new()
             .name("keyroost-worker".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
+                    let debug = apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
+                    if debug {
+                        keyroost_transport::trace::begin();
+                    }
                     // A panicking job must not kill the worker: that would
                     // disconnect the result channel and wedge the busy guard
                     // (spawn_job would reject every future job forever). Catch
@@ -1775,6 +1791,14 @@ impl Worker {
                                  re-plug the key if it stops responding",
                             );
                         }) as ApplyFn,
+                    };
+                    let apply = match debug.then(keyroost_transport::trace::take).flatten() {
+                        Some(trace) if !trace.is_empty() => Box::new(move |app: &mut App| {
+                            app.pending_trace = Some(trace);
+                            apply(app);
+                            app.pending_trace = None; // in case `apply` never logged
+                        }) as ApplyFn,
+                        _ => apply,
                     };
                     if result_tx.send(apply).is_err() {
                         break; // UI gone
@@ -1801,6 +1825,13 @@ fn main() -> eframe::Result<()> {
     if std::env::var_os("KEYROOST_X11").is_some() {
         std::env::remove_var("WAYLAND_DISPLAY");
     }
+
+    // Backs the "APDU trace" checkbox in the activity log pane (see
+    // `App::activity_log`): shared with the worker thread so a toggle takes
+    // effect on the very next device operation, off by default. Not a CLI
+    // flag — this is a runtime setting the user flips from the pane, not
+    // something decided once at launch.
+    let apdu_trace = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1858,11 +1889,12 @@ fn main() -> eframe::Result<()> {
                     accent: accent_idx,
                     colorblind,
                 }),
-                worker: Some(Worker::spawn(cc.egui_ctx.clone())),
+                worker: Some(Worker::spawn(cc.egui_ctx.clone(), apdu_trace.clone())),
                 egui_ctx: Some(cc.egui_ctx.clone()),
                 devices_dirty,
                 reader_watch: Some(reader_watch),
                 mds: ui::mds::MdsDb::load_bundled(),
+                apdu_trace,
                 ..Default::default()
             };
             Ok(Box::new(app))
@@ -1918,6 +1950,17 @@ struct App {
     draft: Draft,
     /// Rolling log of operations (newest last).
     log: Vec<LogLine>,
+    /// Backs the "APDU trace" checkbox in the activity log pane. Shared with
+    /// the worker thread (see `Worker::spawn`), which reads it fresh at the
+    /// start of every job — toggling the checkbox takes effect on the very
+    /// next device operation, not just future app runs.
+    apdu_trace: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The APDU trace captured for the job whose result is being applied
+    /// right now, if the checkbox was on and that job recorded anything.
+    /// Consumed (and cleared) by the first `log`/`log_bg` call in the apply closure;
+    /// `Worker::spawn` also clears it after the apply closure returns, so it
+    /// never bleeds into an unrelated, later log line.
+    pending_trace: Option<Vec<String>>,
     /// otpauth:// import dialog state.
     import_dialog: ImportDialog,
     /// Bulk-import dialog state.
@@ -2388,7 +2431,14 @@ struct BulkDialog {
 
 struct LogLine {
     severity: Severity,
+    kind: LogKind,
     text: String,
+    /// The APDU trace behind this entry, captured on the worker thread while
+    /// the "APDU trace" checkbox (see `App::activity_log`) was on. `None`
+    /// with the checkbox off, for an entry with no device I/O behind it, or
+    /// when a job recorded nothing. Printed in full under the entry —
+    /// exactly the lines the CLI's own `--debug` would print.
+    trace: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2397,6 +2447,19 @@ enum Severity {
     Ok,
     Warn,
     Err,
+}
+
+/// Whether a log entry reports something the user directly asked for (a
+/// button click that writes to, authenticates against, or otherwise acts on
+/// a device) or something the app did on its own — a device scan, a status
+/// sweep triggered by opening a tab or by selecting a device, a re-read that
+/// follows a write to refresh the pane. Rendered with distinct weight (see
+/// `App::activity_log`) so a quiet background poll never reads as though the
+/// user had just done something.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogKind {
+    User,
+    Background,
 }
 
 impl App {
@@ -2475,7 +2538,11 @@ impl App {
             // execution if there's no egui context, e.g. in tests).
             self.busy_jobs = 0;
             self.busy_label = None;
-            self.worker = self.egui_ctx.clone().map(Worker::spawn);
+            let apdu_trace = self.apdu_trace.clone();
+            self.worker = self
+                .egui_ctx
+                .clone()
+                .map(|ctx| Worker::spawn(ctx, apdu_trace));
             self.log(
                 Severity::Err,
                 "the background worker stopped unexpectedly and was restarted",
@@ -2552,10 +2619,34 @@ impl App {
         }
     }
 
+    /// Log something the user directly asked for: a write, an auth attempt,
+    /// an export — anything that happened because of a specific click.
+    /// Rendered at full weight (see `activity_log`). This is the visualization
+    /// every explicit Molto2 action already used; every other module's
+    /// explicit actions should log through this same entry point.
     fn log(&mut self, severity: Severity, text: impl Into<String>) {
+        self.log_kind(severity, LogKind::User, text);
+    }
+
+    /// Log something the app did on its own — a device scan, a status sweep
+    /// triggered by opening a tab or selecting a device, a re-read that
+    /// follows a write to refresh the pane. Rendered muted (see
+    /// `activity_log`) so it never competes visually with a user action.
+    fn log_bg(&mut self, severity: Severity, text: impl Into<String>) {
+        self.log_kind(severity, LogKind::Background, text);
+    }
+
+    fn log_kind(&mut self, severity: Severity, kind: LogKind, text: impl Into<String>) {
+        // The trace captured for whichever job's apply closure is running
+        // right now (see `Worker::spawn`), if any — attached to the first log
+        // line that closure produces, then consumed so a later, unrelated log
+        // call in the same frame doesn't also claim it.
+        let trace = self.pending_trace.take().filter(|t| !t.is_empty());
         self.log.push(LogLine {
             severity,
+            kind,
             text: text.into(),
+            trace,
         });
         // Keep the log bounded; oldest entries are least interesting.
         if self.log.len() > 200 {
@@ -2703,7 +2794,7 @@ impl App {
                             }
                         }
                         if app.slot_meta.is_none() {
-                            app.resweep_slot_meta();
+                            app.resweep_slot_meta(LogKind::Background);
                         }
                         app.log(Severity::Ok, format!("profile #{} written", p));
                     }
@@ -2743,7 +2834,7 @@ impl App {
                             }
                         }
                         if app.slot_meta.is_none() {
-                            app.resweep_slot_meta();
+                            app.resweep_slot_meta(LogKind::Background);
                         }
                         app.log(Severity::Ok, format!("title written on slot #{}", p));
                     }
@@ -2776,7 +2867,7 @@ impl App {
                             }
                         }
                         if app.slot_meta.is_none() {
-                            app.resweep_slot_meta();
+                            app.resweep_slot_meta(LogKind::Background);
                         }
                         match outcome {
                             SeedDeleteOutcome::Deleted => app.log(
@@ -2930,20 +3021,27 @@ impl App {
 
     /// Re-read all 100 public blocks and replace the slot list. Recovers the
     /// metadata display when a write found no existing list to patch (the
-    /// open-time sweep had failed, leaving `slot_meta` `None`).
-    fn resweep_slot_meta(&mut self) {
+    /// open-time sweep had failed, leaving `slot_meta` `None`). `kind` should
+    /// be `User` when this runs because the user clicked "Refresh slots", and
+    /// `Background` for every other caller — a write's own fallback re-sweep,
+    /// or any future automatic trigger — so the activity log renders each the
+    /// way it actually happened.
+    fn resweep_slot_meta(&mut self, kind: LogKind) {
         let Some(mut s) = self.take_molto_session() else {
             return;
         };
         self.spawn_job("Refreshing slots\u{2026}", move || {
             let meta = (0..PROFILES)
                 .map(|p| s.read_public_data(p))
-                .collect::<Result<Vec<_>, _>>()
-                .ok();
+                .collect::<Result<Vec<_>, _>>();
             Box::new(move |app: &mut App| {
                 app.session = Some(s);
-                if let Some(m) = meta {
-                    app.slot_meta = Some(m);
+                match meta {
+                    Ok(m) => {
+                        app.log_kind(Severity::Ok, kind, format!("{} slots read", m.len()));
+                        app.slot_meta = Some(m);
+                    }
+                    Err(e) => app.log_kind(Severity::Warn, kind, format!("slot refresh: {e}")),
                 }
             })
         });
@@ -6078,12 +6176,29 @@ impl App {
                             .filter(|d| d.kind == DeviceKind::Key && !d.serial.is_empty())
                             .map(|d| d.serial.as_str()),
                     );
+                    // Background: every scan funnels through here, whether it
+                    // was kicked off by a hotplug event, the first-frame
+                    // auto-scan, or a "Refresh"/"Scan for devices" click — the
+                    // staggered burst that follows any of them (`pending_scans`)
+                    // makes "which scan did the user actually ask for" moot in
+                    // practice, so all of them log at the same, muted weight.
+                    app.log_bg(
+                        Severity::Info,
+                        format!(
+                            "device scan: {} device{} found",
+                            devices.len(),
+                            if devices.len() == 1 { "" } else { "s" }
+                        ),
+                    );
                     app.devices = devices;
                     if changed {
                         app.on_device_selected();
                     }
                 }
-                Err(e) => App::apply_device_scan_failure(app, e),
+                Err(e) => {
+                    app.log_bg(Severity::Warn, format!("device scan failed: {e}"));
+                    App::apply_device_scan_failure(app, e);
+                }
             })
         });
     }
@@ -6259,7 +6374,11 @@ impl App {
                 }
                 match result {
                     Ok((s, info, meta)) => {
-                        app.log(Severity::Ok, format!("opened Molto2 {}", info.serial));
+                        // Background: this fires automatically whenever a
+                        // Molto2 is selected, never from a click of the
+                        // user's own — same treatment as the device scan
+                        // that usually precedes it.
+                        app.log_bg(Severity::Ok, format!("opened Molto2 {}", info.serial));
                         // Enumeration's gentle probe usually fills these already;
                         // refresh them here as a fallback in case that read failed.
                         if let Some(id) = for_device.clone() {
@@ -6279,7 +6398,7 @@ impl App {
                         app.slot_meta = meta;
                         app.authenticated = false;
                     }
-                    Err(e) => app.log(Severity::Err, format!("open Molto2: {e}")),
+                    Err(e) => app.log_bg(Severity::Err, format!("open Molto2: {e}")),
                 }
             })
         });
@@ -6319,8 +6438,14 @@ impl App {
         });
     }
 
-    /// Read the selected card's read-only PIV status snapshot.
-    fn load_piv_status(&mut self) {
+    /// Read the selected card's read-only PIV status snapshot: status + every
+    /// slot's algorithm/subject/policy. `kind` should be `User` only when
+    /// this runs because the user clicked "Refresh" — the initial read when
+    /// the PIV tab is first opened, and the re-read every write triggers
+    /// afterwards to pick up what it changed, both pass `Background` so the
+    /// activity log renders them the way they actually happened (see
+    /// `LogKind`).
+    fn load_piv_status(&mut self, kind: LogKind) {
         self.piv.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             return;
@@ -6373,19 +6498,30 @@ impl App {
                 }
                 match result {
                     Ok((Ok(status), slot_keys, slot_policies)) => {
+                        app.log_kind(
+                            Severity::Ok,
+                            kind,
+                            format!("PIV status read ({} slots)", slot_keys.len()),
+                        );
                         app.piv.status = Some(status);
                         app.piv.slot_keys = slot_keys;
                         app.piv.slot_policies = slot_policies;
                         app.piv.loaded = true;
                     }
-                    Ok((Err(e), _, _)) | Err(e) => app.piv.error = Some(e.to_string()),
+                    Ok((Err(e), _, _)) | Err(e) => {
+                        app.log_kind(Severity::Err, kind, format!("PIV status read: {e}"));
+                        app.piv.error = Some(e.to_string());
+                    }
                 }
             })
         });
     }
 
     /// Apply a PIV write result: on success store the notice and refreshed
-    /// status; on error store the message. Shared by every PIV write action.
+    /// status; on error store the message. Shared by every PIV write action —
+    /// also where every one of them logs, User-weight (the caller's `notice`
+    /// already says what happened in plain terms; a click landed here to
+    /// produce it).
     fn apply_piv_write(
         app: &mut App,
         result: Result<keyroost_transport::PivStatus, TransportError>,
@@ -6393,12 +6529,15 @@ impl App {
     ) {
         match result {
             Ok(status) => {
+                app.log(Severity::Ok, notice.clone());
                 app.piv.status = Some(status);
                 app.piv.error = None;
                 app.piv.notice = Some(notice);
                 // Re-read so per-slot key algorithms (and anything the write
-                // touched) reflect the new state without a manual Refresh.
-                app.load_piv_status();
+                // touched) reflect the new state without a manual Refresh —
+                // background: it's a side-effect re-read, not the action the
+                // user asked for (that's the log line just above).
+                app.load_piv_status(LogKind::Background);
                 // Any successful PIV write (delete, reset, move, ...) can change
                 // retired-slot occupancy; drop the cache so the retired tab
                 // re-reads fresh on its next open instead of showing stale
@@ -6415,6 +6554,7 @@ impl App {
                 }
             }
             Err(e) => {
+                app.log(Severity::Err, e.to_string());
                 app.piv.notice = None;
                 app.piv.error = Some(e.to_string());
             }
@@ -6599,6 +6739,10 @@ impl App {
                 wipe(&mut app.piv.mgmt_key_input);
                 match result {
                     Ok((pubkey, status)) => {
+                        app.log(
+                            Severity::Ok,
+                            format!("generated {} key in {}", alg.label(), slot.label()),
+                        );
                         app.piv.status = Some(status);
                         app.piv.error = None;
                         // Remember it for this app run so a later self-sign/CSR
@@ -6630,7 +6774,7 @@ impl App {
                         // generating and still doesn't), so without this
                         // refresh the pane would keep showing "empty" until
                         // some *other* write happened to trigger one.
-                        app.load_piv_status();
+                        app.load_piv_status(LogKind::Background);
                         // A retired slot's occupancy cache may now be stale
                         // (generation can target a retired slot); drop it so
                         // it re-reads fresh rather than keeping a cached
@@ -6642,6 +6786,7 @@ impl App {
                         app.piv.retired_occupancy = None;
                     }
                     Err(e) => {
+                        app.log(Severity::Err, e.to_string());
                         app.piv.notice = None;
                         app.piv.error = Some(e.to_string());
                     }
@@ -6903,8 +7048,21 @@ impl App {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok(v) => app.piv.retired_occupancy = Some(v),
-                    Err(e) => app.piv.error = Some(e.to_string()),
+                    Ok(v) => {
+                        // Background: this fires the first time the retired
+                        // slots section is expanded, or the move-key modal is
+                        // opened — neither is "the user asked to read retired
+                        // occupancy", it's incidental to something else.
+                        app.log_bg(
+                            Severity::Ok,
+                            format!("retired slot occupancy read ({} slots)", v.len()),
+                        );
+                        app.piv.retired_occupancy = Some(v);
+                    }
+                    Err(e) => {
+                        app.log_bg(Severity::Warn, format!("retired slot occupancy: {e}"));
+                        app.piv.error = Some(e.to_string());
+                    }
                 }
             })
         })
@@ -7037,10 +7195,15 @@ impl App {
                     wipe(&mut app.piv.sign_pin);
                     match result {
                         Ok(()) => {
+                            app.log(
+                                Severity::Ok,
+                                format!("certificate request signed for {}", slot.label()),
+                            );
                             app.piv.error = None;
                             app.piv.notice = Some("Certificate request signed and saved.".into());
                         }
                         Err(e) => {
+                            app.log(Severity::Err, e.to_string());
                             app.piv.notice = None;
                             app.piv.error = Some(e.to_string());
                         }
@@ -7085,10 +7248,15 @@ impl App {
             })();
             Box::new(move |app: &mut App| match result {
                 Ok(n) => {
+                    app.log(
+                        Severity::Ok,
+                        format!("exported {}-byte certificate from {}", n, slot.label()),
+                    );
                     app.piv.error = None;
                     app.piv.notice = Some(format!("Exported {}-byte DER certificate.", n));
                 }
                 Err(e) => {
+                    app.log(Severity::Err, e.to_string());
                     app.piv.notice = None;
                     app.piv.error = Some(e.to_string());
                 }
@@ -8823,7 +8991,12 @@ impl App {
     /// Global activity-log drawer (bottom), replacing the Molto2-only log.
     fn activity_log(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
         egui::Panel::bottom("log")
-            .exact_size(180.0)
+            .resizable(true)
+            .default_size(180.0)
+            // Enough to still show the header when dragged down; capped so
+            // it can't swallow the whole window and crowd out the device
+            // pane above it.
+            .size_range(96.0..=560.0)
             .frame(panel_frame(p.bar, 16.0, 10.0))
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
@@ -8840,16 +9013,41 @@ impl App {
                         }
                         ui.add_space(4.0);
                         if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
+                            // Traces ride along, indented under the entry they
+                            // belong to — the point of the APDU trace is
+                            // having the exact wire exchange to paste, not
+                            // just the summary.
                             let all = self
                                 .log
                                 .iter()
-                                .map(|l| l.text.clone())
+                                .map(|l| match &l.trace {
+                                    Some(t) if !t.is_empty() => format!(
+                                        "{}\n{}",
+                                        l.text,
+                                        t.iter()
+                                            .map(|apdu| format!("    {apdu}"))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    ),
+                                    _ => l.text.clone(),
+                                })
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             ui.ctx().copy_text(all);
                             // The user copied non-secret log text over the
                             // code; a pending auto-clear would clobber it.
                             self.clipboard_clear_at = None;
+                        }
+                        ui.add_space(10.0);
+                        // Runtime toggle for the worker thread's APDU capture
+                        // (see `Worker::spawn`) — no CLI flag, no restart:
+                        // flip it, and the very next device operation's trace
+                        // shows up under its log entry.
+                        let mut trace_on =
+                            self.apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
+                        if ui.checkbox(&mut trace_on, "APDU trace").changed() {
+                            self.apdu_trace
+                                .store(trace_on, std::sync::atomic::Ordering::Relaxed);
                         }
                     });
                 });
@@ -8858,18 +9056,45 @@ impl App {
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for line in &self.log {
-                            let color = match line.severity {
+                        for line in self.log.iter_mut() {
+                            let base = match line.severity {
                                 Severity::Ok => p.ok,
                                 Severity::Warn => p.warn,
                                 Severity::Err => p.err,
                                 Severity::Info => p.txt2,
                             };
+                            // User actions render exactly as every explicit
+                            // Molto2 action always has: full-strength severity
+                            // color, no prefix. Background entries — a device
+                            // scan, a tab's initial status sweep, a re-read
+                            // that follows a write — are alpha-muted toward
+                            // the panel and get a leading "·", so the
+                            // distinction survives colorblind palettes too and
+                            // never reads as though the user just did
+                            // something.
+                            let (color, prefix, size) = match line.kind {
+                                LogKind::User => (base, "", 12.0),
+                                LogKind::Background => (theme::tint(base, 130), "\u{b7} ", 11.5),
+                            };
                             ui.label(
-                                egui::RichText::new(&line.text)
-                                    .font(theme::f_mono(12.0))
+                                egui::RichText::new(format!("{prefix}{}", line.text))
+                                    .font(theme::f_mono(size))
                                     .color(color),
                             );
+                            // APDU trace ("APDU trace" checkbox above):
+                            // printed exactly like the CLI's own `--debug`
+                            // output — the same formatted lines, captured
+                            // verbatim (see `keyroost_transport::trace`) —
+                            // indented under the entry they belong to.
+                            if let Some(trace) = line.trace.as_ref() {
+                                for apdu in trace {
+                                    ui.label(
+                                        egui::RichText::new(format!("    {apdu}"))
+                                            .font(theme::f_mono(10.5))
+                                            .color(p.txt3),
+                                    );
+                                }
+                            }
                         }
                     });
             });
@@ -13305,7 +13530,7 @@ impl App {
     fn cap_piv(&mut self, ui: &mut egui::Ui, p: &Palette) {
         if !self.piv_tried && !self.busy() {
             self.piv_tried = true;
-            self.load_piv_status();
+            self.load_piv_status(LogKind::Background);
         }
         // Intents collected inside the UI closures and applied afterwards, so a
         // submit method's `&mut self` never overlaps a card's borrow.
@@ -14050,7 +14275,7 @@ impl App {
             self.piv.selected_slot = slot;
         }
         if do_refresh {
-            self.load_piv_status();
+            self.load_piv_status(LogKind::User);
         }
         // The three buttons open the centered credential modal; the modal itself
         // (rendered once per frame) runs the actual op. Opening wipes any stale
@@ -14295,7 +14520,7 @@ impl App {
                         // so it works without authenticating. Covers a factory
                         // reset (which clears the list) and a failed open-sweep.
                         if theme::button(ui, p, BtnKind::Default, "Refresh slots").clicked() {
-                            self.resweep_slot_meta();
+                            self.resweep_slot_meta(LogKind::User);
                         }
                         ui.add_space(6.0);
                         if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
@@ -16299,7 +16524,7 @@ mod tests {
     #[test]
     fn panicking_job_clears_busy_and_worker_survives() {
         let mut app = App {
-            worker: Some(Worker::spawn(egui::Context::default())),
+            worker: Some(Worker::spawn(egui::Context::default(), Default::default())),
             ..Default::default()
         };
         // Silence the panic backtrace this test intentionally triggers.
@@ -16346,7 +16571,7 @@ mod tests {
     #[test]
     fn worker_round_trip_applies_result_and_clears_busy() {
         let mut app = App {
-            worker: Some(Worker::spawn(egui::Context::default())),
+            worker: Some(Worker::spawn(egui::Context::default(), Default::default())),
             ..Default::default()
         };
         app.spawn_job("test", || Box::new(|app: &mut App| app.slot = 42));
@@ -16371,7 +16596,7 @@ mod tests {
     #[test]
     fn spawn_job_ignored_while_busy() {
         let mut app = App {
-            worker: Some(Worker::spawn(egui::Context::default())),
+            worker: Some(Worker::spawn(egui::Context::default(), Default::default())),
             ..Default::default()
         };
         // Occupy the worker with a job whose result we don't drain.

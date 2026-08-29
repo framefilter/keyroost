@@ -10,7 +10,7 @@
 //! PIN verification/changes, key generation and import, PSO signing/decryption,
 //! and factory reset.
 
-use crate::TransportError;
+use crate::{trace, TransportError};
 use keyroost_openpgp as pgp;
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use zeroize::Zeroizing;
@@ -352,14 +352,16 @@ impl OpenPgpSession {
             if sw != 0x6700 && sw != 0x6883 {
                 return ok_or_apdu("openpgp import key", sw);
             }
-            if self.debug {
-                eprintln!(
+            trace::line(self.debug, || {
+                format!(
                     "! openpgp import: extended length rejected (SW={sw:04X}); \
                      retrying with command chaining"
-                );
-            }
-        } else if self.debug {
-            eprintln!("! openpgp import: forcing command chaining (env override)");
+                )
+            });
+        } else {
+            trace::line(self.debug, || {
+                "! openpgp import: forcing command chaining (env override)".to_string()
+            });
         }
 
         let chunks: Vec<Zeroizing<Vec<u8>>> =
@@ -559,14 +561,16 @@ impl OpenPgpSession {
             if sw != 0x6700 && sw != 0x6883 {
                 ok_or_apdu("openpgp decipher", sw)?;
             }
-            if self.debug {
-                eprintln!(
+            trace::line(self.debug, || {
+                format!(
                     "! openpgp decipher: extended length rejected (SW={sw:04X}); \
                      retrying with command chaining"
-                );
-            }
-        } else if self.debug {
-            eprintln!("! openpgp decipher: forcing command chaining (env override)");
+                )
+            });
+        } else {
+            trace::line(self.debug, || {
+                "! openpgp decipher: forcing command chaining (env override)".to_string()
+            });
         }
 
         let chunks = pgp::pso_decipher_chained(cipher_do, 254);

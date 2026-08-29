@@ -13,7 +13,7 @@
 use keyroost_token2prog::{self as prog, Command};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 
-use crate::TransportError;
+use crate::{trace, TransportError};
 
 /// A session against a single-profile programmable token over a reader.
 pub struct Token2ProgSession {
@@ -47,29 +47,29 @@ impl Token2ProgSession {
     /// continuation (contact readers), and return the response payload without
     /// the SW1/SW2 trailer. Errors on any status word other than `9000`.
     fn transmit(&mut self, cmd: &Command) -> Result<Vec<u8>, TransportError> {
-        if self.debug {
-            // INS 0xC5 (set_seed) and 0xCE (answer_challenge) carry a
-            // secret-bearing body. That body is SM4-encrypted under a PUBLIC,
-            // hardcoded device key, so it is effectively plaintext — redact it
-            // from the trace and print only the header (mirrors the seed-body
-            // redaction in `token2otp`). The header still reveals CLA/INS/P1/P2/Lc,
-            // which is what's useful for bring-up.
-            let sensitive = matches!(cmd.apdu.get(1), Some(0xC5) | Some(0xCE));
+        // INS 0xC5 (set_seed) and 0xCE (answer_challenge) carry a
+        // secret-bearing body. That body is SM4-encrypted under a PUBLIC,
+        // hardcoded device key, so it is effectively plaintext — redact it
+        // from the trace and print only the header (mirrors the seed-body
+        // redaction in `token2otp`). The header still reveals CLA/INS/P1/P2/Lc,
+        // which is what's useful for bring-up.
+        let sensitive = matches!(cmd.apdu.get(1), Some(0xC5) | Some(0xCE));
+        trace::line(self.debug, || {
             if sensitive && cmd.apdu.len() > 5 {
-                eprintln!(
+                format!(
                     "> {:>16} >> {}<{} bytes redacted>",
                     cmd.label,
                     hex(&cmd.apdu[..5]),
                     cmd.apdu.len() - 5
-                );
+                )
             } else {
-                eprintln!("> {:>16} >> {}", cmd.label, hex(&cmd.apdu));
+                format!("> {:>16} >> {}", cmd.label, hex(&cmd.apdu))
             }
-        }
+        });
         let (data, sw1, sw2) = self.exchange_full(&cmd.apdu, cmd.label)?;
-        if self.debug {
-            eprintln!("< {:>16} << ...{:02X}{:02X}", cmd.label, sw1, sw2);
-        }
+        trace::line(self.debug, || {
+            format!("< {:>16} << ...{:02X}{:02X}", cmd.label, sw1, sw2)
+        });
         // The challenge answer replies with a bare 9000 (no data) on success and
         // 6983 when the device key is locked; surface the latter clearly.
         if (sw1, sw2) == (0x69, 0x83) {
