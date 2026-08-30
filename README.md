@@ -570,6 +570,12 @@ for slot in 9a 9c 9d 9e; do
   keyroostctl piv self-sign --slot "$slot" --subject "CN=$USER" \
       --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --reader yubikey
 done
+# on a card without GET METADATA (non-Yubico PIV, or Yubico firmware < 5.3)
+# the two steps can't share the key by slot name across invocations; fold
+# them into one so the fresh public key never needs a temp file:
+#   keyroostctl piv self-sign --slot 9a --subject "CN=$USER" --generate-key \
+#       --algorithm eccp256 --mgmt-key-env PIV_MGMT --pin-env PIV_PIN
+# (same --generate-key convenience on `piv request-cert`)
 
 # --- Token2 Molto2 (TOTP programming) ---
 keyroostctl molto info
