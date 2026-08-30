@@ -7,6 +7,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`piv self-sign` and `piv request-cert` can generate the key first.**
+  `--generate-key` folds a fresh `generate-key` into the signing command,
+  with the same `--algorithm`, `--pin-policy` and `--touch-policy` options,
+  so cards without GET METADATA no longer need the `--save-pubkey` /
+  `--load-pubkey` detour. Contributed by @episource. ([#116])
 - **The activity log now covers PIV.** User actions and background reads
   are told apart, and with tracing on each APDU appears by name (for example
   `GET DATA 5FC105`) with the same redaction as `--debug`. The log can be
@@ -979,6 +984,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#107]: https://github.com/framefilter/keyroost/issues/107
 [#110]: https://github.com/framefilter/keyroost/pull/110
 [#114]: https://github.com/framefilter/keyroost/pull/114
+[#116]: https://github.com/framefilter/keyroost/pull/116
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8

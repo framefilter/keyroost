@@ -138,6 +138,10 @@ keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
     <p class="kr-muted">When two <code>--*-stdin</code> flags appear on one command, keyroost
       reads them as consecutive lines in the order the operation needs them — for
       <code>self-sign</code> that is the management key first, then the PIN.</p>
+    <p>Both commands take <code>--generate-key</code> to generate the slot's key in the
+      same step (with the same <code>--algorithm</code>, <code>--pin-policy</code> and
+      <code>--touch-policy</code> options as <code>generate-key</code>), which spares
+      cards without GET METADATA the save-pubkey / load-pubkey detour.</p>
     <span id="delete"></span>
     <p><strong>Clearing a slot.</strong> <code>delete-cert</code> removes only the slot's
       X.509 certificate object and leaves the private key in place — standard PIV, so it
