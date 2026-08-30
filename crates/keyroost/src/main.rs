@@ -14036,16 +14036,18 @@ impl App {
         // of bold labels, the active one underlined with a 2px accent. Clicking
         // a tab selects that slot; every action card below targets it.
         ui.add_space(14.0);
-        {
-            let top = ui.cursor().top();
-            let strip = egui::Rect::from_min_max(
-                egui::pos2(ui.max_rect().left(), top - 4.0),
-                egui::pos2(ui.max_rect().right(), top + 30.0),
-            );
-            ui.painter().rect_filled(strip, 0.0, p.surface);
-        }
-        ui.horizontal(|ui| {
+        // Opaque surface behind the tab labels. The strip wraps to more than one
+        // line when the window is too narrow to hold every tab on one row — the
+        // slot cards below would otherwise be pinned to the unwrapped width of
+        // this row and spill past the pane's right edge. Because the wrapped
+        // height isn't known until the row is laid out, reserve a paint slot
+        // here and fill it from the row's real rect afterwards.
+        let strip_bg = ui.painter().add(egui::Shape::Noop);
+        let strip_resp = ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 20.0;
+            // Rows are far enough apart that a wrapped second row clears the
+            // accent underline (drawn 6px below the row above) with margin.
+            ui.spacing_mut().item_spacing.y = 22.0;
             let tab = |ui: &mut egui::Ui, label: String, active: bool| -> bool {
                 let color = if active { p.txt } else { p.txt3 };
                 let resp = ui
@@ -14055,6 +14057,9 @@ impl App {
                                 .font(theme::f_sb(13.5))
                                 .color(color),
                         )
+                        // Each tab is one atom: it moves to the next row whole
+                        // rather than letting its own text break across two.
+                        .wrap_mode(egui::TextWrapMode::Extend)
                         .sense(egui::Sense::click()),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -14102,6 +14107,15 @@ impl App {
                 self.help_dot(ui, p, "piv-retired");
             }
         });
+        {
+            let row = strip_resp.response.rect;
+            let strip = egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), row.top() - 4.0),
+                egui::pos2(ui.max_rect().right(), row.bottom() + 6.0),
+            );
+            ui.painter()
+                .set(strip_bg, egui::Shape::rect_filled(strip, 0.0, p.surface));
+        }
         // --- Retired-slot rail (only on the retired tab) --------------------
         // All twenty slots, listed the way the Molto2 view lists its profiles:
         // one row each, a filled dot on the right for the ones holding a key,
