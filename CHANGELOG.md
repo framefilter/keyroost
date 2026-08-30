@@ -7,6 +7,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **The activity log now covers PIV.** User actions and background reads
+  are told apart, and with tracing on each APDU appears by name (for example
+  `GET DATA 5FC105`) with the same redaction as `--debug`. The log can be
+  detached into its own window and cleared. Contributed by @episource.
+  ([#114])
 - **OpenPGP keys in modern algorithms.** `openpgp generate-key --algorithm`
   (and the GUI's Generate dialog) can set a slot to Ed25519, X25519, NIST
   P-256/384/521, secp256k1, brainpool 256/384/512, or RSA 2048/3072/4096
@@ -52,6 +57,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   variant (an exhaustive `match` needs a new arm).
 
 ### Fixed
+- The PIV slot tabs wrap instead of overflowing in a narrow window.
+  Contributed by @episource. ([#114])
 - **PIV cards that answer GET VERSION with more than three bytes can now be
   managed.** The Swissbit iShield Key 2 Pro replies to the Yubico version
   extension with four bytes; keyroost rejected the reply and with it the
@@ -971,6 +978,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#106]: https://github.com/framefilter/keyroost/issues/106
 [#107]: https://github.com/framefilter/keyroost/issues/107
 [#110]: https://github.com/framefilter/keyroost/pull/110
+[#114]: https://github.com/framefilter/keyroost/pull/114
 [Unreleased]: https://github.com/framefilter/keyroost/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8
