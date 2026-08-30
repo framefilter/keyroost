@@ -1547,7 +1547,10 @@ mod tests {
             "GET DATA (5F C1 99)"
         );
         assert_eq!(
-            describe_apdu(&piv::put_data(&Slot::Signature.cert_object_tag(), &[0x53, 0x00])),
+            describe_apdu(&piv::put_data(
+                &Slot::Signature.cert_object_tag(),
+                &[0x53, 0x00]
+            )),
             "PUT DATA (5F C1 0A \u{2192} X.509 Certificate for Digital Signature)"
         );
         assert_eq!(

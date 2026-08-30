@@ -1425,7 +1425,9 @@ pub(crate) fn transmit_applet(
     let mut chunks = 0usize;
     loop {
         if let Some(describe) = io.describe {
-            trace::line(debug, || format!("> {:>14} >> {}", io.label, describe(&to_send)));
+            trace::line(debug, || {
+                format!("> {:>14} >> {}", io.label, describe(&to_send))
+            });
         }
         trace::line(debug, || {
             format!(
@@ -1509,7 +1511,10 @@ mod redaction_tests {
     fn iso_sw_summary_reads_common_status_words() {
         assert_eq!(iso_sw_summary(0x90, 0x00), "success");
         assert_eq!(iso_sw_summary(0x6A, 0x82), "file or application not found");
-        assert_eq!(iso_sw_summary(0x69, 0x82), "security status not satisfied — authenticate first");
+        assert_eq!(
+            iso_sw_summary(0x69, 0x82),
+            "security status not satisfied — authenticate first"
+        );
         assert!(iso_sw_summary(0x61, 0x11).starts_with("success"));
         assert!(iso_sw_summary(0x63, 0xC3).starts_with("verification failed"));
         assert!(iso_sw_summary(0x6C, 0x20).starts_with("wrong Le"));

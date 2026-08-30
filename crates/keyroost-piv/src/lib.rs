@@ -1577,7 +1577,10 @@ mod tests {
             assert_eq!(Instruction::from_code(ins.code()), Some(ins));
             assert!(!ins.name().is_empty());
         }
-        assert_eq!(Instruction::GetVersion.name(), "GET VERSION (yubico extension)");
+        assert_eq!(
+            Instruction::GetVersion.name(),
+            "GET VERSION (yubico extension)"
+        );
         assert_eq!(Instruction::Select.name(), "SELECT");
         assert_eq!(Instruction::from_code(0x00), None);
     }
@@ -1588,7 +1591,10 @@ mod tests {
             data_object_name(&[0x5F, 0xC1, 0x05]).as_deref(),
             Some("X.509 Certificate for PIV Authentication")
         );
-        assert_eq!(data_object_name(&[0x7E]).as_deref(), Some("Discovery Object"));
+        assert_eq!(
+            data_object_name(&[0x7E]).as_deref(),
+            Some("Discovery Object")
+        );
         // Numbered ranges: 5F C1 0D..20 -> Retired 1..20; 5F FF 11..15 -> MSROOTS 1..5.
         assert_eq!(
             data_object_name(&Slot::Retired(1).cert_object_tag()).as_deref(),

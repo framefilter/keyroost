@@ -7447,7 +7447,10 @@ impl App {
         let implicit = live
             .map(|d| d.model.clone())
             .unwrap_or_else(|| "this key".to_string());
-        let old_display = target.name_at_open.clone().unwrap_or_else(|| implicit.clone());
+        let old_display = target
+            .name_at_open
+            .clone()
+            .unwrap_or_else(|| implicit.clone());
         let cleared = name.is_empty();
         let new_display = if cleared { implicit } else { name.clone() };
         let mut keyring = keyroost_keyring::Keyring::load_default().unwrap_or_default();
