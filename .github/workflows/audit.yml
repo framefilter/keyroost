@@ -28,7 +28,7 @@ jobs:
 
       # Caches ~/.cargo/bin, so the from-source install below is only paid
       # when the cache rolls over, not on every dependency-bump PR.
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Installed from source with --locked rather than via a third-party
       # installer action: one less moving part in the trust chain.
