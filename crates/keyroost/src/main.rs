@@ -6708,7 +6708,7 @@ impl App {
         self.spawn_job("Setting PIV retry counts\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let alg = s.management_key_algorithm();
+                let alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(alg, &mgmt)?;
                 s.verify_pin(pin.as_bytes())?;
                 s.set_pin_retries(pin_tries, puk_tries)?;
@@ -6749,7 +6749,7 @@ impl App {
                 TransportError,
             > {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.management_key_algorithm();
+                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
                 let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
                 Ok((pubkey, s.status()?))
@@ -6837,7 +6837,7 @@ impl App {
                 let der = cert_bytes_to_der(&bytes)
                     .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.management_key_algorithm();
+                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
                 s.import_certificate(slot, &der)?;
                 s.status()
@@ -6870,7 +6870,7 @@ impl App {
         self.spawn_job("Deleting certificate\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.management_key_algorithm();
+                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
                 s.clear_certificate(slot)?;
                 s.status()
@@ -6934,7 +6934,7 @@ impl App {
         self.spawn_job("Writing a new CHUID\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.management_key_algorithm();
+                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
                 s.new_chuid(&guid, &expiration)?;
                 s.status()
@@ -6967,7 +6967,7 @@ impl App {
         self.spawn_job("Deleting key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.management_key_algorithm();
+                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
                 s.delete_key(slot)?;
                 s.status()
@@ -7006,7 +7006,7 @@ impl App {
         self.spawn_job("Moving key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.management_key_algorithm();
+                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
                 s.move_key(src, dest)?;
                 s.status()
@@ -7141,7 +7141,7 @@ impl App {
             move || {
                 let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
-                    let mgmt_alg = s.management_key_algorithm();
+                    let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                     s.authenticate_management(mgmt_alg, &mgmt)?;
                     if let Some((alg, key)) = known_key {
                         s.remember_pubkey(slot, alg, key);
@@ -7315,7 +7315,7 @@ impl App {
         self.spawn_job("Changing management key\u{2026}", move || {
             let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
-                let cur_alg = s.management_key_algorithm();
+                let cur_alg = s.resolve_management_key_algorithm(old.len())?;
                 s.authenticate_management(cur_alg, &old)?;
                 s.set_management_key(new_alg, &new, false)?;
                 s.status()

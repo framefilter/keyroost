@@ -265,7 +265,7 @@ impl fmt::Display for TransportError {
             TransportError::PivBadKeyLength => {
                 write!(
                     f,
-                    "PIV management key has the wrong length for its algorithm"
+                    "PIV management key length does not match any algorithm this card accepts"
                 )
             }
             TransportError::PivBadPinLength => {

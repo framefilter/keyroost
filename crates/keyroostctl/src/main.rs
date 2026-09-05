@@ -6613,16 +6613,30 @@ fn open_piv_authed(
     mgmt_key: &[u8],
 ) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
     let mut session = open_piv(reader, debug)?;
-    let alg = session.management_key_algorithm();
-    if mgmt_key.len() != alg.key_len() {
-        return Err(format!(
-            "management key is {} bytes; this card's {} key needs {}",
-            mgmt_key.len(),
-            alg.label(),
-            alg.key_len()
-        )
-        .into());
-    }
+    // Prefer GET METADATA; when the card stubs it out, fall back to the key
+    // length (and, for a 24-byte key, a GENERAL AUTHENTICATE P1 probe) rather
+    // than blindly assuming 3DES.
+    let alg = match session.reported_management_key_algorithm() {
+        Some(reported) if mgmt_key.len() != reported.key_len() => {
+            return Err(format!(
+                "management key is {} bytes; this card's {} key needs {}",
+                mgmt_key.len(),
+                reported.label(),
+                reported.key_len()
+            )
+            .into());
+        }
+        Some(reported) => reported,
+        None => session
+            .resolve_management_key_algorithm(mgmt_key.len())
+            .map_err(|_| {
+                format!(
+                    "management key is {} bytes, which does not match any \
+                     PIV management-key algorithm this card accepts",
+                    mgmt_key.len()
+                )
+            })?,
+    };
     session.authenticate_management(alg, mgmt_key)?;
     Ok(session)
 }

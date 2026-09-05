@@ -297,6 +297,50 @@ fn move_key_supported(version: Option<&[u8]>) -> bool {
     }
 }
 
+/// The management-key algorithms whose key is exactly `key_len` bytes, 3DES
+/// first. Empty when no algorithm uses that length.
+///
+/// [`PivSession::resolve_management_key_algorithm`] uses this as its fallback
+/// when GET METADATA is absent *and* the card accepts no GENERAL AUTHENTICATE
+/// probe — i.e. when only the key length is left to go on. Only 24 bytes is
+/// ambiguous (3DES and AES-192 share it); 3DES leads because it was the sole
+/// pre-metadata option. 16 → AES-128 and 32 → AES-256 are unique; 8
+/// (single-DES) and everything else map to nothing.
+fn mgmt_algs_for_key_len(key_len: usize) -> &'static [MgmtAlg] {
+    match key_len {
+        16 => &[MgmtAlg::Aes128],
+        24 => &[MgmtAlg::TripleDes, MgmtAlg::Aes192],
+        32 => &[MgmtAlg::Aes256],
+        _ => &[],
+    }
+}
+
+/// Pick the management-key algorithm to authenticate with from the set the
+/// card accepted a GENERAL AUTHENTICATE witness request for (`accepted`), given
+/// the length of the key in hand. `None` when nothing fits `key_len`.
+///
+/// * `accepted` empty → the probe told us nothing; fall back to the
+///   length-only table ([`mgmt_algs_for_key_len`]).
+/// * otherwise keep only accepted algorithms whose key is `key_len` bytes.
+/// * if that still leaves more than one — which can only be 3DES + AES-192,
+///   the sole length collision (both 24 bytes) — prefer 3DES, the historical
+///   pre-GET-METADATA default.
+fn pick_mgmt_alg(accepted: &[MgmtAlg], key_len: usize) -> Option<MgmtAlg> {
+    let by_len: Vec<MgmtAlg> = if accepted.is_empty() {
+        mgmt_algs_for_key_len(key_len).to_vec()
+    } else {
+        accepted
+            .iter()
+            .copied()
+            .filter(|a| a.key_len() == key_len)
+            .collect()
+    };
+    if by_len.contains(&MgmtAlg::TripleDes) {
+        return Some(MgmtAlg::TripleDes);
+    }
+    by_len.first().copied()
+}
+
 /// A fresh, random 16-byte CHUID GUID — host-side only, no card I/O. For
 /// pre-filling (and, via a "refresh" action, regenerating) a "New CHUID"
 /// GUID input before [`PivSession::new_chuid`] writes whatever the user
@@ -512,14 +556,111 @@ impl PivSession {
         piv::parse_metadata(&data).ok()
     }
 
-    /// The card-management (9B) key's algorithm, from GET METADATA. Defaults to
-    /// [`MgmtAlg::TripleDes`] when the card doesn't report it (pre-5.3 firmware,
-    /// where 3DES was the only option).
-    pub fn management_key_algorithm(&mut self) -> MgmtAlg {
+    /// The card-management (9B) key's algorithm *as the card reports it* via
+    /// GET METADATA, or `None` when the card doesn't answer the extension
+    /// (pre-5.3 YubiKey firmware, and non-Yubico applets that stub it out).
+    /// Unlike [`Self::management_key_algorithm`] this makes no assumption about
+    /// what an absent answer means — see [`Self::resolve_management_key_algorithm`].
+    pub fn reported_management_key_algorithm(&mut self) -> Option<MgmtAlg> {
         self.metadata(piv::KEY_REF_MANAGEMENT)
             .and_then(|m| m.algorithm)
             .and_then(MgmtAlg::from_id)
+    }
+
+    /// The card-management (9B) key's algorithm, from GET METADATA. Defaults to
+    /// [`MgmtAlg::TripleDes`] when the card doesn't report it (pre-5.3 firmware,
+    /// where 3DES was the only option).
+    ///
+    /// Prefer [`Self::resolve_management_key_algorithm`] when a key of known
+    /// length is in hand: it disambiguates cards without GET METADATA instead
+    /// of blindly assuming 3DES.
+    pub fn management_key_algorithm(&mut self) -> MgmtAlg {
+        self.reported_management_key_algorithm()
             .unwrap_or(MgmtAlg::TripleDes)
+    }
+
+    /// Decide which algorithm to run management-key authentication under, given
+    /// the length of the key the caller holds.
+    ///
+    /// 1. If GET METADATA reports an algorithm, that wins (its expected key
+    ///    length is checked against `key_len`).
+    /// 2. Otherwise, probe **every** algorithm — regardless of `key_len` — with
+    ///    GENERAL AUTHENTICATE step 1 (request witness only; no key-derived
+    ///    material reaches the card) and collect the ones the card accepts with
+    ///    `SW 9000`. Then:
+    ///    * narrow that accepted set to the algorithms whose key is `key_len`
+    ///      bytes;
+    ///    * if one remains, use it;
+    ///    * if several remain and 3DES is among them, use 3DES (the historical
+    ///      pre-metadata default — only 3DES and AES-192 can collide on length);
+    ///    * if the card accepted nothing, fall back to `key_len` alone.
+    ///
+    /// The chosen algorithm is only *returned*; the caller still runs
+    /// [`Self::authenticate_management`] with it to actually authenticate.
+    ///
+    /// Returns [`TransportError::PivBadKeyLength`] when nothing the card
+    /// accepts (or, on an empty probe, no algorithm at all) matches `key_len`.
+    pub fn resolve_management_key_algorithm(
+        &mut self,
+        key_len: usize,
+    ) -> Result<MgmtAlg, TransportError> {
+        if let Some(alg) = self.reported_management_key_algorithm() {
+            if alg.key_len() != key_len {
+                return Err(TransportError::PivBadKeyLength);
+            }
+            return Ok(alg);
+        }
+
+        // No GET METADATA. Probe each algorithm's GENERAL AUTHENTICATE P1 with a
+        // bare witness request and see which the card is willing to start.
+        const ALL: [MgmtAlg; 4] = [
+            MgmtAlg::TripleDes,
+            MgmtAlg::Aes128,
+            MgmtAlg::Aes192,
+            MgmtAlg::Aes256,
+        ];
+        trace::line(self.debug, || {
+            "piv mgmt-key: GET METADATA unsupported; probing every GENERAL \
+             AUTHENTICATE P1 with a witness request"
+                .to_string()
+        });
+        let mut accepted: Vec<MgmtAlg> = Vec::with_capacity(ALL.len());
+        for alg in ALL {
+            // A transport failure (card pulled, reader gone) is fatal for every
+            // candidate — propagate it rather than mislabel it "bad key
+            // length". Only a non-9000 status word means "not this P1".
+            let (_, sw) = self.transmit_full(&piv::general_auth_request_witness(
+                alg,
+                piv::KEY_REF_MANAGEMENT,
+            ))?;
+            let ok = sw == piv::SW_OK;
+            trace::line(self.debug, || {
+                format!(
+                    "piv mgmt-key: probe {} (P1={:#04x}) -> {}",
+                    alg.label(),
+                    alg.id(),
+                    if ok {
+                        "accepted".to_string()
+                    } else {
+                        format!("rejected (SW {sw:04X})")
+                    }
+                )
+            });
+            if ok {
+                accepted.push(alg);
+            }
+        }
+
+        if accepted.is_empty() {
+            trace::line(self.debug, || {
+                "piv mgmt-key: card accepted no probe; falling back to key length".to_string()
+            });
+        }
+        let chosen = pick_mgmt_alg(&accepted, key_len).ok_or(TransportError::PivBadKeyLength)?;
+        trace::line(self.debug, || {
+            format!("piv mgmt-key: selected {}", chosen.label())
+        });
+        Ok(chosen)
     }
 
     /// Authenticate to the card-management key via the GENERAL AUTHENTICATE
@@ -1762,6 +1903,60 @@ mod tests {
         assert!(move_key_supported(Some(&[5, 7])));
         // Unknown version -> allow the attempt (card will reject if unsupported).
         assert!(move_key_supported(None));
+    }
+
+    #[test]
+    fn mgmt_algs_for_key_len_disambiguates_by_length() {
+        use MgmtAlg::*;
+        // Unique lengths pin a single algorithm.
+        assert_eq!(mgmt_algs_for_key_len(16), &[Aes128]);
+        assert_eq!(mgmt_algs_for_key_len(32), &[Aes256]);
+        // 24 bytes fits both 3DES and AES-192 — 3DES first (the historical
+        // pre-GET-METADATA default), then the P1 probe decides.
+        assert_eq!(mgmt_algs_for_key_len(24), &[TripleDes, Aes192]);
+        // Every candidate's own key_len() must round-trip back to a list that
+        // contains it — the table and MgmtAlg::key_len() must not drift apart.
+        for alg in [TripleDes, Aes128, Aes192, Aes256] {
+            assert!(mgmt_algs_for_key_len(alg.key_len()).contains(&alg));
+        }
+        // Nothing plausible-looking (single-DES) or absurd resolves.
+        assert!(mgmt_algs_for_key_len(8).is_empty());
+        assert!(mgmt_algs_for_key_len(0).is_empty());
+        assert!(mgmt_algs_for_key_len(20).is_empty());
+    }
+
+    #[test]
+    fn pick_mgmt_alg_narrows_probe_results_by_length() {
+        use MgmtAlg::*;
+
+        // One probe accepted, right length -> that one.
+        assert_eq!(pick_mgmt_alg(&[Aes128], 16), Some(Aes128));
+        // One probe accepted, wrong length for the key in hand -> nothing.
+        assert_eq!(pick_mgmt_alg(&[Aes256], 24), None);
+
+        // A lax card accepts every P1. The 24-byte key narrows it to 3DES +
+        // AES-192, and 3DES wins the tie.
+        assert_eq!(
+            pick_mgmt_alg(&[TripleDes, Aes128, Aes192, Aes256], 24),
+            Some(TripleDes)
+        );
+        // Same lax card, 16-byte key -> unambiguously AES-128.
+        assert_eq!(
+            pick_mgmt_alg(&[TripleDes, Aes128, Aes192, Aes256], 16),
+            Some(Aes128)
+        );
+        // 24-byte key, but only AES-192 was accepted -> no 3DES to prefer.
+        assert_eq!(pick_mgmt_alg(&[Aes192], 24), Some(Aes192));
+        // 24-byte key, both 24-byte algs accepted but in the other order ->
+        // still 3DES (preference, not position).
+        assert_eq!(pick_mgmt_alg(&[Aes192, TripleDes], 24), Some(TripleDes));
+
+        // Empty accepted set = probe learned nothing -> fall back to length
+        // alone (same as the pre-probe behaviour).
+        assert_eq!(pick_mgmt_alg(&[], 16), Some(Aes128));
+        assert_eq!(pick_mgmt_alg(&[], 24), Some(TripleDes));
+        assert_eq!(pick_mgmt_alg(&[], 32), Some(Aes256));
+        assert_eq!(pick_mgmt_alg(&[], 20), None);
     }
 
     // --- pubkey-cache invalidation semantics ---------------------------------
