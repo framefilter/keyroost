@@ -52,11 +52,28 @@ pub struct OpenPgpStatus {
 impl OpenPgpStatus {
     /// The card serial number — the last 4 bytes of the AID (per the spec, the
     /// manufacturer-assigned serial sits at AID bytes 10..14).
+    ///
+    /// Token2's OpenPGP applet reports this serial in BCD coding, the same
+    /// quirk its PIV applet has: each nibble of the raw value is a decimal
+    /// digit of the number printed on the device. When the AID's manufacturer
+    /// ID marks the card as Token2 ([`pgp::MANUFACTURER_ID_TOKEN2`]), the raw
+    /// value is run through [`crate::decode_bcd_serial`] to recover the real
+    /// serial; every other vendor's serial is a plain integer and passes
+    /// through untouched.
     #[must_use]
     pub fn serial(&self) -> Option<u32> {
-        self.aid
+        let raw = self
+            .aid
             .get(10..14)
-            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))?;
+        if pgp::aid_manufacturer_id(&self.aid) == Some(pgp::MANUFACTURER_ID_TOKEN2) {
+            // A BCD serial is at most 8 decimal digits (99_999_999), so it
+            // always fits back into u32; fall back to the raw value if the
+            // decode bailed out on a non-decimal nibble.
+            Some(u32::try_from(crate::decode_bcd_serial(u128::from(raw))).unwrap_or(raw))
+        } else {
+            Some(raw)
+        }
     }
 
     /// Human label of the algorithm in `crt`'s slot (`RSA-2048`, `EdDSA
@@ -787,5 +804,54 @@ mod tests {
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Sign), "EdDSA Ed25519");
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Decrypt), "ECDH X25519");
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Auth), "none");
+    }
+
+    /// Build a minimal 16-byte OpenPGP AID: prefix, version `03 04`,
+    /// `manufacturer`, `serial` (big-endian), trailing `00 00`.
+    fn aid_with(manufacturer: u16, serial: u32) -> Vec<u8> {
+        let mut aid = pgp::AID_PREFIX.to_vec();
+        aid.extend_from_slice(&[0x03, 0x04]);
+        aid.extend_from_slice(&manufacturer.to_be_bytes());
+        aid.extend_from_slice(&serial.to_be_bytes());
+        aid.extend_from_slice(&[0x00, 0x00]);
+        aid
+    }
+
+    #[test]
+    fn serial_bcd_decodes_only_for_token2_cards() {
+        let status = |aid: Vec<u8>| OpenPgpStatus {
+            aid,
+            sig_algo_id: None,
+            dec_algo_id: None,
+            aut_algo_id: None,
+            sig_attrs: vec![],
+            dec_attrs: vec![],
+            aut_attrs: vec![],
+            fingerprint_sig: [0; 20],
+            fingerprint_dec: [0; 20],
+            fingerprint_aut: [0; 20],
+            tries_pw1: 3,
+            tries_rc: 0,
+            tries_pw3: 3,
+            signature_count: None,
+        };
+
+        // Token2: the raw AID serial is BCD — its nibbles are the printed digits.
+        assert_eq!(
+            status(aid_with(pgp::MANUFACTURER_ID_TOKEN2, 0x1234_5678)).serial(),
+            Some(12_345_678)
+        );
+        // A non-decimal nibble can't be BCD, so the raw value passes through.
+        assert_eq!(
+            status(aid_with(pgp::MANUFACTURER_ID_TOKEN2, 0x1234_ABCD)).serial(),
+            Some(0x1234_ABCD)
+        );
+        // Any other vendor's serial is a plain integer, decoded verbatim.
+        assert_eq!(
+            status(aid_with(0x0006, 0x1234_5678)).serial(),
+            Some(0x1234_5678)
+        );
+        // Too-short AID still yields no serial rather than panicking.
+        assert_eq!(status(vec![]).serial(), None);
     }
 }

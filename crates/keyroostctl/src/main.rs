@@ -153,10 +153,40 @@ mod json_out {
         /// Yubico GET VERSION's raw reply, dotted (or hex past 4 bytes),
         /// tolerant of any non-empty byte count.
         pub version: Option<String>,
-        pub serial: Option<u32>,
+        /// Ordinarily the Yubico GET SERIAL extension; when a specific
+        /// fingerprint's own probe supplies a serial instead (currently: a
+        /// Nitrokey's admin application), that one is used and GET SERIAL is
+        /// skipped — a Nitrokey answers that extension too, but with a number
+        /// that isn't its real serial. `None` when neither source answers.
+        ///
+        /// A string, not a number: a serial can be up to 128 bits (a
+        /// Nitrokey's admin serial), and a bare JSON number past 2^53 loses
+        /// precision in most consumers. Decimal within `u64`, `0x`-hex
+        /// beyond — the same rendering `piv status`'s text output uses.
+        pub serial: Option<String>,
         pub pin_retries: Option<u8>,
         pub chuid: Option<PivChuidJson>,
         pub slots: Vec<PivSlotJson>,
+        /// Best-effort applet fingerprint — from ATR/SELECT text as well as
+        /// AID-selectability/instruction-support probes; see
+        /// `keyroost_piv::fingerprint` for the full scheme. Its `Display`
+        /// form — e.g. `"YubiKey"` or `"OpenFips201::SwissbitIShield2"`.
+        pub applet_fingerprint: String,
+        /// The token's own reported name, when one was actually discovered
+        /// (currently: a Nitrokey's admin application, for `Trussed::NitroKey`).
+        /// Empty when none was — not backfilled with a generic name for
+        /// `applet_fingerprint`, so an empty string here means specifically
+        /// "the token didn't tell us its name," not "fingerprinting failed."
+        /// (The plain-text `piv status` output does apply that fallback —
+        /// see `run_piv`.)
+        pub applet_name: String,
+        /// The applet's own firmware version, dotted (same formatting as
+        /// `version`), when a specific fingerprint's probe discovered one —
+        /// currently `Trussed::NitroKey` (Trussed's admin application) only.
+        /// Not necessarily equal to `version`, which is the PIV applet's own
+        /// version. `None` when no such probe applies or it found nothing
+        /// parseable.
+        pub version_firmware: Option<String>,
     }
 
     /// The card's CHUID — FASC-N, GUID, expiration, signature, and LRC. The
@@ -1018,10 +1048,15 @@ enum PivCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Delete a slot's private key (Yubico extension; needs YubiKey firmware
-    /// 5.7 or newer). Permanently erases the key material — the certificate
-    /// object is left in place. Needs the management key. DESTRUCTIVE: requires
-    /// `--yes`. Older cards cannot delete a key; overwrite the slot instead.
+    /// Delete a slot's private key (Yubico extension). Permanently erases the
+    /// key material — the certificate object is left in place. Needs the
+    /// management key. DESTRUCTIVE: requires `--yes`.
+    ///
+    /// Key deletion needs YubiKey 5.7+ or a compatible third-party device. A
+    /// per-fingerprint white/blacklist decides up front: on a device known to
+    /// be incompatible it is refused (pass `--force` to run anyway), on an
+    /// unverified device it runs with a warning that it may fail, and on a
+    /// known-good device it just runs.
     DeleteKey {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1033,10 +1068,18 @@ enum PivCmd {
         mgmt_key_stdin: bool,
         #[arg(long)]
         yes: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
-    /// Move a slot's private key to another slot (Yubico MOVE KEY, fw 5.7+).
+    /// Move a slot's private key to another slot (Yubico MOVE KEY).
     /// Non-destructive; refuses an occupied destination. The certificate stays
     /// in the source slot.
+    ///
+    /// Moving keys between slots needs YubiKey 5.7+ or a compatible third-party
+    /// device. The same per-fingerprint white/blacklist as `delete-key`
+    /// applies: refused on a device known to be incompatible unless `--force`,
+    /// run-with-warning on an unverified one, silent on a known-good one.
     MoveKey {
         /// Source slot (9a/9c/9d/9e/82–95).
         #[arg(long)]
@@ -1051,6 +1094,9 @@ enum PivCmd {
         mgmt_key_env: Option<String>,
         #[arg(long)]
         mgmt_key_stdin: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -6101,7 +6147,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .version
                         .as_deref()
                         .map(keyroost_piv::format_version_bytes),
-                    serial: status.serial,
+                    serial: status.serial.map(keyroost_piv::format_serial_short),
                     pin_retries: status.pin_retries,
                     chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
                         fasc_n: c.fasc_n_display(),
@@ -6119,20 +6165,56 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             cert_len: if s.cert_present { s.cert_len } else { 0 },
                         })
                         .collect(),
+                    applet_fingerprint: status.applet_fingerprint.to_string(),
+                    applet_name: status.applet_name.clone(),
+                    version_firmware: status
+                        .version_firmware
+                        .as_deref()
+                        .map(keyroost_piv::format_version_bytes),
                 })?;
                 return Ok(());
             }
 
+            // `applet_name` is only ever the token's own reported name (e.g.
+            // a Nitrokey's admin application) — empty means none was
+            // discovered, not that fingerprinting failed, so
+            // the plain-text line falls back to the fingerprint's generic
+            // display name instead of showing nothing.
+            let applet_name = if status.applet_name.is_empty() {
+                status.applet_fingerprint.applet_name().to_string()
+            } else {
+                status.applet_name.clone()
+            };
+
+            println!(
+                "Applet:      {} ({})",
+                applet_name, status.applet_fingerprint
+            );
             // Tolerant of any non-empty GET VERSION reply, not just real
             // Yubico firmware's 3 bytes — some third-party PIV applets that
             // answer this vendor extension at all use a different byte count
             // (observed: a Swissbit iShield Key 2 Pro replies with 4).
-            match status.version.as_deref() {
-                Some(v) => println!("Version:     {}", keyroost_piv::format_version_bytes(v)),
-                None => println!("Version:     (unavailable)"),
-            }
+            let version_str = status
+                .version
+                .as_deref()
+                .map(keyroost_piv::format_version_bytes)
+                .unwrap_or_else(|| "(unavailable)".to_string());
+            // `version_firmware` is the token's own firmware (read through a
+            // fingerprint-specific probe only some tokens answer — currently
+            // a Nitrokey only), not necessarily the same as the PIV applet's
+            // own version above; a
+            // dedicated line would repeat the applet version for every token
+            // that doesn't distinguish the two, so it's appended here instead
+            // — and only when it actually differs from the applet version.
+            let fw_suffix = status
+                .version_firmware
+                .as_deref()
+                .filter(|fw| Some(*fw) != status.version.as_deref())
+                .map(|fw| format!(" (FW v{})", keyroost_piv::format_version_bytes(fw)))
+                .unwrap_or_default();
+            println!("Version:     {version_str}{fw_suffix}");
             match status.serial {
-                Some(s) => println!("Serial:      {0} (0x{0:08X})", s),
+                Some(s) => println!("Serial:      {}", keyroost_piv::format_serial_long(s)),
                 None => println!("Serial:      (unavailable)"),
             }
             match status.pin_retries {
@@ -6538,6 +6620,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_env,
             mgmt_key_stdin,
             yes,
+            force,
         } => {
             if !yes {
                 return Err(format!(
@@ -6548,7 +6631,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 .into());
             }
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            // Gate on the applet's fingerprint before authenticating — the
+            // fingerprint probe re-SELECTs PIV and would clear the auth.
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            guard_piv_feature(
+                &mut s,
+                keyroost_piv::compat::PivExtension::DeleteKey,
+                *force,
+            )?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.delete_key(slot.to_slot())?;
             println!(
                 "Deleted the private key in {} (the certificate object, if any, remains).",
@@ -6562,9 +6653,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             mgmt_key_env,
             mgmt_key_stdin,
+            force,
         } => {
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
+            let mut s = open_piv(reader.as_deref(), debug)?;
+            guard_piv_feature(&mut s, keyroost_piv::compat::PivExtension::MoveKey, *force)?;
+            authenticate_piv(&mut s, &mgmt)?;
             s.move_key(from.to_slot(), to.to_slot())?;
             println!(
                 "moved the private key {} \u{2192} {}; the certificate remains in {}",
@@ -6601,20 +6695,35 @@ fn open_piv(
     let by_name = reader_from_name()?;
     let name = resolve_reader(readers, reader.or(by_name.as_deref()), "PIV")?;
     eprintln!("\u{2192} PIV on {}", sanitize_terminal(&name));
-    let mut session = keyroost_transport::PivSession::open(&name)?;
-    session.set_debug(debug);
+    // `open_with_debug`, not `open` + `set_debug` — the latter would miss
+    // the initial SELECT this constructor itself issues, since it happens
+    // before `set_debug` ever runs.
+    let session = keyroost_transport::PivSession::open_with_debug(&name, debug)?;
     Ok(session)
 }
 
-/// [`open_piv`], then authenticate the management key against the card's own
-/// algorithm — with a friendly wrong-length message *before* the card sees
-/// anything, instead of a bare transport error afterwards.
+/// [`open_piv`], then [`authenticate_piv`].
 fn open_piv_authed(
     reader: Option<&str>,
     debug: bool,
     mgmt_key: &[u8],
 ) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
     let mut session = open_piv(reader, debug)?;
+    authenticate_piv(&mut session, mgmt_key)?;
+    Ok(session)
+}
+
+/// Authenticate the management key on an already-open [`PivSession`] against
+/// the card's own algorithm — with a friendly wrong-length message *before*
+/// the card sees anything, instead of a bare transport error afterwards.
+///
+/// Split from [`open_piv_authed`] so a caller can do work on the plain session
+/// first (e.g. [`guard_piv_feature`], which must run before auth because its
+/// fingerprint probe re-SELECTs PIV and clears the auth state).
+fn authenticate_piv(
+    session: &mut keyroost_transport::PivSession,
+    mgmt_key: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     // Prefer GET METADATA; when the card stubs it out, probe every GENERAL
     // AUTHENTICATE P1 with a witness request and narrow by key length, rather
     // than blindly assuming 3DES.
@@ -6647,7 +6756,49 @@ fn open_piv_authed(
             })?,
     };
     session.authenticate_management(alg, mgmt_key)?;
-    Ok(session)
+    Ok(())
+}
+
+/// Apply the per-fingerprint white/blacklist ([`keyroost_piv::compat`]) to one
+/// of the Yubico vendor-extension operations before it runs, mirroring the
+/// GUI's three-way gate and reusing its exact wording
+/// ([`keyroost_piv::compat::PivExtension::requirement`] plus a state suffix):
+///
+/// * whitelisted → run, no output;
+/// * unverified → warn `<requirement> <UNVERIFIED_SUFFIX>`, then run;
+/// * blacklisted → fail with `<requirement> <INCOMPATIBLE_SUFFIX> Pass --force
+///   to run anyway.`; with `force`, downgrade that to the same kind of warning
+///   and run.
+///
+/// Must be called on the session **before** management-key auth — it runs a
+/// fingerprint probe that re-SELECTs PIV.
+fn guard_piv_feature(
+    session: &mut keyroost_transport::PivSession,
+    extension: keyroost_piv::compat::PivExtension,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_piv::compat::FeatureGate;
+    let needs = extension.requirement();
+    match session.feature_gate(extension) {
+        FeatureGate::Supported => {}
+        FeatureGate::Unverified => {
+            eprintln!("warning: {needs} {}", FeatureGate::UNVERIFIED_SUFFIX);
+        }
+        FeatureGate::Unsupported if force => {
+            eprintln!(
+                "warning: {needs} {} Running anyway because --force was given.",
+                FeatureGate::INCOMPATIBLE_SUFFIX
+            );
+        }
+        FeatureGate::Unsupported => {
+            return Err(format!(
+                "{needs} {} Pass --force to run anyway.",
+                FeatureGate::INCOMPATIBLE_SUFFIX
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// The `--generate-key` convenience shared by `piv request-cert` / `piv
@@ -9989,12 +10140,58 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::MoveKey { from, to, .. },
+                cmd: PivCmd::MoveKey {
+                    from, to, force, ..
+                },
             }) => {
                 assert_eq!(from.to_slot().key_ref(), 0x9D);
                 assert_eq!(to.to_slot().key_ref(), 0x82);
+                // --force is opt-in; absent here.
+                assert!(!force);
             }
             _ => panic!("expected piv move-key"),
+        }
+    }
+
+    #[test]
+    fn piv_key_ops_take_force_flag() {
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "move-key",
+            "--from",
+            "9d",
+            "--to",
+            "82",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::MoveKey { force, .. },
+            }) => assert!(force),
+            _ => panic!("expected piv move-key"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "delete-key",
+            "--slot",
+            "9a",
+            "--yes",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::DeleteKey { force, yes, .. },
+            }) => {
+                assert!(force);
+                assert!(yes);
+            }
+            _ => panic!("expected piv delete-key"),
         }
     }
 
@@ -10339,7 +10536,7 @@ mod cli_tests {
     fn piv_status_json_serializes() {
         let p = json_out::PivStatusJson {
             version: Some("5.4.3".into()),
-            serial: Some(12345678),
+            serial: Some("12345678".into()),
             pin_retries: Some(3),
             chuid: Some(json_out::PivChuidJson {
                 fasc_n: "d4e739da...".into(),
@@ -10353,8 +10550,23 @@ mod cli_tests {
                 cert_present: true,
                 cert_len: 800,
             }],
+            applet_fingerprint: "YubiKey".into(),
+            applet_name: "YubiKey".into(),
+            version_firmware: Some("3.35.0".into()),
         };
-        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
+        assert_json_has_keys(
+            &p,
+            &[
+                "version",
+                "serial",
+                "pin_retries",
+                "chuid",
+                "slots",
+                "applet_fingerprint",
+                "applet_name",
+                "version_firmware",
+            ],
+        );
     }
 
     #[test]

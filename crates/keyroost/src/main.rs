@@ -2242,9 +2242,25 @@ impl App {
                         let text = path.display().to_string();
                         match target {
                             FileTarget::OpenpgpImport => self.openpgp.import_path = text,
-                            FileTarget::PivCsr => self.piv.csr_path = text,
-                            FileTarget::PivCert => self.piv.cert_path = text,
-                            FileTarget::PivExport => self.piv.export_path = text,
+                            // PIV cert file ops pick the path first, then act:
+                            // CSR and import need a secret, so open their modal;
+                            // export writes straight to the chosen path.
+                            FileTarget::PivCsr => {
+                                self.piv.csr_path = text;
+                                self.piv_cred_modal_close();
+                                self.piv.cred_modal =
+                                    Some(PivCredModal::new(PivCredKind::RequestCsr));
+                            }
+                            FileTarget::PivCert => {
+                                self.piv.cert_path = text;
+                                self.piv_cred_modal_close();
+                                self.piv.cred_modal =
+                                    Some(PivCredModal::new(PivCredKind::ImportCert));
+                            }
+                            FileTarget::PivExport => {
+                                self.piv.export_path = text;
+                                self.piv_export_cert();
+                            }
                             FileTarget::LbExport(idx) => {
                                 use keyroost_ctap::large_blobs::EntryKind;
                                 // The array may have been reloaded, cleared, or
@@ -6948,9 +6964,10 @@ impl App {
     }
 
     /// Permanently delete (erase) the private key in the selected slot.
-    /// Management-key authorized. Needs YubiKey firmware 5.7+; the transport
-    /// version-gates and surfaces `PivFirmwareTooOld` as the error on older
-    /// cards (the pane also hides the button below 5.7 — this is the backstop).
+    /// Management-key authorized. DELETE KEY is a Yubico extension (fw 5.7+);
+    /// the slot panel resolves `keyroost_piv::compat` into a three-way gate
+    /// (enable / warn / dim), and an unsupported card refuses the APDU itself
+    /// — the transport no longer version-gates.
     fn piv_delete_key(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
@@ -7179,17 +7196,10 @@ impl App {
             self.piv.error = Some("enter a name for the certificate request".into());
             return;
         };
+        // The path comes from a native save dialog, which already handled its
+        // own "replace existing file?" prompt — so no empty / clobber checks
+        // here.
         let path = self.piv.csr_path.trim().to_owned();
-        if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the request".into());
-            return;
-        }
-        if std::path::Path::new(&path).exists() {
-            self.piv.error = Some(format!(
-                "{path} already exists — delete it first or choose another name"
-            ));
-            return;
-        }
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
         // See `load_piv_status`: this job opens its own fresh `PivSession`, so
@@ -7238,19 +7248,10 @@ impl App {
             return;
         };
         let slot = self.piv.selected_slot.to_slot();
+        // The path comes from a native save dialog, which already handled its
+        // own "replace existing file?" prompt — so no empty / clobber checks
+        // here.
         let path = self.piv.export_path.trim().to_owned();
-        if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the certificate".into());
-            return;
-        }
-        // Refuse to clobber an existing file — the user can delete it or pick
-        // another name; there is no undo for an overwritten file.
-        if std::path::Path::new(&path).exists() {
-            self.piv.error = Some(format!(
-                "{path} already exists — delete it first or choose another name"
-            ));
-            return;
-        }
         self.piv.notice = None;
         self.spawn_job("Exporting certificate\u{2026}", move || {
             let result = (|| -> Result<usize, TransportError> {
@@ -12599,6 +12600,7 @@ impl App {
                             );
                         }
                         PivCredKind::ImportCert => {
+                            card_note(ui, p, &format!("Reading {}", self.piv.cert_path));
                             self.piv_modal_mgmt_field(ui, p, kind);
                             // Importing only replaces the public certificate
                             // object (no key loss) — a lighter note, not a red
@@ -12624,6 +12626,7 @@ impl App {
                             );
                         }
                         PivCredKind::RequestCsr => {
+                            card_note(ui, p, &format!("Saving to {}", self.piv.csr_path));
                             pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
                             card_note(ui, p, "The PIN authorizes the on-card signature.");
                         }
@@ -13717,6 +13720,7 @@ impl App {
 
     /// PIV tab — read-only status snapshot (auto-read on first view).
     fn cap_piv(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use keyroost_piv::compat::{FeatureGate, PivExtension};
         if !self.piv_tried && !self.busy() {
             self.piv_tried = true;
             self.load_piv_status(LogKind::Background);
@@ -13789,13 +13793,24 @@ impl App {
                     .as_deref()
                     .map(keyroost_piv::format_version_bytes)
                     .unwrap_or_else(|| "\u{2014}".to_string());
-                let serial = st.serial.map_or("\u{2014}".to_string(), |s| s.to_string());
+                let serial = st
+                    .serial
+                    .map_or("\u{2014}".to_string(), keyroost_piv::format_serial_short);
                 let retries = st
                     .pin_retries
                     .map_or("\u{2014}".to_string(), |n| n.to_string());
+                // The token's own reported name when it has one (e.g. a
+                // Nitrokey's admin application); otherwise the generic name
+                // for its fingerprinted applet family — same fallback as
+                // `keyroostctl piv status`'s plain-text output.
+                let applet_name = if st.applet_name.is_empty() {
+                    st.applet_fingerprint.applet_name().to_string()
+                } else {
+                    st.applet_name.clone()
+                };
                 ui.label(
                     egui::RichText::new(format!(
-                        "Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
+                        "{applet_name} \u{00B7} Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
                     ))
                     .font(theme::f_reg(12.5))
                     .color(p.txt2),
@@ -14010,14 +14025,92 @@ impl App {
             &self.piv.slot_keys,
             self.piv.retired_occupancy.as_deref(),
         );
-        // Key deletion (Yubico MOVE/DELETE KEY) needs firmware 5.7+. The
-        // transport version-gates as a backstop; here we hide the button (and
-        // explain) when the loaded status reports an older — or unknown —
-        // version. Clearing a certificate works everywhere.
-        let can_delete_key = matches!(
-            self.piv.status.as_ref().and_then(|s| s.version.as_deref()),
-            Some(v) if v >= [5, 7].as_slice()
+        // Whether the active slot holds an X.509 certificate — gates Export.
+        // Standard slots read `status.slots`; retired slots carry no cert
+        // signal in the loaded state, and neither does the pane before its
+        // first status read, so both resolve optimistically (the button stays
+        // live and the low-level "slot holds no certificate" error still
+        // guards). Only a standard slot the card has read and found certless
+        // dims the button.
+        let selected_has_cert = match selected {
+            PivSlotSel::Retired(_) => true,
+            _ => {
+                !self.piv.loaded
+                    || self.piv.status.as_ref().is_some_and(|s| {
+                        s.slots
+                            .iter()
+                            .any(|sl| sl.slot == selected.to_slot() && sl.cert_present)
+                    })
+            }
+        };
+        // Move key / Delete key are Yubico extensions (MOVE/DELETE KEY), not
+        // SP 800-73-4. `keyroost_piv::compat` resolves a per-fingerprint
+        // white/blacklist against the applet's reported version into a
+        // three-way gate: enable, enable-but-flag (support unverified on this
+        // device), or dim. An unsupported card refuses the APDU on its own —
+        // there is no transport-side version gate any more. Clearing a
+        // certificate is standard PIV and works everywhere.
+        let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+            (
+                keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                None,
+                None,
+            ),
+            |s| {
+                (
+                    s.applet_fingerprint,
+                    s.version.as_deref(),
+                    s.version_firmware.as_deref(),
+                )
+            },
         );
+        let move_key_gate =
+            keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver, piv_fw_ver);
+        let delete_key_gate =
+            keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
+        // Explanations for the non-standard slot operations when the
+        // fingerprint white/blacklist can't clear them — built from the shared
+        // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
+        // same thing: the extension's `requirement()` sentence, then a state
+        // suffix. Each string is a hover: on the \u{26a0} marker by the row's
+        // help dot for Unverified, on the dimmed button for Unsupported.
+        // "Key deletion" / "Moving keys" keep each distinct from the Delete
+        // row's other button, "Delete certificate\u{2026}" — and the Delete-key
+        // \u{26a0} hover additionally appends that "Delete certificate" is
+        // standard PIV and unaffected (see the hover call site).
+        let move_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::MoveKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let move_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::MoveKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        let delete_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::DeleteKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let delete_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::DeleteKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        // Both certificate actions below (self-sign into the slot, and sign a
+        // CSR) are signed *by this slot's key*. With no key there is nothing to
+        // sign with and the on-card step fails deep in the flow ("slot has no
+        // key…"), so the buttons are dimmed until a key is present and say why
+        // on hover — same treatment as the Move/Delete-key rows.
+        let no_slot_key_hint = "This slot has no key. Generate a key in this slot first \u{2014} \
+             a self-signed certificate and a CSR are both signed by it.";
+        let no_slot_cert_hint =
+            "This slot holds no certificate to export. Import one, or create a self-signed \
+             certificate above.";
+        let no_move_key_hint =
+            "This slot has no key to move \u{2014} generate one in this slot first.";
+        let no_del_cert_hint = "This slot holds no certificate to delete.";
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
         // (Passkeys / Settings / Storage): an opaque surface strip behind a row
@@ -14236,8 +14329,12 @@ impl App {
             }
 
             ui.add_space(12.0);
-            // --- Certificate: subject/validity inputs, then the two
-            // issue actions each right-aligned on their own row.
+            // --- Certificate: subject/validity inputs, then both issue actions
+            // on one right-aligned row — "Sign & save CSR" then "Self-signed ->
+            // slot". Each is signed by the slot's key, so both dim with the same
+            // reason when the slot has none. "Sign & save CSR" opens a save
+            // dialog first (see `drain_file_dialogs`); "Self-signed -> slot"
+            // opens the PIN / management-key modal.
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Certificate")
@@ -14257,160 +14354,136 @@ impl App {
                 300.0,
             );
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Valid for")
-                        .font(theme::f_reg(13.0))
-                        .color(p.txt2),
+                // Same 96px label column `text_field` uses for the "Name" row
+                // above, so this label lines up with it and the input below
+                // starts at the same x.
+                ui.add_sized(
+                    [96.0, 22.0],
+                    egui::Label::new(
+                        egui::RichText::new("Valid for")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt2),
+                    ),
                 );
                 ui.add(
                     egui::DragValue::new(&mut self.piv.cert_days)
                         .range(1..=keyroost_piv::max_valid_days(u64::from(unix_now())))
                         .suffix(" days"),
                 );
+                // right_to_left: add "Self-signed" first so it sits at the far
+                // right, then "Sign & save CSR" to its left.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
-                    {
-                        open_self_sign = true;
-                    }
-                });
-            });
-            ui.add_space(6.0);
-            let mut save_csr = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "CSR file",
-                    &mut self.piv.csr_path,
-                    "/path/to/request.csr",
-                    240.0,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
-                        open_csr = true;
+                    if selected_has_key {
+                        if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
+                            .clicked()
+                        {
+                            open_self_sign = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
+                            .on_hover_text(no_slot_key_hint);
                     }
                     ui.add_space(8.0);
-                    save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                    if selected_has_key {
+                        if theme::button(ui, p, BtnKind::Default, "Sign & save CSR\u{2026}")
+                            .clicked()
+                        {
+                            open_csr = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Sign & save CSR\u{2026}")
+                            .on_hover_text(no_slot_key_hint);
+                    }
                 });
             });
-            if save_csr {
-                self.spawn_file_dialog(
-                    FileTarget::PivCsr,
-                    true,
-                    &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
-                    Some("request.csr"),
-                );
-            }
 
             ui.add_space(12.0);
-            // --- Import cert: file path + Browse/Import right-aligned.
+            // --- Import / Export cert: both buttons on one right-aligned row,
+            // "Import certificate" then "Export certificate". Import opens a
+            // file picker then the management-key modal; Export opens a save
+            // dialog and writes straight to the chosen path — no secret (see
+            // `drain_file_dialogs`). Export dims when the slot holds no cert.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Import cert")
+                    egui::RichText::new("Import/Export cert")
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-import");
-            });
-            ui.add_space(6.0);
-            let mut browse_cert = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "File",
-                    &mut self.piv.cert_path,
-                    "/path/to/cert.pem",
-                    240.0,
-                );
+                self.help_dot(ui, p, "piv-import-export");
+                // right_to_left: add "Export" first so it sits at the far
+                // right, then "Import" to its left.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
+                    if selected_has_cert {
+                        if theme::button(ui, p, BtnKind::Default, "Export certificate\u{2026}")
+                            .clicked()
+                        {
+                            go_export = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Export certificate\u{2026}")
+                            .on_hover_text(no_slot_cert_hint);
+                    }
+                    ui.add_space(8.0);
+                    if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
+                        .clicked()
+                    {
                         open_import = true;
                     }
-                    ui.add_space(8.0);
-                    browse_cert =
-                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
                 });
             });
-            if browse_cert {
-                self.spawn_file_dialog(
-                    FileTarget::PivCert,
-                    false,
-                    &[
-                        ("Certificates", &["pem", "der", "crt", "cer"]),
-                        ("All files", &["*"]),
-                    ],
-                    None,
-                );
-            }
-
-            ui.add_space(12.0);
-            // --- Export cert: destination path + Save/Export right.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Export cert")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-export");
-            });
-            ui.add_space(6.0);
-            let mut save_export = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "Destination",
-                    &mut self.piv.export_path,
-                    "/path/to/out.der",
-                    240.0,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
-                        go_export = true;
-                    }
-                    ui.add_space(8.0);
-                    save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
-                });
-            });
-            if save_export {
-                self.spawn_file_dialog(
-                    FileTarget::PivExport,
-                    true,
-                    &[
-                        ("Certificate (DER)", &["der", "cer"]),
-                        ("Certificate (PEM)", &["pem", "crt"]),
-                        ("All files", &["*"]),
-                    ],
-                    Some("cert.der"),
-                );
-            }
 
             ui.add_space(12.0);
             // --- Move key: its own row, above Delete. It used to be a button
             // inside the Delete row, which put a deliberately non-destructive
             // action under a destructive heading and left it sharing the delete
             // help text — the one place a user checking "is this safe?" would
-            // look. Same 5.7+ gate as delete, plus a key in the active slot.
-            if can_delete_key && selected_has_key {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Move key")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-move");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
-                            open_move_key = true;
+            // look. The row is always shown so the capability stays
+            // discoverable; the button is dimmed with a hover reason when the
+            // slot has no key to move, or on pre-5.7 firmware.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Move key")
+                        .font(theme::f_sb(13.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                self.help_dot(ui, p, "piv-move");
+                // Support-unverified warning sits right after the help dot, by
+                // the operation's own explanation — not out by the button. It
+                // reflects the device's MOVE KEY support, so it shows whether or
+                // not this slot currently has a key for the button to act on
+                // (the button may be dimmed for "no key" underneath it).
+                if matches!(move_key_gate, FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match move_key_gate {
+                        // Blacklisted on this device wins over "no key": the
+                        // firmware reason is the one the user has to resolve
+                        // first, and it holds whether or not the slot is empty.
+                        FeatureGate::Unsupported => {
+                            theme::button_disabled(ui, p, "Move key\u{2026}")
+                                .on_hover_text(move_key_blocked_hint.as_str());
                         }
-                    });
+                        // Unverified still runs — the card refuses if it truly
+                        // can't — so the button stays live where there is a key;
+                        // only the warning above marks the doubt.
+                        FeatureGate::Supported | FeatureGate::Unverified => {
+                            if !selected_has_key {
+                                theme::button_disabled(ui, p, "Move key\u{2026}")
+                                    .on_hover_text(no_move_key_hint);
+                            } else if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}")
+                                .clicked()
+                            {
+                                open_move_key = true;
+                            }
+                        }
+                    }
                 });
-                ui.add_space(12.0);
-            }
+            });
+            ui.add_space(12.0);
             // --- Delete: bold label + help left, the two delete
             // actions right-aligned (Delete key is Danger, gated 5.7+).
             ui.horizontal(|ui| {
@@ -14421,24 +14494,56 @@ impl App {
                 );
                 ui.add_space(6.0);
                 self.help_dot(ui, p, "piv-delete");
+                // Support-unverified warning for "Delete key" sits here, beside
+                // the row's help dot — not out by the button — so its hover
+                // text names "Delete key" explicitly and spells out that
+                // "Delete certificate" (the other button on this row) is
+                // standard PIV and unaffected.
+                if matches!(delete_key_gate, FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p).on_hover_text(format!(
+                        "{delete_key_unverified_hint} \u{201c}Delete certificate\u{201d} is \
+                         standard PIV and unaffected."
+                    ));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if can_delete_key {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
-                            open_delete_key = true;
+                    match delete_key_gate {
+                        // Unverified still runs — the card refuses if it truly
+                        // can't — so the button stays live; only the warning by
+                        // the help dot marks the doubt.
+                        FeatureGate::Supported | FeatureGate::Unverified => {
+                            if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked()
+                            {
+                                open_delete_key = true;
+                            }
                         }
-                        ui.add_space(6.0);
+                        FeatureGate::Unsupported => {
+                            // Kept visible but dimmed on pre-5.7 firmware so the
+                            // action is discoverable; the hover text says why it
+                            // can't run yet.
+                            theme::button_disabled(ui, p, "Delete key\u{2026}")
+                                .on_hover_text(delete_key_blocked_hint.as_str());
+                        }
                     }
-                    if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
-                        .clicked()
-                    {
-                        open_delete_cert = true;
+                    ui.add_space(6.0);
+                    // "Delete certificate" is standard PIV, so no firmware gate
+                    // — but like Export it needs a certificate to act on. Same
+                    // cert-presence signal, same optimistic fallback for retired
+                    // slots / pre-first-read. "Delete key" is deliberately not
+                    // gated: without GET METADATA key presence is unknown, and a
+                    // stale key is still worth an attempt to erase.
+                    if selected_has_cert {
+                        if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                            .clicked()
+                        {
+                            open_delete_cert = true;
+                        }
+                    } else {
+                        theme::button_disabled(ui, p, "Delete certificate\u{2026}")
+                            .on_hover_text(no_del_cert_hint);
                     }
                 });
             });
-            if !can_delete_key {
-                ui.add_space(4.0);
-                note(ui, "Key deletion needs YubiKey 5.7+.");
-            }
         });
         ui.add_space(12.0);
 
@@ -14498,26 +14603,48 @@ impl App {
         // The management-key-gated operations open the centered credential modal
         // (which collects their secrets and runs the op on Submit) rather than
         // running directly. Opening wipes any stale secret fields first so a
-        // fresh dialog starts blank. Export needs no secret, so it still runs
-        // inline.
+        // fresh dialog starts blank.
         if open_generate {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::GenerateKey));
         }
+        // Import / Export / CSR ask for the file first; the picked path is
+        // routed by `drain_file_dialogs`, which then opens the secret modal
+        // (import, CSR) or runs the write straight away (export).
         if open_import {
-            self.piv_cred_modal_close();
-            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportCert));
+            self.spawn_file_dialog(
+                FileTarget::PivCert,
+                false,
+                &[
+                    ("Certificates", &["pem", "der", "crt", "cer"]),
+                    ("All files", &["*"]),
+                ],
+                None,
+            );
         }
         if go_export {
-            self.piv_export_cert();
+            self.spawn_file_dialog(
+                FileTarget::PivExport,
+                true,
+                &[
+                    ("Certificate (DER)", &["der", "cer"]),
+                    ("Certificate (PEM)", &["pem", "crt"]),
+                    ("All files", &["*"]),
+                ],
+                Some("cert.der"),
+            );
         }
         if open_self_sign {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::SelfSign));
         }
         if open_csr {
-            self.piv_cred_modal_close();
-            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::RequestCsr));
+            self.spawn_file_dialog(
+                FileTarget::PivCsr,
+                true,
+                &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
+                Some("request.csr"),
+            );
         }
         if open_set_retries {
             self.piv_cred_modal_close();

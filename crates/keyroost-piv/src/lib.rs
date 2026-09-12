@@ -23,6 +23,8 @@
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
 use zeroize::Zeroizing;
 
+pub mod compat;
+pub mod fingerprint;
 pub mod spki;
 pub mod x509;
 pub mod x509_parse;
@@ -594,12 +596,22 @@ pub fn select_full() -> Vec<u8> {
 /// comment for why both exist.
 #[must_use]
 pub fn select() -> Vec<u8> {
+    select_by_aid(&AID)
+}
+
+/// SELECT an arbitrary application `aid`. Case 4 — a trailing `Le` requests
+/// whatever FCI/application-property-template the card returns on success.
+/// [`select`] and [`select_full`] are both one-line callers; also used
+/// directly to probe for a second applet's presence (e.g.
+/// [`fingerprint::SWISSBIT_RID`]) without a dedicated builder.
+#[must_use]
+pub fn select_by_aid(aid: &[u8]) -> Vec<u8> {
     let mut apdu = build_apdu(
         0x00,
         Instruction::Select.code(),
         INS_SELECT_P1_BY_AID,
         0x00,
-        &AID,
+        aid,
     );
     apdu.push(0x00); // case-4 Le
     apdu
@@ -1409,10 +1421,10 @@ pub fn unwrap_data_object(buf: &[u8]) -> Result<&[u8], ParseError> {
 }
 
 /// Format a Yubico `GET VERSION` reply for display — tolerant of any
-/// non-empty length. Feature gates on the transport side (`move_key_supported`
-/// et al.) compare the same raw bytes directly as a slice rather than parsing
-/// them into a fixed-width tuple first, so there's no separate strict parse
-/// to defer to here either. Up to 4 bytes still reads as a version number, so
+/// non-empty length. The feature white/blacklist ([`compat::resolve`])
+/// compares the same raw bytes directly as a slice rather than parsing them
+/// into a fixed-width tuple first, so there's no separate strict parse to
+/// defer to here either. Up to 4 bytes still reads as a version number, so
 /// it's dot-joined as decimal (`major.minor.patch[...]`, covering both real
 /// Yubico firmware's 3 bytes and small vendor variants like a 4-byte reply
 /// observed from a Swissbit OpenFIPS201 build). Past 4 bytes, dot-joining
@@ -1431,11 +1443,52 @@ pub fn format_version_bytes(bytes: &[u8]) -> String {
     }
 }
 
-/// Parse a Yubico GET SERIAL reply (4-byte big-endian).
-pub fn parse_serial(buf: &[u8]) -> Result<u32, ParseError> {
-    match buf {
-        [a, b, c, d] => Ok(u32::from_be_bytes([*a, *b, *c, *d])),
-        _ => Err(ParseError::BadResponse("serial is not 4 bytes")),
+/// Parse a device serial number reply as an unsigned big-endian integer of
+/// whatever length the card actually sent, zero-extended on the left into a
+/// `u128`. Not fixed at 4 bytes: real Yubico firmware's GET SERIAL answers
+/// with a 4-byte `u32`, but other vendors' PIV applets that answer the same
+/// Yubico extension (or their own proprietary serial commands) use different
+/// widths — observed both an 8-byte native `u64` (Swissbit iShield Key Pro,
+/// answering the Yubico extension itself) and a 16-byte native `u128`
+/// (Nitrokey's admin application). `Err` only when the reply is too long to
+/// fit a `u128` (more than 16 bytes) — there's no way to widen further.
+pub fn parse_serial(buf: &[u8]) -> Result<u128, ParseError> {
+    // An empty body is "no serial", not serial 0: a card that answers GET
+    // SERIAL with `9000` and nothing must read as unavailable, the way it
+    // did when this parser only accepted exactly four bytes.
+    if buf.is_empty() {
+        return Err(ParseError::BadResponse("serial is empty"));
+    }
+    if buf.len() > 16 {
+        return Err(ParseError::BadResponse("serial is more than 16 bytes"));
+    }
+    let mut widened = [0u8; 16];
+    widened[16 - buf.len()..].copy_from_slice(buf);
+    Ok(u128::from_be_bytes(widened))
+}
+
+/// Format a PIV serial for a text terminal: decimal with the hex form
+/// parenthesized, matching every serial observed so far (all of them fit
+/// 64 bits). Past 64 bits — currently only reachable via Nitrokey's own
+/// 128-bit admin serial command — the decimal expansion is unwieldy and no
+/// vendor prints a serial that large in decimal, so those display as hex
+/// alone, with no parenthetical.
+pub fn format_serial_long(serial: u128) -> String {
+    if serial > u128::from(u64::MAX) {
+        format!("0x{serial:X}")
+    } else {
+        format!("{serial} (0x{serial:08X})")
+    }
+}
+
+/// Format a PIV serial for a compact UI label: decimal for a serial that
+/// fits 64 bits, hex for one that doesn't — see [`format_serial_long`] for
+/// why.
+pub fn format_serial_short(serial: u128) -> String {
+    if serial > u128::from(u64::MAX) {
+        format!("0x{serial:X}")
+    } else {
+        serial.to_string()
     }
 }
 
@@ -1503,9 +1556,45 @@ pub fn parse_metadata(buf: &[u8]) -> Result<Metadata, ParseError> {
 
 /// Find the value of the first top-level TLV with single-byte `tag` in `buf`.
 /// Public so the transport layer can reuse it instead of growing its own
-/// BER-TLV walker.
+/// BER-TLV walker. A thin pin of [`find_tlv_recursive_with_limit`] at
+/// `recursion_limit = 0` — i.e. it never descends into a constructed TLV,
+/// only ever scanning the top level.
 #[must_use]
 pub fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
+    find_tlv_recursive_with_limit(buf, tag, 0)
+}
+
+/// How many constructed layers [`find_tlv_recursive`] descends. The FCI a
+/// SELECT response carries nests its objects one or two levels deep (`6F`
+/// wrapping `A5` wrapping the tag), so four is generous for every applet
+/// seen — and it is a hard ceiling, not a hint: the walker recurses on bytes
+/// the card sent, and without a cap a hostile or broken card answering with
+/// deeply nested constructed tags would recurse once per byte of its reply
+/// (a chained SELECT response can run to tens of kilobytes), overflowing the
+/// stack of whatever thread asked for status.
+pub const MAX_TLV_DEPTH: u8 = 4;
+
+/// Like [`find_tlv`], but descends into constructed TLVs (tag bit `0x20`
+/// set) when the target isn't found at the current level, at most
+/// [`MAX_TLV_DEPTH`] layers down. Used by [`fingerprint::select_identity`]
+/// to find tag `0x50` (Application Label) wherever a vendor put it. All tags
+/// handled here are single-byte (no multi-byte BER tag numbers appear in a
+/// PIV FCI), same as [`find_tlv`].
+#[must_use]
+pub fn find_tlv_recursive(buf: &[u8], tag: u8) -> Option<&[u8]> {
+    find_tlv_recursive_with_limit(buf, tag, MAX_TLV_DEPTH)
+}
+
+/// The shared walker behind [`find_tlv`] (`recursion_limit = 0`) and
+/// [`find_tlv_recursive`] (`recursion_limit = MAX_TLV_DEPTH`): finds the
+/// value of the first TLV with single-byte `tag`, descending into constructed
+/// TLVs (tag bit `0x20` set) when the target isn't found at the current
+/// level. `recursion_limit` is reduced by one on every recursive step and no
+/// further descent is attempted once it reaches zero — so `0` is exactly
+/// [`find_tlv`]'s top-level-only behaviour, and `1` looks one constructed
+/// layer deep and no further. There is deliberately no "unbounded" mode.
+#[must_use]
+pub fn find_tlv_recursive_with_limit(buf: &[u8], tag: u8, recursion_limit: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i < buf.len() {
         let t = buf[i];
@@ -1515,6 +1604,13 @@ pub fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
         let value = buf.get(vstart..vend)?;
         if t == tag {
             return Some(value);
+        }
+        if recursion_limit != 0 && t & 0x20 != 0 {
+            let found =
+                find_tlv_recursive_with_limit(value, tag, recursion_limit.saturating_sub(1));
+            if found.is_some() {
+                return found;
+            }
         }
         i = vend;
     }
@@ -1731,8 +1827,48 @@ mod tests {
 
     #[test]
     fn parse_serial_values() {
+        // Standard 4-byte Yubico reply, widened to u128.
         assert_eq!(parse_serial(&[0x02, 0x40, 0x8A, 0x1B]).unwrap(), 0x02408A1B);
-        assert!(parse_serial(&[0x00, 0x01]).is_err());
+        // A short reply widens the same way (2 bytes here).
+        assert_eq!(parse_serial(&[0x00, 0x01]).unwrap(), 1);
+        // 8-byte native-u64 reply (observed: Swissbit iShield Key Pro).
+        assert_eq!(
+            parse_serial(&[0x00, 0x15, 0x67, 0xED, 0x52, 0x81, 0x14, 0xC0]).unwrap(),
+            0x0015_67ED_5281_14C0
+        );
+        // 16-byte native-u128 reply (observed: Nitrokey's admin application).
+        assert_eq!(
+            parse_serial(&[
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10
+            ])
+            .unwrap(),
+            0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10
+        );
+        // Empty is "no serial", never serial 0 — a `9000` with an empty body
+        // must surface as unavailable, not as a real-looking value.
+        assert!(parse_serial(&[]).is_err());
+        // 17 bytes can't fit a u128.
+        assert!(parse_serial(&[0u8; 17]).is_err());
+    }
+
+    #[test]
+    fn format_serial_switches_to_hex_past_64_bits() {
+        assert_eq!(format_serial_long(12345678), "12345678 (0x00BC614E)");
+        assert_eq!(format_serial_short(12345678), "12345678");
+        // u64::MAX itself is still the decimal/hex-parenthesized form.
+        assert_eq!(
+            format_serial_long(u128::from(u64::MAX)),
+            "18446744073709551615 (0xFFFFFFFFFFFFFFFF)"
+        );
+        assert_eq!(
+            format_serial_short(u128::from(u64::MAX)),
+            "18446744073709551615"
+        );
+        // One past u64::MAX switches both forms to hex-only, no parenthetical.
+        let past_64_bits = u128::from(u64::MAX) + 1;
+        assert_eq!(format_serial_long(past_64_bits), "0x10000000000000000");
+        assert_eq!(format_serial_short(past_64_bits), "0x10000000000000000");
     }
 
     #[test]
@@ -2514,5 +2650,94 @@ mod tests {
         // truncated long form
         assert_eq!(read_ber_len(&[0x82, 0x01]), Err(ParseError::Truncated));
         assert_eq!(read_ber_len(&[]), Err(ParseError::Truncated));
+    }
+
+    // --- find_tlv / find_tlv_recursive / find_tlv_recursive_with_limit -----
+    //
+    // A target tag `0x80` nested two constructed (`0x30`) layers deep:
+    // `30 05 30 03 80 01 AB` — outer `30` wraps a `30 03 80 01 AB`, which
+    // itself wraps the target `80 01 AB`. Reaching the target needs two
+    // recursive steps (one per enclosing `0x30`).
+
+    const NESTED_TLV: &[u8] = &[0x30, 0x05, 0x30, 0x03, 0x80, 0x01, 0xAB];
+
+    #[test]
+    fn find_tlv_only_scans_the_top_level() {
+        // A top-level match still works...
+        assert_eq!(find_tlv(&[0x80, 0x01, 0xAB], 0x80), Some(&[0xAB][..]));
+        // ...but a nested one does not, even one level down.
+        assert_eq!(find_tlv(NESTED_TLV, 0x80), None);
+    }
+
+    #[test]
+    fn find_tlv_recursive_descends_up_to_max_depth() {
+        assert_eq!(find_tlv_recursive(NESTED_TLV, 0x80), Some(&[0xAB][..]));
+    }
+
+    /// Wrap `inner` in `depth` constructed (`0x30`) layers.
+    fn nest(inner: &[u8], depth: usize) -> Vec<u8> {
+        let mut v = inner.to_vec();
+        for _ in 0..depth {
+            assert!(v.len() < 0x80, "test helper only builds short-form lengths");
+            let mut outer = vec![0x30, v.len() as u8];
+            outer.extend_from_slice(&v);
+            v = outer;
+        }
+        v
+    }
+
+    #[test]
+    fn find_tlv_recursive_stops_at_max_depth() {
+        let target = [0x80, 0x01, 0xAB];
+        // Exactly MAX_TLV_DEPTH layers down is still reachable...
+        let reachable = nest(&target, usize::from(MAX_TLV_DEPTH));
+        assert_eq!(find_tlv_recursive(&reachable, 0x80), Some(&[0xAB][..]));
+        // ...one deeper is not: the cap is a hard ceiling, not a hint.
+        let too_deep = nest(&target, usize::from(MAX_TLV_DEPTH) + 1);
+        assert_eq!(find_tlv_recursive(&too_deep, 0x80), None);
+    }
+
+    #[test]
+    fn find_tlv_recursive_survives_pathological_nesting() {
+        // A reply made of nothing but nested constructed tags, as deep as
+        // the short-form length allows chained together: `30 7F 30 7F …`.
+        // Without a depth cap this recursed once per byte.
+        let hostile: Vec<u8> = core::iter::repeat_n([0x30, 0x7F], 20_000)
+            .flatten()
+            .collect();
+        assert_eq!(find_tlv_recursive(&hostile, 0x50), None);
+    }
+
+    #[test]
+    fn find_tlv_recursive_with_limit_zero_matches_find_tlv() {
+        assert_eq!(find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 0), None);
+        assert_eq!(
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 0),
+            find_tlv(NESTED_TLV, 0x80)
+        );
+    }
+
+    #[test]
+    fn find_tlv_recursive_with_limit_counts_down_one_layer_at_a_time() {
+        // The target sits two constructed layers deep: limit 1 isn't enough...
+        assert_eq!(find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 1), None);
+        // ...limit 2 reaches it exactly...
+        assert_eq!(
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 2),
+            Some(&[0xAB][..])
+        );
+        // ...and any higher limit still finds it.
+        assert_eq!(
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 5),
+            Some(&[0xAB][..])
+        );
+    }
+
+    #[test]
+    fn find_tlv_recursive_is_the_max_depth_pin() {
+        assert_eq!(
+            find_tlv_recursive(NESTED_TLV, 0x80),
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, MAX_TLV_DEPTH)
+        );
     }
 }

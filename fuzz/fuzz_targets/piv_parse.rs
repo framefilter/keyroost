@@ -15,4 +15,25 @@ fuzz_target!(|data: &[u8]| {
     // CHUID read-back (#102): the card hands back the object new-chuid wrote,
     // and `piv status` parses whatever any card serves under that tag.
     let _ = keyroost_piv::parse_chuid(data);
+    // Applet fingerprinting (#128): every byte here comes from the card —
+    // the ATR's historical bytes (COMPACT-TLV), the SELECT FCI (nested BER,
+    // walked recursively — depth-capped, which this target guards), and the
+    // Nitrokey admin application's status / version-string replies.
+    let _ = keyroost_piv::find_tlv_recursive(data, 0x50);
+    let _ = keyroost_piv::find_tlv(data, 0x50);
+    let atr_id = keyroost_piv::fingerprint::atr_historical_bytes(data)
+        .and_then(keyroost_piv::fingerprint::atr_identity);
+    let sel_id = keyroost_piv::fingerprint::select_identity(data);
+    let _ = keyroost_piv::fingerprint::wants_swissbit_probe(sel_id.as_deref());
+    let _ = keyroost_piv::fingerprint::classify(
+        atr_id.as_deref(),
+        sel_id.as_deref(),
+        data.first().is_some_and(|b| b & 1 != 0),
+        data.first().is_some_and(|b| b & 2 != 0),
+        data.first().is_some_and(|b| b & 4 != 0),
+    );
+    let _ = keyroost_piv::fingerprint::parse_nitrokey_variant(data);
+    let _ = keyroost_piv::fingerprint::parse_ascii_text(data)
+        .and_then(|s| keyroost_piv::fingerprint::parse_dotted_version(&s));
+    let _ = keyroost_piv::fingerprint::format_yubikey_name(data);
 });

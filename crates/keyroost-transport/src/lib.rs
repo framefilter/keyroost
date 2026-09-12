@@ -142,9 +142,6 @@ pub enum TransportError {
     /// *accepted*: RESET RETRY COUNTER really ran, so the card's PIN was
     /// rewritten to a known value and unblocked.
     PivPukGuessAccepted,
-    /// A PIV operation needs a newer firmware than the card reports. Carries the
-    /// human-readable operation that was attempted.
-    PivFirmwareTooOld(&'static str),
     /// A PIV MOVE KEY refused because the destination slot already holds a key
     /// (GET METADATA pre-check, ahead of the card's own refusal).
     PivDestinationOccupied(keyroost_piv::Slot),
@@ -297,9 +294,6 @@ impl fmt::Display for TransportError {
                  (`keyroostctl piv change-pin`) before running the factory reset \
                  again."
             ),
-            TransportError::PivFirmwareTooOld(op) => {
-                write!(f, "{}", op)
-            }
             TransportError::PivDestinationOccupied(slot) => write!(
                 f,
                 "slot {} already holds a key — delete it first or pick an empty slot",
@@ -1095,6 +1089,28 @@ fn read_channel_id(card: &Card) -> (Option<u8>, Option<u8>) {
     }
 }
 
+/// Decode a serial that the device reports in BCD coding: read the raw value's
+/// nibbles most-significant first and accumulate `acc * 10 + nibble`, rather
+/// than trusting the raw integer's own value. Some applets (Token2's PIV and
+/// OpenPGP; see [`piv`] and [`openpgp`]) do this — each nibble of the reply is
+/// one decimal digit of the number printed on the unit. Apply this only to a
+/// serial from a device known to use BCD coding — running it over an ordinary
+/// integer serial would corrupt a perfectly good number. Fails safe: a nibble
+/// outside `0..=9` isn't a decimal digit, so the raw serial is returned
+/// unchanged rather than a bad conversion being forced through. (32 decimal
+/// digits max out below `u128::MAX`, so the accumulation cannot overflow.)
+pub(crate) fn decode_bcd_serial(serial: u128) -> u128 {
+    let mut decoded: u128 = 0;
+    for shift in (0..u128::BITS).step_by(4).rev() {
+        let nibble = (serial >> shift) & 0xF;
+        if nibble > 9 {
+            return serial;
+        }
+        decoded = decoded * 10 + nibble;
+    }
+    decoded
+}
+
 /// Read the YubiKey management serial by selecting the OTP applet and issuing
 /// its device-serial API request. Returns the serial as its decimal string.
 fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
@@ -1794,5 +1810,23 @@ mod redaction_tests {
         }
         assert!(!molto2_cmd_sensitive(&[0x80, 0x41, 0x00, 0x00, 0x00]));
         assert!(!molto2_cmd_sensitive(&[]));
+    }
+
+    #[test]
+    fn decode_bcd_serial_reads_nibbles_as_decimal_digits() {
+        // Every nibble is a decimal digit: 0x1234 -> digits 1,2,3,4 -> 1234.
+        assert_eq!(decode_bcd_serial(0x1234), 1234);
+        // Leading zero nibbles just contribute nothing to the accumulator.
+        assert_eq!(decode_bcd_serial(0x0009_0009), 90009);
+        // A nibble outside 0-9 isn't a decimal digit, so the decode fails safe
+        // and the raw value passes through unchanged.
+        assert_eq!(decode_bcd_serial(0xABCD), 0xABCD);
+        // Zero round-trips trivially either way.
+        assert_eq!(decode_bcd_serial(0), 0);
+        // A full 32-nibble all-nines serial decodes without overflowing u128.
+        assert_eq!(
+            decode_bcd_serial(0x9999_9999_9999_9999_9999_9999_9999_9999),
+            99_999_999_999_999_999_999_999_999_999_999
+        );
     }
 }

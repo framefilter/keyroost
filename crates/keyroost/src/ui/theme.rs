@@ -396,6 +396,55 @@ pub fn button(ui: &mut egui::Ui, p: &Palette, kind: BtnKind, label: &str) -> Res
     resp
 }
 
+/// A visibly disabled sibling of [`button`]: same footprint and rounded shape,
+/// painted muted, with no hover-lift, no pressed state, and no click sense — but
+/// it still senses hover, so the caller can hang an `.on_hover_text(…)` that
+/// says why the action is unavailable. Prefer this over hiding a control the
+/// user should still know is there.
+pub fn button_disabled(ui: &mut egui::Ui, p: &Palette, label: &str) -> Response {
+    let fg = p.txt3;
+    let font = f_sb(13.0);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, fg);
+    let pad_x = 14.0;
+    let size = egui::vec2(galley.size().x + pad_x * 2.0, 32.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(8),
+        tint(p.raised2, 90),
+        Stroke::new(1.0, p.line_soft),
+        StrokeKind::Inside,
+    );
+    let galley = painter.layout_no_wrap(label.to_owned(), f_sb(13.0), fg);
+    painter.galley(rect.center() - galley.size() * 0.5, galley, fg);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+    }
+    resp
+}
+
+/// A small ⚠ glyph in the warning colour that senses hover, so the caller can
+/// hang an `.on_hover_text(…)` on the returned [`Response`]. For flagging a
+/// control that stays usable but carries a caveat — e.g. a non-standard
+/// command whose support on the connected device is unverified — next to
+/// [`button`] rather than dimming it with [`button_disabled`].
+pub fn warn_marker(ui: &mut egui::Ui, p: &Palette) -> Response {
+    let resp = ui.add(
+        egui::Label::new(
+            egui::RichText::new("\u{26A0}")
+                .font(f_sb(13.0))
+                .color(p.warn),
+        )
+        .sense(egui::Sense::hover()),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
+    }
+    resp
+}
+
 /// Like [`button`], but reserves room for a small icon on the left, inside the
 /// button. Returns the response and the center point at which the caller should
 /// paint the icon (using the returned foreground color), so the icon and label

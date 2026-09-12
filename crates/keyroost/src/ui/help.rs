@@ -23,8 +23,8 @@ pub struct Help {
 
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
 ///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-card-details, piv,
-///   molto, custkey, reset, piv-generate, piv-certificate, piv-import,
-///   piv-export, piv-delete, piv-admin
+///   molto, custkey, reset, piv-generate, piv-certificate,
+///   piv-import-export, piv-delete, piv-admin
 pub fn help(topic: &str) -> Option<&'static Help> {
     Some(match topic {
         "device" => &Help {
@@ -104,18 +104,13 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "piv-certificate" => &Help {
             title: "Create a certificate",
-            body: "A self-signed certificate is stored straight into the slot and is ready to use. A CSR is a request file you send to a certificate authority so they can issue one for you. Either way the signing happens on the card, so it needs the PIN.",
+            body: "A self-signed certificate is stored straight into the slot and is ready to use. A CSR is a request file you send to a certificate authority so they can issue one for you. Either way the signing happens on the card, so it needs the PIN; for a CSR, keyroost first asks where to save the request file.",
             slug: "/piv#certificate",
         },
-        "piv-import" => &Help {
-            title: "Import a certificate",
-            body: "Loads a certificate file you already have (PEM or DER) into this slot. You'll need the management key.",
+        "piv-import-export" => &Help {
+            title: "Import or export a certificate",
+            body: "Import loads a certificate file you already have (PEM or DER) into this slot — keyroost asks you to pick the file, then needs the management key. Export saves this slot's certificate to a file — keyroost asks where to write it; it's public information, so no PIN is needed.",
             slug: "/piv#import",
-        },
-        "piv-export" => &Help {
-            title: "Export the certificate",
-            body: "Saves this slot's certificate to a file on your computer. It's public information, so no PIN is needed.",
-            slug: "/piv#export",
         },
         "piv-move" => &Help {
             title: "Move a key",

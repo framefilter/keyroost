@@ -13,7 +13,7 @@ use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use zeroize::Zeroizing;
 
 /// How many wrong-credential attempts to make when intentionally blocking a
@@ -134,13 +134,28 @@ pub struct PivStatus {
     /// Pro, an OpenFIPS201 build, answering `9000` with 4 bytes that don't
     /// trace back to anything in OpenFIPS201's own source), so a reply here
     /// means "answers this Yubico extension," not "is a YubiKey." `None` if
-    /// the card doesn't answer it, or answers empty. Feature gates (e.g.
-    /// [`move_key_supported`]) compare this directly as a byte slice rather
-    /// than requiring an exact 3-byte shape. See
+    /// the card doesn't answer it, or answers empty. [`Self::feature_gate`]
+    /// (via [`keyroost_piv::compat`]) compares this directly as a byte slice
+    /// rather than requiring an exact 3-byte shape. See
     /// [`keyroost_piv::format_version_bytes`] for display formatting.
     pub version: Option<Vec<u8>>,
-    /// Device serial (Yubico GET SERIAL; firmware 5+), if supported.
-    pub serial: Option<u32>,
+    /// The applet's own firmware version, when a specific fingerprint's probe
+    /// discovered one — currently a Nitrokey (`Trussed(NitroKey)`, via
+    /// Trussed's admin application) only. Not necessarily equal to
+    /// [`Self::version`]: that field is the *PIV applet's* own version
+    /// (Yubico's `GET VERSION` extension, when the card answers it at all), a
+    /// different number on cards where this one is populated. `None` when no
+    /// such probe applies to this fingerprint, or the probe ran and found
+    /// nothing parseable — same best-effort degradation as [`Self::applet_name`].
+    pub version_firmware: Option<Vec<u8>>,
+    /// Device serial number. Ordinarily the Yubico GET SERIAL extension
+    /// (widened to `u128` — see [`keyroost_piv::parse_serial`]); when a
+    /// specific fingerprint's own probe supplies a serial instead (currently:
+    /// a Nitrokey's admin application), that one is used and GET SERIAL is
+    /// skipped entirely — a Nitrokey answers that Yubico extension too, but
+    /// with a number that isn't its real serial. `None` when neither source
+    /// answers.
+    pub serial: Option<u128>,
     /// Remaining PIN tries from a no-op VERIFY (`63 Cx`); `Some(0)` when blocked,
     /// `None` when the card didn't report a count.
     pub pin_retries: Option<u8>,
@@ -150,6 +165,23 @@ pub struct PivStatus {
     /// read-only, best-effort read: a transport failure degrades to `None`
     /// rather than failing the whole status snapshot (see [`PivSession::status`]).
     pub chuid: Option<keyroost_piv::Chuid>,
+    /// Best-effort fingerprint of the PIV applet implementation — from ATR
+    /// and SELECT-response text, but also from whether a specific applet can
+    /// be selected by AID at all (e.g. Feitian's registered RID) and, in
+    /// general, from whether the card supports a particular instruction; see
+    /// [`keyroost_piv::fingerprint`] for the full scheme. `Generic` when
+    /// nothing more specific matched, not when fingerprinting itself failed.
+    pub applet_fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    /// The token's own name, when a specific one was actually discovered
+    /// (currently: a Nitrokey's admin application, for
+    /// [`AppletFingerprint::Trussed`](keyroost_piv::fingerprint::AppletFingerprint::Trussed)`(`[`NitroKey`](keyroost_piv::fingerprint::TrussedVariant::NitroKey)`)`).
+    /// Empty otherwise — deliberately not backfilled with the generic
+    /// [`keyroost_piv::fingerprint::AppletFingerprint::applet_name`] for
+    /// `applet_fingerprint`, so a caller can tell "this card told us its own
+    /// name" apart from "we only classified the applet family". A caller
+    /// wanting something to show either way falls back to `applet_fingerprint`
+    /// itself (its `Display` impl, or `applet_fingerprint.applet_name()`).
+    pub applet_name: String,
 }
 
 /// Whether a given PIV key slot holds a certificate (and its size).
@@ -225,6 +257,23 @@ pub struct PivSession {
     /// `move_key`, `reset`) invalidates the corresponding entries — see
     /// [`PivSession::slot_key`].
     pubkey_cache: PubkeyCache,
+    /// Raw response body of the most recent SELECT (full or short AID) —
+    /// the FCI a spec-compliant card returns since both builders request it
+    /// via a case-4 `Le`. Feeds [`keyroost_piv::fingerprint::select_identity`].
+    /// Empty when SELECT never returned a body (a card that answers `9000`
+    /// with nothing), never `None`: fingerprint resolution treats empty and
+    /// absent the same way.
+    select_response: Vec<u8>,
+    /// [`Self::quirks`]'s cache: `None` until first resolved, then the
+    /// [`keyroost_piv::compat::PivQuirk`]s active for this applet for the
+    /// rest of the session. Safe to cache — unlike the read-through data this
+    /// session deliberately doesn't cache (certs, PIN retries, slot
+    /// occupancy; see [`Self::status_detailed`]'s doc) — because the applet's
+    /// identity and reported versions cannot change while the card stays
+    /// connected, but resolving them can cost a handful of extra APDUs (some
+    /// fingerprints need a live SELECT probe), so it's worth not repeating
+    /// per slot.
+    quirks: Option<BTreeSet<keyroost_piv::compat::PivQuirk>>,
 }
 
 /// The in-session public-key cache behind `PivSession`, keyed by PIV key
@@ -282,21 +331,6 @@ impl PubkeyCache {
     }
 }
 
-/// Whether MOVE KEY is available given the reported firmware version — fw
-/// 5.7+ (Yubico). Compared as a plain byte slice, not a fixed 3-part tuple:
-/// [`PivStatus::version`] isn't guaranteed to be exactly 3 bytes, and slice
-/// order gets a length mismatch right on its own (`[5, 7] < [5, 7, 0] <
-/// [5, 7, 1] < [5, 8]`), so `[5, 7]` alone is a correct "5.7 or newer"
-/// threshold without needing a trailing zero. Unknown version → allow the
-/// attempt; the card refuses if it truly can't (belt-and-suspenders with the
-/// pre-check).
-fn move_key_supported(version: Option<&[u8]>) -> bool {
-    match version {
-        Some(v) => v >= [5, 7].as_slice(),
-        None => true,
-    }
-}
-
 /// The management-key algorithms whose key is exactly `key_len` bytes, 3DES
 /// first. Empty when no algorithm uses that length.
 ///
@@ -351,10 +385,75 @@ pub fn random_chuid_guid() -> Result<[u8; 16], TransportError> {
     Ok(guid)
 }
 
+/// Run [`crate::decode_bcd_serial`] over `serial`, but only when
+/// [`keyroost_piv::compat::resolve_quirks`] finds
+/// [`keyroost_piv::compat::PivQuirk::InsF8SerialIsBcd`] active for
+/// `fingerprint` at `applet_version`/`firmware_version` — Token2 is the only
+/// device seeded with that quirk so far; others may be discovered and added
+/// to `keyroost_piv::compat`'s quirk tables later. Every other vendor's
+/// serial is a plain integer already, and BCD-decoding one would corrupt it.
+/// Shared by [`PivSession::status`] and [`PivSession::status_detailed`].
+fn decode_serial_if_bcd(
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+    serial: Option<u128>,
+) -> Option<u128> {
+    let reports_bcd_serial =
+        keyroost_piv::compat::resolve_quirks(fingerprint, applet_version, firmware_version)
+            .contains(&keyroost_piv::compat::PivQuirk::InsF8SerialIsBcd);
+    if reports_bcd_serial {
+        serial.map(crate::decode_bcd_serial)
+    } else {
+        serial
+    }
+}
+
+/// Strip `md`'s algorithm identifier (tag `0x01`) and public key (tag `0x04`)
+/// when `quirks` contains
+/// [`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`] — on an
+/// applet with that quirk, GET METADATA's algorithm byte has been observed
+/// stuck and never reflecting the slot's actual key state, and the public key
+/// goes with it: a raw key blob is meaningless without a trustworthy
+/// algorithm to interpret it against (RSA vs. EC changes how those bytes are
+/// structured, e.g. in [`metadata_key_material`]). Every other field
+/// (`policy`, `origin`, `is_default`, `retries`) is untouched — the quirk is
+/// specific to tags `0x01`/`0x04`. [`PivSession::metadata`] is the sole
+/// caller; split out as a pure function, same seam style as
+/// [`decode_serial_if_bcd`], so the stripping rule is unit-testable without a
+/// card.
+fn clear_metadata_if_quirky(
+    quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>,
+    mut md: Metadata,
+) -> Metadata {
+    if quirks.contains(&keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid) {
+        md.algorithm = None;
+        md.public_key = None;
+    }
+    md
+}
+
 impl PivSession {
     /// Connect to `reader_name` and SELECT the PIV application. Returns
     /// [`TransportError::NoPivApplet`] when the card has no PIV applet.
+    /// Equivalent to [`Self::open_with_debug`]`(reader_name, false)` — see
+    /// that constructor's doc for why a caller that wants `--debug`-style
+    /// tracing of *this very SELECT* has to ask for it here, up front,
+    /// rather than via [`Self::set_debug`] afterward.
     pub fn open(reader_name: &str) -> Result<Self, TransportError> {
+        Self::open_with_debug(reader_name, false)
+    }
+
+    /// [`Self::open`], but with per-APDU stderr tracing already enabled for
+    /// the initial SELECT this constructor itself issues. `open` followed by
+    /// [`Self::set_debug`] — the only other way to turn tracing on — is
+    /// always one APDU too late for that: the SELECT has already happened by
+    /// the time `set_debug` runs, so it silently never appears in a
+    /// `--debug` trace. Front ends that know their debug flag before opening
+    /// (which is all of them — it comes from a CLI flag or a GUI setting,
+    /// not from anything the card says) should call this instead of the
+    /// open-then-set_debug pattern.
+    pub fn open_with_debug(reader_name: &str, debug: bool) -> Result<Self, TransportError> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
         let cstr = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
@@ -362,15 +461,19 @@ impl PivSession {
         let t0 = negotiated_t0(&card);
         let mut session = Self {
             card,
-            debug: false,
+            debug,
             t0,
             pubkey_cache: PubkeyCache::new(),
+            select_response: Vec::new(),
+            quirks: None,
         };
         session.select()?;
         Ok(session)
     }
 
-    /// Enable per-APDU stderr tracing.
+    /// Enable per-APDU stderr tracing. Only affects APDUs sent *after* this
+    /// call — [`Self::open_with_debug`] is the way to also trace the initial
+    /// SELECT [`Self::open`]/this constructor issues before returning.
     pub fn set_debug(&mut self, on: bool) {
         self.debug = on;
     }
@@ -393,6 +496,8 @@ impl PivSession {
                     debug: false,
                     t0,
                     pubkey_cache: PubkeyCache::new(),
+                    select_response: Vec::new(),
+                    quirks: None,
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -414,22 +519,253 @@ impl PivSession {
         // fault on the full-AID attempt still surfaces immediately rather
         // than being masked by a second, unrelated SELECT. See `piv::AID`'s
         // doc comment for the full story.
-        let (_, sw) = self.transmit_full(&piv::select_full())?;
+        let (data, sw) = self.transmit_full(&piv::select_full())?;
         if sw == piv::SW_NOT_FOUND {
-            let (_, sw) = self.transmit_full(&piv::select())?;
+            let (data, sw) = self.transmit_full(&piv::select())?;
             if sw == piv::SW_NOT_FOUND {
+                self.select_response.clear();
                 return Err(TransportError::NoPivApplet);
             }
+            self.select_response = data;
             return ok_or_apdu("select piv applet (short aid)", sw);
         }
+        self.select_response = data;
         ok_or_apdu("select piv applet", sw)
+    }
+
+    /// The connected card's raw ATR (contact) or PC/SC-synthesised
+    /// pseudo-ATR (contactless), via `SCardStatus`. Empty on any transport
+    /// failure — this backs a best-effort fingerprinting read (see
+    /// [`Self::applet_fingerprint`]), not a precondition for anything else, so
+    /// there is no error variant to plumb through.
+    fn atr(&self) -> Vec<u8> {
+        let mut names = [0u8; 256];
+        let mut atr = [0u8; pcsc::MAX_ATR_SIZE];
+        match self.card.status2(&mut names, &mut atr) {
+            Ok(status) => status.atr().to_vec(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Resolve this session's [`keyroost_piv::fingerprint::AppletFingerprint`],
+    /// the token's own name when one was actually discovered (see
+    /// [`PivStatus::applet_name`]), its firmware version (see
+    /// [`PivStatus::version_firmware`]), and — only for identities whose own
+    /// probe supplies one — its serial number, so [`Self::status`] /
+    /// [`Self::status_detailed`] can skip the Yubico GET SERIAL extension
+    /// entirely when it would just get a fake answer (observed: a Nitrokey
+    /// answers that extension too, with a serial that isn't its real one).
+    /// The rest — from the ATR read just now plus the SELECT response
+    /// captured by [`Self::select`]. When the select identity names
+    /// OpenFIPS201, also probes for Swissbit's registered RID
+    /// ([`keyroost_piv::fingerprint::wants_swissbit_probe`]); when neither
+    /// that nor any text-based criterion fingerprints the applet at all, also
+    /// probes [`keyroost_piv::fingerprint::FEITIAN_RID`]
+    /// ([`Self::probe_feitian_rid`]) and, if that still leaves `Generic`,
+    /// [`keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID`]
+    /// ([`Self::probe_idprime_aid`]) as two last resorts, each cheaper to
+    /// skip than to run, tried in that order before finally settling for
+    /// `Generic`. Once the fingerprint itself is resolved, at most one
+    /// further, fingerprint-specific step produces `applet_name`/serial: a
+    /// Nitrokey (`Trussed(NitroKey)`) gets [`Self::probe_nitrokey_admin`] for
+    /// its firmware, hardware variant, and serial, and a YubiKey names itself
+    /// from `version` — the reply [`Self::status`]/[`Self::status_detailed`]
+    /// already fetched via the same Yubico `GET VERSION` extension, passed
+    /// in here so this never issues that command a second time. Every probe
+    /// here always re-selects PIV afterward so the session is left exactly
+    /// as any other caller of [`Self::status`] expects, whether or not the
+    /// probe itself succeeded.
+    fn applet_fingerprint(
+        &mut self,
+        version: Option<&[u8]>,
+    ) -> (
+        keyroost_piv::fingerprint::AppletFingerprint,
+        String,
+        Option<Vec<u8>>,
+        Option<u128>,
+    ) {
+        use keyroost_piv::fingerprint;
+
+        let atr = self.atr();
+        let atr_identity =
+            fingerprint::atr_historical_bytes(&atr).and_then(fingerprint::atr_identity);
+        let select_identity = fingerprint::select_identity(&self.select_response);
+
+        let swissbit_rid_selectable = fingerprint::wants_swissbit_probe(select_identity.as_deref())
+            && self.probe_swissbit_rid();
+
+        // `feitian_rid_selectable` and `idprime_aid_selectable` are each the
+        // sole criterion for their own identity, so they're only worth their
+        // own SELECT round trip when nothing else already fingerprints the
+        // applet — check with both probe bits false first, and only run each
+        // probe (then re-classify) when that still leaves `Generic`, Feitian
+        // before IdPrime.
+        let id = fingerprint::classify(
+            atr_identity.as_deref(),
+            select_identity.as_deref(),
+            swissbit_rid_selectable,
+            false,
+            false,
+        );
+        let id = if id == fingerprint::AppletFingerprint::Generic {
+            fingerprint::classify(
+                atr_identity.as_deref(),
+                select_identity.as_deref(),
+                swissbit_rid_selectable,
+                self.probe_feitian_rid(),
+                false,
+            )
+        } else {
+            id
+        };
+        let id = if id == fingerprint::AppletFingerprint::Generic {
+            fingerprint::classify(
+                atr_identity.as_deref(),
+                select_identity.as_deref(),
+                swissbit_rid_selectable,
+                false,
+                self.probe_idprime_aid(),
+            )
+        } else {
+            id
+        };
+        // No generic name fallback here — an undiscovered name stays empty,
+        // per `PivStatus::applet_name`'s doc; `id`/its `Display`/
+        // `applet_name()` are the generic fallback for a caller that wants
+        // one regardless.
+        let (name, version_firmware, serial) = match id {
+            fingerprint::AppletFingerprint::Trussed(fingerprint::TrussedVariant::NitroKey) => {
+                self.probe_nitrokey_admin()
+            }
+            fingerprint::AppletFingerprint::YubiKey => (
+                version.and_then(fingerprint::format_yubikey_name),
+                None,
+                None,
+            ),
+            _ => (None, None, None),
+        };
+        (id, name.unwrap_or_default(), version_firmware, serial)
+    }
+
+    /// SELECT [`keyroost_piv::fingerprint::FEITIAN_RID`] and report whether the
+    /// card accepted it, then unconditionally re-SELECT PIV afterward. Only
+    /// called when nothing else already fingerprinted the applet — see the
+    /// call site in [`Self::applet_fingerprint`] — since a Feitian RID match
+    /// is the lowest-priority, catch-all criterion and every other one is
+    /// cheaper to check first.
+    fn probe_feitian_rid(&mut self) -> bool {
+        let selectable = matches!(
+            self.transmit_full(&piv::select_by_aid(&keyroost_piv::fingerprint::FEITIAN_RID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let _ = self.select();
+        selectable
+    }
+
+    /// SELECT [`keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID`] and report whether
+    /// the card accepted it — either the standard `SW = 9000`, or the
+    /// non-standard `SW = 6999` this obscure applet instance is documented
+    /// to also answer with — then unconditionally re-SELECT PIV afterward
+    /// (mirrors [`Self::probe_feitian_rid`], against a full AID rather than a
+    /// bare RID). Only called when nothing else, not even Feitian's own
+    /// probe, already fingerprinted the applet — see the call site in
+    /// [`Self::applet_fingerprint`].
+    fn probe_idprime_aid(&mut self) -> bool {
+        let selectable = matches!(
+            self.transmit_full(&piv::select_by_aid(&keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID)),
+            Ok((_, sw)) if sw == piv::SW_OK || sw == 0x6999
+        );
+        let _ = self.select();
+        selectable
+    }
+
+    /// SELECT [`keyroost_piv::fingerprint::SWISSBIT_RID`] and report whether
+    /// the card accepted it, then unconditionally re-SELECT PIV afterward
+    /// (mirrors [`Self::probe_feitian_rid`], against Swissbit's registered
+    /// RID). The re-select's own result is deliberately swallowed: a card
+    /// that answered the PIV re-select badly here would have to fail the
+    /// very next command this session issues anyway, with a clearer error at
+    /// the point of use than anything this fingerprinting probe could add.
+    fn probe_swissbit_rid(&mut self) -> bool {
+        let selectable = matches!(
+            self.transmit_full(&piv::select_by_aid(&keyroost_piv::fingerprint::SWISSBIT_RID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let _ = self.select();
+        selectable
+    }
+
+    /// SELECT [`keyroost_piv::fingerprint::NITROKEY_ADMIN_AID`] (Trussed's admin
+    /// application) and, if accepted, read the hardware variant via its
+    /// `GET STATUS` management command
+    /// ([`keyroost_piv::fingerprint::NITROKEY_GET_ADMIN_STATUS`], for
+    /// `applet_name`), the firmware version via its `GET_VERSION` management
+    /// command in string-output mode
+    /// ([`keyroost_piv::fingerprint::NITROKEY_GET_VERSION_STRING`], split into
+    /// byte components for [`PivStatus::version_firmware`]), and the device
+    /// serial via [`keyroost_piv::fingerprint::NITROKEY_GET_SERIAL`] (its own
+    /// 128-bit value, not the Yubico GET SERIAL extension a Nitrokey answers
+    /// with an unrelated, made-up number) — then unconditionally re-SELECT
+    /// PIV on every path (mirrors [`Self::probe_feitian_rid`] against yet
+    /// another applet, but reading three commands' worth of reply instead of
+    /// just the SELECT result). The three commands degrade independently:
+    /// `(None, _, _)` when SELECT itself is refused (no admin application on
+    /// this build) or the status command is refused/too short/names an
+    /// unrecognised variant byte, `(_, None, _)` when the version command is
+    /// refused, empty, or not a dotted-`u8` string, `(_, _, None)` when the
+    /// serial command is refused or too long to fit a `u128` — either way, a
+    /// Nitrokey that can't answer one of these simply reports nothing for
+    /// that field rather than an error.
+    fn probe_nitrokey_admin(&mut self) -> (Option<String>, Option<Vec<u8>>, Option<u128>) {
+        use keyroost_piv::fingerprint;
+
+        let selected = matches!(
+            self.transmit_full(&piv::select_by_aid(&fingerprint::NITROKEY_ADMIN_AID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let (name, firmware, serial) = if selected {
+            let name = self
+                .transmit_full(&fingerprint::NITROKEY_GET_ADMIN_STATUS)
+                .ok()
+                .filter(|(_, sw)| *sw == piv::SW_OK)
+                .and_then(|(data, _)| fingerprint::parse_nitrokey_variant(&data))
+                .map(fingerprint::format_nitrokey_name);
+            let firmware = self
+                .transmit_full(&fingerprint::NITROKEY_GET_VERSION_STRING)
+                .ok()
+                .filter(|(_, sw)| *sw == piv::SW_OK)
+                .and_then(|(data, _)| fingerprint::parse_ascii_text(&data))
+                .and_then(|s| fingerprint::parse_dotted_version(&s));
+            let serial = self
+                .transmit_full(&fingerprint::NITROKEY_GET_SERIAL)
+                .ok()
+                .filter(|(_, sw)| *sw == piv::SW_OK)
+                .and_then(|(data, _)| keyroost_piv::parse_serial(&data).ok());
+            (name, firmware, serial)
+        } else {
+            (None, None, None)
+        };
+        let _ = self.select();
+        (name, firmware, serial)
     }
 
     /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
     /// and which slots hold a certificate. No PIN, no touch.
     pub fn status(&mut self) -> Result<PivStatus, TransportError> {
         let version = self.version();
-        let serial = self.serial();
+        // Fingerprint resolution runs first: some identities' own probes
+        // supply a real serial number, and when one does, the Yubico GET
+        // SERIAL extension below is skipped entirely — a card that answers
+        // it with a fake value (observed: a Nitrokey) never gets the chance
+        // to overwrite the real one.
+        let (applet_fingerprint, applet_name, version_firmware, fingerprint_serial) =
+            self.applet_fingerprint(version.as_deref());
+        let serial = decode_serial_if_bcd(
+            applet_fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+            fingerprint_serial.or_else(|| self.serial()),
+        );
         let pin_retries = self.pin_retries();
         // Best-effort: a transport hiccup reading the CHUID shouldn't fail
         // the whole status snapshot, any more than an unsupported GET
@@ -441,11 +777,42 @@ impl PivSession {
         }
         Ok(PivStatus {
             version,
+            version_firmware,
             serial,
             pin_retries,
             slots,
             chuid,
+            applet_fingerprint,
+            applet_name,
         })
+    }
+
+    /// Resolve the per-fingerprint white/blacklist ([`keyroost_piv::compat`])
+    /// for one of the vendor-extension operations this session exposes
+    /// ([`Self::move_key`], [`Self::delete_key`]), from the applet's own
+    /// fingerprint and reported version.
+    ///
+    /// Purely advisory: neither `move_key` nor `delete_key` version-gates
+    /// itself any more (an unsupported card refuses the APDU on its own). A
+    /// caller that wants to warn — or refuse — *before* the card sees the
+    /// command calls this and acts on the [`FeatureGate`]. It runs the same
+    /// fingerprint probes as [`Self::status`] and re-SELECTs PIV at the end,
+    /// which clears any management-key authentication, so call it **before**
+    /// [`Self::authenticate_management`].
+    ///
+    /// [`FeatureGate`]: keyroost_piv::compat::FeatureGate
+    pub fn feature_gate(
+        &mut self,
+        feature: keyroost_piv::compat::PivExtension,
+    ) -> keyroost_piv::compat::FeatureGate {
+        let version = self.version();
+        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
+        keyroost_piv::compat::resolve(
+            feature,
+            fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+        )
     }
 
     /// [`Self::status`] plus each slot's key algorithm, certificate Subject
@@ -467,7 +834,15 @@ impl PivSession {
     /// it first to have that key named for a slot with no certificate yet.
     pub fn status_detailed(&mut self) -> Result<PivStatusDetailed, TransportError> {
         let version = self.version();
-        let serial = self.serial();
+        // See the identical ordering (and why) in `status`.
+        let (applet_fingerprint, applet_name, version_firmware, fingerprint_serial) =
+            self.applet_fingerprint(version.as_deref());
+        let serial = decode_serial_if_bcd(
+            applet_fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+            fingerprint_serial.or_else(|| self.serial()),
+        );
         let pin_retries = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
 
@@ -503,10 +878,13 @@ impl PivSession {
         Ok(PivStatusDetailed {
             status: PivStatus {
                 version,
+                version_firmware,
                 serial,
                 pin_retries,
                 slots,
                 chuid,
+                applet_fingerprint,
+                applet_name,
             },
             slots: detail,
         })
@@ -515,17 +893,21 @@ impl PivSession {
     /// Yubico's proprietary GET VERSION extension (`INS FD`), raw reply
     /// bytes, tolerant of any non-empty length — see [`PivStatus::version`]
     /// for why. `None` if the command errors, the card answers a non-`9000`
-    /// status, or the reply is empty. Feature gates (`move_key_supported`,
-    /// the `new_enough` check in [`Self::delete_key`]) call this directly and
-    /// compare the raw bytes as a slice, rather than requiring an exact
-    /// 3-byte shape like real Yubico firmware's.
+    /// status, or the reply is empty. [`Self::feature_gate`] passes the raw
+    /// bytes straight to [`keyroost_piv::compat::resolve`], which compares
+    /// them as a slice rather than requiring an exact 3-byte shape like real
+    /// Yubico firmware's.
     fn version(&mut self) -> Option<Vec<u8>> {
         let (data, sw) = self.transmit_full(&piv::get_version()).ok()?;
         (sw == piv::SW_OK && !data.is_empty()).then_some(data)
     }
 
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
-    fn serial(&mut self) -> Option<u32> {
+    /// Widened to `u128` — see [`keyroost_piv::parse_serial`] for why the
+    /// reply isn't always the standard 4-byte `u32`. Not called at all when
+    /// [`Self::applet_fingerprint`] already produced a serial of its own —
+    /// see the call sites in [`Self::status`]/[`Self::status_detailed`].
+    fn serial(&mut self) -> Option<u128> {
         let (data, sw) = self.transmit_full(&piv::get_serial()).ok()?;
         if sw != piv::SW_OK {
             return None;
@@ -546,14 +928,47 @@ impl PivSession {
         }
     }
 
+    /// The [`keyroost_piv::compat::PivQuirk`]s active for this session's
+    /// applet, resolved once — via [`Self::version`] and
+    /// [`Self::applet_fingerprint`], the same sources [`Self::status`] and
+    /// [`Self::status_detailed`] use — and cached in [`Self::quirks`] (the
+    /// field) for the rest of the session; see that field's doc for why
+    /// caching this particular resolution is safe. [`Self::metadata`] is the
+    /// only caller today.
+    fn quirks(&mut self) -> BTreeSet<keyroost_piv::compat::PivQuirk> {
+        if let Some(quirks) = &self.quirks {
+            return quirks.clone();
+        }
+        let version = self.version();
+        let (fingerprint, _, version_firmware, _) = self.applet_fingerprint(version.as_deref());
+        let quirks = keyroost_piv::compat::resolve_quirks(
+            fingerprint,
+            version.as_deref(),
+            version_firmware.as_deref(),
+        );
+        self.quirks = Some(quirks.clone());
+        quirks
+    }
+
     /// GET METADATA for a key/PIN reference (`0x9B`, `0x80`, `0x81`, or a slot
     /// key ref). `None` when the firmware predates the extension (5.3-).
+    ///
+    /// Runs [`clear_metadata_if_quirky`] over the parsed reply before
+    /// returning it — see that function's doc for what it strips and why.
+    /// This is the sole place that needs to know about the quirk: every
+    /// caller of [`Self::metadata`] — [`Self::slot_key`]/
+    /// [`metadata_key_material`], [`Self::algorithm_without_cert`],
+    /// [`Self::resolve_policy`], [`Self::reported_management_key_algorithm`],
+    /// [`Self::status_detailed`] — already treats a missing algorithm/public
+    /// key as "fall back to another source", which is exactly the right
+    /// behavior on a device where GET METADATA can't be trusted for either.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
         let (data, sw) = self.transmit_full(&piv::get_metadata(key_ref)).ok()?;
         if sw != piv::SW_OK {
             return None;
         }
-        piv::parse_metadata(&data).ok()
+        let md = piv::parse_metadata(&data).ok()?;
+        Some(clear_metadata_if_quirky(&self.quirks(), md))
     }
 
     /// The card-management (9B) key's algorithm *as the card reports it* via
@@ -956,23 +1371,14 @@ impl PivSession {
     }
 
     /// Delete `slot`'s private key (Yubico MOVE-to-`0xFF` extension). Permanently
-    /// erases the key material; the certificate object is untouched. Requires
-    /// YubiKey firmware 5.7+ **and** prior management-key auth
-    /// ([`authenticate_management`]). Cards older than 5.7 cannot delete a key —
-    /// the only recovery there is to overwrite the slot.
+    /// erases the key material; the certificate object is untouched. This is a
+    /// Yubico vendor extension (YubiKey firmware 5.7+); it is **not**
+    /// version-gated here — a card that doesn't implement it refuses the APDU,
+    /// and [`Self::feature_gate`] is the way to check ahead of that. Requires
+    /// prior management-key auth ([`authenticate_management`]).
     ///
     /// [`authenticate_management`]: PivSession::authenticate_management
     pub fn delete_key(&mut self, slot: Slot) -> Result<(), TransportError> {
-        // Version-gate: MOVE/DELETE KEY landed in YubiKey firmware 5.7.
-        // Compared as a byte slice, not a fixed 3-part tuple — see
-        // `move_key_supported`'s doc for why `[5, 7]` alone is the right
-        // threshold.
-        let new_enough = matches!(self.version(), Some(v) if v.as_slice() >= [5, 7].as_slice());
-        if !new_enough {
-            return Err(TransportError::PivFirmwareTooOld(
-                "deleting a key requires YubiKey firmware 5.7 or newer (older cards can only overwrite the slot)",
-            ));
-        }
         let (_, sw) = self.transmit_full(&piv::delete_key(slot))?;
         ok_or_write("piv delete key", sw)?;
         self.pubkey_cache.evict(slot.key_ref());
@@ -1270,11 +1676,15 @@ impl PivSession {
     }
 
     /// Relocate a slot's private key to another slot (Yubico MOVE KEY). Refuses
-    /// a same-slot move, firmware below 5.7, and an occupied destination
-    /// (GET METADATA pre-check — the card also refuses, this gives a clear error
-    /// first). Moves ONLY the key; the source slot's certificate stays put.
-    /// Requires prior management-key auth ([`authenticate_management`]), same
-    /// as [`delete_key`].
+    /// a same-slot move and an occupied destination (GET METADATA pre-check —
+    /// the card also refuses, this gives a clear error first). Moves ONLY the
+    /// key; the source slot's certificate stays put. Requires prior
+    /// management-key auth ([`authenticate_management`]), same as
+    /// [`delete_key`].
+    ///
+    /// This is a Yubico vendor extension (YubiKey firmware 5.7+) and is
+    /// **not** version-gated here — an older card refuses the APDU itself.
+    /// Use [`Self::feature_gate`] to check ahead of that.
     ///
     /// [`authenticate_management`]: PivSession::authenticate_management
     /// [`delete_key`]: PivSession::delete_key
@@ -1282,11 +1692,6 @@ impl PivSession {
         if src.key_ref() == dest.key_ref() {
             return Err(TransportError::MalformedResponse(
                 "source and destination slots are the same",
-            ));
-        }
-        if !move_key_supported(self.version().as_deref()) {
-            return Err(TransportError::PivFirmwareTooOld(
-                "moving a key requires YubiKey firmware 5.7 or newer",
             ));
         }
         if self.slot_has_key(dest)? {
@@ -1311,10 +1716,22 @@ impl PivSession {
     /// transient failure here is reported as an empty slot; the card's own
     /// refusal to write over an occupied destination is the backstop.
     ///
+    /// A `Some` from [`metadata`] is *not* by itself "occupied": some
+    /// implementations (Nitrokey's `piv-authenticator`, and PivApplet as seen
+    /// on a Token2 fingerprint trace) answer `SW_OK` for every retired key
+    /// reference whether or not a key was ever generated there, with an empty
+    /// or key-less body for the ones that weren't. That reply is
+    /// indistinguishable from "no key" and would otherwise mark every retired
+    /// slot present — so this gates on [`metadata_key_material`], the same
+    /// "does this reply actually name the key" check [`Self::slot_key`] uses,
+    /// rather than on the GET METADATA status word alone.
+    ///
     /// [`status`]: PivSession::status
     /// [`metadata`]: PivSession::metadata
     pub fn slot_has_key(&mut self, slot: Slot) -> Result<bool, TransportError> {
-        Ok(self.metadata(slot.key_ref()).is_some())
+        Ok(self
+            .metadata(slot.key_ref())
+            .is_some_and(|md| metadata_key_material(&md).is_some()))
     }
 
     /// Reset the PIV application to factory defaults. Only succeeds when **both**
@@ -1530,9 +1947,30 @@ fn uses_extended_length(apdu: &[u8]) -> bool {
     apdu.get(4) == Some(&0x00)
 }
 
+/// A short, human-readable name for one of the AIDs/RIDs this crate SELECTs
+/// — the standard PIV applet itself (either AID form [`Self::select`] tries)
+/// as well as this crate's own fingerprinting probes — for
+/// [`describe_apdu`]'s trace label. E.g. `"Feitian RID"` for
+/// [`keyroost_piv::fingerprint::FEITIAN_RID`]. `None` for anything else this
+/// crate doesn't recognize.
+fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
+    use keyroost_piv::fingerprint;
+    match aid {
+        _ if aid == piv::AID_FULL => Some("NIST PIV Card Application"),
+        _ if aid == piv::AID => Some("NIST PIV Card Application"),
+        _ if aid == fingerprint::FEITIAN_RID => Some("Feitian RID"),
+        _ if aid == fingerprint::SWISSBIT_RID => Some("Swissbit RID"),
+        _ if aid == fingerprint::IDPRIME_SECONDARY_PIV_AID => Some("IdPrime secondary PIV AID"),
+        _ if aid == fingerprint::NITROKEY_ADMIN_AID => Some("Nitrokey admin AID"),
+        _ => None,
+    }
+}
+
 /// The command-name string that precedes a PIV APDU in a `--debug` /
 /// activity-log trace. Resolves `apdu[1]` via [`piv::Instruction`], names the
-/// data object GET DATA / PUT DATA is aimed at, sharpens two more cases the INS
+/// data object GET DATA / PUT DATA is aimed at, names the AID/RID a SELECT
+/// targets whenever it's one this crate recognizes (the PIV applet itself,
+/// or one of its own fingerprinting probes), sharpens two more cases the INS
 /// byte alone leaves ambiguous, and falls back to the raw INS for an
 /// instruction this crate never builds.
 fn describe_apdu(apdu: &[u8]) -> String {
@@ -1540,6 +1978,13 @@ fn describe_apdu(apdu: &[u8]) -> String {
         return "(malformed APDU)".to_string();
     };
     match piv::Instruction::from_code(ins) {
+        // A SELECT's data field is the raw AID/RID itself (no `5C` wrapper,
+        // unlike GET DATA / PUT DATA below) — name it whenever it's an AID
+        // this crate recognizes; an unrecognized one stays plain `SELECT`.
+        Some(piv::Instruction::Select) => match command_data(apdu).and_then(known_aid_name) {
+            Some(name) => format!("SELECT ({name})"),
+            None => "SELECT".to_string(),
+        },
         // GET DATA / PUT DATA both open their body with a `5C <len> <tag>`
         // object selector — name what's being read/written, or show the raw
         // tag when it's one we don't have a name for. (A chained PUT DATA's
@@ -1842,8 +2287,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decode_serial_if_bcd_applies_only_when_the_quirk_resolves() {
+        use keyroost_piv::fingerprint::AppletFingerprint;
+
+        // Token2 carries `InsF8SerialIsBcd` for any reported applet version
+        // (see `keyroost_piv::compat`'s `QUIRKS_BY_APPLET_TABLE`) — 0x1234
+        // read as packed BCD is decimal 1234.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, Some(0x1234)),
+            Some(1234)
+        );
+        // No applet_version → nothing to version-match, so the quirk never
+        // resolves and the serial passes through unchanged.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, None, None, Some(0x1234)),
+            Some(0x1234)
+        );
+        // A fingerprint with no quirk-table entry at all: unchanged.
+        assert_eq!(
+            decode_serial_if_bcd(
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7]),
+                None,
+                Some(0x1234)
+            ),
+            Some(0x1234)
+        );
+        // No serial to begin with: still `None`, quirk or not.
+        assert_eq!(
+            decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn clear_metadata_if_quirky_strips_algorithm_and_public_key_together() {
+        use keyroost_piv::compat::PivQuirk;
+
+        let md = Metadata {
+            algorithm: Some(0x07),
+            policy: Some((0x01, 0x02)),
+            origin: Some(1),
+            public_key: Some(vec![0xAB, 0xCD]),
+            is_default: Some(false),
+            retries: None,
+        };
+
+        // The quirk active: algorithm and public key are gone, every other
+        // field survives untouched.
+        let quirky = BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid]);
+        let cleared = clear_metadata_if_quirky(&quirky, md.clone());
+        assert_eq!(
+            cleared,
+            Metadata {
+                algorithm: None,
+                public_key: None,
+                ..md.clone()
+            }
+        );
+
+        // No quirk active (empty set, or a set with an unrelated quirk):
+        // passed through unchanged.
+        assert_eq!(clear_metadata_if_quirky(&BTreeSet::new(), md.clone()), md);
+        let other = BTreeSet::from([PivQuirk::InsF8SerialIsBcd]);
+        assert_eq!(clear_metadata_if_quirky(&other, md.clone()), md);
+    }
+
+    #[test]
     fn describe_apdu_names_the_command() {
-        assert_eq!(describe_apdu(&piv::select_full()), "SELECT");
+        assert_eq!(
+            describe_apdu(&piv::select_full()),
+            "SELECT (NIST PIV Card Application)"
+        );
+        // The short RID-only PIV AID names the same application.
+        assert_eq!(
+            describe_apdu(&piv::select()),
+            "SELECT (NIST PIV Card Application)"
+        );
         assert_eq!(
             describe_apdu(&piv::get_version()),
             "GET VERSION (yubico extension)"
@@ -1890,19 +2410,34 @@ mod tests {
     }
 
     #[test]
-    fn move_key_firmware_gate() {
-        // MOVE KEY needs fw 5.7+. Below that -> refuse.
-        assert!(!move_key_supported(Some(&[5, 6, 0])));
-        assert!(move_key_supported(Some(&[5, 7, 0])));
-        assert!(move_key_supported(Some(&[5, 7, 4])));
-        assert!(move_key_supported(Some(&[6, 0, 0])));
-        // A bare [5, 7] itself clears the bar too — slice order puts a
-        // shorter-but-otherwise-equal reply below anything with a 3rd byte,
-        // not above it (`[5, 7] < [5, 7, 0]`), so the threshold has to be
-        // written as [5, 7] rather than [5, 7, 0] to include it.
-        assert!(move_key_supported(Some(&[5, 7])));
-        // Unknown version -> allow the attempt (card will reject if unsupported).
-        assert!(move_key_supported(None));
+    fn describe_apdu_names_fingerprinting_probe_aids() {
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(&keyroost_piv::fingerprint::FEITIAN_RID)),
+            "SELECT (Feitian RID)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::SWISSBIT_RID
+            )),
+            "SELECT (Swissbit RID)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::IDPRIME_SECONDARY_PIV_AID
+            )),
+            "SELECT (IdPrime secondary PIV AID)"
+        );
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::NITROKEY_ADMIN_AID
+            )),
+            "SELECT (Nitrokey admin AID)"
+        );
+        // An AID none of the probes use stays plain, unlabeled SELECT.
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(&[0xA0, 0x00, 0x00, 0x00, 0x03])),
+            "SELECT"
+        );
     }
 
     #[test]
