@@ -486,7 +486,46 @@ pub fn build_verify_pin_data(
     Ok(out)
 }
 
-/// Build the `CHANGE_OTP_PIN` data field, matching the Token2 reference client:
+/// Build a `VERIFY_OTP_PIN` data field that also carries the optional
+/// `EncConfig` byte, used to enable (`0x01`) or disable (`0x00`) fingerprint
+/// protection for OTP while verifying the PIN (manual V1.3 §1.14 / §1.20):
+///
+/// ```text
+/// data      = IV || PinHashEnc2 || EncConfig
+/// EncConfig = AES-256-CBC(SessionEncKey, IV, PKCS#5pad16(FpEnable))   # same IV
+/// ```
+///
+/// The verify portion is identical to [`build_verify_pin_data`]; `EncConfig`
+/// reuses the same outer IV, as the reference firmware expects.
+pub fn build_verify_pin_data_with_config(
+    keys: &SessionKeys,
+    pin: &[u8],
+    rand: &[u8],
+    fp_enable: bool,
+) -> Result<Vec<u8>, EncryptError> {
+    let pin_hash = Zeroizing::new(sha256(pin));
+    let iv2_full = sha256(rand);
+    let mut iv2 = [0u8; 16];
+    iv2.copy_from_slice(&iv2_full[..16]);
+    let inner = aes256_cbc_encrypt_nopad(&pin_hash, &iv2, rand)?;
+
+    let iv = random_iv();
+    let outer = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &inner)?;
+
+    // EncConfig: PKCS#5-pad the single FpEnable byte to one block, encrypt under
+    // the session key with the SAME IV as the verify outer layer.
+    let cfg_byte = if fp_enable { 0x01u8 } else { 0x00u8 };
+    let cfg_padded = pkcs7_pad16(&[cfg_byte]);
+    let enc_config = aes256_cbc_encrypt_nopad(&keys.enc, &iv, &cfg_padded)?;
+
+    let mut out = Vec::with_capacity(16 + outer.len() + enc_config.len());
+    out.extend_from_slice(&iv);
+    out.extend_from_slice(&outer);
+    out.extend_from_slice(&enc_config);
+    Ok(out)
+}
+
+
 ///
 /// ```text
 /// body           = 0x07 || max_retry || len(newPin) || newPin      # newPin empty => remove

@@ -47,7 +47,7 @@ pub use piv::{
 mod token2otp;
 pub use token2otp::{
     otp_type_str, ButtonPrompt, HidOtpTransport, OtpTransportError, PcScOtpTransport,
-    Token2OtpSession,
+    Token2OtpSession, UnlockMethod,
 };
 
 /// Opt-in per-thread APDU trace capture, for front ends that want the wire

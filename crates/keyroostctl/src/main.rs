@@ -2386,6 +2386,38 @@ enum OtpCmd {
         #[arg(long)]
         pin_stdin: bool,
     },
+    /// Report whether the key supports fingerprint-protected OTP (FpEnable).
+    FpStatus,
+    /// Enable fingerprint protection for OTP (needs the current PIN). After this,
+    /// codes can be unlocked by a fingerprint touch as well as the PIN.
+    FpEnable {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+    },
+    /// Disable fingerprint protection for OTP (needs the current PIN).
+    FpDisable {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+    },
+    /// Unlock the codes by a FINGERPRINT touch (no PIN), then list them. Requires
+    /// fingerprint protection to be enabled on the key.
+    FpList,
+    /// List codes, unlocking with a fingerprint if enabled and falling back to
+    /// the PIN if the touch fails (or if fingerprint protection is off). Supply
+    /// the PIN via `--pin-stdin`/`--pin-env` to enable the fallback.
+    UnlockList {
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        #[arg(long)]
+        pin_stdin: bool,
+        /// Skip the fingerprint attempt and go straight to the PIN.
+        #[arg(long)]
+        pin_only: bool,
+    },
 }
 
 /// Transport selector for the `otp` command group.
@@ -5598,6 +5630,106 @@ fn run_otp(
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.remove_pin(current.as_str())?;
             println!("OTP PIN removed. Codes are readable without a PIN again.");
+        }
+        OtpCmd::FpStatus => {
+            let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            match session.fp_supported()? {
+                Some(true) => println!("Fingerprint-protected OTP: enabled"),
+                Some(false) => println!("Fingerprint-protected OTP: disabled (supported)"),
+                None => println!("Fingerprint-protected OTP: not available on this firmware"),
+            }
+        }
+        OtpCmd::FpEnable { pin_env, pin_stdin } => {
+            let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            session.set_fp_protection(pin.as_str(), true)?;
+            println!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
+        }
+        OtpCmd::FpDisable { pin_env, pin_stdin } => {
+            let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            session.set_fp_protection(pin.as_str(), false)?;
+            println!("Fingerprint protection disabled.");
+        }
+        OtpCmd::FpList => {
+            let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            let now = unix_now() as u64;
+            eprintln!("Touch the fingerprint sensor to unlock OTP codes\u{2026}");
+            session.verify_fingerprint()?;
+            let entries = session.enumerate(now)?;
+            if entries.is_empty() {
+                println!("(no OTP entries)");
+            } else {
+                for e in entries {
+                    let label = if e.app_name.is_empty() {
+                        e.account_name.clone()
+                    } else {
+                        format!("{}:{}", e.app_name, e.account_name)
+                    };
+                    let label = sanitize_terminal(&label);
+                    let code = e.code.as_deref().unwrap_or("\u{2014}");
+                    println!(
+                        "{label}  [{}/{}]  {}{}",
+                        keyroost_transport::otp_type_str(e.otp_type),
+                        otp_algo_str_t2(e.algorithm),
+                        code,
+                        if e.button_required { "  (touch)" } else { "" },
+                    );
+                }
+            }
+        }
+        OtpCmd::UnlockList {
+            pin_env,
+            pin_stdin,
+            pin_only,
+        } => {
+            let pin = if pin_env.is_some() || *pin_stdin {
+                Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
+            } else {
+                None
+            };
+            let mut session = open_otp(transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            let now = unix_now() as u64;
+            if !*pin_only && session.fp_is_enabled().unwrap_or(false) {
+                eprintln!("Touch the fingerprint sensor (or wait to fall back to PIN)\u{2026}");
+            }
+            let method = session.unlock_fp_or_pin(
+                pin.as_deref().map(|p| p.as_str()),
+                !*pin_only,
+            )?;
+            eprintln!(
+                "Unlocked with {}.",
+                match method {
+                    keyroost_transport::UnlockMethod::Fingerprint => "fingerprint",
+                    keyroost_transport::UnlockMethod::Pin => "PIN",
+                }
+            );
+            let entries = session.enumerate(now)?;
+            if entries.is_empty() {
+                println!("(no OTP entries)");
+            } else {
+                for e in entries {
+                    let label = if e.app_name.is_empty() {
+                        e.account_name.clone()
+                    } else {
+                        format!("{}:{}", e.app_name, e.account_name)
+                    };
+                    let label = sanitize_terminal(&label);
+                    let code = e.code.as_deref().unwrap_or("\u{2014}");
+                    println!(
+                        "{label}  [{}/{}]  {}{}",
+                        keyroost_transport::otp_type_str(e.otp_type),
+                        otp_algo_str_t2(e.algorithm),
+                        code,
+                        if e.button_required { "  (touch)" } else { "" },
+                    );
+                }
+            }
         }
     }
     Ok(())

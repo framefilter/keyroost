@@ -329,6 +329,8 @@ struct OtpLoad {
     /// a PIN is set, `Some(false)` the feature is present and unset, `None` the
     /// key does not offer the feature at all.
     pin_set: Option<bool>,
+    /// Cached FpEnable from the same flag read: fingerprint protection enabled.
+    fp_enabled: Option<bool>,
 }
 
 /// Per-selection state for the OTP pane.
@@ -356,6 +358,10 @@ pub struct OtpState {
     /// Whether the key currently has an OTP PIN set (R3.4+). `None` until known.
     /// Drives which PIN menu items appear (Set vs Change/Remove/Lock).
     pub pin_set: Option<bool>,
+    /// Whether fingerprint protection is enabled on the key (cached FpEnable).
+    /// Drives the "Touch fingerprint" option on the unlock prompt and the
+    /// enable/disable item in the "..." menu. `None` until known.
+    pub fp_enabled: Option<bool>,
     /// Active transport label after a successful open (for the status line).
     pub active: Option<&'static str>,
     /// Device serial number (hex), read alongside the entry list when available.
@@ -452,6 +458,62 @@ impl App {
             dev.hid_path.as_deref(),
             dev.reader.as_deref(),
         )
+    }
+
+    /// Unlock the codes by a fingerprint touch (from the unlock prompt). Spawns a
+    /// job that establishes the session, waits for the sensor touch, and reads
+    /// the entries; on failure the prompt stays up with the error so the user can
+    /// retry or use the PIN instead.
+    pub(crate) fn unlock_otp_fingerprint(&mut self) {
+        self.otp.error = None;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Touch the fingerprint sensor\u{2026}", move || {
+            let result = (|| -> Result<Vec<OtpRow>, OtpTransportError> {
+                let mut session = target.open()?;
+                session.verify_fingerprint()?;
+                let now = unix_now();
+                let entries = session.enumerate(now)?;
+                Ok(entries
+                    .into_iter()
+                    .map(|e| OtpRow {
+                        app_name: e.app_name,
+                        account_name: e.account_name,
+                        type_str: keyroost_transport::otp_type_str(e.otp_type),
+                        algo_str: otp_algo_str(e.algorithm),
+                        button_required: e.button_required,
+                        code: e.code,
+                        period: e.timestep,
+                    })
+                    .collect())
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(rows) => {
+                        app.otp.rows = rows;
+                        app.otp.pin_required = false;
+                        app.otp.loaded = true;
+                        app.otp.error = None;
+                    }
+                    // Touch failed / wrong finger: keep the prompt up with the
+                    // message; the user can retry the sensor or type the PIN.
+                    Err(e) => {
+                        app.otp.error = Some(e.to_string());
+                        app.otp.pin_required = true;
+                        app.otp.loaded = true;
+                    }
+                }
+            })
+        });
     }
 
     /// List entries on the selected key over the chosen transport.
@@ -608,10 +670,12 @@ impl App {
                     // and it is the key's answer rather than an inference from
                     // whether we happened to hold a PIN.
                     let pin_set = session.pin_set_cached();
+                    let fp_enabled = session.fp_enabled_cached();
                     Ok(OtpLoad {
                         rows,
                         active,
                         pin_set,
+                        fp_enabled,
                         serial,
                         touch_ok,
                         touch_why,
@@ -650,6 +714,7 @@ impl App {
                         // succeeded without a PIN, so the pane reported "no PIN"
                         // and hid Change / Remove / Lock on a protected key.
                         app.otp.pin_set = load.pin_set;
+                        app.otp.fp_enabled = load.fp_enabled;
                     }
                     Err(e) => {
                         if std::env::var_os("KEYROOST_OTP_DEBUG").is_some() {
@@ -1014,6 +1079,52 @@ impl App {
         });
     }
 
+    /// Enable or disable fingerprint protection for OTP. Uses the PIN already
+    /// cached this session; if none is cached, routes through the unlock prompt
+    /// first (the user enters the PIN, then retries the toggle).
+    pub(crate) fn set_otp_fp_protection(&mut self, enable: bool) {
+        let pin = match &self.otp.pin {
+            Some(p) => p.to_string(),
+            None => {
+                self.otp.pin_required = true;
+                self.otp.error =
+                    Some("Enter the OTP PIN first, then use the Fingerprint menu.".into());
+                return;
+            }
+        };
+        self.otp.error = None;
+        let target = match self.otp_target() {
+            Ok(t) => t,
+            Err(e) => {
+                self.otp.error = Some(e);
+                return;
+            }
+        };
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Updating fingerprint protection\u{2026}", move || {
+            let result = (|| -> Result<(), OtpTransportError> {
+                let mut session = target.open()?;
+                session.set_fp_protection(&pin, enable)
+            })();
+            Box::new(move |app: &mut App| {
+                if app.selected_device != for_device {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        app.otp.fp_enabled = Some(enable);
+                        app.otp.info = Some(if enable {
+                            "Fingerprint unlock enabled.".into()
+                        } else {
+                            "Fingerprint unlock disabled.".into()
+                        });
+                    }
+                    Err(e) => app.otp.error = Some(e.to_string()),
+                }
+            })
+        });
+    }
+
     /// Apply a set / change / remove PIN action from the [`PinDialog`].
     pub(crate) fn apply_pin_dialog(&mut self, kind: PinDialogKind) {
         self.otp.error = None;
@@ -1346,6 +1457,7 @@ impl App {
                 let mut new_transport: Option<OtpTransportSel> = None;
                 let mut pin_dialog_open: Option<PinDialogKind> = None;
                 let mut pin_lock = false;
+                let mut fp_toggle: Option<bool> = None;
 
                 let menu_btn =
                     theme::button(ui, p, BtnKind::Default, "...").on_hover_text("More actions");
@@ -1464,6 +1576,38 @@ impl App {
                                 });
                             }
                         }
+
+                        // Fingerprint protection (only meaningful once a PIN is
+                        // set, since enabling/disabling it authenticates with the
+                        // PIN). Requires an enrolled fingerprint on the key; the
+                        // device rejects enabling otherwise, surfaced as an error.
+                        if self.otp.pin_set == Some(true) {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Fingerprint")
+                                    .font(theme::f_reg(11.0))
+                                    .color(p.txt3),
+                            );
+                            match self.otp.fp_enabled {
+                                Some(false) => {
+                                    if ui
+                                        .selectable_label(false, "Enable fingerprint unlock\u{2026}")
+                                        .clicked()
+                                    {
+                                        fp_toggle = Some(true);
+                                    }
+                                }
+                                Some(true) => {
+                                    if ui
+                                        .selectable_label(false, "Disable fingerprint unlock\u{2026}")
+                                        .clicked()
+                                    {
+                                        fp_toggle = Some(false);
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
                     });
 
                 // Apply menu selections after the closure.
@@ -1497,6 +1641,9 @@ impl App {
                 }
                 if pin_lock {
                     self.lock_otp_pin();
+                }
+                if let Some(enable) = fp_toggle {
+                    self.set_otp_fp_protection(enable);
                 }
 
                 // Primary actions, to the left of the overflow menu (added after
@@ -1600,17 +1747,23 @@ impl App {
         // the entries via the stored PIN.
         if self.otp.pin_required {
             let mut do_unlock = false;
+            let mut do_fp = false;
+            let fp_on = self.otp.fp_enabled == Some(true);
             theme::card_frame(p).show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("This key's OTP codes are PIN-protected")
+                    egui::RichText::new("This key's OTP codes are protected")
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("Enter the OTP PIN to view and manage codes.")
-                        .font(theme::f_reg(12.5))
-                        .color(p.txt2),
+                    egui::RichText::new(if fp_on {
+                        "Touch the fingerprint sensor, or enter the OTP PIN, to view codes."
+                    } else {
+                        "Enter the OTP PIN to view and manage codes."
+                    })
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
                 );
                 ui.add_space(8.0);
                 let resp = ui.add(
@@ -1625,6 +1778,11 @@ impl App {
                     if theme::button(ui, p, BtnKind::Primary, "Unlock").clicked() || entered {
                         do_unlock = true;
                     }
+                    if fp_on
+                        && theme::button(ui, p, BtnKind::Default, "Touch fingerprint").clicked()
+                    {
+                        do_fp = true;
+                    }
                 });
                 if let Some(err) = &self.otp.error {
                     ui.add_space(6.0);
@@ -1635,7 +1793,9 @@ impl App {
                     );
                 }
             });
-            if do_unlock && !self.otp.pin_input.trim().is_empty() {
+            if do_fp {
+                self.unlock_otp_fingerprint();
+            } else if do_unlock && !self.otp.pin_input.trim().is_empty() {
                 self.otp.pin = Some(zeroize::Zeroizing::new(
                     self.otp.pin_input.trim().to_owned(),
                 ));

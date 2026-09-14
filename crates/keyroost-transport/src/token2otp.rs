@@ -42,6 +42,16 @@ use zeroize::Zeroizing;
 /// Errors specific to the Token2 OTP applet. Kept separate from the crate-wide
 /// `TransportError` so the OTP feature can evolve without churning every other
 /// applet's error surface; the CLI maps these to exit messages.
+/// How the OTP read window was unlocked, returned by
+/// [`Token2OtpSession::unlock_fp_or_pin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockMethod {
+    /// Unlocked by a fingerprint touch.
+    Fingerprint,
+    /// Unlocked by the PIN.
+    Pin,
+}
+
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum OtpTransportError {
@@ -95,6 +105,13 @@ pub enum OtpTransportError {
     /// internal ordering fault, distinct from a short or malformed device
     /// response — which is what reusing `Parse(Truncated)` for it used to say.
     PinSessionMissing,
+    /// The fingerprint capture did not complete — the sensor was not touched (or
+    /// the match failed) before the poll budget ran out.
+    FingerprintTimeout,
+    /// Enabling fingerprint protection was refused because no fingerprint is
+    /// enrolled on the key (device status `0x6984`). Enroll at least one
+    /// fingerprint (via the key's FIDO2 bio setup) first.
+    NoFingerprintEnrolled,
 }
 
 impl std::fmt::Display for OtpTransportError {
@@ -149,6 +166,16 @@ impl std::fmt::Display for OtpTransportError {
             ),
             OtpTransportError::PinSessionMissing => {
                 write!(f, "no OTP-PIN session was established before a PIN command")
+            }
+            OtpTransportError::FingerprintTimeout => {
+                write!(f, "fingerprint not captured (sensor not touched, or the match failed)")
+            }
+            OtpTransportError::NoFingerprintEnrolled => {
+                write!(
+                    f,
+                    "can't enable fingerprint protection: no fingerprint is enrolled on this key \
+                     — enroll one via the key's FIDO2 fingerprint setup first"
+                )
             }
         }
     }
@@ -754,6 +781,10 @@ pub struct Token2OtpSession {
     /// PIN is set, `Some(false)` the feature is there and no PIN is set, `None`
     /// nothing has asked yet or the key does not offer the feature.
     pin_present: Option<bool>,
+    /// Cached `FpEnable` from the most recent flag read: whether fingerprint
+    /// protection is currently enabled. Populated on the same read that caches
+    /// `pin_present`, so the GUI needs no extra round trip.
+    fp_present: Option<bool>,
 }
 
 /// Host-owned caps on the `ENUM_CODES` pagination loop (audit KEY-009). Both
@@ -908,6 +939,7 @@ impl Token2OtpSession {
                         pin_session: None,
                         pin_verified: false,
                         pin_present: None,
+                        fp_present: None,
                     }),
                     Err((probe_err, _)) => {
                         // HID present but the applet didn't accept the probe
@@ -920,6 +952,7 @@ impl Token2OtpSession {
                                 pin_session: None,
                                 pin_verified: false,
                                 pin_present: None,
+                                fp_present: None,
                             }),
                             // No CCID either. Both outcomes matter now: which
                             // kind of HID failure it was, and why CCID could
@@ -937,6 +970,7 @@ impl Token2OtpSession {
                     pin_session: None,
                     pin_verified: false,
                     pin_present: None,
+                    fp_present: None,
                 })
             }
             Err(e) => Err(e),
@@ -955,6 +989,7 @@ impl Token2OtpSession {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         })
     }
 
@@ -967,6 +1002,7 @@ impl Token2OtpSession {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         })
     }
 
@@ -982,6 +1018,7 @@ impl Token2OtpSession {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         })
     }
 
@@ -995,6 +1032,7 @@ impl Token2OtpSession {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         })
     }
 
@@ -1006,6 +1044,7 @@ impl Token2OtpSession {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         }
     }
 
@@ -1017,6 +1056,7 @@ impl Token2OtpSession {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         }
     }
 
@@ -1127,6 +1167,7 @@ impl Token2OtpSession {
             None
         };
         self.pin_present = flag.as_ref().map(|f| f.is_set());
+        self.fp_present = flag.as_ref().map(|f| f.fp_enable);
         Ok(flag)
     }
 
@@ -1147,6 +1188,13 @@ impl Token2OtpSession {
     #[must_use]
     pub fn pin_set_cached(&self) -> Option<bool> {
         self.pin_present
+    }
+
+    /// The cached `FpEnable` from the most recent flag read — whether fingerprint
+    /// protection is currently enabled. `None` if not yet read or the key lacks
+    /// the feature. No device I/O.
+    pub fn fp_enabled_cached(&self) -> Option<bool> {
+        self.fp_present
     }
 
     /// Establish an authenticated ECDH session and cache the derived keys.
@@ -1299,6 +1347,151 @@ impl Token2OtpSession {
         let (_, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check(sw)?;
         self.pin_verified = false;
+        Ok(())
+    }
+
+    /// Verify by FINGERPRINT (manual V1.3 §1.20): send `80 C5 05 06 01 01` and
+    /// let the device wait for a sensor touch. On success the read/write window
+    /// opens exactly as a PIN verify would — no PIN or ECDH session needed. The
+    /// key must have fingerprint protection enabled (see
+    /// [`set_fp_protection`](Self::set_fp_protection)); otherwise the applet
+    /// rejects it (surfaced via the mapped PIN status words).
+    pub fn verify_fingerprint(&mut self) -> Result<(), OtpTransportError> {
+        // A fingerprint unlock still reads codes over the ECDH-encrypted session
+        // (the touch authorizes; the session encrypts). So establish the session
+        // first — otherwise the encrypted enumeration pages can't be decrypted.
+        self.ensure_session()?;
+        // Start the capture. The device replies 0x9100 = "in progress"; then we
+        // poll with 80 11 00 00 00 until it returns 0x9000 (touch captured) or a
+        // real error (e.g. 0x6FFA = capture failed/timed out, 6982 when
+        // fingerprint protection isn't enabled). Per the reference sample script.
+        let (_, mut sw) = self.transport.transmit(&t2::verify_fingerprint(), false)?;
+        // Poll while the device is still waiting for/processing the touch. Bounded
+        // so a sensor that is never touched can't spin forever; each poll is a
+        // round-trip so this is generous wall-clock time, not a tight loop.
+        const MAX_POLLS: u32 = 600;
+        let mut polls = 0u32;
+        while sw == 0x9100 {
+            if polls >= MAX_POLLS {
+                return Err(OtpTransportError::FingerprintTimeout);
+            }
+            polls += 1;
+            let (_, next) = self.transport.transmit(&t2::fingerprint_poll(), false)?;
+            sw = next;
+        }
+        if sw != 0x9000 {
+            // 0x6FFA is the fingerprint counterpart of the 0x6FF9 button
+            // timeout: capture failed or the sensor wasn't touched. Report it
+            // clearly; map any other terminal word via the PIN status mapping
+            // (e.g. 6982 when fingerprint protection isn't enabled).
+            if sw == 0x6FFA {
+                return Err(OtpTransportError::FingerprintTimeout);
+            }
+            OtpError::check_pin(sw)?;
+        }
+        self.pin_verified = true;
+        Ok(())
+    }
+
+    /// True if fingerprint protection is currently enabled on the key (the
+    /// `FpEnable` flag is set). A quick flag read; needs no session or touch.
+    pub fn fp_is_enabled(&mut self) -> Result<bool, OtpTransportError> {
+        Ok(self.fp_supported()?.unwrap_or(false))
+    }
+
+    /// Unlock the read window, trying FINGERPRINT first and falling back to the
+    /// PIN. Behaviour:
+    ///  * If fingerprint protection is enabled, attempt a fingerprint verify. On
+    ///    a failed/timed-out touch (or if `allow_fp` is false), fall back to the
+    ///    PIN when one is supplied.
+    ///  * If fingerprint protection is not enabled, go straight to the PIN.
+    ///  * If a PIN is needed but none was supplied, returns
+    ///    [`OtpTransportError::PinRequired`].
+    ///
+    /// `allow_fp` lets a caller force the PIN path (e.g. the user chose "use
+    /// PIN"). Returns which method actually succeeded.
+    pub fn unlock_fp_or_pin(
+        &mut self,
+        pin: Option<&str>,
+        allow_fp: bool,
+    ) -> Result<UnlockMethod, OtpTransportError> {
+        let fp_on = self.fp_is_enabled().unwrap_or(false);
+        if allow_fp && fp_on {
+            match self.verify_fingerprint() {
+                Ok(()) => return Ok(UnlockMethod::Fingerprint),
+                // A failed/timed-out touch falls back to the PIN if we have one;
+                // otherwise report the fingerprint failure.
+                Err(e) => match pin {
+                    Some(p) => {
+                        self.verify_pin(p)?;
+                        return Ok(UnlockMethod::Pin);
+                    }
+                    None => return Err(e),
+                },
+            }
+        }
+        // PIN path (fp disabled, or caller forced PIN).
+        match pin {
+            Some(p) => {
+                self.verify_pin(p)?;
+                Ok(UnlockMethod::Pin)
+            }
+            None => Err(OtpTransportError::PinRequired),
+        }
+    }
+
+    /// Report whether the key supports/permits fingerprint-protected OTP
+    /// (`FpEnable` in the PIN flag). `None` if the flag can't be read (older
+    /// firmware). Reads the 9-byte flag so the FpEnable byte is present.
+    pub fn fp_supported(&mut self) -> Result<Option<bool>, OtpTransportError> {
+        let apdu = t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_PRIME);
+        let (data, sw) = self.transport.transmit(&apdu, false)?;
+        if OtpError::check_pin(sw).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(t2::PinFlag::parse(&data)?.fp_enable))
+    }
+
+    /// Enable or disable fingerprint protection for OTP. This is a PIN verify
+    /// (so it needs the current PIN) that carries the optional `EncConfig`
+    /// toggle (manual V1.3 §1.14 / §1.20). Leaves the read window open on
+    /// success, like a normal verify.
+    pub fn set_fp_protection(
+        &mut self,
+        pin: &str,
+        enable: bool,
+    ) -> Result<(), OtpTransportError> {
+        self.ensure_session()?;
+        let flag_apdu = t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
+        let (data, sw) = self.transport.transmit(&flag_apdu, false)?;
+        OtpError::check_pin(sw)?;
+        let flag = t2::PinFlag::parse(&data)?;
+        if !flag.is_set() {
+            return Err(OtpTransportError::PinRequired);
+        }
+        let (iv, enc_rand) = flag
+            .challenge
+            .ok_or(OtpTransportError::Parse(ParseError::Truncated))?;
+        let keys = self
+            .pin_session
+            .as_ref()
+            .ok_or(OtpTransportError::PinSessionMissing)?;
+        let rand = t2::crypto::session_decrypt_raw(&keys.enc, &iv, &enc_rand);
+        if rand.len() != 16 {
+            return Err(OtpTransportError::Encrypt(EncryptError::BadCiphertext));
+        }
+        let data_field =
+            t2::crypto::build_verify_pin_data_with_config(keys, pin.as_bytes(), &rand, enable)?;
+        let apdu = t2::build_apdu(t2::cmd::VERIFY_OTP_PIN, &data_field);
+        let (_, sw) = self.transport.transmit(&apdu, false)?;
+        // Enabling FP protection with no enrolled fingerprint is refused by the
+        // firmware with 0x6984 ("reference data not usable"). Surface it as a
+        // clear "enroll a fingerprint first" rather than a raw status word.
+        if enable && sw == 0x6984 {
+            return Err(OtpTransportError::NoFingerprintEnrolled);
+        }
+        OtpError::check_pin(sw)?;
+        self.pin_verified = true;
         Ok(())
     }
 
@@ -1799,6 +1992,7 @@ mod enumerate_bounds_tests {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         };
         let res = session.enumerate(0);
         assert!(
@@ -1840,6 +2034,7 @@ mod enumerate_bounds_tests {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         };
         let entries = session.enumerate(0).expect("two pages must enumerate");
         assert_eq!(entries.len(), 2);
@@ -2071,6 +2266,7 @@ mod pre_r34_keys_are_unaffected {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         };
         (session, sent)
     }
@@ -2185,6 +2381,7 @@ mod pre_r34_keys_are_unaffected {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         };
         assert!(session.pin_status().unwrap().is_none());
         assert_eq!(session.enumerate_pinned(0, None).unwrap().len(), 1);
@@ -2210,6 +2407,7 @@ mod pre_r34_keys_are_unaffected {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         };
         assert!(matches!(
             session.pin_status(),
@@ -2242,6 +2440,7 @@ mod pre_r34_keys_are_unaffected {
             pin_session: None,
             pin_verified: false,
             pin_present: None,
+            fp_present: None,
         };
         assert!(matches!(
             session.enumerate_pinned(0, None),
