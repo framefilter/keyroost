@@ -902,6 +902,38 @@ mod tests {
         let seed = decode_base32_seed("jbswy3dp").unwrap();
         assert_eq!(&seed[..], b"Hello");
     }
+
+    #[test]
+    fn verify_fingerprint_apdu_form() {
+        // VERIFY_OTP_PIN header (80 C5 05 06) + short Lc=1 + body 0x01
+        // ("fingerprint verify"), the sibling of lock_otp_pin's 0x00 body
+        // (manual V1.3 §1.20).
+        assert_eq!(
+            verify_fingerprint(),
+            vec![0x80, 0xC5, 0x05, 0x06, 0x01, 0x01]
+        );
+        // One byte apart from the lock form, which carries 0x00.
+        assert_eq!(lock_otp_pin(), vec![0x80, 0xC5, 0x05, 0x06, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn fingerprint_poll_apdu_form() {
+        assert_eq!(fingerprint_poll(), vec![0x80, 0x11, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn pin_flag_reads_fp_enable_byte() {
+        // A 9-byte flag read: [is_set, retries, pin_len, max_retries, FpEnable, ...].
+        // FpEnable at offset 4 nonzero -> fingerprint protection on.
+        let on = PinFlag::parse(&[0x01, 0x03, 0x06, 0x03, 0x01, 0, 0, 0, 0]).unwrap();
+        assert!(on.fp_enable);
+        let off = PinFlag::parse(&[0x01, 0x03, 0x06, 0x03, 0x00, 0, 0, 0, 0]).unwrap();
+        assert!(!off.fp_enable);
+        // The 4-byte base read has no FpEnable byte: absent reads as false,
+        // never a panic on the missing offset.
+        let base = PinFlag::parse(&[0x01, 0x03, 0x06, 0x03]).unwrap();
+        assert!(!base.fp_enable);
+    }
 }
 
 /// Token2 publishes both the protocol spec and the applet firmware, so the

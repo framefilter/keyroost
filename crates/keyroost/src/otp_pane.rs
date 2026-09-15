@@ -1588,24 +1588,17 @@ impl App {
                                     .font(theme::f_reg(11.0))
                                     .color(p.txt3),
                             );
-                            match self.otp.fp_enabled {
-                                Some(false) => {
-                                    if ui
-                                        .selectable_label(false, "Enable fingerprint unlock\u{2026}")
-                                        .clicked()
-                                    {
-                                        fp_toggle = Some(true);
-                                    }
+                            // Some(false) -> offer Enable; Some(true) -> offer
+                            // Disable; None (unknown) -> no toggle item.
+                            let toggle = match self.otp.fp_enabled {
+                                Some(false) => Some((true, "Enable fingerprint unlock\u{2026}")),
+                                Some(true) => Some((false, "Disable fingerprint unlock\u{2026}")),
+                                None => None,
+                            };
+                            if let Some((target, label)) = toggle {
+                                if ui.selectable_label(false, label).clicked() {
+                                    fp_toggle = Some(target);
                                 }
-                                Some(true) => {
-                                    if ui
-                                        .selectable_label(false, "Disable fingerprint unlock\u{2026}")
-                                        .clicked()
-                                    {
-                                        fp_toggle = Some(false);
-                                    }
-                                }
-                                None => {}
                             }
                         }
                     });

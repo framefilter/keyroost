@@ -168,7 +168,10 @@ impl std::fmt::Display for OtpTransportError {
                 write!(f, "no OTP-PIN session was established before a PIN command")
             }
             OtpTransportError::FingerprintTimeout => {
-                write!(f, "fingerprint not captured (sensor not touched, or the match failed)")
+                write!(
+                    f,
+                    "fingerprint not captured (sensor not touched, or the match failed)"
+                )
             }
             OtpTransportError::NoFingerprintEnrolled => {
                 write!(
@@ -1456,11 +1459,7 @@ impl Token2OtpSession {
     /// (so it needs the current PIN) that carries the optional `EncConfig`
     /// toggle (manual V1.3 §1.14 / §1.20). Leaves the read window open on
     /// success, like a normal verify.
-    pub fn set_fp_protection(
-        &mut self,
-        pin: &str,
-        enable: bool,
-    ) -> Result<(), OtpTransportError> {
+    pub fn set_fp_protection(&mut self, pin: &str, enable: bool) -> Result<(), OtpTransportError> {
         self.ensure_session()?;
         let flag_apdu = t2::read_otp_pin_flag(t2::cmd::PIN_FLAG_LC_CHALLENGE);
         let (data, sw) = self.transport.transmit(&flag_apdu, false)?;

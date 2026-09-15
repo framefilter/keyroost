@@ -5698,10 +5698,8 @@ fn run_otp(
             if !*pin_only && session.fp_is_enabled().unwrap_or(false) {
                 eprintln!("Touch the fingerprint sensor (or wait to fall back to PIN)\u{2026}");
             }
-            let method = session.unlock_fp_or_pin(
-                pin.as_deref().map(|p| p.as_str()),
-                !*pin_only,
-            )?;
+            let method =
+                session.unlock_fp_or_pin(pin.as_deref().map(|p| p.as_str()), !*pin_only)?;
             eprintln!(
                 "Unlocked with {}.",
                 match method {
