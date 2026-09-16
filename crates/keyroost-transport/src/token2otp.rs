@@ -233,14 +233,27 @@ fn response_is_sensitive(apdu: &[u8]) -> bool {
     )
 }
 
-/// True when `apdu`'s *request* body carries the encrypted seed blob and should
-/// be redacted from the send trace (`WRITE_SEED` / `WRITE_HOTP_SEED`, spec
-/// §1.3). Shared by both transports so a seed never reaches the trace on either
-/// path.
+/// True when `apdu`'s *request* body carries a secret and must be redacted from
+/// the send trace. Shared by both transports so nothing sensitive reaches the
+/// trace on either path. Two families:
+///
+/// * **Seed writes** (`WRITE_SEED` / `WRITE_HOTP_SEED`, spec §1.3): the body is
+///   the ECDH-sealed seed.
+/// * **PIN material** (`SET_OTP_PIN` / `VERIFY_OTP_PIN` / `CHANGE_OTP_PIN`): the
+///   body carries the encrypted PIN hash or new-PIN block. `VERIFY_OTP_PIN`
+///   also has two 1-byte forms that carry no secret — lock (`0x00`) and
+///   fingerprint verify/enable (`0x01`) — so PIN redaction is gated on an
+///   actual payload (`Lc > 1`). Every PIN command is short-`Lc` (payloads are
+///   well under 256 bytes), so `apdu[4]` is the length byte.
 fn request_is_sensitive(apdu: &[u8]) -> bool {
-    matches!(apdu.get(1), Some(0xC5))
+    let seed = matches!(apdu.get(1), Some(0xC5))
         && matches!(apdu.get(2), Some(0x05) | Some(0x00))
-        && matches!(apdu.get(3), Some(0x02) | Some(0x00))
+        && matches!(apdu.get(3), Some(0x02) | Some(0x00));
+    let pin_material = matches!(apdu.get(1), Some(0xC5))
+        && matches!(apdu.get(2), Some(0x05))
+        && matches!(apdu.get(3), Some(0x05) | Some(0x06) | Some(0x08))
+        && matches!(apdu.get(4), Some(&lc) if lc > 1);
+    seed || pin_material
 }
 
 /// Render one debug-trace line. Sensitive payloads (seed blobs on the way
@@ -1668,6 +1681,36 @@ mod trace_redaction_tests {
         assert!(!request_is_sensitive(&cmd::GET_ECDH_PUBKEY));
         assert!(!request_is_sensitive(&cmd::READ_CONFIG));
         assert!(!request_is_sensitive(&[0x00, 0xA4, 0x04, 0x00]));
+    }
+
+    #[test]
+    fn pin_material_requests_are_redacted() {
+        use super::request_is_sensitive;
+        // SET / VERIFY / CHANGE OTP PIN with a real payload carry the encrypted
+        // PIN and must be redacted. Bodies are stand-ins; only the header and
+        // the Lc byte drive the verdict.
+        let with_body = |hdr: [u8; 4], body_len: usize| {
+            let mut v = hdr.to_vec();
+            v.push(body_len as u8); // short Lc
+            v.extend(std::iter::repeat_n(0u8, body_len));
+            v
+        };
+        assert!(request_is_sensitive(&with_body(cmd::SET_OTP_PIN, 48)));
+        assert!(request_is_sensitive(&with_body(cmd::VERIFY_OTP_PIN, 32)));
+        assert!(request_is_sensitive(&with_body(cmd::CHANGE_OTP_PIN, 64)));
+        // set_fp_protection reuses VERIFY_OTP_PIN with the 48-byte
+        // IV||PinHashEnc2||EncConfig body — same header, still redacted.
+        assert!(request_is_sensitive(&with_body(cmd::VERIFY_OTP_PIN, 48)));
+
+        // The 1-byte VERIFY forms carry no secret and stay in the clear, so a
+        // trace still shows lock vs fingerprint-verify. Lock is the builder; the
+        // fingerprint-verify form (Lc=1, body 0x01) is written literally so this
+        // test does not depend on the OTP crate's fingerprint builder.
+        assert!(!request_is_sensitive(&keyroost_token2otp::lock_otp_pin()));
+        assert!(!request_is_sensitive(&[0x80, 0xC5, 0x05, 0x06, 0x01, 0x01]));
+        // The PIN-flag read and the ECDH agreement are not PIN material.
+        assert!(!request_is_sensitive(&cmd::READ_OTP_PIN_FLAG));
+        assert!(!request_is_sensitive(&cmd::READ_AGREEMENT_PUBKEY));
     }
 
     #[test]
