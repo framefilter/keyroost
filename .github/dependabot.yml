@@ -64,6 +64,9 @@ updates:
         versions: ['>=0.36']
       - dependency-name: egui
         versions: ['>=0.36']
+  # Keeps the flake.lock inputs (nixpkgs, flake-parts) fresh for the Nix
+  # packaging added in #109. Grouped so all input bumps arrive as one
+  # reviewable PR, like the cargo tree above.
   - package-ecosystem: "nix"
     directory: /
     schedule:

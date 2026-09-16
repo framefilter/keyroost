@@ -200,6 +200,9 @@ Beyond the maintainers, keyroost is grateful for community contributions:
 - **[@MakeShiftArtist](https://github.com/MakeShiftArtist)** — the Nix flake:
   `keyroost` and `keyroostctl` packages plus a development shell, tested on
   x86_64 Linux ([#109](https://github.com/framefilter/keyroost/pull/109)).
+- **[@plaflamme](https://github.com/plaflamme)** — Dependabot coverage for the
+  flake's inputs, keeping `flake.lock` current
+  ([#132](https://github.com/framefilter/keyroost/pull/132)).
 - **[@episource](https://github.com/episource)** — the project's most prolific
   external contributor: Nitrokey 3 PIV support and `piv new-chuid`
   ([#102](https://github.com/framefilter/keyroost/pull/102)), short-APDU
