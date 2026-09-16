@@ -1371,8 +1371,11 @@ impl Token2OtpSession {
         let (_, mut sw) = self.transport.transmit(&t2::verify_fingerprint(), false)?;
         // Poll while the device is still waiting for/processing the touch. Bounded
         // so a sensor that is never touched can't spin forever; each poll is a
-        // round-trip so this is generous wall-clock time, not a tight loop.
-        const MAX_POLLS: u32 = 600;
+        // round-trip so this is generous wall-clock time, not a tight loop. The
+        // firmware itself gives up (and locks the capture) after ~100 failed
+        // attempts, so this ceiling only ever trips if the device keeps saying
+        // "in progress" past that — a comfortable margin above 100 (Token2, #130).
+        const MAX_POLLS: u32 = 128;
         let mut polls = 0u32;
         while sw == 0x9100 {
             if polls >= MAX_POLLS {
