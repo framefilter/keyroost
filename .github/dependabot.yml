@@ -64,3 +64,10 @@ updates:
         versions: ['>=0.36']
       - dependency-name: egui
         versions: ['>=0.36']
+  - package-ecosystem: "nix"
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      flake-inputs:
+        patterns: ["*"]
