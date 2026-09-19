@@ -56,6 +56,25 @@ updates:
         versions: ['>=0.12']
       - dependency-name: p256
         versions: ['>=0.14']
+      # p384 0.14 is the same elliptic-curve 0.14 wave as p256 0.14 above.
+      # keyroost-pivtest shares one `ToEncodedPoint` trait (from p256's
+      # re-export) across both curves, so p384 can only move to 0.14 when p256
+      # does — bumping it alone puts elliptic-curve 0.13 and 0.14 in the tree
+      # at once and fails to build. Move it with the p256 stack.
+      - dependency-name: p384
+        versions: ['>=0.14']
+      # The dalek crypto crates (keyroost-pivtest's Ed25519 / X25519 host-side
+      # verification) are held at 2.x deliberately, not for a build conflict:
+      # the 3.0 line pulls curve25519-dalek 5.0, a brand-new major, and gains
+      # us nothing the self-test doesn't already do on 2.x. Treated like the
+      # rest of the crypto surface — moved as a deliberate upgrade, not a
+      # single-crate bump. Revisit alongside the #106 dependency-ledger work.
+      - dependency-name: ed25519-dalek
+        versions: ['>=3']
+      - dependency-name: x25519-dalek
+        versions: ['>=3']
+      - dependency-name: curve25519-dalek
+        versions: ['>=5']
       # eframe pins its own egui version, so the pair can only move in
       # lock-step, and a multi-version egui jump needs hand-migration of the
       # GUI code — an upgrade to do deliberately, not via single-crate bumps.
