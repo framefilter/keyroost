@@ -220,3 +220,26 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+  nix:
+    name: build + test (nix ${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runs-on: ubuntu-26.04
+          - system: aarch64-linux
+            runs-on: ubuntu-26.04-arm
+          - system: aarch64-darwin
+            runs-on: macos-latest
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: build keyroost
+        run: nix build --impure .#packages.${{ matrix.system }}.keyroost
+      - name: build keyroostctl
+        run: nix build --impure .#packages.${{ matrix.system }}.keyroostctl

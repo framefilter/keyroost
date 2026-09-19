@@ -21,6 +21,7 @@
           ...
         }:
         let
+          isCI = (builtins.getEnv "CI") == "true";
           workspaceCargo = fromTOML (builtins.readFile ./Cargo.toml);
           keyroostCargo = fromTOML (builtins.readFile ./crates/keyroost/Cargo.toml);
           keyroostctlCargo = fromTOML (builtins.readFile ./crates/keyroostctl/Cargo.toml);
@@ -42,6 +43,9 @@
                 "-p"
                 "keyroost"
               ];
+
+              buildType = if isCI then "debug" else "release";
+              dontStrip = isCI;
 
               buildNoDefaultFeatures = true;
 
@@ -106,6 +110,9 @@
                 "-p"
                 "keyroostctl"
               ];
+
+              buildType = if isCI then "debug" else "release";
+              dontStrip = isCI;
 
               nativeBuildInputs = with pkgs; [
                 pkg-config
