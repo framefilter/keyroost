@@ -239,7 +239,7 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: build keyroost
-        run: nix build --impure .#packages.${{ matrix.system }}.keyroost
-      - name: build keyroostctl
-        run: nix build --impure .#packages.${{ matrix.system }}.keyroostctl
+      - name: build keyroost-debug
+        run: nix build .#keyroost-debug
+      - name: build keyroostctl-debug
+        run: nix build .#keyroostctl-debug
