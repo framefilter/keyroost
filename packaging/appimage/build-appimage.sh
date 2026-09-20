@@ -73,18 +73,20 @@ BIN="${REPO_ROOT}/target/release/keyroost"
 #    against itself. Re-resolve from the release asset's recorded digest
 #    (`gh api repos/linuxdeploy/linuxdeploy/releases/tags/continuous`), then
 #    confirm the bytes actually served hash to that same value before pinning.
-#    Pins last moved 2026-08-04, after upstream rebuilt both tools on
-#    2026-08-01 (linuxdeploy at commit 07333c6, plugin at 536b0687); computed
-#    and recorded digests agreed for both.
+#    Pins last moved 2026-09-20, after upstream rebuilt both tools on
+#    2026-09-01 from the SAME commits as the prior pin (linuxdeploy 07333c6,
+#    plugin 536b0687). AppImage builds are not byte-reproducible, so the
+#    rebuild alone changed both digests with no source change; recorded and
+#    computed digests agreed for both.
 # ---------------------------------------------------------------------------
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 LD_BASE="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous"
 LDP_BASE="https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous"
 # pinned-verified: sha256 checked below before chmod +x / execution
-LD_SHA256="421ca71d5c69ea97c6309276232990d43df1dcece0edfaa26bbf926ff96ed12e"
+LD_SHA256="36a2d7e274d12e1050d0e9ecfe11d339ed54720b2bec464c286d53f8b07f5c62"
 # pinned-verified: sha256 checked below before chmod +x / execution
-LDP_SHA256="a45d3e227bc7f397e9cf6bfa4c9507494efa2293357b6e86690a3de2ca992e79"
+LDP_SHA256="0441769ab38009504d2678c38cd7e526955388dd30a215b4a20afaa5471652f2"
 fetch() { # url dest sha256
   [ -f "$2" ] || curl -fsSL -o "$2" "$1"
   echo "$3  $2" | sha256sum -c -
