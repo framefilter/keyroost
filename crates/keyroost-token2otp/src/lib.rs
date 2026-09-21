@@ -364,7 +364,13 @@ pub fn read_agreement_pubkey(host_pub_xy: &[u8]) -> Vec<u8> {
 }
 
 /// Decoded fixed head of a `READ_OTP_PIN_FLAG` response.
+///
+/// `#[non_exhaustive]`: obtain one from [`PinFlag::parse`] rather than a struct
+/// literal, so later firmware flags can be added as fields without breaking
+/// consumers. (The `fp_enable` field added in 0.10.0 was the last addition
+/// that could break a literal constructor; sealing it here closes that.)
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PinFlag {
     pub alg_id: u8,
     pub retries_left: u8,

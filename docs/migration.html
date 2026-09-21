@@ -72,11 +72,11 @@
       <tr><th>Crate</th><th>Change</th></tr>
       <tr><td><code>keyroost-token2otp</code></td>
         <td><code>PinFlag</code> gained an <code>fp_enable: bool</code> field
-          (the R3.4 fingerprint-protection flag). Unlike the other response
-          types it is not <code>#[non_exhaustive]</code>, so a struct literal
-          that set every field no longer compiles &mdash; obtain a
-          <code>PinFlag</code> from <code>PinFlag::parse</code> rather than
-          constructing one.</td></tr>
+          (the R3.4 fingerprint flag) and is now <code>#[non_exhaustive]</code>,
+          like the other response types. A struct literal that set every field
+          no longer compiles &mdash; obtain a <code>PinFlag</code> from
+          <code>PinFlag::parse</code>. With the type now sealed, this is the
+          last field addition that can affect a consumer.</td></tr>
     </table>
     </div>
   </section>

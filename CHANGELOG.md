@@ -32,6 +32,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   protection is on. Enrollment itself is done through the key's FIDO2
   fingerprint setup. Contributed by @token2. ([#130])
 
+### Changed
+- **`keyroost-token2otp`'s `PinFlag` is now `#[non_exhaustive]`.** It gained an
+  `fp_enable` field this release; sealing the struct lets later firmware flags
+  be added as fields without breaking library consumers, matching the other
+  response types. Obtain a `PinFlag` from `PinFlag::parse` rather than a struct
+  literal. ([#130])
+
 ### Fixed
 - **PIV management-key authentication no longer assumes 3DES on cards that
   lack GET METADATA.** That Yubico extension is the only place a card reports
