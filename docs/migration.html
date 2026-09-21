@@ -60,6 +60,27 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-10-0">
+    <h2>v0.10.0</h2>
+    <p>Nothing changes for scripts or the CLI &mdash; the new commands
+      (<code>otp fp-*</code>, <code>otp unlock-list</code>, <code>piv test</code>)
+      are additions. One published-library break, for consumers that construct
+      a Token2 OTP response type by hand.</p>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-token2otp</code></td>
+        <td><code>PinFlag</code> gained an <code>fp_enable: bool</code> field
+          (the R3.4 fingerprint-protection flag). Unlike the other response
+          types it is not <code>#[non_exhaustive]</code>, so a struct literal
+          that set every field no longer compiles &mdash; obtain a
+          <code>PinFlag</code> from <code>PinFlag::parse</code> rather than
+          constructing one.</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-9-0">
     <h2>v0.9.0</h2>
     <p>Nothing changes for scripts beyond three output details, listed first.

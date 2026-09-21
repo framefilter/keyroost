@@ -129,6 +129,20 @@ keyroostctl otp list --pin-stdin        # unlock in passing; same for add and de
       environment variable (<code>--pin-env</code>) &mdash; never from the command line, where
       it would land in your shell history and in the process list. <code>list</code>,
       <code>add</code> and <code>delete</code> all take both flags.</p>
+    <h3>Unlocking with a fingerprint (Bio3)</h3>
+    <p>On a Bio3 key with at least one fingerprint enrolled, a fingerprint touch can
+      release the protected codes as an alternative to entering the PIN. Fingerprint
+      enrollment itself is done through the key's FIDO2 fingerprint setup, not here;
+      keyroost turns the OTP-side option on or off and unlocks with it. Enabling it
+      needs the current PIN and an enrolled fingerprint.</p>
+<pre><code>keyroostctl otp fp-status               # is fingerprint unlock available, and is it on
+keyroostctl otp fp-enable --pin-stdin   # turn it on (needs the current PIN)
+keyroostctl otp fp-disable --pin-stdin  # turn it off
+keyroostctl otp fp-list                 # touch the sensor to unlock, then list
+keyroostctl otp unlock-list --pin-stdin # try the fingerprint, fall back to the PIN</code></pre>
+    <p class="kr-muted">When fingerprint unlock is on, the GUI's unlock prompt shows a
+      fingerprint-touch button alongside the PIN field, and either one opens the read
+      window.</p>
     <div class="kr-callout danger">
       <div class="kr-callout-title danger">A blocked PIN costs every code on the key</div>
       <p>There is no PIN reset. Wrong attempts count down a retry counter, and once it

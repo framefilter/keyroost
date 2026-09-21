@@ -104,7 +104,9 @@ What keyroost does **not** defend against:
   under `forbid(unsafe_code)` — RustCrypto (`sha2`, `hmac`, `aes`, `des`,
   `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `zeroize`, `scrypt`
   (Aegis vaults), `rsa`/`rand` (host RSA keygen, confined to
-  `keyroost-rsakey`), and `miniz_oxide` (CTAP large-blob deflate). QR and
+  `keyroost-rsakey`), `p384`/`ed25519-dalek`/`x25519-dalek` (host-side
+  verification of the PIV slot self-test, confined to `keyroost-pivtest`),
+  and `miniz_oxide` (CTAP large-blob deflate). QR and
   image decoding (`rqrr`, `png`, `jpeg-decoder`) is confined to
   `keyroost-qr`. The README's "Workspace layout" table lists them per
   crate. No new dependency lands without that justification.

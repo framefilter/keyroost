@@ -8,17 +8,17 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.9.0** — OpenPGP ECC key algorithms
-([#106](https://github.com/framefilter/keyroost/issues/106)), Token2 OTP PIN
-protection ([#107](https://github.com/framefilter/keyroost/issues/107)), PIV
-any-length GET VERSION ([#110](https://github.com/framefilter/keyroost/pull/110)),
-`--generate-key` on self-sign/request-cert
-([#116](https://github.com/framefilter/keyroost/pull/116)), the PIV activity
-log + APDU trace ([#114](https://github.com/framefilter/keyroost/pull/114)),
-status-word meanings in errors
-([#118](https://github.com/framefilter/keyroost/pull/118)), the T=0 chaining
-fix ([#103](https://github.com/framefilter/keyroost/issues/103)) and the
-`changelog.d/` fragment system. The release run is under way.
+Current work: **v0.10.0** — the Nix flake
+([#109](https://github.com/framefilter/keyroost/pull/109)) and its cross-build
+CI ([#144](https://github.com/framefilter/keyroost/pull/144)), the PIV slot
+key self-test ([#127](https://github.com/framefilter/keyroost/pull/127)),
+Token2 OTP fingerprint unlock for Bio3 keys
+([#130](https://github.com/framefilter/keyroost/pull/130)), the PIV
+management-key algorithm probe
+([#124](https://github.com/framefilter/keyroost/pull/124)), and OTP PIN-material
+redaction from the debug trace
+([#131](https://github.com/framefilter/keyroost/pull/131)). The release run is
+under way.
 
 ---
 

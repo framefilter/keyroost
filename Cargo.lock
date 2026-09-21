@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arboard",
  "ashpd",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-ctap"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2021,14 +2021,14 @@ dependencies = [
 
 [[package]]
 name = "keyroost-hid"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "hidapi",
 ]
 
 [[package]]
 name = "keyroost-import"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -2042,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-keyring"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-oath"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-openpgp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-piv"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-pivtest"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ed25519-dalek",
  "keyroost-piv",
@@ -2087,11 +2087,11 @@ dependencies = [
 
 [[package]]
 name = "keyroost-proto"
-version = "0.9.0"
+version = "0.10.0"
 
 [[package]]
 name = "keyroost-qr"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "jpeg-decoder",
  "keyroost-import",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-resolve"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "keyroost-hid",
  "keyroost-keyring",
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-rsakey"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "rand 0.8.8",
  "rsa",
@@ -2123,14 +2123,14 @@ dependencies = [
 
 [[package]]
 name = "keyroost-screengrab"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "keyroost-token2otp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes",
  "cbc",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-token2prog"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "keyroost-proto",
  "zeroize",
@@ -2151,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "keyroost-transport"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes",
  "cipher",
@@ -2172,14 +2172,14 @@ dependencies = [
 
 [[package]]
 name = "keyroost-winwebauthn"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "keyroostctl"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "clap",
  "clap_complete",

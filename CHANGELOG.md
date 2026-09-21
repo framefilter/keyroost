@@ -6,6 +6,53 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-20
+
+### Added
+- **Nix flake.** The repository now builds as a flake: `keyroost` (the
+  default package), `keyroostctl`, and a development shell, with the GUI's
+  X11/Wayland libraries wired into the binary's rpath on Linux. Tested on
+  x86_64 Linux. Contributed by @MakeShiftArtist. ([#109])
+- **PIV slot key self-test.** `keyroostctl piv test --slot <slot>` (and a
+  Test button in the GUI slot pane) proves a slot's private key works end to
+  end: keyroost builds a fixed challenge from the slot certificate's public
+  key, the card runs every operation the key type supports (decrypt for RSA,
+  key agreement for P-256/P-384/X25519, sign for RSA/ECDSA/Ed25519), and the
+  host verifies each result against that public key. Read-only on the card;
+  needs the PIN unless the slot's PIN policy is "never". The verification
+  side lives in a new `keyroost-pivtest` crate, which adds `p384`,
+  `ed25519-dalek` and `x25519-dalek` (RustCrypto/dalek) to the tree.
+  Contributed by @episource. ([#127])
+- **Fingerprint unlock for Token2 Bio3 OTP.** On an R3.4 Bio3 key with a
+  fingerprint enrolled, protected OTP codes can be released by a sensor touch
+  as well as by the PIN. The CLI's `otp` group gains `fp-status`, `fp-enable`,
+  `fp-disable`, `fp-list` (touch to unlock) and `unlock-list` (fingerprint
+  first, PIN fallback; `--pin-only` forces the PIN), and the GUI's unlock
+  prompt offers a touch button alongside the PIN field when fingerprint
+  protection is on. Enrollment itself is done through the key's FIDO2
+  fingerprint setup. Contributed by @token2. ([#130])
+
+### Fixed
+- **PIV management-key authentication no longer assumes 3DES on cards that
+  lack GET METADATA.** That Yubico extension is the only place a card reports
+  its 9B key's algorithm, and applets without it (the Cryptnox OpenFIPS201
+  variant, which ships with an AES key) were authenticated as 3DES and
+  failed. When the extension is absent, keyroost now probes each algorithm
+  with a bare GENERAL AUTHENTICATE witness request (no key material leaves
+  the host), keeps the ones the card accepts, and narrows by the length of
+  the key in hand; a 24-byte key that fits both 3DES and AES-192 still
+  resolves to 3DES, so older YubiKeys behave as before. Applies to the CLI
+  and the GUI alike, and `--debug` traces each probe's verdict. Contributed
+  by @episource. ([#124])
+
+### Security
+- **The `--debug` trace no longer prints Token2 OTP PIN material.** The
+  PIN-bearing commands — `SET_OTP_PIN`, `CHANGE_OTP_PIN`, and the PIN-carrying
+  forms of `VERIFY_OTP_PIN` (a plain PIN verify, and the R3.4 Bio3
+  fingerprint-protection toggle) — now have their request bodies length-redacted
+  in the trace, the same as seed writes. The 1-byte `VERIFY` forms that carry no
+  secret (lock, fingerprint verify) still show in full. ([#131])
+
 ## [0.9.0] - 2026-08-31
 
 ### Added
@@ -1022,12 +1069,18 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#104]: https://github.com/framefilter/keyroost/pull/104
 [#106]: https://github.com/framefilter/keyroost/issues/106
 [#107]: https://github.com/framefilter/keyroost/issues/107
+[#109]: https://github.com/framefilter/keyroost/issues/109
 [#110]: https://github.com/framefilter/keyroost/pull/110
 [#114]: https://github.com/framefilter/keyroost/pull/114
 [#116]: https://github.com/framefilter/keyroost/pull/116
 [#118]: https://github.com/framefilter/keyroost/pull/118
 [#119]: https://github.com/framefilter/keyroost/pull/119
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.9.0...HEAD
+[#124]: https://github.com/framefilter/keyroost/issues/124
+[#127]: https://github.com/framefilter/keyroost/issues/127
+[#130]: https://github.com/framefilter/keyroost/issues/130
+[#131]: https://github.com/framefilter/keyroost/issues/131
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/framefilter/keyroost/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/framefilter/keyroost/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/framefilter/keyroost/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/framefilter/keyroost/compare/v0.7.7...v0.7.8

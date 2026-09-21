@@ -15,7 +15,7 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       pinned-inputs check).
 - [ ] `cargo audit` green (the audit workflow runs on pushes; check the last
       run) and the deps-outdated report reviewed.
-- [ ] **Semver check against the published crates** — with 16 library crates
+- [ ] **Semver check against the published crates** — with 17 library crates
       on crates.io, Cargo treats 0.7.x -> 0.7.y as compatible, so an
       accidental API break in a patch release ships silently and breaks
       downstream `cargo update`:

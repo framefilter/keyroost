@@ -66,7 +66,11 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   clearing a slot's certificate (`delete-cert`) or key (`delete-key`, on YubiKey
   5.7+), moving a key between slots (`move-key`, on YubiKey 5.7+), writing a
   fresh CHUID with a random GUID (`new-chuid`) so Windows re-reads a
-  reprovisioned card, and PIN / PUK / management-key changes and applet reset. Every slot-taking command addresses
+  reprovisioned card, and PIN / PUK / management-key changes and applet reset.
+  A read-only `test` runs every private-key operation a slot's key supports
+  (decrypt for RSA, key-agree for the ECDH curves, sign for RSA / ECDSA /
+  Ed25519) and checks each result against the slot certificate's public key.
+  Every slot-taking command addresses
   9A/9C/9D/9E *and* the 20 Yubico retired key-management slots (82–95), so keys
   can be archived and rotated. The GUI collects the
   management key per operation (and wipes it after), which is ideal for a slot or
@@ -93,7 +97,11 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   On R3.4+ keys the codes can be put behind an OTP PIN (`otp set-pin`,
   `otp verify`, `otp change-pin`, `otp remove-pin`, `otp pin-status`); note
   there is no PIN reset — a blocked PIN is recoverable only by erasing every
-  OTP entry.
+  OTP entry. On Bio3 keys with a fingerprint enrolled, a fingerprint touch can
+  release protected codes as an alternative to the PIN (`otp fp-status`,
+  `otp fp-enable`, `otp fp-disable`, `otp fp-list`, and `otp unlock-list`,
+  which tries the fingerprint and falls back to the PIN); fingerprint
+  enrollment itself is done through the key's FIDO2 fingerprint setup.
 - **One-shot factory reset** — `keyroostctl factory-reset --yes` (and a card on
   the GUI device Overview tab) resets every resettable applet on a key in turn:
   OATH, OpenPGP, PIV, Token2 OTP, then FIDO2. On a USB key the FIDO2 step ends
@@ -670,6 +678,7 @@ old script.
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM | `zeroize` |
+| `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against the slot certificate's public key | `rsa`, `p256`, `p384`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |

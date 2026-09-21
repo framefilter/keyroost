@@ -11,7 +11,7 @@ description = "Host-side round-trip self-tests for a PIV slot key (decrypt / key
 workspace = true
 
 [dependencies]
-keyroost-piv = { path = "../keyroost-piv", version = "0.9.0" }
+keyroost-piv = { path = "../keyroost-piv", version = "0.10.0" }
 # Public-key crypto for the *verification* side of each round trip — a
 # functional check that the card's private-key op produced something the
 # matching public key accepts. All test inputs are fixed compile-time
