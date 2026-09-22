@@ -5,7 +5,5 @@
   large." `piv test` failed on such a slot before it even reached the PIN, and
   `export-cert` and the status pane's Subject-DN read had the same latent gap.
   keyroost now honours the CertInfo flag and inflates the certificate on read
-  (size-capped). Separately, `piv test` now takes the slot's public key from
-  GET METADATA when the card offers it and falls back to the certificate only
-  otherwise, so it reads the key straight from the slot and also works on a
-  slot that holds a key but no certificate. Reported by @n0xena. ([#147])
+  (size-capped), so `piv test`, `export-cert`, and the status pane read such a
+  certificate correctly. Reported by @n0xena. ([#147])

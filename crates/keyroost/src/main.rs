@@ -7775,20 +7775,15 @@ fn run_piv_self_test(
     pin: &[u8],
 ) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, String> {
     let mut s = keyroost_transport::PivSession::open(reader).map_err(|e| e.to_string())?;
-    // Prefer the slot's public key from GET METADATA; fall back to the slot
-    // certificate when the card doesn't report it. Reading from the slot avoids
-    // the stored cert, which YubiKey keeps gzip-compressed (#147), and works
-    // when a slot has a key but no cert.
-    let (alg, pubkey) = if let Some(km) = s.slot_key_from_metadata(slot) {
-        km
-    } else {
-        let cert = s
-            .read_certificate(slot)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
-        keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
-            .map_err(|e| format!("could not read the slot certificate's key: {e}"))?
-    };
+    // Verify against the slot CERTIFICATE's public key on purpose: the cert is
+    // what other PIV software consumes, so a pass proves the cert matches the
+    // slot's key material. A compressed cert is inflated on read (#147/#148).
+    let cert = s
+        .read_certificate(slot)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
+    let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
+        .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
 
     if !keyroost_pivtest::SelfTest::all()
         .into_iter()

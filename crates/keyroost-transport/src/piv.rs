@@ -1265,20 +1265,6 @@ impl PivSession {
         ))
     }
 
-    /// A slot's key algorithm and public key from GET METADATA (the Yubico
-    /// extension, tag `0x04`), or `None` when the card doesn't report it.
-    /// Unlike [`Self::slot_key`] this makes no fallback to a session-cached key
-    /// or to the certificate — the caller decides that. The self-test uses it
-    /// to read the public key straight from the slot, which sidesteps the
-    /// stored certificate entirely (YubiKey keeps it gzip-compressed) and works
-    /// on a slot that holds a key but no cert.
-    pub fn slot_key_from_metadata(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
-        let md = self.metadata(slot.key_ref())?;
-        let (alg, raw) = metadata_key_material(&md)?;
-        let key = public_key_from_metadata(raw).ok()?;
-        Some((alg, key))
-    }
-
     /// Build a PKCS#10 certificate-signing request for the key in `slot`,
     /// signed on the card, returned as PEM. The slot must hold a key
     /// (generated or imported). Verifies `pin` itself, deliberately placed
