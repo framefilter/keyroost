@@ -1075,6 +1075,26 @@ pub fn encode_certificate(der: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The certificate value and its compression flag from the inner content of a
+/// slot cert data-object (the `0x53` template's value, i.e. the output of
+/// [`unwrap_data_object`]): the `0x70` TLV's bytes plus whether the `0x71`
+/// CertInfo byte marks them gzip-compressed (bit 0). `None` when there is no
+/// `0x70` value at all.
+///
+/// keyroost writes uncompressed certs (`encode_certificate` sets CertInfo 0),
+/// but YubiKey stores attestation and imported certs gzip-compressed, so a
+/// cert read back may carry the compressed bytes with the flag set; the caller
+/// inflates them (the byte layer stays free of a decompressor). See
+/// [Yubico's encoded-certificate format](https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html).
+#[must_use]
+pub fn cert_object_parts(inner: &[u8]) -> Option<(&[u8], bool)> {
+    let der = find_tlv(inner, 0x70)?;
+    let gzip = find_tlv(inner, 0x71)
+        .and_then(<[u8]>::first)
+        .is_some_and(|b| b & 0x01 != 0);
+    Some((der, gzip))
+}
+
 /// FASC-N filler for a CHUID that doesn't represent a real federal employee —
 /// the same 25 BCD/odd-parity-encoded bytes `yubico-piv-tool`'s own
 /// `set-chuid` uses (`lib/util.c`'s `CHUID_TMPL`, bytes 2..27). Not meaningful
@@ -2105,6 +2125,27 @@ mod tests {
             encode_certificate(&der),
             vec![0x70, 0x03, 0xAB, 0xCD, 0xEF, 0x71, 0x01, 0x00, 0xFE, 0x00]
         );
+    }
+
+    #[test]
+    fn cert_object_parts_reads_value_and_gzip_flag() {
+        // Uncompressed (what encode_certificate writes): CertInfo 0x00.
+        let unc = [0x70, 0x03, 0xAB, 0xCD, 0xEF, 0x71, 0x01, 0x00, 0xFE, 0x00];
+        assert_eq!(
+            cert_object_parts(&unc),
+            Some((&[0xAB, 0xCD, 0xEF][..], false))
+        );
+        // Gzip-compressed (YubiKey): CertInfo bit 0 set. The 0x70 value here
+        // stands in for the gzip stream; the flag is what matters.
+        let gz = [0x70, 0x02, 0x1F, 0x8B, 0x71, 0x01, 0x01, 0xFE, 0x00];
+        assert_eq!(cert_object_parts(&gz), Some((&[0x1F, 0x8B][..], true)));
+        // Missing 0x71 reads as uncompressed, not an error.
+        assert_eq!(
+            cert_object_parts(&[0x70, 0x01, 0xAB]),
+            Some((&[0xAB][..], false))
+        );
+        // No 0x70 at all -> None (an empty/foreign template).
+        assert_eq!(cert_object_parts(&[0x71, 0x01, 0x00, 0xFE, 0x00]), None);
     }
 
     #[test]

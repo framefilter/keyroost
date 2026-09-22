@@ -106,7 +106,8 @@ What keyroost does **not** defend against:
   (Aegis vaults), `rsa`/`rand` (host RSA keygen, confined to
   `keyroost-rsakey`), `p384`/`ed25519-dalek`/`x25519-dalek` (host-side
   verification of the PIV slot self-test, confined to `keyroost-pivtest`),
-  and `miniz_oxide` (CTAP large-blob deflate). QR and
+  and `miniz_oxide` (CTAP large-blob deflate, and inflating gzip-compressed
+  PIV certificates, both size-capped). QR and
   image decoding (`rqrr`, `png`, `jpeg-decoder`) is confined to
   `keyroost-qr`. The README's "Workspace layout" table lists them per
   crate. No new dependency lands without that justification.

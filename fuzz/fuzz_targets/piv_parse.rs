@@ -15,4 +15,7 @@ fuzz_target!(|data: &[u8]| {
     // CHUID read-back (#102): the card hands back the object new-chuid wrote,
     // and `piv status` parses whatever any card serves under that tag.
     let _ = keyroost_piv::parse_chuid(data);
+    // Cert data-object parts (#147): the 0x70 value + the 0x71 gzip flag,
+    // read from whatever a card serves under the slot cert object.
+    let _ = keyroost_piv::cert_object_parts(data);
 });

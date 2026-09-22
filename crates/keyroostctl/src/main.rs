@@ -6652,11 +6652,20 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             };
 
             let mut s = open_piv(reader.as_deref(), debug)?;
-            let cert = s.read_certificate(piv_slot)?.ok_or_else(|| {
-                format!("{} has no certificate to test against", piv_slot.label())
-            })?;
-            let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
-                .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+            // Prefer the public key straight from the slot (GET METADATA); fall
+            // back to the slot certificate when the card doesn't report it.
+            // Reading from the slot avoids the stored cert entirely, which
+            // YubiKey keeps gzip-compressed (#147), and works when a slot has a
+            // key but no cert.
+            let (alg, pubkey) = if let Some(km) = s.slot_key_from_metadata(piv_slot) {
+                km
+            } else {
+                let cert = s.read_certificate(piv_slot)?.ok_or_else(|| {
+                    format!("{} has no certificate to test against", piv_slot.label())
+                })?;
+                keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
+                    .map_err(|e| format!("could not read the slot certificate's key: {e}"))?
+            };
 
             if !keyroost_pivtest::SelfTest::all()
                 .into_iter()

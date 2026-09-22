@@ -990,7 +990,7 @@ impl PivSession {
         if sw != piv::SW_OK {
             return Ok(None);
         }
-        Ok(cert_object_der(&data).map(<[u8]>::to_vec))
+        Ok(cert_object_der(&data))
     }
 
     /// Yubico ATTEST: the self-signed attestation certificate for `slot`'s key
@@ -1263,6 +1263,20 @@ impl PivSession {
              key material to this command, so it can be cached for \
              CSR/self-sign",
         ))
+    }
+
+    /// A slot's key algorithm and public key from GET METADATA (the Yubico
+    /// extension, tag `0x04`), or `None` when the card doesn't report it.
+    /// Unlike [`Self::slot_key`] this makes no fallback to a session-cached key
+    /// or to the certificate — the caller decides that. The self-test uses it
+    /// to read the public key straight from the slot, which sidesteps the
+    /// stored certificate entirely (YubiKey keeps it gzip-compressed) and works
+    /// on a slot that holds a key but no cert.
+    pub fn slot_key_from_metadata(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
+        let md = self.metadata(slot.key_ref())?;
+        let (alg, raw) = metadata_key_material(&md)?;
+        let key = public_key_from_metadata(raw).ok()?;
+        Some((alg, key))
     }
 
     /// Build a PKCS#10 certificate-signing request for the key in `slot`,
@@ -1741,9 +1755,60 @@ fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
 /// no `0x70`, or a body that isn't a `0x53` data template at all (not
 /// expected from a real card, and degraded rather than errored — this feeds
 /// read-only status calls). Pure, so the byte cases stay unit-tested.
-fn cert_object_der(body: &[u8]) -> Option<&[u8]> {
+fn cert_object_der(body: &[u8]) -> Option<Vec<u8>> {
     let inner = piv::unwrap_data_object(body).ok()?;
-    piv::find_tlv(inner, 0x70)
+    let (der, gzip) = piv::cert_object_parts(inner)?;
+    if gzip {
+        // YubiKey stores the cert gzip-compressed (CertInfo bit 0). Inflate it
+        // before anyone parses it as DER. A stream that won't inflate, or one
+        // that blows the size cap, degrades to "no cert" — the same way a
+        // malformed body already does — rather than handing garbage downstream.
+        gunzip_capped(der)
+    } else {
+        Some(der.to_vec())
+    }
+}
+
+/// Host ceiling on an inflated PIV certificate. Real certs are a few KB; the
+/// card's own object is small. This just bounds a hostile/broken gzip stream
+/// so the decompressor cannot be made to allocate without limit.
+const MAX_CERT_DECOMPRESSED: usize = 64 * 1024;
+
+/// Inflate a gzip (RFC 1952) stream, capped at [`MAX_CERT_DECOMPRESSED`].
+/// `None` on a non-gzip or malformed header, an unparseable DEFLATE body, or
+/// output past the cap. The gzip trailer (CRC32 + ISIZE) is trimmed; the CRC
+/// is not verified — a wrong cert fails its own signature check downstream,
+/// so the CRC adds nothing here.
+fn gunzip_capped(data: &[u8]) -> Option<Vec<u8>> {
+    // Fixed header: magic(2) CM(1) FLG(1) MTIME(4) XFL(1) OS(1) = 10 bytes,
+    // plus the 8-byte trailer, so a valid stream is at least 18 bytes.
+    if data.len() < 18 || data[0] != 0x1F || data[1] != 0x8B || data[2] != 0x08 {
+        return None;
+    }
+    let flg = data[3];
+    let mut pos = 10usize;
+    if flg & 0x04 != 0 {
+        // FEXTRA: 2-byte little-endian length, then that many bytes.
+        let xlen = u16::from_le_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
+        pos = pos.checked_add(2)?.checked_add(xlen)?;
+    }
+    if flg & 0x08 != 0 {
+        // FNAME: zero-terminated.
+        let rel = data.get(pos..)?.iter().position(|&b| b == 0)?;
+        pos = pos.checked_add(rel)?.checked_add(1)?;
+    }
+    if flg & 0x10 != 0 {
+        // FCOMMENT: zero-terminated.
+        let rel = data.get(pos..)?.iter().position(|&b| b == 0)?;
+        pos = pos.checked_add(rel)?.checked_add(1)?;
+    }
+    if flg & 0x02 != 0 {
+        // FHCRC: 2 bytes.
+        pos = pos.checked_add(2)?;
+    }
+    let end = data.len().checked_sub(8)?; // trim CRC32 + ISIZE trailer
+    let deflate = data.get(pos..end)?;
+    miniz_oxide::inflate::decompress_to_vec_with_limit(deflate, MAX_CERT_DECOMPRESSED).ok()
 }
 
 /// A slot's [`PivSlotStatus`] from the certificate DER
@@ -2202,11 +2267,47 @@ mod tests {
 
     #[test]
     fn cert_object_der_populated_template_yields_the_inner_value() {
-        // `53 03 70 01 AB`: a (fake, minimal) `70` TLV wrapping one byte.
+        // `53 03 70 01 AB`: a (fake, minimal) `70` TLV wrapping one byte,
+        // CertInfo absent so it reads as uncompressed and passes through.
         assert_eq!(
             cert_object_der(&[0x53, 0x03, 0x70, 0x01, 0xAB]),
-            Some(&[0xAB][..])
+            Some(vec![0xAB])
         );
+    }
+
+    /// gzip-wrap `payload` the way a YubiKey would (minimal RFC 1952 header,
+    /// raw-DEFLATE body, dummy CRC/ISIZE trailer — the reader trims and does
+    /// not verify the trailer).
+    fn gzip(payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xFF];
+        v.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(payload, 6));
+        v.extend_from_slice(&[0u8; 8]); // CRC32 + ISIZE, unread
+        v
+    }
+
+    #[test]
+    fn gunzip_capped_round_trips() {
+        let der = b"\x30\x82\x01\x0a hello certificate bytes";
+        assert_eq!(gunzip_capped(&gzip(der)).as_deref(), Some(&der[..]));
+        // Not gzip -> None, no panic.
+        assert_eq!(gunzip_capped(b"\x30\x03\x01\x01\xff"), None);
+        assert_eq!(gunzip_capped(&[]), None);
+    }
+
+    #[test]
+    fn cert_object_der_inflates_a_gzip_compressed_cert() {
+        // The exact shape that broke #147: CertInfo 0x01 (gzip) with the cert
+        // stored compressed. cert_object_der must return the ORIGINAL DER.
+        let der = b"\x30\x82\x01\x0a a yubikey attestation cert (stand-in)";
+        let gz = gzip(der);
+        // Build 53 { 70 <gz> 71 01 01 FE 00 } with short-form lengths.
+        assert!(gz.len() < 0x80, "test vector must stay short-form");
+        let mut inner = vec![0x70, gz.len() as u8];
+        inner.extend_from_slice(&gz);
+        inner.extend_from_slice(&[0x71, 0x01, 0x01, 0xFE, 0x00]);
+        let mut obj = vec![0x53, inner.len() as u8];
+        obj.extend_from_slice(&inner);
+        assert_eq!(cert_object_der(&obj).as_deref(), Some(&der[..]));
     }
 
     #[test]
@@ -2256,8 +2357,8 @@ mod tests {
         body.extend_from_slice(&inner);
 
         let cert_der = cert_object_der(&body);
-        assert_eq!(cert_der, Some(&der[..]));
-        let occ = slot_occupancy(piv::Slot::Authentication, cert_der);
+        assert_eq!(cert_der.as_deref(), Some(&der[..]));
+        let occ = slot_occupancy(piv::Slot::Authentication, cert_der.as_deref());
         assert!(occ.cert_present);
         assert_eq!(occ.cert_len, der.len());
     }
@@ -2273,8 +2374,8 @@ mod tests {
         body.extend_from_slice(&inner);
 
         let cert_der = cert_object_der(&body);
-        assert_eq!(cert_der, Some(&der[..]));
-        let occ = slot_occupancy(piv::Slot::Authentication, cert_der);
+        assert_eq!(cert_der.as_deref(), Some(&der[..]));
+        let occ = slot_occupancy(piv::Slot::Authentication, cert_der.as_deref());
         assert!(occ.cert_present);
         assert_eq!(occ.cert_len, der.len());
     }
