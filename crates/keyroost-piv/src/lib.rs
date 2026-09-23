@@ -1068,13 +1068,38 @@ pub fn put_data_chained(tag: &[u8], value: &[u8], max_chunk: usize) -> Vec<Vec<u
     )
 }
 
-/// Wrap a DER X.509 certificate in the PIV cert data-object value: `70 <der>
-/// 71 01 <certinfo> FE 00`. `certinfo` is 0 for an uncompressed cert.
+/// The CertInfo byte of a PIV certificate object: how the `0x70` value is
+/// stored. SP 800-73-4 Part 1 Appendix A defines `0x00` (uncompressed) and
+/// `0x01` (GZIP, RFC 1952); these are the only two values keyroost writes.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertInfo {
+    /// The `0x70` value is the DER certificate itself (CertInfo `0x00`).
+    Uncompressed,
+    /// The `0x70` value is a gzip member holding the DER (CertInfo `0x01`).
+    Gzip,
+}
+
+impl CertInfo {
+    /// The CertInfo byte written into the `0x71` TLV.
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        match self {
+            CertInfo::Uncompressed => 0x00,
+            CertInfo::Gzip => 0x01,
+        }
+    }
+}
+
+/// Wrap a certificate payload in the PIV cert data-object value: `70
+/// <payload> 71 01 <certinfo> FE 00`. `payload` is the DER certificate for
+/// [`CertInfo::Uncompressed`], or a gzip member of it for [`CertInfo::Gzip`]
+/// (the caller compresses; this crate stays free of a compressor).
 #[must_use]
-pub fn encode_certificate(der: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(der.len() + 8);
-    push_tlv(&mut out, &[0x70], der); // the certificate itself
-    push_tlv(&mut out, &[0x71], &[0x00]); // CertInfo: 0 = uncompressed
+pub fn encode_certificate(payload: &[u8], info: CertInfo) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    push_tlv(&mut out, &[0x70], payload); // the certificate (or its gzip)
+    push_tlv(&mut out, &[0x71], &[info.byte()]); // CertInfo
     push_tlv(&mut out, &[0xFE], &[]); // LRC (empty)
     out
 }
@@ -1085,10 +1110,9 @@ pub fn encode_certificate(der: &[u8]) -> Vec<u8> {
 /// CertInfo byte marks them gzip-compressed (bit 0). `None` when there is no
 /// `0x70` value at all.
 ///
-/// keyroost writes uncompressed certs (`encode_certificate` sets CertInfo 0),
-/// but a PIV certificate object may hold the certificate gzip-compressed
+/// A PIV certificate object may hold the certificate gzip-compressed
 /// (CertInfo `0x01`, SP 800-73-4 Part 1 Appendix A); the tool that writes the
-/// object chooses this, and tools such as ykman do so on request. A cert read
+/// object chooses this (see [`encode_certificate`] and [`CertInfo`]). A cert read
 /// back may therefore carry the compressed bytes with the flag set; the caller
 /// inflates them (the byte layer stays free of a decompressor). See also
 /// [Yubico's encoded-certificate format](https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html).
@@ -2075,7 +2099,7 @@ mod tests {
     fn put_data_large_object_uses_extended_apdu() {
         // A 1 KB cert forces extended-length encoding (leading 00, 2-byte Lc).
         let der = vec![0x11u8; 1024];
-        let value = encode_certificate(&der);
+        let value = encode_certificate(&der, CertInfo::Uncompressed);
         let apdu = put_data(&Slot::Signature.cert_object_tag(), &value);
         assert_eq!(&apdu[..5], &[0x00, 0xDB, 0x3F, 0xFF, 0x00]); // extended marker
         let lc = ((apdu[5] as usize) << 8) | apdu[6] as usize;
@@ -2097,7 +2121,7 @@ mod tests {
         // The chained chunks' data fields must concatenate to exactly the
         // same body a single extended-length PUT DATA would carry.
         let der = vec![0x11u8; 1024];
-        let value = encode_certificate(&der);
+        let value = encode_certificate(&der, CertInfo::Uncompressed);
         let tag = Slot::Signature.cert_object_tag();
 
         let extended = put_data(&tag, &value);
@@ -2128,9 +2152,48 @@ mod tests {
         let der = [0xAB, 0xCD, 0xEF];
         // 70 03 AB CD EF 71 01 00 FE 00
         assert_eq!(
-            encode_certificate(&der),
+            encode_certificate(&der, CertInfo::Uncompressed),
             vec![0x70, 0x03, 0xAB, 0xCD, 0xEF, 0x71, 0x01, 0x00, 0xFE, 0x00]
         );
+    }
+
+    #[test]
+    fn encode_certificate_gzip_sets_certinfo_01() {
+        // The 0x70 value stands in for a gzip member; only the CertInfo
+        // byte differs from the uncompressed form (SP 800-73-4 Part 1
+        // Appendix A: 0x01 = GZIP).
+        let gz = [0x1F, 0x8B, 0x08];
+        assert_eq!(
+            encode_certificate(&gz, CertInfo::Gzip),
+            vec![0x70, 0x03, 0x1F, 0x8B, 0x08, 0x71, 0x01, 0x01, 0xFE, 0x00]
+        );
+    }
+
+    #[test]
+    fn certinfo_bytes_are_the_standard_values() {
+        assert_eq!(CertInfo::Uncompressed.byte(), 0x00);
+        assert_eq!(CertInfo::Gzip.byte(), 0x01);
+    }
+
+    #[test]
+    fn encode_certificate_long_form_length_both_variants() {
+        // 300 bytes needs the two-byte long form: 70 82 01 2C <value>.
+        let payload = vec![0x5Au8; 300];
+        for (info, byte) in [(CertInfo::Uncompressed, 0x00), (CertInfo::Gzip, 0x01)] {
+            let out = encode_certificate(&payload, info);
+            assert_eq!(&out[..4], &[0x70, 0x82, 0x01, 0x2C]);
+            assert_eq!(&out[4..304], &payload[..]);
+            assert_eq!(&out[304..], &[0x71, 0x01, byte, 0xFE, 0x00]);
+        }
+    }
+
+    #[test]
+    fn encode_certificate_round_trips_through_cert_object_parts() {
+        let payload = vec![0x42u8; 200];
+        for (info, gzip) in [(CertInfo::Uncompressed, false), (CertInfo::Gzip, true)] {
+            let out = encode_certificate(&payload, info);
+            assert_eq!(cert_object_parts(&out), Some((&payload[..], gzip)));
+        }
     }
 
     #[test]
