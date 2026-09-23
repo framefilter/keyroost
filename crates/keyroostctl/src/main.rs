@@ -6518,7 +6518,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
             let der = cert_to_der(&bytes)?;
             let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.import_certificate(slot.to_slot(), &der)?;
+            s.import_certificate(
+                slot.to_slot(),
+                &der,
+                keyroost_transport::CertCompression::Never,
+            )?;
             println!(
                 "Imported {}-byte certificate into {}.",
                 der.len(),
@@ -6631,12 +6635,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
             let now = unix_now() as i64;
-            let der = s.self_signed_certificate(
+            let (der, _) = s.self_signed_certificate(
                 slot.to_slot(),
                 subject,
                 now,
                 now + i64::from(*days) * 86_400,
                 pin.as_bytes(),
+                keyroost_transport::CertCompression::Never,
             )?;
             println!(
                 "Self-signed certificate ({} bytes, {} days) created and stored in {}.",

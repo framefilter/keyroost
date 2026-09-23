@@ -6852,7 +6852,7 @@ impl App {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
-                s.import_certificate(slot, &der)?;
+                s.import_certificate(slot, &der, keyroost_transport::CertCompression::Never)?;
                 s.status()
             })();
             Box::new(move |app: &mut App| {
@@ -7255,6 +7255,7 @@ impl App {
                         now,
                         now + days * 86_400,
                         pin.as_bytes(),
+                        keyroost_transport::CertCompression::Never,
                     )?;
                     s.status()
                 })();
