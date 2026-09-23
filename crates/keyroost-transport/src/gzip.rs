@@ -1,10 +1,10 @@
-//! Minimal gzip (RFC 1952) reader for compressed PIV certificate objects,
-//! plus the CRC-32 it is checked with.
+//! Minimal gzip (RFC 1952) reader and writer for compressed PIV certificate
+//! objects, plus the CRC-32 both use.
 //!
 //! A PIV certificate object may hold the certificate gzip-compressed
 //! (CertInfo `0x01`, SP 800-73-4 Part 1 Appendix A). The DEFLATE body is
-//! inflated by `miniz_oxide`; the header walk, the CRC-32 and the trailer
-//! check are in-tree.
+//! inflated and deflated by `miniz_oxide`; the header, the CRC-32 and the
+//! trailer are in-tree.
 
 use crate::piv::CertUnreadable;
 
@@ -44,6 +44,27 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
         c = CRC32_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
     }
     c ^ 0xFFFF_FFFF
+}
+
+/// One gzip (RFC 1952) member holding `data`, as written into a compressed
+/// PIV certificate object. The header is fixed for reproducible output: no
+/// optional fields (FLG 0), MTIME 0, XFL 2 (maximum compression), OS 255
+/// (unknown). The DEFLATE body is `miniz_oxide` at level 9; the trailer is
+/// the CRC-32 and the input length, both little-endian.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the certificate import path uses it next")
+)]
+pub(crate) fn gzip_member(data: &[u8]) -> Vec<u8> {
+    const HEADER: [u8; 10] = [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xFF];
+    let body = miniz_oxide::deflate::compress_to_vec(data, 9);
+    let mut out = Vec::with_capacity(HEADER.len() + body.len() + 8);
+    out.extend_from_slice(&HEADER);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    // ISIZE is the input length modulo 2^32 (RFC 1952 section 2.3.1).
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
 }
 
 /// Inflate a gzip (RFC 1952) stream, capped at [`MAX_CERT_DECOMPRESSED`].
@@ -147,6 +168,47 @@ mod tests {
         let crc_at = gz.len() - 8;
         gz[crc_at] ^= 0x01;
         assert_eq!(gunzip_capped(&gz), Err(CertUnreadable::Damaged));
+    }
+
+    #[test]
+    fn gzip_member_header_is_pinned() {
+        // magic, CM=8, FLG=0, MTIME=0, XFL=2 (max compression), OS=255.
+        let gz = gzip_member(PAYLOAD);
+        assert_eq!(
+            &gz[..10],
+            &[0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xFF]
+        );
+        // Trailer: CRC-32 then ISIZE, both little-endian.
+        let n = gz.len();
+        assert_eq!(&gz[n - 8..n - 4], &crc32(PAYLOAD).to_le_bytes());
+        assert_eq!(&gz[n - 4..], &(PAYLOAD.len() as u32).to_le_bytes());
+    }
+
+    #[test]
+    fn gzip_member_round_trips_through_the_reader() {
+        for data in [&b""[..], PAYLOAD, &[0xA5u8; 3000][..]] {
+            assert_eq!(gunzip_capped(&gzip_member(data)).as_deref(), Ok(data));
+        }
+    }
+
+    #[test]
+    fn gzip_member_is_deterministic() {
+        assert_eq!(gzip_member(PAYLOAD), gzip_member(PAYLOAD));
+    }
+
+    #[test]
+    fn gzip_member_compresses_repetitive_input() {
+        // A certificate full of repeated structure shrinks a lot; 6 KB of
+        // a repeating pattern must land well under 3 KB.
+        let data: Vec<u8> = b"CN=keyroost test, O=example, "
+            .iter()
+            .copied()
+            .cycle()
+            .take(6 * 1024)
+            .collect();
+        let gz = gzip_member(&data);
+        assert!(gz.len() < 3 * 1024, "compressed to {} bytes", gz.len());
+        assert_eq!(gunzip_capped(&gz).as_deref(), Ok(&data[..]));
     }
 
     #[test]
