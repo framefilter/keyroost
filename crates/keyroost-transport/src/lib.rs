@@ -43,7 +43,8 @@ pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
 mod piv;
 pub use piv::{
-    random_chuid_guid, PivSession, PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
+    random_chuid_guid, CertUnreadable, PivSession, PivSlotDetail, PivSlotStatus, PivStatus,
+    PivStatusDetailed,
 };
 
 mod token2otp;
@@ -148,6 +149,13 @@ pub enum TransportError {
     /// A PIV MOVE KEY refused because the destination slot already holds a key
     /// (GET METADATA pre-check, ahead of the card's own refusal).
     PivDestinationOccupied(keyroost_piv::Slot),
+    /// The slot holds a certificate, flagged compressed, that cannot be read
+    /// (see [`CertUnreadable`]). Distinct from "no certificate": the slot is
+    /// occupied, and writing a new certificate replaces it.
+    PivCertUnreadable {
+        slot: keyroost_piv::Slot,
+        reason: CertUnreadable,
+    },
     /// The host operating system's random-number source failed; a security
     /// handshake that needs an unpredictable challenge was aborted.
     HostRngFailed,
@@ -304,6 +312,13 @@ impl fmt::Display for TransportError {
                 f,
                 "slot {} already holds a key — delete it first or pick an empty slot",
                 slot.label()
+            ),
+            TransportError::PivCertUnreadable { slot, reason } => write!(
+                f,
+                "{} holds a certificate that cannot be read: {} (importing a new \
+                 certificate replaces it; deleting the certificate clears it)",
+                slot.label(),
+                reason
             ),
             TransportError::HostRngFailed => {
                 write!(f, "the host OS random-number source failed")

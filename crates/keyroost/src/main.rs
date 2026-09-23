@@ -10109,7 +10109,13 @@ impl App {
                                 let lab = format!(
                                     "{:02X} \u{00B7} {}",
                                     slot.slot.key_ref(),
-                                    if slot.cert_present { "cert" } else { "empty" }
+                                    if slot.cert_unreadable.is_some() {
+                                        "unreadable cert"
+                                    } else if slot.cert_present {
+                                        "cert"
+                                    } else {
+                                        "empty"
+                                    }
                                 );
                                 theme::pill(ui, &lab, p.txt2, p.raised2);
                             }
@@ -14153,13 +14159,13 @@ impl App {
             }
         } else {
             let sel_slot = selected.to_slot();
-            let cert_present = self
+            let sel_status = self
                 .piv
                 .status
                 .as_ref()
-                .and_then(|s| s.slots.iter().find(|sl| sl.slot == sel_slot))
-                .map(|sl| sl.cert_present)
-                .unwrap_or(false);
+                .and_then(|s| s.slots.iter().find(|sl| sl.slot == sel_slot));
+            let cert_present = sel_status.is_some_and(|sl| sl.cert_present);
+            let cert_unreadable = sel_status.and_then(|sl| sl.cert_unreadable);
             let entry = self.piv.slot_keys.iter().find(|(s, _, _)| *s == sel_slot);
             let alg = entry.and_then(|(_, a, _)| *a);
             let dn = entry.and_then(|(_, _, d)| d.as_deref());
@@ -14169,11 +14175,14 @@ impl App {
             // certificate", not "…, no certificate (…)": the algorithm
             // belongs to the key, and there's no certificate for it to
             // trail.
-            let mut s = match (cert_present, alg) {
-                (true, Some(a)) => format!("certificate present ({})", a.label()),
-                (true, None) => "certificate present".to_string(),
-                (false, Some(a)) => format!("key present ({}), no certificate", a.label()),
-                (false, None) => "empty".to_string(),
+            let mut s = match (cert_unreadable, cert_present, alg) {
+                // A certificate is there but won't decode: say so, rather than
+                // "empty", which would invite overwriting it unawares.
+                (Some(reason), _, _) => format!("certificate present but unreadable ({reason})"),
+                (None, true, Some(a)) => format!("certificate present ({})", a.label()),
+                (None, true, None) => "certificate present".to_string(),
+                (None, false, Some(a)) => format!("key present ({}), no certificate", a.label()),
+                (None, false, None) => "empty".to_string(),
             };
             // PIN/touch policy, only alongside an actual key — an empty slot
             // has no policy to report, and showing "not available" there

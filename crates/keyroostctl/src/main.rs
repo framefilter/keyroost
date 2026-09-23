@@ -182,6 +182,11 @@ mod json_out {
         pub slot: String,
         pub cert_present: bool,
         pub cert_len: usize,
+        /// Present only when the slot holds a certificate that cannot be
+        /// read: `damaged` or `too_large` (then `cert_present` is true and
+        /// `cert_len` is 0).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cert_unreadable: Option<&'static str>,
     }
 
     /// `keyroostctl piv --json test`.
@@ -6289,6 +6294,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             slot: s.slot.label(),
                             cert_present: s.cert_present,
                             cert_len: if s.cert_present { s.cert_len } else { 0 },
+                            cert_unreadable: s.cert_unreadable.map(|r| r.code()),
                         })
                         .collect(),
                 })?;
@@ -6329,7 +6335,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             println!("Slots:");
             for s in &status.slots {
-                if s.cert_present {
+                if let Some(reason) = s.cert_unreadable {
+                    println!(
+                        "  {:<26} cert present but unreadable ({})",
+                        s.slot.label(),
+                        reason
+                    );
+                } else if s.cert_present {
                     println!(
                         "  {:<26} cert present ({} bytes)",
                         s.slot.label(),
@@ -10657,9 +10669,24 @@ mod cli_tests {
                 slot: "9a (Authentication)".into(),
                 cert_present: true,
                 cert_len: 800,
+                cert_unreadable: None,
             }],
         };
         assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
+    }
+
+    #[test]
+    fn piv_slot_json_reports_an_unreadable_cert_only_when_there_is_one() {
+        let slot = |cert_unreadable| json_out::PivSlotJson {
+            slot: "key management (9D)".into(),
+            cert_present: true,
+            cert_len: 0,
+            cert_unreadable,
+        };
+        let v = serde_json::to_value(slot(Some("damaged"))).expect("serialize");
+        assert_eq!(v["cert_unreadable"], "damaged");
+        let v = serde_json::to_value(slot(None)).expect("serialize");
+        assert!(v.get("cert_unreadable").is_none(), "{v}");
     }
 
     #[test]
