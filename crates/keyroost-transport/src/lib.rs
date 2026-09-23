@@ -41,6 +41,8 @@ pub use token2prog::Token2ProgSession;
 mod openpgp;
 pub use openpgp::{OpenPgpSession, OpenPgpStatus};
 
+mod gzip;
+
 mod piv;
 pub use piv::{
     random_chuid_guid, CertUnreadable, PivSession, PivSlotDetail, PivSlotStatus, PivStatus,

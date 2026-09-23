@@ -9,6 +9,7 @@
 //! PIN/PUK change and unblock, set-pin-retries, set-management-key, key
 //! generation, certificate import/export, and applet reset.
 
+use crate::gzip::gunzip_capped;
 use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
@@ -1801,62 +1802,6 @@ fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, CertUnreadable> {
     }
 }
 
-/// Host ceiling on an inflated PIV certificate. Real certs are a few KB; the
-/// card's own object is small. This just bounds a hostile/broken gzip stream
-/// so the decompressor cannot be made to allocate without limit.
-const MAX_CERT_DECOMPRESSED: usize = 64 * 1024;
-
-/// Inflate a gzip (RFC 1952) stream, capped at [`MAX_CERT_DECOMPRESSED`].
-/// [`CertUnreadable::TooLarge`] for output past the cap;
-/// [`CertUnreadable::Damaged`] for a non-gzip or malformed header or an
-/// unparseable or truncated DEFLATE body. The gzip trailer (CRC32 + ISIZE) is trimmed; the CRC
-/// is not verified — a wrong cert fails its own signature check downstream,
-/// so the CRC adds nothing here.
-fn gunzip_capped(data: &[u8]) -> Result<Vec<u8>, CertUnreadable> {
-    gunzip_stream(data).ok_or(CertUnreadable::Damaged)?
-}
-
-/// [`gunzip_capped`]'s header walk: `None` for a malformed header, else the
-/// inflate result.
-fn gunzip_stream(data: &[u8]) -> Option<Result<Vec<u8>, CertUnreadable>> {
-    // Fixed header: magic(2) CM(1) FLG(1) MTIME(4) XFL(1) OS(1) = 10 bytes,
-    // plus the 8-byte trailer, so a valid stream is at least 18 bytes.
-    if data.len() < 18 || data[0] != 0x1F || data[1] != 0x8B || data[2] != 0x08 {
-        return None;
-    }
-    let flg = data[3];
-    let mut pos = 10usize;
-    if flg & 0x04 != 0 {
-        // FEXTRA: 2-byte little-endian length, then that many bytes.
-        let xlen = u16::from_le_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
-        pos = pos.checked_add(2)?.checked_add(xlen)?;
-    }
-    if flg & 0x08 != 0 {
-        // FNAME: zero-terminated.
-        let rel = data.get(pos..)?.iter().position(|&b| b == 0)?;
-        pos = pos.checked_add(rel)?.checked_add(1)?;
-    }
-    if flg & 0x10 != 0 {
-        // FCOMMENT: zero-terminated.
-        let rel = data.get(pos..)?.iter().position(|&b| b == 0)?;
-        pos = pos.checked_add(rel)?.checked_add(1)?;
-    }
-    if flg & 0x02 != 0 {
-        // FHCRC: 2 bytes.
-        pos = pos.checked_add(2)?;
-    }
-    let end = data.len().checked_sub(8)?; // trim CRC32 + ISIZE trailer
-    let deflate = data.get(pos..end)?;
-    Some(
-        miniz_oxide::inflate::decompress_to_vec_with_limit(deflate, MAX_CERT_DECOMPRESSED).map_err(
-            |e| match e.status {
-                miniz_oxide::inflate::TINFLStatus::HasMoreOutput => CertUnreadable::TooLarge,
-                _ => CertUnreadable::Damaged,
-            },
-        ),
-    )
-}
-
 /// A slot's [`PivSlotStatus`] from its decoded certificate object: present
 /// (with its DER byte length) when non-empty, present-but-unreadable when a
 /// certificate is there that won't decode, absent otherwise.
@@ -2015,6 +1960,7 @@ fn block_crypt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gzip::MAX_CERT_DECOMPRESSED;
 
     #[test]
     fn describe_apdu_names_the_command() {
@@ -2332,13 +2278,13 @@ mod tests {
         );
     }
 
-    /// gzip-wrap `payload` the way a YubiKey would (minimal RFC 1952 header,
-    /// raw-DEFLATE body, dummy CRC/ISIZE trailer — the reader trims and does
-    /// not verify the trailer).
+    /// gzip-wrap `payload` (minimal RFC 1952 header, raw-DEFLATE body, and
+    /// the real CRC32 + ISIZE trailer the reader verifies).
     fn gzip(payload: &[u8]) -> Vec<u8> {
         let mut v = vec![0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xFF];
         v.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(payload, 6));
-        v.extend_from_slice(&[0u8; 8]); // CRC32 + ISIZE, unread
+        v.extend_from_slice(&crate::gzip::crc32(payload).to_le_bytes());
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         v
     }
 
