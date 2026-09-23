@@ -137,6 +137,38 @@ jobs:
       - name: Check on the MSRV toolchain (workspace minus the GUI)
         run: cargo +1.85 check --workspace --exclude keyroost --all-targets --locked
 
+  # The library crates' API docs are published on docs.rs, where a broken or
+  # private intra-doc link renders as a dead or missing link. rustdoc only
+  # warns about those by default, and nothing else here builds docs, so deny
+  # them. Linux-only: the docs are the same on every platform.
+  docs:
+    name: Docs (rustdoc, deny warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same set as the `test` job: documenting the GUI compiles its
+      # eframe/egui dependencies.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpcsclite-dev \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo doc (workspace, deny warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
   # Surface dependencies the compiler will reject in a future Rust release.
   # Builds `--all-features` so every opt-in dep is covered — including the `qr`
   # feature's screen-capture backend and keyroost-hid's `hidapi-backend`, whose
