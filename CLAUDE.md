@@ -123,6 +123,12 @@ workflow during bring-up is:
   agreement with an independent third-party SM4 implementation. Any change to
   command construction must keep those tests green or be paired with a written
   justification for the new expected bytes.
+- **Device behaviour is confirmed, not inferred.** A finding about how a device
+  or its firmware behaves — in a review, an audit, docs, a changelog, or an
+  issue — needs hardware evidence or vendor confirmation before it is written
+  or fixed as fact. Until then, call it unverified and ask. Describe what a
+  device does neutrally: never label a vendor's feature insecure, weak, or a
+  downgrade on the strength of reading a spec or source alone.
 - **Linux build prerequisite:** `sudo apt install libpcsclite-dev pcscd` for the
   CLI; the GUI additionally needs `libxkbcommon-dev libwayland-dev libxcb1-dev
   libgl1-mesa-dev` (full per-distro list in the README's "Smart-card

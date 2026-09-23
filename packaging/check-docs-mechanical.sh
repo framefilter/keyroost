@@ -27,9 +27,9 @@
 # Usage:
 #   packaging/check-docs-mechanical.sh
 #
-# Entirely offline. Builds target/release/keyroostctl first if it is absent
-# (cargo build --release --offline -p keyroostctl) — CLI invocations are
-# validated against the REAL binary's --help tree, never against the source.
+# Entirely offline. Always (re)builds target/release/keyroostctl first — a
+# no-op when current — so CLI invocations are validated against the REAL,
+# up-to-date binary's --help tree, never against the source or a stale build.
 #
 # Deliberate-old-command escapes in docs/migration.html:
 #   - the first column of any table whose header starts with "Old" is skipped;
@@ -50,10 +50,9 @@ for arg in "$@"; do
 done
 
 BIN=target/release/keyroostctl
-if [ ! -x "$BIN" ]; then
-  echo "building ${BIN} (absent)…"
-  cargo build --release --offline -p keyroostctl
-fi
+# Always build: a binary left over from an older checkout would validate the
+# docs against a stale --help tree. On an up-to-date tree this is a no-op.
+cargo build --release --offline -p keyroostctl
 "$BIN" --version >/dev/null || { echo "error: ${BIN} does not run" >&2; exit 2; }
 
 KEYROOSTCTL_BIN="$BIN" python3 - <<'PY'

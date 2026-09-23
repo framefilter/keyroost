@@ -37,6 +37,14 @@ jobs:
       - name: AppStream releases derive cleanly from CHANGELOG
         run: python3 packaging/flatpak/gen-metainfo-releases.py --check
 
+      # A malformed changelog.d fragment (bad filename, unknown category,
+      # empty body) fails the PR that adds it, not the release run that
+      # assembles the fragments into CHANGELOG.md.
+      - name: changelog.d fragments assemble cleanly
+        run: python3 packaging/assemble-changelog.py --check
+      - name: changelog assembler self-test
+        run: bash packaging/test-assemble-changelog.sh
+
   # One source tree, compiled and tested three ways. This matrix is what keeps
   # the macOS/Windows code (the cfg-gated hidapi HID backend) from rotting: a
   # Linux-only change that breaks another platform fails the PR here, so we never
