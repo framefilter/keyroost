@@ -897,7 +897,12 @@ impl PivSession {
     ///
     /// Tries a single extended-length PUT DATA first; a cert big enough to
     /// need one (any real X.509 cert typically is) that gets rejected falls
-    /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why.
+    /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why. The
+    /// fallback also runs when the extended APDU fails at the PC/SC layer
+    /// before any status word comes back (seen with certificates of a few
+    /// KB). A card that refuses the certificate's length or has no room for
+    /// it yields [`TransportError::PivCertTooLarge`] /
+    /// [`TransportError::PivCardFull`].
     pub fn import_certificate(&mut self, slot: Slot, der: &[u8]) -> Result<(), TransportError> {
         let value = piv::encode_certificate(der);
         let tag = slot.cert_object_tag();
@@ -909,30 +914,45 @@ impl PivSession {
                     self.chain_reason()
                 )
             });
-            self.transmit_chain(
+            chained_cert_sw(self.transmit_chain(
                 "piv import certificate",
                 &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
-            )?
-            .1
+            ))?
         } else {
-            let (_, sw) = self.transmit_full(&apdu)?;
-            if sw == piv::SW_OK || !uses_extended_length(&apdu) {
-                sw
-            } else {
-                trace::line(self.debug, || {
-                    format!(
-                        "! piv import certificate: extended length rejected (SW={sw:04X}); \
-                         retrying with command chaining"
-                    )
-                });
-                self.transmit_chain(
+            let extended = uses_extended_length(&apdu);
+            let direct = self.transmit_full(&apdu);
+            if retry_chained_after(&direct, extended) {
+                if let Err(e) = &direct {
+                    trace::line(self.debug, || {
+                        format!(
+                            "! piv import certificate: extended length failed at the PC/SC \
+                             layer ({e}); retrying with command chaining"
+                        )
+                    });
+                }
+                chained_cert_sw(self.transmit_chain(
                     "piv import certificate",
                     &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
-                )?
-                .1
+                ))?
+            } else {
+                let (_, sw) = direct?;
+                if sw == piv::SW_OK || !extended {
+                    sw
+                } else {
+                    trace::line(self.debug, || {
+                        format!(
+                            "! piv import certificate: extended length rejected (SW={sw:04X}); \
+                             retrying with command chaining"
+                        )
+                    });
+                    chained_cert_sw(self.transmit_chain(
+                        "piv import certificate",
+                        &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
+                    ))?
+                }
             }
         };
-        ok_or_write("piv import certificate", sw)
+        cert_write_result(slot, der.len(), sw)
     }
 
     /// Write a CHUID (Card Holder Unique Identifier) to the card: `guid` is
@@ -1611,6 +1631,49 @@ impl PivSession {
             }
         }
         Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
+    }
+}
+
+/// Whether a direct (single-APDU) certificate PUT DATA that came back as
+/// `result` should be retried with command chaining *because of a PC/SC-layer
+/// failure*: only a [`TransportError::Pcsc`] error on an extended-length APDU
+/// qualifies. Some reader/card paths fail an extended APDU of a few KB below
+/// the card, before any status word; chaining sends short APDUs instead. A
+/// status word (success or not) is left to the SW-driven fallback, and every
+/// other error propagates.
+fn retry_chained_after(result: &Result<(Vec<u8>, u16), TransportError>, extended: bool) -> bool {
+    extended && matches!(result, Err(TransportError::Pcsc(_)))
+}
+
+/// The status word a chained certificate PUT DATA ended on. `transmit_chain`
+/// reports an intermediate chunk's non-`9000` as a generic
+/// [`TransportError::Apdu`]; a `6700` or `6A84` there is handed back as a
+/// status word instead, so [`cert_write_result`] names it the same way as on
+/// the final chunk. Every other error propagates unchanged.
+fn chained_cert_sw(result: Result<(Vec<u8>, u16), TransportError>) -> Result<u16, TransportError> {
+    match result {
+        Ok((_, sw)) => Ok(sw),
+        Err(TransportError::Apdu { sw1, sw2, .. })
+            if matches!(
+                u16::from_be_bytes([sw1, sw2]),
+                piv::SW_WRONG_LENGTH | piv::SW_NOT_ENOUGH_MEMORY
+            ) =>
+        {
+            Ok(u16::from_be_bytes([sw1, sw2]))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Map the final status word of a certificate PUT DATA: `6700` (wrong
+/// length) → [`TransportError::PivCertTooLarge`] with the DER length,
+/// `6A84` (not enough memory) → [`TransportError::PivCardFull`], anything
+/// else as any PIV write ([`ok_or_write`]).
+fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportError> {
+    match sw {
+        piv::SW_WRONG_LENGTH => Err(TransportError::PivCertTooLarge { slot, len }),
+        piv::SW_NOT_ENOUGH_MEMORY => Err(TransportError::PivCardFull { slot }),
+        _ => ok_or_write("piv import certificate", sw),
     }
 }
 
@@ -2404,6 +2467,71 @@ mod tests {
             reason: CertUnreadable::TooLarge,
         };
         assert!(e.to_string().contains("64 KiB"), "{e}");
+    }
+
+    #[test]
+    fn a_pcsc_failure_of_an_extended_apdu_retries_chained() {
+        let pcsc = Err(TransportError::Pcsc(pcsc::Error::NotTransacted));
+        assert!(retry_chained_after(&pcsc, true));
+        // A short APDU has nothing to gain from chaining.
+        assert!(!retry_chained_after(&pcsc, false));
+        // Any other error propagates.
+        assert!(!retry_chained_after(
+            &Err(TransportError::HostRngFailed),
+            true
+        ));
+        // A status word, success or not, is the SW-driven fallback's call.
+        assert!(!retry_chained_after(&Ok((Vec::new(), piv::SW_OK)), true));
+        assert!(!retry_chained_after(&Ok((Vec::new(), 0x6700)), true));
+    }
+
+    #[test]
+    fn cert_write_status_names_too_large_and_card_full() {
+        let slot = piv::Slot::Signature;
+        assert!(matches!(
+            cert_write_result(slot, 3087, piv::SW_WRONG_LENGTH),
+            Err(TransportError::PivCertTooLarge { len: 3087, .. })
+        ));
+        assert!(matches!(
+            cert_write_result(slot, 3087, piv::SW_NOT_ENOUGH_MEMORY),
+            Err(TransportError::PivCardFull { .. })
+        ));
+        assert!(cert_write_result(slot, 10, piv::SW_OK).is_ok());
+        assert!(matches!(
+            cert_write_result(slot, 10, piv::SW_SECURITY_NOT_SATISFIED),
+            Err(TransportError::PivSecurityNotSatisfied)
+        ));
+    }
+
+    #[test]
+    fn a_mid_chain_length_or_memory_refusal_reaches_the_cert_mapping() {
+        let apdu = |sw1, sw2| {
+            Err(TransportError::Apdu {
+                label: "piv import certificate",
+                sw1,
+                sw2,
+            })
+        };
+        assert_eq!(chained_cert_sw(apdu(0x67, 0x00)).ok(), Some(0x6700));
+        assert_eq!(chained_cert_sw(apdu(0x6A, 0x84)).ok(), Some(0x6A84));
+        assert_eq!(chained_cert_sw(Ok((Vec::new(), 0x9000))).ok(), Some(0x9000));
+        // Other intermediate refusals keep their generic error.
+        assert!(matches!(
+            chained_cert_sw(apdu(0x69, 0x82)),
+            Err(TransportError::Apdu { sw1: 0x69, .. })
+        ));
+    }
+
+    #[test]
+    fn too_large_and_card_full_errors_name_the_slot_and_size() {
+        let slot = piv::Slot::Signature;
+        let msg = TransportError::PivCertTooLarge { slot, len: 3087 }.to_string();
+        assert!(msg.contains(&slot.label()), "{msg}");
+        assert!(msg.contains("3087 bytes"), "{msg}");
+        assert!(msg.contains("too large"), "{msg}");
+        let msg = TransportError::PivCardFull { slot }.to_string();
+        assert!(msg.contains(&slot.label()), "{msg}");
+        assert!(msg.contains("no room left"), "{msg}");
     }
 
     #[test]

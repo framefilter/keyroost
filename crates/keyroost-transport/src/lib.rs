@@ -158,6 +158,14 @@ pub enum TransportError {
         slot: keyroost_piv::Slot,
         reason: CertUnreadable,
     },
+    /// A certificate import the card refused as too long (`SW 6700` to the
+    /// PUT DATA of the slot's certificate object). `len` is the DER length.
+    PivCertTooLarge {
+        slot: keyroost_piv::Slot,
+        len: usize,
+    },
+    /// A certificate import the card refused for lack of memory (`SW 6A84`).
+    PivCardFull { slot: keyroost_piv::Slot },
     /// The host operating system's random-number source failed; a security
     /// handshake that needs an unpredictable challenge was aborted.
     HostRngFailed,
@@ -321,6 +329,17 @@ impl fmt::Display for TransportError {
                  certificate replaces it; deleting the certificate clears it)",
                 slot.label(),
                 reason
+            ),
+            TransportError::PivCertTooLarge { slot, len } => write!(
+                f,
+                "the certificate ({} bytes) is too large for {}: the card refused its length",
+                len,
+                slot.label()
+            ),
+            TransportError::PivCardFull { slot } => write!(
+                f,
+                "the card has no room left to store a certificate in {}",
+                slot.label()
             ),
             TransportError::HostRngFailed => {
                 write!(f, "the host OS random-number source failed")

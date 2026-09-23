@@ -61,6 +61,10 @@ pub const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
 pub const SW_AUTH_BLOCKED: u16 = 0x6983;
 /// Reference data (key/PIN) not found.
 pub const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
+/// Wrong length (e.g. a PUT DATA whose object is longer than the card takes).
+pub const SW_WRONG_LENGTH: u16 = 0x6700;
+/// Not enough memory space in the file (the card has no room for the object).
+pub const SW_NOT_ENOUGH_MEMORY: u16 = 0x6A84;
 
 /// PIN reference (P2) for the PIV application PIN.
 pub const PIN_REF_APPLICATION: u8 = 0x80;
