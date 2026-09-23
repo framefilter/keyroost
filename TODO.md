@@ -8,17 +8,18 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: **v0.10.0** — the Nix flake
-([#109](https://github.com/framefilter/keyroost/pull/109)) and its cross-build
-CI ([#144](https://github.com/framefilter/keyroost/pull/144)), the PIV slot
-key self-test ([#127](https://github.com/framefilter/keyroost/pull/127)),
-Token2 OTP fingerprint unlock for Bio3 keys
-([#130](https://github.com/framefilter/keyroost/pull/130)), the PIV
-management-key algorithm probe
-([#124](https://github.com/framefilter/keyroost/pull/124)), and OTP PIN-material
-redaction from the debug trace
-([#131](https://github.com/framefilter/keyroost/pull/131)). The release run is
-under way.
+Current work: **v0.11.0 — a small, fast release.** Already on `main`: the
+compressed-PIV-certificate fix for
+[#147](https://github.com/framefilter/keyroost/issues/147)
+([#148](https://github.com/framefilter/keyroost/pull/148), with `piv test`
+restored to checking the certificate's key in
+[#149](https://github.com/framefilter/keyroost/pull/149)); #147 is folded in
+here rather than shipped as a 0.10.1 patch, and is closed once 0.11.0 ships.
+Scope is the three cleanups at the top of "Ready to pick up", then the
+packaging probe and the playbook. PIV fingerprinting
+([#128](https://github.com/framefilter/keyroost/pull/128)) goes in **only if
+it is ready when the cleanups are** — it does not hold the release; otherwise
+it anchors the next one.
 
 ---
 
@@ -32,12 +33,34 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Ready to pick up
 
+**v0.11.0 scope (do these first):**
+
+- **Remove `PivSession::management_key_algorithm`** — dead since
+  [#124](https://github.com/framefilter/keyroost/pull/124): every caller now uses
+  `reported_management_key_algorithm` or `resolve_management_key_algorithm`
+  (`crates/keyroost-transport/src/piv.rs`). (S)
+
+- **Wire `packaging/assemble-changelog.py --check` into CI** so a malformed
+  `changelog.d` fragment fails the PR that adds it, not the release run. (S)
+
+- **Fix the stale-binary trap in `packaging/check-docs-mechanical.sh`.** It only
+  builds `target/release/keyroostctl` when the binary is absent, so an existing
+  stale binary is checked against current docs. Always build (cargo's no-op
+  rebuild is cheap). (S)
+
+- **Amend the audit rule:** a finding about device or firmware behaviour needs
+  hardware or vendor confirmation before it is filed or fixed as fact. (S)
+
+**Release steps:**
+
 - **Run the mandatory packaging probe before any version bump.**
   `gh workflow run linux-bundles.yml --ref <ref>` with no tag input = build-only;
   both the flatpak and AppImage jobs must go green *before* any version bump or
   tag. Packaging pulls from upstreams that drift independently (the v0.7.3
   flatpak broke at release time because a source was pruned). Full sequence:
   `packaging/RELEASING.md`, which is the playbook for the whole release.
+
+**Not in v0.11.0:**
 
 - **Responsive layout at high zoom / narrow window.** At ~200% zoom in a
   partial-screen window, horizontal rows overflow and overlap (top-bar Reset vs
@@ -66,6 +89,15 @@ Being worked on right now — check with whoever holds it before starting.
 ---
 
 ## Blocked / needs someone else
+
+- **PIV applet fingerprinting + device feature gates
+  ([#128](https://github.com/framefilter/keyroost/pull/128), episource, draft)**
+  — resolves [#113](https://github.com/framefilter/keyroost/issues/113) and
+  [#125](https://github.com/framefilter/keyroost/issues/125). Waiting on the
+  author. When it is ready: rebase onto `main` (expect conflicts with #148/#149
+  in the PIV files), re-review against `packaging/REVIEWING.md` (check the
+  agreed fixes: per-session fingerprint cache, serial as a JSON string), and
+  verify on YubiKey 5.7, Nitrokey 3, Token2 and Solo 2.
 
 - **OnlyKey recognition
   ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
@@ -152,6 +184,10 @@ plan's two-key manual steps were never executed):
 ---
 
 ## Deferred to a later release
+
+- **Cache the Nix CI build** — the cross-build job
+  ([#144](https://github.com/framefilter/keyroost/pull/144)) starts cold every
+  run. Optional; speeds CI, changes nothing shipped.
 
 - **PC/SC: `dlopen` libpcsclite at runtime instead of hard-linking it** — the
   real fix for [#47](https://github.com/framefilter/keyroost/issues/47).
