@@ -198,6 +198,34 @@ keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
       key. The desktop app offers the same thing as <strong>New CHUID</strong> in the card
       settings.</p>
 <pre><code>keyroostctl piv new-chuid --mgmt-key-stdin</code></pre>
+    <span id="compression"></span>
+    <p><strong>Compressed certificates.</strong> The PIV standard lets a slot's certificate
+      be stored gzip-compressed: the certificate object's CertInfo byte says whether it is
+      (NIST SP&nbsp;800-73-4, Part&nbsp;1, Appendix&nbsp;A). keyroost reads compressed
+      certificates, and <code>piv status</code> marks them <em>stored compressed</em>. When
+      writing one with <code>import-cert</code> or <code>self-sign</code>, keyroost stores the
+      certificate uncompressed by default and compresses it only if the card refuses it as
+      too large, then says it did and why. <code>--compress</code> always stores it
+      compressed; <code>--no-compress</code> never does, so a certificate the card refuses
+      fails with a message saying compression may make it fit. keyroost keeps no table of
+      card sizes — the card's own refusal decides — and every compressed write is read back
+      and compared with the original certificate. The desktop app's <strong>Import
+      certificate</strong> and <strong>Self-signed certificate</strong> dialogs offer the same
+      choice as a <strong>Compression</strong> dropdown: Automatic (only if too large),
+      Always, or Never.</p>
+<pre><code>keyroostctl piv import-cert --slot 9d --file cert.pem --mgmt-key-stdin   # compress only if needed
+keyroostctl piv import-cert --slot 9d --file cert.pem --mgmt-key-stdin --compress
+keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-stdin \
+    --no-compress</code></pre>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Which software reads compressed certificates</div>
+      <p>Readers confirmed to handle them include ykman, yubico-piv-tool / libykpiv / ykcs11
+        (when built with compression support), OpenSC (when built with zlib), the YubiKey
+        Minidriver 5.0 and later, and the Yubico .NET SDK 1.13.1 and later. Support in
+        Windows' built-in PIV smart-card driver and in macOS's built-in PIV support has not
+        been verified. A certificate that fits uncompressed is stored uncompressed unless you
+        ask otherwise.</p>
+    </div>
   </section>
 
   <section class="kr-section">
