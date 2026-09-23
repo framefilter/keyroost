@@ -3851,7 +3851,7 @@ impl<'tx> PivSession<'tx> {
     /// [`TransportError::PivCardFull`].
     pub fn import_certificate(&mut self, slot: Slot, der: &[u8]) -> Result<(), TransportError> {
         self.reject_certificate_key_mismatch(slot, der)?;
-        let value = piv::encode_certificate(der);
+        let value = piv::encode_certificate(der, piv::CertInfo::Uncompressed);
         let tag = slot.cert_object_tag();
         let apdu = piv::put_data(&tag, &value);
         let sw = if self.chain_upfront() {
