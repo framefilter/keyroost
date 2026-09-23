@@ -1023,7 +1023,7 @@ impl Token2OtpSession {
     }
 
     /// Open the OTP applet on one explicitly resolved USB-HID device path (no
-    /// first-match scan). Probes the applet the same way [`detect_hid_only`] does.
+    /// first-match scan). Probes the applet the same way [`Self::detect_hid_only`] does.
     pub fn open_hid_path(path: &Path, debug: bool) -> Result<Self, OtpTransportError> {
         let mut t = HidOtpTransport::open_path(path)?;
         t.set_debug(debug);

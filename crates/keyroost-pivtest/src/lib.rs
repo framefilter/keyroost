@@ -8,7 +8,7 @@
 //! with that slot and the matching public key accepts the result.
 //!
 //! This is a **functional** check, not a known-answer test and not a security
-//! operation: every input is a compile-time constant (see [`mod@data`]), so
+//! operation: every input is a compile-time constant (see the private `data` module), so
 //! there is no RNG anywhere in this crate.
 //!
 //! Supported per operation:

@@ -25,7 +25,7 @@
 //! dependency — consistent with the workspace's vendoring policy. Unknown
 //! fields are skipped (forward compatibility); entries the Molto2 can't
 //! represent (HOTP, SHA-512/MD5, out-of-range secrets) are reported as
-//! [`Skipped`] rather than failing the whole batch — a user migrating 20
+//! [`Skipped`](crate::migration::Skipped) rather than failing the whole batch — a user migrating 20
 //! accounts shouldn't lose 19 because one is HOTP.
 
 use crate::bulk::{BulkEntry, BulkError};

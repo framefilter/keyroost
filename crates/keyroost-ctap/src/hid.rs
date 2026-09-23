@@ -409,7 +409,7 @@ impl CtapHidDevice {
     /// Send a CTAPHID command and read the response.
     ///
     /// A device that answers `ERR_CHANNEL_BUSY` is retried transparently under
-    /// the budget in [`busy_retry_delay`]; every other CTAPHID error code is
+    /// the budget in `busy_retry_delay`; every other CTAPHID error code is
     /// returned to the caller on the spot. A retry re-enters `send`/`recv`
     /// unchanged — the sensitivity of the exchange is classified once, up
     /// front, so every attempt's trace line is redacted identically, and the

@@ -109,7 +109,7 @@ impl SessionOpError {
     }
 
     /// Classify a boxed error from an op path that returns `Box<dyn Error>`
-    /// (e.g. passkey delete/refresh). Downcasts to [`CtapError`] to recover the
+    /// (e.g. passkey delete/refresh). Downcasts to [`CtapError`](keyroost_ctap::CtapError) to recover the
     /// status byte; non-CTAP errors never re-lock.
     fn from_boxed(err: Box<dyn std::error::Error>) -> Self {
         match err.downcast::<keyroost_ctap::CtapError>() {
@@ -3924,7 +3924,7 @@ impl App {
         });
     }
 
-    /// Open the device and run `f` with a [`Configurator`] holding a fresh
+    /// Open the device and run `f` with a [`Configurator`](keyroost_ctap::config::Configurator) holding a fresh
     /// pinUvAuthToken that carries the AuthenticatorConfiguration permission.
     /// Mirrors `with_fresh_bio`; config commands need their own permissioned
     /// token, so they always take a PIN at action time.

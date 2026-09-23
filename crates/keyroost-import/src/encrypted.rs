@@ -1,6 +1,6 @@
 //! Aegis encrypted-vault decryption.
 //!
-//! Aegis (https://getaegis.app/) uses a two-stage scheme:
+//! Aegis (<https://getaegis.app/>) uses a two-stage scheme:
 //!   1. A *password slot* records scrypt parameters (n, r, p, salt) and an
 //!      AES-256-GCM-encrypted master key (with its own nonce/tag).
 //!   2. The vault `db` field is a base64-encoded AES-256-GCM ciphertext of the

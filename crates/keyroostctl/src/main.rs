@@ -4,6 +4,10 @@
 //! Started as a replacement for the Molto2 vendor script with a cleaner
 //! subcommand layout; each applet now has its own command group.
 
+// clap turns the arg doc comments into --help text and man pages, where
+// placeholders like `<group>` are meant literally, not as HTML tags.
+#![allow(rustdoc::invalid_html_tags)]
+
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6914,7 +6918,7 @@ fn open_piv_authed(
 /// The `--generate-key` convenience shared by `piv request-cert` / `piv
 /// self-sign`: generate a fresh key pair in `slot` on `s` (which must already
 /// be management-key authenticated), and, if asked, drop a PEM copy of its
-/// public key. [`PivSession::generate_key`] seeds this session's in-memory
+/// public key. [`PivSession::generate_key`](keyroost_transport::PivSession::generate_key) seeds this session's in-memory
 /// pubkey cache, so the CSR / self-signed certificate that follows finds the
 /// key without any `--load-pubkey`.
 fn inline_generate_key(
@@ -8710,7 +8714,7 @@ where
 }
 
 /// Open the FIDO device, obtain a pinUvAuthToken with the AuthenticatorConfig
-/// permission, and run `f` with a [`Configurator`]. Mirrors
+/// permission, and run `f` with a [`Configurator`](keyroost_ctap::config::Configurator). Mirrors
 /// [`with_bio_enrollment`] for the `authenticatorConfig` (0x0D) command family.
 fn with_configurator<F>(
     path: Option<&std::path::Path>,

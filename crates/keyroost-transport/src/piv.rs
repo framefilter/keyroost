@@ -135,7 +135,7 @@ pub struct PivStatus {
     /// trace back to anything in OpenFIPS201's own source), so a reply here
     /// means "answers this Yubico extension," not "is a YubiKey." `None` if
     /// the card doesn't answer it, or answers empty. Feature gates (e.g.
-    /// [`move_key_supported`]) compare this directly as a byte slice rather
+    /// `move_key_supported`) compare this directly as a byte slice rather
     /// than requiring an exact 3-byte shape. See
     /// [`keyroost_piv::format_version_bytes`] for display formatting.
     pub version: Option<Vec<u8>>,
@@ -1215,7 +1215,7 @@ impl PivSession {
     /// instruction but reply with an empty body for slots they haven't wired
     /// reporting up for yet, rather than failing it outright. That's
     /// functionally identical to "no GET METADATA support" for our purposes,
-    /// so [`metadata_key_material`] is the single gate for "does this reply
+    /// so `metadata_key_material` is the single gate for "does this reply
     /// actually name the key", and only a `Some` from it short-circuits the
     /// cache fallback below.
     ///

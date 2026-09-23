@@ -11,7 +11,8 @@
 //!   now it hands the (lazy) line to this one function instead.
 //! * **The GUI's activity log** — a front end that wants the exact wire
 //!   exchange behind one operation, not a shared stderr stream, calls
-//!   [`begin`] before the operation and [`take`] after to collect whatever
+//!   [`begin`](crate::trace::begin) before the operation and
+//!   [`take`](crate::trace::take) after to collect whatever
 //!   was recorded on the calling thread in between — independent of any
 //!   session's own `debug` flag, so a session the GUI never told to print
 //!   can still be traced. This works because the GUI's blocking device jobs

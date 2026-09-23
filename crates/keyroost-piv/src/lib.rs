@@ -919,7 +919,7 @@ pub fn general_auth_sign(key_alg: KeyAlg, key_ref: u8, payload: &[u8]) -> Vec<u8
 
 /// Command-chaining form of [`general_auth_sign`]: the same dynamic-auth
 /// template, emitted as a sequence of chained `0x87` GENERAL AUTHENTICATE
-/// APDUs (see [`chain_apdu`]) instead of one extended-length APDU. The final
+/// APDUs (see `chain_apdu`) instead of one extended-length APDU. The final
 /// chunk requests a short-form `Le` of `0x00` ("up to 256 bytes"); a reply
 /// longer than that still chains normally through `61xx`/GET RESPONSE, which
 /// is unaffected by how the *command* was sent.
@@ -1044,7 +1044,7 @@ pub fn put_data(tag: &[u8], value: &[u8]) -> Vec<u8> {
 }
 
 /// Command-chaining form of [`put_data`]: the same `5C`/`53` body, emitted as
-/// a sequence of chained `0xDB` PUT DATA APDUs (see [`chain_apdu`]) instead of
+/// a sequence of chained `0xDB` PUT DATA APDUs (see `chain_apdu`) instead of
 /// one extended-length APDU. PUT DATA returns no data, so no chunk requests an
 /// `Le`.
 ///
@@ -1162,7 +1162,7 @@ pub fn max_valid_days(now_unix_secs: u64) -> u32 {
 /// `now_unix_secs` plus `valid_days` days — the same "valid for N days"
 /// shape [`x509::tbs_certificate`]'s own validity period uses, rather than a
 /// freeform date a caller would have to validate. The day count itself
-/// (not just the resulting year) is clamped to [`MAX_EXPIRATION_YEAR`]'s
+/// (not just the resulting year) is clamped to `MAX_EXPIRATION_YEAR`'s
 /// last day, so the result is always exactly 8 bytes and saturates cleanly
 /// at `9999-12-31` regardless of how large `valid_days` is — clamping only
 /// the year would leave an unclamped month/day from whatever the
