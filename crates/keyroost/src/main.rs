@@ -8343,7 +8343,11 @@ impl App {
                     cached_state,
                     |s| {
                         piv_authenticate(s, &mgmt)?;
-                        s.import_certificate(slot, &der)?;
+                        s.import_certificate(
+                            slot,
+                            &der,
+                            keyroost_transport::CertCompression::Never,
+                        )?;
                         let status = s.status()?;
                         Ok((status, s.state()))
                     },
@@ -8807,6 +8811,7 @@ impl App {
                             i64::from(now),
                             keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
                             pin.as_bytes(),
+                            keyroost_transport::CertCompression::Never,
                         )?;
                         let status = s.status()?;
                         Ok((status, s.state()))

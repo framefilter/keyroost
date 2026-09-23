@@ -51,10 +51,6 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 /// optional fields (FLG 0), MTIME 0, XFL 2 (maximum compression), OS 255
 /// (unknown). The DEFLATE body is `miniz_oxide` at level 9; the trailer is
 /// the CRC-32 and the input length, both little-endian.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the certificate import path uses it next")
-)]
 pub(crate) fn gzip_member(data: &[u8]) -> Vec<u8> {
     const HEADER: [u8; 10] = [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xFF];
     let body = miniz_oxide::deflate::compress_to_vec(data, 9);
