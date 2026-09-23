@@ -1442,9 +1442,10 @@ struct PivCredModal {
     kind: PivCredKind,
     busy: bool,
     result: Option<Result<(), String>>,
-    /// A multi-line report shown under the success line — currently only the
-    /// per-operation pass list from a `SelfTest` run that fully passed. A
-    /// failing run puts its report in `result`'s `Err` instead.
+    /// A multi-line report shown under the success line: the per-operation
+    /// pass list from a `SelfTest` run that fully passed (a failing run puts
+    /// its report in `result`'s `Err` instead), or how a certificate import /
+    /// self-signed certificate was stored when it was stored compressed.
     detail: Option<String>,
 }
 
@@ -1532,6 +1533,10 @@ struct PivState {
     gen_touch_policy: keyroost_piv::TouchPolicy,
     /// PEM of the most recently generated public key, shown for copying.
     gen_pubkey_pem: Option<String>,
+    /// Compression choice in the Import certificate and Self-signed
+    /// certificate dialogs (the CLI's `--compress` / `--no-compress`).
+    /// Reset to Automatic per modal open.
+    cert_compression: PivCertCompressionSel,
     /// Certificate import file path.
     cert_path: String,
     /// Certificate export destination path.
@@ -1633,6 +1638,7 @@ impl Default for PivState {
             gen_pin_policy: keyroost_piv::PinPolicy::Default,
             gen_touch_policy: keyroost_piv::TouchPolicy::Default,
             gen_pubkey_pem: None,
+            cert_compression: PivCertCompressionSel::Auto,
             cert_path: String::new(),
             export_path: String::new(),
             new_mgmt_key_input: String::new(),
@@ -1682,6 +1688,146 @@ impl PivSlotSel {
     fn label(self) -> String {
         self.to_slot().label()
     }
+}
+
+/// The Compression dropdown in the Import certificate and Self-signed
+/// certificate dialogs. Mirrors the CLI: Automatic = neither flag, Always =
+/// `--compress`, Never = `--no-compress`.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+enum PivCertCompressionSel {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl PivCertCompressionSel {
+    const ALL: [PivCertCompressionSel; 3] = [
+        PivCertCompressionSel::Auto,
+        PivCertCompressionSel::Always,
+        PivCertCompressionSel::Never,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            PivCertCompressionSel::Auto => "Automatic (only if too large)",
+            PivCertCompressionSel::Always => "Always",
+            PivCertCompressionSel::Never => "Never",
+        }
+    }
+    fn to_compression(self) -> keyroost_transport::CertCompression {
+        use keyroost_transport::CertCompression;
+        match self {
+            PivCertCompressionSel::Auto => CertCompression::Auto,
+            PivCertCompressionSel::Always => CertCompression::Always,
+            PivCertCompressionSel::Never => CertCompression::Never,
+        }
+    }
+}
+
+/// Shown when Automatic compression had to store a certificate compressed;
+/// the same note the CLI prints.
+const PIV_AUTO_COMPRESSED_NOTE: &str = "The certificate did not fit on the card \
+    uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
+    software reads compressed certificates; support in Windows' built-in smart-card \
+    driver and in macOS's built-in PIV support has not been verified.";
+
+/// The pane notice after a certificate was stored: `base`, the stored size
+/// when compressed, and the Automatic note when that is why it was.
+fn piv_cert_stored_notice(
+    base: &str,
+    compressed: bool,
+    stored_len: usize,
+    auto_compressed: bool,
+) -> String {
+    let mut s = base.to_owned();
+    if compressed {
+        s.push_str(&format!(
+            " (stored compressed: {stored_len} bytes on the card)"
+        ));
+    }
+    s.push('.');
+    if auto_compressed {
+        s.push(' ');
+        s.push_str(PIV_AUTO_COMPRESSED_NOTE);
+    }
+    s
+}
+
+/// The dialog's success detail for a certificate stored compressed (one
+/// line per paragraph); `None` when it was stored uncompressed.
+fn piv_cert_stored_detail(
+    compressed: bool,
+    stored_len: usize,
+    auto_compressed: bool,
+) -> Option<String> {
+    compressed.then(|| {
+        let mut s = format!("Stored compressed: {stored_len} bytes on the card.");
+        if auto_compressed {
+            s.push('\n');
+            s.push_str(PIV_AUTO_COMPRESSED_NOTE);
+        }
+        s
+    })
+}
+
+/// With Compression set to Never, what to add to a "too large" refusal so
+/// the user knows the dropdown can make it fit. `None` otherwise.
+fn piv_cert_error_hint(e: &TransportError, choice: PivCertCompressionSel) -> Option<&'static str> {
+    match e {
+        TransportError::PivCertTooLarge {
+            compressed_len: None,
+            ..
+        } if choice == PivCertCompressionSel::Never => {
+            Some(" (set Compression to Automatic or Always)")
+        }
+        _ => None,
+    }
+}
+
+/// The selected slot's state words: whether it holds a certificate (and
+/// whether that is stored compressed or unreadable) or just a key, with the
+/// key algorithm parenthesized after the state word it describes.
+fn piv_slot_state_text(
+    cert_unreadable: Option<keyroost_transport::CertUnreadable>,
+    cert_present: bool,
+    cert_compressed: bool,
+    alg: Option<keyroost_piv::KeyAlg>,
+) -> String {
+    // "key present" and "certificate present" both get the algorithm
+    // parenthesized right after the state word they describe — for the
+    // no-certificate case that's "key present (…), no certificate", not
+    // "…, no certificate (…)": the algorithm belongs to the key, and
+    // there's no certificate for it to trail.
+    match (cert_unreadable, cert_present, alg) {
+        // A certificate is there but won't decode: say so, rather than
+        // "empty", which would invite overwriting it unawares.
+        (Some(reason), _, _) => format!("certificate present but unreadable ({reason})"),
+        (None, true, alg) => {
+            let parts: Vec<&str> = alg
+                .map(keyroost_piv::KeyAlg::label)
+                .into_iter()
+                .chain(cert_compressed.then_some("compressed"))
+                .collect();
+            if parts.is_empty() {
+                "certificate present".to_string()
+            } else {
+                format!("certificate present ({})", parts.join(", "))
+            }
+        }
+        (None, false, Some(a)) => format!("key present ({}), no certificate", a.label()),
+        (None, false, None) => "empty".to_string(),
+    }
+}
+
+/// A PIV certificate-compression picker combo.
+fn piv_cert_compression_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivCertCompressionSel) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(sel.label())
+        .show_ui(ui, |ui| {
+            for opt in PivCertCompressionSel::ALL {
+                ui.selectable_value(sel, opt, opt.label());
+            }
+        });
 }
 
 /// PIV key-generation algorithm selector.
@@ -6608,6 +6754,50 @@ impl App {
         }
     }
 
+    /// [`Self::apply_piv_write`] + [`Self::apply_piv_cred_result`] for a
+    /// certificate import or self-signed certificate: the notice (`base`
+    /// plus how it was stored) and the dialog's detail mirror the CLI's
+    /// output, and a too-large refusal under Never points at the dropdown.
+    fn apply_piv_cert_write(
+        app: &mut App,
+        result: Result<
+            (
+                keyroost_transport::PivStatus,
+                keyroost_transport::CertImport,
+            ),
+            TransportError,
+        >,
+        base: &str,
+        choice: PivCertCompressionSel,
+    ) {
+        match result {
+            Ok((status, stored)) => {
+                let notice = piv_cert_stored_notice(
+                    base,
+                    stored.compressed,
+                    stored.stored_len,
+                    stored.auto_compressed,
+                );
+                Self::apply_piv_write(app, Ok(status), notice);
+                if let Some(m) = app.piv.cred_modal.as_mut() {
+                    m.detail = piv_cert_stored_detail(
+                        stored.compressed,
+                        stored.stored_len,
+                        stored.auto_compressed,
+                    );
+                }
+            }
+            Err(e) => {
+                let hint = piv_cert_error_hint(&e, choice);
+                Self::apply_piv_write(app, Err(e), String::new());
+                if let (Some(hint), Some(err)) = (hint, app.piv.error.as_mut()) {
+                    err.push_str(hint);
+                }
+            }
+        }
+        Self::apply_piv_cred_result(app);
+    }
+
     /// Change the PIV PIN. Validates new==confirm, runs off-thread, and surfaces
     /// the outcome both in the pane banner and in the credential modal.
     fn piv_change_pin(&mut self) {
@@ -6841,9 +7031,13 @@ impl App {
         };
         let slot = self.piv.selected_slot.to_slot();
         let path = self.piv.cert_path.trim().to_owned();
+        let choice = self.piv.cert_compression;
         self.piv.notice = None;
         self.spawn_job("Importing certificate\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+            let result = (|| -> Result<
+                (keyroost_transport::PivStatus, keyroost_transport::CertImport),
+                TransportError,
+            > {
                 let bytes = std::fs::read(&path).map_err(|_| {
                     TransportError::MalformedResponse("cannot read certificate file")
                 })?;
@@ -6852,13 +7046,12 @@ impl App {
                 let mut s = keyroost_transport::PivSession::open(&name)?;
                 let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                 s.authenticate_management(mgmt_alg, &mgmt)?;
-                s.import_certificate(slot, &der, keyroost_transport::CertCompression::Never)?;
-                s.status()
+                let stored = s.import_certificate(slot, &der, choice.to_compression())?;
+                Ok((s.status()?, stored))
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
-                Self::apply_piv_write(app, result, "Certificate imported.".into());
-                Self::apply_piv_cred_result(app);
+                Self::apply_piv_cert_write(app, result, "Certificate imported", choice);
             })
         });
     }
@@ -7237,11 +7430,15 @@ impl App {
         // See `load_piv_status`: this job opens its own fresh `PivSession`, so
         // a key generated earlier this app run has to be handed back in.
         let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
+        let choice = self.piv.cert_compression;
         self.piv.notice = None;
         self.spawn_job(
             "Creating self-signed certificate\u{2026} (touch if it blinks)",
             move || {
-                let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+                let result = (|| -> Result<
+                    (keyroost_transport::PivStatus, keyroost_transport::CertImport),
+                    TransportError,
+                > {
                     let mut s = keyroost_transport::PivSession::open(&name)?;
                     let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
                     s.authenticate_management(mgmt_alg, &mgmt)?;
@@ -7249,25 +7446,25 @@ impl App {
                         s.remember_pubkey(slot, alg, key);
                     }
                     let now = i64::from(unix_now());
-                    s.self_signed_certificate(
+                    let (_, stored) = s.self_signed_certificate(
                         slot,
                         &subject,
                         now,
                         now + days * 86_400,
                         pin.as_bytes(),
-                        keyroost_transport::CertCompression::Never,
+                        choice.to_compression(),
                     )?;
-                    s.status()
+                    Ok((s.status()?, stored))
                 })();
                 Box::new(move |app: &mut App| {
                     wipe(&mut app.piv.sign_pin);
                     wipe(&mut app.piv.mgmt_key_input);
-                    Self::apply_piv_write(
+                    Self::apply_piv_cert_write(
                         app,
                         result,
-                        format!("Self-signed certificate stored in {}.", slot.label()),
+                        &format!("Self-signed certificate stored in {}", slot.label()),
+                        choice,
                     );
-                    Self::apply_piv_cred_result(app);
                 })
             },
         );
@@ -12604,6 +12801,29 @@ impl App {
         }
     }
 
+    /// The Compression row of the Import certificate and Self-signed
+    /// certificate dialogs (the CLI's `--compress` / `--no-compress`), with
+    /// the same help the CLI gives.
+    fn piv_modal_compression_field(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Compression")
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            );
+            ui.add_space(8.0);
+            piv_cert_compression_combo(ui, "piv-cert-compression", &mut self.piv.cert_compression);
+        });
+        card_note(
+            ui,
+            p,
+            "Compressed is the PIV standard's gzip form; some software may not read \
+             compressed certificates. Automatic compresses only if the card refuses the \
+             certificate as too large.",
+        );
+    }
+
     /// PIV credential-entry modal: drives the PIN/PUK flows (Change PIN / Change
     /// PUK / Unblock PIN) *and* the management-key-gated operations (generate
     /// key, import / self-sign / CSR, set retries, change management key) inside
@@ -12790,6 +13010,7 @@ impl App {
                         }
                         PivCredKind::ImportCert => {
                             self.piv_modal_mgmt_field(ui, p, kind);
+                            self.piv_modal_compression_field(ui, p);
                             // Importing only replaces the public certificate
                             // object (no key loss) — a lighter note, not a red
                             // warning.
@@ -12806,6 +13027,7 @@ impl App {
                         PivCredKind::SelfSign => {
                             self.piv_modal_mgmt_field(ui, p, kind);
                             pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            self.piv_modal_compression_field(ui, p);
                             card_note(
                                 ui,
                                 p,
@@ -13108,6 +13330,7 @@ impl App {
         self.piv.move_dest = None;
         self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
         self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
+        self.piv.cert_compression = PivCertCompressionSel::Auto;
         self.piv.cred_modal = None;
     }
 
@@ -14167,24 +14390,11 @@ impl App {
                 .and_then(|s| s.slots.iter().find(|sl| sl.slot == sel_slot));
             let cert_present = sel_status.is_some_and(|sl| sl.cert_present);
             let cert_unreadable = sel_status.and_then(|sl| sl.cert_unreadable);
+            let cert_compressed = sel_status.is_some_and(|sl| sl.cert_compressed);
             let entry = self.piv.slot_keys.iter().find(|(s, _, _)| *s == sel_slot);
             let alg = entry.and_then(|(_, a, _)| *a);
             let dn = entry.and_then(|(_, _, d)| d.as_deref());
-            // "key present" and "certificate present" both get the algorithm
-            // parenthesized right after the state word they describe — for
-            // the no-certificate case that's "key present (…), no
-            // certificate", not "…, no certificate (…)": the algorithm
-            // belongs to the key, and there's no certificate for it to
-            // trail.
-            let mut s = match (cert_unreadable, cert_present, alg) {
-                // A certificate is there but won't decode: say so, rather than
-                // "empty", which would invite overwriting it unawares.
-                (Some(reason), _, _) => format!("certificate present but unreadable ({reason})"),
-                (None, true, Some(a)) => format!("certificate present ({})", a.label()),
-                (None, true, None) => "certificate present".to_string(),
-                (None, false, Some(a)) => format!("key present ({}), no certificate", a.label()),
-                (None, false, None) => "empty".to_string(),
-            };
+            let mut s = piv_slot_state_text(cert_unreadable, cert_present, cert_compressed, alg);
             // PIN/touch policy, only alongside an actual key — an empty slot
             // has no policy to report, and showing "not available" there
             // would read as a hardware problem rather than just "no key yet".
@@ -17135,6 +17345,141 @@ mod tests {
         app.piv_cred_modal_close();
         assert_eq!(app.piv.gen_pin_policy, keyroost_piv::PinPolicy::Default);
         assert_eq!(app.piv.gen_touch_policy, keyroost_piv::TouchPolicy::Default);
+    }
+
+    /// The Compression dropdown: its choices and labels, the transport choice
+    /// each maps to, and its initial selection on a fresh state and after
+    /// the modal-close reset (Automatic, like the CLI with neither flag).
+    #[test]
+    fn piv_cert_compression_dropdown() {
+        use keyroost_transport::CertCompression;
+        let labels: Vec<_> = PivCertCompressionSel::ALL
+            .iter()
+            .map(|s| s.label())
+            .collect();
+        assert_eq!(labels, ["Automatic (only if too large)", "Always", "Never"]);
+        assert_eq!(
+            PivCertCompressionSel::Auto.to_compression(),
+            CertCompression::Auto
+        );
+        assert_eq!(
+            PivCertCompressionSel::Always.to_compression(),
+            CertCompression::Always
+        );
+        assert_eq!(
+            PivCertCompressionSel::Never.to_compression(),
+            CertCompression::Never
+        );
+
+        assert_eq!(
+            PivState::default().cert_compression,
+            PivCertCompressionSel::Auto
+        );
+        let mut app = App::default();
+        app.piv.cert_compression = PivCertCompressionSel::Never;
+        app.piv_cred_modal_close();
+        assert_eq!(app.piv.cert_compression, PivCertCompressionSel::Auto);
+    }
+
+    /// The success notice mirrors the CLI: the stored size when compressed,
+    /// and the why-and-compatibility note when Automatic had to compress.
+    #[test]
+    fn piv_cert_stored_notice_and_detail() {
+        assert_eq!(
+            piv_cert_stored_notice("Certificate imported", false, 3087, false),
+            "Certificate imported."
+        );
+        assert_eq!(piv_cert_stored_detail(false, 3087, false), None);
+
+        assert_eq!(
+            piv_cert_stored_notice("Certificate imported", true, 2900, false),
+            "Certificate imported (stored compressed: 2900 bytes on the card)."
+        );
+        assert_eq!(
+            piv_cert_stored_detail(true, 2900, false).as_deref(),
+            Some("Stored compressed: 2900 bytes on the card.")
+        );
+
+        let auto = piv_cert_stored_notice("Certificate imported", true, 2900, true);
+        assert!(
+            auto.starts_with("Certificate imported (stored compressed: 2900 bytes on the card)."),
+            "{auto}"
+        );
+        assert!(auto.ends_with(PIV_AUTO_COMPRESSED_NOTE), "{auto}");
+        let detail = piv_cert_stored_detail(true, 2900, true).unwrap();
+        assert!(detail.contains(PIV_AUTO_COMPRESSED_NOTE), "{detail}");
+
+        let note = PIV_AUTO_COMPRESSED_NOTE;
+        assert!(note.contains("did not fit"), "{note}");
+        assert!(note.contains("Windows"), "{note}");
+        assert!(note.contains("macOS"), "{note}");
+        assert!(note.contains("not been verified"), "{note}");
+        assert!(!note.to_lowercase().contains("unsupported"), "{note}");
+    }
+
+    /// With Compression set to Never, a too-large refusal points at the
+    /// dropdown (the CLI names its flags instead).
+    #[test]
+    fn piv_cert_too_large_hint_only_for_never() {
+        let slot = keyroost_piv::Slot::KeyManagement;
+        let too_large = TransportError::PivCertTooLarge {
+            slot,
+            len: 6164,
+            compressed_len: None,
+        };
+        let hint = piv_cert_error_hint(&too_large, PivCertCompressionSel::Never).unwrap();
+        assert!(hint.contains("Compression"), "{hint}");
+        assert!(hint.contains("Automatic"), "{hint}");
+        assert_eq!(
+            piv_cert_error_hint(&too_large, PivCertCompressionSel::Auto),
+            None
+        );
+        assert_eq!(
+            piv_cert_error_hint(
+                &TransportError::PivCardFull { slot },
+                PivCertCompressionSel::Never
+            ),
+            None
+        );
+    }
+
+    /// The selected slot's state line marks a compressed certificate.
+    #[test]
+    fn piv_slot_state_text_marks_compression() {
+        let p256 = Some(keyroost_piv::KeyAlg::EccP256);
+        assert_eq!(
+            piv_slot_state_text(None, true, true, p256),
+            "certificate present (ECC P-256, compressed)"
+        );
+        assert_eq!(
+            piv_slot_state_text(None, true, false, p256),
+            "certificate present (ECC P-256)"
+        );
+        assert_eq!(
+            piv_slot_state_text(None, true, true, None),
+            "certificate present (compressed)"
+        );
+        assert_eq!(
+            piv_slot_state_text(None, true, false, None),
+            "certificate present"
+        );
+        assert_eq!(
+            piv_slot_state_text(None, false, false, p256),
+            "key present (ECC P-256), no certificate"
+        );
+        assert_eq!(piv_slot_state_text(None, false, false, None), "empty");
+        assert_eq!(
+            piv_slot_state_text(
+                Some(keyroost_transport::CertUnreadable::Damaged),
+                true,
+                false,
+                p256
+            ),
+            format!(
+                "certificate present but unreadable ({})",
+                keyroost_transport::CertUnreadable::Damaged
+            )
+        );
     }
 
     /// Each flow maps to its own title, busy caption, and success text.
