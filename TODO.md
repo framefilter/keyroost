@@ -15,8 +15,8 @@ compressed-PIV-certificate fix for
 restored to checking the certificate's key in
 [#149](https://github.com/framefilter/keyroost/pull/149)); #147 is folded in
 here rather than shipped as a 0.10.1 patch, and is closed once 0.11.0 ships.
-Scope is the three cleanups at the top of "Ready to pick up", then the
-packaging probe and the playbook. PIV fingerprinting
+The v0.11.0 cleanups ride on the `release-prep/v0.11.0` branch; once it
+merges, what remains is the packaging probe and the playbook. PIV fingerprinting
 ([#128](https://github.com/framefilter/keyroost/pull/128)) goes in **only if
 it is ready when the cleanups are** — it does not hold the release; otherwise
 it anchors the next one.
@@ -32,24 +32,6 @@ Being worked on right now — check with whoever holds it before starting.
 ---
 
 ## Ready to pick up
-
-**v0.11.0 scope (do these first):**
-
-- **Remove `PivSession::management_key_algorithm`** — dead since
-  [#124](https://github.com/framefilter/keyroost/pull/124): every caller now uses
-  `reported_management_key_algorithm` or `resolve_management_key_algorithm`
-  (`crates/keyroost-transport/src/piv.rs`). (S)
-
-- **Wire `packaging/assemble-changelog.py --check` into CI** so a malformed
-  `changelog.d` fragment fails the PR that adds it, not the release run. (S)
-
-- **Fix the stale-binary trap in `packaging/check-docs-mechanical.sh`.** It only
-  builds `target/release/keyroostctl` when the binary is absent, so an existing
-  stale binary is checked against current docs. Always build (cargo's no-op
-  rebuild is cheap). (S)
-
-- **Amend the audit rule:** a finding about device or firmware behaviour needs
-  hardware or vendor confirmation before it is filed or fixed as fact. (S)
 
 **Release steps:**
 
