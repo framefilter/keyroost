@@ -173,7 +173,8 @@ pub struct PivSlotStatus {
 
 /// Why a slot's certificate object holds a certificate that cannot be read.
 /// Both cases are a certificate flagged gzip-compressed (CertInfo `71 01 01`,
-/// the way a YubiKey may store it) whose compressed data won't inflate.
+/// as the tool that wrote the object may choose) whose compressed data won't
+/// inflate.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertUnreadable {
@@ -1794,8 +1795,9 @@ fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, CertUnreadable> {
         return Ok(None);
     };
     if gzip {
-        // YubiKey stores the cert gzip-compressed (CertInfo bit 0). Inflate it
-        // before anyone parses it as DER; never hand the compressed bytes on.
+        // The object holds the cert gzip-compressed (CertInfo bit 0, which
+        // the writing tool chose). Inflate it before anyone parses it as DER;
+        // never hand the compressed bytes on.
         gunzip_capped(der).map(Some)
     } else {
         Ok(Some(der.to_vec()))

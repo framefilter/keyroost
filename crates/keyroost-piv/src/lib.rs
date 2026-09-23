@@ -1082,9 +1082,11 @@ pub fn encode_certificate(der: &[u8]) -> Vec<u8> {
 /// `0x70` value at all.
 ///
 /// keyroost writes uncompressed certs (`encode_certificate` sets CertInfo 0),
-/// but YubiKey stores attestation and imported certs gzip-compressed, so a
-/// cert read back may carry the compressed bytes with the flag set; the caller
-/// inflates them (the byte layer stays free of a decompressor). See
+/// but a PIV certificate object may hold the certificate gzip-compressed
+/// (CertInfo `0x01`, SP 800-73-4 Part 1 Appendix A); the tool that writes the
+/// object chooses this, and tools such as ykman do so on request. A cert read
+/// back may therefore carry the compressed bytes with the flag set; the caller
+/// inflates them (the byte layer stays free of a decompressor). See also
 /// [Yubico's encoded-certificate format](https://docs.yubico.com/yesdk/users-manual/application-piv/commands.html).
 #[must_use]
 pub fn cert_object_parts(inner: &[u8]) -> Option<(&[u8], bool)> {
@@ -2135,7 +2137,7 @@ mod tests {
             cert_object_parts(&unc),
             Some((&[0xAB, 0xCD, 0xEF][..], false))
         );
-        // Gzip-compressed (YubiKey): CertInfo bit 0 set. The 0x70 value here
+        // Gzip-compressed: CertInfo bit 0 set. The 0x70 value here
         // stands in for the gzip stream; the flag is what matters.
         let gz = [0x70, 0x02, 0x1F, 0x8B, 0x71, 0x01, 0x01, 0xFE, 0x00];
         assert_eq!(cert_object_parts(&gz), Some((&[0x1F, 0x8B][..], true)));

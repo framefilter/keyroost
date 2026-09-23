@@ -6670,9 +6670,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let mut s = open_piv(reader.as_deref(), debug)?;
             // The self-test verifies against the slot CERTIFICATE's public key
             // on purpose: the cert is what other PIV software consumes, so a
-            // pass proves the cert matches the slot's key material. A YubiKey
-            // may store that cert gzip-compressed; read_certificate inflates it
-            // (#147/#148), so reading it back here works.
+            // pass proves the cert matches the slot's key material. The cert
+            // object may hold it gzip-compressed (the writing tool's choice);
+            // read_certificate inflates it (#147/#148), so reading it back
+            // here works.
             let cert = s.read_certificate(piv_slot)?.ok_or_else(|| {
                 format!("{} has no certificate to test against", piv_slot.label())
             })?;
