@@ -187,6 +187,10 @@ mod json_out {
         /// `cert_len` is 0).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cert_unreadable: Option<&'static str>,
+        /// Present (and `true`) only when the certificate is stored
+        /// gzip-compressed; `cert_len` is still the DER length.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pub cert_compressed: bool,
     }
 
     /// `keyroostctl piv --json test`.
@@ -744,6 +748,85 @@ impl CliTouchPolicy {
 /// into the signing command so that on a card without GET METADATA (firmware
 /// older than 5.3, or non-Yubico PIV) you don't have to shuttle the public key
 /// through a temporary file (`generate-key --save-pubkey` then this command's
+/// Whether `piv import-cert` / `piv self-sign` store the certificate
+/// compressed. Neither flag: compress only if the card refuses the
+/// certificate as too large.
+#[derive(clap::Args)]
+struct CertCompressArgs {
+    /// Store the certificate compressed (the PIV standard's gzip form), even
+    /// if it would fit uncompressed. Some software may not read compressed
+    /// certificates. Without --compress or --no-compress, the certificate is
+    /// compressed only if the card refuses it as too large.
+    #[arg(long, conflicts_with = "no_compress")]
+    compress: bool,
+    /// Never store the certificate compressed (the PIV standard's gzip
+    /// form), which some software may not read; a certificate the card
+    /// refuses as too large then fails instead.
+    #[arg(long)]
+    no_compress: bool,
+}
+
+impl CertCompressArgs {
+    fn choice(&self) -> keyroost_transport::CertCompression {
+        use keyroost_transport::CertCompression;
+        if self.compress {
+            CertCompression::Always
+        } else if self.no_compress {
+            CertCompression::Never
+        } else {
+            CertCompression::Auto
+        }
+    }
+}
+
+/// Printed after a certificate the default (automatic) choice had to store
+/// compressed. The GUI shows the same note.
+const AUTO_COMPRESSED_NOTE: &str = "Note: the certificate did not fit on the card \
+    uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
+    software reads compressed certificates; support in Windows' built-in smart-card \
+    driver and in macOS's built-in PIV support has not been verified.";
+
+/// The success line's addition for a compressed certificate: how many bytes
+/// the card holds. Empty for an uncompressed one.
+fn stored_compressed_suffix(compressed: bool, stored_len: usize) -> String {
+    if compressed {
+        format!(" (stored compressed: {stored_len} bytes on the card)")
+    } else {
+        String::new()
+    }
+}
+
+/// A certificate import's error for the user: with `--no-compress`, a card
+/// that refused the certificate as too large also gets the flags that would
+/// let it be stored compressed. Every other error passes through.
+fn cert_import_error(
+    e: keyroost_transport::TransportError,
+    choice: keyroost_transport::CertCompression,
+) -> Box<dyn std::error::Error> {
+    use keyroost_transport::{CertCompression, TransportError};
+    match e {
+        TransportError::PivCertTooLarge {
+            compressed_len: None,
+            ..
+        } if choice == CertCompression::Never => {
+            format!("{e} (leave out --no-compress, or pass --compress)").into()
+        }
+        e => e.into(),
+    }
+}
+
+/// Print the success line of a certificate import plus, when the automatic
+/// choice compressed it, why.
+fn print_cert_stored(line: &str, stored: &keyroost_transport::CertImport) {
+    println!(
+        "{line}{}.",
+        stored_compressed_suffix(stored.compressed, stored.stored_len)
+    );
+    if stored.auto_compressed {
+        println!("{AUTO_COMPRESSED_NOTE}");
+    }
+}
+
 /// `--load-pubkey`). Every option mirrors `piv generate-key` and is inert
 /// unless `--generate-key` is passed.
 #[derive(clap::Args)]
@@ -917,6 +1000,8 @@ enum PivCmd {
         mgmt_key_env: Option<String>,
         #[arg(long)]
         mgmt_key_stdin: bool,
+        #[command(flatten)]
+        compression: CertCompressArgs,
     },
     /// Export a slot's certificate (DER) to a file or stdout. No PIN required.
     ExportCert {
@@ -1003,6 +1088,8 @@ enum PivCmd {
         load_pubkey: Option<std::path::PathBuf>,
         #[command(flatten)]
         keygen: InlineKeyGen,
+        #[command(flatten)]
+        compression: CertCompressArgs,
     },
     /// Exercise a slot's private key end to end: for every operation the key's
     /// algorithm supports (decrypt for RSA, key-agree for ECDH curves, sign
@@ -6295,6 +6382,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             cert_present: s.cert_present,
                             cert_len: if s.cert_present { s.cert_len } else { 0 },
                             cert_unreadable: s.cert_unreadable.map(|r| r.code()),
+                            cert_compressed: s.cert_compressed,
                         })
                         .collect(),
                 })?;
@@ -6343,9 +6431,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     );
                 } else if s.cert_present {
                     println!(
-                        "  {:<26} cert present ({} bytes)",
+                        "  {:<26} cert present ({} bytes{})",
                         s.slot.label(),
-                        s.cert_len
+                        s.cert_len,
+                        if s.cert_compressed {
+                            ", stored compressed"
+                        } else {
+                            ""
+                        }
                     );
                 } else {
                     println!("  {:<26} empty", s.slot.label());
@@ -6512,17 +6605,24 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             file,
             mgmt_key_env,
             mgmt_key_stdin,
+            compression,
         } => {
             let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let bytes =
                 std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
             let der = cert_to_der(&bytes)?;
             let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.import_certificate(slot.to_slot(), &der)?;
-            println!(
-                "Imported {}-byte certificate into {}.",
-                der.len(),
-                slot.to_slot().label()
+            let choice = compression.choice();
+            let stored = s
+                .import_certificate(slot.to_slot(), &der, choice)
+                .map_err(|e| cert_import_error(e, choice))?;
+            print_cert_stored(
+                &format!(
+                    "Imported {}-byte certificate into {}",
+                    der.len(),
+                    slot.to_slot().label()
+                ),
+                &stored,
             );
         }
 
@@ -6613,6 +6713,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             file,
             load_pubkey,
             keygen,
+            compression,
         } => {
             if *days == 0 {
                 return Err("validity must be at least 1 day".into());
@@ -6631,18 +6732,25 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
             let now = unix_now() as i64;
-            let der = s.self_signed_certificate(
-                slot.to_slot(),
-                subject,
-                now,
-                now + i64::from(*days) * 86_400,
-                pin.as_bytes(),
-            )?;
-            println!(
-                "Self-signed certificate ({} bytes, {} days) created and stored in {}.",
-                der.len(),
-                days,
-                slot.to_slot().label()
+            let choice = compression.choice();
+            let (der, stored) = s
+                .self_signed_certificate(
+                    slot.to_slot(),
+                    subject,
+                    now,
+                    now + i64::from(*days) * 86_400,
+                    pin.as_bytes(),
+                    choice,
+                )
+                .map_err(|e| cert_import_error(e, choice))?;
+            print_cert_stored(
+                &format!(
+                    "Self-signed certificate ({} bytes, {} days) created and stored in {}",
+                    der.len(),
+                    days,
+                    slot.to_slot().label()
+                ),
+                &stored,
             );
             if let Some(path) = file {
                 std::fs::write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
@@ -10671,9 +10779,117 @@ mod cli_tests {
                 cert_present: true,
                 cert_len: 800,
                 cert_unreadable: None,
+                cert_compressed: false,
             }],
         };
         assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
+    }
+
+    #[test]
+    fn piv_cert_compression_flags_parse() {
+        use keyroost_transport::CertCompression;
+        let import = |extra: &[&str]| {
+            let mut args = vec![
+                "keyroostctl",
+                "piv",
+                "import-cert",
+                "--slot",
+                "9d",
+                "--file",
+                "c.pem",
+            ];
+            args.extend_from_slice(extra);
+            parse(&args).map(|cli| match cli.command {
+                Some(Cmd::Piv {
+                    cmd: PivCmd::ImportCert { compression, .. },
+                }) => compression.choice(),
+                _ => panic!("expected piv import-cert"),
+            })
+        };
+        assert_eq!(import(&[]).unwrap(), CertCompression::Auto);
+        assert_eq!(import(&["--compress"]).unwrap(), CertCompression::Always);
+        assert_eq!(import(&["--no-compress"]).unwrap(), CertCompression::Never);
+        assert!(import(&["--compress", "--no-compress"]).is_err());
+
+        let self_sign = |extra: &[&str]| {
+            let mut args = vec![
+                "keyroostctl",
+                "piv",
+                "self-sign",
+                "--slot",
+                "9a",
+                "--subject",
+                "CN=x",
+            ];
+            args.extend_from_slice(extra);
+            parse(&args).map(|cli| match cli.command {
+                Some(Cmd::Piv {
+                    cmd: PivCmd::SelfSign { compression, .. },
+                }) => compression.choice(),
+                _ => panic!("expected piv self-sign"),
+            })
+        };
+        assert_eq!(self_sign(&[]).unwrap(), CertCompression::Auto);
+        assert_eq!(self_sign(&["--compress"]).unwrap(), CertCompression::Always);
+        assert_eq!(
+            self_sign(&["--no-compress"]).unwrap(),
+            CertCompression::Never
+        );
+        assert!(self_sign(&["--no-compress", "--compress"]).is_err());
+    }
+
+    #[test]
+    fn piv_cert_stored_output() {
+        // Uncompressed: the existing line stays as it was, no note.
+        assert_eq!(stored_compressed_suffix(false, 3087), "");
+        // Compressed: the stored size is named.
+        assert_eq!(
+            stored_compressed_suffix(true, 2900),
+            " (stored compressed: 2900 bytes on the card)"
+        );
+        // The Auto note says why, and words unverified support neutrally.
+        let note = AUTO_COMPRESSED_NOTE;
+        assert!(note.contains("did not fit"), "{note}");
+        assert!(note.contains("stored compressed"), "{note}");
+        assert!(note.contains("Windows"), "{note}");
+        assert!(note.contains("macOS"), "{note}");
+        assert!(note.contains("not been verified"), "{note}");
+        assert!(!note.to_lowercase().contains("unsupported"), "{note}");
+    }
+
+    #[test]
+    fn piv_too_large_with_no_compress_points_at_the_flags() {
+        use keyroost_transport::{CertCompression, TransportError};
+        let slot = keyroost_piv::Slot::KeyManagement;
+        let e = || TransportError::PivCertTooLarge {
+            slot,
+            len: 6164,
+            compressed_len: None,
+        };
+        let msg = cert_import_error(e(), CertCompression::Never).to_string();
+        assert!(msg.contains("may make it fit"), "{msg}");
+        assert!(msg.contains("--no-compress"), "{msg}");
+        // Auto/Always never reach "not tried"; other errors pass through.
+        let msg = cert_import_error(e(), CertCompression::Auto).to_string();
+        assert!(!msg.contains("--no-compress"), "{msg}");
+        let msg = cert_import_error(TransportError::PivCardFull { slot }, CertCompression::Never)
+            .to_string();
+        assert!(!msg.contains("--no-compress"), "{msg}");
+    }
+
+    #[test]
+    fn piv_slot_json_reports_compression_only_when_compressed() {
+        let slot = |cert_compressed| json_out::PivSlotJson {
+            slot: "key management (9D)".into(),
+            cert_present: true,
+            cert_len: 6164,
+            cert_unreadable: None,
+            cert_compressed,
+        };
+        let v = serde_json::to_value(slot(true)).expect("serialize");
+        assert_eq!(v["cert_compressed"], true);
+        let v = serde_json::to_value(slot(false)).expect("serialize");
+        assert!(v.get("cert_compressed").is_none(), "{v}");
     }
 
     #[test]
@@ -10683,6 +10899,7 @@ mod cli_tests {
             cert_present: true,
             cert_len: 0,
             cert_unreadable,
+            cert_compressed: false,
         };
         let v = serde_json::to_value(slot(Some("damaged"))).expect("serialize");
         assert_eq!(v["cert_unreadable"], "damaged");

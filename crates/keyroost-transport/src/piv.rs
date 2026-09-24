@@ -9,7 +9,7 @@
 //! PIN/PUK change and unblock, set-pin-retries, set-management-key, key
 //! generation, certificate import/export, and applet reset.
 
-use crate::gzip::gunzip_capped;
+use crate::gzip::{gunzip_capped, gzip_member};
 use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
@@ -169,6 +169,39 @@ pub struct PivSlotStatus {
     /// `Some` when the slot holds a certificate that cannot be read, and why.
     /// The slot is not empty: writing a new certificate replaces it.
     pub cert_unreadable: Option<CertUnreadable>,
+    /// True when the certificate is stored gzip-compressed (CertInfo `0x01`)
+    /// and inflated cleanly. `cert_len` is still the inflated DER length.
+    pub cert_compressed: bool,
+}
+
+/// Whether [`PivSession::import_certificate`] stores a certificate
+/// gzip-compressed (CertInfo `0x01`, the compressed form SP 800-73-4 Part 1
+/// Appendix A defines for a PIV certificate object).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CertCompression {
+    /// Store it uncompressed; if the card refuses it as too large, store it
+    /// compressed instead (one retry). The result says when that happened.
+    #[default]
+    Auto,
+    /// Always store it compressed.
+    Always,
+    /// Never compress; a certificate the card refuses as too large fails.
+    Never,
+}
+
+/// What [`PivSession::import_certificate`] stored.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CertImport {
+    /// The certificate was stored gzip-compressed.
+    pub compressed: bool,
+    /// Bytes of certificate data stored in the object: the DER, or the gzip
+    /// member when compressed (the object's own framing is not counted).
+    pub stored_len: usize,
+    /// [`CertCompression::Auto`] compressed it because the card refused the
+    /// uncompressed certificate as too large.
+    pub auto_compressed: bool,
 }
 
 /// Why a slot's certificate object holds a certificate that cannot be read.
@@ -515,7 +548,11 @@ impl PivSession {
             // The slot's one certificate read — its occupancy fields, its
             // Subject DN, and the algorithm's cert fallback all come off this.
             let cert = self.cert_object(slot)?;
-            let cert_der = cert.as_ref().ok().and_then(Option::as_deref);
+            let cert_der = cert
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map(|c| c.der.as_slice());
             // The slot's one GET METADATA — shared by algorithm and policy.
             let meta = self.metadata(slot.key_ref());
 
@@ -530,10 +567,7 @@ impl PivSession {
                 .map(|dn| dn.to_string());
             let policy = self.resolve_policy(slot, meta.as_ref());
 
-            slots.push(slot_occupancy(
-                slot,
-                cert.as_ref().map(Option::as_deref).map_err(|e| *e),
-            ));
+            slots.push(slot_status_of(slot, &cert));
             detail.push(PivSlotDetail {
                 slot,
                 algorithm,
@@ -892,21 +926,52 @@ impl PivSession {
         self.pubkey_cache.remember(slot.key_ref(), alg, key);
     }
 
-    /// Import a DER-encoded X.509 certificate into `slot`. Requires prior
-    /// management-key auth.
+    /// Import a DER-encoded X.509 certificate into `slot`, stored compressed
+    /// or not as `compression` says. Requires prior management-key auth.
+    ///
+    /// A card that refuses the certificate's length or has no room for it
+    /// yields [`TransportError::PivCertTooLarge`] /
+    /// [`TransportError::PivCardFull`]. With [`CertCompression::Auto`], a
+    /// length refusal of the uncompressed certificate is retried once
+    /// compressed (a refused write leaves the slot's previous certificate in
+    /// place). After any compressed write the slot is read back and must
+    /// return `der` exactly, else [`TransportError::PivCertReadbackMismatch`].
+    pub fn import_certificate(
+        &mut self,
+        slot: Slot,
+        der: &[u8],
+        compression: CertCompression,
+    ) -> Result<CertImport, TransportError> {
+        let done = store_certificate(slot, der, compression, |info, payload| {
+            let sw = self.put_cert_object(slot, &piv::encode_certificate(payload, info))?;
+            cert_write_result(slot, der.len(), sw)
+        })?;
+        if done.auto_compressed {
+            trace::line(self.debug, || {
+                "! piv import certificate: refused uncompressed as too large; \
+                 stored gzip-compressed"
+                    .to_string()
+            });
+        }
+        if done.compressed {
+            let back = self.read_certificate(slot);
+            check_readback(slot, der, back)?;
+        }
+        Ok(done)
+    }
+
+    /// PUT DATA of a slot's certificate object `value`, returning the final
+    /// status word.
     ///
     /// Tries a single extended-length PUT DATA first; a cert big enough to
     /// need one (any real X.509 cert typically is) that gets rejected falls
     /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why. The
     /// fallback also runs when the extended APDU fails at the PC/SC layer
     /// before any status word comes back (seen with certificates of a few
-    /// KB). A card that refuses the certificate's length or has no room for
-    /// it yields [`TransportError::PivCertTooLarge`] /
-    /// [`TransportError::PivCardFull`].
-    pub fn import_certificate(&mut self, slot: Slot, der: &[u8]) -> Result<(), TransportError> {
-        let value = piv::encode_certificate(der);
+    /// KB). A mid-chain `6700` / `6A84` comes back as that status word.
+    fn put_cert_object(&mut self, slot: Slot, value: &[u8]) -> Result<u16, TransportError> {
         let tag = slot.cert_object_tag();
-        let apdu = piv::put_data(&tag, &value);
+        let apdu = piv::put_data(&tag, value);
         let sw = if self.chain_upfront() {
             trace::line(self.debug, || {
                 format!(
@@ -916,7 +981,7 @@ impl PivSession {
             });
             chained_cert_sw(self.transmit_chain(
                 "piv import certificate",
-                &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
+                &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
             ))?
         } else {
             let extended = uses_extended_length(&apdu);
@@ -932,7 +997,7 @@ impl PivSession {
                 }
                 chained_cert_sw(self.transmit_chain(
                     "piv import certificate",
-                    &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
+                    &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
                 ))?
             } else {
                 let (_, sw) = direct?;
@@ -947,12 +1012,12 @@ impl PivSession {
                     });
                     chained_cert_sw(self.transmit_chain(
                         "piv import certificate",
-                        &piv::put_data_chained(&tag, &value, CHAIN_CHUNK),
+                        &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
                     ))?
                 }
             }
         };
-        cert_write_result(slot, der.len(), sw)
+        Ok(sw)
     }
 
     /// Write a CHUID (Card Holder Unique Identifier) to the card: `guid` is
@@ -1036,6 +1101,7 @@ impl PivSession {
     /// `status_detailed` derive occupancy straight from this).
     pub fn read_certificate(&mut self, slot: Slot) -> Result<Option<Vec<u8>>, TransportError> {
         self.cert_object(slot)?
+            .map(|c| c.map(|c| c.der))
             .map_err(|reason| TransportError::PivCertUnreadable { slot, reason })
     }
 
@@ -1046,12 +1112,12 @@ impl PivSession {
     fn cert_object(
         &mut self,
         slot: Slot,
-    ) -> Result<Result<Option<Vec<u8>>, CertUnreadable>, TransportError> {
+    ) -> Result<Result<Option<StoredCert>, CertUnreadable>, TransportError> {
         let (data, sw) = self.transmit_full(&piv::get_data(&slot.cert_object_tag()))?;
         if sw != piv::SW_OK {
             return Ok(Ok(None));
         }
-        Ok(cert_object_der(&data))
+        Ok(cert_object_decode(&data))
     }
 
     /// Yubico ATTEST: the self-signed attestation certificate for `slot`'s key
@@ -1351,8 +1417,9 @@ impl PivSession {
     }
 
     /// Create a self-signed certificate for the key in `slot` (validity in
-    /// unix seconds), sign it on the card, **import it into the slot**, and
-    /// return the DER. Requires prior management-key auth (for the import).
+    /// unix seconds), sign it on the card, **import it into the slot**
+    /// (stored as `compression` says, see [`Self::import_certificate`]), and
+    /// return the DER with what the import stored. Requires prior management-key auth (for the import).
     /// Verifies `pin` itself, deliberately placed *after* resolving the
     /// slot's key material ([`Self::slot_key`]) and *immediately* before the
     /// signing [`Self::sign`] call — see `slot_key`'s doc comment for why
@@ -1364,7 +1431,8 @@ impl PivSession {
         not_before: i64,
         not_after: i64,
         pin: &[u8],
-    ) -> Result<Vec<u8>, TransportError> {
+        compression: CertCompression,
+    ) -> Result<(Vec<u8>, CertImport), TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
         let spki = piv::spki::subject_public_key_info(&key, alg)
@@ -1379,8 +1447,8 @@ impl PivSession {
         self.verify_pin(pin)?;
         let sig = self.sign(slot, alg, &prepared)?;
         let der = piv::x509::assemble(&tbs, alg, &sig).map_err(TransportError::X509)?;
-        self.import_certificate(slot, &der)?;
-        Ok(der)
+        let stored = self.import_certificate(slot, &der, compression)?;
+        Ok((der, stored))
     }
 
     /// Relocate a slot's private key to another slot (Yubico MOVE KEY). Refuses
@@ -1557,10 +1625,7 @@ impl PivSession {
     /// Whether `slot` holds a certificate (GET DATA), and its size if so.
     fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
         let cert = self.cert_object(slot)?;
-        Ok(slot_occupancy(
-            slot,
-            cert.as_ref().map(Option::as_deref).map_err(|e| *e),
-        ))
+        Ok(slot_status_of(slot, &cert))
     }
 
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
@@ -1666,14 +1731,83 @@ fn chained_cert_sw(result: Result<(Vec<u8>, u16), TransportError>) -> Result<u16
 }
 
 /// Map the final status word of a certificate PUT DATA: `6700` (wrong
-/// length) → [`TransportError::PivCertTooLarge`] with the DER length,
+/// length) → [`TransportError::PivCertTooLarge`] with the DER length (the
+/// compressed length, if any, is filled in by [`store_certificate`]),
 /// `6A84` (not enough memory) → [`TransportError::PivCardFull`], anything
 /// else as any PIV write ([`ok_or_write`]).
 fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportError> {
     match sw {
-        piv::SW_WRONG_LENGTH => Err(TransportError::PivCertTooLarge { slot, len }),
+        piv::SW_WRONG_LENGTH => Err(TransportError::PivCertTooLarge {
+            slot,
+            len,
+            compressed_len: None,
+        }),
         piv::SW_NOT_ENOUGH_MEMORY => Err(TransportError::PivCardFull { slot }),
         _ => ok_or_write("piv import certificate", sw),
+    }
+}
+
+/// The [`CertCompression`] decision for one certificate import. `put`
+/// writes the certificate object for a (CertInfo, payload) pair and maps the
+/// card's answer as [`cert_write_result`] does. Auto writes uncompressed and,
+/// only on [`TransportError::PivCertTooLarge`], writes the gzip form once;
+/// every other error is returned as is. A refused compressed write reports
+/// the compressed length too. Pure apart from `put`, so the decision is
+/// unit-tested without a card.
+fn store_certificate(
+    slot: Slot,
+    der: &[u8],
+    compression: CertCompression,
+    mut put: impl FnMut(piv::CertInfo, &[u8]) -> Result<(), TransportError>,
+) -> Result<CertImport, TransportError> {
+    // Always skips straight to the compressed write; Auto only reaches it
+    // after the card refused the uncompressed certificate as too large.
+    let tried_uncompressed = compression != CertCompression::Always;
+    if tried_uncompressed {
+        match put(piv::CertInfo::Uncompressed, der) {
+            Ok(()) => {
+                return Ok(CertImport {
+                    compressed: false,
+                    stored_len: der.len(),
+                    auto_compressed: false,
+                })
+            }
+            Err(TransportError::PivCertTooLarge { .. }) if compression == CertCompression::Auto => {
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let gz = gzip_member(der);
+    match put(piv::CertInfo::Gzip, &gz) {
+        Ok(()) => Ok(CertImport {
+            compressed: true,
+            stored_len: gz.len(),
+            auto_compressed: tried_uncompressed,
+        }),
+        Err(TransportError::PivCertTooLarge { .. }) => Err(TransportError::PivCertTooLarge {
+            slot,
+            len: der.len(),
+            compressed_len: Some(gz.len()),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Check the read-back of a certificate just stored compressed: it must be
+/// exactly `der`. A missing, different or uninflatable certificate is
+/// [`TransportError::PivCertReadbackMismatch`]; a failed exchange
+/// propagates unchanged.
+fn check_readback(
+    slot: Slot,
+    der: &[u8],
+    back: Result<Option<Vec<u8>>, TransportError>,
+) -> Result<(), TransportError> {
+    match back {
+        Ok(Some(got)) if got == der => Ok(()),
+        Ok(_) | Err(TransportError::PivCertUnreadable { .. }) => {
+            Err(TransportError::PivCertReadbackMismatch { slot })
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1841,30 +1975,64 @@ fn metadata_key_material(md: &Metadata) -> Option<(KeyAlg, &[u8])> {
     Some((alg, raw))
 }
 
-/// The certificate DER inside a `9000` GET DATA body for a slot's cert
-/// object: the `0x70` TLV's value. `None` when the body carries no
-/// certificate — a `53 00` empty template (Nitrokey's `piv-authenticator`
-/// answers a deleted slot this way instead of `6A82`), a `0x53` object with
-/// no `0x70`, or a body that isn't a `0x53` data template at all (not
-/// expected from a real card, and degraded rather than errored — this feeds
-/// read-only status calls). `Err` when there IS a certificate, flagged
-/// compressed, that won't inflate — reported as unreadable, never as empty.
-/// Pure, so the byte cases stay unit-tested.
-fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, CertUnreadable> {
+/// A slot's certificate as decoded from its object: the DER (inflated when
+/// stored compressed) and whether it was stored compressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredCert {
+    der: Vec<u8>,
+    compressed: bool,
+}
+
+/// The certificate inside a `9000` GET DATA body for a slot's cert object:
+/// the `0x70` TLV's value, inflated when CertInfo marks it gzip-compressed.
+/// `None` when the body carries no certificate — a `53 00` empty template
+/// (Nitrokey's `piv-authenticator` answers a deleted slot this way instead
+/// of `6A82`), a `0x53` object with no `0x70`, or a body that isn't a `0x53`
+/// data template at all (not expected from a real card, and degraded rather
+/// than errored — this feeds read-only status calls). `Err` when there IS a
+/// certificate, flagged compressed, that won't inflate — reported as
+/// unreadable, never as empty. Pure, so the byte cases stay unit-tested.
+fn cert_object_decode(body: &[u8]) -> Result<Option<StoredCert>, CertUnreadable> {
     let Some((der, gzip)) = piv::unwrap_data_object(body)
         .ok()
         .and_then(piv::cert_object_parts)
     else {
         return Ok(None);
     };
-    if gzip {
+    let der = if gzip {
         // The object holds the cert gzip-compressed (CertInfo bit 0, which
         // the writing tool chose). Inflate it before anyone parses it as DER;
         // never hand the compressed bytes on.
-        gunzip_capped(der).map(Some)
+        gunzip_capped(der)?
     } else {
-        Ok(Some(der.to_vec()))
-    }
+        der.to_vec()
+    };
+    Ok(Some(StoredCert {
+        der,
+        compressed: gzip,
+    }))
+}
+
+/// A slot's [`PivSlotStatus`] from its decoded certificate object:
+/// [`slot_occupancy`] plus the compressed flag of a readable certificate.
+fn slot_status_of(
+    slot: piv::Slot,
+    cert: &Result<Option<StoredCert>, CertUnreadable>,
+) -> PivSlotStatus {
+    let der = cert
+        .as_ref()
+        .map(|c| c.as_ref().map(|c| c.der.as_slice()))
+        .map_err(|e| *e);
+    let mut status = slot_occupancy(slot, der);
+    status.cert_compressed = status.cert_len > 0
+        && matches!(
+            cert,
+            Ok(Some(StoredCert {
+                compressed: true,
+                ..
+            }))
+        );
+    status
 }
 
 /// A slot's [`PivSlotStatus`] from its decoded certificate object: present
@@ -1877,6 +2045,7 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
             cert_present: true,
             cert_len: 0,
             cert_unreadable: Some(reason),
+            cert_compressed: false,
         },
         Ok(der) => {
             let len = der.map_or(0, <[u8]>::len);
@@ -1885,6 +2054,7 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
                 cert_present: len > 0,
                 cert_len: len,
                 cert_unreadable: None,
+                cert_compressed: false,
             }
         }
     }
@@ -2026,6 +2196,11 @@ fn block_crypt(
 mod tests {
     use super::*;
     use crate::gzip::MAX_CERT_DECOMPRESSED;
+
+    /// [`cert_object_decode`]'s DER alone: what `read_certificate` returns.
+    fn cert_object_der(body: &[u8]) -> Result<Option<Vec<u8>>, CertUnreadable> {
+        cert_object_decode(body).map(|c| c.map(|c| c.der))
+    }
 
     #[test]
     fn describe_apdu_names_the_command() {
@@ -2525,13 +2700,277 @@ mod tests {
     #[test]
     fn too_large_and_card_full_errors_name_the_slot_and_size() {
         let slot = piv::Slot::Signature;
-        let msg = TransportError::PivCertTooLarge { slot, len: 3087 }.to_string();
+        let msg = TransportError::PivCertTooLarge {
+            slot,
+            len: 3087,
+            compressed_len: None,
+        }
+        .to_string();
         assert!(msg.contains(&slot.label()), "{msg}");
         assert!(msg.contains("3087 bytes"), "{msg}");
         assert!(msg.contains("too large"), "{msg}");
         let msg = TransportError::PivCardFull { slot }.to_string();
         assert!(msg.contains(&slot.label()), "{msg}");
         assert!(msg.contains("no room left"), "{msg}");
+    }
+
+    // --- compression choice on certificate import ------------------------
+    //
+    // `store_certificate` is the whole Auto/Always/Never decision; the card
+    // is a fake writer that records each (CertInfo, payload) it is handed.
+
+    fn too_large(slot: Slot, der: &[u8]) -> TransportError {
+        // What `cert_write_result` returns for SW 6700.
+        TransportError::PivCertTooLarge {
+            slot,
+            len: der.len(),
+            compressed_len: None,
+        }
+    }
+
+    /// A stand-in DER that compresses, so the gzip payload is distinct.
+    fn sample_der() -> Vec<u8> {
+        b"0\x82 stand-in certificate "
+            .iter()
+            .copied()
+            .cycle()
+            .take(4000)
+            .collect()
+    }
+
+    #[test]
+    fn cert_compression_defaults_to_auto() {
+        assert_eq!(CertCompression::default(), CertCompression::Auto);
+    }
+
+    #[test]
+    fn auto_stores_uncompressed_when_it_fits() {
+        let der = sample_der();
+        let mut calls = Vec::new();
+        let done = store_certificate(Slot::Signature, &der, CertCompression::Auto, |info, p| {
+            calls.push((info, p.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, vec![(piv::CertInfo::Uncompressed, der.clone())]);
+        assert!(!done.compressed);
+        assert!(!done.auto_compressed);
+        assert_eq!(done.stored_len, der.len());
+    }
+
+    #[test]
+    fn auto_retries_compressed_once_when_too_large() {
+        let der = sample_der();
+        let slot = Slot::Signature;
+        let mut calls = Vec::new();
+        let done = store_certificate(slot, &der, CertCompression::Auto, |info, p| {
+            calls.push((info, p.to_vec()));
+            match info {
+                piv::CertInfo::Uncompressed => Err(too_large(slot, &der)),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+        let gz = crate::gzip::gzip_member(&der);
+        assert_eq!(
+            calls,
+            vec![
+                (piv::CertInfo::Uncompressed, der.clone()),
+                (piv::CertInfo::Gzip, gz.clone()),
+            ]
+        );
+        assert!(done.compressed);
+        assert!(done.auto_compressed);
+        assert_eq!(done.stored_len, gz.len());
+    }
+
+    #[test]
+    fn auto_does_not_retry_after_any_other_error() {
+        let der = sample_der();
+        let slot = Slot::Signature;
+        let mut calls = 0;
+        let r = store_certificate(slot, &der, CertCompression::Auto, |_, _| {
+            calls += 1;
+            Err(TransportError::PivCardFull { slot })
+        });
+        assert!(matches!(r, Err(TransportError::PivCardFull { .. })));
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let r = store_certificate(slot, &der, CertCompression::Auto, |_, _| {
+            calls += 1;
+            Err(TransportError::Apdu {
+                label: "piv import certificate",
+                sw1: 0x69,
+                sw2: 0x82,
+            })
+        });
+        assert!(matches!(r, Err(TransportError::Apdu { .. })));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn auto_too_large_even_compressed_reports_both_sizes() {
+        let der = sample_der();
+        let slot = Slot::Signature;
+        let mut calls = 0;
+        let r = store_certificate(slot, &der, CertCompression::Auto, |_, _| {
+            calls += 1;
+            Err(too_large(slot, &der))
+        });
+        let gz_len = crate::gzip::gzip_member(&der).len();
+        assert_eq!(calls, 2);
+        match r {
+            Err(TransportError::PivCertTooLarge {
+                len,
+                compressed_len,
+                ..
+            }) => {
+                assert_eq!(len, der.len());
+                assert_eq!(compressed_len, Some(gz_len));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn always_stores_compressed_only() {
+        let der = sample_der();
+        let mut calls = Vec::new();
+        let done = store_certificate(Slot::Signature, &der, CertCompression::Always, |info, p| {
+            calls.push((info, p.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        let gz = crate::gzip::gzip_member(&der);
+        assert_eq!(calls, vec![(piv::CertInfo::Gzip, gz.clone())]);
+        assert!(done.compressed);
+        assert!(!done.auto_compressed);
+        assert_eq!(done.stored_len, gz.len());
+    }
+
+    #[test]
+    fn always_too_large_reports_the_compressed_size() {
+        let der = sample_der();
+        let slot = Slot::Signature;
+        let r = store_certificate(slot, &der, CertCompression::Always, |_, _| {
+            Err(too_large(slot, &der))
+        });
+        let gz_len = crate::gzip::gzip_member(&der).len();
+        assert!(matches!(
+            r,
+            Err(TransportError::PivCertTooLarge { compressed_len: Some(n), .. }) if n == gz_len
+        ));
+    }
+
+    #[test]
+    fn never_does_not_compress_even_when_too_large() {
+        let der = sample_der();
+        let slot = Slot::Signature;
+        let mut calls = Vec::new();
+        let r = store_certificate(slot, &der, CertCompression::Never, |info, _| {
+            calls.push(info);
+            Err(too_large(slot, &der))
+        });
+        assert_eq!(calls, vec![piv::CertInfo::Uncompressed]);
+        assert!(matches!(
+            r,
+            Err(TransportError::PivCertTooLarge {
+                compressed_len: None,
+                ..
+            })
+        ));
+        let done = store_certificate(slot, &der, CertCompression::Never, |_, _| Ok(())).unwrap();
+        assert!(!done.compressed);
+        assert_eq!(done.stored_len, der.len());
+    }
+
+    #[test]
+    fn too_large_display_suggests_compression_only_when_not_tried() {
+        let slot = Slot::Signature;
+        let untried = TransportError::PivCertTooLarge {
+            slot,
+            len: 6164,
+            compressed_len: None,
+        }
+        .to_string();
+        assert!(untried.contains("6164 bytes"), "{untried}");
+        assert!(
+            untried.contains("storing it compressed may make it fit"),
+            "{untried}"
+        );
+        // Transport text never names a CLI flag.
+        assert!(!untried.contains("--"), "{untried}");
+        let tried = TransportError::PivCertTooLarge {
+            slot,
+            len: 6164,
+            compressed_len: Some(4100),
+        }
+        .to_string();
+        assert!(tried.contains("6164 bytes"), "{tried}");
+        assert!(tried.contains("4100 bytes compressed"), "{tried}");
+        assert!(tried.contains("even compressed"), "{tried}");
+        assert!(!tried.contains("may make it fit"), "{tried}");
+    }
+
+    #[test]
+    fn readback_must_return_the_written_certificate() {
+        let slot = Slot::Signature;
+        let der = sample_der();
+        assert!(check_readback(slot, &der, Ok(Some(der.clone()))).is_ok());
+        for got in [Ok(None), Ok(Some(b"other".to_vec()))] {
+            assert!(matches!(
+                check_readback(slot, &der, got),
+                Err(TransportError::PivCertReadbackMismatch { .. })
+            ));
+        }
+        // A certificate the card hands back but that will not inflate is a
+        // mismatch too, not a separate error.
+        assert!(matches!(
+            check_readback(
+                slot,
+                &der,
+                Err(TransportError::PivCertUnreadable {
+                    slot,
+                    reason: CertUnreadable::Damaged,
+                })
+            ),
+            Err(TransportError::PivCertReadbackMismatch { .. })
+        ));
+        // A failed exchange propagates as itself.
+        assert!(matches!(
+            check_readback(slot, &der, Err(TransportError::NoPivApplet)),
+            Err(TransportError::NoPivApplet)
+        ));
+        let msg = TransportError::PivCertReadbackMismatch { slot }.to_string();
+        assert!(msg.contains(&slot.label()), "{msg}");
+        assert!(
+            msg.contains("did not return the certificate that was written"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn slot_status_reports_a_compressed_certificate() {
+        let slot = Slot::Signature;
+        let der = sample_der();
+        let obj = compressed_cert_object(&crate::gzip::gzip_member(&der));
+        let st = slot_status_of(slot, &cert_object_decode(&obj));
+        assert!(st.cert_present);
+        assert!(st.cert_compressed);
+        assert_eq!(st.cert_len, der.len()); // the DER, not the gzip member
+
+        let plain = [0x53, 0x07, 0x70, 0x02, 0xAB, 0xCD, 0x71, 0x01, 0x00];
+        let st = slot_status_of(slot, &cert_object_decode(&plain));
+        assert!(st.cert_present);
+        assert!(!st.cert_compressed);
+
+        // Flagged compressed but damaged: present, unreadable, not "compressed".
+        let bad = compressed_cert_object(b"not gzip at all, just bytes");
+        let st = slot_status_of(slot, &cert_object_decode(&bad));
+        assert!(st.cert_present);
+        assert!(!st.cert_compressed);
+        assert_eq!(st.cert_unreadable, Some(CertUnreadable::Damaged));
     }
 
     #[test]

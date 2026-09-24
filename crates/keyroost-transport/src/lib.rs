@@ -45,8 +45,8 @@ mod gzip;
 
 mod piv;
 pub use piv::{
-    random_chuid_guid, CertUnreadable, PivSession, PivSlotDetail, PivSlotStatus, PivStatus,
-    PivStatusDetailed,
+    random_chuid_guid, CertCompression, CertImport, CertUnreadable, PivSession, PivSlotDetail,
+    PivSlotStatus, PivStatus, PivStatusDetailed,
 };
 
 mod token2otp;
@@ -159,11 +159,17 @@ pub enum TransportError {
         reason: CertUnreadable,
     },
     /// A certificate import the card refused as too long (`SW 6700` to the
-    /// PUT DATA of the slot's certificate object). `len` is the DER length.
+    /// PUT DATA of the slot's certificate object). `len` is the DER length;
+    /// `compressed_len` is the gzip-compressed length when the compressed
+    /// form was tried and refused too, `None` when it was not tried.
     PivCertTooLarge {
         slot: keyroost_piv::Slot,
         len: usize,
+        compressed_len: Option<usize>,
     },
+    /// A certificate was stored compressed, but reading the slot back did
+    /// not return the certificate that was written.
+    PivCertReadbackMismatch { slot: keyroost_piv::Slot },
     /// A certificate import the card refused for lack of memory (`SW 6A84`).
     PivCardFull { slot: keyroost_piv::Slot },
     /// The host operating system's random-number source failed; a security
@@ -330,10 +336,33 @@ impl fmt::Display for TransportError {
                 slot.label(),
                 reason
             ),
-            TransportError::PivCertTooLarge { slot, len } => write!(
-                f,
-                "the certificate ({} bytes) is too large for {}: the card refused its length",
+            TransportError::PivCertTooLarge {
+                slot,
                 len,
+                compressed_len: None,
+            } => write!(
+                f,
+                "the certificate ({} bytes) is too large for {}: the card refused its \
+                 length; storing it compressed may make it fit",
+                len,
+                slot.label()
+            ),
+            TransportError::PivCertTooLarge {
+                slot,
+                len,
+                compressed_len: Some(compressed),
+            } => write!(
+                f,
+                "the certificate ({} bytes, {} bytes compressed) is too large for {}: \
+                 the card refused its length even compressed",
+                len,
+                compressed,
+                slot.label()
+            ),
+            TransportError::PivCertReadbackMismatch { slot } => write!(
+                f,
+                "{}: the card did not return the certificate that was written \
+                 (checked by reading it back after storing it compressed)",
                 slot.label()
             ),
             TransportError::PivCardFull { slot } => write!(
