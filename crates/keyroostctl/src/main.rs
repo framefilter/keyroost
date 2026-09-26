@@ -783,8 +783,8 @@ impl CertCompressArgs {
 /// compressed. The GUI shows the same note.
 const AUTO_COMPRESSED_NOTE: &str = "Note: the certificate did not fit on the card \
     uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
-    software reads compressed certificates; support in Windows' built-in smart-card \
-    driver and in macOS's built-in PIV support has not been verified.";
+    software reads compressed certificates, including Windows' built-in smart-card \
+    driver in a community test; macOS's built-in PIV support has not been verified.";
 
 /// The success line's addition for a compressed certificate: how many bytes
 /// the card holds. Empty for an uncompressed one.
