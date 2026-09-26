@@ -45,8 +45,9 @@ mod gzip;
 
 mod piv;
 pub use piv::{
-    random_chuid_guid, CertUnreadable, PivSession, PivSlotDetail, PivSlotStatus, PivStatus,
-    PivStatusDetailed,
+    random_chuid_guid, random_management_key, CertUnreadable, CurrentMgmtAuth, FactoryResetOutcome,
+    FactoryResetPlan, PinProtectMaintenance, PivResetPreview, PivSession, PivSessionState,
+    PivSlotDetail, PivSlotStatus, PivStatus, PivStatusDetailed,
 };
 
 mod token2otp;
@@ -118,6 +119,21 @@ pub enum TransportError {
     /// PIV management-key authentication failed (the card's challenge response
     /// did not verify, i.e. the supplied management key is wrong).
     PivManagementAuthFailed,
+    /// [`PivSession::authenticate_management_via_pin`]'s PIN VERIFY
+    /// succeeded, but — on every fingerprint except HID Crescendo, which
+    /// this error can't occur for — its PIN-protected-data read came back
+    /// with no management key: either the read itself failed, or it
+    /// succeeded with no tag `0x88` / subtag `0x89` inside. Either way,
+    /// PIN-based management auth simply hasn't been set up on this card yet.
+    PivPinProtectedKeyNotSet,
+    /// [`PivSession::delete_management_key_hid_crescendo`] was called on a
+    /// device that isn't a HID Crescendo unit with no real `0x9B` slot
+    /// object — deleting the management key outright has no equivalent on
+    /// any other applet (a standard PIV management key is mandatory and can
+    /// only be replaced). A caller that only offers this option when
+    /// `PivSession::fingerprint` already says so should never actually see
+    /// this.
+    PivManagementKeyDeleteUnsupported,
     /// A PIV PIN/PUK verification failed; `tries_remaining` is the count the
     /// card reported (`63 Cx`), or `None` when blocked / unknown.
     PivPinRejected { tries_remaining: Option<u8> },
@@ -130,24 +146,66 @@ pub enum TransportError {
     /// Caught before transmit — the card would silently truncate or pad.
     PivBadPinLength,
     /// PIV reset refused by the card: the PIN and PUK must both be blocked
-    /// before the applet allows a factory reset (`SW 6983`).
+    /// before the applet allows a factory reset. Different fingerprints have
+    /// been observed answering this identical precondition with `SW 6982`,
+    /// `6983`, or `6985` — [`PivSession::reset`] maps all three onto this one
+    /// variant.
     PivResetNotAllowed,
-    /// A forced PIV factory reset was refused before it started: the card does
-    /// not answer the vendor extensions that carry the RESET instruction, so
-    /// blocking its PIN and PUK (which the forced path does deliberately) would
-    /// have no way back.
-    PivForceResetUnsupported,
-    /// A forced PIV factory reset stopped part-way: a blocking loop hit its
-    /// attempt cap without the card reporting the credential blocked, so RESET
-    /// was never sent. Carries the state the card is actually in.
-    PivForceResetIncomplete(&'static str),
-    /// A deliberately-wrong PUK guess in the forced factory reset was
-    /// *accepted*: RESET RETRY COUNTER really ran, so the card's PIN was
-    /// rewritten to a known value and unblocked.
+    /// `PivSession::factory_reset` was refused before it started: this
+    /// fingerprint's [`keyroost_piv::compat::PivExtension::Reset`] gate
+    /// resolves [`keyroost_piv::compat::FeatureGate::Unsupported`], so
+    /// blocking its PIN and PUK (which the burn-dance path does
+    /// deliberately) would have no way back.
+    PivResetUnsupported,
+    /// `PivSession::factory_reset` was refused before it started: this
+    /// fingerprint carries [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`]
+    /// and no credential was supplied — RESET needs an authenticated
+    /// management-key session here, not the PIN/PUK-blocked precondition the
+    /// burn-dance path automates. Burning the PIN and PUK anyway would only
+    /// leave the card locked with no working RESET behind it.
+    PivResetNeedsManagementAuth,
+    /// `PivSession::reset` was refused before it started: this fingerprint
+    /// carries [`keyroost_piv::compat::PivQuirk::ResetFailsIfManagementKeyIsAes`]
+    /// and the card's management key currently reports an AES algorithm
+    /// (`.0`) rather than 3DES. Every known version of this applet's own
+    /// RESET handler unconditionally casts the `0x9B` key object to `DESKey`
+    /// and throws when it's actually an AES key — sending RESET here would
+    /// only get that exception reported back as a non-success status word.
+    /// Change the management key back to 3DES first, then retry.
+    PivResetManagementKeyMustBe3Des(keyroost_piv::MgmtAlg),
+    /// `PivSession::factory_reset`'s RESET attempt failed on a card whose
+    /// [`keyroost_piv::compat::PivExtension::Reset`] support resolves
+    /// [`keyroost_piv::compat::FeatureGate::Unverified`] — it deliberately
+    /// skipped its usual PIN/PUK pre-blocking here (blocking both counters
+    /// on a device that might not actually implement RESET risks leaving it
+    /// permanently locked), so this is what the bare attempt got back from
+    /// the card.
+    PivResetUnverifiedFailed(Box<TransportError>),
+    /// `PivSession::factory_reset`'s device-wide mechanism
+    /// ([`keyroost_piv::compat::PivExtension::ResetGlobal`] — HID
+    /// Crescendo's ACA RESET CARD today) failed: the SELECT, the
+    /// authentication, or RESET CARD itself. No PIN or PUK was ever touched
+    /// on this path — unlike a burn-dance failure
+    /// ([`Self::PivResetIncomplete`]), a caller must not append the "PIV
+    /// may now be locked" caveat that one gets.
+    PivResetGlobalFailed(Box<TransportError>),
+    /// `PivSession::factory_reset` authenticated a management-key session
+    /// (because this fingerprint carries
+    /// [`keyroost_piv::compat::PivQuirk::ResetNeedsManagementAuth`] and a
+    /// credential was supplied — see [`Self::PivResetNeedsManagementAuth`]
+    /// for the no-credential refusal instead) but the authentication itself,
+    /// or the RESET attempt right after it, failed. No PIN or PUK was ever
+    /// touched on this path either.
+    PivResetManagementAuthFailed(Box<TransportError>),
+    /// `PivSession::factory_reset`'s burn-dance path stopped part-way: a
+    /// blocking loop hit its attempt cap without the card reporting the
+    /// credential blocked, so RESET was never sent. Carries the state the
+    /// card is actually in.
+    PivResetIncomplete(&'static str),
+    /// A deliberately-wrong PUK guess in `PivSession::factory_reset`'s
+    /// burn-dance path was *accepted*: RESET RETRY COUNTER really ran, so
+    /// the card's PIN was rewritten to a known value and unblocked.
     PivPukGuessAccepted,
-    /// A PIV operation needs a newer firmware than the card reports. Carries the
-    /// human-readable operation that was attempted.
-    PivFirmwareTooOld(&'static str),
     /// A PIV MOVE KEY refused because the destination slot already holds a key
     /// (GET METADATA pre-check, ahead of the card's own refusal).
     PivDestinationOccupied(keyroost_piv::Slot),
@@ -166,6 +224,22 @@ pub enum TransportError {
     },
     /// A certificate import the card refused for lack of memory (`SW 6A84`).
     PivCardFull { slot: keyroost_piv::Slot },
+    /// `PivSession::delete_key` on a HID Crescendo fingerprint needs the
+    /// slot's current algorithm to build HID's own INJECT PKI KEY delete
+    /// sequence (see [`keyroost_piv::fingerprint::hid_crescendo_c2300_delete_key`]/
+    /// [`hid_crescendo_c4000_delete_key`](keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key)),
+    /// but this session's GET PIV PROPERTIES read never named an algorithm
+    /// for `.0` — either the slot holds no key at all, or the read itself
+    /// failed.
+    PivDeleteKeyAlgorithmUnknown(keyroost_piv::Slot),
+    /// `PivSession::delete_key` on [`keyroost_piv::fingerprint::HidCrescendoVariant::Generic`]
+    /// tried both the C4000 and the C2300 INJECT PKI KEY delete sequence (in
+    /// that order — see [`PivSession::delete_key`]'s doc) and both were
+    /// refused. Carries the C2300 attempt's error, the last one tried — the
+    /// C4000 attempt's is dropped, same as `PivSession::factory_reset`'s
+    /// "wrong guess, not necessarily a real failure" unverified-gate
+    /// fallbacks elsewhere do.
+    PivDeleteKeyHidCrescendoGenericFailed(Box<TransportError>),
     /// The host operating system's random-number source failed; a security
     /// handshake that needs an unpredictable challenge was aborted.
     HostRngFailed,
@@ -186,6 +260,27 @@ pub enum TransportError {
     /// The requested OpenPGP key algorithm cannot live in the requested slot
     /// (Ed25519 only signs; X25519 only agrees keys).
     OpenPgpSlotMismatch(keyroost_openpgp::SlotMismatch),
+    /// `PivSession::import_certificate` refused: this session already knows
+    /// `.0`'s current public key (GET METADATA, or this session's
+    /// generate/`remember_pubkey` cache — see `PivSession::slot_key`), and
+    /// the certificate about to be imported carries a different one. Only
+    /// raised when both sides are actually knowable — see
+    /// `PivSession::import_certificate`'s doc for why an unknowable slot key
+    /// or an unparsable certificate key each fall through to "allow" instead.
+    PivImportCertificateKeyMismatch(keyroost_piv::Slot),
+    /// `PivSession::import_certificate`'s weaker, secondary refusal: the full
+    /// key comparison above couldn't run at all (no GET METADATA/session
+    /// cache for the slot), but `PivExtension::GetSlotKeyStatus` resolves
+    /// `Supported` for this fingerprint, so its own live, device-reported
+    /// channel could still name `slot`'s algorithm (`slot_algorithm`) — and
+    /// it disagrees with the certificate's (`certificate_algorithm`), e.g. an
+    /// RSA slot receiving an ECC certificate. The exact key bytes were never
+    /// compared, only the algorithm.
+    PivImportCertificateAlgorithmMismatch {
+        slot: keyroost_piv::Slot,
+        slot_algorithm: keyroost_piv::KeyAlg,
+        certificate_algorithm: keyroost_piv::KeyAlg,
+    },
     /// An RSA-only operation (RSA key import) found the slot already holds an
     /// ECC key instead. `slot` is the CLI's `--slot` value (`sign` / `decrypt`
     /// / `auth`); `label` is the ECC algorithm's display label.
@@ -272,6 +367,16 @@ impl fmt::Display for TransportError {
             TransportError::PivManagementAuthFailed => {
                 write!(f, "PIV management-key authentication failed (wrong key)")
             }
+            TransportError::PivPinProtectedKeyNotSet => write!(
+                f,
+                "PIN-based management unlock has not been set up on this card \
+                 (no PIN-protected management key found)"
+            ),
+            TransportError::PivManagementKeyDeleteUnsupported => write!(
+                f,
+                "deleting the management key outright is only supported on HID Crescendo \
+                 devices without a standard PIV management key"
+            ),
             TransportError::PivPinRejected {
                 tries_remaining: Some(n),
             } => write!(f, "PIV PIN/PUK rejected ({} tries remaining)", n),
@@ -297,16 +402,70 @@ impl fmt::Display for TransportError {
                     "PIV reset refused: the PIN and PUK must both be blocked first"
                 )
             }
-            TransportError::PivForceResetUnsupported => write!(
+            TransportError::PivResetUnsupported => write!(
                 f,
-                "this card does not implement the RESET instruction a forced \
-                 factory reset depends on (it is a vendor extension, not part of \
+                "this card does not implement the RESET instruction a factory \
+                 reset depends on (it is a vendor extension, not part of \
                  the PIV standard). Getting there means deliberately blocking the \
                  PIN and the PUK, and on this card nothing could unblock them \
                  afterwards, so keyroost will not do it. A card like this has to \
                  be reset by whoever issued it."
             ),
-            TransportError::PivForceResetIncomplete(state) => write!(f, "{}", state),
+            TransportError::PivResetNeedsManagementAuth => write!(
+                f,
+                "this card's RESET needs an authenticated management-key session, \
+                 not the PIN/PUK-blocked precondition a factory reset otherwise \
+                 automates \u{2014} and no such credential was supplied. \
+                 Deliberately blocking the PIN and PUK anyway would only leave the \
+                 card locked with no working RESET behind it, so keyroost refuses \
+                 without a credential in hand."
+            ),
+            TransportError::PivResetManagementKeyMustBe3Des(alg) => write!(
+                f,
+                "this card's RESET is known to fail while the management key is {} — \
+                 change it back to 3DES first, then retry the reset",
+                alg.label()
+            ),
+            TransportError::PivResetUnverifiedFailed(inner) => {
+                write!(
+                    f,
+                    "PIV RESET support on this card is unverified, so the factory \
+                     reset attempted it without first blocking the PIN and PUK \
+                     (doing so blindly risks a permanent lock if RESET turns out \
+                     unsupported here) \u{2014} and the card refused: {inner}."
+                )?;
+                // `PivResetNotAllowed`'s own message already states the exact
+                // precondition the card reported (SW_AUTH_BLOCKED /
+                // SW_CONDITIONS_NOT_SATISFIED); repeating a hedge to "consult
+                // the documentation, commonly PIN+PUK blocked" would just say
+                // the same thing a third time. Any other inner failure means
+                // the card refused for some other reason this crate doesn't
+                // recognize, so the generic pointer at the device's own docs
+                // still earns its place there.
+                if matches!(inner.as_ref(), TransportError::PivResetNotAllowed) {
+                    write!(f, " Block both manually, then retry the factory reset.")
+                } else {
+                    write!(
+                        f,
+                        " Consult this device's own PIV documentation for RESET's \
+                         precondition (commonly: the PIN and PUK both blocked, or \
+                         an authenticated session) and perform it manually, then \
+                         retry the factory reset."
+                    )
+                }
+            }
+            TransportError::PivResetGlobalFailed(inner) => write!(
+                f,
+                "this device's device-wide reset mechanism failed: {inner}. No PIN \
+                 or PUK was touched \u{2014} PIV, and whatever else that mechanism \
+                 covers, is untouched too."
+            ),
+            TransportError::PivResetManagementAuthFailed(inner) => write!(
+                f,
+                "the management-key session for this device's PIV RESET failed: \
+                 {inner}. No PIN or PUK was touched."
+            ),
+            TransportError::PivResetIncomplete(state) => write!(f, "{}", state),
             TransportError::PivPukGuessAccepted => write!(
                 f,
                 "the factory reset's throwaway PUK guess turned out to be this \
@@ -315,9 +474,6 @@ impl fmt::Display for TransportError {
                  (`keyroostctl piv change-pin`) before running the factory reset \
                  again."
             ),
-            TransportError::PivFirmwareTooOld(op) => {
-                write!(f, "{}", op)
-            }
             TransportError::PivDestinationOccupied(slot) => write!(
                 f,
                 "slot {} already holds a key — delete it first or pick an empty slot",
@@ -341,6 +497,18 @@ impl fmt::Display for TransportError {
                 "the card has no room left to store a certificate in {}",
                 slot.label()
             ),
+            TransportError::PivDeleteKeyAlgorithmUnknown(slot) => write!(
+                f,
+                "cannot delete slot {}'s key: this device's GET PIV PROPERTIES read \
+                 never named an algorithm for it (nothing loaded, or the read failed), \
+                 and that's needed to build the delete command",
+                slot.label()
+            ),
+            TransportError::PivDeleteKeyHidCrescendoGenericFailed(inner) => write!(
+                f,
+                "delete key failed: tried both HID Crescendo delete sequences \
+                 (C4000, then C2300) and neither worked ({inner})"
+            ),
             TransportError::HostRngFailed => {
                 write!(f, "the host OS random-number source failed")
             }
@@ -361,6 +529,28 @@ impl fmt::Display for TransportError {
                 "the {slot} slot holds an ECC key ({label}); RSA import needs an RSA \
                  slot — run `openpgp generate-key --slot {slot} --algorithm rsa2048` first"
             ),
+            TransportError::PivImportCertificateKeyMismatch(slot) => write!(
+                f,
+                "certificate not imported: its public key does not match the key \
+                 already in slot {} — either import the matching certificate, or \
+                 start over by generating a fresh CSR or self-signed certificate for \
+                 the slot's current key.",
+                slot.label()
+            ),
+            TransportError::PivImportCertificateAlgorithmMismatch {
+                slot,
+                slot_algorithm,
+                certificate_algorithm,
+            } => write!(
+                f,
+                "certificate not imported: slot {} currently holds a {} key, but the \
+                 certificate's key is {} — either import the matching certificate, or \
+                 start over by generating a fresh CSR or self-signed certificate for \
+                 the slot's current key.",
+                slot.label(),
+                slot_algorithm.label(),
+                certificate_algorithm.label()
+            ),
         }
     }
 }
@@ -374,6 +564,10 @@ impl std::error::Error for TransportError {
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::OpenPgpSlotMismatch(e) => Some(e),
             TransportError::PivParse(e) => Some(e),
+            TransportError::PivResetUnverifiedFailed(e)
+            | TransportError::PivResetGlobalFailed(e)
+            | TransportError::PivResetManagementAuthFailed(e)
+            | TransportError::PivDeleteKeyHidCrescendoGenericFailed(e) => Some(e.as_ref()),
             TransportError::X509(e) => Some(e),
             _ => None,
         }
@@ -1131,6 +1325,28 @@ fn read_channel_id(card: &Card) -> (Option<u8>, Option<u8>) {
     }
 }
 
+/// Decode a serial that the device reports in BCD coding: read the raw value's
+/// nibbles most-significant first and accumulate `acc * 10 + nibble`, rather
+/// than trusting the raw integer's own value. Some applets (Token2's PIV and
+/// OpenPGP; see [`piv`] and [`openpgp`]) do this — each nibble of the reply is
+/// one decimal digit of the number printed on the unit. Apply this only to a
+/// serial from a device known to use BCD coding — running it over an ordinary
+/// integer serial would corrupt a perfectly good number. Fails safe: a nibble
+/// outside `0..=9` isn't a decimal digit, so the raw serial is returned
+/// unchanged rather than a bad conversion being forced through. (32 decimal
+/// digits max out below `u128::MAX`, so the accumulation cannot overflow.)
+pub(crate) fn decode_bcd_serial(serial: u128) -> u128 {
+    let mut decoded: u128 = 0;
+    for shift in (0..u128::BITS).step_by(4).rev() {
+        let nibble = (serial >> shift) & 0xF;
+        if nibble > 9 {
+            return serial;
+        }
+        decoded = decoded * 10 + nibble;
+    }
+    decoded
+}
+
 /// Read the YubiKey management serial by selecting the OTP applet and issuing
 /// its device-serial API request. Returns the serial as its decimal string.
 fn read_yubikey_serial(card: &Card) -> Result<String, TransportError> {
@@ -1830,5 +2046,23 @@ mod redaction_tests {
         }
         assert!(!molto2_cmd_sensitive(&[0x80, 0x41, 0x00, 0x00, 0x00]));
         assert!(!molto2_cmd_sensitive(&[]));
+    }
+
+    #[test]
+    fn decode_bcd_serial_reads_nibbles_as_decimal_digits() {
+        // Every nibble is a decimal digit: 0x1234 -> digits 1,2,3,4 -> 1234.
+        assert_eq!(decode_bcd_serial(0x1234), 1234);
+        // Leading zero nibbles just contribute nothing to the accumulator.
+        assert_eq!(decode_bcd_serial(0x0009_0009), 90009);
+        // A nibble outside 0-9 isn't a decimal digit, so the decode fails safe
+        // and the raw value passes through unchanged.
+        assert_eq!(decode_bcd_serial(0xABCD), 0xABCD);
+        // Zero round-trips trivially either way.
+        assert_eq!(decode_bcd_serial(0), 0);
+        // A full 32-nibble all-nines serial decodes without overflowing u128.
+        assert_eq!(
+            decode_bcd_serial(0x9999_9999_9999_9999_9999_9999_9999_9999),
+            99_999_999_999_999_999_999_999_999_999_999
+        );
     }
 }

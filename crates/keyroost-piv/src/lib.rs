@@ -23,6 +23,8 @@
 use keyroost_proto::apdu::{build_apdu, build_apdu_get};
 use zeroize::Zeroizing;
 
+pub mod compat;
+pub mod fingerprint;
 pub mod spki;
 pub mod x509;
 pub mod x509_parse;
@@ -59,6 +61,13 @@ pub const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
 /// Authentication method blocked (PIN/PUK exhausted, or RESET preconditions
 /// unmet).
 pub const SW_AUTH_BLOCKED: u16 = 0x6983;
+/// Conditions of use not satisfied. Yubico's own RESET documentation names
+/// this — not [`SW_AUTH_BLOCKED`] — as what a YubiKey returns when RESET's
+/// "PIN and PUK must already be blocked" precondition is unmet:
+/// <https://docs.yubico.com/yesdk/users-manual/application-piv/apdu/reset-piv.html>.
+/// Treat the two as interchangeable for that precondition rather than
+/// assuming one fingerprint's choice generalizes.
+pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 /// Reference data (key/PIN) not found.
 pub const SW_REFERENCE_NOT_FOUND: u16 = 0x6A88;
 /// Wrong length (e.g. a PUT DATA whose object is longer than the card takes).
@@ -290,6 +299,25 @@ impl Slot {
 /// CHUID (Card Holder Unique Identifier) data-object tag.
 pub const OBJECT_CHUID: [u8; 3] = [0x5F, 0xC1, 0x02];
 
+/// "Printed Information" data-object tag (`5F C1 09`). Yubico overloads this
+/// same object as its PIN-protected-data container, storing tag `0x88`
+/// wrapping subtag `0x89` (the plaintext management key) inside it — see
+/// [`parse_pin_protected_management_key`]. The two uses don't collide in
+/// practice: a card doing PIN-protected management-key storage has no
+/// separate use for the standard "printed information" text.
+pub const OBJECT_PIN_PROTECTED_DATA: [u8; 3] = [0x5F, 0xC1, 0x09];
+
+/// Yubico "Admin Data" object (`5F FF 00`) — vendor metadata carrying, among
+/// other things, a tag-`0x81` flags byte inside a tag-`0x80` container. Bit
+/// `0x02` of that byte is the one this crate cares about: it marks whether
+/// the management key is currently stored PIN-protected in
+/// [`OBJECT_PIN_PROTECTED_DATA`] (`ykman`'s "PIN-protected management key"/
+/// `--protect` bookkeeping). See
+/// <https://docs.yubico.com/yesdk/users-manual/application-piv/piv-objects.html>
+/// (`53 05 / 80 03 / 81 01 / 02` is that SDK's own worked example of setting
+/// this exact bit) and [`set_admin_data_pin_protected_flag`].
+pub const OBJECT_ADMIN_DATA: [u8; 3] = [0x5F, 0xFF, 0x00];
+
 /// Management-key (9B) cipher algorithm. The card stores one of these; auth
 /// uses a witness/challenge round whose block size this dictates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,12 +396,58 @@ pub enum KeyAlg {
     Rsa4096,
     EccP256,
     EccP384,
+    EccP521,
     Ed25519,
     X25519,
 }
 
 impl KeyAlg {
-    /// PIV algorithm identifier byte.
+    /// Every variant, in declaration order — for a UI's algorithm picker (list
+    /// them all, then gate each individually; see
+    /// [`compat::PivExtension::SlotKeyAlgorithm`]) or
+    /// [`compat::key_alg_from_apdu_id`]'s reverse lookup, which walks this to
+    /// find which algorithm a fingerprint's own wire byte names.
+    pub const ALL: [KeyAlg; 9] = [
+        KeyAlg::Rsa1024,
+        KeyAlg::Rsa2048,
+        KeyAlg::Rsa3072,
+        KeyAlg::Rsa4096,
+        KeyAlg::EccP256,
+        KeyAlg::EccP384,
+        KeyAlg::EccP521,
+        KeyAlg::Ed25519,
+        KeyAlg::X25519,
+    ];
+
+    /// PIV algorithm identifier byte — Yubico's own encoding (`ykpiv`'s
+    /// `YKPIV_ALGO_*` constants), used here as keyroost's **default** wire
+    /// mapping, not a universal one. RSA-1024/2048 and ECC P-256/P-384 are
+    /// SP 800-73-4's own standardized values, so every compliant device
+    /// agrees on them regardless. ECC P-521 similarly has a standard byte,
+    /// just not from SP 800-73-4/SP 800-78-4 (which doesn't approve the
+    /// curve for federal PIV use at all): INCITS 504-1's own broader
+    /// cryptographic-algorithm-identifier table reserves `0x15` for it, and
+    /// IDEMIA's own public comments to NIST confirm this is the byte their
+    /// P-521-capable PIV products actually use — so `0x15` is used here as
+    /// the default too, on the same "standardized, not any one vendor's
+    /// choice" footing as the SP 800-73-4 rows, even though it comes from
+    /// the adjacent standard. RSA-3072/4096 and the Ed25519/X25519 rows have
+    /// no standard byte at all — those four are genuine vendor extensions,
+    /// and this table's value for them is specifically Yubico's choice,
+    /// since YubiKey supports all four. A fingerprint whose own wire byte
+    /// for a given algorithm differs from this table — HID Crescendo's
+    /// RSA-4096 is a confirmed example, `0x04` there against Yubico's `0x16`
+    /// here, see [`fingerprint::hid_crescendo_algorithm_from_id`]; a
+    /// Swissbit iShield Pro 2 (OpenFIPS201 applet v1.4.1, firmware v1.1.2)
+    /// is a confirmed example for EccP521 specifically, `0x32` there against
+    /// INCITS 504-1's `0x15` here — is resolved by a caller through
+    /// [`compat::slot_key_algorithm_apdu_id`]/[`compat::key_alg_from_apdu_id`]
+    /// rather than [`Self::id`]/[`Self::from_id`] directly: those two
+    /// consult a per-fingerprint override before falling back to this
+    /// table, which is the only case this method should still be reached
+    /// for. Whether the algorithm is supported at all on a given device is
+    /// a separate question, gated by [`compat::PivExtension::SlotKeyAlgorithm`]
+    /// and [`compat::resolve`].
     #[must_use]
     pub const fn id(self) -> u8 {
         match self {
@@ -383,12 +457,14 @@ impl KeyAlg {
             KeyAlg::Rsa4096 => 0x16,
             KeyAlg::EccP256 => 0x11,
             KeyAlg::EccP384 => 0x14,
+            KeyAlg::EccP521 => 0x15,
             KeyAlg::Ed25519 => 0xE0,
             KeyAlg::X25519 => 0xE1,
         }
     }
 
-    /// Resolve a PIV algorithm identifier.
+    /// Resolve a PIV algorithm identifier — the inverse of [`Self::id`], and
+    /// the same Yubico-encoding, default-only caveat: see that method's doc.
     #[must_use]
     pub const fn from_id(id: u8) -> Option<Self> {
         match id {
@@ -398,6 +474,7 @@ impl KeyAlg {
             0x16 => Some(KeyAlg::Rsa4096),
             0x11 => Some(KeyAlg::EccP256),
             0x14 => Some(KeyAlg::EccP384),
+            0x15 => Some(KeyAlg::EccP521),
             0xE0 => Some(KeyAlg::Ed25519),
             0xE1 => Some(KeyAlg::X25519),
             _ => None,
@@ -414,6 +491,7 @@ impl KeyAlg {
             KeyAlg::Rsa4096 => "RSA-4096",
             KeyAlg::EccP256 => "ECC P-256",
             KeyAlg::EccP384 => "ECC P-384",
+            KeyAlg::EccP521 => "ECC P-521",
             KeyAlg::Ed25519 => "Ed25519",
             KeyAlg::X25519 => "X25519",
         }
@@ -598,12 +676,22 @@ pub fn select_full() -> Vec<u8> {
 /// comment for why both exist.
 #[must_use]
 pub fn select() -> Vec<u8> {
+    select_by_aid(&AID)
+}
+
+/// SELECT an arbitrary application `aid`. Case 4 — a trailing `Le` requests
+/// whatever FCI/application-property-template the card returns on success.
+/// [`select`] and [`select_full`] are both one-line callers; also used
+/// directly to probe for a second applet's presence (e.g.
+/// [`fingerprint::SWISSBIT_RID`]) without a dedicated builder.
+#[must_use]
+pub fn select_by_aid(aid: &[u8]) -> Vec<u8> {
     let mut apdu = build_apdu(
         0x00,
         Instruction::Select.code(),
         INS_SELECT_P1_BY_AID,
         0x00,
-        &AID,
+        aid,
     );
     apdu.push(0x00); // case-4 Le
     apdu
@@ -666,8 +754,10 @@ pub fn data_object_name(tag: &[u8]) -> Option<String> {
         [0x5F, 0xC1, 0x22] => "Biometric Information Templates Group Template",
         [0x5F, 0xC1, 0x23] => "Secure Messaging Certificate Signer",
         [0x5F, 0xC1, 0x24] => "Pairing Code Reference Data Container",
+        [0x5F, 0xFF, 0x00] => "Yubico Admin Data",
         [0x5F, 0xFF, 0x01] => "Yubico PIV Attestation Certificate",
         [0x5F, 0xFF, 0x10] => "Yubico MSCMAP",
+        [0xFF, 0xFF, 0x7F] => "HID Crescendo C2300 GET PIV PROPERTIES",
         _ => return None,
     };
     Some(name.to_string())
@@ -676,12 +766,30 @@ pub fn data_object_name(tag: &[u8]) -> Option<String> {
 /// VERIFY the application PIN. The PIN is padded to 8 bytes with `0xFF` per
 /// SP 800-73 and must be 6–8 bytes ([`PinLengthError`] otherwise). The PIN
 /// bytes come from the caller and are never logged.
+///
+/// [`PIN_REF_APPLICATION`] (`0x80`) is the standard PIV application-PIN
+/// reference; [`verify_pin_at`] is the general form this delegates to, for a
+/// device whose currently-selected applet expects a different P2 —
+/// see that function's doc.
 pub fn verify_pin(pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
+    verify_pin_at(PIN_REF_APPLICATION, pin)
+}
+
+/// VERIFY a PIN against an explicit P2 `reference`, instead of always the
+/// standard [`PIN_REF_APPLICATION`] — [`verify_pin`] is this with `reference
+/// = PIN_REF_APPLICATION`. Exists because not every applet that answers
+/// VERIFY uses that reference: HID Crescendo's ACA (Access Control Applet)
+/// instance answers its own VERIFY PIN at P2 `0x00`
+/// (<https://docs.hidglobal.com/crescendo/api/low-level/verify-pin.htm>),
+/// not the standard PIV application-PIN reference — see
+/// `fingerprint::HID_CRESCENDO_ACA_PIN_REF`. Same padding/length rules as
+/// [`verify_pin`] either way.
+pub fn verify_pin_at(reference: u8, pin: &[u8]) -> Result<Vec<u8>, PinLengthError> {
     Ok(build_apdu(
         0x00,
         Instruction::Verify.code(),
         0x00,
-        PIN_REF_APPLICATION,
+        reference,
         &pad_pin(pin)?,
     ))
 }
@@ -907,14 +1015,18 @@ fn general_auth_key_agree_data(peer_public_key: &[u8]) -> Vec<u8> {
 
 /// GENERAL AUTHENTICATE in signing mode: ask a key slot to sign/decrypt
 /// `payload` (a PKCS#1 block for RSA, or a raw hash for ECC). The card replies
-/// with `7C L 82 <l> <result>`. `key_alg` is the slot's algorithm (P1),
-/// `key_ref` its slot (P2).
+/// with `7C L 82 <l> <result>`. `alg_id` is the slot's algorithm identifier
+/// byte (P1) — [`KeyAlg::id`]'s Yubico-default encoding, or a fingerprint's
+/// own override resolved via [`compat::slot_key_algorithm_apdu_id`]; this
+/// pure byte-layer function has no fingerprint of its own to resolve
+/// that with, so the caller is expected to have done so already. `key_ref` is
+/// the slot (P2).
 #[must_use]
-pub fn general_auth_sign(key_alg: KeyAlg, key_ref: u8, payload: &[u8]) -> Vec<u8> {
+pub fn general_auth_sign(alg_id: u8, key_ref: u8, payload: &[u8]) -> Vec<u8> {
     build_apdu_ext(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_sign_data(payload),
         Some(0), // large RSA result: request the lot
@@ -936,7 +1048,7 @@ pub fn general_auth_sign(key_alg: KeyAlg, key_ref: u8, payload: &[u8]) -> Vec<u8
 /// identical data chained.
 #[must_use]
 pub fn general_auth_sign_chained(
-    key_alg: KeyAlg,
+    alg_id: u8,
     key_ref: u8,
     payload: &[u8],
     max_chunk: usize,
@@ -944,7 +1056,7 @@ pub fn general_auth_sign_chained(
     chain_apdu(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_sign_data(payload),
         max_chunk,
@@ -958,14 +1070,15 @@ pub fn general_auth_sign_chained(
 /// card replies with `7C L 82 <l> <Z>`, where `Z` is the raw shared secret
 /// (the x-coordinate for the NIST curves, the 32-byte output for X25519).
 /// `peer_public_key` is `04 || X || Y` for P-256/P-384 or the raw 32-byte
-/// point for X25519; `key_alg` (P1) is the slot's algorithm, `key_ref` (P2)
+/// point for X25519; `alg_id` (P1) is the slot's algorithm identifier byte —
+/// same caveat as [`general_auth_sign`]'s own `alg_id` — and `key_ref` (P2)
 /// its slot.
 #[must_use]
-pub fn general_auth_key_agree(key_alg: KeyAlg, key_ref: u8, peer_public_key: &[u8]) -> Vec<u8> {
+pub fn general_auth_key_agree(alg_id: u8, key_ref: u8, peer_public_key: &[u8]) -> Vec<u8> {
     build_apdu_ext(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_key_agree_data(peer_public_key),
         Some(0),
@@ -977,7 +1090,7 @@ pub fn general_auth_key_agree(key_alg: KeyAlg, key_ref: u8, peer_public_key: &[u
 /// readers that reject a single extended-`Lc` GENERAL AUTHENTICATE.
 #[must_use]
 pub fn general_auth_key_agree_chained(
-    key_alg: KeyAlg,
+    alg_id: u8,
     key_ref: u8,
     peer_public_key: &[u8],
     max_chunk: usize,
@@ -985,7 +1098,7 @@ pub fn general_auth_key_agree_chained(
     chain_apdu(
         0x00,
         Instruction::GeneralAuthenticate.code(),
-        key_alg.id(),
+        alg_id,
         key_ref,
         &general_auth_key_agree_data(peer_public_key),
         max_chunk,
@@ -995,16 +1108,19 @@ pub fn general_auth_key_agree_chained(
 
 /// GENERATE ASYMMETRIC KEY PAIR in `slot`. The card creates a fresh private key
 /// and returns its public key (`7F49` template). Requires prior management-key
-/// authentication.
+/// authentication. `alg_id` is the algorithm identifier byte (tag `0x80`) —
+/// same caveat as [`general_auth_sign`]'s own `alg_id`: this pure byte-layer
+/// function takes whatever byte the caller resolved and has no fingerprint of
+/// its own to resolve one from.
 #[must_use]
 pub fn generate_key(
     slot: Slot,
-    alg: KeyAlg,
+    alg_id: u8,
     pin_policy: PinPolicy,
     touch_policy: TouchPolicy,
 ) -> Vec<u8> {
     let mut control = Vec::with_capacity(9);
-    push_tlv(&mut control, &[0x80], &[alg.id()]); // algorithm
+    push_tlv(&mut control, &[0x80], &[alg_id]); // algorithm
     if pin_policy != PinPolicy::Default {
         push_tlv(&mut control, &[0xAA], &[pin_policy.id()]);
     }
@@ -1150,6 +1266,32 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// GeneralizedTime included).
 const MAX_EXPIRATION_YEAR: i64 = 9999;
 
+/// Latest Unix seconds any expiration this crate encodes — a CHUID's
+/// `YYYYMMDD` or an X.509 `not_after` — can represent without producing a
+/// 5-digit year: the last second of `MAX_EXPIRATION_YEAR`-12-31. Shared by
+/// `x509::der_time`'s own clamp (so a CHUID and a certificate's validity
+/// period saturate at the identical instant) and by a caller composing
+/// several validity units together (e.g. `--years`/`--months`/`--days`
+/// summed), which needs one final clamp after adding them all rather than
+/// three independent per-unit ones.
+#[must_use]
+pub fn max_expiration_unix_secs() -> i64 {
+    days_from_civil(MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+}
+
+/// Format a Unix timestamp's civil date as the 8 ASCII digits (`YYYYMMDD`) a
+/// CHUID expiration (tag `0x35`) encodes — general enough for a caller that
+/// has already computed an arbitrary end instant itself (e.g. summing
+/// `--days`/`--months`/`--years` together) rather than going through one of
+/// the single-unit `chuid_expiration_in_*` helpers below. Does not clamp;
+/// a caller whose input can run past the calendar's edge should clamp
+/// against [`max_expiration_unix_secs`] first, same as those helpers do
+/// internally.
+#[must_use]
+pub fn yyyymmdd_from_unix_secs(unix_secs: i64) -> [u8; 8] {
+    format_yyyymmdd(civil_from_days(unix_secs.div_euclid(86_400)))
+}
+
 /// The largest "valid for N days from now" a CHUID expiration or a
 /// certificate's validity period can actually represent: the day count from
 /// `now_unix_secs` to `9999-12-31`, the ceiling both
@@ -1181,10 +1323,168 @@ pub fn chuid_expiration_in_days(now_unix_secs: u64, valid_days: u32) -> [u8; 8] 
     let expiry_secs = now_unix_secs.saturating_add(u64::from(valid_days).saturating_mul(86_400));
     let days = (expiry_secs / 86_400) as i64;
     let days = days.min(days_from_civil(MAX_EXPIRATION_YEAR, 12, 31));
-    let (y, m, d) = civil_from_days(days);
+    format_yyyymmdd(civil_from_days(days))
+}
+
+/// Format a civil date as the 8 ASCII digits `chuid_expiration_in_days`/
+/// `chuid_expiration_in_years` both encode into CHUID tag `0x35`.
+fn format_yyyymmdd((y, m, d): (i64, u32, u32)) -> [u8; 8] {
     let mut out = [0u8; 8];
     out.copy_from_slice(format!("{y:04}{m:02}{d:02}").as_bytes());
     out
+}
+
+/// Gregorian leap-year rule: divisible by 4, except centuries, unless also
+/// divisible by 400.
+fn is_leap_year(y: i64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
+/// The largest "valid for N calendar years from now" a CHUID expiration or a
+/// certificate's validity period can actually represent — the calendar-year
+/// counterpart of [`max_valid_days`], sizing a "Valid for" input's upper
+/// bound when the input's unit is years rather than days.
+#[must_use]
+pub fn max_valid_years(now_unix_secs: u64) -> u32 {
+    let now_days = (now_unix_secs / 86_400) as i64;
+    let (y, _, _) = civil_from_days(now_days);
+    (MAX_EXPIRATION_YEAR - y).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// `now_unix_secs` plus `years` whole calendar years, keeping the same
+/// month, day, and time-of-day — e.g. 3 years from 2024-06-15 14:00:00 lands
+/// on 2027-06-15 14:00:00, not on some fixed 365.25-day-per-year multiple
+/// the way [`chuid_expiration_in_days`]/a flat `now + days*86_400` would. If
+/// the source day doesn't exist in the target year (a Feb 29 whose target
+/// year isn't a leap year), the day clamps back to the 28th — the same
+/// "same date, N years later" rule every mainstream date library applies to
+/// a leap day. The result is clamped to the last second of
+/// `MAX_EXPIRATION_YEAR`-12-31, same ceiling and same shape as
+/// `x509::der_time`'s own clamp, so a certificate's `not_after` computed
+/// this way saturates identically regardless of unit.
+#[must_use]
+pub fn add_calendar_years(now_unix_secs: u64, years: u32) -> i64 {
+    let now_secs = now_unix_secs as i64;
+    let days = now_secs.div_euclid(86_400);
+    let time_of_day = now_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let target_year = y.saturating_add(i64::from(years));
+    let d = if m == 2 && d == 29 && !is_leap_year(target_year) {
+        28
+    } else {
+        d
+    };
+    let new_days = days_from_civil(target_year, m, d);
+    let max_days = days_from_civil(MAX_EXPIRATION_YEAR, 12, 31);
+    if new_days >= max_days {
+        max_days * 86_400 + 86_399
+    } else {
+        new_days * 86_400 + time_of_day
+    }
+}
+
+/// Compute a CHUID expiration date (tag `0x35`, ASCII `YYYYMMDD`) as
+/// `now_unix_secs` plus `valid_years` calendar years — the year-unit
+/// counterpart of [`chuid_expiration_in_days`], built on
+/// [`add_calendar_years`] so the two units agree on what "the same date, N
+/// years later" means.
+#[must_use]
+pub fn chuid_expiration_in_years(now_unix_secs: u64, valid_years: u32) -> [u8; 8] {
+    let expiry_secs = add_calendar_years(now_unix_secs, valid_years);
+    let days = expiry_secs.div_euclid(86_400);
+    format_yyyymmdd(civil_from_days(days))
+}
+
+/// Number of days in a given proleptic-Gregorian (year, month).
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => unreachable!("civil_from_days/days_from_civil only ever produce 1..=12"),
+    }
+}
+
+/// The largest "valid for N calendar months from now" a CHUID expiration or
+/// a certificate's validity period can actually represent — the month-unit
+/// counterpart of [`max_valid_days`]/[`max_valid_years`].
+#[must_use]
+pub fn max_valid_months(now_unix_secs: u64) -> u32 {
+    let now_days = (now_unix_secs / 86_400) as i64;
+    let (y, m, _) = civil_from_days(now_days);
+    let months_remaining = (MAX_EXPIRATION_YEAR - y) * 12 + (12 - i64::from(m));
+    months_remaining.clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// `now_unix_secs` plus `months` whole calendar months, keeping the same
+/// day-of-month and time-of-day — e.g. 2 months from 2026-01-31 14:00:00
+/// lands on 2026-03-31 14:00:00 (skipping February, which has no 31st). If
+/// the source day doesn't exist in the target month (Jan 31 + 1 month, since
+/// February never reaches the 31st), the day clamps down to that month's
+/// last day, the same rule [`add_calendar_years`] applies to a Feb 29 whose
+/// target year isn't a leap year. Clamped to the last second of
+/// `MAX_EXPIRATION_YEAR`-12-31, same ceiling and shape as
+/// [`add_calendar_years`]'s own clamp.
+#[must_use]
+pub fn add_calendar_months(now_unix_secs: u64, months: u32) -> i64 {
+    let now_secs = now_unix_secs as i64;
+    let days = now_secs.div_euclid(86_400);
+    let time_of_day = now_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let total_months = i64::from(m - 1) + i64::from(months);
+    let target_year = y + total_months.div_euclid(12);
+    let target_month = (total_months.rem_euclid(12) + 1) as u32;
+    let d = d.min(days_in_month(target_year, target_month));
+    let new_days = days_from_civil(target_year, target_month, d);
+    let max_days = days_from_civil(MAX_EXPIRATION_YEAR, 12, 31);
+    if new_days >= max_days {
+        max_days * 86_400 + 86_399
+    } else {
+        new_days * 86_400 + time_of_day
+    }
+}
+
+/// Compute a CHUID expiration date (tag `0x35`, ASCII `YYYYMMDD`) as
+/// `now_unix_secs` plus `valid_months` calendar months — the month-unit
+/// counterpart of [`chuid_expiration_in_days`]/[`chuid_expiration_in_years`],
+/// built on [`add_calendar_months`].
+#[must_use]
+pub fn chuid_expiration_in_months(now_unix_secs: u64, valid_months: u32) -> [u8; 8] {
+    let expiry_secs = add_calendar_months(now_unix_secs, valid_months);
+    let days = expiry_secs.div_euclid(86_400);
+    format_yyyymmdd(civil_from_days(days))
+}
+
+/// Compose a validity period from independent year/month/day counts that
+/// sum — applied in that order (years first, then months relative to that
+/// point, then a flat day count) — starting at `now_unix_secs`. The shared
+/// implementation behind `keyroostctl`'s combinable `--years`/`--months`/
+/// `--days` flags and the GUI's three-field "Valid for" input, so both agree
+/// bit-for-bit on what e.g. "1 year, 5 days" means, rather than each
+/// re-deriving the composition order. Clamped to
+/// [`max_expiration_unix_secs`], same ceiling every single-unit helper above
+/// already clamps to.
+#[must_use]
+pub fn add_calendar_period(now_unix_secs: u64, years: u32, months: u32, days: u32) -> i64 {
+    let after_years = if years > 0 {
+        add_calendar_years(now_unix_secs, years)
+    } else {
+        now_unix_secs as i64
+    };
+    let after_months = if months > 0 {
+        add_calendar_months(after_years as u64, months)
+    } else {
+        after_years
+    };
+    after_months
+        .saturating_add(i64::from(days) * 86_400)
+        .min(max_expiration_unix_secs())
 }
 
 /// Encode a CHUID data-object value (PIV object [`OBJECT_CHUID`], `5F C1 02`)
@@ -1488,11 +1788,165 @@ pub fn unwrap_data_object(buf: &[u8]) -> Result<&[u8], ParseError> {
     buf.get(start..end).ok_or(ParseError::Truncated)
 }
 
+/// Extract the management key from a GET DATA response on
+/// [`OBJECT_PIN_PROTECTED_DATA`]: strip the outer `0x53` template (same as
+/// [`unwrap_data_object`]), then find tag `0x88` and, inside it, subtag
+/// `0x89` — the scheme [`compat::PivExtension::PinManagementAuth`]'s own doc
+/// describes. `None` on any parse failure *or* on a well-formed reply that
+/// simply carries no tag 88 / subtag 89: a card can legitimately answer this
+/// way when PIN management auth has never been set up, which callers must
+/// tell apart from "the read itself failed" only by the fact that this
+/// returns `None` either way — there's nothing more specific to report.
+/// Returned zeroizing since this is live management-key material, same
+/// handling as a key the user typed directly.
+#[must_use]
+pub fn parse_pin_protected_management_key(buf: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let inner = unwrap_data_object(buf).ok()?;
+    let tag88 = find_tlv(inner, 0x88)?;
+    let key = find_tlv(tag88, 0x89)?;
+    Some(Zeroizing::new(key.to_vec()))
+}
+
+/// Build the inner bytes (nested `88`/`89`, everything [`put_data`] wraps in
+/// its own outer `0x53`) to write [`OBJECT_PIN_PROTECTED_DATA`] as Yubico's
+/// PIN-protected management-key container — the write-side counterpart of
+/// [`parse_pin_protected_management_key`]. Per
+/// <https://docs.yubico.com/yesdk/users-manual/application-piv/pin-only.html>,
+/// this object carries nothing else when used this way (see
+/// [`OBJECT_PIN_PROTECTED_DATA`]'s own doc for why that's safe to assume), so
+/// unlike [`set_admin_data_pin_protected_flag`] this always replaces the
+/// object wholesale rather than patching around existing content.
+#[must_use]
+pub fn build_pin_protected_management_key(key: &[u8]) -> Vec<u8> {
+    let mut tag89 = Vec::with_capacity(key.len() + 2);
+    push_tlv(&mut tag89, &[0x89], key);
+    let mut tag88 = Vec::with_capacity(tag89.len() + 2);
+    push_tlv(&mut tag88, &[0x88], &tag89);
+    tag88
+}
+
+/// Top-level-only BER-TLV span finder: like [`find_tlv`], but returns the
+/// matched entry's `(tlv_start, value_start, value_end)` offsets into `buf`
+/// instead of just the value slice, so a caller can splice a replacement in
+/// while copying every other byte through unchanged. `None` on a parse
+/// failure or no match, same non-distinction [`find_tlv`] itself makes.
+fn tlv_span(buf: &[u8], tag: u8) -> Option<(usize, usize, usize)> {
+    let mut i = 0;
+    while i < buf.len() {
+        let t = buf[i];
+        let (len, header) = read_ber_len(buf.get(i + 1..)?).ok()?;
+        let vstart = i + 1 + header;
+        let vend = vstart.checked_add(len)?;
+        if vend > buf.len() {
+            return None;
+        }
+        if t == tag {
+            return Some((i, vstart, vend));
+        }
+        i = vend;
+    }
+    None
+}
+
+/// Bit `0x02` of Admin Data's tag-`0x81` flags byte — see
+/// [`OBJECT_ADMIN_DATA`]'s doc.
+const ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY: u8 = 0x02;
+
+/// Set or clear the PIN-protected-management-key bit (`0x02`) in Admin
+/// Data's tag-`0x81` flags byte, inside its tag-`0x80` container, leaving
+/// every other byte untouched: other bits of that same flags byte (e.g.
+/// `ykman`'s own PUK-blocked bit, `0x01`), any other subtag of `0x80` (salt
+/// `0x82`, PIN-last-updated timestamp `0x83`), and any top-level tag
+/// sibling to `0x80`. See [`OBJECT_ADMIN_DATA`]'s doc for the object and
+/// bit this operates on.
+///
+/// `existing` is [`unwrap_data_object`]'s output for a prior GET DATA on
+/// [`OBJECT_ADMIN_DATA`] — the object's content with the outer `0x53`
+/// template already stripped — or `&[]` for a device that has never written
+/// this object.
+///
+/// Returns the new inner content to [`put_data`] back (re-wrapping in `0x53`
+/// is [`put_data`]'s own job, not this function's), or `None` when there is
+/// nothing to write:
+///
+/// - `set = true` always returns `Some`, synthesizing the `0x80`/`0x81`
+///   nesting from scratch when `existing` doesn't already carry it.
+/// - `set = false` returns `None` when the `0x80`/`0x81` nesting is entirely
+///   absent — nothing was ever configured, so there is nothing to clear and
+///   the object must be left alone, not created just to write a `0`.
+///
+/// A malformed `existing` (or an unexpected tag-`0x81` value length — SP
+/// 800-73's own example is a single byte) is treated the same as "not
+/// found": `None` for `set = false`, and for `set = true` the unparseable
+/// tail is left in place while a fresh `0x80`/`0x81` is appended — this can
+/// duplicate a tag-`0x80` a genuinely malformed reply already had, but never
+/// silently drops or corrupts bytes this function couldn't make sense of.
+#[must_use]
+pub fn set_admin_data_pin_protected_flag(existing: &[u8], set: bool) -> Option<Vec<u8>> {
+    let Some((c_start, cv_start, cv_end)) = tlv_span(existing, 0x80) else {
+        if !set {
+            return None; // never configured; leave it alone
+        }
+        let mut container = Vec::with_capacity(3);
+        push_tlv(
+            &mut container,
+            &[0x81],
+            &[ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY],
+        );
+        let mut inner = existing.to_vec();
+        push_tlv(&mut inner, &[0x80], &container);
+        return Some(inner);
+    };
+    let container = &existing[cv_start..cv_end];
+    let new_container = match tlv_span(container, 0x81) {
+        Some((f_start, fv_start, fv_end)) => {
+            let value = container.get(fv_start..fv_end)?;
+            let &[current] = value else {
+                // Unexpected length for a field SP 800-73's own example
+                // always shows as one byte — leave the container as-is
+                // rather than guess at a multi-byte flags encoding this
+                // crate has never observed.
+                return None;
+            };
+            if !set && current & ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY == 0 {
+                return None; // already clear; nothing to write back
+            }
+            let updated = if set {
+                current | ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY
+            } else {
+                current & !ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY
+            };
+            let mut rebuilt = Vec::with_capacity(container.len());
+            rebuilt.extend_from_slice(&container[..f_start]);
+            push_tlv(&mut rebuilt, &[0x81], &[updated]);
+            rebuilt.extend_from_slice(&container[fv_end..]);
+            rebuilt
+        }
+        None => {
+            if !set {
+                return None; // tag 0x81 absent; nothing to clear
+            }
+            let mut rebuilt = container.to_vec();
+            push_tlv(
+                &mut rebuilt,
+                &[0x81],
+                &[ADMIN_DATA_FLAG_PIN_PROTECTED_MGM_KEY],
+            );
+            rebuilt
+        }
+    };
+    let mut inner = Vec::with_capacity(existing.len() + 3);
+    inner.extend_from_slice(&existing[..c_start]);
+    push_tlv(&mut inner, &[0x80], &new_container);
+    inner.extend_from_slice(&existing[cv_end..]);
+    Some(inner)
+}
+
 /// Format a Yubico `GET VERSION` reply for display — tolerant of any
-/// non-empty length. Feature gates on the transport side (`move_key_supported`
-/// et al.) compare the same raw bytes directly as a slice rather than parsing
-/// them into a fixed-width tuple first, so there's no separate strict parse
-/// to defer to here either. Up to 4 bytes still reads as a version number, so
+/// non-empty length. The feature known-support table ([`compat::resolve`])
+/// compares the same raw bytes directly as a slice rather than parsing them
+/// into a fixed-width tuple first, so there's no separate strict parse to
+/// defer to here either. Up to 4 bytes still reads as a version number, so
 /// it's dot-joined as decimal (`major.minor.patch[...]`, covering both real
 /// Yubico firmware's 3 bytes and small vendor variants like a 4-byte reply
 /// observed from a Swissbit OpenFIPS201 build). Past 4 bytes, dot-joining
@@ -1511,11 +1965,60 @@ pub fn format_version_bytes(bytes: &[u8]) -> String {
     }
 }
 
-/// Parse a Yubico GET SERIAL reply (4-byte big-endian).
-pub fn parse_serial(buf: &[u8]) -> Result<u32, ParseError> {
-    match buf {
-        [a, b, c, d] => Ok(u32::from_be_bytes([*a, *b, *c, *d])),
-        _ => Err(ParseError::BadResponse("serial is not 4 bytes")),
+/// Parse a device serial number reply as an unsigned big-endian integer of
+/// whatever length the card actually sent, zero-extended on the left into a
+/// `u128`. Not fixed at 4 bytes: real Yubico firmware's GET SERIAL answers
+/// with a 4-byte `u32`, but other vendors' PIV applets that answer the same
+/// Yubico extension (or their own proprietary serial commands) use different
+/// widths — observed both an 8-byte native `u64` (Swissbit iShield Key Pro,
+/// answering the Yubico extension itself) and a 16-byte native `u128`
+/// (Nitrokey's admin application). `Err` only when the reply is too long to
+/// fit a `u128` (more than 16 bytes) — there's no way to widen further.
+pub fn parse_serial(buf: &[u8]) -> Result<u128, ParseError> {
+    // An empty body is "no serial", not serial 0: a card that answers GET
+    // SERIAL with `9000` and nothing must read as unavailable, the way it
+    // did when this parser only accepted exactly four bytes.
+    if buf.is_empty() {
+        return Err(ParseError::BadResponse("serial is empty"));
+    }
+    if buf.len() > 16 {
+        return Err(ParseError::BadResponse("serial is more than 16 bytes"));
+    }
+    let mut widened = [0u8; 16];
+    widened[16 - buf.len()..].copy_from_slice(buf);
+    Ok(u128::from_be_bytes(widened))
+}
+
+/// The largest serial this crate still formats in decimal — `2^80 - 1`.
+/// Chosen to comfortably cover HID Crescendo's GlobalPlatform-CPLC-derived
+/// serial ([`fingerprint::parse_cplc_serial`]: 20 decimal digits, under
+/// 2^67) with headroom to spare, while a genuinely large serial — currently
+/// only reachable via Nitrokey's own 128-bit admin serial command — still
+/// switches to hex past it. See [`format_serial_long`]/[`format_serial_short`].
+const MAX_DECIMAL_SERIAL: u128 = (1 << 80) - 1;
+
+/// Format a PIV serial for a text terminal: decimal with the hex form
+/// parenthesized, matching every serial observed so far, HID Crescendo's own
+/// on-card printed decimal serial included — see `MAX_DECIMAL_SERIAL`.
+/// Past that, the decimal expansion is unwieldy and no vendor prints a
+/// serial that large in decimal, so those display as hex alone, with no
+/// parenthetical.
+pub fn format_serial_long(serial: u128) -> String {
+    if serial > MAX_DECIMAL_SERIAL {
+        format!("0x{serial:X}")
+    } else {
+        format!("{serial} (0x{serial:08X})")
+    }
+}
+
+/// Format a PIV serial for a compact UI label: decimal for a serial that
+/// fits `MAX_DECIMAL_SERIAL`, hex for one that doesn't — see
+/// [`format_serial_long`] for why.
+pub fn format_serial_short(serial: u128) -> String {
+    if serial > MAX_DECIMAL_SERIAL {
+        format!("0x{serial:X}")
+    } else {
+        serial.to_string()
     }
 }
 
@@ -1531,6 +2034,38 @@ pub fn parse_general_auth(buf: &[u8], inner_tag: u8) -> Result<&[u8], ParseError
     let end = start.checked_add(len).ok_or(ParseError::Truncated)?;
     let inner = buf.get(start..end).ok_or(ParseError::Truncated)?;
     find_tlv(inner, inner_tag).ok_or(ParseError::NotAuthTemplate)
+}
+
+/// Like [`parse_general_auth`], but accepts whatever tag the response's sole
+/// inner TLV element carries instead of requiring a specific `inner_tag` —
+/// for [`compat::PivQuirk::HostChallengeResponsePermissiveTag`] devices that
+/// echo the mutual-auth step-2 response under the wrong tag (observed:
+/// IdPrime answers with `0x80`, the witness tag from step 1, where SP
+/// 800-73-4 calls for `0x82`). Only safe when the reply holds exactly one
+/// TLV element: with more than one present there's no unambiguous "this one
+/// is the answer" choice, so that case still errors as
+/// [`ParseError::NotAuthTemplate`] rather than guessing.
+pub fn parse_general_auth_permissive(buf: &[u8]) -> Result<&[u8], ParseError> {
+    if buf.first() != Some(&TAG_DYN_AUTH) {
+        return Err(ParseError::NotAuthTemplate);
+    }
+    let (len, header) = read_ber_len(&buf[1..])?;
+    let start = 1 + header;
+    let end = start.checked_add(len).ok_or(ParseError::Truncated)?;
+    let inner = buf.get(start..end).ok_or(ParseError::Truncated)?;
+    // <tag> <len> <value>, single-byte tag — same assumption every other
+    // inner-tag walker in this module makes (see `find_tlv`'s doc).
+    let len_bytes = inner.get(1..).ok_or(ParseError::NotAuthTemplate)?;
+    let (vlen, vheader) = read_ber_len(len_bytes)?;
+    let vstart = 1 + vheader;
+    let vend = vstart.checked_add(vlen).ok_or(ParseError::Truncated)?;
+    let value = inner.get(vstart..vend).ok_or(ParseError::Truncated)?;
+    if vend != inner.len() {
+        // More than one TLV element present (or trailing garbage) — no
+        // single unambiguous value to return.
+        return Err(ParseError::NotAuthTemplate);
+    }
+    Ok(value)
 }
 
 /// Parse a `0x7F49` generated-public-key template into a [`PublicKey`]. RSA
@@ -1583,9 +2118,45 @@ pub fn parse_metadata(buf: &[u8]) -> Result<Metadata, ParseError> {
 
 /// Find the value of the first top-level TLV with single-byte `tag` in `buf`.
 /// Public so the transport layer can reuse it instead of growing its own
-/// BER-TLV walker.
+/// BER-TLV walker. A thin pin of [`find_tlv_recursive_with_limit`] at
+/// `recursion_limit = 0` — i.e. it never descends into a constructed TLV,
+/// only ever scanning the top level.
 #[must_use]
 pub fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
+    find_tlv_recursive_with_limit(buf, tag, 0)
+}
+
+/// How many constructed layers [`find_tlv_recursive`] descends. The FCI a
+/// SELECT response carries nests its objects one or two levels deep (`6F`
+/// wrapping `A5` wrapping the tag), so four is generous for every applet
+/// seen — and it is a hard ceiling, not a hint: the walker recurses on bytes
+/// the card sent, and without a cap a hostile or broken card answering with
+/// deeply nested constructed tags would recurse once per byte of its reply
+/// (a chained SELECT response can run to tens of kilobytes), overflowing the
+/// stack of whatever thread asked for status.
+pub const MAX_TLV_DEPTH: u8 = 4;
+
+/// Like [`find_tlv`], but descends into constructed TLVs (tag bit `0x20`
+/// set) when the target isn't found at the current level, at most
+/// [`MAX_TLV_DEPTH`] layers down. Used by [`fingerprint::select_identity`]
+/// to find tag `0x50` (Application Label) wherever a vendor put it. All tags
+/// handled here are single-byte (no multi-byte BER tag numbers appear in a
+/// PIV FCI), same as [`find_tlv`].
+#[must_use]
+pub fn find_tlv_recursive(buf: &[u8], tag: u8) -> Option<&[u8]> {
+    find_tlv_recursive_with_limit(buf, tag, MAX_TLV_DEPTH)
+}
+
+/// The shared walker behind [`find_tlv`] (`recursion_limit = 0`) and
+/// [`find_tlv_recursive`] (`recursion_limit = MAX_TLV_DEPTH`): finds the
+/// value of the first TLV with single-byte `tag`, descending into constructed
+/// TLVs (tag bit `0x20` set) when the target isn't found at the current
+/// level. `recursion_limit` is reduced by one on every recursive step and no
+/// further descent is attempted once it reaches zero — so `0` is exactly
+/// [`find_tlv`]'s top-level-only behaviour, and `1` looks one constructed
+/// layer deep and no further. There is deliberately no "unbounded" mode.
+#[must_use]
+pub fn find_tlv_recursive_with_limit(buf: &[u8], tag: u8, recursion_limit: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i < buf.len() {
         let t = buf[i];
@@ -1595,6 +2166,13 @@ pub fn find_tlv(buf: &[u8], tag: u8) -> Option<&[u8]> {
         let value = buf.get(vstart..vend)?;
         if t == tag {
             return Some(value);
+        }
+        if recursion_limit != 0 && t & 0x20 != 0 {
+            let found =
+                find_tlv_recursive_with_limit(value, tag, recursion_limit.saturating_sub(1));
+            if found.is_some() {
+                return found;
+            }
         }
         i = vend;
     }
@@ -1693,6 +2271,10 @@ mod tests {
             data_object_name(&[0x5F, 0xFF, 0x01]).as_deref(),
             Some("Yubico PIV Attestation Certificate")
         );
+        assert_eq!(
+            data_object_name(&fingerprint::HID_CRESCENDO_C2300_PROPERTIES_TAG).as_deref(),
+            Some("HID Crescendo C2300 GET PIV PROPERTIES")
+        );
         // Unassigned tags have no name.
         assert_eq!(data_object_name(&[0x5F, 0xC1, 0x99]), None);
         assert_eq!(data_object_name(&[]), None);
@@ -1768,6 +2350,23 @@ mod tests {
     }
 
     #[test]
+    fn verify_pin_at_uses_the_given_p2_reference() {
+        // Same body as `verify_pin_pads_to_eight`, but P2 = 0x00 — HID
+        // Crescendo's ACA VERIFY PIN reference
+        // (`fingerprint::HID_CRESCENDO_ACA_PIN_REF`) — instead of the
+        // standard PIV application-PIN reference.
+        assert_eq!(
+            verify_pin_at(0x00, b"123456").unwrap(),
+            vec![0x00, 0x20, 0x00, 0x00, 0x08, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0xFF, 0xFF]
+        );
+        // `verify_pin` is exactly `verify_pin_at(PIN_REF_APPLICATION, ..)`.
+        assert_eq!(
+            verify_pin_at(PIN_REF_APPLICATION, b"123456").unwrap(),
+            verify_pin(b"123456").unwrap()
+        );
+    }
+
+    #[test]
     fn verify_status_is_case1() {
         assert_eq!(verify_pin_status(), vec![0x00, 0x20, 0x00, 0x80]);
     }
@@ -1810,9 +2409,173 @@ mod tests {
     }
 
     #[test]
+    fn parse_pin_protected_management_key_extracts_tag_89() {
+        // 53 <len> 88 <len> 89 <len> <key> — outer data template, tag 88
+        // (PIN-protected data), subtag 89 (the management key itself).
+        let key = [0xAAu8; 24];
+        let mut tag89 = vec![0x89, key.len() as u8];
+        tag89.extend_from_slice(&key);
+        let mut tag88 = vec![0x88, tag89.len() as u8];
+        tag88.extend_from_slice(&tag89);
+        let mut buf = vec![0x53, tag88.len() as u8];
+        buf.extend_from_slice(&tag88);
+
+        let extracted = parse_pin_protected_management_key(&buf).unwrap();
+        assert_eq!(&extracted[..], &key[..]);
+    }
+
+    #[test]
+    fn parse_pin_protected_management_key_none_when_not_set_up() {
+        // Well-formed 53/88 wrapper, but no subtag 89 inside — PIN
+        // management auth hasn't been set up on this card.
+        let tag88 = vec![0x88, 0x00];
+        let mut buf = vec![0x53, tag88.len() as u8];
+        buf.extend_from_slice(&tag88);
+        assert!(parse_pin_protected_management_key(&buf).is_none());
+
+        // No tag 88 at all.
+        assert!(parse_pin_protected_management_key(&[0x53, 0x03, 0xAA, 0xBB, 0xCC]).is_none());
+
+        // Not even a 53 template.
+        assert!(parse_pin_protected_management_key(&[0x70, 0x01, 0x00]).is_none());
+    }
+
+    #[test]
+    fn build_pin_protected_management_key_round_trips_with_parse() {
+        let key = [0x11u8; 24];
+        let inner = build_pin_protected_management_key(&key);
+        let mut buf = vec![0x53];
+        push_ber_len(&mut buf, inner.len());
+        buf.extend_from_slice(&inner);
+        assert_eq!(
+            &parse_pin_protected_management_key(&buf).unwrap()[..],
+            &key[..]
+        );
+    }
+
+    #[test]
+    fn admin_data_flag_set_matches_sdk_worked_example() {
+        // The Yubico SDK docs' own example of `AdminData.PinProtected = true`
+        // on a previously-empty object: `53 05 / 80 03 / 81 01 / 02`.
+        let inner = set_admin_data_pin_protected_flag(&[], true).unwrap();
+        assert_eq!(inner, vec![0x80, 0x03, 0x81, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn admin_data_flag_clear_on_never_configured_is_a_no_op() {
+        assert!(set_admin_data_pin_protected_flag(&[], false).is_none());
+        // A container with unrelated subtags but no 0x81 flags byte at all —
+        // still nothing to clear.
+        let inner = [0x80, 0x03, 0x82, 0x01, 0xAA];
+        assert!(set_admin_data_pin_protected_flag(&inner, false).is_none());
+    }
+
+    #[test]
+    fn admin_data_flag_clear_preserves_other_bits_and_siblings() {
+        // Flags byte 0x03 = PIN-protected (0x02) *and* PUK-blocked (0x01,
+        // ykman's own bit) both set, plus an unrelated salt subtag (0x82)
+        // and a top-level sibling tag (0x99) that must survive untouched.
+        let inner = [
+            0x80, 0x06, 0x81, 0x01, 0x03, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F,
+        ];
+        let updated = set_admin_data_pin_protected_flag(&inner, false).unwrap();
+        assert_eq!(
+            updated,
+            vec![0x80, 0x06, 0x81, 0x01, 0x01, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F]
+        );
+    }
+
+    #[test]
+    fn admin_data_flag_set_preserves_other_bits_and_siblings() {
+        // Only PUK-blocked (0x01) set going in; setting PIN-protected must
+        // OR it in (-> 0x03), not clobber it, and siblings still survive.
+        let inner = [
+            0x80, 0x06, 0x81, 0x01, 0x01, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F,
+        ];
+        let updated = set_admin_data_pin_protected_flag(&inner, true).unwrap();
+        assert_eq!(
+            updated,
+            vec![0x80, 0x06, 0x81, 0x01, 0x03, 0x82, 0x01, 0xAA, 0x99, 0x01, 0x7F]
+        );
+    }
+
+    #[test]
+    fn admin_data_flag_clear_already_clear_is_a_no_op() {
+        let inner = [0x80, 0x03, 0x81, 0x01, 0x01]; // only PUK-blocked set
+        assert!(set_admin_data_pin_protected_flag(&inner, false).is_none());
+    }
+
+    #[test]
+    fn admin_data_flag_set_synthesizes_container_alongside_existing_siblings() {
+        // A top-level sibling tag already present, but no 0x80 container at
+        // all yet — the fresh 80/81 pair is appended after it, sibling
+        // untouched.
+        let inner = [0x99, 0x01, 0x7F];
+        let updated = set_admin_data_pin_protected_flag(&inner, true).unwrap();
+        assert_eq!(
+            updated,
+            vec![0x99, 0x01, 0x7F, 0x80, 0x03, 0x81, 0x01, 0x02]
+        );
+    }
+
+    #[test]
     fn parse_serial_values() {
+        // Standard 4-byte Yubico reply, widened to u128.
         assert_eq!(parse_serial(&[0x02, 0x40, 0x8A, 0x1B]).unwrap(), 0x02408A1B);
-        assert!(parse_serial(&[0x00, 0x01]).is_err());
+        // A short reply widens the same way (2 bytes here).
+        assert_eq!(parse_serial(&[0x00, 0x01]).unwrap(), 1);
+        // 8-byte native-u64 reply (observed: Swissbit iShield Key Pro).
+        assert_eq!(
+            parse_serial(&[0x00, 0x15, 0x67, 0xED, 0x52, 0x81, 0x14, 0xC0]).unwrap(),
+            0x0015_67ED_5281_14C0
+        );
+        // 16-byte native-u128 reply (observed: Nitrokey's admin application).
+        assert_eq!(
+            parse_serial(&[
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10
+            ])
+            .unwrap(),
+            0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10
+        );
+        // Empty is "no serial", never serial 0 — a `9000` with an empty body
+        // must surface as unavailable, not as a real-looking value.
+        assert!(parse_serial(&[]).is_err());
+        // 17 bytes can't fit a u128.
+        assert!(parse_serial(&[0u8; 17]).is_err());
+    }
+
+    #[test]
+    fn format_serial_switches_to_hex_past_80_bits() {
+        assert_eq!(format_serial_long(12345678), "12345678 (0x00BC614E)");
+        assert_eq!(format_serial_short(12345678), "12345678");
+        // A HID Crescendo CPLC-derived serial (20 decimal digits, well under
+        // 80 bits) still prints in decimal, matching the card's own printed
+        // serial rather than switching to hex.
+        let hid_crescendo_serial = 1234_5678_4321_0009_0009u128;
+        assert_eq!(
+            format_serial_long(hid_crescendo_serial),
+            "12345678432100090009 (0xAB54A91FB0870099)"
+        );
+        assert_eq!(
+            format_serial_short(hid_crescendo_serial),
+            "12345678432100090009"
+        );
+        // The 80-bit boundary itself is still the decimal/hex-parenthesized
+        // form.
+        let max_decimal = (1u128 << 80) - 1;
+        assert_eq!(
+            format_serial_long(max_decimal),
+            "1208925819614629174706175 (0xFFFFFFFFFFFFFFFFFFFF)"
+        );
+        assert_eq!(
+            format_serial_short(max_decimal),
+            "1208925819614629174706175"
+        );
+        // One bit past it switches both forms to hex-only, no parenthetical.
+        let past_80_bits = max_decimal + 1;
+        assert_eq!(format_serial_long(past_80_bits), "0x100000000000000000000");
+        assert_eq!(format_serial_short(past_80_bits), "0x100000000000000000000");
     }
 
     #[test]
@@ -1862,6 +2625,7 @@ mod tests {
             KeyAlg::Rsa4096,
             KeyAlg::EccP256,
             KeyAlg::EccP384,
+            KeyAlg::EccP521,
             KeyAlg::Ed25519,
             KeyAlg::X25519,
         ] {
@@ -1869,6 +2633,7 @@ mod tests {
         }
         assert_eq!(KeyAlg::Rsa2048.id(), 0x07);
         assert_eq!(KeyAlg::EccP256.id(), 0x11);
+        assert_eq!(KeyAlg::EccP521.id(), 0x15);
     }
 
     #[test]
@@ -1900,7 +2665,7 @@ mod tests {
         assert_eq!(
             generate_key(
                 Slot::Authentication,
-                KeyAlg::EccP256,
+                KeyAlg::EccP256.id(),
                 PinPolicy::Default,
                 TouchPolicy::Default
             ),
@@ -1914,7 +2679,7 @@ mod tests {
         assert_eq!(
             generate_key(
                 Slot::Signature,
-                KeyAlg::Rsa2048,
+                KeyAlg::Rsa2048.id(),
                 PinPolicy::Once,
                 TouchPolicy::Always
             ),
@@ -2265,6 +3030,153 @@ mod tests {
     }
 
     #[test]
+    fn chuid_expiration_in_years_keeps_month_and_day() {
+        // 1767225600 = 2026-01-01 (same known-answer timestamp the days
+        // tests above use). +1 year keeps 01-01, landing on 2027-01-01.
+        assert_eq!(&chuid_expiration_in_years(1_767_225_600, 0), b"20260101");
+        assert_eq!(&chuid_expiration_in_years(1_767_225_600, 1), b"20270101");
+        assert_eq!(&chuid_expiration_in_years(1_767_225_600, 4), b"20300101");
+    }
+
+    #[test]
+    fn chuid_expiration_in_years_clamps_feb_29_in_a_non_leap_target_year() {
+        // 2024-02-29 (2024 is a leap year). +1 year has no 2025-02-29 to
+        // land on, so it clamps to 2025-02-28 rather than rolling over into
+        // March.
+        let leap_day = (days_from_civil(2024, 2, 29) * 86_400) as u64;
+        assert_eq!(&chuid_expiration_in_years(leap_day, 1), b"20250228");
+        // +4 years lands back on a leap year, so the 29th is preserved.
+        assert_eq!(&chuid_expiration_in_years(leap_day, 4), b"20280229");
+    }
+
+    #[test]
+    fn add_calendar_years_preserves_time_of_day() {
+        // 2026-01-01 01:01:24 UTC (1767225600 + 3684s) + 2 years ->
+        // 2028-01-01 at the same time-of-day.
+        let now = 1_767_225_600u64 + 3_684;
+        let end = add_calendar_years(now, 2);
+        assert_eq!(end, days_from_civil(2028, 1, 1) * 86_400 + 3_684);
+    }
+
+    #[test]
+    fn add_calendar_years_extreme_valid_years_does_not_panic() {
+        // A caller-supplied year count far beyond any realistic UI bound
+        // must degrade (via the year clamp), not panic or overflow.
+        let end = add_calendar_years(0, u32::MAX);
+        assert_eq!(
+            end,
+            days_from_civil(MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+        );
+    }
+
+    #[test]
+    fn max_valid_years_reaches_exactly_year_9999() {
+        let now = 1_767_225_600u64; // 2026-01-01
+        let years = max_valid_years(now);
+        let expiration = chuid_expiration_in_years(now, years);
+        assert_eq!(&expiration, b"99990101"); // same month/day, target year 9999
+                                              // One year more overflows past year 9999 itself (there is no
+                                              // 10000-01-01 to represent), so it clamps to that year's last day
+                                              // rather than a 5-digit year.
+        let expiration = chuid_expiration_in_years(now, years + 1);
+        assert_eq!(&expiration, b"99991231");
+    }
+
+    #[test]
+    fn max_valid_years_never_negative_past_the_year_9999_line() {
+        let far_future_secs = u64::MAX / 2;
+        assert_eq!(max_valid_years(far_future_secs), 0);
+    }
+
+    #[test]
+    fn chuid_expiration_in_months_keeps_day_of_month() {
+        // 1767225600 = 2026-01-01. +1 month keeps the 1st, landing on
+        // 2026-02-01; +13 months crosses a year boundary to 2027-02-01.
+        assert_eq!(&chuid_expiration_in_months(1_767_225_600, 0), b"20260101");
+        assert_eq!(&chuid_expiration_in_months(1_767_225_600, 1), b"20260201");
+        assert_eq!(&chuid_expiration_in_months(1_767_225_600, 13), b"20270201");
+    }
+
+    #[test]
+    fn chuid_expiration_in_months_clamps_the_31st_into_a_shorter_month() {
+        // 2026-01-31 + 1 month has no Feb 31st, so it clamps to Feb 28
+        // (2026 isn't a leap year).
+        let jan_31 = (days_from_civil(2026, 1, 31) * 86_400) as u64;
+        assert_eq!(&chuid_expiration_in_months(jan_31, 1), b"20260228");
+        // +2 months lands on a 31-day month, so the 31st is preserved.
+        assert_eq!(&chuid_expiration_in_months(jan_31, 2), b"20260331");
+    }
+
+    #[test]
+    fn add_calendar_months_preserves_time_of_day() {
+        // 2026-01-01 01:01:24 UTC (1767225600 + 3684s) + 2 months ->
+        // 2026-03-01 at the same time-of-day.
+        let now = 1_767_225_600u64 + 3_684;
+        let end = add_calendar_months(now, 2);
+        assert_eq!(end, days_from_civil(2026, 3, 1) * 86_400 + 3_684);
+    }
+
+    #[test]
+    fn add_calendar_months_extreme_valid_months_does_not_panic() {
+        let end = add_calendar_months(0, u32::MAX);
+        assert_eq!(
+            end,
+            days_from_civil(MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+        );
+    }
+
+    #[test]
+    fn max_valid_months_reaches_exactly_year_9999() {
+        let now = 1_767_225_600u64; // 2026-01-01
+        let months = max_valid_months(now);
+        let expiration = chuid_expiration_in_months(now, months);
+        assert_eq!(&expiration, b"99991201"); // same day, month 12 of year 9999
+                                              // One month more overflows past year 9999 itself, so it clamps to
+                                              // that year's last day rather than rolling into year 10000.
+        let expiration = chuid_expiration_in_months(now, months + 1);
+        assert_eq!(&expiration, b"99991231");
+    }
+
+    #[test]
+    fn max_valid_months_never_negative_past_the_year_9999_line() {
+        let far_future_secs = u64::MAX / 2;
+        assert_eq!(max_valid_months(far_future_secs), 0);
+    }
+
+    #[test]
+    fn add_calendar_period_sums_all_three_units() {
+        // 2026-01-01 + 1 year, 2 months, 5 days -> 2027-03-01, then +5 days
+        // -> 2027-03-06.
+        let now = 1_767_225_600u64; // 2026-01-01
+        let end = add_calendar_period(now, 1, 2, 5);
+        assert_eq!(end, days_from_civil(2027, 3, 6) * 86_400);
+    }
+
+    #[test]
+    fn add_calendar_period_matches_each_unit_alone() {
+        let now = 1_767_225_600u64;
+        assert_eq!(
+            add_calendar_period(now, 1, 0, 0),
+            add_calendar_years(now, 1)
+        );
+        assert_eq!(
+            add_calendar_period(now, 0, 1, 0),
+            add_calendar_months(now, 1)
+        );
+        assert_eq!(add_calendar_period(now, 0, 0, 1), now as i64 + 86_400);
+        assert_eq!(add_calendar_period(now, 0, 0, 0), now as i64);
+    }
+
+    #[test]
+    fn add_calendar_period_clamps_when_the_sum_overshoots_9999() {
+        // Each unit alone would already saturate at year 9999's last day;
+        // summing all three extreme values must land on that same instant,
+        // not overflow past it.
+        let end = add_calendar_period(0, u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(end, max_expiration_unix_secs());
+    }
+
+    #[test]
     fn parse_chuid_round_trips_encode_chuid() {
         let guid = [
             0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -2423,6 +3335,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_general_auth_permissive_accepts_any_single_tag() {
+        // 7C 0A 80 08 <8-byte value> — the IdPrime shape: wrong tag (0x80,
+        // not 0x82), but exactly one TLV element, so it's accepted anyway.
+        let mut buf = vec![0x7C, 0x0A, 0x80, 0x08];
+        buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            parse_general_auth_permissive(&buf).unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        // the spec-correct tag works exactly the same way
+        let mut buf82 = vec![0x7C, 0x0A, 0x82, 0x08];
+        buf82.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            parse_general_auth_permissive(&buf82).unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn parse_general_auth_permissive_rejects_multiple_tags() {
+        // 7C 06 80 02 AA BB 81 00 — two TLV elements: no single unambiguous
+        // answer, so this must still fail rather than pick one.
+        let buf = [0x7C, 0x06, 0x80, 0x02, 0xAA, 0xBB, 0x81, 0x00];
+        assert_eq!(
+            parse_general_auth_permissive(&buf),
+            Err(ParseError::NotAuthTemplate)
+        );
+        // wrong outer tag, same as `parse_general_auth`
+        assert_eq!(
+            parse_general_auth_permissive(&[0x70, 0x02, 0x80, 0x00]),
+            Err(ParseError::NotAuthTemplate)
+        );
+        // empty inner template — no TLV element at all
+        assert_eq!(
+            parse_general_auth_permissive(&[0x7C, 0x00]),
+            Err(ParseError::NotAuthTemplate)
+        );
+    }
+
+    #[test]
     fn parse_public_key_rsa_and_ecc() {
         // RSA: 7F49 <len> 81 04 <mod> 82 03 01 00 01
         let mut rsa = vec![
@@ -2489,7 +3441,7 @@ mod tests {
     fn general_auth_sign_short_and_extended() {
         // Small ECC payload stays in a short APDU:
         // 00 87 11 9A 0A  7C 08 82 00 81 04 <payload>  00
-        let apdu = general_auth_sign(KeyAlg::EccP256, 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        let apdu = general_auth_sign(KeyAlg::EccP256.id(), 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(
             apdu,
             vec![
@@ -2499,7 +3451,7 @@ mod tests {
         );
         // A 256-byte RSA-2048 block forces the extended form: marker 0x00,
         // 2-byte Lc, body, 2-byte Le 0x0000 ("up to 65536").
-        let apdu = general_auth_sign(KeyAlg::Rsa2048, 0x9A, &[0x55; 256]);
+        let apdu = general_auth_sign(KeyAlg::Rsa2048.id(), 0x9A, &[0x55; 256]);
         // data: 7C 82 01 06 ( 82 00  81 82 01 00 <256> )
         assert_eq!(&apdu[..5], &[0x00, 0x87, 0x07, 0x9A, 0x00]);
         let lc = ((apdu[5] as usize) << 8) | apdu[6] as usize;
@@ -2513,7 +3465,7 @@ mod tests {
     fn general_auth_key_agree_uses_tag_85() {
         // Same shape as general_auth_sign but the peer key sits in 0x85, not 0x81:
         // 00 87 11 9D 0A  7C 08 82 00 85 04 <peer>  00
-        let apdu = general_auth_key_agree(KeyAlg::EccP256, 0x9D, &[0x04, 0xAA, 0xBB, 0xCC]);
+        let apdu = general_auth_key_agree(KeyAlg::EccP256.id(), 0x9D, &[0x04, 0xAA, 0xBB, 0xCC]);
         assert_eq!(
             apdu,
             vec![
@@ -2522,7 +3474,7 @@ mod tests {
             ]
         );
         // A large payload forces the extended form; the 0x85 inner tag stays.
-        let apdu = general_auth_key_agree(KeyAlg::EccP256, 0x9D, &[0x04; 256]);
+        let apdu = general_auth_key_agree(KeyAlg::EccP256.id(), 0x9D, &[0x04; 256]);
         assert_eq!(&apdu[..5], &[0x00, 0x87, 0x11, 0x9D, 0x00]);
         assert_eq!(&apdu[7..11], &[0x7C, 0x82, 0x01, 0x06]); // 7C len == sign's, 0x85 body
         assert_eq!(apdu[13], 0x85);
@@ -2531,8 +3483,12 @@ mod tests {
 
     #[test]
     fn general_auth_key_agree_chained_matches_sign_chained_shape() {
-        let chunks =
-            general_auth_key_agree_chained(KeyAlg::EccP256, 0x9D, &[0x04, 0xAA, 0xBB, 0xCC], 254);
+        let chunks = general_auth_key_agree_chained(
+            KeyAlg::EccP256.id(),
+            0x9D,
+            &[0x04, 0xAA, 0xBB, 0xCC],
+            254,
+        );
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0],
@@ -2546,7 +3502,7 @@ mod tests {
     #[test]
     fn general_auth_sign_chained_single_chunk_keeps_le() {
         let chunks =
-            general_auth_sign_chained(KeyAlg::EccP256, 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD], 254);
+            general_auth_sign_chained(KeyAlg::EccP256.id(), 0x9A, &[0xAA, 0xBB, 0xCC, 0xDD], 254);
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0],
@@ -2563,11 +3519,11 @@ mod tests {
         // dynamic-auth template a single extended-length APDU would carry,
         // and only the final chunk carries Le.
         let payload = [0x55u8; 256]; // RSA-2048 prepared block
-        let extended = general_auth_sign(KeyAlg::Rsa2048, 0x9A, &payload);
+        let extended = general_auth_sign(KeyAlg::Rsa2048.id(), 0x9A, &payload);
         let ext_lc = ((extended[5] as usize) << 8) | extended[6] as usize;
         let ext_body = &extended[7..7 + ext_lc];
 
-        let chunks = general_auth_sign_chained(KeyAlg::Rsa2048, 0x9A, &payload, 254);
+        let chunks = general_auth_sign_chained(KeyAlg::Rsa2048.id(), 0x9A, &payload, 254);
         assert!(chunks.len() > 1);
         let last = chunks.len() - 1;
         let mut reassembled = Vec::new();
@@ -2649,5 +3605,94 @@ mod tests {
         // truncated long form
         assert_eq!(read_ber_len(&[0x82, 0x01]), Err(ParseError::Truncated));
         assert_eq!(read_ber_len(&[]), Err(ParseError::Truncated));
+    }
+
+    // --- find_tlv / find_tlv_recursive / find_tlv_recursive_with_limit -----
+    //
+    // A target tag `0x80` nested two constructed (`0x30`) layers deep:
+    // `30 05 30 03 80 01 AB` — outer `30` wraps a `30 03 80 01 AB`, which
+    // itself wraps the target `80 01 AB`. Reaching the target needs two
+    // recursive steps (one per enclosing `0x30`).
+
+    const NESTED_TLV: &[u8] = &[0x30, 0x05, 0x30, 0x03, 0x80, 0x01, 0xAB];
+
+    #[test]
+    fn find_tlv_only_scans_the_top_level() {
+        // A top-level match still works...
+        assert_eq!(find_tlv(&[0x80, 0x01, 0xAB], 0x80), Some(&[0xAB][..]));
+        // ...but a nested one does not, even one level down.
+        assert_eq!(find_tlv(NESTED_TLV, 0x80), None);
+    }
+
+    #[test]
+    fn find_tlv_recursive_descends_up_to_max_depth() {
+        assert_eq!(find_tlv_recursive(NESTED_TLV, 0x80), Some(&[0xAB][..]));
+    }
+
+    /// Wrap `inner` in `depth` constructed (`0x30`) layers.
+    fn nest(inner: &[u8], depth: usize) -> Vec<u8> {
+        let mut v = inner.to_vec();
+        for _ in 0..depth {
+            assert!(v.len() < 0x80, "test helper only builds short-form lengths");
+            let mut outer = vec![0x30, v.len() as u8];
+            outer.extend_from_slice(&v);
+            v = outer;
+        }
+        v
+    }
+
+    #[test]
+    fn find_tlv_recursive_stops_at_max_depth() {
+        let target = [0x80, 0x01, 0xAB];
+        // Exactly MAX_TLV_DEPTH layers down is still reachable...
+        let reachable = nest(&target, usize::from(MAX_TLV_DEPTH));
+        assert_eq!(find_tlv_recursive(&reachable, 0x80), Some(&[0xAB][..]));
+        // ...one deeper is not: the cap is a hard ceiling, not a hint.
+        let too_deep = nest(&target, usize::from(MAX_TLV_DEPTH) + 1);
+        assert_eq!(find_tlv_recursive(&too_deep, 0x80), None);
+    }
+
+    #[test]
+    fn find_tlv_recursive_survives_pathological_nesting() {
+        // A reply made of nothing but nested constructed tags, as deep as
+        // the short-form length allows chained together: `30 7F 30 7F …`.
+        // Without a depth cap this recursed once per byte.
+        let hostile: Vec<u8> = core::iter::repeat_n([0x30, 0x7F], 20_000)
+            .flatten()
+            .collect();
+        assert_eq!(find_tlv_recursive(&hostile, 0x50), None);
+    }
+
+    #[test]
+    fn find_tlv_recursive_with_limit_zero_matches_find_tlv() {
+        assert_eq!(find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 0), None);
+        assert_eq!(
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 0),
+            find_tlv(NESTED_TLV, 0x80)
+        );
+    }
+
+    #[test]
+    fn find_tlv_recursive_with_limit_counts_down_one_layer_at_a_time() {
+        // The target sits two constructed layers deep: limit 1 isn't enough...
+        assert_eq!(find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 1), None);
+        // ...limit 2 reaches it exactly...
+        assert_eq!(
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 2),
+            Some(&[0xAB][..])
+        );
+        // ...and any higher limit still finds it.
+        assert_eq!(
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, 5),
+            Some(&[0xAB][..])
+        );
+    }
+
+    #[test]
+    fn find_tlv_recursive_is_the_max_depth_pin() {
+        assert_eq!(
+            find_tlv_recursive(NESTED_TLV, 0x80),
+            find_tlv_recursive_with_limit(NESTED_TLV, 0x80, MAX_TLV_DEPTH)
+        );
     }
 }

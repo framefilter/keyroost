@@ -157,10 +157,40 @@ mod json_out {
         /// Yubico GET VERSION's raw reply, dotted (or hex past 4 bytes),
         /// tolerant of any non-empty byte count.
         pub version: Option<String>,
-        pub serial: Option<u32>,
+        /// Ordinarily the Yubico GET SERIAL extension; when a specific
+        /// fingerprint's own probe supplies a serial instead (currently: a
+        /// Nitrokey's admin application), that one is used and GET SERIAL is
+        /// skipped — a Nitrokey answers that extension too, but with a number
+        /// that isn't its real serial. `None` when neither source answers.
+        ///
+        /// A string, not a number: a serial can be up to 128 bits (a
+        /// Nitrokey's admin serial), and a bare JSON number past 2^53 loses
+        /// precision in most consumers. Decimal within `u64`, `0x`-hex
+        /// beyond — the same rendering `piv status`'s text output uses.
+        pub serial: Option<String>,
         pub pin_retries: Option<u8>,
         pub chuid: Option<PivChuidJson>,
         pub slots: Vec<PivSlotJson>,
+        /// Best-effort applet fingerprint — from ATR/SELECT text as well as
+        /// AID-selectability/instruction-support probes; see
+        /// `keyroost_piv::fingerprint` for the full scheme. Its `Display`
+        /// form — e.g. `"YubiKey"` or `"OpenFips201::SwissbitIShield2"`.
+        pub applet_fingerprint: String,
+        /// The token's own reported name, when one was actually discovered
+        /// (currently: a Nitrokey's admin application, for `Trussed::NitroKey`).
+        /// Empty when none was — not backfilled with a generic name for
+        /// `applet_fingerprint`, so an empty string here means specifically
+        /// "the token didn't tell us its name," not "fingerprinting failed."
+        /// (The plain-text `piv status` output does apply that fallback —
+        /// see `run_piv`.)
+        pub applet_name: String,
+        /// The applet's own firmware version, dotted (same formatting as
+        /// `version`), when a specific fingerprint's probe discovered one —
+        /// currently `Trussed::NitroKey` (Trussed's admin application) only.
+        /// Not necessarily equal to `version`, which is the PIV applet's own
+        /// version. `None` when no such probe applies or it found nothing
+        /// parseable.
+        pub version_firmware: Option<String>,
     }
 
     /// The card's CHUID — FASC-N, GUID, expiration, signature, and LRC. The
@@ -535,6 +565,53 @@ enum Cmd {
         /// Confirm the wipe. Required — without it the command refuses.
         #[arg(long)]
         yes: bool,
+        /// Some cards protect reset behind management auth, checked just
+        /// before the PIV step. Whether that applies to the selected device
+        /// is only known once it's fingerprinted: running this command
+        /// without a management key (or, depending on the card, a PIN)
+        /// either succeeds outright, or refuses and asks you to re-run it
+        /// with --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default or
+        /// --pin-env/--pin-stdin supplied. This flag is the management key,
+        /// as hex, read from this environment variable. Mutually exclusive
+        /// with the PIN options below — pick whichever credential you
+        /// actually have.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_env: Option<String>,
+        /// Same credential, read from stdin (one line, hex) instead of an
+        /// environment variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_stdin: bool,
+        /// Same credential, but not typed in: try this device's well-known
+        /// factory-default management key, if one is known; fails with a
+        /// clear error if it isn't.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_default: bool,
+        /// Same requirement, satisfied with a PIN instead of the management
+        /// key — only useful when the selected card actually accepts a PIN
+        /// for it. Read from this environment variable.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
+        )]
+        pin_env: Option<String>,
+        /// Same PIN, read from stdin (one line) instead of an environment
+        /// variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
+        )]
+        pin_stdin: bool,
     },
 }
 
@@ -657,6 +734,8 @@ enum CliPivKeyAlg {
     EccP256,
     #[value(name = "eccp384")]
     EccP384,
+    #[value(name = "eccp521")]
+    EccP521,
     Ed25519,
     X25519,
 }
@@ -671,6 +750,7 @@ impl CliPivKeyAlg {
             CliPivKeyAlg::Rsa4096 => Rsa4096,
             CliPivKeyAlg::EccP256 => EccP256,
             CliPivKeyAlg::EccP384 => EccP384,
+            CliPivKeyAlg::EccP521 => EccP521,
             CliPivKeyAlg::Ed25519 => Ed25519,
             CliPivKeyAlg::X25519 => X25519,
         }
@@ -840,33 +920,86 @@ enum PivCmd {
         pin_tries: u8,
         #[arg(long, value_name = "N")]
         puk_tries: u8,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
         pin_stdin: bool,
     },
     /// Change the card-management (9B) key.
+    ///
+    /// Changing the management key needs a YubiKey or a compatible
+    /// third-party device: refused on a device known to be incompatible
+    /// unless `--force`, runs with a warning on an unverified one, silent on a
+    /// known-good one.
+    ///
+    /// On every device except HID Crescendo (which unlocks management
+    /// directly off the PIN, with no key material to store), this also
+    /// maintains Yubico's PIN-protected management-key storage, enabling it
+    /// with `--allow-pin-unlock` or disabling it without — gated on
+    /// `PivExtension::PinManagementAuth`: silent on a known-good device, a
+    /// warning on an unverified one. On a device known unable to support it,
+    /// `--allow-pin-unlock` is refused unless `--force`; left unset, the
+    /// maintenance step is silently skipped instead — a plain key rotation on
+    /// such a device isn't blocked just because pin-unlock, which it never
+    /// asked to touch, is confirmed absent.
     ChangeManagementKey {
-        #[arg(long, value_name = "SUBSTR")]
+        // Explicit `display_order` on every field here (10.. up, one per
+        // field, matching declaration order): clap-derive's implicit order
+        // is an auto-incrementing counter that starts fresh at 0 in *each*
+        // derive invocation, including the top-level `Cli` struct's own
+        // `global = true` args (`--list-readers`/`--debug`/`--device`/
+        // `--json`, implicitly 0..3). Left implicit, this variant's own
+        // fields also start at 0, so `--help` interleaved the two structs'
+        // args by tied order number instead of keeping this command's own
+        // args — the `--old-mgmt-key-*` trio in particular — together.
+        #[arg(long, value_name = "SUBSTR", display_order = 10)]
         reader: Option<String>,
-        #[arg(long, value_name = "VAR", conflicts_with = "old_mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["old_mgmt_key_stdin", "old_mgmt_key_default"], display_order = 11)]
         old_mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_default"], display_order = 12)]
         old_mgmt_key_stdin: bool,
-        #[arg(long, value_name = "VAR", conflicts_with = "new_mgmt_key_stdin")]
+        /// Authenticate with this device's well-known factory-default
+        /// management key, if one is known; fails with a clear error if it
+        /// isn't. Only applies to the OLD (current) key — there's no
+        /// equivalent for NEW, since installing a known-weak key on purpose
+        /// isn't what this convenience is for.
+        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_stdin"], display_order = 13)]
+        old_mgmt_key_default: bool,
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with = "new_mgmt_key_stdin",
+            display_order = 14
+        )]
         new_mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, display_order = 15)]
         new_mgmt_key_stdin: bool,
         /// Algorithm of the NEW management key.
-        #[arg(long, value_enum, default_value = "aes192")]
+        #[arg(long, value_enum, default_value = "aes192", display_order = 16)]
         new_algorithm: CliPivMgmtAlg,
         /// Require a physical touch for every future management-key auth.
-        #[arg(long)]
+        #[arg(long, display_order = 17)]
         touch: bool,
+        /// Store the new management key PIN-protected, so it can later be
+        /// unlocked with the PIN alone instead of the raw key. Omit to
+        /// instead clear any existing PIN-protected storage of the old key —
+        /// except on a device confirmed unable to support this at all, where
+        /// omitting it is a no-op rather than an attempted clear. Ignored on
+        /// HID Crescendo, which already unlocks management off the PIN with
+        /// no key material of its own to store.
+        #[arg(long, display_order = 18)]
+        allow_pin_unlock: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long, display_order = 19)]
+        force: bool,
     },
     /// Generate a new key pair in a slot and print its public key (PEM). Needs
     /// the management key. Overwrites any existing key in the slot.
@@ -887,10 +1020,14 @@ enum PivCmd {
         /// (firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         touch_policy: CliTouchPolicy,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         /// Also write the generated public key (PEM) to this path. Needed to
         /// `request-cert`/`self-sign` this same key from a *later*, separate
         /// `keyroostctl` invocation on cards that don't support GET METADATA
@@ -903,8 +1040,22 @@ enum PivCmd {
         /// generation into the signing command.
         #[arg(long, value_name = "PATH")]
         save_pubkey: Option<std::path::PathBuf>,
+        /// Run even with a PIN/touch policy known to be incompatible with
+        /// this device (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
     /// Import a DER or PEM X.509 certificate into a slot. Needs the management key.
+    ///
+    /// No `--load-pubkey` here, unlike `request-cert`/`self-sign`: those
+    /// commands need the key material to build their actual output (a CSR, a
+    /// self-signed certificate), so it's load-bearing there. This command's
+    /// key-match check is only an extra, best-effort safety net — without an
+    /// independently confirmed key to compare against, there's no way to
+    /// judge whether the certificate is "correct" anyway, so it simply
+    /// trusts the certificate's own declared public key and imports it, same
+    /// as it did before that check existed. A `--load-pubkey` flag here would
+    /// only feed that same unverifiable trust back into the comparison.
     ImportCert {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -913,10 +1064,14 @@ enum PivCmd {
         /// Path to a `.der` or `.pem` certificate file.
         #[arg(long, value_name = "PATH")]
         file: std::path::PathBuf,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
     },
     /// Export a slot's certificate (DER) to a file or stdout. No PIN required.
     ExportCert {
@@ -959,12 +1114,26 @@ enum PivCmd {
         #[arg(
             long,
             value_name = "VAR",
-            conflicts_with = "mgmt_key_stdin",
+            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"],
             requires = "generate_key"
         )]
         mgmt_key_env: Option<String>,
-        #[arg(long, requires = "generate_key")]
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"],
+            requires = "generate_key"
+        )]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't. Same
+        /// scope as `--mgmt-key-env`/`--mgmt-key-stdin` above — only
+        /// consulted with `--generate-key`.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"],
+            requires = "generate_key"
+        )]
+        mgmt_key_default: bool,
         #[command(flatten)]
         keygen: InlineKeyGen,
     },
@@ -980,17 +1149,35 @@ enum PivCmd {
         /// (supported attributes: CN, O, OU, C, L, ST).
         #[arg(long, value_name = "DN")]
         subject: String,
-        /// Validity period in days, starting now.
-        #[arg(long, value_name = "N", default_value_t = 365)]
-        days: u32,
+        /// Validity period in whole calendar years from now, applied before
+        /// `--months`/`--days` — the same month and day as today, that many
+        /// years later (a Feb 29 clamps to Feb 28 in a target year that
+        /// isn't a leap year).
+        #[arg(long, value_name = "N")]
+        years: Option<u32>,
+        /// Validity period in whole calendar months, added on top of
+        /// `--years` (if given) before `--days` — the same day of month as
+        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
+        /// to Feb 28/29, the month's last day).
+        #[arg(long, value_name = "N")]
+        months: Option<u32>,
+        /// Validity period in days, starting now. Combines with `--years`/
+        /// `--months` (e.g. `--years 1 --days 5` is 1 year and 5 additional
+        /// days from now); defaults to 1 year if none of the three is given.
+        #[arg(long, value_name = "N")]
+        days: Option<u32>,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         /// Also write the certificate as PEM to this path.
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
@@ -1009,8 +1196,9 @@ enum PivCmd {
     /// for RSA / ECDSA / Ed25519), run a fixed challenge on the card and
     /// verify the result against the slot certificate's public key. Reports
     /// each operation's pass / fail / skipped. Read-only — nothing on the card
-    /// changes. Needs the PIN unless the slot's PIN policy is `never`
-    /// (then omit `--pin-env` / `--pin-stdin`).
+    /// changes. `--pin-env` / `--pin-stdin` are always optional: it's your
+    /// call whether to test with or without a PIN. Depending on device state
+    /// and PIN policy, omitting it may fail.
     Test {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1029,26 +1217,104 @@ enum PivCmd {
     NewChuid {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
+        /// CHUID expiration, in whole calendar years from now, applied
+        /// before `--months`/`--days` — the same month and day as today,
+        /// that many years later (a Feb 29 clamps to Feb 28 in a target
+        /// year that isn't a leap year). Informational only.
+        #[arg(long, value_name = "N")]
+        years: Option<u32>,
+        /// CHUID expiration, in whole calendar months, added on top of
+        /// `--years` (if given) before `--days` — the same day of month as
+        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
+        /// to Feb 28/29, the month's last day). Informational only.
+        #[arg(long, value_name = "N")]
+        months: Option<u32>,
         /// CHUID expiration, in days from now. Informational only — it has no
-        /// technical implications. Same default as self-sign's certificate
-        /// validity.
-        #[arg(long, value_name = "N", default_value_t = 365)]
-        days: u32,
+        /// technical implications. Combines with `--years`/`--months` (e.g.
+        /// `--years 1 --days 5` is 1 year and 5 additional days from now);
+        /// same default as self-sign's certificate validity.
+        #[arg(long, value_name = "N")]
+        days: Option<u32>,
         /// GUID, hex (dashes optional). Omit to use random GUID.
         #[arg(long, value_name = "HEX")]
         guid: Option<String>,
     },
-    /// Reset the PIV application to factory defaults. Only works when BOTH the
-    /// PIN and PUK are already blocked. Wipes all keys, certs, and PINs.
+    /// Reset the PIV application to factory defaults: Wipes all keys, certs,
+    /// and PINs.This typically requires both the PIN and PUK to already be
+    /// blocked. This is arranged automatically if the device is known to
+    /// support RESET. On an unverified device, only a bare RESET is sent,
+    /// with nothing done to arrange any precondition itself — if it does turn
+    /// out to need PIN/PUK already blocked, the caller must prepare manually.
+    ///
+    /// Resetting the PIV applet needs a YubiKey or a compatible third-party
+    /// device: refused on a device known to be incompatible unless
+    /// `--force`, runs with a warning on an unverified one, silent on a
+    /// known-good one.
+    ///
+    /// Some cards protect reset behind management auth instead of the
+    /// PIN/PUK convention above. Whether that applies to the selected device
+    /// is only known once it's fingerprinted: running this command without a
+    /// management key (or, depending on the card, a PIN) either succeeds
+    /// outright, or refuses and asks you to re-run it with
+    /// --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default or
+    /// --pin-env/--pin-stdin supplied.
     Reset {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
         #[arg(long)]
         yes: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
+        /// The management key, as hex, read from this environment variable
+        /// — only consulted when the selected device turns out to need one.
+        /// Mutually exclusive with the PIN options below — pick whichever
+        /// credential you actually have.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_env: Option<String>,
+        /// Same credential, read from stdin (one line, hex) instead of an
+        /// environment variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_stdin: bool,
+        /// Same credential, but not typed in: try this device's well-known
+        /// factory-default management key, if one is known; fails with a
+        /// clear error if it isn't.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env", "pin_stdin"]
+        )]
+        mgmt_key_default: bool,
+        /// Same requirement, satisfied with a PIN instead of the management
+        /// key — only useful when the selected card actually accepts a PIN
+        /// for it. Read from this environment variable.
+        #[arg(
+            long,
+            value_name = "VAR",
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
+        )]
+        pin_env: Option<String>,
+        /// Same PIN, read from stdin (one line) instead of an environment
+        /// variable.
+        #[arg(
+            long,
+            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
+        )]
+        pin_stdin: bool,
     },
     /// Clear a slot's certificate object (standard PIV; works on every card).
     /// Removes ONLY the X.509 certificate — the slot's private key is left in
@@ -1058,32 +1324,52 @@ enum PivCmd {
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         #[arg(long)]
         yes: bool,
     },
-    /// Delete a slot's private key (Yubico extension; needs YubiKey firmware
-    /// 5.7 or newer). Permanently erases the key material — the certificate
-    /// object is left in place. Needs the management key. DESTRUCTIVE: requires
-    /// `--yes`. Older cards cannot delete a key; overwrite the slot instead.
+    /// Delete a slot's private key (Yubico extension). Permanently erases the
+    /// key material — the certificate object is left in place. Needs the
+    /// management key. DESTRUCTIVE: requires `--yes`.
+    ///
+    /// Key deletion needs YubiKey 5.7+ or a compatible third-party device: on
+    /// a device known to be incompatible it is refused (pass `--force` to
+    /// run anyway), on an unverified device it runs with a warning that it
+    /// may fail, and on a known-good device it just runs.
     DeleteKey {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
         #[arg(long)]
         yes: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
-    /// Move a slot's private key to another slot (Yubico MOVE KEY, fw 5.7+).
+    /// Move a slot's private key to another slot (Yubico MOVE KEY).
     /// Non-destructive; refuses an occupied destination. The certificate stays
     /// in the source slot.
+    ///
+    /// Moving keys between slots needs YubiKey 5.7+ or a compatible
+    /// third-party device: refused on a device known to be incompatible
+    /// unless `--force`, runs with a warning on an unverified one, silent on a
+    /// known-good one.
     MoveKey {
         /// Source slot (9a/9c/9d/9e/82–95).
         #[arg(long)]
@@ -1094,10 +1380,17 @@ enum PivCmd {
         /// PC/SC reader substring (skips auto-detection).
         #[arg(long)]
         reader: Option<String>,
-        #[arg(long, value_name = "VAR", conflicts_with = "mgmt_key_stdin")]
+        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
+        /// Use this device's well-known factory-default management key, if
+        /// one is known; fails with a clear error if it isn't.
+        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
+        mgmt_key_default: bool,
+        /// Run even on a device known to be incompatible (the operation will likely fail).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -2668,6 +2961,130 @@ fn check_valid_days(days: u32) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The years counterpart of [`check_valid_days`] — same rationale, same
+/// 9999-12-31 ceiling, just checked against [`keyroost_piv::max_valid_years`]
+/// instead.
+fn check_valid_years(years: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
+    if years > max {
+        return Err(format!(
+            "--years {years} exceeds the largest representable value ({max} years \
+             from now) — a CHUID/certificate date is a 4-digit year, capped at \
+             9999-12-31"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The months counterpart of [`check_valid_days`]/[`check_valid_years`] —
+/// same rationale, same 9999-12-31 ceiling, checked against
+/// [`keyroost_piv::max_valid_months`].
+fn check_valid_months(months: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
+    if months > max {
+        return Err(format!(
+            "--months {months} exceeds the largest representable value ({max} months \
+             from now) — a CHUID/certificate date is a 4-digit year, capped at \
+             9999-12-31"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// `piv self-sign` and `piv new-chuid` both take a `--days`/`--months`/
+/// `--years` triple that freely combines and sums (e.g. `--years 1 --days 5`
+/// is 1 year and 5 additional days from now, applied in that order — see
+/// [`keyroost_piv::add_calendar_period`]); `None`/`None`/`None` — no flag
+/// given — resolves to a 1-year default rather than each call site
+/// re-deriving it.
+#[derive(Debug, PartialEq, Eq)]
+struct ValidFor {
+    years: u32,
+    months: u32,
+    days: u32,
+}
+
+impl ValidFor {
+    fn resolve(days: Option<u32>, months: Option<u32>, years: Option<u32>) -> ValidFor {
+        if days.is_none() && months.is_none() && years.is_none() {
+            return ValidFor {
+                years: 1,
+                months: 0,
+                days: 0,
+            };
+        }
+        ValidFor {
+            years: years.unwrap_or(0),
+            months: months.unwrap_or(0),
+            days: days.unwrap_or(0),
+        }
+    }
+
+    /// Reject an all-zero period, then check each given unit against its own
+    /// ceiling ([`keyroost_piv::max_valid_days`]/`_months`/`_years`, each
+    /// independently computed from "now") — a conservative check when units
+    /// combine (adding years first only ever shrinks the days/months budget
+    /// left before 9999-12-31, so a component that already fits its own
+    /// from-now ceiling always fits the summed one too); the actual encoder
+    /// clamps the summed result as a backstop regardless (see
+    /// `check_valid_days`'s doc comment for why a clear error is still
+    /// preferred over that silent saturation for the common single-unit
+    /// case).
+    fn check(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.years == 0 && self.months == 0 && self.days == 0 {
+            return Err("validity must be at least 1 day".into());
+        }
+        if self.years > 0 {
+            check_valid_years(self.years)?;
+        }
+        if self.months > 0 {
+            check_valid_months(self.months)?;
+        }
+        if self.days > 0 {
+            check_valid_days(self.days)?;
+        }
+        Ok(())
+    }
+
+    /// Unix seconds this period ends at, starting from `now_unix_secs`.
+    fn end_unix_secs(&self, now_unix_secs: u64) -> i64 {
+        keyroost_piv::add_calendar_period(now_unix_secs, self.years, self.months, self.days)
+    }
+
+    /// CHUID expiration (`YYYYMMDD`) this period produces from `now_unix_secs`.
+    fn chuid_expiration(&self, now_unix_secs: u64) -> [u8; 8] {
+        keyroost_piv::yyyymmdd_from_unix_secs(self.end_unix_secs(now_unix_secs))
+    }
+
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.years > 0 {
+            parts.push(format!(
+                "{} year{}",
+                self.years,
+                if self.years == 1 { "" } else { "s" }
+            ));
+        }
+        if self.months > 0 {
+            parts.push(format!(
+                "{} month{}",
+                self.months,
+                if self.months == 1 { "" } else { "s" }
+            ));
+        }
+        if self.days > 0 {
+            parts.push(format!(
+                "{} day{}",
+                self.days,
+                if self.days == 1 { "" } else { "s" }
+            ));
+        }
+        parts.join(", ")
+    }
+}
+
 /// Load a bulk-import file, transparently decrypting an Aegis encrypted
 /// vault if `--password-stdin` or `--password-env` was supplied.
 fn load_bulk_entries(
@@ -2876,8 +3293,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Whole-device factory reset: wipe every resettable applet in planner order.
-    if let Cmd::FactoryReset { reader, yes } = cmd {
-        return run_factory_reset(reader.as_deref(), *yes, cli.debug);
+    if let Cmd::FactoryReset {
+        reader,
+        yes,
+        mgmt_key_env,
+        mgmt_key_stdin,
+        mgmt_key_default,
+        pin_env,
+        pin_stdin,
+    } = cmd
+    {
+        return run_factory_reset(
+            reader.as_deref(),
+            *yes,
+            cli.debug,
+            mgmt_key_env.as_deref(),
+            *mgmt_key_stdin,
+            *mgmt_key_default,
+            pin_env.as_deref(),
+            *pin_stdin,
+        );
     }
 
     unreachable!("every subcommand is handled above");
@@ -4272,10 +4707,19 @@ const FACTORY_RESET_CONSENT: &str =
      Each applet that completes comes back in factory condition, and every step \
      reports its own outcome)";
 
+// One more `--mgmt-key-*` source (`mgmt_key_default`) pushed this past
+// clippy's default 7-argument threshold; every argument here is a distinct
+// CLI flag, so a struct would just move the sprawl rather than reduce it.
+#[allow(clippy::too_many_arguments)]
 fn run_factory_reset(
     reader: Option<&str>,
     yes: bool,
     debug: bool,
+    mgmt_key_env: Option<&str>,
+    mgmt_key_stdin: bool,
+    mgmt_key_default: bool,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_resolve::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
 
@@ -4304,10 +4748,108 @@ fn run_factory_reset(
         dev.hid_path.as_deref(),
         &keyroost_hid::enumerate().unwrap_or_default(),
     );
-    let plan = factory_reset_plan(dev.caps);
+    let mut plan = factory_reset_plan(dev.caps);
     if plan.is_empty() {
         return Err(format!(
             "'{}' exposes no resettable applet (nothing to factory-reset)",
+            sanitize_terminal(&dev.model)
+        )
+        .into());
+    }
+
+    // Fingerprint PIV before running anything destructive — mirrors the GUI's
+    // `App::start_factory_reset_confirm`, just synchronous (the CLI has no
+    // worker thread to keep this off of). Two separate questions, not one:
+    // whether PIV can be reset at all (`PivSession::preview_factory_reset`,
+    // which checks `PivExtension::ResetGlobal` first and falls back to
+    // `PivExtension::Reset`'s own shape — `Unsupported` means neither is
+    // available, so `ResetStep::Piv` is dropped from the plan entirely
+    // rather than offered for a step `factory_reset` would only refuse), and
+    // whether a credential is needed for whichever mechanism does run
+    // (`PivSession::global_reset_available` — `PivQuirk::
+    // ResetNeedsManagementAuth` applying, ORed across either extension not
+    // being a confirmed dead end). `factory_reset` itself decides which
+    // mechanism actually consumes the resolved credential; a device that
+    // can't be probed (no reader, transport fault) is treated as needing
+    // neither — the PIV step below still runs and reports its own, real
+    // error if the device is genuinely unreachable.
+    let mut piv_resettable = true;
+    let reset_auth = if plan.contains(&ResetStep::Piv) {
+        match dev.reader.as_deref() {
+            Some(r) => {
+                // `with_transaction`'s own connect/SELECT failure is
+                // swallowed below, same as the old `PivSession::open(r).ok()`
+                // — the PIV step itself surfaces a real error later if the
+                // device is genuinely unreachable. A failure *inside* the
+                // closure (from `resolve_reset_cli_auth`) is a different
+                // matter — a real credential-resolution problem that must
+                // abort the whole command — so it travels out as the
+                // closure's own `Result` value rather than through
+                // `with_transaction`'s error channel, and is propagated
+                // (`return Err`) below instead of swallowed.
+                type Probed = Result<
+                    (
+                        bool,
+                        Option<Result<ResetCliAuth, Box<dyn std::error::Error>>>,
+                    ),
+                    TransportError,
+                >;
+                let probed: Probed = keyroost_transport::PivSession::with_transaction(r, |s| {
+                    let resettable = !matches!(
+                        s.preview_factory_reset(),
+                        keyroost_transport::PivResetPreview::Unsupported
+                    );
+                    let auth = if s.global_reset_available() {
+                        // Ask before the PIN gate is consulted below:
+                        // whichever mechanism actually runs, both need
+                        // `current`, so this is the one place
+                        // `PivQuirk::ResetNeedsManagementAuth` applying
+                        // is handled — abort here, before anything
+                        // destructive, rather than let the PIV step
+                        // discover it partway through the plan.
+                        let pin_gate = s.pin_management_auth_gate();
+                        Some(resolve_reset_cli_auth(
+                            mgmt_key_env,
+                            mgmt_key_stdin,
+                            mgmt_key_default,
+                            pin_env,
+                            pin_stdin,
+                            pin_gate,
+                            Some(s),
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok::<_, TransportError>((resettable, auth))
+                });
+                match probed {
+                    Ok((resettable, auth)) => {
+                        piv_resettable = resettable;
+                        match auth {
+                            Some(Ok(a)) => Some(a),
+                            Some(Err(e)) => return Err(e),
+                            None => None,
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if !piv_resettable {
+        keyroost_resolve::exclude_unresettable_piv(&mut plan);
+    }
+    // Re-check: a device offering only `Caps::PIV` (the check above only
+    // catches an empty plan built from caps, before this exclusion) can
+    // still end up with nothing left to reset once a live fingerprint rules
+    // PIV out too.
+    if plan.is_empty() {
+        return Err(format!(
+            "'{}' has no reset mechanism available for any of its applets \
+             (nothing to factory-reset)",
             sanitize_terminal(&dev.model)
         )
         .into());
@@ -4351,13 +4893,19 @@ fn run_factory_reset(
                     }
                 }
             }
-            other => reset_one_card_applet(*other, reader, debug),
+            other => reset_one_card_applet(*other, reader, debug, reset_auth.as_ref()),
         };
         let label = step.label();
         match &outcome {
             StepOutcome::Wiped => println!("{label:<8} wiped"),
+            // Device-wide mechanism, not confined to PIV alone — name the
+            // whole device instead of just the applet that triggered it.
+            StepOutcome::WipedGlobal => {
+                println!("{:<8} wiped", keyroost_resolve::PIV_GLOBAL_RESET_LABEL)
+            }
+            StepOutcome::WipedWithWarning(e) => println!("{label:<8} wiped (warning: {e})"),
             StepOutcome::Failed(e) => println!("{label:<8} failed: {e}"),
-            StepOutcome::Skipped => println!("{label:<8} skipped"),
+            StepOutcome::Skipped(reason) => println!("{label:<8} skipped: {reason}"),
         }
         reports.push(StepReport {
             step: *step,
@@ -4774,7 +5322,7 @@ fn candidates_of<'a>(
 /// three self-describing variants: the error, plus where the card actually
 /// stands and what finishes the job.
 ///
-/// `force_reset` blocks the PIN and PUK on its way to RESET — the card only
+/// `factory_reset` blocks the PIN and PUK on its way to RESET — the card only
 /// accepts a RESET once both are blocked — so a fault in the middle can leave
 /// PIV locked but not wiped. That is not bricked, but it is also not something
 /// `keyroostctl piv reset` can finish: a fault in the PUK loop leaves the PIN
@@ -4790,14 +5338,184 @@ fn piv_factory_reset_failure(err: &str) -> String {
     )
 }
 
+/// How `--mgmt-key-env`/`--mgmt-key-stdin`/`--mgmt-key-default`/`--pin-env`/
+/// `--pin-stdin` resolved: the management key or a PIN for whichever RESET
+/// mechanism actually consumes it — `PivSession::factory_reset` (today,
+/// always HID Crescendo's ACA instance when it runs the device-wide step)
+/// for `factory-reset`'s PIV step, or a plain
+/// `PivSession::authenticate_management_current` + `PivSession::reset` for
+/// `piv reset`'s own credential prompt — see `resolve_reset_cli_auth`'s doc.
+/// Mirrors the GUI's `GlobalResetAuth` — same two-way shape, same eventual
+/// conversion into `keyroost_transport::CurrentMgmtAuth`.
+enum ResetCliAuth {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Pin(zeroize::Zeroizing<String>),
+}
+
+/// Resolve [`ResetCliAuth`] from a RESET command's five `--mgmt-key-*`/
+/// `--pin-*` flags, already mutually exclusive by construction (each
+/// `conflicts_with_all`s the other four) — shared by `factory-reset`'s PIV
+/// step and `piv reset`, the two commands that can hit `PivQuirk::
+/// ResetNeedsManagementAuth`'s precondition. `--mgmt-key-default` is the CLI
+/// equivalent of the GUI's "Use default XAUTH key" convenience: unlike the
+/// typed/piped forms, it never touches argv or stdin and instead reaches for
+/// keyroost's own per-fingerprint quirks-table default
+/// (`PivSession::default_management_key`) — a deliberate CLI-side opt-in, so
+/// a scripted `--yes` run only reaches for a well-known key when the caller
+/// explicitly asked it to via this flag, not silently.
+///
+/// `pin_gate` is `PivSession::pin_management_auth_gate`'s live verdict for
+/// the device being reset, consulted only for the error below: the abort
+/// message names the PIN option — and whether it's confirmed or merely
+/// unverified on this device — precisely when that gate says a PIN is a
+/// candidate at all, rather than always offering it (`PivQuirk::
+/// ResetNeedsManagementAuth` says a credential is needed; it says nothing
+/// about which kinds this fingerprint actually accepts).
+///
+/// `session` is only consulted for `--mgmt-key-default` — every other branch
+/// ignores it. Both real call sites already have one open (fingerprinting
+/// the device is how `PivQuirk::ResetNeedsManagementAuth` gets checked in
+/// the first place) and pass `Some`; it's `Option` rather than a required
+/// reference purely so the credential-resolution unit tests below, which
+/// exercise `mgmt_key_default: false` and have no reader to open a real
+/// session against, can pass `None`.
+fn resolve_reset_cli_auth(
+    mgmt_key_env: Option<&str>,
+    mgmt_key_stdin: bool,
+    mgmt_key_default: bool,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
+    pin_gate: keyroost_piv::compat::FeatureGate,
+    session: Option<&mut keyroost_transport::PivSession<'_>>,
+) -> Result<ResetCliAuth, Box<dyn std::error::Error>> {
+    if mgmt_key_default {
+        let session = session.expect(
+            "--mgmt-key-default always runs with an already-open PivSession at both call sites",
+        );
+        return session
+            .default_management_key()
+            .map(|key| ResetCliAuth::Key(zeroize::Zeroizing::new(key.to_vec())))
+            .ok_or_else(|| {
+                "--mgmt-key-default: keyroost has no known factory-default management key \
+                 on record for this device; pass --mgmt-key-env/--mgmt-key-stdin instead"
+                    .into()
+            });
+    }
+    if mgmt_key_env.is_some() || mgmt_key_stdin {
+        return Ok(ResetCliAuth::Key(read_mgmt_key(
+            "reset management key",
+            mgmt_key_env,
+            mgmt_key_stdin,
+        )?));
+    }
+    if pin_env.is_some() || pin_stdin {
+        return Ok(ResetCliAuth::Pin(read_secret(
+            "reset PIN",
+            pin_env,
+            pin_stdin,
+        )?));
+    }
+    use keyroost_piv::compat::FeatureGate;
+    let pin_hint = match pin_gate {
+        FeatureGate::Supported => {
+            " or --pin-env/--pin-stdin (a PIN works too, instead of the management key)"
+        }
+        FeatureGate::Unverified => {
+            " or --pin-env/--pin-stdin (a PIN may also work instead of the management key, \
+             but that's unverified on this device)"
+        }
+        FeatureGate::Unsupported => "",
+    };
+    Err(format!(
+        "this device needs a management-key credential to reset PIV \u{2014} pass \
+         --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default{pin_hint}"
+    )
+    .into())
+}
+
 /// Run one card-applet reset step, mapping its result to a StepOutcome so a
 /// single failure is recorded, not propagated (continue-on-error).
+/// `reset_auth` is only ever consulted for `ResetStep::Piv` — the credential
+/// `run_factory_reset` resolved when `PivSession::global_reset_available`
+/// said one was needed, handed straight through to
+/// `PivSession::factory_reset`, which decides on its own whether the
+/// device-wide mechanism or a plain PIV reset actually consumes it.
 fn reset_one_card_applet(
     step: keyroost_resolve::ResetStep,
     reader: Option<&str>,
     debug: bool,
+    reset_auth: Option<&ResetCliAuth>,
 ) -> keyroost_resolve::StepOutcome {
     use keyroost_resolve::{ResetStep, StepOutcome};
+
+    // PIV gets its own path, ahead of the shared closure below:
+    // `PivSession::factory_reset` decides on its own, from a live fingerprint,
+    // whether to run the device-wide mechanism, a PIV-only reset, or skip the
+    // applet outright (RESET known-unsupported on both axes, or a
+    // precondition — an authenticated management-key session — with no
+    // credential supplied) rather than fail it, a distinction `run()`'s
+    // uniform Ok/Err mapping below can't express.
+    if step == ResetStep::Piv {
+        let outcome = (|| -> Result<StepOutcome, Box<dyn std::error::Error>> {
+            let name = resolve_piv_reader(reader)?;
+            keyroost_transport::PivSession::with_transaction_traced(&name, debug, |s| {
+                let current = reset_auth.map(|auth| match auth {
+                    ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                    ResetCliAuth::Pin(pin) => {
+                        keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
+                    }
+                });
+                Ok(match s.factory_reset(current) {
+                    Ok(keyroost_transport::FactoryResetOutcome::Wiped) => StepOutcome::Wiped,
+                    // The device-wide mechanism ran cleanly -- more than just PIV
+                    // was wiped, so the report should say so rather than naming
+                    // only the applet that happened to trigger it.
+                    Ok(keyroost_transport::FactoryResetOutcome::WipedGlobal) => {
+                        StepOutcome::WipedGlobal
+                    }
+                    // The device IS wiped -- only the courtesy XAUTH-key restore
+                    // (the device-wide mechanism's own follow-up) failed.
+                    // `WipedWithWarning`, not `Failed`: the wipe itself is done,
+                    // so this counts as wiped, but the restore failure is real
+                    // and still needs its own line.
+                    Ok(keyroost_transport::FactoryResetOutcome::WipedKeyRestoreFailed) => {
+                        StepOutcome::WipedWithWarning(
+                            "restoring XAUTH key 1 to the factory-delivery value afterward failed \
+                         \u{2014} it's left cleared instead. Set it manually \
+                         (`keyroostctl piv change-management-key`) if you need it back."
+                                .into(),
+                        )
+                    }
+                    // Never touched the PIN or PUK -- refused before the burn
+                    // sequence even started. Not a failure, an exclusion.
+                    Err(
+                        e @ (TransportError::PivResetUnsupported
+                        | TransportError::PivResetNeedsManagementAuth),
+                    ) => StepOutcome::Skipped(sanitize_terminal(&e.to_string())),
+                    // These already state the card's real state and the way
+                    // forward. Pointing at `keyroostctl piv reset` on top of them
+                    // would be wrong: it sends the very RESET the card just
+                    // refused, or it contradicts their own "re-run the factory
+                    // reset" (Incomplete, PukGuessAccepted); the unverified-attempt,
+                    // device-wide-mechanism, and authenticated-management-key
+                    // failures already explain themselves in full, with no
+                    // PIN/PUK blocked to caveat about.
+                    Err(
+                        e @ (TransportError::PivResetIncomplete(_)
+                        | TransportError::PivPukGuessAccepted
+                        | TransportError::PivResetUnverifiedFailed(_)
+                        | TransportError::PivResetGlobalFailed(_)
+                        | TransportError::PivResetManagementAuthFailed(_)),
+                    ) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
+                    Err(other) => StepOutcome::Failed(sanitize_terminal(
+                        &piv_factory_reset_failure(&other.to_string()),
+                    )),
+                })
+            })
+        })();
+        return outcome.unwrap_or_else(|e| StepOutcome::Failed(sanitize_terminal(&e.to_string())));
+    }
+
     let run = || -> Result<(), Box<dyn std::error::Error>> {
         match step {
             ResetStep::Oath => {
@@ -4811,23 +5529,7 @@ fn reset_one_card_applet(
                 let mut s = open_openpgp(reader, debug)?;
                 s.factory_reset()?;
             }
-            ResetStep::Piv => {
-                let mut s = open_piv(reader, debug)?;
-                s.force_reset().map_err(|e| -> Box<dyn std::error::Error> {
-                    match e {
-                        // These three already state the card's real state and
-                        // the way forward. Pointing at `keyroostctl piv reset`
-                        // on top of them would be wrong: it sends the very
-                        // RESET the card just refused (Unsupported), or it
-                        // contradicts their own "re-run the factory reset"
-                        // (Incomplete, PukGuessAccepted).
-                        TransportError::PivForceResetUnsupported
-                        | TransportError::PivForceResetIncomplete(_)
-                        | TransportError::PivPukGuessAccepted => e.into(),
-                        other => piv_factory_reset_failure(&other.to_string()).into(),
-                    }
-                })?;
-            }
+            ResetStep::Piv => unreachable!("handled above, before this closure"),
             ResetStep::Token2Otp => {
                 let mut s = open_otp(OtpTransportArg::Auto, debug)?;
                 s.erase_all()?;
@@ -6269,88 +6971,132 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         PivCmd::Status { reader } => {
-            let mut session = open_piv(reader.as_deref(), debug)?;
-            let status = session.status()?;
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |session| -> Result<(), Box<dyn std::error::Error>> {
+                    let status = session.status()?;
 
-            if json_output() {
-                emit_json(&json_out::PivStatusJson {
-                    version: status
+                    if json_output() {
+                        emit_json(&json_out::PivStatusJson {
+                            version: status
+                                .version
+                                .as_deref()
+                                .map(keyroost_piv::format_version_bytes),
+                            serial: status.serial.map(keyroost_piv::format_serial_short),
+                            pin_retries: status.pin_retries,
+                            chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
+                                fasc_n: c.fasc_n_display(),
+                                guid: c.guid_display(),
+                                expiration: c.expiration_display(),
+                                signature: c.signature_display(),
+                                lrc: c.lrc_display(),
+                            }),
+                            slots: status
+                                .slots
+                                .iter()
+                                .map(|s| json_out::PivSlotJson {
+                                    slot: s.slot.label(),
+                                    cert_present: s.cert_present,
+                                    cert_len: if s.cert_present { s.cert_len } else { 0 },
+                                    cert_unreadable: s.cert_unreadable.map(|r| r.code()),
+                                })
+                                .collect(),
+                            applet_fingerprint: status.applet_fingerprint.to_string(),
+                            applet_name: status.applet_name.clone(),
+                            version_firmware: status
+                                .version_firmware
+                                .as_deref()
+                                .map(keyroost_piv::format_version_bytes),
+                        })?;
+                        return Ok(());
+                    }
+
+                    // `applet_name` is only ever the token's own reported name (e.g.
+                    // a Nitrokey's admin application) — empty means none was
+                    // discovered, not that fingerprinting failed, so
+                    // the plain-text line falls back to the fingerprint's generic
+                    // display name instead of showing nothing.
+                    let applet_name = if status.applet_name.is_empty() {
+                        status.applet_fingerprint.applet_name().to_string()
+                    } else {
+                        status.applet_name.clone()
+                    };
+
+                    println!(
+                        "Applet:      {} ({})",
+                        applet_name, status.applet_fingerprint
+                    );
+                    // Tolerant of any non-empty GET VERSION reply, not just real
+                    // Yubico firmware's 3 bytes — some third-party PIV applets that
+                    // answer this vendor extension at all use a different byte count
+                    // (observed: a Swissbit iShield Key 2 Pro replies with 4).
+                    let version_str = status
                         .version
                         .as_deref()
-                        .map(keyroost_piv::format_version_bytes),
-                    serial: status.serial,
-                    pin_retries: status.pin_retries,
-                    chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
-                        fasc_n: c.fasc_n_display(),
-                        guid: c.guid_display(),
-                        expiration: c.expiration_display(),
-                        signature: c.signature_display(),
-                        lrc: c.lrc_display(),
-                    }),
-                    slots: status
-                        .slots
-                        .iter()
-                        .map(|s| json_out::PivSlotJson {
-                            slot: s.slot.label(),
-                            cert_present: s.cert_present,
-                            cert_len: if s.cert_present { s.cert_len } else { 0 },
-                            cert_unreadable: s.cert_unreadable.map(|r| r.code()),
-                        })
-                        .collect(),
-                })?;
-                return Ok(());
-            }
-
-            // Tolerant of any non-empty GET VERSION reply, not just real
-            // Yubico firmware's 3 bytes — some third-party PIV applets that
-            // answer this vendor extension at all use a different byte count
-            // (observed: a Swissbit iShield Key 2 Pro replies with 4).
-            match status.version.as_deref() {
-                Some(v) => println!("Version:     {}", keyroost_piv::format_version_bytes(v)),
-                None => println!("Version:     (unavailable)"),
-            }
-            match status.serial {
-                Some(s) => println!("Serial:      {0} (0x{0:08X})", s),
-                None => println!("Serial:      (unavailable)"),
-            }
-            match status.pin_retries {
-                Some(0) => println!("PIN retries: 0 (blocked)"),
-                Some(n) => println!("PIN retries: {}", n),
-                None => println!("PIN retries: (unavailable)"),
-            }
-            match &status.chuid {
-                Some(c) => {
-                    // Signature/LRC are empty in every CHUID this crate
-                    // itself writes — "empty" reads clearer than a blank
-                    // value after the label.
-                    let or_empty = |s: String| if s.is_empty() { "empty".to_string() } else { s };
-                    println!("CHUID:");
-                    println!("  FASC-N:      {}", c.fasc_n_display());
-                    println!("  GUID:        {}", c.guid_display());
-                    println!("  Expiration:  {}", c.expiration_display());
-                    println!("  Signature:   {}", or_empty(c.signature_display()));
-                    println!("  LRC:         {}", or_empty(c.lrc_display()));
-                }
-                None => println!("CHUID:       (unavailable)"),
-            }
-            println!("Slots:");
-            for s in &status.slots {
-                if let Some(reason) = s.cert_unreadable {
-                    println!(
-                        "  {:<26} cert present but unreadable ({})",
-                        s.slot.label(),
-                        reason
-                    );
-                } else if s.cert_present {
-                    println!(
-                        "  {:<26} cert present ({} bytes)",
-                        s.slot.label(),
-                        s.cert_len
-                    );
-                } else {
-                    println!("  {:<26} empty", s.slot.label());
-                }
-            }
+                        .map(keyroost_piv::format_version_bytes)
+                        .unwrap_or_else(|| "(unavailable)".to_string());
+                    // `version_firmware` is the token's own firmware (read through a
+                    // fingerprint-specific probe only some tokens answer — currently
+                    // a Nitrokey only), not necessarily the same as the PIV applet's
+                    // own version above; a
+                    // dedicated line would repeat the applet version for every token
+                    // that doesn't distinguish the two, so it's appended here instead
+                    // — and only when it actually differs from the applet version.
+                    let fw_suffix = status
+                        .version_firmware
+                        .as_deref()
+                        .filter(|fw| Some(*fw) != status.version.as_deref())
+                        .map(|fw| format!(" (FW v{})", keyroost_piv::format_version_bytes(fw)))
+                        .unwrap_or_default();
+                    println!("Version:     {version_str}{fw_suffix}");
+                    match status.serial {
+                        Some(s) => println!("Serial:      {}", keyroost_piv::format_serial_long(s)),
+                        None => println!("Serial:      (unavailable)"),
+                    }
+                    match status.pin_retries {
+                        Some(0) => println!("PIN retries: 0 (blocked)"),
+                        Some(n) => println!("PIN retries: {}", n),
+                        None => println!("PIN retries: (unavailable)"),
+                    }
+                    match &status.chuid {
+                        Some(c) => {
+                            // Signature/LRC are empty in every CHUID this crate
+                            // itself writes — "empty" reads clearer than a blank
+                            // value after the label.
+                            let or_empty =
+                                |s: String| if s.is_empty() { "empty".to_string() } else { s };
+                            println!("CHUID:");
+                            println!("  FASC-N:      {}", c.fasc_n_display());
+                            println!("  GUID:        {}", c.guid_display());
+                            println!("  Expiration:  {}", c.expiration_display());
+                            println!("  Signature:   {}", or_empty(c.signature_display()));
+                            println!("  LRC:         {}", or_empty(c.lrc_display()));
+                        }
+                        None => println!("CHUID:       (unavailable)"),
+                    }
+                    println!("Slots:");
+                    for s in &status.slots {
+                        if let Some(reason) = s.cert_unreadable {
+                            println!(
+                                "  {:<26} cert present but unreadable ({})",
+                                s.slot.label(),
+                                reason
+                            );
+                        } else if s.cert_present {
+                            println!(
+                                "  {:<26} cert present ({} bytes)",
+                                s.slot.label(),
+                                s.cert_len
+                            );
+                        } else {
+                            println!("  {:<26} empty", s.slot.label());
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::ChangePin {
@@ -6362,9 +7108,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let old = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
             let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            s.change_pin(old.as_bytes(), new.as_bytes())?;
-            println!("PIN changed.");
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    s.change_pin(old.as_bytes(), new.as_bytes())?;
+                    println!("PIN changed.");
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::ChangePuk {
@@ -6376,9 +7129,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let old = read_secret("old PUK", old_puk_env.as_deref(), *old_puk_stdin)?;
             let new = read_secret("new PUK", new_puk_env.as_deref(), *new_puk_stdin)?;
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            s.change_puk(old.as_bytes(), new.as_bytes())?;
-            println!("PUK changed.");
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    s.change_puk(old.as_bytes(), new.as_bytes())?;
+                    println!("PUK changed.");
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::UnblockPin {
@@ -6390,9 +7150,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let puk = read_secret("PUK", puk_env.as_deref(), *puk_stdin)?;
             let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
-            println!("PIN unblocked and reset.");
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
+                    println!("PIN unblocked and reset.");
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::SetRetries {
@@ -6401,6 +7168,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             puk_tries,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             pin_env,
             pin_stdin,
         } => {
@@ -6411,31 +7179,43 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .into(),
                 );
             }
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.verify_pin(pin.as_bytes())?;
-            s.set_pin_retries(*pin_tries, *puk_tries)?;
-            println!(
-                "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults.",
-                pin_tries, puk_tries
-            );
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    authenticate_piv(s, &mgmt)?;
+                    s.verify_pin(pin.as_bytes())?;
+                    s.set_pin_retries(*pin_tries, *puk_tries)?;
+                    println!(
+                        "PIN/PUK retry counts set to {}/{}. Both reset to factory defaults.",
+                        pin_tries, puk_tries
+                    );
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::ChangeManagementKey {
             reader,
             old_mgmt_key_env,
             old_mgmt_key_stdin,
+            old_mgmt_key_default,
             new_mgmt_key_env,
             new_mgmt_key_stdin,
             new_algorithm,
             touch,
+            allow_pin_unlock,
+            force,
         } => {
-            let old = read_mgmt_key(
-                "old management key",
-                old_mgmt_key_env.as_deref(),
-                *old_mgmt_key_stdin,
-            )?;
             let new = read_mgmt_key(
                 "new management key",
                 new_mgmt_key_env.as_deref(),
@@ -6451,13 +7231,141 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let mut s = open_piv_authed(reader.as_deref(), debug, &old)?;
-            s.set_management_key(new_alg, &new, *touch)?;
-            println!(
-                "Management key changed to {}{}.",
-                new_alg.label(),
-                if *touch { " (touch required)" } else { "" }
-            );
+            // Gate on the applet's fingerprint before authenticating — the
+            // fingerprint probe re-SELECTs PIV and would clear the auth.
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let old = resolve_mgmt_key(
+                        "old management key",
+                        old_mgmt_key_env.as_deref(),
+                        *old_mgmt_key_stdin,
+                        *old_mgmt_key_default,
+                        s,
+                    )?;
+                    guard_piv_feature(
+                        s,
+                        keyroost_piv::compat::PivExtension::SetManagementKey,
+                        *force,
+                    )?;
+                    let pin_unlock_gate =
+                        s.feature_gate(keyroost_piv::compat::PivExtension::PinManagementAuth);
+                    // Whether to run the PIN-protected-storage maintenance step
+                    // below (2a/2b) at all, alongside the key change:
+                    // - `Supported`: always.
+                    // - `Unverified`: always, with a warning — support was never
+                    //   confirmed either way, so a caller who didn't even ask
+                    //   still gets best-effort maintenance rather than being
+                    //   blocked, but is told it isn't confirmed here.
+                    // - `Unsupported`: only if `--allow-pin-unlock` was actually
+                    //   given — that's a deliberate request for a feature
+                    //   confirmed absent, gated like any other extension (error
+                    //   unless `--force`). Left unset (the common case — most
+                    //   invocations of this command are a plain key rotation
+                    //   that never touches pin-unlock at all), a confirmed-absent
+                    //   device is silently skipped: no error, no warning, just
+                    //   the ordinary management-key change. Irrelevant on HID
+                    //   Crescendo in practice (it resolves this extension
+                    //   `Supported` unconditionally), which is also the
+                    //   fingerprint `set_management_key_pin_protected` skips the
+                    //   maintenance step for entirely regardless of this flag.
+                    let maintain_pin_unlock = match pin_unlock_gate {
+                        keyroost_piv::compat::FeatureGate::Supported => true,
+                        keyroost_piv::compat::FeatureGate::Unverified => {
+                            eprintln!(
+                                "warning: {} {}",
+                                keyroost_piv::compat::PivExtension::PinManagementAuth.requirement(),
+                                keyroost_piv::compat::FeatureGate::UNVERIFIED_SUFFIX
+                            );
+                            true
+                        }
+                        keyroost_piv::compat::FeatureGate::Unsupported if *allow_pin_unlock => {
+                            guard_piv_feature(
+                                s,
+                                keyroost_piv::compat::PivExtension::PinManagementAuth,
+                                *force,
+                            )?;
+                            true
+                        }
+                        keyroost_piv::compat::FeatureGate::Unsupported => false,
+                    };
+                    authenticate_piv(s, &old)?;
+                    // A HID Crescendo unit whose management key isn't a real PIV
+                    // object runs its own self-contained unlock right before PUT
+                    // XAUTH KEY (see `set_management_key`'s doc) rather than relying
+                    // on `authenticate_piv`'s auth above still being in force —
+                    // `current` carries the same key again for that path; every
+                    // other device ignores it.
+                    let current = keyroost_transport::CurrentMgmtAuth::Key(&old);
+                    let maintenance = if maintain_pin_unlock {
+                        s.set_management_key_pin_protected(
+                            current,
+                            new_alg,
+                            &new,
+                            *touch,
+                            *allow_pin_unlock,
+                        )?
+                    } else {
+                        s.set_management_key(current, new_alg, &new, *touch)?;
+                        keyroost_transport::PinProtectMaintenance::NotApplicable
+                    };
+                    println!(
+                        "Management key changed to {}{}.",
+                        new_alg.label(),
+                        if *touch { " (touch required)" } else { "" }
+                    );
+                    match maintenance {
+                        keyroost_transport::PinProtectMaintenance::NotApplicable => {}
+                        keyroost_transport::PinProtectMaintenance::Ran {
+                            printed_data: Ok(()),
+                        } => {
+                            println!(
+                                "{}",
+                                if *allow_pin_unlock {
+                                    "PIN-protected management-key storage enabled: the PIN \
+                                     alone now unlocks management on this device."
+                                } else {
+                                    "PIN-protected management-key storage disabled (if it \
+                                     was set)."
+                                }
+                            );
+                        }
+                        keyroost_transport::PinProtectMaintenance::Ran {
+                            printed_data: Err(e),
+                        } => {
+                            let action = if *allow_pin_unlock {
+                                "enable"
+                            } else {
+                                "disable"
+                            };
+                            // `Supported` means this device is confirmed to support
+                            // the write, so a failure here is a real problem — every
+                            // other gate value (`Unverified`, or `Unsupported`
+                            // overridden by `--force`) means it was never confirmed
+                            // to work here at all, so the same failure is expected
+                            // background noise (see `PinProtectMaintenance`'s doc).
+                            if matches!(
+                                pin_unlock_gate,
+                                keyroost_piv::compat::FeatureGate::Supported
+                            ) {
+                                return Err(format!(
+                                    "management key changed, but failed to {action} \
+                                     PIN-protected management-key storage: {e}"
+                                )
+                                .into());
+                            }
+                            eprintln!(
+                                "warning: management key changed, but could not {action} \
+                                 PIN-protected management-key storage ({e}) — support for \
+                                 this is unverified on this device, so this may be expected."
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::GenerateKey {
@@ -6468,42 +7376,108 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             touch_policy,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             save_pubkey,
+            force,
         } => {
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let alg = algorithm.to_alg();
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            eprintln!(
-                "Generating {} in {} (touch the key if it blinks)\u{2026}",
-                alg.label(),
-                slot.to_slot().label()
-            );
-            let pubkey = s.generate_key(
-                slot.to_slot(),
-                alg,
-                pin_policy.to_policy(),
-                touch_policy.to_policy(),
-            )?;
-            let der = match keyroost_piv::spki::subject_public_key_info(&pubkey, alg) {
-                Ok(der) => der,
-                Err(e) => {
-                    return Err(
-                        format!("key generated, but encoding its public key failed: {}", e).into(),
-                    )
-                }
-            };
-            let pem = keyroost_piv::spki::to_pem(&der);
-            if let Some(path) = save_pubkey {
-                std::fs::write(path, pem.as_bytes())
-                    .map_err(|e| format!("write {}: {}", path.display(), e))?;
-                eprintln!(
+            // Gate the PIN/touch policy — Yubico extensions to GENERATE
+            // ASYMMETRIC KEYPAIR, not SP 800-73-4 — on the applet's
+            // fingerprint before authenticating, same reasoning as
+            // `guard_piv_feature`'s own doc: its fingerprint probe re-SELECTs
+            // PIV and would clear the auth. `default` is standard PIV and
+            // needs neither extension, so both checks are skipped outright
+            // when the caller didn't ask for anything non-default.
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    // Unlike PIN/touch policy, every algorithm choice is gated —
+                    // there's no "default" that's exempt: even the SP 800-73-4
+                    // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
+                    // universally implemented, and RSA-3072/4096/Ed25519/X25519 are
+                    // vendor extensions with no standard obligation at all. See
+                    // `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`.
+                    guard_piv_feature(
+                        s,
+                        keyroost_piv::compat::PivExtension::SlotKeyAlgorithm(alg),
+                        *force,
+                    )?;
+                    if !matches!(pin_policy, CliPinPolicy::Default) {
+                        guard_piv_feature(
+                            s,
+                            keyroost_piv::compat::PivExtension::SlotPinPolicy,
+                            *force,
+                        )?;
+                    }
+                    if !matches!(touch_policy, CliTouchPolicy::Default) {
+                        guard_piv_feature(
+                            s,
+                            keyroost_piv::compat::PivExtension::SlotTouchPolicy,
+                            *force,
+                        )?;
+                    }
+                    // Narrower than the two gates above: a device can support the
+                    // extension in general yet reject one specific value.
+                    guard_piv_policy_value(
+                        s,
+                        keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
+                        matches!(pin_policy, CliPinPolicy::Once),
+                        "PIN policy \"once\"",
+                        *force,
+                    )?;
+                    guard_piv_policy_value(
+                        s,
+                        keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
+                        matches!(touch_policy, CliTouchPolicy::Cached),
+                        "Touch policy \"cached\"",
+                        *force,
+                    )?;
+                    authenticate_piv(s, &mgmt)?;
+                    eprintln!(
+                        "Generating {} in {} (touch the key if it blinks)\u{2026}",
+                        alg.label(),
+                        slot.to_slot().label()
+                    );
+                    let pubkey = s.generate_key(
+                        slot.to_slot(),
+                        alg,
+                        pin_policy.to_policy(),
+                        touch_policy.to_policy(),
+                    )?;
+                    let der = match keyroost_piv::spki::subject_public_key_info(&pubkey, alg) {
+                        Ok(der) => der,
+                        Err(e) => {
+                            return Err(format!(
+                                "key generated, but encoding its public key failed: {}",
+                                e
+                            )
+                            .into())
+                        }
+                    };
+                    let pem = keyroost_piv::spki::to_pem(&der);
+                    if let Some(path) = save_pubkey {
+                        std::fs::write(path, pem.as_bytes())
+                            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                        eprintln!(
                     "Wrote key material for {} to {} — pass it to request-cert/self-sign's \
                      --load-pubkey if you sign this key from a separate command.",
                     slot.to_slot().label(),
                     path.display()
                 );
-            }
-            print!("{}", pem);
+                    }
+                    print!("{}", pem);
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::ImportCert {
@@ -6512,48 +7486,72 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             file,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
         } => {
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
             let bytes =
                 std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
             let der = cert_to_der(&bytes)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.import_certificate(slot.to_slot(), &der)?;
-            println!(
-                "Imported {}-byte certificate into {}.",
-                der.len(),
-                slot.to_slot().label()
-            );
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    authenticate_piv(s, &mgmt)?;
+                    s.import_certificate(slot.to_slot(), &der)?;
+                    println!(
+                        "Imported {}-byte certificate into {}.",
+                        der.len(),
+                        slot.to_slot().label()
+                    );
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::ExportCert { reader, slot, file } => {
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            match s.read_certificate(slot.to_slot())? {
-                None => {
-                    return Err(format!("{} holds no certificate", slot.to_slot().label()).into())
-                }
-                Some(der) => match file {
-                    Some(path) => {
-                        std::fs::write(path, &der)
-                            .map_err(|e| format!("write {}: {}", path.display(), e))?;
-                        eprintln!(
-                            "Wrote {}-byte DER certificate to {}.",
-                            der.len(),
-                            path.display()
-                        );
-                    }
-                    None => {
-                        use std::io::{IsTerminal, Write};
-                        // DER is binary — don't garble an interactive terminal.
-                        if std::io::stdout().is_terminal() {
-                            return Err("stdout is a terminal; pass --file PATH or pipe \
-                                        (e.g. | openssl x509 -inform der -text)"
-                                .into());
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    match s.read_certificate(slot.to_slot())? {
+                        None => {
+                            return Err(
+                                format!("{} holds no certificate", slot.to_slot().label()).into()
+                            )
                         }
-                        std::io::stdout().write_all(&der)?;
+                        Some(der) => match file {
+                            Some(path) => {
+                                std::fs::write(path, &der)
+                                    .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                                eprintln!(
+                                    "Wrote {}-byte DER certificate to {}.",
+                                    der.len(),
+                                    path.display()
+                                );
+                            }
+                            None => {
+                                use std::io::{IsTerminal, Write};
+                                // DER is binary — don't garble an interactive terminal.
+                                if std::io::stdout().is_terminal() {
+                                    return Err("stdout is a terminal; pass --file PATH or pipe \
+                                        (e.g. | openssl x509 -inform der -text)"
+                                        .into());
+                                }
+                                std::io::stdout().write_all(&der)?;
+                            }
+                        },
                     }
+                    Ok(())
                 },
-            }
+            )?;
         }
 
         PivCmd::RequestCert {
@@ -6566,39 +7564,64 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             load_pubkey,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             keygen,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut s = if keygen.generate_key {
-                // The key-generation step needs management-key auth; the CSR
-                // signature that follows still only needs the PIN.
-                let mgmt =
-                    read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-                let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-                inline_generate_key(&mut s, slot.to_slot(), keygen)?;
-                s
-            } else {
-                let mut s = open_piv(reader.as_deref(), debug)?;
-                if let Some(path) = load_pubkey {
-                    let (alg, key) = load_pubkey_material(path)?;
-                    s.remember_pubkey(slot.to_slot(), alg, key);
-                }
-                s
-            };
-            eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
-            let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes())?;
-            match file {
-                Some(path) => {
-                    std::fs::write(path, pem.as_bytes())
-                        .map_err(|e| format!("write {}: {}", path.display(), e))?;
-                    eprintln!(
-                        "Wrote certificate request for {} to {}.",
-                        slot.to_slot().label(),
-                        path.display()
-                    );
-                }
-                None => print!("{}", pem),
+            // Know whether the target key can sign before spending the PIN
+            // or the management key on a request that's doomed anyway — the
+            // algorithm is knowable from `--algorithm`/`--load-pubkey` with
+            // no card I/O at all, or from the slot's existing key with a
+            // read-only GET METADATA/certificate read once a session is
+            // open.
+            if keygen.generate_key {
+                guard_signable_alg(keygen.algorithm.to_alg())?;
+            } else if let Some(path) = load_pubkey {
+                guard_signable_alg(load_pubkey_material(path)?.0)?;
             }
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    if !keygen.generate_key && load_pubkey.is_none() {
+                        if let Some(alg) = s.slot_key_algorithm(slot.to_slot()) {
+                            guard_signable_alg(alg)?;
+                        }
+                    }
+                    let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+                    if keygen.generate_key {
+                        // The key-generation step needs management-key auth; the CSR
+                        // signature that follows still only needs the PIN.
+                        let mgmt = resolve_mgmt_key(
+                            "management key",
+                            mgmt_key_env.as_deref(),
+                            *mgmt_key_stdin,
+                            *mgmt_key_default,
+                            s,
+                        )?;
+                        authenticate_piv(s, &mgmt)?;
+                        inline_generate_key(s, slot.to_slot(), keygen)?;
+                    } else if let Some(path) = load_pubkey {
+                        let (alg, key) = load_pubkey_material(path)?;
+                        s.remember_pubkey(slot.to_slot(), alg, key);
+                    }
+                    eprintln!("Signing the request on the card (touch if it blinks)\u{2026}");
+                    let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes())?;
+                    match file {
+                        Some(path) => {
+                            std::fs::write(path, pem.as_bytes())
+                                .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                            eprintln!(
+                                "Wrote certificate request for {} to {}.",
+                                slot.to_slot().label(),
+                                path.display()
+                            );
+                        }
+                        None => print!("{}", pem),
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::SelfSign {
@@ -6606,49 +7629,73 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             slot,
             subject,
             days,
+            months,
+            years,
             pin_env,
             pin_stdin,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             file,
             load_pubkey,
             keygen,
         } => {
-            if *days == 0 {
-                return Err("validity must be at least 1 day".into());
-            }
-            check_valid_days(*days)?;
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            // Management-key auth covers the certificate import; the PIN
-            // covers the signature itself.
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            if keygen.generate_key {
-                inline_generate_key(&mut s, slot.to_slot(), keygen)?;
-            } else if let Some(path) = load_pubkey {
-                let (alg, key) = load_pubkey_material(path)?;
-                s.remember_pubkey(slot.to_slot(), alg, key);
-            }
-            eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
-            let now = unix_now() as i64;
-            let der = s.self_signed_certificate(
-                slot.to_slot(),
-                subject,
-                now,
-                now + i64::from(*days) * 86_400,
-                pin.as_bytes(),
+            let valid_for = ValidFor::resolve(*days, *months, *years);
+            valid_for.check()?;
+            // Know whether the target key can sign before spending the PIN
+            // or the management key on a certificate that's doomed anyway.
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    if keygen.generate_key {
+                        guard_signable_alg(keygen.algorithm.to_alg())?;
+                    } else if let Some(path) = load_pubkey {
+                        guard_signable_alg(load_pubkey_material(path)?.0)?;
+                    } else if let Some(alg) = s.slot_key_algorithm(slot.to_slot()) {
+                        guard_signable_alg(alg)?;
+                    }
+                    let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+                    // Management-key auth covers the certificate import; the PIN
+                    // covers the signature itself.
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    authenticate_piv(s, &mgmt)?;
+                    if keygen.generate_key {
+                        inline_generate_key(s, slot.to_slot(), keygen)?;
+                    } else if let Some(path) = load_pubkey {
+                        let (alg, key) = load_pubkey_material(path)?;
+                        s.remember_pubkey(slot.to_slot(), alg, key);
+                    }
+                    eprintln!("Signing the certificate on the card (touch if it blinks)\u{2026}");
+                    let now = unix_now();
+                    let der = s.self_signed_certificate(
+                        slot.to_slot(),
+                        subject,
+                        i64::from(now),
+                        valid_for.end_unix_secs(u64::from(now)),
+                        pin.as_bytes(),
+                    )?;
+                    println!(
+                        "Self-signed certificate ({} bytes, {}) created and stored in {}.",
+                        der.len(),
+                        valid_for.describe(),
+                        slot.to_slot().label()
+                    );
+                    if let Some(path) = file {
+                        std::fs::write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
+                            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                        eprintln!("PEM copy written to {}.", path.display());
+                    }
+                    Ok(())
+                },
             )?;
-            println!(
-                "Self-signed certificate ({} bytes, {} days) created and stored in {}.",
-                der.len(),
-                days,
-                slot.to_slot().label()
-            );
-            if let Some(path) = file {
-                std::fs::write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
-                    .map_err(|e| format!("write {}: {}", path.display(), e))?;
-                eprintln!("PEM copy written to {}.", path.display());
-            }
         }
 
         PivCmd::Test {
@@ -6658,8 +7705,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_stdin,
         } => {
             let piv_slot = slot.to_slot();
-            // The PIN is optional: a slot whose PIN policy is `never` (usually
-            // 9e) needs none. When given, verify it once up front so a wrong
+            // The PIN is always optional, independent of the slot's PIN
+            // policy — it's the caller's call whether to test with or
+            // without one. When given, verify it once up front so a wrong
             // PIN fails before any op and costs just one retry.
             let pin = if pin_env.is_some() || *pin_stdin {
                 Some(read_secret("PIN", pin_env.as_deref(), *pin_stdin)?)
@@ -6667,92 +7715,105 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 None
             };
 
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            // The self-test verifies against the slot CERTIFICATE's public key
-            // on purpose: the cert is what other PIV software consumes, so a
-            // pass proves the cert matches the slot's key material. The cert
-            // object may hold it gzip-compressed (the writing tool's choice);
-            // read_certificate inflates it (#147/#148), so reading it back
-            // here works.
-            let cert = s.read_certificate(piv_slot)?.ok_or_else(|| {
-                format!("{} has no certificate to test against", piv_slot.label())
-            })?;
-            let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
-                .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    // The self-test verifies against the slot CERTIFICATE's public
+                    // key on purpose: the cert is what other PIV software consumes,
+                    // so a pass proves the cert matches the slot's key material. The
+                    // cert object may hold it gzip-compressed (the writing tool's
+                    // choice); read_certificate inflates it (#147/#148), so reading
+                    // it back here works.
+                    let cert = s.read_certificate(piv_slot)?.ok_or_else(|| {
+                        format!("{} has no certificate to test against", piv_slot.label())
+                    })?;
+                    let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(
+                        &cert,
+                    )
+                    .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
 
-            if !keyroost_pivtest::SelfTest::all()
-                .into_iter()
-                .any(|op| keyroost_pivtest::supports(op, alg))
-            {
-                return Err(format!("no self-test applies to a {} key", alg.label()).into());
-            }
+                    if !keyroost_pivtest::SelfTest::all()
+                        .into_iter()
+                        .any(|op| keyroost_pivtest::supports(op, alg))
+                    {
+                        return Err(format!("no self-test applies to a {} key", alg.label()).into());
+                    }
 
-            if let Some(pin) = &pin {
-                s.verify_pin(pin.as_bytes())?;
-            }
-            eprintln!(
-                "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
-                piv_slot.label(),
-                alg.label()
-            );
+                    if let Some(pin) = &pin {
+                        s.verify_pin(pin.as_bytes())?;
+                    }
+                    eprintln!(
+                        "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
+                        piv_slot.label(),
+                        alg.label()
+                    );
 
-            let mut ran = 0usize;
-            let results = keyroost_pivtest::run(alg, &pubkey, |op, input| {
-                // PIN-per-use slots (9c) drop the verified state after each
-                // GENERAL AUTHENTICATE — re-verify before every op past the
-                // first that actually runs.
-                if let (Some(pin), true) = (&pin, ran > 0) {
-                    s.verify_pin(pin.as_bytes())?;
-                }
-                ran += 1;
-                if op.is_key_agreement() {
-                    s.key_agree(piv_slot, alg, input)
-                } else if op == keyroost_pivtest::SelfTest::Decrypt {
-                    s.decrypt(piv_slot, alg, input)
-                } else {
-                    s.sign(piv_slot, alg, input)
-                }
-            });
+                    let mut ran = 0usize;
+                    let results = keyroost_pivtest::run(alg, &pubkey, |op, input| {
+                        // PIN-per-use slots (9c) drop the verified state after each
+                        // GENERAL AUTHENTICATE — re-verify before every op past the
+                        // first that actually runs.
+                        if let (Some(pin), true) = (&pin, ran > 0) {
+                            s.verify_pin(pin.as_bytes())?;
+                        }
+                        ran += 1;
+                        if op.is_key_agreement() {
+                            s.key_agree(piv_slot, alg, input)
+                        } else if op == keyroost_pivtest::SelfTest::Decrypt {
+                            s.decrypt(piv_slot, alg, input)
+                        } else {
+                            s.sign(piv_slot, alg, input)
+                        }
+                    });
 
-            let all_ok = !results.iter().any(|(_, r)| r.is_failure());
-            if json_output() {
-                emit_json(&json_out::PivTestJson {
-                    slot: piv_slot.label().to_string(),
-                    algorithm: alg.label().to_string(),
-                    ok: all_ok,
-                    operations: results
-                        .iter()
-                        .map(|(op, r)| json_out::PivTestOpJson {
-                            operation: op.label().to_string(),
-                            result: match r {
-                                keyroost_pivtest::Outcome::Passed => "passed",
-                                keyroost_pivtest::Outcome::Skipped(_) => "skipped",
-                                keyroost_pivtest::Outcome::Failed(_) => "failed",
-                            }
-                            .to_string(),
-                            detail: match r {
-                                keyroost_pivtest::Outcome::Failed(e) => Some(e.clone()),
-                                _ => None,
-                            },
-                        })
-                        .collect(),
-                })?;
-            } else {
-                println!("{}", keyroost_pivtest::format_report(&results));
-            }
-            if !all_ok {
-                return Err("one or more self-tests failed".into());
-            }
+                    let all_ok = !results.iter().any(|(_, r)| r.is_failure());
+                    if json_output() {
+                        emit_json(&json_out::PivTestJson {
+                            slot: piv_slot.label().to_string(),
+                            algorithm: alg.label().to_string(),
+                            ok: all_ok,
+                            operations: results
+                                .iter()
+                                .map(|(op, r)| json_out::PivTestOpJson {
+                                    operation: op.label().to_string(),
+                                    result: match r {
+                                        keyroost_pivtest::Outcome::Passed => "passed",
+                                        keyroost_pivtest::Outcome::Skipped(_) => "skipped",
+                                        keyroost_pivtest::Outcome::Failed(_) => "failed",
+                                    }
+                                    .to_string(),
+                                    detail: match r {
+                                        keyroost_pivtest::Outcome::Failed(e) => Some(e.clone()),
+                                        _ => None,
+                                    },
+                                })
+                                .collect(),
+                        })?;
+                    } else {
+                        println!("{}", keyroost_pivtest::format_report(&results));
+                    }
+                    if !all_ok {
+                        return Err("one or more self-tests failed".into());
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::NewChuid {
             reader,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             days,
+            months,
+            years,
             guid,
         } => {
-            check_valid_days(*days)?;
+            let valid_for = ValidFor::resolve(*days, *months, *years);
+            valid_for.check()?;
             let guid = match guid {
                 Some(hex) => keyroost_piv::parse_guid_hex(hex).ok_or(
                     "--guid must be 16 bytes of hex, dashes optional \
@@ -6760,30 +7821,117 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )?,
                 None => keyroost_transport::random_chuid_guid()?,
             };
-            let expiration = keyroost_piv::chuid_expiration_in_days(u64::from(unix_now()), *days);
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.new_chuid(&guid, &expiration)?;
-            println!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
+            let expiration = valid_for.chuid_expiration(u64::from(unix_now()));
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    authenticate_piv(s, &mgmt)?;
+                    s.new_chuid(&guid, &expiration)?;
+                    println!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
+                    Ok(())
+                },
+            )?;
         }
 
-        PivCmd::Reset { reader, yes } => {
-            let mut s = open_piv(reader.as_deref(), debug)?;
-            let st = s.status()?;
-            let serial = st
-                .serial
-                .map(|v| format!("serial {}", v))
-                .unwrap_or_else(|| "this device".into());
-            if !yes {
-                return Err(format!(
-                    "refusing to reset the PIV application on {} without --yes \
+        PivCmd::Reset {
+            reader,
+            yes,
+            force,
+            mgmt_key_env,
+            mgmt_key_stdin,
+            mgmt_key_default,
+            pin_env,
+            pin_stdin,
+        } => {
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    // Gate on the applet's fingerprint before reading status — the
+                    // fingerprint probe re-SELECTs PIV, same ordering concern
+                    // `delete-key`/`move-key` document at their own call sites.
+                    guard_piv_feature(s, keyroost_piv::compat::PivExtension::Reset, *force)?;
+                    let st = s.status()?;
+                    let serial = st
+                        .serial
+                        .map(|v| format!("serial {}", v))
+                        .unwrap_or_else(|| "this device".into());
+                    if !yes {
+                        return Err(format!(
+                            "refusing to reset the PIV application on {} without --yes \
                      (this wipes all PIV keys, certificates, and PINs)",
-                    serial
-                )
-                .into());
-            }
-            s.reset()?;
-            println!("PIV application reset to factory defaults on {}.", serial);
+                            serial
+                        )
+                        .into());
+                    }
+                    // Some fingerprints need an authenticated management-key session
+                    // before RESET is even accepted (`PivQuirk::
+                    // ResetNeedsManagementAuth`) — the same precondition
+                    // `factory-reset`'s PIV step fingerprints for, scoped here to
+                    // the plain PIV-only mechanism this command sends
+                    // (`PivSession::plan_factory_reset`'s own shape, never the
+                    // device-wide one `factory-reset` may additionally reach for).
+                    // Resolve a credential for it up front, before the wipe, rather
+                    // than let the bare RESET below fail with a raw status word.
+                    let auth = match s.plan_factory_reset() {
+                        keyroost_transport::FactoryResetPlan::NeedsManagementAuth => {
+                            let pin_gate = s.pin_management_auth_gate();
+                            Some(resolve_reset_cli_auth(
+                                mgmt_key_env.as_deref(),
+                                *mgmt_key_stdin,
+                                *mgmt_key_default,
+                                pin_env.as_deref(),
+                                *pin_stdin,
+                                pin_gate,
+                                Some(s),
+                            )?)
+                        }
+                        _ => None,
+                    };
+                    let current = auth.as_ref().map(|auth| match auth {
+                        ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                        ResetCliAuth::Pin(pin) => {
+                            keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
+                        }
+                    });
+                    if let Some(current) = current {
+                        s.authenticate_management_current(current)?;
+                    }
+                    // Some fingerprints are known to take unusually long to finish
+                    // RESET (`PivQuirk::ResetLongRunning`, e.g. observed over a
+                    // minute on ArekinathPivApplet::SwissbitIShield1) — warn right
+                    // before the wipe actually starts, using the same wording the
+                    // GUI's PIV pane shows on its "Reset applet" card, so a slow but
+                    // working reset isn't mistaken for a hang and interrupted.
+                    if s.quirks()
+                        .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning)
+                    {
+                        eprintln!(
+                            "warning: {}",
+                            keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT
+                        );
+                    }
+                    // `current` is also handed to `force_reset_if_known_supported`
+                    // below — dead today (`PivSession::reset`'s doc explains why),
+                    // since the authenticated session above is what actually
+                    // satisfies `NeedsManagementAuth` here; threaded through anyway
+                    // so nothing here needs to change if the plain PIV-only RESET
+                    // ever grows its own use for it.
+                    s.force_reset_if_known_supported(current)?;
+                    println!("PIV application reset to factory defaults on {}.", serial);
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::DeleteCert {
@@ -6791,6 +7939,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             slot,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             yes,
         } => {
             if !yes {
@@ -6801,13 +7950,27 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.clear_certificate(slot.to_slot())?;
-            println!(
-                "Cleared the certificate in {} (the private key remains).",
-                slot.to_slot().label()
-            );
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    authenticate_piv(s, &mgmt)?;
+                    s.clear_certificate(slot.to_slot())?;
+                    println!(
+                        "Cleared the certificate in {} (the private key remains).",
+                        slot.to_slot().label()
+                    );
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::DeleteKey {
@@ -6815,7 +7978,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             slot,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
             yes,
+            force,
         } => {
             if !yes {
                 return Err(format!(
@@ -6825,13 +7990,30 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.delete_key(slot.to_slot())?;
-            println!(
-                "Deleted the private key in {} (the certificate object, if any, remains).",
-                slot.to_slot().label()
-            );
+            // Gate on the applet's fingerprint before authenticating — the
+            // fingerprint probe re-SELECTs PIV and would clear the auth.
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    guard_piv_feature(s, keyroost_piv::compat::PivExtension::DeleteKey, *force)?;
+                    authenticate_piv(s, &mgmt)?;
+                    s.delete_key(slot.to_slot())?;
+                    println!(
+                        "Deleted the private key in {} (the certificate object, if any, remains).",
+                        slot.to_slot().label()
+                    );
+                    Ok(())
+                },
+            )?;
         }
 
         PivCmd::MoveKey {
@@ -6840,16 +8022,33 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             mgmt_key_env,
             mgmt_key_stdin,
+            mgmt_key_default,
+            force,
         } => {
-            let mgmt = read_mgmt_key("management key", mgmt_key_env.as_deref(), *mgmt_key_stdin)?;
-            let mut s = open_piv_authed(reader.as_deref(), debug, &mgmt)?;
-            s.move_key(from.to_slot(), to.to_slot())?;
-            println!(
-                "moved the private key {} \u{2192} {}; the certificate remains in {}",
-                from.to_slot().label(),
-                to.to_slot().label(),
-                from.to_slot().label()
-            );
+            let name = resolve_piv_reader(reader.as_deref())?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    let mgmt = resolve_mgmt_key(
+                        "management key",
+                        mgmt_key_env.as_deref(),
+                        *mgmt_key_stdin,
+                        *mgmt_key_default,
+                        s,
+                    )?;
+                    guard_piv_feature(s, keyroost_piv::compat::PivExtension::MoveKey, *force)?;
+                    authenticate_piv(s, &mgmt)?;
+                    s.move_key(from.to_slot(), to.to_slot())?;
+                    println!(
+                        "moved the private key {} \u{2192} {}; the certificate remains in {}",
+                        from.to_slot().label(),
+                        to.to_slot().label(),
+                        from.to_slot().label()
+                    );
+                    Ok(())
+                },
+            )?;
         }
     }
     Ok(())
@@ -6870,29 +8069,36 @@ fn open_openpgp(
     Ok(session)
 }
 
-/// Open the PIV session on the reader matching `reader` (or the sole PIV reader).
-fn open_piv(
-    reader: Option<&str>,
-    debug: bool,
-) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
+/// Resolve the PIV reader to open — `reader` if given, else the sole PIV
+/// reader — and announce it on stderr. A `PivSession` can no longer be
+/// returned from a helper like the old `open_piv` did: it now lives inside
+/// one PC/SC transaction spanning the whole command, so every call site
+/// resolves the reader name here first, then opens the session itself via
+/// [`keyroost_transport::PivSession::with_transaction_traced`] (or
+/// [`keyroost_transport::PivSession::with_cached_transaction_traced`]),
+/// running the rest of the command inside that call's closure.
+fn resolve_piv_reader(reader: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let readers = keyroost_transport::PivSession::list_piv_readers()?;
     let by_name = reader_from_name()?;
     let name = resolve_reader(readers, reader.or(by_name.as_deref()), "PIV")?;
     eprintln!("\u{2192} PIV on {}", sanitize_terminal(&name));
-    let mut session = keyroost_transport::PivSession::open(&name)?;
-    session.set_debug(debug);
-    Ok(session)
+    Ok(name)
 }
 
-/// [`open_piv`], then authenticate the management key against the card's own
-/// algorithm — with a friendly wrong-length message *before* the card sees
-/// anything, instead of a bare transport error afterwards.
-fn open_piv_authed(
-    reader: Option<&str>,
-    debug: bool,
+/// Authenticate the management key on an already-open [`keyroost_transport::PivSession`] against
+/// the card's own algorithm — with a friendly wrong-length message *before*
+/// the card sees anything, instead of a bare transport error afterwards.
+///
+/// Every call site opens the plain session via
+/// [`keyroost_transport::PivSession::with_transaction_traced`] first, since
+/// resolving `--mgmt-key-default` (via [`resolve_mgmt_key`]) and feature
+/// gates like [`guard_piv_feature`] both need one already open — the latter's
+/// fingerprint probe re-SELECTs PIV and clears the auth state, so it must run
+/// before this, not after.
+fn authenticate_piv(
+    session: &mut keyroost_transport::PivSession<'_>,
     mgmt_key: &[u8],
-) -> Result<keyroost_transport::PivSession, Box<dyn std::error::Error>> {
-    let mut session = open_piv(reader, debug)?;
+) -> Result<(), Box<dyn std::error::Error>> {
     // Prefer GET METADATA; when the card stubs it out, probe every GENERAL
     // AUTHENTICATE P1 with a witness request and narrow by key length, rather
     // than blindly assuming 3DES.
@@ -6925,7 +8131,166 @@ fn open_piv_authed(
             })?,
     };
     session.authenticate_management(alg, mgmt_key)?;
-    Ok(session)
+    Ok(())
+}
+
+/// Apply the per-fingerprint known-support table ([`keyroost_piv::compat`]) to
+/// one of the Yubico vendor-extension operations before it runs, mirroring the
+/// GUI's three-way gate and reusing its exact wording
+/// ([`keyroost_piv::compat::PivExtension::requirement`] plus a state suffix):
+///
+/// * known-supported → run, no output;
+/// * unverified → warn `<requirement> <UNVERIFIED_SUFFIX>`, then run;
+/// * known-unsupported → fail with `<requirement> <INCOMPATIBLE_SUFFIX> Pass
+///   --force to run anyway.`; with `force`, downgrade that to the same kind of
+///   warning and run.
+///
+/// For [`keyroost_piv::compat::PivExtension::Reset`] specifically, the known-unsupported refusal
+/// also checks [`keyroost_piv::compat::PivExtension::ResetGlobal`] — the device-wide reset
+/// directive that takes PIV down with it alongside at least one other applet
+/// — and, if that resolves `Supported` or `Unverified`, appends a sentence
+/// pointing at `keyroostctl factory-reset` as the working alternative. This
+/// is the CLI counterpart of the PIV pane's "Factory reset supported →" link
+/// (`piv_reset_global_alternative_available` in the GUI), except the CLI also
+/// mentions the unverified case — a sentence can carry that nuance where a
+/// link either shows or doesn't.
+///
+/// Must be called on the session **before** management-key auth — it runs a
+/// fingerprint probe that re-SELECTs PIV.
+fn guard_piv_feature(
+    session: &mut keyroost_transport::PivSession<'_>,
+    extension: keyroost_piv::compat::PivExtension,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_piv::compat::{FeatureGate, PivExtension};
+    let needs = extension.requirement();
+    match session.feature_gate(extension) {
+        FeatureGate::Supported => {}
+        FeatureGate::Unverified => {
+            eprintln!("warning: {needs} {}", FeatureGate::UNVERIFIED_SUFFIX);
+        }
+        FeatureGate::Unsupported if force => {
+            eprintln!(
+                "warning: {needs} {} Running anyway because --force was given.",
+                FeatureGate::INCOMPATIBLE_SUFFIX
+            );
+        }
+        FeatureGate::Unsupported => {
+            let mut msg = format!(
+                "{needs} {} Pass --force to run anyway.",
+                FeatureGate::INCOMPATIBLE_SUFFIX
+            );
+            if extension == PivExtension::Reset {
+                if let Some(hint) = reset_global_alternative_hint(session) {
+                    msg.push(' ');
+                    msg.push_str(&hint);
+                }
+            }
+            return Err(msg.into());
+        }
+    }
+    Ok(())
+}
+
+/// When [`guard_piv_feature`] is about to refuse `PivExtension::Reset` as
+/// known-unsupported, checks whether `PivExtension::ResetGlobal` resolves
+/// `Supported` or `Unverified` on this same device and, if so, returns a
+/// sentence pointing at the whole-device `keyroostctl factory-reset` as a
+/// working alternative — `None` when `ResetGlobal` is itself known-unsupported,
+/// leaving nothing to redirect to.
+///
+/// Runs its own fingerprint probe (same cost as [`keyroost_transport::PivSession::feature_gate`]
+/// itself), so this is one more SELECT round trip — acceptable here since it
+/// only runs on the road to an error, never on a path that would otherwise
+/// succeed.
+fn reset_global_alternative_hint(
+    session: &mut keyroost_transport::PivSession<'_>,
+) -> Option<String> {
+    use keyroost_piv::compat::{FeatureGate, PivExtension};
+    match session.feature_gate(PivExtension::ResetGlobal) {
+        FeatureGate::Supported => Some(
+            "Its whole-device factory reset is supported, though — run \
+             `keyroostctl factory-reset` instead."
+                .to_string(),
+        ),
+        FeatureGate::Unverified => Some(
+            "Its whole-device factory reset is unverified but may work — run \
+             `keyroostctl factory-reset` instead."
+                .to_string(),
+        ),
+        FeatureGate::Unsupported => None,
+    }
+}
+
+/// Refuse one specific PIN/touch policy *value* the fingerprint/version
+/// quirk table ([`keyroost_piv::compat::PivQuirk`]) has flagged as
+/// unsupported even though the surrounding extension
+/// ([`keyroost_piv::compat::PivExtension::SlotPinPolicy`]/
+/// [`SlotTouchPolicy`](keyroost_piv::compat::PivExtension::SlotTouchPolicy))
+/// otherwise resolves fine — e.g. YubiKey firmware 4.0\u{2013}4.2 supports slot
+/// touch policy in general but rejects the specific `cached` value
+/// ([`keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported`]).
+/// Mirrors [`guard_piv_feature`]'s tone and `--force` override, but keys off a
+/// quirk rather than a [`keyroost_piv::compat::FeatureGate`], since this is about one option within
+/// an otherwise-supported extension, not the extension as a whole:
+///
+/// * `value_selected` is `false` (some other value was picked) → no-op,
+///   regardless of the quirk;
+/// * the quirk isn't present → no-op;
+/// * quirk present and selected → refuse with `--force` guidance, unless
+///   `force` is set, in which case warn and continue.
+///
+/// Must run before management-key auth for the same reason
+/// [`guard_piv_feature`] must: [`PivSession::quirks`] shares the cached
+/// fingerprint probe [`PivSession::feature_gate`] performs, and that probe
+/// re-SELECTs PIV.
+///
+/// [`PivSession::quirks`]: keyroost_transport::PivSession::quirks
+/// [`PivSession::feature_gate`]: keyroost_transport::PivSession::feature_gate
+fn guard_piv_policy_value(
+    session: &mut keyroost_transport::PivSession<'_>,
+    quirk: keyroost_piv::compat::PivQuirk,
+    value_selected: bool,
+    value_label: &str,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !value_selected || !session.quirks().contains(&quirk) {
+        return Ok(());
+    }
+    if force {
+        eprintln!(
+            "warning: {value_label} is known to be unsupported on this device. Running anyway \
+             because --force was given."
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "{value_label} is known to be unsupported on this device. Pass --force to run anyway."
+    )
+    .into())
+}
+
+/// Refuse early when `alg` can't produce a signature — currently just
+/// X25519, whose only card operation is ECDH key agreement (see
+/// [`keyroost_piv::x509::signature_hash`]). Issuing a certificate for such a
+/// key needs a different enrollment mechanism (CRMF/CMP-style, proving
+/// possession via key agreement rather than a signature), which keyroost
+/// doesn't implement. `piv self-sign` / `piv request-cert` call this as soon
+/// as the target algorithm is known — before any PIN/management-key prompt
+/// or card write — so a doomed request fails fast instead of after a touch
+/// prompt.
+fn guard_signable_alg(alg: keyroost_piv::KeyAlg) -> Result<(), Box<dyn std::error::Error>> {
+    keyroost_piv::x509::signature_hash(alg)
+        .map(|_| ())
+        .map_err(|_| {
+            format!(
+                "{} keys can't sign a certificate or certificate request \u{2014} that key type \
+                 only supports key agreement. keyroost doesn't implement the CRMF/CMP-style \
+                 enrollment such a key would need.",
+                alg.label()
+            )
+            .into()
+        })
 }
 
 /// The `--generate-key` convenience shared by `piv request-cert` / `piv
@@ -6935,7 +8300,7 @@ fn open_piv_authed(
 /// pubkey cache, so the CSR / self-signed certificate that follows finds the
 /// key without any `--load-pubkey`.
 fn inline_generate_key(
-    s: &mut keyroost_transport::PivSession,
+    s: &mut keyroost_transport::PivSession<'_>,
     slot: keyroost_piv::Slot,
     keygen: &InlineKeyGen,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -6974,6 +8339,55 @@ fn read_mgmt_key(
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
     let hex = read_secret(label, env, from_stdin)?;
     Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
+}
+
+/// Resolve a management-key credential from the three `--{prefix}env`/
+/// `--{prefix}stdin`/`--{prefix}default` flags a PIV command offers for it
+/// (`{prefix}` is [`env_prefix_for`]'s mapping for `label`, e.g. "management
+/// key" \u{2192} "mgmt-key-"). The first two are [`read_mgmt_key`], unchanged;
+/// `--{prefix}default` instead reaches for `session`'s well-known
+/// factory-default management key
+/// ([`keyroost_transport::PivSession::default_management_key`], which reads
+/// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`] off the
+/// session's already-resolved fingerprint) and fails with a clear message
+/// when keyroost has none on record for this device \u{2014} the same
+/// "no known default" signal that disables the GUI's "use default"
+/// convenience. `session` must already be open (and PIV selected) since
+/// resolving the default needs this device's fingerprint.
+fn resolve_mgmt_key(
+    label: &str,
+    env: Option<&str>,
+    from_stdin: bool,
+    use_default: bool,
+    session: &mut keyroost_transport::PivSession<'_>,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let prefix = env_prefix_for(label);
+    if use_default {
+        return session
+            .default_management_key()
+            .map(|key| zeroize::Zeroizing::new(key.to_vec()))
+            .ok_or_else(|| {
+                format!(
+                    "--{prefix}default: keyroost has no known factory-default {label} on \
+                     record for this device; pass --{prefix}env/--{prefix}stdin instead"
+                )
+                .into()
+            });
+    }
+    // read_secret's generic "no source" message only knows about --*-env/
+    // --*-stdin. When neither was supplied, add the --*-default hint too —
+    // but only if this device actually has a known factory-default on
+    // record (`session` is already open, so this is the same
+    // `default_management_key` check `--{prefix}default` itself would use);
+    // otherwise the hint would send the caller toward a flag that just fails
+    // with "no known factory-default" right after.
+    if env.is_none() && !from_stdin && session.default_management_key().is_some() {
+        return Err(format!(
+            "no source for {label}: pass --{prefix}env VAR or --{prefix}stdin or --{prefix}default"
+        )
+        .into());
+    }
+    read_mgmt_key(label, env, from_stdin)
 }
 
 /// Write `data` to `path` with owner-only permissions (0600) on Unix, failing
@@ -9768,6 +11182,169 @@ mod cli_tests {
     }
 
     #[test]
+    fn factory_reset_global_reset_credential_flags_parse_and_are_optional() {
+        // Absent by default -- most devices never need a management-key
+        // credential for PIV's reset at all.
+        match parse(&["keyroostctl", "factory-reset", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::FactoryReset {
+                mgmt_key_env,
+                mgmt_key_stdin,
+                pin_env,
+                pin_stdin,
+                ..
+            }) => {
+                assert_eq!(mgmt_key_env, None);
+                assert!(!mgmt_key_stdin);
+                assert_eq!(pin_env, None);
+                assert!(!pin_stdin);
+            }
+            _ => panic!("expected factory-reset"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::FactoryReset { mgmt_key_env, .. }) => {
+                assert_eq!(mgmt_key_env.as_deref(), Some("XAUTH"))
+            }
+            _ => panic!("expected factory-reset"),
+        }
+        match parse(&["keyroostctl", "factory-reset", "--yes", "--pin-env", "GPIN"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::FactoryReset { pin_env, .. }) => {
+                assert_eq!(pin_env.as_deref(), Some("GPIN"))
+            }
+            _ => panic!("expected factory-reset"),
+        }
+    }
+
+    #[test]
+    fn resolve_reset_cli_auth_errors_when_nothing_was_passed() {
+        // No `Debug` on `ResetCliAuth` (it carries secret material — same
+        // reason the GUI's analogous `PivMgmtAuth` skips it too), so match
+        // rather than `.expect_err()`.
+        use keyroost_piv::compat::FeatureGate;
+        match resolve_reset_cli_auth(
+            None,
+            false,
+            false,
+            None,
+            false,
+            FeatureGate::Unsupported,
+            None,
+        ) {
+            Ok(_) => panic!("no credential source was given"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("--mgmt-key-env"), "{msg}");
+                assert!(msg.contains("--mgmt-key-default"), "{msg}");
+                assert!(!msg.contains("--pin-env"), "{msg}");
+            }
+        }
+        match resolve_reset_cli_auth(
+            None,
+            false,
+            false,
+            None,
+            false,
+            FeatureGate::Supported,
+            None,
+        ) {
+            Ok(_) => panic!("no credential source was given"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("--mgmt-key-env"), "{msg}");
+                assert!(msg.contains("--pin-env"), "{msg}");
+                assert!(!msg.contains("unverified"), "{msg}");
+            }
+        }
+        match resolve_reset_cli_auth(
+            None,
+            false,
+            false,
+            None,
+            false,
+            FeatureGate::Unverified,
+            None,
+        ) {
+            Ok(_) => panic!("no credential source was given"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("--mgmt-key-env"), "{msg}");
+                assert!(msg.contains("--pin-env"), "{msg}");
+                assert!(msg.contains("unverified"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn factory_reset_global_reset_credential_flags_are_mutually_exclusive() {
+        // Any two of the five (mgmt-key-env/mgmt-key-stdin/mgmt-key-default/
+        // pin-env/pin-stdin) at once must refuse -- only one credential
+        // source at a time.
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+            "--pin-env",
+            "GPIN",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-stdin",
+            "--pin-stdin",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--mgmt-key-env",
+            "XAUTH",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--pin-stdin",
+        ])
+        .is_err());
+        match parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key-default",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::FactoryReset {
+                mgmt_key_default, ..
+            }) => assert!(mgmt_key_default),
+            _ => panic!("expected factory-reset"),
+        }
+    }
+
+    #[test]
     fn oath_add_positional_name_does_not_hijack_device_selector() {
         // Regression: a subcommand's `name` arg must not be consumed as the
         // global device selector. That happened when the global selector shared
@@ -10267,10 +11844,14 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::MoveKey { from, to, .. },
+                cmd: PivCmd::MoveKey {
+                    from, to, force, ..
+                },
             }) => {
                 assert_eq!(from.to_slot().key_ref(), 0x9D);
                 assert_eq!(to.to_slot().key_ref(), 0x82);
+                // --force is opt-in; absent here.
+                assert!(!force);
             }
             _ => panic!("expected piv move-key"),
         }
@@ -10317,6 +11898,169 @@ mod cli_tests {
     }
 
     #[test]
+    fn piv_key_ops_take_force_flag() {
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "move-key",
+            "--from",
+            "9d",
+            "--to",
+            "82",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::MoveKey { force, .. },
+            }) => assert!(force),
+            _ => panic!("expected piv move-key"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "delete-key",
+            "--slot",
+            "9a",
+            "--yes",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::DeleteKey { force, yes, .. },
+            }) => {
+                assert!(force);
+                assert!(yes);
+            }
+            _ => panic!("expected piv delete-key"),
+        }
+        match parse(&["keyroostctl", "piv", "reset", "--yes", "--force"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset { force, yes, .. },
+            }) => {
+                assert!(force);
+                assert!(yes);
+            }
+            _ => panic!("expected piv reset"),
+        }
+    }
+
+    #[test]
+    fn piv_reset_credential_flags_parse_and_are_optional() {
+        // Absent by default -- most devices' RESET never needs a
+        // management-key credential at all.
+        match parse(&["keyroostctl", "piv", "reset", "--yes"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::Reset {
+                        mgmt_key_env,
+                        mgmt_key_stdin,
+                        pin_env,
+                        pin_stdin,
+                        ..
+                    },
+            }) => {
+                assert_eq!(mgmt_key_env, None);
+                assert!(!mgmt_key_stdin);
+                assert_eq!(pin_env, None);
+                assert!(!pin_stdin);
+            }
+            _ => panic!("expected piv reset"),
+        }
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset { mgmt_key_env, .. },
+            }) => assert_eq!(mgmt_key_env.as_deref(), Some("XAUTH")),
+            _ => panic!("expected piv reset"),
+        }
+        match parse(&["keyroostctl", "piv", "reset", "--yes", "--pin-env", "GPIN"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset { pin_env, .. },
+            }) => assert_eq!(pin_env.as_deref(), Some("GPIN")),
+            _ => panic!("expected piv reset"),
+        }
+    }
+
+    #[test]
+    fn piv_reset_credential_flags_are_mutually_exclusive() {
+        // Any two of the five (mgmt-key-env/mgmt-key-stdin/mgmt-key-default/
+        // pin-env/pin-stdin) at once must refuse -- only one credential
+        // source at a time.
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-env",
+            "XAUTH",
+            "--pin-env",
+            "GPIN",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-stdin",
+            "--pin-stdin",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--mgmt-key-stdin",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key-default",
+            "--pin-env",
+            "GPIN",
+        ])
+        .is_err());
+        match parse(&["keyroostctl", "piv", "reset", "--yes", "--mgmt-key-default"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Piv {
+                cmd: PivCmd::Reset {
+                    mgmt_key_default, ..
+                },
+            }) => assert!(mgmt_key_default),
+            _ => panic!("expected piv reset"),
+        }
+    }
+
+    #[test]
     fn piv_generate_key_policies_default_to_the_plain_piv_wire_format() {
         // Omitting both flags must decode to Default/Default — the byte layer
         // then leaves the 0xAA/0xAB policy tags out of the APDU entirely, the
@@ -10332,11 +12076,13 @@ mod cli_tests {
                     PivCmd::GenerateKey {
                         pin_policy,
                         touch_policy,
+                        force,
                         ..
                     },
             }) => {
                 assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Default);
                 assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Default);
+                assert!(!force);
             }
             _ => panic!("expected piv generate-key"),
         }
@@ -10352,6 +12098,7 @@ mod cli_tests {
             "once",
             "--touch-policy",
             "cached",
+            "--force",
         ])
         .unwrap()
         .command
@@ -10361,11 +12108,13 @@ mod cli_tests {
                     PivCmd::GenerateKey {
                         pin_policy,
                         touch_policy,
+                        force,
                         ..
                     },
             }) => {
                 assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Once);
                 assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Cached);
+                assert!(force);
             }
             _ => panic!("expected piv generate-key"),
         }
@@ -10489,16 +12238,25 @@ mod cli_tests {
 
     #[test]
     fn piv_new_chuid_default_days_matches_self_sign() {
-        // `new-chuid --days` and `self-sign --days` are two separate clap
-        // literal defaults (365 each) — pin them equal so a future change to
-        // one doesn't silently drift from the other.
-        let chuid_days = match parse(&["keyroostctl", "piv", "new-chuid"]).unwrap().command {
+        // Neither command's `--days`/`--months`/`--years` defaults via clap
+        // anymore (all three are `Option<u32>`, left `None` when omitted so
+        // `ValidFor::resolve` can tell "explicitly given" from "defaulted");
+        // pin the parsed triples equal across both commands so a future
+        // change to one doesn't silently drift from the other, and pin
+        // `ValidFor::resolve`'s shared default to 1 year.
+        let chuid = match parse(&["keyroostctl", "piv", "new-chuid"]).unwrap().command {
             Some(Cmd::Piv {
-                cmd: PivCmd::NewChuid { days, .. },
-            }) => days,
+                cmd:
+                    PivCmd::NewChuid {
+                        days,
+                        months,
+                        years,
+                        ..
+                    },
+            }) => (days, months, years),
             _ => panic!("expected piv new-chuid"),
         };
-        let cert_days = match parse(&[
+        let cert = match parse(&[
             "keyroostctl",
             "piv",
             "self-sign",
@@ -10511,11 +12269,67 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::SelfSign { days, .. },
-            }) => days,
+                cmd:
+                    PivCmd::SelfSign {
+                        days,
+                        months,
+                        years,
+                        ..
+                    },
+            }) => (days, months, years),
             _ => panic!("expected piv self-sign"),
         };
-        assert_eq!(chuid_days, cert_days);
+        assert_eq!(chuid, cert);
+        assert_eq!(chuid, (None, None, None));
+        assert_eq!(
+            ValidFor::resolve(chuid.0, chuid.1, chuid.2),
+            ValidFor {
+                years: 1,
+                months: 0,
+                days: 0
+            }
+        );
+    }
+
+    #[test]
+    fn piv_self_sign_days_months_years_combine_and_sum() {
+        // `--years 1 --days 5` is not rejected as a conflict; it resolves to
+        // both counts at once.
+        let (days, months, years) = match parse(&[
+            "keyroostctl",
+            "piv",
+            "self-sign",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--years",
+            "1",
+            "--days",
+            "5",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Piv {
+                cmd:
+                    PivCmd::SelfSign {
+                        days,
+                        months,
+                        years,
+                        ..
+                    },
+            }) => (days, months, years),
+            _ => panic!("expected piv self-sign"),
+        };
+        assert_eq!(
+            ValidFor::resolve(days, months, years),
+            ValidFor {
+                years: 1,
+                months: 0,
+                days: 5
+            }
+        );
     }
 
     #[test]
@@ -10529,6 +12343,64 @@ mod cli_tests {
         let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
         let err = check_valid_days(max + 1).unwrap_err();
         assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn check_valid_months_accepts_the_default_and_the_actual_ceiling() {
+        assert!(check_valid_months(12).is_ok());
+        assert!(check_valid_months(keyroost_piv::max_valid_months(u64::from(unix_now()))).is_ok());
+    }
+
+    #[test]
+    fn check_valid_months_rejects_one_past_the_ceiling() {
+        let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
+        let err = check_valid_months(max + 1).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn check_valid_years_accepts_the_default_and_the_actual_ceiling() {
+        assert!(check_valid_years(1).is_ok());
+        assert!(check_valid_years(keyroost_piv::max_valid_years(u64::from(unix_now()))).is_ok());
+    }
+
+    #[test]
+    fn check_valid_years_rejects_one_past_the_ceiling() {
+        let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
+        let err = check_valid_years(max + 1).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn valid_for_check_rejects_an_all_zero_period() {
+        assert!(ValidFor {
+            years: 0,
+            months: 0,
+            days: 0
+        }
+        .check()
+        .is_err());
+        // Explicitly passing `--days 0` (nothing else) also resolves to an
+        // all-zero period, and must be rejected the same way.
+        assert!(ValidFor::resolve(Some(0), None, None).check().is_err());
+    }
+
+    /// `guard_signable_alg` is the early-exit `piv self-sign` / `piv
+    /// request-cert` call before any PIN/management-key prompt or card
+    /// write: every signing-capable algorithm passes, and X25519 — the one
+    /// key-agreement-only algorithm keyroost supports — is rejected with a
+    /// message naming the key type, mirroring
+    /// `keyroost_piv::x509::signature_hash`'s own verdict exactly.
+    #[test]
+    fn guard_signable_alg_rejects_only_x25519() {
+        use keyroost_piv::KeyAlg;
+        for alg in KeyAlg::ALL {
+            let guard_ok = guard_signable_alg(alg).is_ok();
+            let x509_ok = keyroost_piv::x509::signature_hash(alg).is_ok();
+            assert_eq!(guard_ok, x509_ok, "mismatch for {alg:?}");
+        }
+        let err = guard_signable_alg(KeyAlg::X25519).unwrap_err();
+        assert!(err.to_string().contains("X25519"));
     }
 
     #[test]
@@ -10657,7 +12529,7 @@ mod cli_tests {
     fn piv_status_json_serializes() {
         let p = json_out::PivStatusJson {
             version: Some("5.4.3".into()),
-            serial: Some(12345678),
+            serial: Some("12345678".into()),
             pin_retries: Some(3),
             chuid: Some(json_out::PivChuidJson {
                 fasc_n: "d4e739da...".into(),
@@ -10672,8 +12544,23 @@ mod cli_tests {
                 cert_len: 800,
                 cert_unreadable: None,
             }],
+            applet_fingerprint: "YubiKey".into(),
+            applet_name: "YubiKey".into(),
+            version_firmware: Some("3.35.0".into()),
         };
-        assert_json_has_keys(&p, &["version", "serial", "pin_retries", "chuid", "slots"]);
+        assert_json_has_keys(
+            &p,
+            &[
+                "version",
+                "serial",
+                "pin_retries",
+                "chuid",
+                "slots",
+                "applet_fingerprint",
+                "applet_name",
+                "version_firmware",
+            ],
+        );
     }
 
     #[test]

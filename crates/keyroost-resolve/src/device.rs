@@ -660,8 +660,21 @@ pub fn enumerate() -> Result<Vec<Device>, String> {
 pub enum ResetStep {
     Oath,
     OpenPgp,
-    Piv,
     Token2Otp,
+    /// Resetting the PIV applet — `keyroost_transport::PivSession::
+    /// factory_reset` decides on its own, from a live fingerprint, exactly
+    /// which mechanism this ends up running: a PIV-only reset (several
+    /// shapes, `keyroost_transport::FactoryResetPlan`), or a device-wide one
+    /// (`keyroost_piv::compat::PivExtension::ResetGlobal` — today: HID
+    /// Crescendo's RESET CARD against its ACA instance, taking at least one
+    /// other applet down with PIV). Placed right before [`Self::Fido`],
+    /// not with the other card applets above: unlike them, whether this step
+    /// belongs in the plan *at all* needs that same live fingerprint —
+    /// `factory_reset` refuses outright when neither mechanism is available —
+    /// so a caller that has fingerprinted and found neither should remove it
+    /// with [`exclude_unresettable_piv`] before running the plan, the same
+    /// way [`Self::Fido`] always stays last regardless.
+    Piv,
     Fido,
 }
 
@@ -681,14 +694,19 @@ impl ResetStep {
 
 /// Ordered factory-reset steps for a key with these capabilities. Card
 /// applets first (silent wipes), FIDO last (its reset needs a replug +
-/// touch ceremony, so it ends the flow). Only applets the key advertises
-/// appear. Pure — the single source of truth both the CLI and GUI consume,
-/// so they can never disagree about what "everything" means.
+/// touch ceremony, so it ends the flow); [`ResetStep::Piv`] sits immediately
+/// before FIDO rather than alongside the other card applets — see that
+/// variant's doc for why. Only applets the key advertises appear. Pure — the
+/// single source of truth both the CLI and GUI consume, so they can never
+/// disagree about what "everything" means.
 ///
 /// Callers pass [`Device::caps`], the *offered* set, so an unverified
 /// capability (see [`CapState::Unverified`]) gets its reset step too:
 /// unverified always behaves as "offer it", and the attempt itself reports
-/// whether the applet is really there.
+/// whether the applet is really there. [`ResetStep::Piv`] is the one
+/// exception this doesn't itself resolve: `Caps::PIV` says the applet is
+/// there, not that it can be reset at all — call
+/// [`exclude_unresettable_piv`] once a live fingerprint confirms it can't.
 pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     let mut steps = Vec::new();
     if caps.has(Caps::OATH) {
@@ -697,11 +715,11 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     if caps.has(Caps::PGP) {
         steps.push(ResetStep::OpenPgp);
     }
-    if caps.has(Caps::PIV) {
-        steps.push(ResetStep::Piv);
-    }
     if caps.has(Caps::OTP) {
         steps.push(ResetStep::Token2Otp);
+    }
+    if caps.has(Caps::PIV) {
+        steps.push(ResetStep::Piv);
     }
     if caps.has(Caps::FIDO2) {
         steps.push(ResetStep::Fido);
@@ -709,17 +727,75 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     steps
 }
 
+/// Remove [`ResetStep::Piv`] from an already-built [`factory_reset_plan`]
+/// result — call once a live fingerprint
+/// (`keyroost_transport::PivSession::preview_factory_reset` resolving
+/// `keyroost_transport::PivResetPreview::Unsupported`) confirms neither
+/// `keyroost_piv::compat::PivExtension::Reset` nor `PivExtension::
+/// ResetGlobal` is available, so a factory reset never shows the applet in
+/// its confirmation dialog, nor attempts it, for a device that was never
+/// going to accept any reset mechanism.
+///
+/// Separate from `factory_reset_plan` itself on purpose: that function is
+/// pure and caps-only, but whether PIV can be reset at all needs a live
+/// fingerprint that only a caller holding an open session can have. A
+/// no-op if the plan doesn't contain [`ResetStep::Piv`] to begin with (e.g.
+/// `Caps::PIV` wasn't set).
+pub fn exclude_unresettable_piv(plan: &mut Vec<ResetStep>) {
+    plan.retain(|s| *s != ResetStep::Piv);
+}
+
+/// The step name to show for a [`StepOutcome::WipedGlobal`] report line,
+/// naming the whole device rather than just [`ResetStep::Piv`] — see that
+/// variant's doc for why. Shared between the CLI and GUI so the two never
+/// drift on the wording.
+pub const PIV_GLOBAL_RESET_LABEL: &str = "Whole device (via PIV)";
+
 /// The outcome of one reset step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     /// The applet was reset to factory state.
     Wiped,
+    /// Wiped, but via a device-wide reset mechanism that took at least one
+    /// other applet down with it, not a mechanism confined to this one
+    /// applet — so a report line naming only this step's applet (`PIV`)
+    /// undersells what actually happened. Callers that only care whether the
+    /// wipe itself happened should treat this the same as `Wiped`; callers
+    /// building a *label* for the step should use [`PIV_GLOBAL_RESET_LABEL`]
+    /// instead of [`ResetStep::label`]. Today's one producer: PIV's
+    /// `PivExtension::ResetGlobal` path succeeding cleanly
+    /// (`keyroost_transport::FactoryResetOutcome::WipedGlobal`).
+    WipedGlobal,
+    /// The applet *was* reset to factory state, but a non-fatal follow-up
+    /// step afterward failed; the string describes what went wrong and what
+    /// to do about it. The applet itself isn't left in its old state —
+    /// unlike `Failed`, a caller that only cares whether the wipe itself
+    /// happened (pane re-initialisation, a plain wiped/not-wiped count)
+    /// should treat this the same as `Wiped` — but the follow-up failure is
+    /// real and still needs surfacing on its own, the same way `Failed`
+    /// does. Today's one producer: PIV's device-wide reset mechanism, when
+    /// RESET CARD succeeds but restoring the courtesy XAUTH-key factory
+    /// default afterward fails
+    /// (`keyroost_transport::FactoryResetOutcome::WipedKeyRestoreFailed`).
+    WipedWithWarning(String),
     /// The reset was attempted and failed; the string is the reason.
     Failed(String),
-    /// The step was not run (applet not present) — reserved for callers that
-    /// build a full report over all step kinds; `factory_reset_plan` simply
-    /// omits absent applets.
-    Skipped,
+    /// The step was never attempted; the string says why. `factory_reset_plan`
+    /// itself only *offers* a step when its applet is present (an absent
+    /// applet is simply omitted, not reported `Skipped`) — this variant is for
+    /// a step that *was* offered but the runner decided, once it had live
+    /// device data a `Caps`-only plan can't see, not to touch it. Today's one
+    /// producer: the PIV step, when `keyroost_transport::PivSession::
+    /// factory_reset` refuses before attempting anything —
+    /// `keyroost_piv::compat::PivExtension::Reset` and `ResetGlobal` both
+    /// known-unsupported (`exclude_unresettable_piv` should normally have
+    /// dropped the step already; this is the fallback for when the earlier
+    /// fingerprint that decision relied on couldn't be taken and the plan
+    /// still offered it), or `PivQuirk::ResetNeedsManagementAuth` applying
+    /// with no credential supplied — either way, better to say so plainly
+    /// than to either silently omit the applet or burn its PIN/PUK for a
+    /// RESET that was never going to be accepted.
+    Skipped(String),
 }
 
 /// One line of a factory-reset report: which applet, and how it went.
@@ -1951,8 +2027,8 @@ mod plan_tests {
             vec![
                 ResetStep::Oath,
                 ResetStep::OpenPgp,
-                ResetStep::Piv,
                 ResetStep::Token2Otp,
+                ResetStep::Piv,
                 ResetStep::Fido,
             ]
         );
@@ -1976,6 +2052,34 @@ mod plan_tests {
             Vec::<ResetStep>::new()
         );
         assert_eq!(factory_reset_plan(Caps::default()), Vec::<ResetStep>::new());
+    }
+
+    #[test]
+    fn piv_sits_immediately_before_fido_not_with_the_other_card_applets() {
+        let plan = factory_reset_plan(caps(&[
+            Caps::OATH,
+            Caps::PGP,
+            Caps::PIV,
+            Caps::OTP,
+            Caps::FIDO2,
+        ]));
+        let piv_idx = plan.iter().position(|s| *s == ResetStep::Piv).unwrap();
+        assert_eq!(plan[piv_idx + 1], ResetStep::Fido);
+    }
+
+    #[test]
+    fn exclude_unresettable_piv_removes_just_the_piv_step() {
+        let mut plan = factory_reset_plan(caps(&[Caps::OATH, Caps::PIV, Caps::FIDO2]));
+        exclude_unresettable_piv(&mut plan);
+        assert_eq!(plan, vec![ResetStep::Oath, ResetStep::Fido]);
+    }
+
+    #[test]
+    fn exclude_unresettable_piv_is_a_no_op_without_a_piv_step() {
+        let mut plan = factory_reset_plan(caps(&[Caps::OATH, Caps::FIDO2]));
+        let before = plan.clone();
+        exclude_unresettable_piv(&mut plan);
+        assert_eq!(plan, before);
     }
 
     #[test]

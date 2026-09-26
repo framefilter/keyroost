@@ -13,11 +13,11 @@
 //!
 //! Supported per operation:
 //!
-//! | operation   | RSA | P-256 | P-384 | Ed25519 | X25519 |
-//! |-------------|-----|-------|-------|---------|--------|
-//! | [`SelfTest::Decrypt`]  | ✔ |   |   |   |   |
-//! | [`SelfTest::KeyAgree`] |   | ✔ | ✔ |   | ✔ |
-//! | [`SelfTest::Sign`]     | ✔ | ✔ | ✔ | ✔ |   |
+//! | operation   | RSA | P-256 | P-384 | P-521 | Ed25519 | X25519 |
+//! |-------------|-----|-------|-------|-------|---------|--------|
+//! | [`SelfTest::Decrypt`]  | ✔ |   |   |   |   |   |
+//! | [`SelfTest::KeyAgree`] |   | ✔ | ✔ | ✔ |   | ✔ |
+//! | [`SelfTest::Sign`]     | ✔ | ✔ | ✔ | ✔ | ✔ |   |
 
 #![forbid(unsafe_code)]
 
@@ -26,7 +26,7 @@ mod data;
 use core::fmt;
 
 use data::{ec_scalar, DECRYPT_PLAINTEXT, SHA512_DIGESTINFO_PREFIX, TEST_INPUT};
-// `elliptic_curve` is shared by p256 and p384; one import covers both curves.
+// `elliptic_curve` is shared by p256, p384, and p521; one import covers all three curves.
 pub use keyroost_piv::{KeyAlg, PublicKey};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -36,7 +36,7 @@ pub enum SelfTest {
     /// RSA: PKCS#1 v1.5-encrypt a known string to the slot's public key, have
     /// the card decrypt it, check the plaintext comes back.
     Decrypt,
-    /// ECDH (P-256 / P-384 / X25519): agree a shared secret two ways — the
+    /// ECDH (P-256 / P-384 / P-521 / X25519): agree a shared secret two ways — the
     /// card's private key against a fixed peer public key, and this host's
     /// fixed peer private key against the slot's public key — and check they
     /// match.
@@ -83,8 +83,16 @@ pub fn supports(op: SelfTest, alg: KeyAlg) -> bool {
     );
     match op {
         SelfTest::Decrypt => rsa,
-        SelfTest::KeyAgree => matches!(alg, KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::X25519),
-        SelfTest::Sign => rsa || matches!(alg, KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::Ed25519),
+        SelfTest::KeyAgree => matches!(
+            alg,
+            KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 | KeyAlg::X25519
+        ),
+        SelfTest::Sign => {
+            rsa || matches!(
+                alg,
+                KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 | KeyAlg::Ed25519
+            )
+        }
     }
 }
 
@@ -189,6 +197,7 @@ enum Verifier {
 enum EcCurve {
     P256,
     P384,
+    P521,
 }
 
 /// Build the challenge for `op` against a slot holding `(alg, pubkey)`, where
@@ -295,6 +304,24 @@ fn prepare_key_agree(alg: KeyAlg, pubkey: &PublicKey) -> Result<Challenge, TestE
                 secret.raw_secret_bytes().to_vec(),
             )
         }
+        KeyAlg::EccP521 => {
+            // p521 is on a newer major `elliptic-curve` than p256/p384 (no
+            // 0.13-series release of it exists), so its SEC1-encoding trait
+            // is `ToSec1Point`/`to_sec1_point`, not the `ToEncodedPoint`/
+            // `to_encoded_point` the top-of-file import covers for the other
+            // two curves — imported locally rather than at module scope so
+            // it doesn't collide with (or get mistaken for) that one.
+            use p521::elliptic_curve::sec1::ToSec1Point;
+            let our = p521::PublicKey::from_sec1_bytes(point)
+                .map_err(|_| TestError::BadPublicKey("malformed P-521 public point"))?;
+            let their = p521::SecretKey::from_slice(&ec_scalar::<66>(true))
+                .map_err(|_| TestError::BadPublicKey("derived P-521 scalar out of range"))?;
+            let secret = p521::ecdh::diffie_hellman(their.to_nonzero_scalar(), our.as_affine());
+            (
+                their.public_key().to_sec1_point(false).as_bytes().to_vec(),
+                secret.raw_secret_bytes().to_vec(),
+            )
+        }
         KeyAlg::X25519 => {
             let our: [u8; 32] = point
                 .try_into()
@@ -347,11 +374,17 @@ fn prepare_sign(alg: KeyAlg, pubkey: &PublicKey) -> Result<Challenge, TestError>
                 },
             })
         }
-        KeyAlg::EccP256 | KeyAlg::EccP384 => {
+        KeyAlg::EccP256 | KeyAlg::EccP384 | KeyAlg::EccP521 => {
             let point = ecc_point(pubkey)?;
+            // Digest length is SHA-256/384 for P-256/384 (matching the curve's
+            // own field size), and SHA-512 for P-521 (64 bytes — shorter than
+            // the 66-byte field, per the conventional NIST/PIV pairing;
+            // `keyroost_piv::x509::SigHash::Sha512` uses the same digest for
+            // the same reason).
             let (curve, digest_len) = match alg {
                 KeyAlg::EccP256 => (EcCurve::P256, 32usize),
-                _ => (EcCurve::P384, 48usize),
+                KeyAlg::EccP384 => (EcCurve::P384, 48usize),
+                _ => (EcCurve::P521, 64usize),
             };
             // Validate the point up front so a bad cert fails at prepare time.
             match curve {
@@ -362,6 +395,10 @@ fn prepare_sign(alg: KeyAlg, pubkey: &PublicKey) -> Result<Challenge, TestError>
                 EcCurve::P384 => {
                     p384::ecdsa::VerifyingKey::from_sec1_bytes(point)
                         .map_err(|_| TestError::BadPublicKey("malformed P-384 public point"))?;
+                }
+                EcCurve::P521 => {
+                    p521::ecdsa::VerifyingKey::from_sec1_bytes(point)
+                        .map_err(|_| TestError::BadPublicKey("malformed P-521 public point"))?;
                 }
             }
             Ok(Challenge {
@@ -427,6 +464,15 @@ fn verify_ecdsa(
             let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(point)
                 .map_err(|_| TestError::BadPublicKey("malformed P-384 public point"))?;
             let s = p384::ecdsa::Signature::from_der(sig)
+                .map_err(|_| TestError::CardReply("ECDSA signature is not valid DER"))?;
+            vk.verify_prehash(digest, &s)
+                .map_err(|_| TestError::Mismatch(SelfTest::Sign))
+        }
+        EcCurve::P521 => {
+            use p521::ecdsa::signature::hazmat::PrehashVerifier;
+            let vk = p521::ecdsa::VerifyingKey::from_sec1_bytes(point)
+                .map_err(|_| TestError::BadPublicKey("malformed P-521 public point"))?;
+            let s = p521::ecdsa::Signature::from_der(sig)
                 .map_err(|_| TestError::CardReply("ECDSA signature is not valid DER"))?;
             vk.verify_prehash(digest, &s)
                 .map_err(|_| TestError::Mismatch(SelfTest::Sign))

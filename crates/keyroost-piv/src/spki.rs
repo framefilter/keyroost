@@ -97,6 +97,7 @@ const OID_RSA_ENCRYPTION: &[u8] = &[
 const OID_EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
 const OID_P256: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 const OID_P384: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22];
+const OID_P521: &[u8] = &[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23];
 const OID_ED25519: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x70];
 const OID_X25519: &[u8] = &[0x06, 0x03, 0x2B, 0x65, 0x6E];
 const DER_NULL: &[u8] = &[0x05, 0x00];
@@ -115,6 +116,7 @@ pub fn subject_public_key_info(key: &PublicKey, alg: KeyAlg) -> Result<Vec<u8>, 
         }
         (PublicKey::Ecc { point }, KeyAlg::EccP256) => Ok(ec_spki(OID_P256, point)),
         (PublicKey::Ecc { point }, KeyAlg::EccP384) => Ok(ec_spki(OID_P384, point)),
+        (PublicKey::Ecc { point }, KeyAlg::EccP521) => Ok(ec_spki(OID_P521, point)),
         (PublicKey::Ecc { point }, KeyAlg::Ed25519) => Ok(eddsa_spki(OID_ED25519, point)),
         (PublicKey::Ecc { point }, KeyAlg::X25519) => Ok(eddsa_spki(OID_X25519, point)),
         _ => Err(SpkiError::KeyTypeMismatch),
@@ -264,6 +266,30 @@ mod tests {
             .any(|w| w == OID_EC_PUBLIC_KEY));
         // the uncompressed point appears verbatim
         assert!(der.windows(point.len()).any(|w| w == point.as_slice()));
+    }
+
+    #[test]
+    fn ec_p521_spki_contains_curve_oid_and_point() {
+        let point = {
+            let mut p = vec![0x04];
+            p.extend(std::iter::repeat_n(0xAB, 132));
+            p
+        };
+        let der = subject_public_key_info(
+            &PublicKey::Ecc {
+                point: point.clone(),
+            },
+            KeyAlg::EccP521,
+        )
+        .unwrap();
+        assert!(der.windows(OID_P521.len()).any(|w| w == OID_P521));
+        assert!(der
+            .windows(OID_EC_PUBLIC_KEY.len())
+            .any(|w| w == OID_EC_PUBLIC_KEY));
+        // the uncompressed point appears verbatim
+        assert!(der.windows(point.len()).any(|w| w == point.as_slice()));
+        // P-521's OID arc (0x23) must not be confused with P-384's (0x22).
+        assert!(!der.windows(OID_P384.len()).any(|w| w == OID_P384));
     }
 
     #[test]

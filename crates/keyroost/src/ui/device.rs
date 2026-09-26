@@ -7,7 +7,7 @@
 pub use keyroost_resolve::{enumerate, CapState, Caps, Device, DeviceId, DeviceKind};
 
 /// Which capability pane is showing for the selected device.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CapTab {
     #[default]
     Overview,

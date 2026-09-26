@@ -425,23 +425,10 @@ const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
 const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
 const OID_P256: &str = "1.2.840.10045.3.1.7";
 const OID_P384: &str = "1.3.132.0.34";
+const OID_P521: &str = "1.3.132.0.35";
 const OID_ED25519: &str = "1.3.101.112";
 const OID_X25519: &str = "1.3.101.110";
 
-/// Parse the key algorithm out of a certificate's `SubjectPublicKeyInfo`.
-///
-/// This is independent of GET METADATA (the Yubico extension `PivSession`
-/// otherwise reads the algorithm from, available on firmware 5.3+ only): a
-/// certificate is a mandatory PIV data object on any PIV card, so a caller
-/// that already has the cert bytes (e.g. for its Subject DN) can recover the
-/// algorithm from them too, with no extra card round-trip and no firmware- or
-/// vendor-dependent extension involved.
-///
-/// Returns `Ok(None)` — not an error — for a key type this reader doesn't
-/// recognize (an OID/parameter combination outside PIV's `KeyAlg` set, or an
-/// RSA modulus whose bit length doesn't land on one of PIV's four sizes): an
-/// unusual certificate shouldn't stop the caller from displaying whatever
-/// else (e.g. the Subject DN) it already parsed.
 /// The whole DER encoding of a `Certificate`'s `subjectPublicKeyInfo`
 /// `SEQUENCE` (tag, length, and content), by walking `Certificate ::= SEQUENCE
 /// { tbsCertificate, signatureAlgorithm, signature }` into `tbsCertificate`
@@ -471,6 +458,20 @@ fn certificate_spki(cert_der: &[u8]) -> Result<&[u8], X509ParseError> {
     Ok(&rest[..rest.len() - after_spki.len()])
 }
 
+/// Parse the key algorithm out of a certificate's `SubjectPublicKeyInfo`.
+///
+/// This is independent of GET METADATA (the Yubico extension `PivSession`
+/// otherwise reads the algorithm from, available on firmware 5.3+ only): a
+/// certificate is a mandatory PIV data object on any PIV card, so a caller
+/// that already has the cert bytes (e.g. for its Subject DN) can recover the
+/// algorithm from them too, with no extra card round-trip and no firmware- or
+/// vendor-dependent extension involved.
+///
+/// Returns `Ok(None)` — not an error — for a key type this reader doesn't
+/// recognize (an OID/parameter combination outside PIV's `KeyAlg` set, or an
+/// RSA modulus whose bit length doesn't land on one of PIV's four sizes): an
+/// unusual certificate shouldn't stop the caller from displaying whatever
+/// else (e.g. the Subject DN) it already parsed.
 pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseError> {
     let spki = certificate_spki(cert_der)?;
     // subjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
@@ -495,6 +496,7 @@ pub fn parse_key_algorithm(cert_der: &[u8]) -> Result<Option<KeyAlg>, X509ParseE
             Ok(match curve_oid.as_str() {
                 OID_P256 => Some(KeyAlg::EccP256),
                 OID_P384 => Some(KeyAlg::EccP384),
+                OID_P521 => Some(KeyAlg::EccP521),
                 _ => None,
             })
         }
@@ -561,7 +563,16 @@ fn strip_der_uint_sign_guard(content: &[u8]) -> &[u8] {
 /// signals corruption in whatever stored it, not a merely-unusual key.
 pub fn parse_subject_public_key_info(der: &[u8]) -> Result<(KeyAlg, PublicKey), X509ParseError> {
     let (spki, _) = expect_tag(der, 0x30)?;
-    let (alg_id, after_alg_id) = expect_tag(spki.content, 0x30)?;
+    parse_spki_content(spki.content)
+}
+
+/// Shared TLV decoding behind [`parse_subject_public_key_info`] and
+/// [`parse_certificate_public_key`]: `content` is a `SubjectPublicKeyInfo`
+/// `SEQUENCE`'s content (algorithm `AlgorithmIdentifier` + `subjectPublicKey`
+/// BIT STRING), already peeled of its own outer tag/length by each caller's
+/// own route to it (bare SPKI DER vs. a full certificate's `tbsCertificate`).
+fn parse_spki_content(content: &[u8]) -> Result<(KeyAlg, PublicKey), X509ParseError> {
+    let (alg_id, after_alg_id) = expect_tag(content, 0x30)?;
     let (spk, _) = expect_tag(after_alg_id, 0x03)?;
     let (oid_tlv, params) = expect_tag(alg_id.content, 0x06)?;
     let oid = decode_oid(oid_tlv.content).ok_or(X509ParseError::Malformed)?;
@@ -589,6 +600,7 @@ pub fn parse_subject_public_key_info(der: &[u8]) -> Result<(KeyAlg, PublicKey), 
             let alg = match curve_oid.as_str() {
                 OID_P256 => KeyAlg::EccP256,
                 OID_P384 => KeyAlg::EccP384,
+                OID_P521 => KeyAlg::EccP521,
                 _ => return Err(X509ParseError::Malformed),
             };
             Ok((
@@ -619,6 +631,12 @@ pub fn parse_subject_public_key_info(der: &[u8]) -> Result<(KeyAlg, PublicKey), 
 /// [`parse_subject_public_key_info`] recovers. Unlike `parse_key_algorithm`
 /// this errors (rather than `Ok(None)`) on an unrecognised key type: a caller
 /// that needs the key bytes has nothing to do with a key it can't read.
+///
+/// Also used for comparing an imported certificate's key against a slot's own
+/// reported public key (`PivSession::slot_key`) before writing it — an error
+/// here gives a caller nothing to compare against for a certificate whose key
+/// this reader doesn't understand, which callers should treat as "can't
+/// verify" rather than "mismatch confirmed".
 ///
 /// # Errors
 /// [`X509ParseError`] on a malformed certificate or a public-key OID/curve
@@ -951,6 +969,12 @@ mod tests {
                 },
             ),
             (
+                crate::KeyAlg::EccP521,
+                PublicKey::Ecc {
+                    point: ec_point(133),
+                },
+            ),
+            (
                 crate::KeyAlg::Ed25519,
                 PublicKey::Ecc {
                     point: ed_point.clone(),
@@ -971,6 +995,28 @@ mod tests {
             assert_eq!(
                 parse_key_algorithm(&cert),
                 Ok(Some(*alg)),
+                "round-trip mismatch for {:?}",
+                alg
+            );
+        }
+    }
+
+    /// Round-trip every `KeyAlg` through [`crate::spki::subject_public_key_info`]
+    /// and [`parse_certificate_public_key`] — the certificate-shaped
+    /// counterpart of `subject_public_key_info_round_trips_every_alg` below,
+    /// checking the full `(KeyAlg, PublicKey)` (not just the algorithm, unlike
+    /// `key_algorithm_round_trips_every_alg` above) comes back byte-identical
+    /// out of a whole `Certificate`, not just a bare SPKI. This is the
+    /// comparison `PivSession::import_certificate` relies on to catch a
+    /// certificate whose key doesn't match the slot it's about to land in.
+    #[test]
+    fn certificate_public_key_round_trips_every_alg() {
+        for (alg, key) in &round_trip_cases() {
+            let spki = crate::spki::subject_public_key_info(key, *alg).unwrap();
+            let cert = build_cert_with_spki(&spki);
+            assert_eq!(
+                parse_certificate_public_key(&cert),
+                Ok((*alg, key.clone())),
                 "round-trip mismatch for {:?}",
                 alg
             );

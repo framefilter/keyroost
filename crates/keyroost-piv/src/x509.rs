@@ -12,7 +12,7 @@
 //! Scope is deliberately narrow: subjects limited to the common attributes
 //! (CN/O/OU/C/L/ST), v3 certificates without extensions, one signature
 //! algorithm per key type (SHA-256 for RSA and P-256, SHA-384 for P-384,
-//! pure Ed25519). X25519 cannot sign and is rejected.
+//! SHA-512 for P-521, pure Ed25519). X25519 cannot sign and is rejected.
 
 use crate::spki::{der_bitstring, der_seq, der_tlv, der_uint, pem};
 use crate::KeyAlg;
@@ -50,6 +50,7 @@ impl std::error::Error for X509Error {}
 pub enum SigHash {
     Sha256,
     Sha384,
+    Sha512,
     /// Ed25519: pass the raw to-be-signed bytes to the card unhashed.
     None,
 }
@@ -62,6 +63,7 @@ pub fn signature_hash(alg: KeyAlg) -> Result<SigHash, X509Error> {
         }
         KeyAlg::EccP256 => Ok(SigHash::Sha256),
         KeyAlg::EccP384 => Ok(SigHash::Sha384),
+        KeyAlg::EccP521 => Ok(SigHash::Sha512),
         KeyAlg::Ed25519 => Ok(SigHash::None),
         KeyAlg::X25519 => Err(X509Error::UnsupportedAlgorithm),
     }
@@ -82,6 +84,10 @@ pub fn signature_algorithm(alg: KeyAlg) -> Result<&'static [u8], X509Error> {
         // ecdsa-with-SHA384 (1.2.840.10045.4.3.3), params absent.
         KeyAlg::EccP384 => Ok(&[
             0x30, 0x0A, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03,
+        ]),
+        // ecdsa-with-SHA512 (1.2.840.10045.4.3.4), params absent.
+        KeyAlg::EccP521 => Ok(&[
+            0x30, 0x0A, 0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04,
         ]),
         // id-Ed25519 (1.3.101.112), params absent.
         KeyAlg::Ed25519 => Ok(&[0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70]),
@@ -185,7 +191,7 @@ impl SubjectName {
 /// [`crate::chuid_expiration_in_days`] clamps to, so a CHUID and a
 /// certificate's validity period saturate at the identical date.
 fn max_der_time_unix_secs() -> i64 {
-    crate::days_from_civil(crate::MAX_EXPIRATION_YEAR, 12, 31) * 86_400 + 86_399
+    crate::max_expiration_unix_secs()
 }
 
 /// `Time` per RFC 5280: UTCTime (`YYMMDDHHMMSSZ`) for dates through 2049,
@@ -454,6 +460,7 @@ mod tests {
     fn signature_metadata() {
         assert_eq!(signature_hash(KeyAlg::Rsa2048), Ok(SigHash::Sha256));
         assert_eq!(signature_hash(KeyAlg::EccP384), Ok(SigHash::Sha384));
+        assert_eq!(signature_hash(KeyAlg::EccP521), Ok(SigHash::Sha512));
         assert_eq!(signature_hash(KeyAlg::Ed25519), Ok(SigHash::None));
         assert_eq!(
             signature_hash(KeyAlg::X25519),

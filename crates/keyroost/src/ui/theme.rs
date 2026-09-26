@@ -190,6 +190,20 @@ impl Palette {
         v.window_corner_radius = CornerRadius::same(14);
         v.window_stroke = Stroke::new(1.0, self.line);
         ctx.set_visuals(v);
+        // Solid (space-reserving) scroll bars everywhere, not just wherever a
+        // pane happens to opt in locally. egui's default "floating" bars
+        // reserve no layout space and instead grow their own hit-rect on
+        // hover (`floating_width` -> the wider `bar_width`), overlapping
+        // whatever is drawn underneath; the underlying widget and the bar then
+        // fight over hover each frame the pointer sits on that boundary,
+        // which reads as a rapidly flickering scrollbar (and, short of that,
+        // can clip the last pixels of whatever the bar sits on top of). A
+        // `ui.spacing_mut()` override only reaches that one `Ui` and its
+        // children — it can't fix a `ComboBox`/menu popup, since `Popup`
+        // always rebuilds its content `Ui` from this ambient context style
+        // rather than inheriting the caller's local one. Setting it here,
+        // once, for both themes, is what actually reaches every dropdown.
+        ctx.all_styles_mut(|s| s.spacing.scroll = egui::style::ScrollStyle::solid());
     }
 }
 
@@ -392,6 +406,55 @@ pub fn button(ui: &mut egui::Ui, p: &Palette, kind: BtnKind, label: &str) -> Res
     painter.galley(rect.center() - galley.size() * 0.5, galley, fg);
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// A visibly disabled sibling of [`button`]: same footprint and rounded shape,
+/// painted muted, with no hover-lift, no pressed state, and no click sense — but
+/// it still senses hover, so the caller can hang an `.on_hover_text(…)` that
+/// says why the action is unavailable. Prefer this over hiding a control the
+/// user should still know is there.
+pub fn button_disabled(ui: &mut egui::Ui, p: &Palette, label: &str) -> Response {
+    let fg = p.txt3;
+    let font = f_sb(13.0);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, fg);
+    let pad_x = 14.0;
+    let size = egui::vec2(galley.size().x + pad_x * 2.0, 32.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(8),
+        tint(p.raised2, 90),
+        Stroke::new(1.0, p.line_soft),
+        StrokeKind::Inside,
+    );
+    let galley = painter.layout_no_wrap(label.to_owned(), f_sb(13.0), fg);
+    painter.galley(rect.center() - galley.size() * 0.5, galley, fg);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+    }
+    resp
+}
+
+/// A small ⚠ glyph in the warning colour that senses hover, so the caller can
+/// hang an `.on_hover_text(…)` on the returned [`Response`]. For flagging a
+/// control that stays usable but carries a caveat — e.g. a non-standard
+/// command whose support on the connected device is unverified — next to
+/// [`button`] rather than dimming it with [`button_disabled`].
+pub fn warn_marker(ui: &mut egui::Ui, p: &Palette) -> Response {
+    let resp = ui.add(
+        egui::Label::new(
+            egui::RichText::new("\u{26A0}")
+                .font(f_sb(13.0))
+                .color(p.warn),
+        )
+        .sense(egui::Sense::hover()),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Help);
     }
     resp
 }

@@ -35,6 +35,11 @@ use zeroize::Zeroizing;
 /// serial number — but [`select`] addresses the applet with this 6-byte prefix.
 pub const AID_PREFIX: [u8; 6] = [0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
 
+/// OpenPGP manufacturer ID assigned to Token2 (bytes 8..10 of the AID). Its
+/// applets report the AID serial in BCD coding, so a caller that recognises
+/// this ID must BCD-decode the serial rather than read it as a plain integer.
+pub const MANUFACTURER_ID_TOKEN2: u16 = 0x0011;
+
 /// The 2-byte manufacturer ID (big-endian) from an OpenPGP card AID, i.e.
 /// bytes 8..10 of `D2 76 00 01 24 01 <version:2> <manufacturer:2>
 /// <serial:4> 00 00`. `None` when `aid` doesn't begin with [`AID_PREFIX`] or
@@ -70,7 +75,7 @@ pub fn manufacturer_name(id: u16) -> Option<&'static str> {
         0x000E => "Excelsecu",
         0x000F => "Nitrokey",
         0x0010 => "NeoPGP",
-        0x0011 => "Token2",
+        MANUFACTURER_ID_TOKEN2 => "Token2",
         0x002A => "Magrathea",
         0x0042 => "GnuPG e.V.",
         0x1337 => "Warsaw Hackerspace",

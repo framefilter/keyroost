@@ -518,8 +518,10 @@ pub fn read_serial_request() -> Vec<u8> {
     build_apdu(cmd::READ_SERIAL_INS, &payload)
 }
 
-/// Parse the serial-number response (spec §6.10): `D1 len ascii_hex...`. The SN
-/// is double-encoded — ASCII-hex characters the host then hex-decodes to bytes.
+/// Parse the FIDO applet's serial-number response (spec §6.10): `D1 len
+/// ascii_hex...`. The SN is double-encoded — ASCII-hex characters the host
+/// then hex-decodes to bytes. The OTP applet answers the same request with a
+/// differently-encoded reply; see [`parse_otp_serial`].
 pub fn parse_serial(data: &[u8]) -> Result<Vec<u8>, ParseError> {
     if data.len() < 2 || data[0] != 0xD1 {
         return Err(ParseError::Truncated);
@@ -527,6 +529,25 @@ pub fn parse_serial(data: &[u8]) -> Result<Vec<u8>, ParseError> {
     let sn_len = data[1] as usize;
     let hex = data.get(2..2 + sn_len).ok_or(ParseError::Truncated)?;
     decode_ascii_hex(hex)
+}
+
+/// Parse the OTP applet's serial-number response to the same
+/// [`read_serial_request`]: `D1 len ascii...`, but — unlike the FIDO applet's
+/// [`parse_serial`] — the `len` bytes are *not* ASCII-hex of a further-encoded
+/// binary value; they're the serial itself, printed as plain ASCII decimal
+/// digits (observed: a 14-character reply). Returns it as a `u128` — leading
+/// zeros are not preserved, same tradeoff `crate::decode_bcd_serial`-style
+/// callers already accept elsewhere for a device serial.
+pub fn parse_otp_serial(data: &[u8]) -> Result<u128, ParseError> {
+    if data.len() < 2 || data[0] != 0xD1 {
+        return Err(ParseError::Truncated);
+    }
+    let sn_len = data[1] as usize;
+    let ascii = data.get(2..2 + sn_len).ok_or(ParseError::Truncated)?;
+    let text =
+        std::str::from_utf8(ascii).map_err(|_| ParseError::Malformed("serial is not ASCII"))?;
+    text.parse::<u128>()
+        .map_err(|_| ParseError::Malformed("serial is not a decimal number"))
 }
 
 /// Decode an even-length ASCII-hex byte slice (spec §6.10 SN field).
@@ -893,6 +914,36 @@ mod tests {
             parse_serial(&resp).unwrap(),
             vec![0x12, 0x34, 0x56, 0x78, 0x90]
         );
+    }
+
+    #[test]
+    fn otp_serial_reads_plain_ascii_decimal_not_ascii_hex() {
+        // Same D1/len framing as the FIDO applet's reply, but the 14 bytes are
+        // the serial itself in plain ASCII decimal — not a further ASCII-hex
+        // encoding of a binary value the way `parse_serial` expects. Reusing
+        // `parse_serial`'s hex-decode on this would silently halve the digit
+        // count and produce a different number entirely (the bug this
+        // dedicated parser fixes).
+        let serial = b"01000000123456";
+        let mut resp = vec![0xD1, serial.len() as u8];
+        resp.extend_from_slice(serial);
+        assert_eq!(parse_otp_serial(&resp), Ok(1_000_000_123_456));
+
+        // Leading zeros in the ASCII text don't error, just aren't preserved
+        // in the returned integer (same tradeoff as the BCD-serial decoders
+        // elsewhere in the workspace).
+        assert_eq!(
+            parse_otp_serial(&resp).unwrap().to_string(),
+            "1000000123456"
+        );
+
+        // Non-decimal ASCII: rejected rather than silently misparsed.
+        let mut bad = vec![0xD1, 0x03];
+        bad.extend_from_slice(b"12x");
+        assert!(parse_otp_serial(&bad).is_err());
+
+        // Truncated reply: rejected, not out-of-bounds.
+        assert!(parse_otp_serial(&[0xD1, 0x05, b'1', b'2']).is_err());
     }
 
     #[test]

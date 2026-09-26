@@ -142,6 +142,24 @@ fn key_agree_round_trips_p384() {
 }
 
 #[test]
+fn key_agree_round_trips_p521() {
+    // See `prepare_key_agree`'s `KeyAlg::EccP521` arm on why this needs its
+    // own SEC1-encoding trait import.
+    use p521::elliptic_curve::sec1::ToSec1Point;
+    let card = p521::SecretKey::from_slice(&card_scalar::<66>()).unwrap();
+    let pubkey = PublicKey::Ecc {
+        point: card.public_key().to_sec1_point(false).as_bytes().to_vec(),
+    };
+    let ch = prepare(SelfTest::KeyAgree, KeyAlg::EccP521, &pubkey).unwrap();
+    let their = p521::PublicKey::from_sec1_bytes(&ch.card_input).unwrap();
+    let reply = p521::ecdh::diffie_hellman(card.to_nonzero_scalar(), their.as_affine())
+        .raw_secret_bytes()
+        .to_vec();
+    ch.verify(&reply).unwrap();
+    assert!(ch.verify(&reply[..reply.len() - 1]).is_err());
+}
+
+#[test]
 fn key_agree_round_trips_x25519() {
     let card_scalar = card_scalar::<32>();
     let pubkey = PublicKey::Ecc {
@@ -199,6 +217,25 @@ fn sign_round_trips_p384() {
 }
 
 #[test]
+fn sign_round_trips_p521() {
+    use p521::ecdsa::signature::hazmat::PrehashSigner;
+    let sk = p521::ecdsa::SigningKey::from_slice(&card_scalar::<66>()).unwrap();
+    let pubkey = PublicKey::Ecc {
+        point: sk.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
+    };
+    let ch = prepare(SelfTest::Sign, KeyAlg::EccP521, &pubkey).unwrap();
+    let sig: p521::ecdsa::Signature = sk.sign_prehash(&ch.card_input).unwrap();
+    ch.verify(sig.to_der().as_bytes()).unwrap();
+
+    // A signature over a different digest is well-formed DER but must not verify.
+    let other: p521::ecdsa::Signature = sk.sign_prehash(&[0x11; 64]).unwrap();
+    assert!(matches!(
+        ch.verify(other.to_der().as_bytes()),
+        Err(TestError::Mismatch(_))
+    ));
+}
+
+#[test]
 fn sign_round_trips_ed25519() {
     use ed25519_dalek::Signer;
     let sk = ed25519_dalek::SigningKey::from_bytes(&card_scalar::<32>());
@@ -222,10 +259,13 @@ fn supports_matrix() {
     assert!(supports(SelfTest::Decrypt, KeyAlg::Rsa2048));
     assert!(!supports(SelfTest::Decrypt, KeyAlg::EccP256));
     assert!(supports(SelfTest::KeyAgree, KeyAlg::EccP384));
+    assert!(supports(SelfTest::KeyAgree, KeyAlg::EccP521));
     assert!(supports(SelfTest::KeyAgree, KeyAlg::X25519));
     assert!(!supports(SelfTest::KeyAgree, KeyAlg::Ed25519));
+    assert!(supports(SelfTest::Sign, KeyAlg::EccP521));
     assert!(supports(SelfTest::Sign, KeyAlg::Ed25519));
     assert!(!supports(SelfTest::Sign, KeyAlg::X25519));
+    assert!(!supports(SelfTest::Decrypt, KeyAlg::EccP521));
 }
 
 #[test]

@@ -18,10 +18,14 @@ keyroost-piv = { path = "../keyroost-piv", version = "0.10.0" }
 # constants (see `data.rs`); this crate pulls in NO RNG. `rsa`/`p256` are
 # already in the workspace tree; `p384` / `ed25519-dalek` / `x25519-dalek`
 # were added for this feature (the user asked for those algorithms), and the
-# two dalek crates share one `curve25519-dalek` subtree.
+# two dalek crates share one `curve25519-dalek` subtree. `p521` (a separate
+# RustCrypto crate, not a `p384` feature — NIST curves each get their own
+# crate in that family) was added for EccP521; same `ecdh` feature, same
+# default-on `ecdsa` feature as `p384`.
 rsa = "0.9"
 p256 = { version = "0.13", features = ["ecdh"] }
 p384 = { version = "0.13", features = ["ecdh"] }
+p521 = { version = "0.14", features = ["ecdh"] }
 ed25519-dalek = "2"
 x25519-dalek = "2"
 zeroize = "1"

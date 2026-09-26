@@ -819,18 +819,195 @@ fn fido_settings_available(info: Option<&AuthenticatorInfo>) -> bool {
     info.is_some_and(|i| i.versions.iter().any(|v| v.starts_with("FIDO_2_")))
 }
 
+/// What `App::start_factory_reset_confirm` learned about the selected
+/// device's PIV step before arming the confirm dialog — resolved one step
+/// ahead of the dialog itself (fingerprinted the moment "Factory reset…" is
+/// pressed, not deferred to when the reset actually runs), so
+/// `factory_reset_confirm_summary` can describe exactly what that step will
+/// do instead of hedging across every possibility. Mirrors
+/// `keyroost_transport::PivResetPreview`, the same verdict the reset itself
+/// resolves when it runs (`PivSession::factory_reset`, inside
+/// `run_card_reset_step`) — fingerprinted again there rather than threaded
+/// through from here: the two calls are only ever seconds apart and
+/// `preview_factory_reset` costs no PIN/PUK attempt, so a fresh re-check is
+/// cheap and can't go stale the way carrying this value forward could (the
+/// confirm dialog can sit open for a while, or the key can be swapped and
+/// swapped back — see `render_factory_reset_confirm`'s KEY-008 guard).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FactoryResetPivPreview {
+    /// The device's plan has no PIV step — nothing to fingerprint.
+    NotOffered,
+    /// The fingerprint attempt itself failed (no PC/SC reader for PIV,
+    /// `PivSession::open` error, …) — the summary falls back to generic
+    /// wording rather than blocking the whole confirm dialog on a
+    /// diagnostic step's own failure.
+    CheckFailed,
+    /// The live verdict — `Unsupported` means neither reset mechanism is
+    /// available, so `App::start_factory_reset_confirm` doesn't even plan a
+    /// PIV step for this device (`keyroost_resolve::exclude_unresettable_piv`);
+    /// `factory_reset_confirm_summary` never actually renders this variant's
+    /// own text as a result (its `if plan.contains(&ResetStep::Piv)` guard
+    /// skips the whole block), but it's still tracked here rather than
+    /// folded into `NotOffered`/`CheckFailed` — those mean "nothing to say",
+    /// this means "there was something to fingerprint, and the answer was
+    /// no".
+    Resolved(keyroost_transport::PivResetPreview),
+}
+
+/// Whether `piv_preview` says PIV can't be reset at all —
+/// `App::render_factory_reset_confirm`/`App::run_factory_reset_gui` both
+/// exclude [`keyroost_resolve::ResetStep::Piv`]
+/// (`keyroost_resolve::exclude_unresettable_piv`) from the plan they rebuild
+/// when this is true, rather than offering (or attempting) a step
+/// `PivSession::factory_reset` would only refuse.
+#[must_use]
+fn factory_reset_piv_unresettable(preview: FactoryResetPivPreview) -> bool {
+    matches!(
+        preview,
+        FactoryResetPivPreview::Resolved(keyroost_transport::PivResetPreview::Unsupported)
+    )
+}
+
+/// State for the armed factory-reset confirm dialog: which device it's for
+/// (KEY-008 — the dialog dies the instant the selection changes; see
+/// `render_factory_reset_confirm`) and what's known about that device's PIV
+/// step (see `FactoryResetPivPreview`).
+#[derive(Clone)]
+struct FactoryResetConfirmState {
+    for_device: DeviceId,
+    piv_preview: FactoryResetPivPreview,
+    /// Whether `keyroost_transport::PivSession::global_reset_available`
+    /// resolved true for this device: either `PivExtension::Reset` or
+    /// `PivExtension::ResetGlobal` resolves something other than
+    /// `Unsupported` (`Supported` or `Unverified`), *and*
+    /// `PivQuirk::ResetNeedsManagementAuth` is set — today: every HID
+    /// Crescendo fingerprint, C2300/C4000/Generic alike (see that method's
+    /// doc for why `Generic` needs the OR, not just `ResetGlobal ==
+    /// Supported`). The credential need this reflects comes from the quirk
+    /// alone, not specifically from `ResetGlobal` — when true, the dialog
+    /// shows the credential prompt (`App::factory_reset_mgmt_auth_field`)
+    /// and `factory_reset_confirm_summary` says a credential is needed,
+    /// regardless of which extension is the reason. Does **not** by itself
+    /// decide whether `PivSession::factory_reset` ends up running the
+    /// device-wide mechanism or the PIV-only one — `piv_preview` already
+    /// carries that (see `FactoryResetPivPreview::Resolved`), so this crate
+    /// doesn't track `reset_global_gate` separately any more.
+    needs_reset_mgmt_auth: bool,
+    /// This device's well-known factory-default management-key bytes, from
+    /// the same fingerprint job that resolved `piv_preview`/
+    /// `needs_reset_mgmt_auth`
+    /// (`keyroost_transport::PivSession::default_management_key`). `None`
+    /// when keyroost has no known default for this fingerprint/version —
+    /// the same signal `App::piv_modal_mgmt_field` uses to disable its "Use
+    /// default management key" checkbox rather than offer one that might be
+    /// wrong. `App::factory_reset_mgmt_auth_field` mirrors that: disables
+    /// the checkbox and shows the hex value in a tooltip only when this is
+    /// `Some`.
+    default_mgmt_key: Option<&'static [u8]>,
+    /// [`keyroost_piv::compat::PivQuirk::ResetLongRunning`], from the same
+    /// fingerprint job that resolved `piv_preview`/`needs_reset_mgmt_auth`/
+    /// `default_mgmt_key` — `false` whenever that job never ran or never
+    /// completed (`NotOffered`/`CheckFailed`), same as the other two fields
+    /// default to their "nothing learned" value in those cases.
+    /// `factory_reset_confirm_summary` appends
+    /// [`keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT`] to the
+    /// PIV note when this is set, same wording the PIV pane's "Reset applet"
+    /// card and `keyroostctl piv reset` already show.
+    reset_long_running: bool,
+}
+
+/// How the factory-reset confirm dialog's reset management-auth credential
+/// prompt is currently resolved — the same three-way shape as
+/// [`PivMgmtAuthMode`] (a typed field, a "use the well-known default"
+/// convenience, or a PIN), kept as its own type because the credential
+/// itself is a different one: whatever
+/// [`keyroost_transport::PivSession::default_management_key`] resolves for
+/// *this reset*, not necessarily the same value
+/// [`PivMgmtAuthMode::Default`] resolves for a already-unlocked session's
+/// other management operations (e.g. Generate Key) — the two happen to
+/// coincide on HID Crescendo today (its only known default is its ACA
+/// XAUTH key either way — see
+/// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`]'s doc), but
+/// nothing here assumes that holds for a future fingerprint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ResetMgmtAuthMode {
+    /// Neither toggle ticked: `App::reset_mgmt_auth_input` holds a typed
+    /// management-key hex string.
+    #[default]
+    Manual,
+    /// "Use default management key":
+    /// `FactoryResetConfirmState::default_mgmt_key`, resolved for the
+    /// specific device this dialog is armed for.
+    Default,
+    /// "Use PIN": the ACA instance's own VERIFY PIN — not the standard PIV
+    /// application PIN [`PivMgmtAuthMode::Pin`] means.
+    Pin,
+}
+
+/// [`piv_mgmt_mode_after_toggle`]'s twin for [`ResetMgmtAuthMode`] — same
+/// rule, different type: `mode_if_checked` if the click checked the box,
+/// [`ResetMgmtAuthMode::Manual`] if it unchecked it, regardless of what
+/// the mode held before.
+#[must_use]
+fn reset_mgmt_auth_mode_after_toggle(
+    checked: bool,
+    mode_if_checked: ResetMgmtAuthMode,
+) -> ResetMgmtAuthMode {
+    if checked {
+        mode_if_checked
+    } else {
+        ResetMgmtAuthMode::Manual
+    }
+}
+
+/// How the user authorized `PivSession::factory_reset`'s credential, when
+/// `PivQuirk::ResetNeedsManagementAuth` means one is needed — the
+/// factory-default management key, a typed management key, or a PIN for the
+/// ACA's own VERIFY PIN reference (today's only real consumer of any of the
+/// three is HID Crescendo's device-wide mechanism; a plain PIV reset needing
+/// this same quirk would take the same shape, just via the standard PIV
+/// management-key round instead — see `PivSession::factory_reset`'s doc).
+/// Produced by `App::reset_mgmt_current_auth`, consumed by
+/// `run_card_reset_step`'s `Piv` branch. Mirrors [`PivMgmtAuth`]'s shape for
+/// the same reason that type exists — a single resolved form both the
+/// dialog's validation and the worker job's actual call convert into
+/// `keyroost_transport::CurrentMgmtAuth` the same way.
+enum ResetMgmtAuth {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Pin(zeroize::Zeroizing<String>),
+}
+
 /// The confirmation body for the Factory reset modal: what key, and exactly
 /// which applets get wiped, with the two ceremonies that aren't a plain wipe
-/// spelled out (PIV blocks its PIN+PUK first; FIDO needs a replug + touch).
+/// spelled out (PIV's actual precondition, per `piv_preview`; FIDO needs a
+/// replug + touch).
 fn factory_reset_confirm_summary(
     serial: &str,
     model: &str,
     plan: &[keyroost_resolve::ResetStep],
+    piv_preview: FactoryResetPivPreview,
+    needs_management_auth: bool,
+    reset_long_running: bool,
 ) -> String {
     use keyroost_resolve::ResetStep;
+    use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+    // `PivExtension::ResetGlobal` resolving `Supported` or `Unverified`
+    // (`PivResetPreview::Global`) means the PIV step, if it runs, will take
+    // at least one other applet down with it — the same device-wide
+    // mechanism `StepOutcome::WipedGlobal` names post-hoc with
+    // `PIV_GLOBAL_RESET_LABEL` once the reset has actually happened. Name it
+    // the same way here, ahead of time, rather than letting the confirm
+    // dialog undersell the PIV step as a bare "PIV".
+    let piv_is_global = matches!(
+        piv_preview,
+        FactoryResetPivPreview::Resolved(PivResetPreview::Global)
+    );
     let applets = plan
         .iter()
-        .map(|s| s.label())
+        .map(|s| match s {
+            ResetStep::Piv if piv_is_global => keyroost_resolve::PIV_GLOBAL_RESET_LABEL,
+            s => s.label(),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let mut msg = format!(
@@ -839,15 +1016,104 @@ fn factory_reset_confirm_summary(
          comes back in factory condition, ready to set up again."
     );
     if plan.contains(&ResetStep::Piv) {
-        // Don't promise the key "stays fully usable": the PIV path blocks the
-        // PIN and PUK on purpose, so a wipe that stops between the blocking and
-        // the RESET leaves that applet locked. The step report says which.
-        msg.push_str(
-            "\n\nPIV: the PIN and PUK are intentionally blocked, then the applet \
-             is wiped (the standard reset path). If the wipe stops after the \
-             blocking, PIV stays locked until a reset finishes \u{2014} the report \
-             below the button says what state it's in.",
-        );
+        // Don't promise the key "stays fully usable" in the
+        // `BurnPinPukThenReset` case: PIN/PUK are blocked on purpose there, so
+        // a wipe that stops between the blocking and the RESET leaves PIV
+        // locked until a reset finishes.
+        let piv_note = match piv_preview {
+            // Shouldn't happen — `start_factory_reset_confirm` always
+            // fingerprints when the plan offers PIV — but fails into the same
+            // wording `CheckFailed` gets rather than claim something about a
+            // step that was never actually fingerprinted.
+            FactoryResetPivPreview::NotOffered | FactoryResetPivPreview::CheckFailed => {
+                "\n\nPIV: keyroost couldn't confirm this device's RESET support \
+                 ahead of time. It will still attempt the standard path (block the \
+                 PIN and PUK, then wipe) \u{2014} the report below the button says \
+                 what actually happened."
+            }
+            // Unreachable via normal flow: `start_factory_reset_confirm`
+            // drops `ResetStep::Piv` from the plan entirely whenever
+            // `preview_factory_reset` resolves this (`exclude_unresettable_piv`),
+            // so this whole block never runs for it. Kept for exhaustiveness
+            // — empty string is the safe fallback if it's ever reached anyway
+            // (e.g. a plan built before a fresh fingerprint changed the
+            // answer).
+            FactoryResetPivPreview::Resolved(PivResetPreview::Unsupported) => "",
+            // The device-wide mechanism will run — nothing special to caveat
+            // here: PIV just gets wiped along with the plan's other applets,
+            // same as `BurnPinPukThenReset` below promises for the PIV-only
+            // path, without that path's own PIN/PUK-blocking caveat (this
+            // mechanism never touches either counter). The credential
+            // sentence below covers the one thing worth calling out, when
+            // the quirk applies.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global) => "",
+            // Also unreachable via normal flow, same reasoning as the
+            // top-level `Unsupported` arm above — `preview_factory_reset` maps
+            // `FactoryResetPlan::Unsupported` to the outer `PivResetPreview::
+            // Unsupported`, never to `Piv(Unsupported)`.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::Unsupported,
+            )) => "",
+            // Unlike `BurnPinPukThenReset` below, this authenticates once,
+            // then sends RESET — a clean, atomic pass/fail with no
+            // partial-blocking state the step report could reveal, so this
+            // doesn't point at it the way the burn case does. The credential
+            // sentence below (always shown alongside this arm, since
+            // `NeedsManagementAuth` only resolves when the quirk applies)
+            // says where the credential it authenticates with comes from.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::NeedsManagementAuth,
+            )) => {
+                "\n\nPIV: this device resets via an authenticated management-key \
+                 session \u{2014} keyroost authenticates with the credential \
+                 entered below, then wipes."
+            }
+            // Also atomic, same reasoning as `NeedsManagementAuth` above: the
+            // bare RESET attempt this case sends never touches the PIN or PUK
+            // either, so it either wipes PIV outright or leaves it exactly as
+            // it was — nothing partial for the step report to disambiguate.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::Unverified,
+            )) => {
+                "\n\nPIV: RESET support on this device is unverified. keyroost will \
+                 attempt it without blocking the PIN and PUK first \u{2014} consult \
+                 this device's own documentation for any precondition (commonly: \
+                 the PIN and PUK both already blocked) and complete it manually if \
+                 the attempt fails."
+            }
+            // The one case that isn't atomic: burning the PIN, then the PUK,
+            // then sending RESET is three separate steps, and a failure
+            // between any of them leaves PIV in a partial state this text
+            // alone can't describe — hence pointing at the step report, unlike
+            // every other case above.
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )) => {
+                "\n\nPIV: the PIN and PUK are intentionally blocked, then the applet \
+                 is wiped (the standard reset path). If the wipe stops after the \
+                 blocking, PIV stays locked until a reset finishes \u{2014} the \
+                 report below the button says what state it's in."
+            }
+        };
+        msg.push_str(piv_note);
+        // `needs_management_auth` is `PivSession::global_reset_available`'s
+        // boolean — `PivQuirk::ResetNeedsManagementAuth` applying, ANDed
+        // with either `PivExtension::Reset` or `PivExtension::ResetGlobal`
+        // not being a confirmed dead end. Whichever mechanism `piv_preview`
+        // says will actually run (`Global` or `Piv(NeedsManagementAuth)`),
+        // this same credential is what it needs, entered in the same field
+        // (`App::factory_reset_mgmt_auth_field`) — so one sentence covers
+        // both, rather than duplicating it into each arm above.
+        if needs_management_auth {
+            msg.push_str("\n\nResetting this device requires management auth, entered below.");
+        }
+        // `PivQuirk::ResetLongRunning` — same wording the PIV pane's "Reset
+        // applet" card and `keyroostctl piv reset` already show, appended
+        // here too so it isn't missed before the whole-device wipe starts.
+        if reset_long_running {
+            msg.push_str("\n\n");
+            msg.push_str(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT);
+        }
     }
     if plan.contains(&ResetStep::Fido) {
         msg.push_str("\n\nFinishes with a step to unplug the key, plug it back in, and touch it.");
@@ -881,6 +1147,9 @@ enum RowTone {
     Done,
     /// Nothing went wrong, but the step hasn't happened yet.
     Waiting,
+    /// The step wiped what it was supposed to, but something afterward
+    /// still needs attention.
+    Warn,
     /// The step did not wipe what it was supposed to.
     Bad,
     /// The step wasn't part of this run.
@@ -904,10 +1173,95 @@ fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
         ),
         FactoryResetRow::Step(r) => match &r.outcome {
             StepOutcome::Wiped => (format!("{}  wiped", r.step.label()), RowTone::Done),
+            // Device-wide mechanism, not confined to PIV alone — name the
+            // whole device instead of just the applet that triggered it.
+            StepOutcome::WipedGlobal => (
+                format!("{}  wiped", keyroost_resolve::PIV_GLOBAL_RESET_LABEL),
+                RowTone::Done,
+            ),
+            StepOutcome::WipedWithWarning(e) => (
+                format!("{}  wiped, but: {e}", r.step.label()),
+                RowTone::Warn,
+            ),
             StepOutcome::Failed(e) => (format!("{}  failed: {e}", r.step.label()), RowTone::Bad),
-            StepOutcome::Skipped => (format!("{}  skipped", r.step.label()), RowTone::Muted),
+            StepOutcome::Skipped(reason) => (
+                format!("{}  skipped: {reason}", r.step.label()),
+                RowTone::Muted,
+            ),
         },
     }
+}
+
+/// One-line factory-reset summary for the activity log: which steps wiped
+/// cleanly, which wiped but left a follow-up warning, which failed (each
+/// with its own reason), and which were skipped (each with its own reason)
+/// — the same buckets `factory_reset_row_line` paints per-row in the
+/// Overview pane, collapsed into one line so the activity log keeps a
+/// permanent record of the run even after the pane's own report is
+/// overwritten by the next one.
+///
+/// `StepOutcome::WipedWithWarning` counts toward *both* the "wiped" list
+/// (the applet really was wiped — a reader scanning just that list must see
+/// it there) and its own "warnings" list (the follow-up failure is real and
+/// still needs its own line) — the one outcome that isn't confined to a
+/// single bucket, matching what it actually is: a wipe that succeeded, with
+/// a caveat.
+fn factory_reset_report_summary(reports: &[keyroost_resolve::StepReport]) -> String {
+    use keyroost_resolve::StepOutcome;
+    let wiped: Vec<&str> = reports
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.outcome,
+                StepOutcome::Wiped | StepOutcome::WipedGlobal | StepOutcome::WipedWithWarning(_)
+            )
+        })
+        .map(|r| match r.outcome {
+            // Device-wide mechanism, not confined to PIV alone — name the
+            // whole device instead of just the applet that triggered it.
+            StepOutcome::WipedGlobal => keyroost_resolve::PIV_GLOBAL_RESET_LABEL,
+            _ => r.step.label(),
+        })
+        .collect();
+    let warnings: Vec<String> = reports
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            StepOutcome::WipedWithWarning(e) => Some(format!("{}: {e}", r.step.label())),
+            _ => None,
+        })
+        .collect();
+    let failed: Vec<String> = reports
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            StepOutcome::Failed(e) => Some(format!("{}: {e}", r.step.label())),
+            _ => None,
+        })
+        .collect();
+    let skipped: Vec<String> = reports
+        .iter()
+        .filter_map(|r| match &r.outcome {
+            StepOutcome::Skipped(reason) => Some(format!("{}: {reason}", r.step.label())),
+            _ => None,
+        })
+        .collect();
+    let mut msg = format!(
+        "wiped: {}",
+        if wiped.is_empty() {
+            "none".to_string()
+        } else {
+            wiped.join(", ")
+        }
+    );
+    if !warnings.is_empty() {
+        msg.push_str(&format!("; warnings: {}", warnings.join("; ")));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!("; failed: {}", failed.join("; ")));
+    }
+    if !skipped.is_empty() {
+        msg.push_str(&format!("; skipped: {}", skipped.join("; ")));
+    }
+    msg
 }
 
 /// Fold the FIDO finale's outcome into the factory-reset report, replacing the
@@ -923,7 +1277,17 @@ fn factory_reset_row_line(row: &FactoryResetRow) -> (String, RowTone) {
 ///
 /// Only a caller that actually attempted the wipe may use this. Everything
 /// else takes [`resolve_pending_fido_reset_row`].
-fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolve::StepOutcome) {
+///
+/// Returns whether a row was actually found and replaced — `false` means this
+/// wasn't part of a factory-reset run at all (a standalone "Reset key"), which
+/// callers use to decide whether the finale is also worth a permanent
+/// activity-log line rather than just an Overview-pane update (see
+/// [`App::apply_factory_reset_sweep`]'s doc on why that permanent record
+/// matters).
+fn resolve_fido_reset_row(
+    rows: &mut [FactoryResetRow],
+    outcome: keyroost_resolve::StepOutcome,
+) -> bool {
     if let Some(row) = rows.iter_mut().find(|r| match r {
         FactoryResetRow::FidoPending => true,
         FactoryResetRow::Step(r) => r.step == keyroost_resolve::ResetStep::Fido,
@@ -932,6 +1296,9 @@ fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolv
             step: keyroost_resolve::ResetStep::Fido,
             outcome,
         });
+        true
+    } else {
+        false
     }
 }
 
@@ -947,10 +1314,17 @@ fn resolve_fido_reset_row(rows: &mut [FactoryResetRow], outcome: keyroost_resolv
 /// irreversible ceremony that already succeeded. A pending row is the only
 /// evidence that this dialog owns the finale, so it is the only row these
 /// callers may write.
+///
+/// Returns whether a pending row was actually found and resolved — `false`
+/// covers both "no factory reset in flight" and "this row already answered",
+/// neither of which is this dialog's finale to announce. `true` means this
+/// really was the factory reset's FIDO step being decided just now, which
+/// callers use to also give it a permanent activity-log line (see
+/// [`resolve_fido_reset_row`]'s doc for why).
 fn resolve_pending_fido_reset_row(
     rows: &mut [FactoryResetRow],
     outcome: keyroost_resolve::StepOutcome,
-) {
+) -> bool {
     if let Some(row) = rows
         .iter_mut()
         .find(|r| matches!(r, FactoryResetRow::FidoPending))
@@ -959,30 +1333,80 @@ fn resolve_pending_fido_reset_row(
             step: keyroost_resolve::ResetStep::Fido,
             outcome,
         });
+        true
+    } else {
+        false
     }
 }
 
-/// Render a forced PIV wipe's failure for the report pane.
+/// Severity + activity-log line for a factory reset's FIDO finale outcome.
 ///
-/// `force_reset` blocks the PIN and then the PUK on its way to RESET, so a
-/// failure between the blocking and the wipe leaves a card that is locked but
-/// not erased. The confirmation modal promises the report says which state the
-/// card is in, so every failure has to carry that.
+/// Callers reach here only after [`resolve_fido_reset_row`] or
+/// [`resolve_pending_fido_reset_row`] confirms this really was the finale
+/// being decided — otherwise the card sweep's own "factory reset finished"
+/// line (written before the FIDO ceremony even starts, see
+/// [`App::apply_factory_reset_sweep`]) is the only activity-log record of
+/// the run, and never gets updated once FIDO's outcome is known. Reuses
+/// [`factory_reset_row_line`]'s wording so the permanent log and the
+/// Overview pane read as the same event.
+fn factory_reset_fido_finale_log_line(
+    outcome: &keyroost_resolve::StepOutcome,
+) -> (Severity, String) {
+    use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+    let severity = match outcome {
+        // `WipedGlobal` never actually reaches here in practice (its sole
+        // producer is PIV, and this function is only ever called for
+        // `ResetStep::Fido`), but the match has to stay exhaustive.
+        StepOutcome::Wiped | StepOutcome::WipedGlobal => Severity::Ok,
+        StepOutcome::WipedWithWarning(_) | StepOutcome::Skipped(_) => Severity::Warn,
+        StepOutcome::Failed(_) => Severity::Err,
+    };
+    let (text, _tone) = factory_reset_row_line(&FactoryResetRow::Step(StepReport {
+        step: ResetStep::Fido,
+        outcome: outcome.clone(),
+    }));
+    (severity, format!("factory reset \u{2014} {text}"))
+}
+
+/// Render a `PivSession::factory_reset` failure for the report pane.
 ///
-/// Three variants already say it themselves — the card refused before anything
-/// was blocked, the run stopped part-way (carrying the state), or the throwaway
-/// PUK guess was accepted — and appending to those would contradict them.
-/// Everything else (a transport error mid-loop, an unexpected status word the
-/// PIN/PUK mapping renders as a bare APDU failure, a host RNG failure) arrives
-/// as text that says nothing about the blocking, so the disclosure is appended.
+/// Only one of its paths — the PIN/PUK burn dance — blocks the PIN and then
+/// the PUK on its way to RESET, so only there can a failure between the
+/// blocking and the wipe leave a card that is locked but not erased. The
+/// confirmation modal promises the report says which state the card is in,
+/// so every failure from that path has to carry that.
 ///
-/// The way out is to run the factory reset again, not the single-applet PIV
-/// reset: a fault in the PUK loop leaves the PIN blocked and the PUK *not*
-/// blocked, and the card refuses a plain RESET until both are blocked.
-fn piv_force_reset_message(e: TransportError) -> String {
+/// The variants each of `factory_reset`'s other paths (device-wide
+/// mechanism, authenticated management-key RESET, unverified bare RESET,
+/// or an outright refusal before anything ran) can return already say so
+/// themselves — none of them ever blocks a PIN or PUK, so appending the
+/// burn-dance disclosure to them would be wrong. Only an error that could
+/// have come from the burn dance (a transport error mid-loop, an unexpected
+/// status word the PIN/PUK mapping renders as a bare APDU failure, a host
+/// RNG failure) gets the disclosure appended.
+///
+/// The way out, when it applies, is to run the factory reset again, not the
+/// single-applet PIV reset: a fault in the PUK loop leaves the PIN blocked
+/// and the PUK *not* blocked, and the card refuses a plain RESET until both
+/// are blocked.
+fn piv_factory_reset_message(e: TransportError) -> String {
     match e {
-        TransportError::PivForceResetUnsupported
-        | TransportError::PivForceResetIncomplete(_)
+        // None of these touched the PIN or PUK: `Unsupported`/
+        // `NeedsManagementAuth` refuse before the burn sequence even starts
+        // (see `PivSession::plan_factory_reset`), `UnverifiedFailed` is the
+        // bare-RESET path that deliberately skips pre-blocking, and
+        // `GlobalFailed`/`ManagementAuthFailed` are the device-wide and
+        // authenticated-management-key mechanisms — neither has any
+        // PIN/PUK-blocking step to have left half-done. The "PIV may now be
+        // locked" caveat below would be actively wrong for any of these, so
+        // they pass through as-is — each variant's own `Display` already
+        // says what actually happened.
+        TransportError::PivResetUnsupported
+        | TransportError::PivResetNeedsManagementAuth
+        | TransportError::PivResetUnverifiedFailed(_)
+        | TransportError::PivResetGlobalFailed(_)
+        | TransportError::PivResetManagementAuthFailed(_)
+        | TransportError::PivResetIncomplete(_)
         | TransportError::PivPukGuessAccepted => e.to_string(),
         other => format!(
             "{other} (the wipe blocks the PIN and PUK before erasing, so PIV may \
@@ -990,6 +1414,39 @@ fn piv_force_reset_message(e: TransportError) -> String {
              factory reset again to finish it)"
         ),
     }
+}
+
+/// Whether the PIV pane's "Reset applet" card should show its "Factory reset
+/// supported →" link to the whole-device factory reset (Overview tab): true
+/// when `reset_global_gate` — a *different* extension,
+/// `PivExtension::ResetGlobal`, a device-wide reset directive that takes PIV
+/// down with it alongside at least one other applet — resolves
+/// [`keyroost_piv::compat::FeatureGate::Supported`] (an *unverified* alternative isn't something to
+/// steer a user toward) AND `reset_gate` (`PivExtension::Reset`, the
+/// PIV-only path) is anything other than [`keyroost_piv::compat::FeatureGate::Supported`] (a
+/// known-good PIV-only path has nothing to redirect away from — this is the
+/// "leave as-is" case).
+fn piv_reset_global_alternative_available(
+    reset_gate: keyroost_piv::compat::FeatureGate,
+    reset_global_gate: keyroost_piv::compat::FeatureGate,
+) -> bool {
+    use keyroost_piv::compat::FeatureGate;
+    reset_global_gate == FeatureGate::Supported && reset_gate != FeatureGate::Supported
+}
+
+/// Whether the Generate Key modal's "Policy other than `default` requires
+/// YubiKey or compatible token." caveat still needs to be shown below the
+/// PIN/touch policy combos: true unless *both* gates are confirmed
+/// [`keyroost_piv::compat::FeatureGate::Supported`] — at that point the caveat is stale noise on a
+/// device already known to handle non-default policies, and the per-row
+/// warning marker / disabled-combo hover above already cover the
+/// unverified/unsupported cases on their own.
+fn piv_policy_caveat_hint_needed(
+    pin_policy_gate: keyroost_piv::compat::FeatureGate,
+    touch_policy_gate: keyroost_piv::compat::FeatureGate,
+) -> bool {
+    use keyroost_piv::compat::FeatureGate;
+    pin_policy_gate != FeatureGate::Supported || touch_policy_gate != FeatureGate::Supported
 }
 
 /// Run one non-FIDO applet reset off the UI thread, mapping the result to a
@@ -1001,8 +1458,64 @@ fn run_card_reset_step(
     step: keyroost_resolve::ResetStep,
     reader: Option<&str>,
     hid_path: Option<&std::path::Path>,
+    reset_mgmt_auth: Option<&ResetMgmtAuth>,
 ) -> keyroost_resolve::StepOutcome {
     use keyroost_resolve::{ResetStep, StepOutcome};
+
+    // PIV gets its own path, ahead of the shared closure below:
+    // `PivSession::factory_reset` decides on its own, from a live fingerprint,
+    // whether to run the device-wide mechanism, a PIV-only reset, or skip the
+    // applet outright (RESET known-unsupported on both axes, or a
+    // precondition — an authenticated management-key session — with no
+    // credential supplied) rather than fail it, a distinction the shared
+    // Ok/Err mapping the other steps share can't express. See
+    // `piv_factory_reset_message` for why none of the "never touched PIN/PUK"
+    // errors get its usual caveat appended.
+    if step == ResetStep::Piv {
+        return (|| -> Result<StepOutcome, String> {
+            let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
+            let current = reset_mgmt_auth.map(|auth| match auth {
+                ResetMgmtAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                ResetMgmtAuth::Pin(pin) => keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes()),
+            });
+            keyroost_transport::PivSession::with_transaction(
+                name,
+                |s| -> Result<StepOutcome, TransportError> {
+                    Ok(match s.factory_reset(current) {
+                Ok(keyroost_transport::FactoryResetOutcome::Wiped) => StepOutcome::Wiped,
+                // The device-wide mechanism ran cleanly -- more than just PIV
+                // was wiped, so the report should say so rather than naming
+                // only the applet that happened to trigger it.
+                Ok(keyroost_transport::FactoryResetOutcome::WipedGlobal) => {
+                    StepOutcome::WipedGlobal
+                }
+                // The device IS wiped -- only the courtesy XAUTH-key restore
+                // (the device-wide mechanism's own follow-up) failed.
+                // `WipedWithWarning`, not `Failed`: the wipe itself is done,
+                // so this must count as wiped everywhere that's what's being
+                // asked (the pane re-init below, the "N wiped" report), but
+                // the restore failure is real and still needs its own line.
+                Ok(keyroost_transport::FactoryResetOutcome::WipedKeyRestoreFailed) => {
+                    StepOutcome::WipedWithWarning(
+                        "restoring XAUTH key 1 to the factory-delivery value afterward failed \
+                         \u{2014} it's left cleared instead. Set it manually (PIV \u{2192} \
+                         Change management key) if you need it back."
+                            .into(),
+                    )
+                }
+                Err(
+                    e @ (TransportError::PivResetUnsupported
+                    | TransportError::PivResetNeedsManagementAuth),
+                ) => StepOutcome::Skipped(e.to_string()),
+                Err(e) => StepOutcome::Failed(piv_factory_reset_message(e)),
+            })
+                },
+            )
+            .map_err(|e: TransportError| e.to_string())
+        })()
+        .unwrap_or_else(StepOutcome::Failed);
+    }
+
     let run = || -> Result<(), String> {
         match step {
             ResetStep::Oath => {
@@ -1017,12 +1530,7 @@ fn run_card_reset_step(
                     keyroost_transport::OpenPgpSession::open(name).map_err(|e| e.to_string())?;
                 s.factory_reset().map_err(|e| e.to_string())?;
             }
-            ResetStep::Piv => {
-                let name = reader.ok_or("no PC/SC reader for the PIV applet")?;
-                let mut s =
-                    keyroost_transport::PivSession::open(name).map_err(|e| e.to_string())?;
-                s.force_reset().map_err(piv_force_reset_message)?;
-            }
+            ResetStep::Piv => unreachable!("handled above, before this closure"),
             ResetStep::Token2Otp => {
                 // The OTP applet lives on the FIDO HID node when present, else on
                 // the PC/SC reader. Mirror the CLI's `HidThenReader` behavior:
@@ -1088,6 +1596,22 @@ fn snap_subview(current: FidoSubview, tabs: &[(FidoSubview, &str)]) -> FidoSubvi
         current
     } else {
         tabs.first().map(|(v, _)| *v).unwrap_or_default()
+    }
+}
+
+/// The capability tab to actually render: the current pick when `offered`
+/// (the selected device's own `Device::tabs()`) still has it, else the
+/// first offered tab, else `Overview` (`offered` empty — a Molto2 token,
+/// which has no capability tabs at all). Same shape as [`snap_subview`], one
+/// level up: a per-device remembered pick (`App::cap_tab_by_device`) can be
+/// stale exactly the same way a persisted `FidoSubview` pick can — switching
+/// from a key with PIV to one without would otherwise leave the pane on a
+/// tab the new key doesn't have.
+fn snap_cap_tab(current: CapTab, offered: &[CapTab]) -> CapTab {
+    if offered.contains(&current) {
+        current
+    } else {
+        offered.first().copied().unwrap_or_default()
     }
 }
 
@@ -1335,7 +1859,7 @@ impl OpenPgpKeyAlgSel {
 /// non-secret parameters (slot, algorithm, file path, subject, …) stay inline
 /// in the pane. The variant selects which secret fields the modal renders and
 /// which op Submit dispatches to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PivCredKind {
     ChangePin,
     ChangePuk,
@@ -1351,9 +1875,9 @@ enum PivCredKind {
     MoveKey,
     NewChuid,
     /// Run every key self-test the selected slot's algorithm supports
-    /// (decrypt / key-agree / sign, in that order). Needs the PIN (unless the
-    /// slot's PIN policy is `never`); no management key, and nothing on the
-    /// card changes.
+    /// (decrypt / key-agree / sign, in that order). The PIN field is always
+    /// optional — it's the user's choice whether to test with or without a
+    /// PIN; no management key, and nothing on the card changes.
     SelfTest,
 }
 
@@ -1431,6 +1955,16 @@ impl PivCredKind {
                 | PivCredKind::NewChuid
         )
     }
+    /// True for a flow that already collects a PIN of its own further down in
+    /// the modal — `SelfSign`'s signing PIN, `SetRetries`' current PIN — for a
+    /// reason unrelated to management auth. PIV has exactly one application
+    /// PIN, so when `use_pin` is set on one of these,
+    /// `piv_modal_mgmt_field` doesn't render a second PIN box asking for the
+    /// same value twice: the dedicated field's PIN is reused directly for
+    /// management auth too, in [`App::piv_current_mgmt_auth`].
+    fn shares_pin_field(self) -> bool {
+        matches!(self, PivCredKind::SelfSign | PivCredKind::SetRetries)
+    }
 }
 
 /// Live state of the PIV credential-entry modal. Open iff `PivState::cred_modal`
@@ -1456,6 +1990,46 @@ impl PivCredModal {
             result: None,
             detail: None,
         }
+    }
+}
+
+/// How the management-key modal's "Use default management key" / "Use PIN"
+/// toggles are currently resolved — one canonical field instead of two
+/// independent `bool`s, so the two checkboxes can't drift into an
+/// inconsistent combination (each is a pure view onto, and setter of, this
+/// single value: checking one sets it to that variant; unchecking either
+/// always returns to [`Self::Manual`], never leaves the other variant
+/// standing from a stale toggle). [`Self::Manual`] — neither box ticked —
+/// means "read the typed hex from `PivState::mgmt_key_input`", the ordinary
+/// case this whole type exists to make unambiguous.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PivMgmtAuthMode {
+    /// Neither toggle is ticked: `PivState::mgmt_key_input` holds a typed
+    /// management-key hex string.
+    #[default]
+    Manual,
+    /// "Use default management key": the well-known factory default.
+    Default,
+    /// "Use PIN": `keyroost_piv::compat::PivExtension::PinManagementAuth`
+    /// instead of a management key — see [`App::piv_current_mgmt_auth`].
+    Pin,
+}
+
+/// What `PivState::mgmt_auth_mode` should become after one of the modal's
+/// two toggle checkboxes is clicked: `mode_if_checked` if the click checked
+/// it, `PivMgmtAuthMode::Manual` if the click unchecked it — unconditionally,
+/// regardless of which variant `mgmt_auth_mode` held before. Factored out of
+/// `App::piv_modal_mgmt_field` so this rule is unit-testable without an egui
+/// context; it's also the fix for a real reported bug where two independent
+/// `bool`s (one per checkbox), each resetting the other on check but not
+/// consulting it on uncheck, could leave `mgmt_auth_mode`-equivalent state
+/// stuck on a stale toggle after check-then-switch-then-uncheck.
+#[must_use]
+fn piv_mgmt_mode_after_toggle(checked: bool, mode_if_checked: PivMgmtAuthMode) -> PivMgmtAuthMode {
+    if checked {
+        mode_if_checked
+    } else {
+        PivMgmtAuthMode::Manual
     }
 }
 
@@ -1494,12 +2068,17 @@ struct PivState {
     /// True once a status has been fetched for the current selection.
     loaded: bool,
     /// Management key (hex) entered to authorize key-gen / cert-import /
-    /// set-retries / management-key change. Cleared after use.
+    /// set-retries / management-key change. Cleared after use. Doubles as
+    /// the PIN input when [`Self::mgmt_auth_mode`] is
+    /// [`PivMgmtAuthMode::Pin`] and the flow has no dedicated PIN field of
+    /// its own (see [`PivCredKind::shares_pin_field`]) — the same field,
+    /// its label and hint swapped, rather than a second box. Only actually
+    /// read when [`Self::mgmt_auth_mode`] is [`PivMgmtAuthMode::Manual`] or
+    /// [`PivMgmtAuthMode::Pin`] — see that type's doc.
     mgmt_key_input: String,
-    /// "Use default management key" toggle in the modal: when set, the standard
-    /// factory-default key is used instead of `mgmt_key_input` (the common case,
-    /// since most users never rotate the PIV management key). Reset per modal.
-    use_default_mgmt: bool,
+    /// The management-key modal's "Use default management key" / "Use PIN"
+    /// toggle state — see [`PivMgmtAuthMode`]. Reset per modal.
+    mgmt_auth_mode: PivMgmtAuthMode,
     /// Change-PIN old/new/confirm entries. Cleared after use.
     pin_old: String,
     pin_new: String,
@@ -1521,7 +2100,7 @@ struct PivState {
     /// act on this single selection instead of each carrying its own dropdown.
     selected_slot: PivSlotSel,
     /// Key-generation algorithm selector.
-    gen_alg: PivKeyAlgSel,
+    gen_alg: keyroost_piv::KeyAlg,
     /// PIN/touch policy selectors in the Generate key modal. `Default`/
     /// `Default` (the initial selection) sends the plain PIV GENERATE
     /// ASYMMETRIC KEY PAIR APDU, with no policy tags, which is what every PIV
@@ -1530,8 +2109,6 @@ struct PivState {
     /// honors. Reset per modal open.
     gen_pin_policy: keyroost_piv::PinPolicy,
     gen_touch_policy: keyroost_piv::TouchPolicy,
-    /// PEM of the most recently generated public key, shown for copying.
-    gen_pubkey_pem: Option<String>,
     /// Certificate import file path.
     cert_path: String,
     /// Certificate export destination path.
@@ -1539,14 +2116,34 @@ struct PivState {
     /// New management key (hex) + algorithm for a management-key rotation.
     new_mgmt_key_input: String,
     new_mgmt_alg: PivMgmtAlgSel,
+    /// "Allow PIN unlock" checkbox in the management-key rotation dialog —
+    /// whether the new key should also be stored PIN-protected (Yubico's
+    /// `PivExtension::PinManagementAuth`; see
+    /// `keyroost_transport::PivSession::set_management_key_pin_protected`).
+    /// Reset to `false` per dialog open, same as `new_mgmt_key_input`; the
+    /// row rendering this forces it to (effectively) `true` and disables
+    /// editing on HID Crescendo, which unlocks management off the PIN
+    /// already, with nothing to toggle — see the "Management key" row's own
+    /// comment.
+    new_mgmt_allow_pin_unlock: bool,
     /// Certificate creation: subject (bare name or full DN), validity, the PIN
     /// that authorizes the on-card signature, and the CSR destination.
     cert_subject: String,
-    cert_days: u32,
+    /// Validity period, entered as three counts that sum — years applied
+    /// first, then months relative to that point, then a flat day count —
+    /// fed to [`keyroost_piv::add_calendar_period`]. Mirrors `keyroostctl
+    /// piv self-sign`'s combinable `--years`/`--months`/`--days` exactly.
+    cert_valid_years: u32,
+    cert_valid_months: u32,
+    cert_valid_days: u32,
     sign_pin: String,
     csr_path: String,
-    /// New CHUID: validity in days from now (same shape and default as
-    /// `cert_days`), fed to [`keyroost_piv::chuid_expiration_in_days`].
+    /// New CHUID: validity, same three-field shape and default as
+    /// `cert_valid_years`/`cert_valid_months`/`cert_valid_days`, fed to
+    /// [`keyroost_piv::add_calendar_period`] +
+    /// [`keyroost_piv::yyyymmdd_from_unix_secs`].
+    chuid_valid_years: u32,
+    chuid_valid_months: u32,
     chuid_valid_days: u32,
     /// New CHUID: the GUID input, hex (canonical `8-4-4-4-12` dashed form as
     /// pre-filled, but [`keyroost_piv::parse_guid_hex`] accepts plain hex
@@ -1556,6 +2153,19 @@ struct PivState {
     chuid_guid: String,
     /// Reset confirmation modal: typed-`reset` text (modal open iff `Some`).
     confirm_reset: Option<String>,
+    /// True from the moment any PIV device job — status read, PIN/PUK/
+    /// management-key change, key generate/import/delete/move, self-test,
+    /// self-sign/CSR, CHUID write, reset, ... — queues via `spawn_piv_job`
+    /// until that job's apply closure runs. The pane reads this once,
+    /// wrapping everything except the slot tab strip (and the retired-slot
+    /// rail) in a single `add_enabled_ui` (see `cap_piv`) — disabling every
+    /// button/field in the applet-wide and per-slot cards for the duration
+    /// without hooking into each one individually, while scrolling and slot
+    /// selection stay live. Not `self.busy()`: that flips true for *any*
+    /// queued job app-wide (an unrelated OATH or FIDO action among them),
+    /// which would dim the PIV pane over device work that has nothing to do
+    /// with the PIV applet.
+    inflight: bool,
     /// Credential-entry modal for PIN/PUK changes + unblock (open iff `Some`).
     /// The PIN/PUK secret fields above render *inside* this modal, not inline in
     /// the pane, so the entry and its result stay on-screen (issue #31).
@@ -1567,22 +2177,6 @@ struct PivState {
     /// so expanding the section only probes the card once. `None` until read;
     /// invalidated after a move so the section re-reads on its next expand.
     retired_occupancy: Option<Vec<(keyroost_piv::Slot, bool)>>,
-    /// Algorithm + public key of any slot generated on the selected device
-    /// during this app run, keyed by PIV key reference. In-memory only —
-    /// there is no on-disk or cross-process cache — and it lives exactly as
-    /// long as `PivState` does (reset on device switch or PIV reset, same as
-    /// every other field here). Each `PivSession` this pane opens is fresh
-    /// per action (a new `PivSession::open` per generate/CSR/self-sign job,
-    /// not one session kept alive across them), so its own in-session cache
-    /// ([`keyroost_transport::PivSession::remember_pubkey`]) can't bridge
-    /// "generate" to "sign a CSR with it" on its own; this map is what lets
-    /// this pane still do that within one running app, on cards that don't
-    /// answer GET METADATA. Populated by `piv_generate_key`; consumed (via
-    /// `remember_pubkey`, seeded into a freshly-opened session before it needs
-    /// the key) by `load_piv_status`, `piv_self_sign`, and `piv_request_csr`;
-    /// invalidated by `piv_delete_key`, carried across by `piv_move_key`, and
-    /// cleared wholesale by `piv_reset`.
-    pubkey_cache: std::collections::HashMap<u8, (keyroost_piv::KeyAlg, keyroost_piv::PublicKey)>,
 }
 
 // The pane is replaced wholesale on device switch (`self.piv =
@@ -1591,7 +2185,7 @@ struct PivState {
 impl Drop for PivState {
     fn drop(&mut self) {
         wipe(&mut self.mgmt_key_input);
-        self.use_default_mgmt = false;
+        self.mgmt_auth_mode = PivMgmtAuthMode::default();
         wipe(&mut self.pin_old);
         wipe(&mut self.pin_new);
         wipe(&mut self.pin_confirm);
@@ -1616,7 +2210,7 @@ impl Default for PivState {
             notice: None,
             loaded: false,
             mgmt_key_input: String::new(),
-            use_default_mgmt: false,
+            mgmt_auth_mode: PivMgmtAuthMode::default(),
             pin_old: String::new(),
             pin_new: String::new(),
             pin_confirm: String::new(),
@@ -1629,27 +2223,31 @@ impl Default for PivState {
             retries_puk: 3,
             retries_pin_auth: String::new(),
             selected_slot: PivSlotSel::default(),
-            gen_alg: PivKeyAlgSel::default(),
+            gen_alg: keyroost_piv::KeyAlg::EccP256,
             gen_pin_policy: keyroost_piv::PinPolicy::Default,
             gen_touch_policy: keyroost_piv::TouchPolicy::Default,
-            gen_pubkey_pem: None,
             cert_path: String::new(),
             export_path: String::new(),
             new_mgmt_key_input: String::new(),
             new_mgmt_alg: PivMgmtAlgSel::default(),
+            new_mgmt_allow_pin_unlock: false,
             cert_subject: String::new(),
-            cert_days: 365,
+            cert_valid_years: 1,
+            cert_valid_months: 0,
+            cert_valid_days: 0,
             sign_pin: String::new(),
             csr_path: String::new(),
-            chuid_valid_days: 365,
+            chuid_valid_years: 1,
+            chuid_valid_months: 0,
+            chuid_valid_days: 0,
             chuid_guid: keyroost_transport::random_chuid_guid()
                 .map(|g| keyroost_piv::format_guid(&g))
                 .unwrap_or_default(),
             confirm_reset: None,
+            inflight: false,
             cred_modal: None,
             move_dest: None,
             retired_occupancy: None,
-            pubkey_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -1684,71 +2282,98 @@ impl PivSlotSel {
     }
 }
 
-/// PIV key-generation algorithm selector.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum PivKeyAlgSel {
-    #[default]
-    EccP256,
-    EccP384,
-    Rsa2048,
-    Rsa3072,
-    Rsa4096,
-    Ed25519,
-}
+// PIV key-generation algorithm selection uses `keyroost_piv::KeyAlg` directly
+// (see `gen_alg` below) rather than a GUI-only wrapper enum — same pattern
+// `gen_pin_policy`/`gen_touch_policy` already use for their domain types.
+// `KeyAlg::ALL` lists every candidate for the combo
+// (`piv_keyalg_combo`); which ones are actually selectable on the live device
+// is a per-algorithm `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`
+// gate, resolved where the combo is drawn, not baked into the selector type.
 
-impl PivKeyAlgSel {
-    fn to_alg(self) -> keyroost_piv::KeyAlg {
-        use keyroost_piv::KeyAlg::*;
-        match self {
-            PivKeyAlgSel::EccP256 => EccP256,
-            PivKeyAlgSel::EccP384 => EccP384,
-            PivKeyAlgSel::Rsa2048 => Rsa2048,
-            PivKeyAlgSel::Rsa3072 => Rsa3072,
-            PivKeyAlgSel::Rsa4096 => Rsa4096,
-            PivKeyAlgSel::Ed25519 => Ed25519,
-        }
-    }
-    fn label(self) -> &'static str {
-        self.to_alg().label()
-    }
-    const ALL: [PivKeyAlgSel; 6] = [
-        PivKeyAlgSel::EccP256,
-        PivKeyAlgSel::EccP384,
-        PivKeyAlgSel::Rsa2048,
-        PivKeyAlgSel::Rsa3072,
-        PivKeyAlgSel::Rsa4096,
-        PivKeyAlgSel::Ed25519,
-    ];
-}
-
-/// PIV management-key algorithm selector (for rotation).
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// PIV management-key algorithm selector (for rotation). [`Self::Delete`] is
+/// not an algorithm at all — HID Crescendo's ACA-only "management key" (see
+/// [`keyroost_transport::CurrentMgmtAuth`]'s doc) can be deleted outright
+/// instead of replaced, unlike a standard PIV management key, which is
+/// mandatory — but it's still always offered, last, in [`Self::ALL`], on
+/// every device, not only HID Crescendo: which options are actually
+/// *selectable* on the live device is a per-choice
+/// `keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm` gate,
+/// resolved where the combo is drawn (see `cap_piv`) and rendered as a
+/// disabled entry rather than an omitted one — same split between "offered
+/// set" and "live gate" that `KeyAlg`/`piv_keyalg_combo` already use for the
+/// slot key-algorithm picker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum PivMgmtAlgSel {
     #[default]
     Aes192,
     Aes128,
     Aes256,
     TripleDes,
+    Delete,
 }
 
 impl PivMgmtAlgSel {
-    fn to_alg(self) -> keyroost_piv::MgmtAlg {
+    /// `None` for [`Self::Delete`] — see this type's doc.
+    fn to_alg(self) -> Option<keyroost_piv::MgmtAlg> {
         use keyroost_piv::MgmtAlg::*;
         match self {
-            PivMgmtAlgSel::Aes192 => Aes192,
-            PivMgmtAlgSel::Aes128 => Aes128,
-            PivMgmtAlgSel::Aes256 => Aes256,
-            PivMgmtAlgSel::TripleDes => TripleDes,
+            PivMgmtAlgSel::Aes192 => Some(Aes192),
+            PivMgmtAlgSel::Aes128 => Some(Aes128),
+            PivMgmtAlgSel::Aes256 => Some(Aes256),
+            PivMgmtAlgSel::TripleDes => Some(TripleDes),
+            PivMgmtAlgSel::Delete => None,
+        }
+    }
+    /// This choice as a `keyroost_piv::compat::MgmtAlgChoice` — the argument
+    /// [`keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm`] gates on.
+    /// A 1:1 mapping (unlike [`Self::to_alg`], `MgmtAlgChoice` has its own
+    /// [`Self::Delete`]-equivalent variant, so this never returns `Option`).
+    fn to_choice(self) -> keyroost_piv::compat::MgmtAlgChoice {
+        use keyroost_piv::compat::MgmtAlgChoice;
+        match self {
+            PivMgmtAlgSel::Aes192 => MgmtAlgChoice::Aes192,
+            PivMgmtAlgSel::Aes128 => MgmtAlgChoice::Aes128,
+            PivMgmtAlgSel::Aes256 => MgmtAlgChoice::Aes256,
+            PivMgmtAlgSel::TripleDes => MgmtAlgChoice::TripleDes,
+            PivMgmtAlgSel::Delete => MgmtAlgChoice::Delete,
         }
     }
     fn label(self) -> &'static str {
-        self.to_alg().label()
+        match self {
+            PivMgmtAlgSel::Delete => "Delete",
+            other => other
+                .to_alg()
+                .expect("every non-Delete variant has an algorithm")
+                .label(),
+        }
     }
-    const ALL: [PivMgmtAlgSel; 4] = [
-        PivMgmtAlgSel::Aes192,
-        PivMgmtAlgSel::Aes128,
-        PivMgmtAlgSel::Aes256,
+    /// Every candidate for the management-key algorithm combo, in menu order
+    /// — alphabetical by [`Self::label`] (`"3DES"`, `"AES-128"`, `"AES-192"`,
+    /// `"AES-256"`), with [`Self::Delete`] last: it isn't a real algorithm
+    /// name to sort alongside the rest (see this type's own doc), and
+    /// `"Delete"` happens to sort after all four anyway. Offered identically
+    /// on every device, standard PIV or HID Crescendo alike: which entries
+    /// actually resolve selectable there is a live
+    /// `keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm` gate per
+    /// candidate (see this type's own doc), not a difference in which
+    /// candidates are listed. A standard device's mandatory management key
+    /// has no delete mechanism keyroost implements, so `Delete` renders
+    /// disabled there; HID Crescendo's ACA XAUTH key can be removed outright
+    /// ([`keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove`]),
+    /// so it's selectable there — same "list every candidate, gate each one
+    /// live" shape `keyroost_piv::KeyAlg::ALL`/[`piv_keyalg_combo`] already
+    /// use for the slot key-algorithm picker.
+    ///
+    /// Note `Self::ALL[0]` (`TripleDes`) is *not* [`Self::default`] (`Aes192`)
+    /// — unlike before this was alphabetized, the two are no longer the same
+    /// entry; see [`piv_mgmtalg_unsupported_fallback`]'s doc for where that
+    /// used to matter.
+    const ALL: [PivMgmtAlgSel; 5] = [
         PivMgmtAlgSel::TripleDes,
+        PivMgmtAlgSel::Aes128,
+        PivMgmtAlgSel::Aes192,
+        PivMgmtAlgSel::Aes256,
+        PivMgmtAlgSel::Delete,
     ];
 }
 
@@ -1986,6 +2611,17 @@ struct App {
     selected_device: Option<DeviceId>,
     /// Which capability pane is showing for the selected key.
     cap_tab: CapTab,
+    /// Each device's own last-shown `cap_tab`, so switching to another
+    /// device's tab and back doesn't reset the pane to Overview — only the
+    /// *currently* selected device's pick lives in `cap_tab` at any moment;
+    /// `on_device_selected` is what moves the outgoing device's pick in here
+    /// and restores the incoming device's. A pick that's stale for its
+    /// device (the device no longer offers that tab) is corrected at render
+    /// time by `snap_cap_tab`, the same way `security_keys.subview` already
+    /// self-heals for FIDO's own sub-tabs — so entries here are never
+    /// pruned on device disappearance the way `piv_session_state` is: an
+    /// invalid entry is harmless, `snap_cap_tab` just falls through it.
+    cap_tab_by_device: std::collections::HashMap<DeviceId, CapTab>,
     /// Error from the last device enumeration, surfaced in the sidebar.
     devices_error: Option<String>,
     /// When set: the OTP code we placed on the clipboard and the time
@@ -2014,6 +2650,26 @@ struct App {
     openpgp: OpenPgpState,
     /// PIV read-only status view state.
     piv: PivState,
+    /// Per-device cache of [`keyroost_transport::PivSessionState`] — the
+    /// applet identity, applet-specific byte cache, and in-session public-
+    /// key cache a `PivSession` would otherwise have to re-resolve from
+    /// scratch every single action (sessions are opened fresh per action,
+    /// never kept alive across them). Every PIV action reads its device's
+    /// entry (or an empty default, the first time) before spawning its job,
+    /// hands it to `PivSession::with_cached_transaction`, and — once the job's session is
+    /// done with whatever it went on to do — stores `PivSession::state()`
+    /// back here, so the *next* action on the same device gets to skip
+    /// re-probing identity, and the public-key cache (bridging "generate" to
+    /// a later "sign a CSR with it" on cards without GET METADATA) survives
+    /// switching to another device's tab and back, which it did not before
+    /// this map existed. `with_cached_transaction`'s own validation (PC/SC presence
+    /// bookkeeping, ATR, raw SELECT response) is what makes trusting a
+    /// carried-over entry safe even though the physical card in a reader can
+    /// change between two actions — see that method's doc. Keyed by
+    /// [`DeviceId`], not reader name: pruned in lockstep with `devices`
+    /// wherever a device disappears, so an unplugged key's cached identity
+    /// doesn't linger indefinitely.
+    piv_session_state: std::collections::HashMap<DeviceId, keyroost_transport::PivSessionState>,
     /// Token2 on-device OTP (TOTP/HOTP) view state.
     otp: OtpState,
     /// Dark / light theme (persisted via eframe storage).
@@ -2070,7 +2726,36 @@ struct App {
     reset_arm: Option<ResetArm>,
     /// Pending whole-device factory-reset confirmation, bound to the device it
     /// was opened for (KEY-008 posture). None unless the modal is open.
-    factory_reset_confirm: Option<DeviceId>,
+    factory_reset_confirm: Option<FactoryResetConfirmState>,
+    /// Validation error from the last "Yes, wipe this key" click on the
+    /// factory-reset confirm dialog (e.g. bad hex in the reset management-auth
+    /// credential field) — shown inline in that dialog, cleared on a fresh
+    /// arm, a successful submit, or Cancel. Kept separate from `piv.error`:
+    /// this error belongs to the confirm dialog, not the PIV pane, and must
+    /// not leak into (or be clobbered by) that pane's own error state.
+    factory_reset_confirm_error: Option<String>,
+    /// Typed-`reset` text for the factory-reset confirm dialog's guard —
+    /// mirrors `PivState::confirm_reset`/`typed_reset_modal`'s gate so both
+    /// destructive-reset dialogs demand the same "type reset to confirm"
+    /// ceremony before "Yes, wipe this key" arms. Cleared on arm, cancel, and
+    /// successful submit alongside `factory_reset_confirm`/
+    /// `factory_reset_confirm_error`.
+    factory_reset_confirm_typed: String,
+    /// Mode for the factory-reset confirm dialog's reset management-auth
+    /// credential prompt (shown only when
+    /// `FactoryResetConfirmState::needs_reset_mgmt_auth` is true). Lives on `App`,
+    /// not inside `FactoryResetConfirmState`, for the same reason
+    /// `PivState::mgmt_auth_mode` lives on `PivState` rather than inside
+    /// whatever op is using it: it's user-typed UI state that must survive
+    /// the confirm-arming round trip (fingerprinting runs as a background
+    /// job in between) and be wiped explicitly on submit/cancel, not
+    /// implicitly dropped with whatever state happened to be armed when it
+    /// was typed.
+    reset_mgmt_auth_mode: ResetMgmtAuthMode,
+    /// Typed field backing `reset_mgmt_auth_mode`: a management-key hex
+    /// string in `Manual` mode, a PIN in `Pin` mode. Wiped on submit and on
+    /// dialog dismissal, same discipline as `PivState::mgmt_key_input`.
+    reset_mgmt_auth_input: String,
     /// Live per-step report while a factory reset runs (empty when idle).
     factory_reset_report: Vec<FactoryResetRow>,
     /// Remaining scans in the current burst. A single scan races slow-to-
@@ -2255,9 +2940,25 @@ impl App {
                         let text = path.display().to_string();
                         match target {
                             FileTarget::OpenpgpImport => self.openpgp.import_path = text,
-                            FileTarget::PivCsr => self.piv.csr_path = text,
-                            FileTarget::PivCert => self.piv.cert_path = text,
-                            FileTarget::PivExport => self.piv.export_path = text,
+                            // PIV cert file ops pick the path first, then act:
+                            // CSR and import need a secret, so open their modal;
+                            // export writes straight to the chosen path.
+                            FileTarget::PivCsr => {
+                                self.piv.csr_path = text;
+                                self.piv_cred_modal_close();
+                                self.piv.cred_modal =
+                                    Some(PivCredModal::new(PivCredKind::RequestCsr));
+                            }
+                            FileTarget::PivCert => {
+                                self.piv.cert_path = text;
+                                self.piv_cred_modal_close();
+                                self.piv.cred_modal =
+                                    Some(PivCredModal::new(PivCredKind::ImportCert));
+                            }
+                            FileTarget::PivExport => {
+                                self.piv.export_path = text;
+                                self.piv_export_cert();
+                            }
                             FileTarget::LbExport(idx) => {
                                 use keyroost_ctap::large_blobs::EntryKind;
                                 // The array may have been reloaded, cleared, or
@@ -2479,6 +3180,32 @@ enum Severity {
 enum LogKind {
     User,
     Background,
+}
+
+/// Whether [`App::load_piv_status`] should reuse this device's cached
+/// [`keyroost_transport::PivSessionState`] or force a from-scratch
+/// resolution — independent of [`LogKind`]: how loudly a read is logged and
+/// whether it trusts the cache are two separate questions. Today's sole
+/// `Bypass` caller (the Refresh button) happens to also be the sole
+/// `LogKind::User` caller, but that's a coincidence of what the button does,
+/// not a rule tying the two together — a future caller is free to mix them
+/// the other way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PivCache {
+    /// Reuse this device's `piv_session_state` entry via
+    /// [`keyroost_transport::PivSession::with_cached_transaction`] — the default for
+    /// every unprompted read (first tab view, the re-read every write
+    /// triggers): `with_cached_transaction`'s own checks already vouch for it, so
+    /// there's no reason to distrust it just because nothing asked to.
+    Reuse,
+    /// Ignore whatever's cached and open via a plain
+    /// [`keyroost_transport::PivSession::with_transaction`] — a real SELECT, a real
+    /// fingerprint probe, no shortcuts, same as if this device had never
+    /// been seen this app run. The result still gets stored back into
+    /// `piv_session_state` afterward like any other read, so this doesn't
+    /// leave the cache disabled going forward — it only forces *this* read
+    /// to double-check it.
+    Bypass,
 }
 
 impl App {
@@ -4352,11 +5079,13 @@ impl App {
                 app.security_keys.info = None;
                 app.security_keys.error = None;
                 // When this reset was a factory reset's finale, record it —
-                // the Overview report is where the user is looking.
-                resolve_fido_reset_row(
-                    &mut app.factory_reset_report,
-                    keyroost_resolve::StepOutcome::Wiped,
-                );
+                // the Overview report is where the user is looking, and the
+                // activity log, where the permanent record lives.
+                let outcome = keyroost_resolve::StepOutcome::Wiped;
+                if resolve_fido_reset_row(&mut app.factory_reset_report, outcome.clone()) {
+                    let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                    app.log(severity, line);
+                }
                 // Re-read info so the PIN status reflects the wipe.
                 app.fetch_selected_info();
             }
@@ -4373,11 +5102,14 @@ impl App {
                 // `security_keys.error` is painted only in the FIDO2 and PIN
                 // panes; a factory reset leaves the user on Overview, so the
                 // failure has to land in the report too or the wipe looks
-                // complete when the passkeys and PIN survived.
-                resolve_fido_reset_row(
-                    &mut app.factory_reset_report,
-                    keyroost_resolve::StepOutcome::Failed(msg.clone()),
-                );
+                // complete when the passkeys and PIN survived — and in the
+                // activity log, so the permanent record doesn't stop at
+                // whatever the card sweep alone finished with.
+                let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
+                if resolve_fido_reset_row(&mut app.factory_reset_report, outcome.clone()) {
+                    let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                    app.log(severity, line);
+                }
                 app.security_keys.error = Some(msg);
             }
         }
@@ -4977,25 +5709,136 @@ impl App {
         });
     }
 
+    /// The "Factory reset…" button's click handler: arms the confirm dialog
+    /// for the selected device, but if its plan includes a PIV step,
+    /// fingerprints PIV on the worker first — both `PivResetPreview`
+    /// (`PivSession::preview_factory_reset` — read-only, no PIN/PUK attempt;
+    /// tells the confirm dialog exactly which mechanism `factory_reset` will
+    /// run, or that neither is available) and whether that mechanism needs a
+    /// credential (`PivSession::global_reset_available`) — so the dialog's
+    /// text can say exactly what will happen (or be skipped) instead of
+    /// hedging across every possibility before the fact, and so it knows
+    /// whether to show the credential prompt at all. Same verdict
+    /// `PivSession::factory_reset` resolves again when the reset actually runs
+    /// — see `FactoryResetPivPreview`'s doc for why that's a deliberate,
+    /// cheap re-check rather than reused state (`needs_reset_mgmt_auth` itself,
+    /// unlike `piv_preview`, IS carried forward into `run_factory_reset_gui`
+    /// rather than re-fingerprinted — see that method's doc for why the two
+    /// differ).
+    ///
+    /// A device with no PIV step arms immediately. A device with one arms
+    /// only once the fingerprint job completes; a click while a job is
+    /// already in flight silently drops (the button can simply be pressed
+    /// again) — nothing user-typed is at stake here, unlike the callers
+    /// `spawn_job`'s own doc warns about.
+    fn start_factory_reset_confirm(&mut self) {
+        let Some(dev) = self.selected_device().cloned() else {
+            return;
+        };
+        self.factory_reset_confirm_typed.clear();
+        let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        if !plan.contains(&keyroost_resolve::ResetStep::Piv) {
+            self.factory_reset_confirm = Some(FactoryResetConfirmState {
+                for_device: dev.id,
+                piv_preview: FactoryResetPivPreview::NotOffered,
+                needs_reset_mgmt_auth: false,
+                default_mgmt_key: None,
+                reset_long_running: false,
+            });
+            return;
+        }
+        let Some(reader) = dev.reader.clone() else {
+            // `Caps::PIV` says PIV should be reachable, but there's no PC/SC
+            // reader to fingerprint it over (shouldn't happen in practice) —
+            // arm with the same fallback wording an outright fingerprint
+            // failure gets rather than get stuck offering nothing.
+            self.factory_reset_confirm = Some(FactoryResetConfirmState {
+                for_device: dev.id,
+                piv_preview: FactoryResetPivPreview::CheckFailed,
+                needs_reset_mgmt_auth: false,
+                default_mgmt_key: None,
+                reset_long_running: false,
+            });
+            return;
+        };
+        let for_device = dev.id;
+        self.spawn_job("Checking PIV reset support\u{2026}", move || {
+            let (preview, needs_reset_mgmt_auth, default_mgmt_key, reset_long_running) =
+                keyroost_transport::PivSession::with_transaction(&reader, |s| {
+                    // One fingerprint serves all four checks — see
+                    // `PivSession::preview_factory_reset`/
+                    // `global_reset_available`/`default_management_key`/
+                    // `quirks`'s docs.
+                    let preview = FactoryResetPivPreview::Resolved(s.preview_factory_reset());
+                    Ok::<_, TransportError>((
+                        preview,
+                        s.global_reset_available(),
+                        s.default_management_key(),
+                        s.quirks()
+                            .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning),
+                    ))
+                })
+                .unwrap_or((
+                    FactoryResetPivPreview::CheckFailed,
+                    false,
+                    None,
+                    false,
+                ));
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(Some(&for_device), app.selected_device.as_ref()) {
+                    return;
+                }
+                app.factory_reset_confirm = Some(FactoryResetConfirmState {
+                    for_device,
+                    piv_preview: preview,
+                    needs_reset_mgmt_auth,
+                    default_mgmt_key,
+                    reset_long_running,
+                });
+            })
+        });
+    }
+
     /// Confirm modal for the whole-device factory reset. Device-bound like
     /// `render_oath_reset_confirm`: it dies the instant the selection changes,
     /// so a confirmed wipe can only ever land on the key it was opened for
     /// (KEY-008). "Yes, wipe this key" starts the sequential reset job.
     fn render_factory_reset_confirm(&mut self, ctx: &egui::Context, p: &Palette) {
-        let Some(for_device) = self.factory_reset_confirm.clone() else {
+        let Some(FactoryResetConfirmState {
+            for_device,
+            piv_preview,
+            needs_reset_mgmt_auth,
+            default_mgmt_key,
+            reset_long_running,
+        }) = self.factory_reset_confirm.clone()
+        else {
             return;
         };
         if !completion_still_valid(Some(&for_device), self.selected_device.as_ref()) {
             self.factory_reset_confirm = None;
+            self.factory_reset_confirm_error = None;
+            self.factory_reset_confirm_typed.clear();
             return;
         }
         let summary = match self.selected_device() {
             Some(dev) => {
-                let plan = keyroost_resolve::factory_reset_plan(dev.caps);
-                factory_reset_confirm_summary(&dev.serial, &dev.model, &plan)
+                let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+                if factory_reset_piv_unresettable(piv_preview) {
+                    keyroost_resolve::exclude_unresettable_piv(&mut plan);
+                }
+                factory_reset_confirm_summary(
+                    &dev.serial,
+                    &dev.model,
+                    &plan,
+                    piv_preview,
+                    needs_reset_mgmt_auth,
+                    reset_long_running,
+                )
             }
             None => {
                 self.factory_reset_confirm = None;
+                self.factory_reset_confirm_error = None;
+                self.factory_reset_confirm_typed.clear();
                 return;
             }
         };
@@ -5006,11 +5849,30 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label(summary);
+                if needs_reset_mgmt_auth {
+                    ui.add_space(8.0);
+                    self.factory_reset_mgmt_auth_field(ui, p, default_mgmt_key);
+                }
+                if let Some(err) = &self.factory_reset_confirm_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.err, err);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
-                        decision = Some(true);
-                    }
+                    ui.label("Type \u{201c}reset\u{201d} to confirm:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.factory_reset_confirm_typed)
+                            .desired_width(120.0),
+                    );
+                });
+                ui.add_space(8.0);
+                let armed = self.factory_reset_confirm_typed.trim() == "reset";
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(armed, |ui| {
+                        if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
+                            decision = Some(true);
+                        }
+                    });
                     if ui.button("Cancel").clicked() {
                         decision = Some(false);
                     }
@@ -5020,12 +5882,137 @@ impl App {
             Some(true) => {
                 if self.run_factory_reset_gui() {
                     self.factory_reset_confirm = None;
+                    self.factory_reset_confirm_error = None;
+                    self.factory_reset_confirm_typed.clear();
                 }
-                // else: a job is in flight; keep the modal open so the confirmed
-                // wipe isn't silently swallowed — the user can retry when it clears.
+                // else: either a job is already in flight, or the entered
+                // credential didn't validate (`factory_reset_confirm_error`
+                // is now set) — either way keep the modal open so the
+                // confirmed wipe isn't silently swallowed; the user can fix
+                // the input or retry once the worker clears.
             }
-            Some(false) => self.factory_reset_confirm = None,
+            Some(false) => {
+                self.factory_reset_confirm = None;
+                self.factory_reset_confirm_error = None;
+                self.factory_reset_confirm_typed.clear();
+                wipe(&mut self.reset_mgmt_auth_input);
+            }
             None => {}
+        }
+    }
+
+    /// The factory-reset confirm dialog's management-auth credential prompt,
+    /// shown whenever `FactoryResetConfirmState::needs_reset_mgmt_auth` is true —
+    /// i.e. whenever `PivQuirk::ResetNeedsManagementAuth` applies.
+    /// `PivSession::factory_reset` decides on its own, from the live
+    /// fingerprint, which mechanism actually authenticates with what's typed
+    /// here: HID Crescendo's ACA instance (today's only real consumer) or,
+    /// on a fingerprint whose credential need is `PivExtension::Reset`
+    /// alone, the standard PIV management-key round
+    /// (`PivSession::authenticate_management_current`) — either way the same
+    /// field, resolved into the same `keyroost_transport::CurrentMgmtAuth`.
+    /// Same toggle-plus-field shape and wording as `App::piv_modal_mgmt_field`
+    /// — "Use default management key" / "Use PIN" checkboxes, each a pure
+    /// view onto (and setter of) `reset_mgmt_auth_mode`, plus the typed field
+    /// underneath when neither is ticked or "Use PIN" is. `default_key` is
+    /// `FactoryResetConfirmState::default_mgmt_key`, resolved for this
+    /// device by the same fingerprint job that armed the dialog; mirroring
+    /// `piv_modal_mgmt_field`, the checkbox is disabled — and reset back to
+    /// `Manual` if it was already ticked when the device stopped offering
+    /// one — whenever this is `None`, and shows the hex value in a tooltip
+    /// when it's `Some`, rather than assuming HID's factory value the way
+    /// this dialog used to. Unlike `piv_modal_mgmt_field`, there's no
+    /// `PinManagementAuth`-style support gate on "Use PIN": both choices are
+    /// always valid here, the only question is which credential the user has
+    /// on hand.
+    fn factory_reset_mgmt_auth_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        default_key: Option<&'static [u8]>,
+    ) {
+        if default_key.is_none() && self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Default {
+            // Same rationale as `piv_modal_mgmt_field`'s reset: don't leave
+            // the toggle checked for a default a device switch just took
+            // away.
+            self.reset_mgmt_auth_mode = ResetMgmtAuthMode::Manual;
+        }
+        ui.horizontal(|ui| {
+            let mut is_default = self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Default;
+            let mut resp = ui.add_enabled(
+                default_key.is_some(),
+                egui::Checkbox::new(&mut is_default, "Use default management key"),
+            );
+            if let Some(key) = default_key {
+                // Only on the enabled checkbox — a disabled one has no
+                // applicable default to show.
+                resp = resp.on_hover_text(format!("Default management key: {}", hex_lower(key)));
+            }
+            if resp.changed() {
+                self.reset_mgmt_auth_mode =
+                    reset_mgmt_auth_mode_after_toggle(is_default, ResetMgmtAuthMode::Default);
+            }
+            let mut is_pin = self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Pin;
+            if ui.checkbox(&mut is_pin, "Use PIN").changed() {
+                self.reset_mgmt_auth_mode =
+                    reset_mgmt_auth_mode_after_toggle(is_pin, ResetMgmtAuthMode::Pin);
+            }
+        });
+        if self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Default {
+            return;
+        }
+        let use_pin = self.reset_mgmt_auth_mode == ResetMgmtAuthMode::Pin;
+        let (label, hint) = if use_pin {
+            ("PIN", "PIN")
+        } else {
+            // Deliberately not `piv_modal_mgmt_field`'s "hex (48/32/64
+            // chars)": HID's ACA XAUTH key — the credential this actually
+            // authenticates with on every fingerprint that needs this field
+            // today — only ever supports TDES/AES-128 (8/16/24-byte keys),
+            // never AES-256, unlike the standard PIV 0x9B round.
+            ("Management key", "hex (16/32/48 chars)")
+        };
+        let mut reset_mgmt_rev = self
+            .secret_reveal
+            .get("reset-mgmt-auth")
+            .copied()
+            .unwrap_or(false);
+        piv_secret_field(
+            ui,
+            p,
+            label,
+            &mut self.reset_mgmt_auth_input,
+            &mut reset_mgmt_rev,
+            hint,
+            96.0,
+            300.0,
+        );
+        self.secret_reveal.insert("reset-mgmt-auth", reset_mgmt_rev);
+    }
+
+    /// Resolve the credential the user entered for the factory reset's
+    /// management-auth step: `FactoryResetConfirmState::default_mgmt_key`
+    /// when "Use default management key" is ticked, a typed PIN with "Use
+    /// PIN" ticked, otherwise the typed management-key hex. Mirrors
+    /// `App::piv_current_mgmt_key`'s shape and error wording for the
+    /// `Default` case (down to reusing the exact same "no known default"
+    /// message) and `App::piv_current_mgmt_auth`'s role: the one call site
+    /// both the dialog's validation and `run_factory_reset_gui` go through,
+    /// so the resolution logic can't drift between the two.
+    fn reset_mgmt_current_auth(&self) -> Result<ResetMgmtAuth, String> {
+        match self.reset_mgmt_auth_mode {
+            ResetMgmtAuthMode::Default => self
+                .factory_reset_confirm
+                .as_ref()
+                .and_then(|c| c.default_mgmt_key)
+                .map(|key| ResetMgmtAuth::Key(zeroize::Zeroizing::new(key.to_vec())))
+                .ok_or_else(|| "This device has no known default management key.".to_string()),
+            ResetMgmtAuthMode::Pin => Ok(ResetMgmtAuth::Pin(zeroize::Zeroizing::new(
+                self.reset_mgmt_auth_input.clone(),
+            ))),
+            ResetMgmtAuthMode::Manual => {
+                piv_mgmt_key_bytes(&self.reset_mgmt_auth_input).map(ResetMgmtAuth::Key)
+            }
         }
     }
 
@@ -5033,6 +6020,17 @@ impl App {
     /// against. Lifted out of `run_factory_reset_gui`'s apply closure for the
     /// same reason as [`App::apply_reset_path_outcome`]: the device-binding
     /// rule is the part worth testing, and it needs no key in hand.
+    ///
+    /// Every path through here logs a plain-language summary
+    /// (`factory_reset_report_summary`: which steps wiped, failed, or were
+    /// skipped, and why) — independent of `factory_reset_report` (the
+    /// Overview pane's own live list, overwritten by the next run) and
+    /// independent of any APDU trace. That `log`/`log_global` call is also
+    /// what flushes a trace captured for this job: `App::push_log` is the
+    /// sole consumer of `App::pending_trace` (see `Worker::spawn`'s doc), so
+    /// a path through here that never logs would silently drop it — this
+    /// function used to have exactly one such path (see the orphaned case
+    /// below, which already logged, and the normal case, which didn't).
     ///
     /// The orphaned case is louder here than anywhere else in the file. By the
     /// time this runs, every card step has already been executed against the
@@ -5054,28 +6052,6 @@ impl App {
             // and deliberately don't open the FIDO dialog either, because
             // arming a wipe under the key on screen now is exactly what the
             // guard exists to prevent.
-            let wiped: Vec<&str> = reports
-                .iter()
-                .filter(|r| matches!(r.outcome, StepOutcome::Wiped))
-                .map(|r| r.step.label())
-                .collect();
-            let failed: Vec<String> = reports
-                .iter()
-                .filter_map(|r| match &r.outcome {
-                    StepOutcome::Failed(e) => Some(format!("{}: {e}", r.step.label())),
-                    _ => None,
-                })
-                .collect();
-            let wiped_txt = if wiped.is_empty() {
-                "nothing".to_string()
-            } else {
-                wiped.join(", ")
-            };
-            let failed_txt = if failed.is_empty() {
-                "nothing".to_string()
-            } else {
-                failed.join("; ")
-            };
             let fido_txt = if ends_in_fido {
                 format!(
                     " {} was left un-wiped \u{2014} the replug-and-touch ceremony never started.",
@@ -5088,9 +6064,9 @@ impl App {
                 Severity::Warn,
                 LogKind::User,
                 format!(
-                    "a factory reset finished after the selection moved on \u{2014} wiped: \
-                     {wiped_txt}; not wiped: {failed_txt}.{fido_txt} Re-select that key to see \
-                     its current state and finish the reset."
+                    "a factory reset finished after the selection moved on \u{2014} {}.{fido_txt} \
+                     Re-select that key to see its current state and finish the reset.",
+                    factory_reset_report_summary(&reports)
                 ),
             );
             return;
@@ -5099,7 +6075,15 @@ impl App {
         // (mirrors the OATH reset apply), clearing its "tried" flag so the
         // pane re-lists on its own.
         for r in &reports {
-            if matches!(r.outcome, StepOutcome::Wiped) {
+            // `WipedGlobal` and `WipedWithWarning` count here too: the
+            // applet itself really was wiped, either cleanly via the
+            // device-wide mechanism or with a non-fatal follow-up (today:
+            // PIV's courtesy XAUTH-key restore) that didn't go cleanly --
+            // the pane's stale state still needs clearing either way.
+            if matches!(
+                r.outcome,
+                StepOutcome::Wiped | StepOutcome::WipedGlobal | StepOutcome::WipedWithWarning(_)
+            ) {
                 match r.step {
                     ResetStep::Oath => {
                         app.oath = OathState::default();
@@ -5108,6 +6092,10 @@ impl App {
                     ResetStep::OpenPgp => {
                         app.openpgp = OpenPgpState::default();
                     }
+                    // Fires regardless of which mechanism `PivSession::
+                    // factory_reset` actually ran (device-wide or PIV-only) --
+                    // `ResetStep::Piv` covers both; there's no separate step
+                    // for the device-wide path any more.
                     ResetStep::Piv => {
                         app.piv = PivState::default();
                         app.piv_tried = false;
@@ -5120,6 +6108,36 @@ impl App {
                 }
             }
         }
+        // Record the run in the activity log — independent of any APDU
+        // trace: whether a factory reset ran, which applets it wiped, and
+        // which steps failed or were skipped (and why). This is also the
+        // call that flushes a captured APDU trace: `App::push_log` is the
+        // sole consumer of `App::pending_trace` (see `Worker::spawn`'s doc),
+        // so without a `log` call here, a trace captured for this whole job
+        // had nowhere to attach and was silently discarded — this whole
+        // function used to report only through `factory_reset_report`
+        // (the Overview pane's own list), never through the activity log.
+        // `WipedGlobal` counts as clean here (it's a full success, just via
+        // a different mechanism), but deliberately not
+        // `| StepOutcome::WipedWithWarning(_)`, unlike the pane-reinit loop
+        // above: the applet is wiped either way, but a run with a warning
+        // attached isn't a clean run, and `Severity::Warn` is what actually
+        // gets that warning in front of the user.
+        let severity = if reports
+            .iter()
+            .all(|r| matches!(r.outcome, StepOutcome::Wiped | StepOutcome::WipedGlobal))
+        {
+            Severity::Ok
+        } else {
+            Severity::Warn
+        };
+        app.log(
+            severity,
+            format!(
+                "factory reset finished \u{2014} {}",
+                factory_reset_report_summary(&reports)
+            ),
+        );
         app.factory_reset_report = reports.into_iter().map(FactoryResetRow::Step).collect();
         // Hand the FIDO finale to the tested armed-reset flow. Seed its
         // report row first: the ceremony can fail (no touch in time) or
@@ -5140,15 +6158,69 @@ impl App {
     /// re-initialise the wiped panes, and — when the plan ends in FIDO — hand
     /// the finale to the existing armed `ResetDialog` (which owns the replug +
     /// touch ceremony), so no new FIDO logic is written here.
+    ///
+    /// If the armed `factory_reset_confirm` says a management-key credential
+    /// is needed (`FactoryResetConfirmState::needs_reset_mgmt_auth` — set
+    /// once, by `start_factory_reset_confirm`'s fingerprint, and carried
+    /// forward rather than re-checked here): resolves the credential the user
+    /// typed into the confirm dialog (`Self::reset_mgmt_current_auth`) and
+    /// hands it to `run_card_reset_step`'s `Piv` branch, which passes it straight
+    /// through to `PivSession::factory_reset` — that method decides on its own
+    /// which mechanism actually consumes it (or, if neither `PivExtension::
+    /// Reset` nor `ResetGlobal` is available, that it goes unused). Also
+    /// excludes `ResetStep::Piv` from the plan entirely when
+    /// `piv_preview` says neither mechanism is available at all
+    /// (`factory_reset_piv_unresettable` /
+    /// `keyroost_resolve::exclude_unresettable_piv`) — same decision
+    /// `render_factory_reset_confirm` already made for the dialog text, made
+    /// again here from the same stored `piv_preview` rather than a fresh
+    /// fingerprint, for the reason the next paragraph gives.
+    ///
+    /// Unlike the individual PIV step's own fingerprint (deliberately
+    /// re-run fresh every time it executes — see `FactoryResetPivPreview`'s
+    /// doc), *what's in the plan* is decided once, when the dialog was
+    /// armed, and not revisited here: re-deciding plan membership would need
+    /// its own PC/SC round trip before this method could even build
+    /// `card_steps`, which blocking-I/O-on-the-UI-thread this whole
+    /// worker-job structure exists to avoid.
+    ///
+    /// An invalid credential returns `false` (same "keep the dialog open"
+    /// signal a busy worker gives) with `factory_reset_confirm_error` set,
+    /// instead of queuing a job that could only fail once it reached the
+    /// card.
     fn run_factory_reset_gui(&mut self) -> bool {
         use keyroost_resolve::{ResetStep, StepReport};
         let Some(dev) = self.selected_device().cloned() else {
             return false;
         };
-        let plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
+        let piv_preview = self
+            .factory_reset_confirm
+            .as_ref()
+            .map(|c| c.piv_preview)
+            .unwrap_or(FactoryResetPivPreview::NotOffered);
+        if factory_reset_piv_unresettable(piv_preview) {
+            keyroost_resolve::exclude_unresettable_piv(&mut plan);
+        }
         if plan.is_empty() {
             return false;
         }
+        let needs_reset_mgmt_auth = self
+            .factory_reset_confirm
+            .as_ref()
+            .is_some_and(|c| c.needs_reset_mgmt_auth);
+        let reset_mgmt_auth = if needs_reset_mgmt_auth {
+            match self.reset_mgmt_current_auth() {
+                Ok(auth) => Some(auth),
+                Err(e) => {
+                    self.factory_reset_confirm_error = Some(e);
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        self.factory_reset_confirm_error = None;
         // Capture the transport descriptors before going off-thread.
         let reader = dev.reader.clone();
         let hid_path = dev.hid_path.clone();
@@ -5166,10 +6238,16 @@ impl App {
         self.spawn_job("Factory-resetting key\u{2026}", move || {
             let mut reports: Vec<StepReport> = Vec::new();
             for step in card_steps {
-                let outcome = run_card_reset_step(step, reader.as_deref(), hid_path.as_deref());
+                let outcome = run_card_reset_step(
+                    step,
+                    reader.as_deref(),
+                    hid_path.as_deref(),
+                    reset_mgmt_auth.as_ref(),
+                );
                 reports.push(StepReport { step, outcome });
             }
             Box::new(move |app: &mut App| {
+                wipe(&mut app.reset_mgmt_auth_input);
                 App::apply_factory_reset_sweep(app, for_device.as_ref(), reports, ends_in_fido)
             })
         })
@@ -5213,7 +6291,7 @@ impl App {
         let waiting = self.reset_arm.as_ref().is_some_and(|arm| {
             completion_still_valid(arm.for_device.as_ref(), self.selected_device.as_ref())
         });
-        egui::Window::new("Reset security key?")
+        egui::Window::new("Reset FIDO security key?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -5303,10 +6381,14 @@ impl App {
                                progress. Retry from the FIDO2 pane once it finishes; \
                                the card was not touched."
                         .to_string();
-                    resolve_pending_fido_reset_row(
+                    let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
+                    if resolve_pending_fido_reset_row(
                         &mut self.factory_reset_report,
-                        keyroost_resolve::StepOutcome::Failed(msg.clone()),
-                    );
+                        outcome.clone(),
+                    ) {
+                        let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                        self.log(severity, line);
+                    }
                     self.security_keys.error = Some(msg);
                 }
             } else {
@@ -5317,16 +6399,20 @@ impl App {
             self.security_keys.reset = ResetDialog::default();
             self.reset_arm = None;
             // If this dialog was a factory reset's FIDO finale, say so in the
-            // report rather than leaving a row that reads as still in progress.
+            // report rather than leaving a row that reads as still in progress
+            // — and in the activity log, whose "factory reset finished" line
+            // was written before this ceremony even started and never
+            // otherwise learns how it ended.
             // Pending-only: a row that already answered belongs to an earlier
             // ceremony this cancel didn't undo (the report outlives the dialog),
             // and rewriting a completed wipe as "failed" asks for it again.
-            resolve_pending_fido_reset_row(
-                &mut self.factory_reset_report,
-                keyroost_resolve::StepOutcome::Failed(
-                    "cancelled \u{2014} the passkeys and PIN are still on this key".into(),
-                ),
+            let outcome = keyroost_resolve::StepOutcome::Failed(
+                "cancelled \u{2014} the passkeys and PIN are still on this key".into(),
             );
+            if resolve_pending_fido_reset_row(&mut self.factory_reset_report, outcome.clone()) {
+                let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                self.log(severity, line);
+            }
         }
     }
 
@@ -5386,10 +6472,11 @@ impl App {
             // for a replug-and-touch ceremony that is never coming. Pending-only
             // for the same reason as the cancel branch: nothing was attempted
             // here, so an already-answered row is not this refusal's to rewrite.
-            resolve_pending_fido_reset_row(
-                &mut self.factory_reset_report,
-                keyroost_resolve::StepOutcome::Failed(msg.clone()),
-            );
+            let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
+            if resolve_pending_fido_reset_row(&mut self.factory_reset_report, outcome.clone()) {
+                let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+                self.log(severity, line);
+            }
             self.security_keys.error = Some(msg);
         } else {
             self.reset_arm = Some(ResetArm {
@@ -5651,7 +6738,8 @@ impl App {
 
     /// The admin PIN (PW3) the modal's flows send: the typed `admin_pin`, or the
     /// well-known factory default when "Use default admin PIN (PW3)" is ticked.
-    /// Mirrors the PIV `use_default_mgmt` convenience. Does not mutate state.
+    /// Mirrors the PIV `PivMgmtAuthMode::Default` convenience. Does not
+    /// mutate state.
     fn openpgp_admin_pin_value(&self) -> String {
         if self.openpgp.use_default_admin {
             OPENPGP_DEFAULT_ADMIN_PIN.to_string()
@@ -5992,16 +7080,54 @@ fn piv_mgmt_key_bytes(hex: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> 
         .map_err(|e| format!("management key is not valid hex: {}", e))
 }
 
-/// The well-known factory-default PIV management key, as a hex string. The
-/// standard PIV default is 24 bytes of `01 02 03 04 05 06 07 08` repeated three
-/// times (a 3-DES / AES-192 key); Token2 PIN+ ships a vendor-specific default
-/// instead. Used by the modal's "Use default management key" convenience toggle
-/// so the common case (key never rotated) is one click.
-fn piv_default_mgmt_key_hex(is_token2: bool) -> &'static str {
-    if is_token2 {
-        "865362865362865362865362865362865362865362865362"
-    } else {
-        "010203040506070801020304050607080102030405060708"
+/// The well-known factory-default PIV/XAUTH management-key bytes for a
+/// device fingerprinted as `fingerprint` at `version`/`firmware_version`, if
+/// keyroost has one on record —
+/// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`], read off
+/// [`keyroost_piv::compat::resolve_quirks`]. `None` means keyroost has no
+/// known default for this device (an unrecognised fingerprint, or one the
+/// quirk table deliberately leaves unseeded) — the modal's "Use default
+/// management key" convenience toggle
+/// ([`App::piv_modal_mgmt_field`]) disables itself in that case rather than
+/// offering a default it can't actually supply. The slice's length is
+/// whatever that fingerprint's management-key algorithm actually takes — 16
+/// bytes for AES-128, 24 for 3-DES/AES-192, 32 for AES-256 — never assume 24.
+fn piv_default_mgmt_key(
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<&'static [u8]> {
+    keyroost_piv::compat::default_9b_management_key(&keyroost_piv::compat::resolve_quirks(
+        fingerprint,
+        version,
+        firmware_version,
+    ))
+}
+
+/// How the user authorized a PIV management operation — the standard
+/// management key (typed or the well-known default), or a PIN for
+/// `keyroost_piv::compat::PivExtension::PinManagementAuth`. Produced by
+/// `App::piv_current_mgmt_auth`, consumed by `piv_authenticate`.
+enum PivMgmtAuth {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Pin(zeroize::Zeroizing<String>),
+}
+
+/// Unlock PIV management on an already-open session per `auth`: the standard
+/// GET METADATA/GENERAL AUTHENTICATE round for `PivMgmtAuth::Key`, or
+/// `PivSession::authenticate_management_via_pin` for `PivMgmtAuth::Pin`. The
+/// single call site every management-gated PIV job in this module runs
+/// through, so the two authorization paths stay in sync.
+fn piv_authenticate(
+    s: &mut keyroost_transport::PivSession<'_>,
+    auth: &PivMgmtAuth,
+) -> Result<(), TransportError> {
+    match auth {
+        PivMgmtAuth::Key(key) => {
+            let alg = s.resolve_management_key_algorithm(key.len())?;
+            s.authenticate_management(alg, key)
+        }
+        PivMgmtAuth::Pin(pin) => s.authenticate_management_via_pin(pin.as_bytes()),
     }
 }
 
@@ -6208,6 +7334,7 @@ impl App {
                         .cloned();
                     let next = keep.or_else(|| devices.first().map(|d| d.id.clone()));
                     let changed = next != app.selected_device;
+                    let previous = app.selected_device.clone();
                     app.selected_device = next;
                     // Surface duplicate-serial ambiguity (KEY-015): same-serial
                     // keys stay separately selectable (distinct #-suffixed ids),
@@ -6234,8 +7361,20 @@ impl App {
                         ),
                     );
                     app.devices = devices;
+                    // A device that's genuinely gone shouldn't leave its
+                    // cached PIV identity/pubkey data sitting in memory
+                    // indefinitely. Prune here, against an actual fresh scan
+                    // result, rather than on every selection change (nothing
+                    // about switching *which* still-present device is
+                    // selected implies any device disappeared) or on a
+                    // failed scan (transient — doesn't mean the hardware
+                    // actually went away, and wiping every entry over one
+                    // pcscd hiccup would force a full re-fingerprint of
+                    // everything on the next successful scan for no reason).
+                    app.piv_session_state
+                        .retain(|id, _| app.devices.iter().any(|d| &d.id == id));
                     if changed {
-                        app.on_device_selected();
+                        app.on_device_selected(previous);
                     }
                 }
                 Err(e) => {
@@ -6264,10 +7403,10 @@ impl App {
     fn apply_device_scan_failure(app: &mut App, error: String) {
         app.devices_error = Some(error);
         app.devices.clear();
-        if app.selected_device.take().is_some() {
+        if let Some(previous) = app.selected_device.take() {
             // Same teardown as any other selection change. With nothing
             // selected it returns before dispatching any read.
-            app.on_device_selected();
+            app.on_device_selected(Some(previous));
         }
     }
 
@@ -6276,16 +7415,31 @@ impl App {
         if self.selected_device.as_deref() == Some(id.as_str()) {
             return;
         }
-        self.selected_device = Some(id);
-        self.on_device_selected();
+        let previous = self.selected_device.replace(id);
+        self.on_device_selected(previous);
     }
 
     /// Reset per-applet state for a new selection and kick off the cheap,
     /// no-touch reads (FIDO GetInfo; Molto2 session open). OATH/PGP/PIV reads
     /// stay deferred to their tab so selecting a key never triggers a surprise
-    /// touch prompt.
-    fn on_device_selected(&mut self) {
-        self.cap_tab = CapTab::Overview;
+    /// touch prompt. `previous` is the device id that was selected before
+    /// this change (`None` if nothing was), needed only to save its
+    /// `cap_tab` pick — everything else this resets is genuinely per-device
+    /// UI/session state with nothing worth carrying forward under any id.
+    fn on_device_selected(&mut self, previous: Option<DeviceId>) {
+        if let Some(prev) = previous {
+            self.cap_tab_by_device.insert(prev, self.cap_tab);
+        }
+        // The raw remembered pick, or `Overview` for a device seen for the
+        // first time — `cap_tabs` corrects it at render time if it's stale
+        // for this device (`snap_cap_tab`), so no need to consult
+        // `self.devices` here just to pre-validate it.
+        self.cap_tab = self
+            .selected_device
+            .as_ref()
+            .and_then(|id| self.cap_tab_by_device.get(id))
+            .copied()
+            .unwrap_or_default();
         self.security_keys.info = None;
         self.security_keys.init = None;
         self.security_keys.session = None;
@@ -6486,52 +7640,183 @@ impl App {
         });
     }
 
+    /// Same contract as `spawn_job` (returns whether the job actually
+    /// queued), but also manages `PivState::inflight` for the job's
+    /// lifetime: set the moment it queues, cleared as the very first thing
+    /// the apply closure does — before whatever outcome-specific work `job`
+    /// goes on to do, same ordering `piv_reset` used to hand-roll for
+    /// `reset_inflight` alone. Every PIV device job (status read, PIN/PUK/
+    /// management-key change, key generate/import/delete/move, self-test,
+    /// self-sign/CSR, CHUID write, reset, ...) should queue through this
+    /// rather than `spawn_job` directly, so `cap_piv`'s two
+    /// `add_enabled_ui(!self.piv.inflight, ...)` wraps disable the pane for
+    /// any of them uniformly instead of each call site managing its own flag.
+    fn spawn_piv_job<F>(&mut self, label: impl Into<String>, job: F) -> bool
+    where
+        F: FnOnce() -> ApplyFn + Send + 'static,
+    {
+        let queued = self.spawn_job(label, move || {
+            let apply = job();
+            Box::new(move |app: &mut App| {
+                app.piv.inflight = false;
+                apply(app);
+            }) as ApplyFn
+        });
+        if queued {
+            self.piv.inflight = true;
+        }
+        queued
+    }
+
+    /// The selected device's cached [`keyroost_transport::PivSessionState`]
+    /// (an empty, freshly-`Default`ed one the first time this device's PIV
+    /// tab does anything), cloned for a background job to move into its
+    /// `PivSession::with_cached_transaction` call — cloned rather than borrowed because
+    /// the job runs off-thread and can't hold a reference into `App`. Every
+    /// PIV action calls this before `spawn_piv_job` and passes the result
+    /// through; see the `piv_session_state` field's doc for the full round
+    /// trip.
+    fn piv_cached_piv_session_state(&self) -> keyroost_transport::PivSessionState {
+        self.selected_device
+            .as_ref()
+            .and_then(|id| self.piv_session_state.get(id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store `state` as `device`'s cached PIV session state. Called from a
+    /// PIV job's apply closure with the device id captured *before* the job
+    /// was spawned (not `self.selected_device` as it stands when the apply
+    /// closure runs) — unlike `app.piv.status` and the rest of the pane's
+    /// live display, which a stale completion must discard (see
+    /// `completion_still_valid`), this map is keyed by device id and simply
+    /// unused by whatever's currently on screen if the selection moved on,
+    /// so there's nothing to guard: storing it is correct and worth doing
+    /// even for a device the user has since switched away from, precisely
+    /// so switching back to it later still finds it cached. A `None` device
+    /// (nothing was selected when the job was captured) is a no-op.
+    fn store_piv_session_state(
+        &mut self,
+        device: Option<DeviceId>,
+        state: keyroost_transport::PivSessionState,
+    ) {
+        if let Some(id) = device {
+            self.piv_session_state.insert(id, state);
+        }
+    }
+
+    /// Split a job result that also carries the session's final
+    /// [`keyroost_transport::PivSessionState`] into the plain
+    /// `Result<PivStatus, TransportError>` [`Self::apply_piv_write`] expects,
+    /// storing the state for `device` along the way (a no-op on `Err`: a
+    /// job whose `PivSession::with_cached_transaction` failed outright, or that never
+    /// got as far as producing a final state, has nothing to store). Shared
+    /// by every simple PIN/PUK/management-key/retries write, which
+    /// otherwise all repeat this same split.
+    fn store_and_unwrap_piv_write(
+        &mut self,
+        device: Option<DeviceId>,
+        result: Result<
+            (
+                keyroost_transport::PivStatus,
+                keyroost_transport::PivSessionState,
+            ),
+            TransportError,
+        >,
+    ) -> Result<keyroost_transport::PivStatus, TransportError> {
+        match result {
+            Ok((status, state)) => {
+                self.store_piv_session_state(device, state);
+                Ok(status)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::load_piv_status_with_cache`] with `cache` fixed to
+    /// [`PivCache::Reuse`] — the common case: every caller except the
+    /// Refresh button wants this. See that method's doc for the full
+    /// contract.
+    fn load_piv_status(&mut self, kind: LogKind) {
+        self.load_piv_status_with_cache(kind, PivCache::Reuse);
+    }
+
     /// Read the selected card's read-only PIV status snapshot: status + every
     /// slot's algorithm/subject/policy. `kind` should be `User` only when
     /// this runs because the user clicked "Refresh" — the initial read when
     /// the PIV tab is first opened, and the re-read every write triggers
     /// afterwards to pick up what it changed, both pass `Background` so the
     /// activity log renders them the way they actually happened (see
-    /// `LogKind`).
-    fn load_piv_status(&mut self, kind: LogKind) {
+    /// `LogKind`). `cache` governs the separate question of whether this
+    /// read trusts `piv_session_state` at all — see [`PivCache`]. Callers
+    /// that always want [`PivCache::Reuse`] (everyone but the Refresh
+    /// button) can go through [`Self::load_piv_status`] instead, which
+    /// fixes it for them. The activity log line itself distinguishes the two
+    /// outcomes a `Reuse` read can have: "PIV status read (N slots)" when
+    /// [`keyroost_transport::PivSession::touched_card`] says a live APDU
+    /// actually reached the card, "PIV status cache validated" when every
+    /// value came out of the reused state with none.
+    fn load_piv_status_with_cache(&mut self, kind: LogKind, cache: PivCache) {
         self.piv.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             return;
         };
         let for_device = self.selected_device.clone();
-        // Snapshot before crossing the thread boundary: the job opens a fresh
-        // `PivSession` that knows nothing of keys generated earlier this app
-        // run, so they are handed back via `remember_pubkey` for
-        // `status_detailed`'s algorithm fallback to name a slot GET METADATA
-        // can't describe yet — see `PivState::pubkey_cache`.
-        let pubkey_cache = self.piv.pubkey_cache.clone();
-        self.spawn_job("Reading PIV status\u{2026}", move || {
+        let cached_state = match cache {
+            PivCache::Reuse => Some(self.piv_cached_piv_session_state()),
+            PivCache::Bypass => None,
+        };
+        self.spawn_piv_job("Reading PIV status\u{2026}", move || {
             // One transport call gathers the snapshot and every slot's
             // algorithm / Subject DN / PIN-touch policy, reading each slot's
             // GET METADATA and certificate object exactly once. Doing this
             // pane-side with `slot_key_algorithm` + `read_certificate` +
             // `slot_policy` per slot re-read the certificate two or three
             // times and GET METADATA twice (`PivSession` keeps no read cache).
-            let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
-                for slot in keyroost_piv::Slot::all() {
-                    if let Some((alg, key)) = pubkey_cache.get(&slot.key_ref()) {
-                        s.remember_pubkey(slot, *alg, key.clone());
-                    }
+            // `with_cached_transaction` carries forward whatever keys generated earlier
+            // this app run were already cached — including across a device
+            // switch and back — so there's no need to reseed `remember_pubkey`
+            // per slot the way a plain `with_transaction` would have required;
+            // `PivCache::Bypass` forgoes that on purpose — see this
+            // method's doc.
+            let result = match cached_state {
+                Some(cached) => {
+                    keyroost_transport::PivSession::with_cached_transaction(&reader, cached, |s| {
+                        let detailed = s.status_detailed();
+                        // Read before `state()` so it reflects this call's
+                        // own status_detailed() and nothing after — whether
+                        // *any* of it needed a live APDU, or every value came
+                        // out of the state `with_cached_transaction` carried
+                        // in with no card round trip at all.
+                        let touched_card = s.touched_card();
+                        Ok::<_, TransportError>((detailed, s.state(), touched_card))
+                    })
                 }
-                s.status_detailed()
-            });
+                None => keyroost_transport::PivSession::with_transaction(&reader, |s| {
+                    let detailed = s.status_detailed();
+                    let touched_card = s.touched_card();
+                    Ok::<_, TransportError>((detailed, s.state(), touched_card))
+                }),
+            };
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok(Ok(detailed)) => {
+                    Ok((Ok(detailed), state, touched_card)) => {
+                        app.store_piv_session_state(for_device.clone(), state);
                         let keyroost_transport::PivStatusDetailed { status, slots, .. } = detailed;
-                        app.log_kind(
-                            Severity::Ok,
-                            kind,
-                            format!("PIV status read ({} slots)", slots.len()),
-                        );
+                        // `touched_card` false means every field above came
+                        // out of the cache `with_cached_transaction` reused, with no
+                        // live APDU at all — say so distinctly from an
+                        // actual read, rather than implying this round trip
+                        // hit the card when it didn't.
+                        let message = if touched_card {
+                            format!("PIV status read ({} slots)", slots.len())
+                        } else {
+                            "PIV status cache validated".to_string()
+                        };
+                        app.log_kind(Severity::Ok, kind, message);
                         app.piv.slot_keys = slots
                             .iter()
                             .map(|d| (d.slot, d.algorithm, d.subject.clone()))
@@ -6540,7 +7825,12 @@ impl App {
                         app.piv.status = Some(status);
                         app.piv.loaded = true;
                     }
-                    Ok(Err(e)) | Err(e) => {
+                    Ok((Err(e), state, _touched_card)) => {
+                        app.store_piv_session_state(for_device.clone(), state);
+                        app.log_kind(Severity::Err, kind, format!("PIV status read: {e}"));
+                        app.piv.error = Some(e.to_string());
+                    }
+                    Err(e) => {
                         app.log_kind(Severity::Err, kind, format!("PIV status read: {e}"));
                         app.piv.error = Some(e.to_string());
                     }
@@ -6621,16 +7911,20 @@ impl App {
         }
         let (old, new) = (self.piv.pin_old.clone(), self.piv.pin_new.clone());
         self.piv.notice = None;
-        self.spawn_job("Changing PIV PIN\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                s.change_pin(old.as_bytes(), new.as_bytes())?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Changing PIV PIN\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    s.change_pin(old.as_bytes(), new.as_bytes())?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.pin_old);
                 wipe(&mut app.piv.pin_new);
                 wipe(&mut app.piv.pin_confirm);
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(app, result, "PIN changed.".into());
                 Self::apply_piv_cred_result(app);
             })
@@ -6648,16 +7942,20 @@ impl App {
         }
         let (old, new) = (self.piv.puk_old.clone(), self.piv.puk_new.clone());
         self.piv.notice = None;
-        self.spawn_job("Changing PUK\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                s.change_puk(old.as_bytes(), new.as_bytes())?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Changing PUK\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    s.change_puk(old.as_bytes(), new.as_bytes())?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.puk_old);
                 wipe(&mut app.piv.puk_new);
                 wipe(&mut app.piv.puk_confirm);
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(app, result, "PUK changed.".into());
                 Self::apply_piv_cred_result(app);
             })
@@ -6673,43 +7971,89 @@ impl App {
             self.piv.unblock_new_pin.clone(),
         );
         self.piv.notice = None;
-        self.spawn_job("Unblocking PIN\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Unblocking PIN\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    s.unblock_pin(puk.as_bytes(), new.as_bytes())?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.unblock_puk);
                 wipe(&mut app.piv.unblock_new_pin);
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(app, result, "PIN unblocked and reset.".into());
                 Self::apply_piv_cred_result(app);
             })
         });
     }
 
+    /// [`piv_default_mgmt_key`] for the currently selected card's last-read
+    /// status — `None` before any status has been read, or when this
+    /// fingerprint/version carries no
+    /// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`]. The one
+    /// place both [`Self::piv_current_mgmt_key`] and
+    /// [`Self::piv_modal_mgmt_field`]'s checkbox-enablement check resolve
+    /// this, so the two can't disagree about whether a default is on offer.
+    fn piv_current_default_mgmt_key(&self) -> Option<&'static [u8]> {
+        let status = self.piv.status.as_ref()?;
+        piv_default_mgmt_key(
+            status.applet_fingerprint,
+            status.version.as_deref(),
+            status.version_firmware.as_deref(),
+        )
+    }
+
     /// Resolve the *current* management key the user authorized this op with:
-    /// the well-known factory default when "Use default management key" is
-    /// ticked, otherwise the hex they typed. Decoding errors are surfaced the
-    /// same way the inline field's were.
+    /// this device's well-known factory default when "Use default management
+    /// key" is ticked, otherwise the hex they typed. Decoding errors are
+    /// surfaced the same way the inline field's were; ticking the toggle on a
+    /// device with no known default (which the checkbox should already be
+    /// disabled for — see [`Self::piv_modal_mgmt_field`]) surfaces the same
+    /// way rather than silently falling back to a guess.
     fn piv_current_mgmt_key(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
-        if self.piv.use_default_mgmt {
-            let is_token2 = self
-                .selected_device()
-                .map(|d| d.vendor.eq_ignore_ascii_case("token2"))
-                .unwrap_or(false);
-            piv_mgmt_key_bytes(piv_default_mgmt_key_hex(is_token2))
+        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
+            self.piv_current_default_mgmt_key()
+                .map(|key| zeroize::Zeroizing::new(key.to_vec()))
+                .ok_or_else(|| "This device has no known default management key.".to_string())
         } else {
             piv_mgmt_key_bytes(&self.piv.mgmt_key_input)
         }
+    }
+
+    /// Resolve how the user authorized `kind`'s management operation: the
+    /// standard management key (default or typed — [`Self::piv_current_mgmt_key`])
+    /// or, with "Use PIN" ticked, a PIN for
+    /// `PivSession::authenticate_management_via_pin`. The PIN itself comes
+    /// from `mgmt_key_input` normally, or — for a flow with a dedicated PIN
+    /// field of its own (`PivCredKind::shares_pin_field`) — from that field
+    /// directly, exactly the sequence [`piv_authenticate`] would run had the
+    /// same PIN been typed into the management-key field instead: PIV has
+    /// only one application PIN, so there's nothing to gain by asking twice.
+    fn piv_current_mgmt_auth(&self, kind: PivCredKind) -> Result<PivMgmtAuth, String> {
+        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+            let pin = if kind.shares_pin_field() {
+                match kind {
+                    PivCredKind::SelfSign => &self.piv.sign_pin,
+                    PivCredKind::SetRetries => &self.piv.retries_pin_auth,
+                    _ => unreachable!("shares_pin_field() covers exactly these two kinds"),
+                }
+            } else {
+                &self.piv.mgmt_key_input
+            };
+            return Ok(PivMgmtAuth::Pin(zeroize::Zeroizing::new(pin.clone())));
+        }
+        self.piv_current_mgmt_key().map(PivMgmtAuth::Key)
     }
 
     fn piv_set_retries(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::SetRetries) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6718,18 +8062,21 @@ impl App {
         let pin = zeroize::Zeroizing::new(self.piv.retries_pin_auth.clone());
         let (pin_tries, puk_tries) = (self.piv.retries_pin, self.piv.retries_puk);
         self.piv.notice = None;
-        self.spawn_job("Setting PIV retry counts\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(alg, &mgmt)?;
-                s.verify_pin(pin.as_bytes())?;
-                s.set_pin_retries(pin_tries, puk_tries)?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Setting PIV retry counts\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.verify_pin(pin.as_bytes())?;
+                    s.set_pin_retries(pin_tries, puk_tries)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 wipe(&mut app.piv.retries_pin_auth);
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(
                     app,
                     result,
@@ -6744,49 +8091,52 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::GenerateKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
             }
         };
         let slot = self.piv.selected_slot.to_slot();
-        let alg = self.piv.gen_alg.to_alg();
+        let alg = self.piv.gen_alg;
         let (pin_policy, touch_policy) = (self.piv.gen_pin_policy, self.piv.gen_touch_policy);
         self.piv.notice = None;
-        self.piv.gen_pubkey_pem = None;
-        self.spawn_job("Generating key\u{2026} (touch if it blinks)", move || {
-            let result = (|| -> Result<
-                (keyroost_piv::PublicKey, keyroost_transport::PivStatus),
-                TransportError,
-            > {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
-                let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
-                Ok((pubkey, s.status()?))
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Generating key\u{2026} (touch if it blinks)", move || {
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &name,
+                cached_state,
+                |s| -> Result<_, TransportError> {
+                    piv_authenticate(s, &mgmt)?;
+                    let pubkey = s.generate_key(slot, alg, pin_policy, touch_policy)?;
+                    let status = s.status()?;
+                    Ok((pubkey, status, s.state()))
+                },
+            );
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 match result {
-                    Ok((pubkey, status)) => {
+                    Ok((pubkey, status, state)) => {
                         app.log(
                             Severity::Ok,
                             format!("generated {} key in {}", alg.label(), slot.label()),
                         );
                         app.piv.status = Some(status);
                         app.piv.error = None;
-                        // Remember it for this app run so a later self-sign/CSR
-                        // (a fresh `PivSession` — see `PivState::pubkey_cache`)
-                        // and this same status refresh below can name the key
-                        // on cards that don't answer GET METADATA.
-                        app.piv
-                            .pubkey_cache
-                            .insert(slot.key_ref(), (alg, pubkey.clone()));
+                        // `generate_key` already remembered the new key in
+                        // this session's own pubkey cache — see
+                        // `PivSessionState::pubkey_cache`'s doc. Storing the
+                        // updated state (rather than just discarding it) is
+                        // what lets a later self-sign/CSR, or this same
+                        // status refresh below, name the key on cards that
+                        // don't answer GET METADATA — including after
+                        // switching to another device's tab and back, which
+                        // a bare per-job cache couldn't survive.
+                        app.store_piv_session_state(for_device.clone(), state);
                         match keyroost_piv::spki::subject_public_key_info(&pubkey, alg) {
-                            Ok(der) => {
-                                app.piv.gen_pubkey_pem = Some(keyroost_piv::spki::to_pem(&der));
+                            Ok(_) => {
                                 app.piv.notice = Some(format!("Generated {} key.", alg.label()));
                             }
                             Err(e) => {
@@ -6832,8 +8182,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::ImportCert) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6842,21 +8192,42 @@ impl App {
         let slot = self.piv.selected_slot.to_slot();
         let path = self.piv.cert_path.trim().to_owned();
         self.piv.notice = None;
-        self.spawn_job("Importing certificate\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
+        let for_device = self.selected_device.clone();
+        // `with_cached_transaction` restores the whole cached pubkey map (every slot, not
+        // just this one) as part of resolving the session — see
+        // `load_piv_status`/`piv_self_sign`'s docs for why a key generated
+        // earlier this app run, including one that overwrote an older key
+        // already loaded into this slot, has to be known before
+        // `import_certificate`'s own key-match check
+        // (`PivSession::reject_certificate_key_mismatch`) has anything to
+        // compare against — without it, that check silently treats the
+        // slot's key as unknowable and lets a stale certificate through even
+        // when this app run knows better.
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Importing certificate\u{2026}", move || {
+            let result = (|| -> Result<
+                (keyroost_transport::PivStatus, keyroost_transport::PivSessionState),
+                TransportError,
+            > {
                 let bytes = std::fs::read(&path).map_err(|_| {
                     TransportError::MalformedResponse("cannot read certificate file")
                 })?;
                 let der = cert_bytes_to_der(&bytes)
                     .ok_or(TransportError::MalformedResponse("file is not PEM or DER"))?;
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
-                s.import_certificate(slot, &der)?;
-                s.status()
+                keyroost_transport::PivSession::with_cached_transaction(
+                    &name,
+                    cached_state,
+                    |s| {
+                        piv_authenticate(s, &mgmt)?;
+                        s.import_certificate(slot, &der)?;
+                        let status = s.status()?;
+                        Ok((status, s.state()))
+                    },
+                )
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(app, result, "Certificate imported.".into());
                 Self::apply_piv_cred_result(app);
             })
@@ -6871,8 +8242,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::DeleteCert) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6880,16 +8251,19 @@ impl App {
         };
         let slot = self.piv.selected_slot.to_slot();
         self.piv.notice = None;
-        self.spawn_job("Deleting certificate\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
-                s.clear_certificate(slot)?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Deleting certificate\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.clear_certificate(slot)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(
                     app,
                     result,
@@ -6910,6 +8284,30 @@ impl App {
         }
     }
 
+    /// "Change management key"'s "Generate random key & Copy" link: fill `New
+    /// key` with a fresh random key sized for `alg` and copy it to the
+    /// clipboard. Host-side only (no card I/O); the field's prior contents
+    /// are wiped, not just overwritten, same discipline as every other
+    /// secret-bearing field this app clears. Auto-clears the clipboard after
+    /// 45s like the OTP-code copy path, so the generated key doesn't sit in
+    /// clipboard-manager history forever. Leaves the field as-is on the
+    /// vanishingly rare RNG failure rather than blanking a value the user
+    /// may already be editing. Reveals the field (same `secret_reveal` toggle
+    /// its own eye icon uses) — the value just landed on the clipboard in
+    /// plain text anyway, so hiding it in the field buys nothing and only
+    /// stops the user checking what they generated.
+    fn piv_generate_random_mgmt_key(&mut self, ctx: &egui::Context, alg: keyroost_piv::MgmtAlg) {
+        let Ok(key) = keyroost_transport::random_management_key(alg) else {
+            return;
+        };
+        let hex = hex_lower(&key);
+        wipe(&mut self.piv.new_mgmt_key_input);
+        self.piv.new_mgmt_key_input.push_str(&hex);
+        ctx.copy_text(hex.clone());
+        self.clipboard_clear_at = Some((hex, now_secs_f64() + 45.0));
+        self.secret_reveal.insert("piv-new-mgmt-key", true);
+    }
+
     /// Write a CHUID — the GUID from `chuid_guid` (a fresh random default,
     /// or whatever the user overwrote it with). Management-key authorized;
     /// applet-wide, not tied to any slot. Mirrors `piv_import_cert`'s shape:
@@ -6921,8 +8319,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::NewChuid) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6939,21 +8337,26 @@ impl App {
                 return;
             }
         };
-        let expiration = keyroost_piv::chuid_expiration_in_days(
+        let expiration = keyroost_piv::yyyymmdd_from_unix_secs(keyroost_piv::add_calendar_period(
             u64::from(unix_now()),
+            self.piv.chuid_valid_years,
+            self.piv.chuid_valid_months,
             self.piv.chuid_valid_days,
-        );
+        ));
         self.piv.notice = None;
-        self.spawn_job("Writing a new CHUID\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
-                s.new_chuid(&guid, &expiration)?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Writing a new CHUID\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.new_chuid(&guid, &expiration)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(app, result, "New CHUID written.".into());
                 Self::apply_piv_cred_result(app);
             })
@@ -6961,15 +8364,16 @@ impl App {
     }
 
     /// Permanently delete (erase) the private key in the selected slot.
-    /// Management-key authorized. Needs YubiKey firmware 5.7+; the transport
-    /// version-gates and surfaces `PivFirmwareTooOld` as the error on older
-    /// cards (the pane also hides the button below 5.7 — this is the backstop).
+    /// Management-key authorized. DELETE KEY is a Yubico extension (fw 5.7+);
+    /// the slot panel resolves `keyroost_piv::compat` into a three-way gate
+    /// (enable / warn / dim), and an unsupported card refuses the APDU itself
+    /// — the transport no longer version-gates.
     fn piv_delete_key(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::DeleteKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -6977,19 +8381,22 @@ impl App {
         };
         let slot = self.piv.selected_slot.to_slot();
         self.piv.notice = None;
-        self.spawn_job("Deleting key\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
-                s.delete_key(slot)?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Deleting key\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    s.delete_key(slot)?;
+                    // `delete_key` already evicted this slot from the
+                    // session's own pubkey cache — nothing left to do here
+                    // beyond storing the updated state back.
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
-                if result.is_ok() {
-                    app.piv.pubkey_cache.remove(&slot.key_ref());
-                }
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(app, result, format!("Key erased from {}.", slot.label()));
                 Self::apply_piv_cred_result(app);
             })
@@ -7003,8 +8410,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::MoveKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -7016,24 +8423,23 @@ impl App {
             return;
         };
         self.piv.notice = None;
-        self.spawn_job("Moving key\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                s.authenticate_management(mgmt_alg, &mgmt)?;
-                s.move_key(src, dest)?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Moving key\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &mgmt)?;
+                    // The key itself relocated, not just its reference —
+                    // `move_key` already carries a cached entry along with it
+                    // in the session's own pubkey cache, same as
+                    // `PivSession::move_key`'s in-session cache always has.
+                    s.move_key(src, dest)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
-                // The key itself relocated, not just its reference — carry a
-                // cached entry along with it, same as `PivSession::move_key`
-                // does for its own in-session cache.
-                if result.is_ok() {
-                    if let Some(v) = app.piv.pubkey_cache.remove(&src.key_ref()) {
-                        app.piv.pubkey_cache.insert(dest.key_ref(), v);
-                    }
-                }
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(
                     app,
                     result,
@@ -7068,19 +8474,26 @@ impl App {
             return false;
         };
         let for_device = self.selected_device.clone();
-        self.spawn_job("Reading retired slots\u{2026}", move || {
-            let result = keyroost_transport::PivSession::open(&reader).map(|mut s| {
-                keyroost_piv::Slot::retired_all()
-                    .into_iter()
-                    .map(|slot| (slot, s.slot_has_key(slot).unwrap_or(false)))
-                    .collect::<Vec<_>>()
-            });
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Reading retired slots\u{2026}", move || {
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &reader,
+                cached_state,
+                |s| {
+                    let occupancy: Vec<_> = keyroost_piv::Slot::retired_all()
+                        .into_iter()
+                        .map(|slot| (slot, s.slot_has_key(slot).unwrap_or(false)))
+                        .collect();
+                    Ok::<_, TransportError>((occupancy, s.state()))
+                },
+            );
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok(v) => {
+                    Ok((v, state)) => {
+                        app.store_piv_session_state(for_device.clone(), state);
                         // Background: this fires the first time the retired
                         // slots section is expanded, or the move-key modal is
                         // opened — neither is "the user asked to read retired
@@ -7144,19 +8557,19 @@ impl App {
     /// (decrypt, then key-agree, then sign): build a fixed challenge from the
     /// slot certificate's public key ([`keyroost_pivtest`]), run the
     /// private-key op on the card, and verify the reply against that public
-    /// key. Read-only on the card — no write, no management key. The PIN is
-    /// verified unless the slot's PIN policy is `never` and the field is
-    /// blank. Each operation's pass/fail is reported together.
+    /// key. Read-only on the card — no write, no management key. The PIN
+    /// field is always optional — it's the user's call whether to test with
+    /// or without one, independent of the slot's (possibly misreported) PIN
+    /// policy; the PIN is only sent to the card when the field is non-blank.
+    /// Each operation's pass/fail is reported together.
     fn piv_self_test(&mut self) {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
-        let policy = self.piv_selected_slot_policy();
-        let pin_required = policy.map(|(p, _)| p) != Some(keyroost_piv::PinPolicy::Never);
         let want_touch = matches!(
-            policy.map(|(_, t)| t),
+            self.piv_selected_slot_policy().map(|(_, t)| t),
             Some(keyroost_piv::TouchPolicy::Always | keyroost_piv::TouchPolicy::Cached)
         );
         self.piv.notice = None;
@@ -7165,18 +8578,23 @@ impl App {
         } else {
             "Running self-test\u{2026}"
         };
-        self.spawn_job(label, move || {
-            let outcome = run_piv_self_test(&name, slot, pin_required, pin.as_bytes());
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job(label, move || {
+            let outcome = run_piv_self_test(&name, slot, pin.as_bytes(), cached_state);
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.sign_pin);
                 let (all_ok, text) = match &outcome {
                     // Skipped ops don't count as failures.
-                    Ok(results) => (
+                    Ok((results, _)) => (
                         !results.iter().any(|(_, r)| r.is_failure()),
                         keyroost_pivtest::format_report(results),
                     ),
                     Err(e) => (false, e.clone()),
                 };
+                if let Ok((_, state)) = outcome {
+                    app.store_piv_session_state(for_device, state);
+                }
                 if all_ok {
                     app.log(
                         Severity::Ok,
@@ -7220,8 +8638,8 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let mgmt = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::SelfSign) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
@@ -7233,34 +8651,47 @@ impl App {
         };
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
-        let days = i64::from(self.piv.cert_days.max(1));
-        // See `load_piv_status`: this job opens its own fresh `PivSession`, so
-        // a key generated earlier this app run has to be handed back in.
-        let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
+        let years = self.piv.cert_valid_years;
+        let months = self.piv.cert_valid_months;
+        // Same "at least a day" floor `cert_days.max(1)` used before the
+        // single field split into three: an all-zero combination would
+        // otherwise produce a validity period that ends before it starts.
+        let days = if years == 0 && months == 0 {
+            self.piv.cert_valid_days.max(1)
+        } else {
+            self.piv.cert_valid_days
+        };
         self.piv.notice = None;
-        self.spawn_job(
+        let for_device = self.selected_device.clone();
+        // `with_cached_transaction` restores whatever the session's pubkey cache already
+        // knew — including a key generated earlier this app run, on cards
+        // where the freshly-opened session otherwise has no other way to
+        // learn it (see `load_piv_status`'s doc).
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job(
             "Creating self-signed certificate\u{2026} (touch if it blinks)",
             move || {
-                let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                    let mut s = keyroost_transport::PivSession::open(&name)?;
-                    let mgmt_alg = s.resolve_management_key_algorithm(mgmt.len())?;
-                    s.authenticate_management(mgmt_alg, &mgmt)?;
-                    if let Some((alg, key)) = known_key {
-                        s.remember_pubkey(slot, alg, key);
-                    }
-                    let now = i64::from(unix_now());
-                    s.self_signed_certificate(
-                        slot,
-                        &subject,
-                        now,
-                        now + days * 86_400,
-                        pin.as_bytes(),
-                    )?;
-                    s.status()
-                })();
+                let result = keyroost_transport::PivSession::with_cached_transaction(
+                    &name,
+                    cached_state,
+                    |s| {
+                        piv_authenticate(s, &mgmt)?;
+                        let now = unix_now();
+                        s.self_signed_certificate(
+                            slot,
+                            &subject,
+                            i64::from(now),
+                            keyroost_piv::add_calendar_period(u64::from(now), years, months, days),
+                            pin.as_bytes(),
+                        )?;
+                        let status = s.status()?;
+                        Ok((status, s.state()))
+                    },
+                );
                 Box::new(move |app: &mut App| {
                     wipe(&mut app.piv.sign_pin);
                     wipe(&mut app.piv.mgmt_key_input);
+                    let result = app.store_and_unwrap_piv_write(for_device, result);
                     Self::apply_piv_write(
                         app,
                         result,
@@ -7281,41 +8712,37 @@ impl App {
             self.piv.error = Some("enter a name for the certificate request".into());
             return;
         };
+        // The path comes from a native save dialog, which already handled its
+        // own "replace existing file?" prompt — so no empty / clobber checks
+        // here.
         let path = self.piv.csr_path.trim().to_owned();
-        if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the request".into());
-            return;
-        }
-        if std::path::Path::new(&path).exists() {
-            self.piv.error = Some(format!(
-                "{path} already exists — delete it first or choose another name"
-            ));
-            return;
-        }
         let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
         let slot = self.piv.selected_slot.to_slot();
-        // See `load_piv_status`: this job opens its own fresh `PivSession`, so
-        // a key generated earlier this app run has to be handed back in.
-        let known_key = self.piv.pubkey_cache.get(&slot.key_ref()).cloned();
         self.piv.notice = None;
-        self.spawn_job(
+        let for_device = self.selected_device.clone();
+        // See `piv_self_sign`: `with_cached_transaction` restores whatever the session's
+        // pubkey cache already knew, including a key generated earlier this
+        // app run.
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job(
             "Signing certificate request\u{2026} (touch if it blinks)",
             move || {
-                let result = (|| -> Result<(), TransportError> {
-                    let mut s = keyroost_transport::PivSession::open(&name)?;
-                    if let Some((alg, key)) = known_key {
-                        s.remember_pubkey(slot, alg, key);
-                    }
-                    let pem = s.generate_csr(slot, &subject, pin.as_bytes())?;
-                    std::fs::write(&path, pem.as_bytes()).map_err(|_| {
-                        TransportError::MalformedResponse("cannot write destination file")
-                    })?;
-                    Ok(())
-                })();
+                let result = keyroost_transport::PivSession::with_cached_transaction(
+                    &name,
+                    cached_state,
+                    |s| -> Result<_, TransportError> {
+                        let pem = s.generate_csr(slot, &subject, pin.as_bytes())?;
+                        std::fs::write(&path, pem.as_bytes()).map_err(|_| {
+                            TransportError::MalformedResponse("cannot write destination file")
+                        })?;
+                        Ok(s.state())
+                    },
+                );
                 Box::new(move |app: &mut App| {
                     wipe(&mut app.piv.sign_pin);
                     match result {
-                        Ok(()) => {
+                        Ok(state) => {
+                            app.store_piv_session_state(for_device, state);
                             app.log(
                                 Severity::Ok,
                                 format!("certificate request signed for {}", slot.label()),
@@ -7340,35 +8767,32 @@ impl App {
             return;
         };
         let slot = self.piv.selected_slot.to_slot();
+        // The path comes from a native save dialog, which already handled its
+        // own "replace existing file?" prompt — so no empty / clobber checks
+        // here.
         let path = self.piv.export_path.trim().to_owned();
-        if path.is_empty() {
-            self.piv.error = Some("enter a destination path for the certificate".into());
-            return;
-        }
-        // Refuse to clobber an existing file — the user can delete it or pick
-        // another name; there is no undo for an overwritten file.
-        if std::path::Path::new(&path).exists() {
-            self.piv.error = Some(format!(
-                "{path} already exists — delete it first or choose another name"
-            ));
-            return;
-        }
         self.piv.notice = None;
-        self.spawn_job("Exporting certificate\u{2026}", move || {
-            let result = (|| -> Result<usize, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let der = s
-                    .read_certificate(slot)?
-                    .ok_or(TransportError::MalformedResponse(
-                        "slot holds no certificate",
-                    ))?;
-                std::fs::write(&path, &der).map_err(|_| {
-                    TransportError::MalformedResponse("cannot write destination file")
-                })?;
-                Ok(der.len())
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Exporting certificate\u{2026}", move || {
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &name,
+                cached_state,
+                |s| -> Result<_, TransportError> {
+                    let der =
+                        s.read_certificate(slot)?
+                            .ok_or(TransportError::MalformedResponse(
+                                "slot holds no certificate",
+                            ))?;
+                    std::fs::write(&path, &der).map_err(|_| {
+                        TransportError::MalformedResponse("cannot write destination file")
+                    })?;
+                    Ok((der.len(), s.state()))
+                },
+            );
             Box::new(move |app: &mut App| match result {
-                Ok(n) => {
+                Ok((n, state)) => {
+                    app.store_piv_session_state(for_device, state);
                     app.log(
                         Severity::Ok,
                         format!("exported {}-byte certificate from {}", n, slot.label()),
@@ -7389,47 +8813,185 @@ impl App {
         let Some(name) = self.selected_oath_reader() else {
             return;
         };
-        let old = match self.piv_current_mgmt_key() {
-            Ok(b) => b,
+        let old = match self.piv_current_mgmt_auth(PivCredKind::ChangeMgmtKey) {
+            Ok(a) => a,
             Err(e) => {
                 self.piv.error = Some(e);
                 return;
             }
         };
-        let new = match piv_mgmt_key_bytes(&self.piv.new_mgmt_key_input) {
-            Ok(b) => b,
-            Err(e) => {
-                self.piv.error = Some(e);
-                return;
+        // "Delete" (HID Crescendo only — see `PivMgmtAlgSel`'s doc) needs no
+        // new-key input at all: an empty key goes to the card instead,
+        // deleting XAUTH key 1 rather than replacing it. Every other
+        // selection reads/validates the typed hex as usual.
+        let new = match self.piv.new_mgmt_alg.to_alg() {
+            Some(new_alg) => {
+                let new = match piv_mgmt_key_bytes(&self.piv.new_mgmt_key_input) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.piv.error = Some(e);
+                        return;
+                    }
+                };
+                if new.len() != new_alg.key_len() {
+                    self.piv.error = Some(format!(
+                        "new management key is {} bytes; {} needs {}",
+                        new.len(),
+                        new_alg.label(),
+                        new_alg.key_len()
+                    ));
+                    return;
+                }
+                Some((new_alg, new))
             }
+            None => None,
         };
-        let new_alg = self.piv.new_mgmt_alg.to_alg();
-        if new.len() != new_alg.key_len() {
-            self.piv.error = Some(format!(
-                "new management key is {} bytes; {} needs {}",
-                new.len(),
-                new_alg.label(),
-                new_alg.key_len()
-            ));
-            return;
-        }
+        // Whether to also maintain PIN-protected management-key storage
+        // (`set_management_key_pin_protected`'s steps 2a/2b) alongside the
+        // key change itself, gated on `PivExtension::PinManagementAuth` the
+        // same way the checkbox row above is — the GUI has no `--force`
+        // override the way `keyroostctl` does, so a device known unable to
+        // support it stays on plain `set_management_key`, leaving Admin
+        // Data / the PIN-protected object untouched either way. HID
+        // Crescendo resolves this `Supported` unconditionally, so it always
+        // takes the maintenance path — its own no-op lives inside
+        // `set_management_key_pin_protected` itself, not here.
+        //
+        // `pin_unlock_gate` is kept (not just the derived `maintain_pin_unlock`
+        // bool) because the worker closure below needs it again, at a finer
+        // grain, to decide whether a `PinProtectMaintenance::Ran` write
+        // failure is a real error (`Supported`) or expected background noise
+        // worth a warning instead (`Unverified` — the only other value
+        // reachable here, since `Unsupported` already means
+        // `maintain_pin_unlock` is false).
+        let pin_unlock_gate = {
+            use keyroost_piv::compat::PivExtension;
+            let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+                (
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
+            );
+            keyroost_piv::compat::resolve(
+                PivExtension::PinManagementAuth,
+                piv_fp,
+                piv_ver,
+                piv_fw_ver,
+            )
+        };
+        let maintain_pin_unlock = !matches!(
+            pin_unlock_gate,
+            keyroost_piv::compat::FeatureGate::Unsupported
+        );
+        let allow_pin_unlock = self.piv.new_mgmt_allow_pin_unlock;
         self.piv.notice = None;
-        self.spawn_job("Changing management key\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                let cur_alg = s.resolve_management_key_algorithm(old.len())?;
-                s.authenticate_management(cur_alg, &old)?;
-                s.set_management_key(new_alg, &new, false)?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Changing management key\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    piv_authenticate(s, &old)?;
+                    // A HID Crescendo unit whose management key isn't a real
+                    // PIV object runs its own self-contained unlock right
+                    // before PUT XAUTH KEY (see `set_management_key`'s doc)
+                    // rather than relying on the `piv_authenticate` call
+                    // above still being in force — `current` carries the
+                    // same credential again for that path; every other
+                    // device ignores it.
+                    let current = match &old {
+                        PivMgmtAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
+                        PivMgmtAuth::Pin(pin) => {
+                            keyroost_transport::CurrentMgmtAuth::Pin(pin.as_bytes())
+                        }
+                    };
+                    let mut pin_unlock_warning = None;
+                    match &new {
+                        Some((new_alg, new_key)) if maintain_pin_unlock => {
+                            match s.set_management_key_pin_protected(
+                                current,
+                                *new_alg,
+                                new_key,
+                                false,
+                                allow_pin_unlock,
+                            )? {
+                                keyroost_transport::PinProtectMaintenance::NotApplicable
+                                | keyroost_transport::PinProtectMaintenance::Ran {
+                                    printed_data: Ok(()),
+                                } => {}
+                                keyroost_transport::PinProtectMaintenance::Ran {
+                                    printed_data: Err(e),
+                                } => {
+                                    // `Supported` is a confirmed device — a
+                                    // failure there is real and still fails
+                                    // the whole job, same as before this
+                                    // outcome existed. Anything less certain
+                                    // (only `Unverified` reaches here, per
+                                    // `maintain_pin_unlock`'s own doc above)
+                                    // was never confirmed to support this
+                                    // write at all, so it's downgraded to a
+                                    // warning the apply closure logs instead.
+                                    if pin_unlock_gate == keyroost_piv::compat::FeatureGate::Supported {
+                                        return Err(e);
+                                    }
+                                    let action = if allow_pin_unlock { "enable" } else { "disable" };
+                                    pin_unlock_warning = Some(format!(
+                                        "Could not {action} PIN-protected management-key \
+                                         storage ({e}) — support for this is unverified on \
+                                         this device, so this may be expected."
+                                    ));
+                                }
+                            }
+                        }
+                        Some((new_alg, new_key)) => {
+                            s.set_management_key(current, *new_alg, new_key, false)?;
+                        }
+                        None => s.delete_management_key_hid_crescendo(current)?,
+                    }
+                    let status = s.status()?;
+                    Ok((status, s.state(), pin_unlock_warning))
+                });
             Box::new(move |app: &mut App| {
                 wipe(&mut app.piv.mgmt_key_input);
                 wipe(&mut app.piv.new_mgmt_key_input);
-                Self::apply_piv_write(
-                    app,
-                    result,
-                    format!("Management key changed to {}.", new_alg.label()),
-                );
+                let (result, pin_unlock_warning) = match result {
+                    Ok((status, state, warning)) => (Ok((status, state)), warning),
+                    Err(e) => (Err(e), None),
+                };
+                // Reflects what actually happened, not just what was asked
+                // for: a `pin_unlock_warning` means the PIN-protected-storage
+                // write itself failed (downgraded to a warning, logged
+                // separately below) even though the management key change
+                // succeeded — the status line must not then go on to claim
+                // that write also succeeded.
+                let notice = match &new {
+                    Some((new_alg, _)) => {
+                        let base = format!("Management key changed to {}.", new_alg.label());
+                        if !maintain_pin_unlock || pin_unlock_warning.is_some() {
+                            base
+                        } else if allow_pin_unlock {
+                            format!("{base} PIN-protected management-key storage enabled.")
+                        } else {
+                            format!("{base} PIN-protected management-key storage disabled (if it was set).")
+                        }
+                    }
+                    None => "Management key deleted.".to_string(),
+                };
+                let result = app.store_and_unwrap_piv_write(for_device, result);
+                let succeeded = result.is_ok();
+                Self::apply_piv_write(app, result, notice);
+                if succeeded {
+                    if let Some(w) = pin_unlock_warning {
+                        app.log(Severity::Warn, w);
+                    }
+                }
                 Self::apply_piv_cred_result(app);
             })
         });
@@ -7442,26 +9004,40 @@ impl App {
             return true; // nothing to do; let the modal close
         };
         self.piv.notice = None;
-        self.spawn_job("Resetting PIV applet\u{2026}", move || {
-            let result = (|| -> Result<keyroost_transport::PivStatus, TransportError> {
-                let mut s = keyroost_transport::PivSession::open(&name)?;
-                s.reset()?;
-                s.status()
-            })();
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        let queued = self.spawn_piv_job("Resetting PIV applet\u{2026}", move || {
+            let result =
+                keyroost_transport::PivSession::with_cached_transaction(&name, cached_state, |s| {
+                    // The PIV pane's "Reset applet" card collects no
+                    // management-key/PIN credential of its own (unlike the
+                    // Overview tab's whole-device factory reset) — nothing to
+                    // pass here today; see `force_reset_if_known_supported`'s
+                    // doc for why the parameter exists regardless.
+                    //
+                    // `force_reset_if_known_supported`/`reset` already
+                    // rebuild this session's state from nothing internally
+                    // (see `PivSession::refresh`'s doc) — wipes every slot,
+                    // nothing cached survives it — so `s.state()` below is
+                    // already the post-reset state; there's nothing left to
+                    // clear by hand.
+                    s.force_reset_if_known_supported(None)?;
+                    let status = s.status()?;
+                    Ok((status, s.state()))
+                });
             Box::new(move |app: &mut App| {
-                if result.is_ok() {
-                    // Wipes every slot; nothing cached survives it — same
-                    // invalidation `PivSession::reset` applies to its own
-                    // in-session cache.
-                    app.piv.pubkey_cache.clear();
-                }
+                let result = app.store_and_unwrap_piv_write(for_device, result);
                 Self::apply_piv_write(
                     app,
                     result,
                     "PIV application reset to factory defaults.".into(),
                 );
             })
-        })
+        });
+        // `queued` still matters here beyond `spawn_piv_job`'s own bookkeeping:
+        // a worker already busy means the confirm modal should stay open for
+        // the caller to retry, rather than closing on a click that did nothing.
+        queued
     }
 
     /// Apply the three rename-dialog actions shared by the security-key hero and
@@ -7768,56 +9344,80 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
 ///
 /// `Err` is a *setup* failure (couldn't open the card, no certificate in the
 /// slot, unreadable key, PIN rejected) — nothing was tested.
+///
+/// The PIN is used only when `pin` is non-empty — never inferred from the
+/// slot's PIN policy. That policy is left entirely to the caller to decide
+/// whether to supply a PIN, so a test can deliberately be run without one to
+/// see whether the card enforces its policy.
 fn run_piv_self_test(
     reader: &str,
     slot: keyroost_piv::Slot,
-    pin_required: bool,
     pin: &[u8],
-) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, String> {
-    let mut s = keyroost_transport::PivSession::open(reader).map_err(|e| e.to_string())?;
-    // Verify against the slot CERTIFICATE's public key on purpose: the cert is
-    // what other PIV software consumes, so a pass proves the cert matches the
-    // slot's key material. A compressed cert is inflated on read (#147/#148).
-    let cert = s
-        .read_certificate(slot)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
-    let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
-        .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+    cached: keyroost_transport::PivSessionState,
+) -> Result<
+    (
+        Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>,
+        keyroost_transport::PivSessionState,
+    ),
+    String,
+> {
+    // The session itself can only report `TransportError` (from
+    // `with_cached_transaction`'s own connect/SELECT machinery) — flattened
+    // to `String` right at the end, via the outer `map_err`/`and_then`
+    // below. Everything this closure does on its own (no certificate, an
+    // unusable algorithm, a rejected PIN) keeps building its `String`
+    // exactly as before, one level in, via `inner`.
+    keyroost_transport::PivSession::with_cached_transaction(reader, cached, |s| {
+        let inner = (|| -> Result<_, String> {
+            // Verify against the slot CERTIFICATE's public key on purpose: the
+            // cert is what other PIV software consumes, so a pass proves the
+            // cert matches the slot's key material. A compressed cert is
+            // inflated on read (#147/#148).
+            let cert = s
+                .read_certificate(slot)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
+            let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
+                .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
 
-    if !keyroost_pivtest::SelfTest::all()
-        .into_iter()
-        .any(|op| keyroost_pivtest::supports(op, alg))
-    {
-        return Err(format!("no self-test applies to a {} key", alg.label()));
-    }
+            if !keyroost_pivtest::SelfTest::all()
+                .into_iter()
+                .any(|op| keyroost_pivtest::supports(op, alg))
+            {
+                return Err(format!("no self-test applies to a {} key", alg.label()));
+            }
 
-    // Verify once up front so a wrong PIN fails the whole run (one retry, not
-    // one per op). PIN-per-use slots (9C) drop the verified state after each
-    // GENERAL AUTHENTICATE, so the per-op closure re-verifies before every
-    // op after the first that actually runs.
-    if pin_required || !pin.is_empty() {
-        s.verify_pin(pin).map_err(|e| e.to_string())?;
-    }
-    let mut ran = 0usize;
-    Ok(keyroost_pivtest::run(
-        alg,
-        &pubkey,
-        |op, input| -> Result<Vec<u8>, String> {
-            if pin_required && ran > 0 {
+            // Verify once up front so a wrong PIN fails the whole run (one
+            // retry, not one per op). PIN-per-use slots (9C) drop the
+            // verified state after each GENERAL AUTHENTICATE, so the per-op
+            // closure re-verifies before every op after the first that
+            // actually runs.
+            let has_pin = !pin.is_empty();
+            if has_pin {
                 s.verify_pin(pin).map_err(|e| e.to_string())?;
             }
-            ran += 1;
-            if op.is_key_agreement() {
-                s.key_agree(slot, alg, input)
-            } else if op == keyroost_pivtest::SelfTest::Decrypt {
-                s.decrypt(slot, alg, input)
-            } else {
-                s.sign(slot, alg, input)
-            }
-            .map_err(|e| e.to_string())
-        },
-    ))
+            let mut ran = 0usize;
+            let results =
+                keyroost_pivtest::run(alg, &pubkey, |op, input| -> Result<Vec<u8>, String> {
+                    if has_pin && ran > 0 {
+                        s.verify_pin(pin).map_err(|e| e.to_string())?;
+                    }
+                    ran += 1;
+                    if op.is_key_agreement() {
+                        s.key_agree(slot, alg, input)
+                    } else if op == keyroost_pivtest::SelfTest::Decrypt {
+                        s.decrypt(slot, alg, input)
+                    } else {
+                        s.sign(slot, alg, input)
+                    }
+                    .map_err(|e| e.to_string())
+                });
+            Ok((results, s.state()))
+        })();
+        Ok::<_, TransportError>(inner)
+    })
+    .map_err(|e| e.to_string())
+    .and_then(|inner| inner)
 }
 
 /// Slots a key may be moved to: every standard + retired slot that is empty
@@ -7850,6 +9450,38 @@ fn piv_slot_occupied(
                 .unwrap_or(false)
         }
     }
+}
+
+/// Whether a slot-emptiness-sensitive button should dim specifically because
+/// the active slot is confirmed empty — the narrower criterion
+/// `keyroost_piv::compat::PivExtension::GetSlotKeyStatus` unlocks. Shared by
+/// "Delete key" (distinct from "Delete certificate"'s `selected_has_cert`
+/// check — a different object, gated by a different extension) and "Import
+/// certificate" (which has no separate firmware gate of its own to check
+/// first, unlike "Delete key" — see that button's call site for why this is
+/// only meaningful there once `delete_key_gate` itself isn't
+/// `FeatureGate::Unsupported`).
+///
+/// `true` only when `get_slot_key_status_gate` resolves
+/// [`FeatureGate::Supported`](keyroost_piv::compat::FeatureGate::Supported)
+/// *and* `selected_has_key` is `false` — this device has a confirmed,
+/// device-reported way to know slot occupancy (GET METADATA, or HID
+/// Crescendo's own GET PIV PROPERTIES), and it says this slot has no key.
+/// Every other combination — the gate isn't `Supported`, or it is and the
+/// slot does hold a key — leaves the button enabled: without a reliable
+/// device signal, a `None` algorithm reading could just as easily mean
+/// "this device can't tell us" as "genuinely empty" (see
+/// [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`]'s doc), and
+/// hiding a real capability on a guess is worse than occasionally offering a
+/// delete that fails deep with "slot has no key", or an import that a
+/// key loaded out-of-band this session can't see would in fact have matched.
+#[must_use]
+fn slot_confirmed_empty(
+    get_slot_key_status_gate: keyroost_piv::compat::FeatureGate,
+    selected_has_key: bool,
+) -> bool {
+    use keyroost_piv::compat::FeatureGate;
+    get_slot_key_status_gate == FeatureGate::Supported && !selected_has_key
 }
 
 fn move_key_eligible_destinations(
@@ -7915,12 +9547,163 @@ fn secret_field(
     ui.add_space(4.0);
 }
 
+/// Masked secret input with a reveal ("eye") toggle painted *inside* the
+/// field itself, at its right edge, instead of beside it. A widened right
+/// text margin keeps typed characters clear of the icon; the widget's outer
+/// `desired_width` is untouched, so this drops into a spot already sized for
+/// a plain masked `TextEdit` without changing that size — unlike
+/// [`secret_edit`], which adds a separate icon column next to the field.
+/// `revealed` is read for the initial mask state and flipped in place when
+/// the eye is clicked. Used only by the PIV pane and the factory-reset
+/// dialog (see [`piv_pin_field`]/[`piv_secret_field`]); every other secret
+/// field in the app still uses [`secret_edit`] or a plain mask.
+fn inline_secret_edit(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    buf: &mut String,
+    revealed: &mut bool,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    let mut edit = egui::TextEdit::singleline(buf)
+        .desired_width(width)
+        .margin(egui::Margin {
+            left: 4,
+            right: 30,
+            top: 2,
+            bottom: 2,
+        });
+    if !*revealed {
+        edit = edit.password(true);
+    }
+    if !hint.is_empty() {
+        edit = edit.hint_text(hint);
+    }
+    let resp = ui.add(edit);
+    // Eye toggle painted over the field's own right edge. This claims no
+    // extra layout space of its own — it only paints/interacts within the
+    // rect the TextEdit above already occupies.
+    let center = egui::pos2(resp.rect.right() - 13.0, resp.rect.center().y);
+    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(20.0, resp.rect.height()));
+    let ir = ui.interact(icon_rect, resp.id.with("reveal"), egui::Sense::click());
+    let col = if ir.hovered() { p.txt } else { p.txt2 };
+    paint_eye_icon(ui, center, col);
+    if !*revealed {
+        // Slash across the eye to signal the hidden state.
+        ui.painter().line_segment(
+            [
+                egui::pos2(center.x - 6.0, center.y + 4.0),
+                egui::pos2(center.x + 6.0, center.y - 4.0),
+            ],
+            egui::Stroke::new(1.1, col),
+        );
+    }
+    if ir.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if ir.clicked() {
+        *revealed = !*revealed;
+    }
+    let _ = ir.on_hover_text(if *revealed { "Hide" } else { "Show" });
+    guard_secret_field(ui.ctx(), &resp);
+    resp
+}
+
+/// Like [`pin_field`], but the value can be revealed via [`inline_secret_edit`]'s
+/// in-field eye toggle, and the label column width is a caller-supplied
+/// `label_w` rather than a hardcoded 96px — needed for the rows (`SelfSign`,
+/// `SetRetries`) that share a column with a "Management key" row (see
+/// [`label_text_width`]). PIV-pane/factory-reset-dialog only — see that
+/// function's doc for why this isn't just a flag on `pin_field`.
+fn piv_pin_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    buf: &mut String,
+    revealed: &mut bool,
+    label_w: f32,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [label_w, 22.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            ),
+        );
+        inline_secret_edit(ui, p, buf, revealed, "", 200.0);
+    });
+    ui.add_space(4.0);
+}
+
+/// Like [`secret_field`], but with [`piv_pin_field`]'s inline reveal toggle.
+/// Same scope note: PIV pane and factory-reset dialog only.
+#[allow(clippy::too_many_arguments)]
+fn piv_secret_field(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    label: &str,
+    buf: &mut String,
+    revealed: &mut bool,
+    hint: &str,
+    label_w: f32,
+    w: f32,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [label_w, 22.0],
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            ),
+        );
+        inline_secret_edit(ui, p, buf, revealed, hint, w);
+    });
+    ui.add_space(4.0);
+}
+
 /// Fine-print note inside a management card.
 fn card_note(ui: &mut egui::Ui, p: &Palette, t: &str) {
     ui.label(
         egui::RichText::new(t)
             .font(theme::f_reg(12.0))
             .color(p.txt3),
+    );
+}
+
+/// The "Valid for" fields shared by the certificate and CHUID cards: three
+/// `DragValue`s — years, months, days, in that order — that sum, mirroring
+/// `keyroostctl piv self-sign`/`new-chuid`'s combinable `--years`/`--months`/
+/// `--days` exactly (see [`keyroost_piv::add_calendar_period`]). Renders
+/// only the three fields, not the "Valid for" label itself — the two call
+/// sites lay that out differently (a plain label vs. one column-aligned with
+/// the field above it), so each renders its own. Each field's own range
+/// tops out at what that unit alone could still represent from `now` —
+/// generous rather than exact once more than one field is nonzero, since the
+/// actual encoder clamps the summed result regardless.
+fn piv_valid_for_fields(
+    ui: &mut egui::Ui,
+    now: u32,
+    years: &mut u32,
+    months: &mut u32,
+    days: &mut u32,
+) {
+    ui.add(
+        egui::DragValue::new(years)
+            .range(0..=keyroost_piv::max_valid_years(u64::from(now)))
+            .suffix(" y"),
+    );
+    ui.add(
+        egui::DragValue::new(months)
+            .range(0..=keyroost_piv::max_valid_months(u64::from(now)))
+            .suffix(" mo"),
+    );
+    ui.add(
+        egui::DragValue::new(days)
+            .range(0..=keyroost_piv::max_valid_days(u64::from(now)))
+            .suffix(" d"),
     );
 }
 
@@ -8017,38 +9800,132 @@ fn chuid_guid_field_width(ctx: &egui::Context) -> f32 {
     w + 24.0
 }
 
-/// Label-column width for the New CHUID dialog's rows: the rendered width of
-/// "Management key" (the longest of the three row labels there — "GUID" and
-/// "Valid for" both fit inside it) plus a little padding. Every other
-/// dialog's `secret_field`/`text_field` label sits in a fixed 96px column,
-/// which is too narrow for "Management key" specifically — it overflowed
-/// into the field next to it, which then started at a different x than the
-/// GUID row's input did. Measured for the same reason
-/// [`chuid_guid_field_width`] is: correct regardless of font metrics.
-fn chuid_label_width(ctx: &egui::Context) -> f32 {
+/// Font-measured width (+ padding) of a label text — the general form behind
+/// [`chuid_label_width`]. A fixed-guess label column (the app's usual 96px)
+/// is only ever wide enough for the labels someone happened to test with;
+/// when a dialog shows two rows sharing a label column and one label is
+/// longer than the guess, that row's label overflows into the field next to
+/// it, which then starts at a different x than the other row's field.
+/// Measuring the actual longest label at the current font/zoom — the same
+/// reason [`chuid_guid_field_width`] measures rather than guesses — avoids
+/// that regardless of font metrics.
+fn label_text_width(ctx: &egui::Context, text: &str) -> f32 {
     let w = ctx
-        .fonts_mut(|f| {
-            f.layout_no_wrap(
-                "Management key".to_owned(),
-                theme::f_reg(13.0),
-                egui::Color32::WHITE,
-            )
-        })
+        .fonts_mut(|f| f.layout_no_wrap(text.to_owned(), theme::f_reg(13.0), egui::Color32::WHITE))
         .size()
         .x;
     w + 8.0
 }
 
-/// A PIV slot picker combo.
-/// A PIV key-algorithm picker combo.
-fn piv_keyalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivKeyAlgSel) {
+/// Label-column width for the New CHUID dialog's rows, and for any other
+/// dialog with a row sharing a column with a "Management key"/PIN row (see
+/// `App::piv_modal_mgmt_field`'s label_w for callers): the rendered width of
+/// "Management key" (the longest of the New CHUID dialog's three row labels
+/// there — "GUID" and "Valid for" both fit inside it) plus a little padding.
+fn chuid_label_width(ctx: &egui::Context) -> f32 {
+    label_text_width(ctx, "Management key")
+}
+
+/// `ui.selectable_value`'s own row, but sized the same whether or not the
+/// pointer is hovering it. Plain `ui.selectable_value` builds on
+/// `Button::selectable`, which only forces `frame_when_inactive(true)` for
+/// the *currently selected* row; every other row paints no stroke at rest
+/// and reserves no space for one either. This app's theme (`Palette::apply`)
+/// gives the `inactive` widget state a real 1px stroke width too — for text
+/// fields' own visible boundary — where egui's own default is 0, so an
+/// *unselected* row ends up measurably shorter at rest than hovered: 1px is
+/// exactly what egui's frame math sets aside for the stroke it isn't
+/// painting. In a combo popup with a small, fixed option list sitting close
+/// to the popup's height cap, that per-row wobble was enough to tip the
+/// whole list into needing a scrollbar the instant the pointer landed on a
+/// row — every PIV dropdown built from a `for` loop over a fixed option set
+/// (algorithm, management-key algorithm, PIN/touch policy, move destination)
+/// hits this the same way. Forcing the frame on unconditionally makes the
+/// reserved space — and so the row's height — independent of hover.
+fn stable_selectable_value<'a, T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    value: T,
+    text: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    let selected = *current == value;
+    let resp = ui.add(egui::Button::selectable(selected, text).frame_when_inactive(true));
+    if resp.clicked() && *current != value {
+        *current = value;
+    }
+    resp
+}
+
+/// Opacity for a gated (disabled) row in the PIV algorithm/policy combos —
+/// [`piv_keyalg_combo`] and [`piv_mgmtalg_combo`] gate entries today;
+/// `piv_policy_combo` sets it too even though every `PivPolicyOption` quirk
+/// currently filters `options` instead of disabling a value in place (see
+/// its `show_ui` closure) — so this is ready the day one does. The
+/// move-destination combo is the one PIV dropdown left out: it only ever
+/// offers an already-filtered, all-enabled slot list. egui's own default
+/// (`Visuals::disabled_alpha`, 0.5) reads as barely-lighter-than-enabled at
+/// this popup's font size, so a gated row and a pickable one are too close
+/// in weight to tell apart at a glance; this app sets it lower, scoped to
+/// just these popups' own `Ui` (see each `show_ui` closure), so it doesn't
+/// touch other disabled widgets in the app.
+const PIV_COMBO_DISABLED_ALPHA: f32 = 0.32;
+
+/// A PIV key-algorithm picker combo, listing every `keyroost_piv::KeyAlg`
+/// variant. `gate_of` resolves each candidate's
+/// `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm` gate on the live
+/// device: an entry gating `Unsupported` renders disabled (dimmed, not
+/// removed — the combo's shape stays the same as gates change) the same way
+/// the Move/Delete-key rows dim on this device; `Unverified` entries stay
+/// enabled and are instead called out together in a note below the combo
+/// (see `cap_piv`), since a per-row marker doesn't fit a closed dropdown the
+/// way it does an always-visible row.
+fn piv_keyalg_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    sel: &mut keyroost_piv::KeyAlg,
+    gate_of: impl Fn(keyroost_piv::KeyAlg) -> keyroost_piv::compat::FeatureGate,
+) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
-            for opt in PivKeyAlgSel::ALL {
-                ui.selectable_value(sel, opt, opt.label());
+            // `disabled_alpha`'s egui default (0.5) leaves a gated row only
+            // faintly lighter than an enabled one at this popup's font size —
+            // see PIV_COMBO_DISABLED_ALPHA. Set on this popup's own `Ui`
+            // (built fresh from the ambient style per `Palette::apply`'s
+            // `ScrollStyle` comment above), so it reaches every row below
+            // without touching disabled widgets elsewhere in the app.
+            ui.style_mut().visuals.disabled_alpha = PIV_COMBO_DISABLED_ALPHA;
+            for opt in keyroost_piv::KeyAlg::ALL {
+                let enabled = gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported;
+                ui.add_enabled_ui(enabled, |ui| {
+                    stable_selectable_value(ui, sel, opt, opt.label());
+                });
             }
         });
+}
+
+/// If `sel` gates `Unsupported` under `gate_of`, snap it to the first
+/// candidate in `keyroost_piv::KeyAlg::ALL` that doesn't — the slot
+/// key-algorithm counterpart of [`piv_mgmtalg_unsupported_fallback`], same
+/// reasoning: `fallback` (the caller's usual "widely-supported default", e.g.
+/// `KeyAlg::EccP256`) is itself just one candidate and could be the very
+/// entry gating `Unsupported` on some fingerprint, so it isn't returned
+/// unconditionally — only once every algorithm in `ALL` gates `Unsupported`
+/// and there's nothing better left to pick. Factored out of `cap_piv` so this
+/// fallback rule is unit-testable without an egui context.
+#[must_use]
+fn piv_keyalg_unsupported_fallback(
+    sel: keyroost_piv::KeyAlg,
+    fallback: keyroost_piv::KeyAlg,
+    gate_of: impl Fn(keyroost_piv::KeyAlg) -> keyroost_piv::compat::FeatureGate,
+) -> keyroost_piv::KeyAlg {
+    if gate_of(sel) != keyroost_piv::compat::FeatureGate::Unsupported {
+        return sel;
+    }
+    keyroost_piv::KeyAlg::ALL
+        .into_iter()
+        .find(|&alg| gate_of(alg) != keyroost_piv::compat::FeatureGate::Unsupported)
+        .unwrap_or(fallback)
 }
 
 /// An OpenPGP key-algorithm picker combo, restricted to `choices` (the card's
@@ -8102,26 +9979,157 @@ impl PivPolicyOption for keyroost_piv::TouchPolicy {
     }
 }
 
+/// Snap `*sel` to `options[0]` if it isn't already one of `options` — the
+/// generic counterpart of [`piv_mgmtalg_clamp`], used when a per-fingerprint
+/// [`keyroost_piv::compat::PivQuirk`] (e.g.
+/// [`SlotTouchPolicyCachedNotSupported`](keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported))
+/// has dropped a value from `options` that was previously selected — e.g. a
+/// device switch left `Cached` selected on a fingerprint that doesn't accept
+/// it. `T::ALL[0]` is always `Default`, so `options` never actually excludes
+/// it (only `Once`/`Cached` are ever quirk-gated) — this only ever snaps back
+/// to `Default`, never to some other survivor.
+fn piv_policy_clamp<T: PivPolicyOption>(sel: &mut T, options: &[T]) {
+    if let Some(&first) = options.first() {
+        if !options.contains(sel) {
+            *sel = first;
+        }
+    }
+}
+
 /// PIN/Touch Policy picker combo (Generate key modal). Generic over
-/// [`PivPolicyOption`] — the type of `sel` alone picks the right option list
-/// and labels.
-fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T) {
+/// [`PivPolicyOption`] — the type of `sel` alone picks the right label
+/// function. `options` is the offered set — [`PivPolicyOption::ALL`] on a
+/// device with no relevant quirk, or that list with one value removed (see
+/// [`piv_policy_clamp`]) — mirroring [`piv_mgmtalg_combo`]'s own
+/// caller-filtered-options shape.
+fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T, options: &[T]) {
+    piv_policy_clamp(sel, options);
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
-            for &opt in T::ALL {
-                ui.selectable_value(sel, opt, opt.label());
+            // No option is ever gated disabled today — quirk-excluded values
+            // are dropped from `options` outright rather than shown dimmed —
+            // but set the same dimming as the two combos above in case a
+            // future quirk gates a policy value in place instead of
+            // filtering it out (see `PIV_COMBO_DISABLED_ALPHA`).
+            ui.style_mut().visuals.disabled_alpha = PIV_COMBO_DISABLED_ALPHA;
+            for &opt in options {
+                stable_selectable_value(ui, sel, opt, opt.label());
             }
         });
 }
 
-/// A PIV management-key-algorithm picker combo.
-fn piv_mgmtalg_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivMgmtAlgSel) {
+/// Snap `*sel` to `options[0]` if it isn't already one of `options` — used
+/// so [`piv_mgmtalg_combo`] never shows a selection it isn't actually
+/// offering (e.g. `*sel` left on an algorithm the previously-selected device
+/// offered but this one doesn't). Factored out of that function so the
+/// clamp rule is unit-testable without an egui context. No-op on an empty
+/// `options` — there's nothing to snap to.
+fn piv_mgmtalg_clamp(sel: &mut PivMgmtAlgSel, options: &[PivMgmtAlgSel]) {
+    if let Some(&first) = options.first() {
+        if !options.contains(sel) {
+            *sel = first;
+        }
+    }
+}
+
+/// If `sel` gates `Unsupported` under `gate_of`, snap it to the first offered
+/// option that doesn't — used so the management-key algorithm combo never
+/// preselects a disabled entry. Deliberately not "snap to `options[0]`"
+/// outright, the way [`piv_mgmtalg_clamp`] does for an *unoffered* selection:
+/// `options[0]` (`TripleDes` on [`PivMgmtAlgSel::ALL`] today, now that it's
+/// alphabetized — this reasoning predates that and originally named `Aes192`,
+/// which was both `options[0]` *and* the type's `#[default]` at the time) can
+/// itself be the very entry gating `Unsupported` — a HID Crescendo device's
+/// XAUTH key never accepts AES-192, for instance — so falling back to it
+/// again would leave the combo showing a disabled selection instead of fixing
+/// anything. Falls back to `options[0]` only when
+/// every offered option gates `Unsupported`, and leaves `sel` alone
+/// (including when it isn't `Unsupported` to begin with) if `options` is
+/// empty — there's nothing to snap to either way. Factored out of `cap_piv`
+/// so this fallback rule is unit-testable without an egui context, the same
+/// reason [`piv_mgmtalg_clamp`] is its own function.
+#[must_use]
+fn piv_mgmtalg_unsupported_fallback(
+    sel: PivMgmtAlgSel,
+    options: &[PivMgmtAlgSel],
+    gate_of: impl Fn(PivMgmtAlgSel) -> keyroost_piv::compat::FeatureGate,
+) -> PivMgmtAlgSel {
+    if gate_of(sel) != keyroost_piv::compat::FeatureGate::Unsupported {
+        return sel;
+    }
+    options
+        .iter()
+        .copied()
+        .find(|&opt| gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported)
+        .or_else(|| options.first().copied())
+        .unwrap_or(sel)
+}
+
+/// The management-key algorithm combo's per-algorithm "unverified" warning
+/// list — every offered algorithm gating [`keyroost_piv::compat::FeatureGate::Unverified`],
+/// *unless* `extension_gate`
+/// (`keyroost_piv::compat::PivExtension::SetManagementKey`'s own gate, not a
+/// per-algorithm one) is already
+/// [`keyroost_piv::compat::FeatureGate::Unsupported`] — in which case this is
+/// always empty. When the whole extension is unsupported, the "Change
+/// management key…" button and the algorithm combo are already disabled with
+/// their own blocked-hint tooltip (see `cap_piv`'s "Management key" row); a
+/// caller can't pick an algorithm for a change it can't make at all, so
+/// calling out individually "unverified" algorithms on top of that would be
+/// misleading noise rather than useful information. Factored out of `cap_piv`
+/// so this suppression rule is unit-testable without an egui context, the
+/// same reason [`piv_mgmtalg_unsupported_fallback`] is its own function.
+#[must_use]
+fn piv_mgmtalg_unverified_labels(
+    extension_gate: keyroost_piv::compat::FeatureGate,
+    options: &[PivMgmtAlgSel],
+    gate_of: impl Fn(PivMgmtAlgSel) -> keyroost_piv::compat::FeatureGate,
+) -> Vec<&'static str> {
+    if extension_gate == keyroost_piv::compat::FeatureGate::Unsupported {
+        return Vec::new();
+    }
+    options
+        .iter()
+        .copied()
+        .filter(|&opt| gate_of(opt) == keyroost_piv::compat::FeatureGate::Unverified)
+        .map(PivMgmtAlgSel::label)
+        .collect()
+}
+
+/// A PIV management-key-algorithm picker combo. `options` is the offered set
+/// — [`PivMgmtAlgSel::ALL`] at every call site today, the same five entries
+/// on every device (see that type's doc); kept as a parameter rather than
+/// hard-coded so the clamp/fallback logic below stays generically testable.
+/// If `*sel` isn't among `options`, it snaps to `options[0]` before drawing —
+/// see [`piv_mgmtalg_clamp`].
+///
+/// `gate_of` resolves each candidate's
+/// `keyroost_piv::compat::PivExtension::ManagementKeyAlgorithm` gate on the
+/// live device, same shape and same treatment as [`piv_keyalg_combo`]'s own
+/// `gate_of`: an entry gating `Unsupported` renders disabled (dimmed, not
+/// removed — the combo's shape stays the same as gates change); `Unverified`
+/// entries stay enabled and are instead called out together in a note above
+/// the combo (see `cap_piv`).
+fn piv_mgmtalg_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    sel: &mut PivMgmtAlgSel,
+    options: &[PivMgmtAlgSel],
+    gate_of: impl Fn(PivMgmtAlgSel) -> keyroost_piv::compat::FeatureGate,
+) {
+    piv_mgmtalg_clamp(sel, options);
     egui::ComboBox::from_id_salt(id)
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
-            for opt in PivMgmtAlgSel::ALL {
-                ui.selectable_value(sel, opt, opt.label());
+            // See `piv_keyalg_combo`'s matching line: bump the dimming for
+            // gated rows in this popup only.
+            ui.style_mut().visuals.disabled_alpha = PIV_COMBO_DISABLED_ALPHA;
+            for &opt in options {
+                let enabled = gate_of(opt) != keyroost_piv::compat::FeatureGate::Unsupported;
+                ui.add_enabled_ui(enabled, |ui| {
+                    stable_selectable_value(ui, sel, opt, opt.label());
+                });
             }
         });
 }
@@ -9487,11 +11495,13 @@ impl App {
                                 // Salted per tab so each pane keeps its own
                                 // scroll position.
                                 //
-                                // Solid bar style: reserve a real gutter for the
-                                // scrollbar instead of floating it over the cards'
-                                // right edge (the floating bar sat on top of card
-                                // borders and the panes' top-right action buttons).
-                                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                                // Solid (space-reserving) scroll bars are the
+                                // app-wide default set in `theme::Palette::apply`
+                                // — no local override needed here. That default
+                                // is what keeps this bar from floating over the
+                                // cards' right edge (it used to sit on top of
+                                // card borders and the panes' top-right action
+                                // buttons).
                                 egui::ScrollArea::vertical()
                                     .id_salt(("cap-pane", self.cap_tab as u8))
                                     .auto_shrink([false, false])
@@ -9683,6 +11693,9 @@ impl App {
     /// Capability tab bar under the hero. The active tab gets `txt` + an accent
     /// underline; the rest are muted.
     fn cap_tabs(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
+        // A per-device remembered pick (or a device swap under an unchanged
+        // selection) can be stale for this device — see `snap_cap_tab`'s doc.
+        self.cap_tab = snap_cap_tab(self.cap_tab, &dev.tabs());
         ui.add_space(12.0);
         let mut next = None;
         ui.horizontal(|ui| {
@@ -9765,6 +11778,7 @@ impl App {
                         )
                         .sense(egui::Sense::click()),
                     )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     go = true;
@@ -10224,7 +12238,7 @@ impl App {
                                     let (text, tone) = factory_reset_row_line(row);
                                     let color = match tone {
                                         RowTone::Done => p.ok,
-                                        RowTone::Waiting => p.warn,
+                                        RowTone::Waiting | RowTone::Warn => p.warn,
                                         RowTone::Bad => p.err,
                                         RowTone::Muted => p.txt3,
                                     };
@@ -10237,7 +12251,7 @@ impl App {
                             }
                         });
                     if arm {
-                        self.factory_reset_confirm = self.selected_device.clone();
+                        self.start_factory_reset_confirm();
                     }
                 }
             }
@@ -12570,37 +14584,159 @@ impl App {
     /// default management key" toggle (the common case — most users never rotate
     /// the well-known factory default) and, when it's off, the hex entry field.
     /// When the toggle is on the field is hidden and the op reads the default via
-    /// `piv_current_mgmt_key`.
+    /// `piv_current_mgmt_auth`. The toggle itself is disabled — greyed out,
+    /// unclickable — whenever `Self::piv_current_default_mgmt_key` resolves
+    /// `None`: this fingerprint/version carries no
+    /// `keyroost_piv::compat::PivQuirk::Default9bManagementKey`, so keyroost has
+    /// no default to offer rather than one that might just be wrong. When it
+    /// does resolve `Some`, hovering the (enabled) checkbox shows the
+    /// applicable default key as hex in a tooltip, so the user can see what
+    /// they're about to authorize with before committing to it.
+    ///
+    /// When this device's fingerprint resolves
+    /// `keyroost_piv::compat::PivExtension::PinManagementAuth` to `Supported`
+    /// *or* `Unverified`, a second "Use PIN" toggle appears alongside it —
+    /// with a warning-triangle marker next to it for `Unverified`, same as
+    /// every other gated control in this pane, so the user can still try it
+    /// but knows it hasn't been confirmed on this specific device.
+    /// `Unsupported` hides the toggle entirely, same as before. Both toggles
+    /// are pure views onto — and setters of — the single
+    /// `PivState::mgmt_auth_mode` (see that type's doc for why): checking
+    /// either sets the mode to that variant; unchecking either always
+    /// returns to `PivMgmtAuthMode::Manual`, never leaves the other toggle's
+    /// variant standing. With "Use PIN" on, the hex field either turns into
+    /// a PIN entry (label "PIN", hint "PIN") — or, for a flow with a
+    /// dedicated PIN field of its own (`PivCredKind::shares_pin_field`),
+    /// disappears entirely, since that field's PIN is reused for management
+    /// auth too (there is only one PIV application PIN).
     fn piv_modal_mgmt_field(&mut self, ui: &mut egui::Ui, p: &Palette, kind: PivCredKind) {
         if !kind.needs_mgmt_key() {
             return;
         }
-        ui.checkbox(&mut self.piv.use_default_mgmt, "Use default management key");
-        if !self.piv.use_default_mgmt {
-            // Match the New CHUID dialog's GUID row so the two fields line
-            // up — same field width *and* same label-column width ("GUID"
-            // is short enough to fit the shared 96px label box, but
-            // "Management key" isn't, so both rows need the wider,
-            // measured column or their inputs start at different x).
-            // Every other flow keeps the narrower defaults.
-            let (label_w, width) = if kind == PivCredKind::NewChuid {
+        let pin_auth_gate = {
+            let (fp, ver, fw) = self.piv.status.as_ref().map_or(
                 (
-                    chuid_label_width(ui.ctx()),
-                    chuid_guid_field_width(ui.ctx()),
-                )
-            } else {
-                (96.0, 300.0)
-            };
-            secret_field(
-                ui,
-                p,
-                "Management key",
-                &mut self.piv.mgmt_key_input,
-                "hex (48/32/64 chars)",
-                label_w,
-                width,
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
             );
+            keyroost_piv::compat::resolve(
+                keyroost_piv::compat::PivExtension::PinManagementAuth,
+                fp,
+                ver,
+                fw,
+            )
+        };
+        let pin_auth_available = !matches!(
+            pin_auth_gate,
+            keyroost_piv::compat::FeatureGate::Unsupported
+        );
+        if !pin_auth_available && self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+            // Keeps state sane if a device switch mid-modal drops support out
+            // from under an already-checked toggle.
+            self.piv.mgmt_auth_mode = PivMgmtAuthMode::Manual;
         }
+        let default_key = self.piv_current_default_mgmt_key();
+        if default_key.is_none() && self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
+            // Same rationale as the "Use PIN" reset above: don't leave the
+            // toggle checked for a default a device switch just took away.
+            self.piv.mgmt_auth_mode = PivMgmtAuthMode::Manual;
+        }
+        ui.horizontal(|ui| {
+            let mut is_default = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default;
+            let mut resp = ui.add_enabled(
+                default_key.is_some(),
+                egui::Checkbox::new(&mut is_default, "Use default management key"),
+            );
+            if let Some(key) = default_key {
+                // Only on the enabled checkbox — a disabled one has no
+                // applicable default to show.
+                resp = resp.on_hover_text(format!("Default management key: {}", hex_lower(key)));
+            }
+            if resp.changed() {
+                self.piv.mgmt_auth_mode =
+                    piv_mgmt_mode_after_toggle(is_default, PivMgmtAuthMode::Default);
+            }
+            if pin_auth_available {
+                let mut is_pin = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin;
+                if ui.checkbox(&mut is_pin, "Use PIN").changed() {
+                    self.piv.mgmt_auth_mode =
+                        piv_mgmt_mode_after_toggle(is_pin, PivMgmtAuthMode::Pin);
+                }
+                if matches!(pin_auth_gate, keyroost_piv::compat::FeatureGate::Unverified) {
+                    ui.add_space(4.0);
+                    theme::warn_marker(ui, p).on_hover_text(format!(
+                        "{} {}",
+                        keyroost_piv::compat::PivExtension::PinManagementAuth.requirement(),
+                        keyroost_piv::compat::FeatureGate::UNVERIFIED_SUFFIX
+                    ));
+                }
+            }
+        });
+        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Default {
+            return;
+        }
+        let use_pin = self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin;
+        if use_pin && kind.shares_pin_field() {
+            return;
+        }
+        // Match whichever row shares a label column with this one, so the
+        // fields line up: the New CHUID dialog's GUID row (and, for
+        // `ChangeMgmtKey`, that same modal's own "New key" row below this
+        // one), or — for `SelfSign`/`SetRetries` — the dedicated PIN row
+        // below this one. "GUID"/"New key"/"PIN" are all short enough to fit
+        // the shared 96px label box, but "Management key" isn't, so every
+        // row sharing a column with it needs the wider, measured width or
+        // their inputs start at different x. Field width stays each row's
+        // own — only the label column needs to match. Every other flow
+        // (nothing else visible to misalign against) keeps the narrower
+        // default.
+        let label_w = if matches!(
+            kind,
+            PivCredKind::NewChuid
+                | PivCredKind::ChangeMgmtKey
+                | PivCredKind::SelfSign
+                | PivCredKind::SetRetries
+        ) {
+            chuid_label_width(ui.ctx())
+        } else {
+            96.0
+        };
+        let width = if kind == PivCredKind::NewChuid {
+            chuid_guid_field_width(ui.ctx())
+        } else {
+            300.0
+        };
+        let (label, hint) = if use_pin {
+            ("PIN", "PIN")
+        } else {
+            ("Management key", "hex (48/32/64 chars)")
+        };
+        let mut mgmt_key_rev = self
+            .secret_reveal
+            .get("piv-mgmt-key-input")
+            .copied()
+            .unwrap_or(false);
+        piv_secret_field(
+            ui,
+            p,
+            label,
+            &mut self.piv.mgmt_key_input,
+            &mut mgmt_key_rev,
+            hint,
+            label_w,
+            width,
+        );
+        self.secret_reveal
+            .insert("piv-mgmt-key-input", mgmt_key_rev);
     }
 
     /// PIV credential-entry modal: drives the PIN/PUK flows (Change PIN / Change
@@ -12715,20 +14851,132 @@ impl App {
                     // user can retry without losing the dialog).
                     match kind {
                         PivCredKind::ChangePin => {
-                            pin_field(ui, p, "Current PIN", &mut self.piv.pin_old);
-                            pin_field(ui, p, "New PIN", &mut self.piv.pin_new);
-                            pin_field(ui, p, "Confirm new PIN", &mut self.piv.pin_confirm);
+                            let mut old_rev = self
+                                .secret_reveal
+                                .get("piv-pin-old")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut new_rev = self
+                                .secret_reveal
+                                .get("piv-pin-new")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut confirm_rev = self
+                                .secret_reveal
+                                .get("piv-pin-confirm")
+                                .copied()
+                                .unwrap_or(false);
+                            // Sized to "Confirm new PIN", the widest of this
+                            // dialog's three labels, so all three fields'
+                            // left edges line up (see `label_text_width`).
+                            let label_w = label_text_width(ui.ctx(), "Confirm new PIN");
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Current PIN",
+                                &mut self.piv.pin_old,
+                                &mut old_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "New PIN",
+                                &mut self.piv.pin_new,
+                                &mut new_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Confirm new PIN",
+                                &mut self.piv.pin_confirm,
+                                &mut confirm_rev,
+                                label_w,
+                            );
+                            self.secret_reveal.insert("piv-pin-old", old_rev);
+                            self.secret_reveal.insert("piv-pin-new", new_rev);
+                            self.secret_reveal.insert("piv-pin-confirm", confirm_rev);
                             card_note(ui, p, "6\u{2013}8 characters.");
                         }
                         PivCredKind::ChangePuk => {
-                            pin_field(ui, p, "Current PUK", &mut self.piv.puk_old);
-                            pin_field(ui, p, "New PUK", &mut self.piv.puk_new);
-                            pin_field(ui, p, "Confirm new PUK", &mut self.piv.puk_confirm);
+                            let mut old_rev = self
+                                .secret_reveal
+                                .get("piv-puk-old")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut new_rev = self
+                                .secret_reveal
+                                .get("piv-puk-new")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut confirm_rev = self
+                                .secret_reveal
+                                .get("piv-puk-confirm")
+                                .copied()
+                                .unwrap_or(false);
+                            // Sized to "Confirm new PUK" — same rationale as
+                            // `ChangePin` above.
+                            let label_w = label_text_width(ui.ctx(), "Confirm new PUK");
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Current PUK",
+                                &mut self.piv.puk_old,
+                                &mut old_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "New PUK",
+                                &mut self.piv.puk_new,
+                                &mut new_rev,
+                                label_w,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Confirm new PUK",
+                                &mut self.piv.puk_confirm,
+                                &mut confirm_rev,
+                                label_w,
+                            );
+                            self.secret_reveal.insert("piv-puk-old", old_rev);
+                            self.secret_reveal.insert("piv-puk-new", new_rev);
+                            self.secret_reveal.insert("piv-puk-confirm", confirm_rev);
                             card_note(ui, p, "8 characters.");
                         }
                         PivCredKind::UnblockPin => {
-                            pin_field(ui, p, "PUK", &mut self.piv.unblock_puk);
-                            pin_field(ui, p, "New PIN", &mut self.piv.unblock_new_pin);
+                            let mut puk_rev = self
+                                .secret_reveal
+                                .get("piv-unblock-puk")
+                                .copied()
+                                .unwrap_or(false);
+                            let mut new_pin_rev = self
+                                .secret_reveal
+                                .get("piv-unblock-new-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PUK",
+                                &mut self.piv.unblock_puk,
+                                &mut puk_rev,
+                                96.0,
+                            );
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "New PIN",
+                                &mut self.piv.unblock_new_pin,
+                                &mut new_pin_rev,
+                                96.0,
+                            );
+                            self.secret_reveal.insert("piv-unblock-puk", puk_rev);
+                            self.secret_reveal
+                                .insert("piv-unblock-new-pin", new_pin_rev);
                             card_note(ui, p, "Recovers a blocked PIN without wiping any keys.");
                         }
                         // Management-key-gated flows: only the *secrets* live here;
@@ -12753,18 +15001,131 @@ impl App {
                             self.piv_modal_mgmt_field(ui, p, kind);
                             card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
                             ui.add_space(8.0);
+
+                            // PIN/touch policy (tags 0xAA/0xAB on GENERATE
+                            // ASYMMETRIC KEYPAIR) are Yubico extensions, not SP
+                            // 800-73-4 — gated the same three-way way
+                            // (`keyroost_piv::compat`) Move/Delete key are
+                            // elsewhere in this pane, just resolved locally
+                            // here since this modal doesn't share those rows'
+                            // gate locals. `default` needs neither extension
+                            // and is unaffected either way.
+                            use keyroost_piv::compat::{FeatureGate, PivExtension};
+                            let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+                                (
+                                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                                    None,
+                                    None,
+                                ),
+                                |s| {
+                                    (
+                                        s.applet_fingerprint,
+                                        s.version.as_deref(),
+                                        s.version_firmware.as_deref(),
+                                    )
+                                },
+                            );
+                            let pin_policy_gate = keyroost_piv::compat::resolve(
+                                PivExtension::SlotPinPolicy,
+                                piv_fp,
+                                piv_ver,
+                                piv_fw_ver,
+                            );
+                            let touch_policy_gate = keyroost_piv::compat::resolve(
+                                PivExtension::SlotTouchPolicy,
+                                piv_fp,
+                                piv_ver,
+                                piv_fw_ver,
+                            );
+                            // Narrower than the two gates above: a device can
+                            // support the extension in general yet reject one
+                            // specific value (e.g. YubiKey firmware 4.0-4.2
+                            // supports touch policy but not `cached`).
+                            let policy_quirks =
+                                keyroost_piv::compat::resolve_quirks(piv_fp, piv_ver, piv_fw_ver);
+                            let pin_once_blocked = policy_quirks.contains(
+                                &keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
+                            );
+                            let touch_cached_blocked = policy_quirks.contains(
+                                &keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
+                            );
+                            let pin_policy_unverified_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotPinPolicy.requirement(),
+                                FeatureGate::UNVERIFIED_SUFFIX
+                            );
+                            let pin_policy_blocked_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotPinPolicy.requirement(),
+                                FeatureGate::INCOMPATIBLE_SUFFIX
+                            );
+                            let touch_policy_unverified_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotTouchPolicy.requirement(),
+                                FeatureGate::UNVERIFIED_SUFFIX
+                            );
+                            let touch_policy_blocked_hint = format!(
+                                "{} {}",
+                                PivExtension::SlotTouchPolicy.requirement(),
+                                FeatureGate::INCOMPATIBLE_SUFFIX
+                            );
+                            // `Unsupported` blocks the whole combo (matching
+                            // Move/Delete key's own treatment) rather than
+                            // just the one value the quirks above narrow —
+                            // there's nothing to offer once the extension
+                            // itself is known absent, so force the selection
+                            // back to `default` rather than leave a stale
+                            // non-default value the combo can no longer show
+                            // as selectable.
+                            if matches!(pin_policy_gate, FeatureGate::Unsupported) {
+                                self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
+                            }
+                            if matches!(touch_policy_gate, FeatureGate::Unsupported) {
+                                self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
+                            }
+                            let pin_policy_options: Vec<keyroost_piv::PinPolicy> =
+                                keyroost_piv::PinPolicy::ALL
+                                    .iter()
+                                    .copied()
+                                    .filter(|&opt| {
+                                        !(pin_once_blocked && opt == keyroost_piv::PinPolicy::Once)
+                                    })
+                                    .collect();
+                            let touch_policy_options: Vec<keyroost_piv::TouchPolicy> =
+                                keyroost_piv::TouchPolicy::ALL
+                                    .iter()
+                                    .copied()
+                                    .filter(|&opt| {
+                                        !(touch_cached_blocked
+                                            && opt == keyroost_piv::TouchPolicy::Cached)
+                                    })
+                                    .collect();
+
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new("Pin Policy")
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt2),
                                 );
+                                if matches!(pin_policy_gate, FeatureGate::Unverified) {
+                                    ui.add_space(4.0);
+                                    theme::warn_marker(ui, p)
+                                        .on_hover_text(pin_policy_unverified_hint.as_str());
+                                }
                                 ui.add_space(8.0);
-                                piv_policy_combo(
-                                    ui,
-                                    "piv-gen-pin-policy",
-                                    &mut self.piv.gen_pin_policy,
-                                );
+                                ui.add_enabled_ui(
+                                    !matches!(pin_policy_gate, FeatureGate::Unsupported),
+                                    |ui| {
+                                        piv_policy_combo(
+                                            ui,
+                                            "piv-gen-pin-policy",
+                                            &mut self.piv.gen_pin_policy,
+                                            &pin_policy_options,
+                                        );
+                                    },
+                                )
+                                .response
+                                .on_disabled_hover_text(pin_policy_blocked_hint.as_str());
                             });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
@@ -12773,21 +15134,37 @@ impl App {
                                         .font(theme::f_reg(13.0))
                                         .color(p.txt2),
                                 );
+                                if matches!(touch_policy_gate, FeatureGate::Unverified) {
+                                    ui.add_space(4.0);
+                                    theme::warn_marker(ui, p)
+                                        .on_hover_text(touch_policy_unverified_hint.as_str());
+                                }
                                 ui.add_space(8.0);
-                                piv_policy_combo(
-                                    ui,
-                                    "piv-gen-touch-policy",
-                                    &mut self.piv.gen_touch_policy,
-                                );
+                                ui.add_enabled_ui(
+                                    !matches!(touch_policy_gate, FeatureGate::Unsupported),
+                                    |ui| {
+                                        piv_policy_combo(
+                                            ui,
+                                            "piv-gen-touch-policy",
+                                            &mut self.piv.gen_touch_policy,
+                                            &touch_policy_options,
+                                        );
+                                    },
+                                )
+                                .response
+                                .on_disabled_hover_text(touch_policy_blocked_hint.as_str());
                             });
-                            card_note(
-                                ui,
-                                p,
-                                "Policy other than `default` requires YubiKey or compatible \
-                                 token.",
-                            );
+                            if piv_policy_caveat_hint_needed(pin_policy_gate, touch_policy_gate) {
+                                card_note(
+                                    ui,
+                                    p,
+                                    "Policy other than `default` requires YubiKey or compatible \
+                                     token.",
+                                );
+                            }
                         }
                         PivCredKind::ImportCert => {
+                            card_note(ui, p, &format!("Reading {}", self.piv.cert_path));
                             self.piv_modal_mgmt_field(ui, p, kind);
                             // Importing only replaces the public certificate
                             // object (no key loss) — a lighter note, not a red
@@ -12804,30 +15181,73 @@ impl App {
                         }
                         PivCredKind::SelfSign => {
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            let mut sign_pin_rev = self
+                                .secret_reveal
+                                .get("piv-sign-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            // Matches `piv_modal_mgmt_field`'s own label
+                            // column above, so the two fields' left edges
+                            // line up.
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PIN",
+                                &mut self.piv.sign_pin,
+                                &mut sign_pin_rev,
+                                chuid_label_width(ui.ctx()),
+                            );
+                            self.secret_reveal.insert("piv-sign-pin", sign_pin_rev);
                             card_note(
                                 ui,
                                 p,
-                                "Management key authorizes the import; the PIN authorizes \
-                                 the on-card signature.",
+                                if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                    "The PIN unlocks management and authorizes the \
+                                     on-card signature."
+                                } else {
+                                    "Management key authorizes the import; the PIN authorizes \
+                                     the on-card signature."
+                                },
                             );
                         }
                         PivCredKind::RequestCsr => {
-                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
+                            card_note(ui, p, &format!("Saving to {}", self.piv.csr_path));
+                            let mut sign_pin_rev = self
+                                .secret_reveal
+                                .get("piv-sign-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PIN",
+                                &mut self.piv.sign_pin,
+                                &mut sign_pin_rev,
+                                96.0,
+                            );
+                            self.secret_reveal.insert("piv-sign-pin", sign_pin_rev);
                             card_note(ui, p, "The PIN authorizes the on-card signature.");
                         }
                         PivCredKind::SelfTest => {
-                            pin_field(ui, p, "PIN", &mut self.piv.sign_pin);
-                            if self.piv_selected_slot_policy().map(|(pin, _)| pin)
-                                == Some(keyroost_piv::PinPolicy::Never)
-                            {
-                                card_note(
-                                    ui,
-                                    p,
-                                    "This slot's PIN policy is \u{201c}never\u{201d} \u{2014} \
-                                     you can leave the PIN blank.",
-                                );
-                            }
+                            let mut sign_pin_rev = self
+                                .secret_reveal
+                                .get("piv-sign-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "PIN (optional)",
+                                &mut self.piv.sign_pin,
+                                &mut sign_pin_rev,
+                                96.0,
+                            );
+                            self.secret_reveal.insert("piv-sign-pin", sign_pin_rev);
+                            card_note(
+                                ui,
+                                p,
+                                "PIN optional; device state and policy may still require it.",
+                            );
                             card_note(
                                 ui,
                                 p,
@@ -12838,26 +15258,267 @@ impl App {
                         }
                         PivCredKind::SetRetries => {
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            pin_field(ui, p, "Current PIN", &mut self.piv.retries_pin_auth);
+                            let mut retries_pin_rev = self
+                                .secret_reveal
+                                .get("piv-retries-pin")
+                                .copied()
+                                .unwrap_or(false);
+                            // Matches `piv_modal_mgmt_field`'s own label
+                            // column above, so the two fields' left edges
+                            // line up.
+                            piv_pin_field(
+                                ui,
+                                p,
+                                "Current PIN",
+                                &mut self.piv.retries_pin_auth,
+                                &mut retries_pin_rev,
+                                chuid_label_width(ui.ctx()),
+                            );
+                            self.secret_reveal
+                                .insert("piv-retries-pin", retries_pin_rev);
                             card_note(
                                 ui,
                                 p,
-                                "Resets PIN and PUK to factory defaults; needs the \
-                                 management key and the current PIN.",
+                                if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                    "Resets PIN and PUK to factory defaults; the PIN both \
+                                     unlocks management and authorizes the reset."
+                                } else {
+                                    "Resets PIN and PUK to factory defaults; needs the \
+                                     management key and the current PIN."
+                                },
                             );
                         }
                         PivCredKind::ChangeMgmtKey => {
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            secret_field(
-                                ui,
-                                p,
-                                "New key",
-                                &mut self.piv.new_mgmt_key_input,
-                                "hex (48/32/64 chars)",
-                                96.0,
-                                300.0,
-                            );
-                            card_note(ui, p, "Enter the current key, then the new key.");
+                            // Shared with `piv_modal_mgmt_field`'s own
+                            // "Management key"/"PIN" row above (see its
+                            // comment) so this row's field starts at the same
+                            // x. The "Generate random key & Copy" link and "Allow
+                            // PIN unlock" checkbox below it are centered
+                            // instead, not lined up under this column — see
+                            // their own comments.
+                            let label_w = chuid_label_width(ui.ctx());
+                            match self.piv.new_mgmt_alg.to_alg() {
+                                Some(alg) => {
+                                    let new_key_hint = format!("hex ({} chars)", alg.key_len() * 2);
+                                    let mut new_key_rev = self
+                                        .secret_reveal
+                                        .get("piv-new-mgmt-key")
+                                        .copied()
+                                        .unwrap_or(false);
+                                    piv_secret_field(
+                                        ui,
+                                        p,
+                                        "New key",
+                                        &mut self.piv.new_mgmt_key_input,
+                                        &mut new_key_rev,
+                                        &new_key_hint,
+                                        label_w,
+                                        300.0,
+                                    );
+                                    self.secret_reveal.insert("piv-new-mgmt-key", new_key_rev);
+                                    ui.add_space(2.0);
+                                    // Centered rather than lined up under the
+                                    // label column like the rows above/below
+                                    // it — this link and the "Allow PIN
+                                    // unlock" checkbox beneath it read as a
+                                    // pair of standalone actions, not a
+                                    // labeled field, so they share the
+                                    // modal's horizontal center instead.
+                                    ui.vertical_centered(|ui| {
+                                        // Plain accent-colored `Label` +
+                                        // `Sense::click()`, not `ui.link()` —
+                                        // same pattern as the zoom "Reset"
+                                        // link above: a pointing-hand cursor
+                                        // on hover, but no underline.
+                                        if ui
+                                            .add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(
+                                                        "Generate random key & Copy",
+                                                    )
+                                                    .font(theme::f_sb(13.0))
+                                                    .color(p.accent),
+                                                )
+                                                .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .on_hover_text(
+                                                "Fill in a fresh random key of the selected \
+                                                 length and copy it to the clipboard.",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.piv_generate_random_mgmt_key(ui.ctx(), alg);
+                                        }
+                                    });
+                                    // "Allow PIN unlock": whether the new key
+                                    // is also stored PIN-protected (Yubico's
+                                    // `PivExtension::PinManagementAuth`) —
+                                    // gated the same three-way way the
+                                    // GenerateKey modal's own PIN/touch
+                                    // policy rows are, resolved locally here
+                                    // since this modal doesn't share the
+                                    // status card's gate locals. HID
+                                    // Crescendo unlocks management off the
+                                    // PIN already, with no key material to
+                                    // store — forced on and disabled there
+                                    // instead of gated, same "nothing to
+                                    // toggle" treatment
+                                    // `set_management_key_pin_protected`
+                                    // itself gives that fingerprint (it skips
+                                    // the maintenance step outright).
+                                    use keyroost_piv::compat::{FeatureGate, PivExtension};
+                                    let is_hid_crescendo = self.piv.status.as_ref().is_some_and(|s| {
+                                        matches!(
+                                            s.applet_fingerprint,
+                                            keyroost_piv::fingerprint::AppletFingerprint::HidCrescendo(_)
+                                        )
+                                    });
+                                    ui.add_space(4.0);
+                                    // Centered under the link above, not under
+                                    // the field label column — see that row's
+                                    // comment.
+                                    if is_hid_crescendo {
+                                        self.piv.new_mgmt_allow_pin_unlock = true;
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_enabled_ui(false, |ui| {
+                                                ui.checkbox(
+                                                    &mut self.piv.new_mgmt_allow_pin_unlock,
+                                                    "Allow PIN unlock",
+                                                );
+                                            });
+                                        });
+                                    } else {
+                                        let (piv_fp, piv_ver, piv_fw_ver) =
+                                            self.piv.status.as_ref().map_or(
+                                                (
+                                                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                                                    None,
+                                                    None,
+                                                ),
+                                                |s| {
+                                                    (
+                                                        s.applet_fingerprint,
+                                                        s.version.as_deref(),
+                                                        s.version_firmware.as_deref(),
+                                                    )
+                                                },
+                                            );
+                                        let pin_unlock_gate = keyroost_piv::compat::resolve(
+                                            PivExtension::PinManagementAuth,
+                                            piv_fp,
+                                            piv_ver,
+                                            piv_fw_ver,
+                                        );
+                                        let pin_unlock_blocked_hint = format!(
+                                            "{} {}",
+                                            PivExtension::PinManagementAuth.requirement(),
+                                            FeatureGate::INCOMPATIBLE_SUFFIX
+                                        );
+                                        // `ui.vertical_centered` only centers
+                                        // a row correctly when the row is a
+                                        // single widget claiming its own
+                                        // natural size — `ui.horizontal`
+                                        // always pre-claims the *full*
+                                        // available width up front (so
+                                        // multi-widget centering has nothing
+                                        // left to center), which is exactly
+                                        // why the checkbox-alone branches
+                                        // above and below this one center
+                                        // fine while this one (checkbox +
+                                        // conditional warning icon, two
+                                        // widgets on one line) didn't. Measure
+                                        // the row's actual rendered width and
+                                        // pad it into the middle by hand
+                                        // instead; the padding is one frame
+                                        // stale right after the icon
+                                        // appears/disappears, which is
+                                        // imperceptible for a row that only
+                                        // changes on a device switch.
+                                        let row_w_id =
+                                            egui::Id::new("piv-allow-pin-unlock-row-width");
+                                        let last_row_w =
+                                            ui.data(|d| d.get_temp::<f32>(row_w_id)).unwrap_or(0.0);
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(
+                                                ((ui.available_width() - last_row_w) / 2.0)
+                                                    .max(0.0),
+                                            );
+                                            let row = ui.horizontal(|ui| {
+                                                ui.add_enabled_ui(
+                                                    !matches!(
+                                                        pin_unlock_gate,
+                                                        FeatureGate::Unsupported
+                                                    ),
+                                                    |ui| {
+                                                        ui.checkbox(
+                                                            &mut self.piv.new_mgmt_allow_pin_unlock,
+                                                            "Allow PIN unlock",
+                                                        );
+                                                    },
+                                                )
+                                                .response
+                                                .on_disabled_hover_text(
+                                                    pin_unlock_blocked_hint.as_str(),
+                                                );
+                                                if matches!(
+                                                    pin_unlock_gate,
+                                                    FeatureGate::Unverified
+                                                ) {
+                                                    ui.add_space(4.0);
+                                                    theme::warn_marker(ui, p).on_hover_text(
+                                                        format!(
+                                                            "{} {}",
+                                                            PivExtension::PinManagementAuth
+                                                                .requirement(),
+                                                            FeatureGate::UNVERIFIED_SUFFIX
+                                                        )
+                                                        .as_str(),
+                                                    );
+                                                }
+                                            });
+                                            ui.data_mut(|d| {
+                                                d.insert_temp(row_w_id, row.response.rect.width())
+                                            });
+                                        });
+                                    }
+                                    card_note(
+                                        ui,
+                                        p,
+                                        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                            "Enter the PIN, then the new key. Select \"Allow \
+                                             PIN Unlock\" to also unlock management with the \
+                                             PIN, in addition to the management key."
+                                        } else {
+                                            "Enter the current key, then the new key. Select \
+                                             \"Allow PIN unlock\" to also unlock management \
+                                             with the PIN, in addition to the management key."
+                                        },
+                                    );
+                                }
+                                // "Delete" (HID Crescendo only, see
+                                // `PivMgmtAlgSel`): no new-key field at all —
+                                // an empty key is sent, deleting XAUTH key 1
+                                // instead of replacing it.
+                                None => {
+                                    card_note(
+                                        ui,
+                                        p,
+                                        if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                                            "Enter the PIN to unlock. This deletes the \
+                                             management key rather than replacing it, \
+                                             leaving the PIN as the only remaining \
+                                             authentication mechanism."
+                                        } else {
+                                            "Enter the current key to unlock. This deletes \
+                                             the management key rather than replacing it, \
+                                             leaving the PIN as the only remaining \
+                                             authentication mechanism."
+                                        },
+                                    );
+                                }
+                            }
                         }
                         PivCredKind::DeleteCert => {
                             let slot = self.piv.selected_slot.label();
@@ -12889,7 +15550,7 @@ impl App {
                                 ui,
                                 p,
                                 "The management key authorizes the deletion. Needs \
-                                 YubiKey 5.7 or newer.",
+                                 YubiKey 5.7+ or compatible third party device.",
                             );
                         }
                         PivCredKind::MoveKey => {
@@ -12918,7 +15579,8 @@ impl App {
                                     .selected_text(sel_text)
                                     .show_ui(ui, |ui| {
                                         for dest in &move_dests {
-                                            ui.selectable_value(
+                                            stable_selectable_value(
+                                                ui,
                                                 &mut self.piv.move_dest,
                                                 Some(*dest),
                                                 dest.label(),
@@ -12932,7 +15594,8 @@ impl App {
                                 ui,
                                 p,
                                 "Moves only the key; the certificate stays in the \
-                                 source slot. Needs YubiKey 5.7 or newer.",
+                                 source slot. Needs YubiKey 5.7+ or compatible third \
+                                 party device.",
                             );
                         }
                         PivCredKind::NewChuid => {
@@ -12967,17 +15630,23 @@ impl App {
                             });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Valid for")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt2),
+                                // Same fixed label column the "GUID" row above
+                                // uses, so the years field's left edge lines up
+                                // with the GUID input's.
+                                ui.add_sized(
+                                    [chuid_label_width(ui.ctx()), 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("Valid for")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt2),
+                                    ),
                                 );
-                                ui.add(
-                                    egui::DragValue::new(&mut self.piv.chuid_valid_days)
-                                        .range(
-                                            1..=keyroost_piv::max_valid_days(u64::from(unix_now())),
-                                        )
-                                        .suffix(" days"),
+                                piv_valid_for_fields(
+                                    ui,
+                                    unix_now(),
+                                    &mut self.piv.chuid_valid_years,
+                                    &mut self.piv.chuid_valid_months,
+                                    &mut self.piv.chuid_valid_days,
                                 );
                             });
                             card_note(
@@ -13103,7 +15772,8 @@ impl App {
         wipe(&mut self.piv.new_mgmt_key_input);
         wipe(&mut self.piv.sign_pin);
         wipe(&mut self.piv.retries_pin_auth);
-        self.piv.use_default_mgmt = false;
+        self.piv.mgmt_auth_mode = PivMgmtAuthMode::default();
+        self.piv.new_mgmt_allow_pin_unlock = false;
         self.piv.move_dest = None;
         self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
         self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
@@ -13927,6 +16597,7 @@ impl App {
 
     /// PIV tab — read-only status snapshot (auto-read on first view).
     fn cap_piv(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        use keyroost_piv::compat::{FeatureGate, PivExtension};
         if !self.piv_tried && !self.busy() {
             self.piv_tried = true;
             self.load_piv_status(LogKind::Background);
@@ -13951,6 +16622,7 @@ impl App {
         let mut open_new_chuid = false;
         let mut click_retired_tab = false;
         let mut arm_reset = false;
+        let mut go_to_overview = false;
         let mut copy_pem: Option<String> = None;
         // Slot the user clicked in the status card this frame (applied after the
         // card borrows end). `selected` is a copy of the active selection so the
@@ -13960,179 +16632,434 @@ impl App {
 
         let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
 
+        // Yubico SET PIN RETRIES (`INS 0xFA`) sets the PIN's and PUK's retry
+        // counters together in one APDU — there is no way to change one
+        // without the other — so it's gated by a single extension rather
+        // than a pair the way Move/Delete key are. Computed up front,
+        // before the "Retry counts" row below (the per-slot gates further
+        // down compute this same fingerprint/version triple again, for
+        // their own slot-scoped purposes).
+        let (retries_piv_fp, retries_piv_ver, retries_piv_fw_ver) =
+            self.piv.status.as_ref().map_or(
+                (
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
+            );
+        let set_retries_gate = keyroost_piv::compat::resolve(
+            PivExtension::SetPinPukRetries,
+            retries_piv_fp,
+            retries_piv_ver,
+            retries_piv_fw_ver,
+        );
+        let set_retries_unverified_hint = format!(
+            "{} {}",
+            PivExtension::SetPinPukRetries.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let set_retries_blocked_hint = format!(
+            "{} {}",
+            PivExtension::SetPinPukRetries.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        // Change management key (Yubico SET MANAGEMENT KEY) is gated the
+        // same way, from the same fingerprint/version triple as the retry
+        // counts above — see the "Management key" row below.
+        let change_mgmt_key_gate = keyroost_piv::compat::resolve(
+            PivExtension::SetManagementKey,
+            retries_piv_fp,
+            retries_piv_ver,
+            retries_piv_fw_ver,
+        );
+        let change_mgmt_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::SetManagementKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let change_mgmt_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::SetManagementKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        // Per-algorithm gates for the "Management key" row's algorithm
+        // combo, below — same shape as `keyalg_gates` (the slot
+        // key-algorithm combo's own gate table, built further down in this
+        // function): resolved eagerly here (an owned array, not a closure
+        // over `retries_piv_fp`/`retries_piv_ver`/`retries_piv_fw_ver`) for
+        // the same borrow-lifetime reason `keyalg_gates`'s own doc gives. Not
+        // every algorithm is universally implemented, standardized or not,
+        // and `Delete` is a real HID-Crescendo-only capability rather than
+        // always-unsupported filler — see
+        // `PivExtension::ManagementKeyAlgorithm`'s own doc.
+        let mgmtalg_gates: [(PivMgmtAlgSel, FeatureGate); PivMgmtAlgSel::ALL.len()] =
+            PivMgmtAlgSel::ALL.map(|alg| {
+                (
+                    alg,
+                    keyroost_piv::compat::resolve(
+                        PivExtension::ManagementKeyAlgorithm(alg.to_choice()),
+                        retries_piv_fp,
+                        retries_piv_ver,
+                        retries_piv_fw_ver,
+                    ),
+                )
+            });
+        let mgmtalg_gate = move |alg: PivMgmtAlgSel| {
+            mgmtalg_gates
+                .iter()
+                .find_map(|&(a, gate)| (a == alg).then_some(gate))
+                .unwrap_or(FeatureGate::Unverified)
+        };
+        // Unsupported doesn't just dim the DragValues below -- with no way
+        // to submit them, a count the user dragged in before this device
+        // turned out incompatible (or left over from a previous, compatible
+        // device, since this pane's state doesn't reset on every status
+        // refresh) would otherwise sit there stale and misleading. Reset
+        // both back to the same factory-default count `PivState::default()`
+        // seeds them with, every frame this gate resolves `Unsupported` --
+        // cheap and idempotent, and the fields are non-interactive anyway
+        // while it holds.
+        if matches!(set_retries_gate, FeatureGate::Unsupported) {
+            self.piv.retries_pin = 3;
+            self.piv.retries_puk = 3;
+        }
+
         // --- PIV smart card status card (full-width, FIDO2 "PIN & sign-in"
         // shape): title + help left, Refresh right, applet/serial/retries body.
-        theme::card_frame(p).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("PIV smart card")
-                        .font(theme::f_sb(14.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                        do_refresh = true;
-                    }
+        //
+        // Wrapped in `add_enabled_ui` rather than gating each button/field
+        // below: egui propagates `enabled` down the whole child tree, so
+        // this one call dims Refresh, the PIN/PUK/retries/management-key/
+        // CHUID actions, and every input among them together, with nothing
+        // to keep in sync as rows are added or reordered. `self.piv.inflight`
+        // covers every PIV job, not just this card's own Refresh, so any
+        // in-flight generate/import/delete/... elsewhere dims this card too.
+        ui.add_enabled_ui(!self.piv.inflight, |ui| {
+            theme::card_frame(p).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("PIV smart card")
+                            .font(theme::f_sb(14.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
+                            do_refresh = true;
+                        }
+                    });
                 });
-            });
-            ui.add_space(8.0);
-            if let Some(err) = &self.piv.error {
-                ui.colored_label(p.err, err);
-                ui.add_space(6.0);
-            }
-            if let Some(n) = &self.piv.notice {
-                ui.colored_label(p.ok, n);
-                ui.add_space(6.0);
-            }
-            // Status body: version / serial / PIN retries collapsed onto one
-            // dotted line.
-            if let Some(st) = &self.piv.status {
-                // Tolerant of any non-empty GET VERSION reply, not just real
-                // Yubico firmware's 3 bytes — some third-party PIV applets
-                // that answer this vendor extension at all use a different
-                // byte count (observed: a Swissbit iShield Key 2 Pro replies
-                // with 4).
-                let ver = st
-                    .version
-                    .as_deref()
-                    .map(keyroost_piv::format_version_bytes)
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let serial = st.serial.map_or("\u{2014}".to_string(), |s| s.to_string());
-                let retries = st
-                    .pin_retries
-                    .map_or("\u{2014}".to_string(), |n| n.to_string());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Applet {ver} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
-                    ))
-                    .font(theme::f_reg(12.5))
-                    .color(p.txt2),
-                );
-                // CHUID — GUID and expiration only. FASC-N carries no
-                // information worth showing here (it's a fixed filler, not
-                // real card data — see keyroost_piv::encode_chuid) and stays
-                // out of the UI; `keyroostctl piv status` still prints it.
-                // The signature and LRC fields are omitted everywhere.
-                if let Some(chuid) = &st.chuid {
+                ui.add_space(8.0);
+                if let Some(err) = &self.piv.error {
+                    ui.colored_label(p.err, err);
+                    ui.add_space(6.0);
+                }
+                if let Some(n) = &self.piv.notice {
+                    ui.colored_label(p.ok, n);
+                    ui.add_space(6.0);
+                }
+                // Status body: version / serial / PIN retries collapsed onto one
+                // dotted line.
+                if let Some(st) = &self.piv.status {
+                    // Tolerant of any non-empty GET VERSION reply, not just real
+                    // Yubico firmware's 3 bytes — some third-party PIV applets
+                    // that answer this vendor extension at all use a different
+                    // byte count (observed: a Swissbit iShield Key 2 Pro replies
+                    // with 4).
+                    //
+                    // `version_firmware` is the token's own firmware version
+                    // (read through a fingerprint-specific probe only some
+                    // tokens answer — currently a Nitrokey only), a separate
+                    // axis from the PIV applet's own version above — see
+                    // `PivStatus::version_firmware`'s doc for why the two
+                    // aren't interchangeable. Shown only when it adds
+                    // information: suppressed when it's absent, and folded
+                    // into the "Applet" segment (rather than repeated as its
+                    // own dotted field) when it equals the applet version, so
+                    // the common case where a token doesn't distinguish the
+                    // two axes doesn't show the same number twice.
+                    let applet_ver = st.version.as_deref().map(keyroost_piv::format_version_bytes);
+                    let fw_ver = st
+                        .version_firmware
+                        .as_deref()
+                        .filter(|fw| Some(*fw) != st.version.as_deref())
+                        .map(keyroost_piv::format_version_bytes);
+                    let applet_field = match (applet_ver, fw_ver) {
+                        (Some(av), Some(fw)) => format!("Applet {av} (FW v{fw})"),
+                        (Some(av), None) => format!("Applet {av}"),
+                        (None, Some(fw)) => format!("Applet FW v{fw}"),
+                        (None, None) => "Applet \u{2014}".to_string(),
+                    };
+                    let serial = st
+                        .serial
+                        .map_or("\u{2014}".to_string(), keyroost_piv::format_serial_short);
+                    let retries = st
+                        .pin_retries
+                        .map_or("\u{2014}".to_string(), |n| n.to_string());
+                    // The token's own reported name when it has one (e.g. a
+                    // Nitrokey's admin application); otherwise the generic name
+                    // for its fingerprinted applet family — same fallback as
+                    // `keyroostctl piv status`'s plain-text output.
+                    let applet_name = if st.applet_name.is_empty() {
+                        st.applet_fingerprint.applet_name().to_string()
+                    } else {
+                        st.applet_name.clone()
+                    };
                     ui.label(
                         egui::RichText::new(format!(
-                            "CHUID: GUID {} \u{00B7} Expires {}",
-                            chuid.guid_display(),
-                            chuid.expiration_display()
+                            "{applet_name} \u{00B7} {applet_field} \u{00B7} Serial {serial} \u{00B7} PIN retries {retries}"
                         ))
                         .font(theme::f_reg(12.5))
                         .color(p.txt2),
                     );
+                    // CHUID — GUID and expiration only. FASC-N carries no
+                    // information worth showing here (it's a fixed filler, not
+                    // real card data — see keyroost_piv::encode_chuid) and stays
+                    // out of the UI; `keyroostctl piv status` still prints it.
+                    // The signature and LRC fields are omitted everywhere.
+                    if let Some(chuid) = &st.chuid {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "CHUID: GUID {} \u{00B7} Expires {}",
+                                chuid.guid_display(),
+                                chuid.expiration_display()
+                            ))
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                        );
+                    }
+                } else if self.piv.error.is_none() {
+                    ui.label(
+                        egui::RichText::new("Reading PIV status\u{2026}")
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt3),
+                    );
                 }
-            } else if self.piv.error.is_none() {
-                ui.label(
-                    egui::RichText::new("Reading PIV status\u{2026}")
-                        .font(theme::f_reg(13.0))
-                        .color(p.txt3),
-                );
-            }
 
-            // Applet-wide administration: PIN & PUK, retry counts, and the
-            // management key all apply to the whole applet rather than to one
-            // slot, so they sit with the applet status here.
-            ui.add_space(12.0);
+                // Applet-wide administration: PIN & PUK, retry counts, and the
+                // management key all apply to the whole applet rather than to one
+                // slot, so they sit with the applet status here.
+                ui.add_space(12.0);
 
-            // PIN & PUK: bold label + help left, the three actions right.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("PIN & PUK")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "pin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
-                        open_unblock = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
-                        open_change_puk = true;
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
-                        open_change_pin = true;
-                    }
-                });
-            });
-
-            // Retry counts: label + help left, the tries DragValues and the
-            // apply button right-aligned.
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Retry counts")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-admin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}").clicked()
-                    {
-                        open_set_retries = true;
-                    }
-                    ui.add_space(8.0);
-                    ui.add(egui::DragValue::new(&mut self.piv.retries_puk).range(1..=15u8));
+                // PIN & PUK: bold label + help left, the three actions right.
+                ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("PUK tries")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
+                        egui::RichText::new("PIN & PUK")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
                     );
-                    ui.add_space(8.0);
-                    ui.add(egui::DragValue::new(&mut self.piv.retries_pin).range(1..=15u8));
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "pin");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
+                            open_unblock = true;
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Default, "Change PUK\u{2026}").clicked() {
+                            open_change_puk = true;
+                        }
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
+                            open_change_pin = true;
+                        }
+                    });
+                });
+
+                // Retry counts: label + help left, the tries DragValues and the
+                // apply button right-aligned. SET PIN RETRIES (Yubico `INS
+                // 0xFA`) sets both counters in one APDU, so it's gated by the
+                // single `set_retries_gate` above rather than a pair, unlike
+                // Move/Delete key: `Unsupported` dims both DragValues and the
+                // button together (there's nothing partial to offer) and resets
+                // both counts to their factory default above, rather than
+                // leaving a stale drag-in value behind a disabled field; and
+                // `Unverified` only adds the same warning marker Move key uses,
+                // leaving everything else live.
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("PIN tries")
-                            .font(theme::f_reg(13.0))
-                            .color(p.txt2),
+                        egui::RichText::new("Retry counts")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
                     );
-                });
-            });
-
-            // Management key: label + help left, algorithm combo and change
-            // button right-aligned.
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Management key")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-admin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
-                        .clicked()
-                    {
-                        open_change_mgmt = true;
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    if matches!(set_retries_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(set_retries_unverified_hint.as_str());
                     }
-                    ui.add_space(8.0);
-                    piv_mgmtalg_combo(ui, "piv-new-mgmt-alg", &mut self.piv.new_mgmt_alg);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if matches!(set_retries_gate, FeatureGate::Unsupported) {
+                            theme::button_disabled(ui, p, "Set retry counts\u{2026}")
+                                .on_hover_text(set_retries_blocked_hint.as_str());
+                        } else if theme::button(ui, p, BtnKind::Default, "Set retry counts\u{2026}")
+                            .clicked()
+                        {
+                            open_set_retries = true;
+                        }
+                        ui.add_space(8.0);
+                        let retries_unsupported = matches!(set_retries_gate, FeatureGate::Unsupported);
+                        // A disabled `DragValue` still renders whatever number
+                        // `self.piv.retries_{pin,puk}` currently holds — the
+                        // factory-default `3` these two reset to just above, on
+                        // a device that plain doesn't support setting retries at
+                        // all. Left alone, that reads as a real reported count
+                        // rather than the meaningless placeholder it is. Blank
+                        // it via a custom formatter rather than the field's
+                        // value: the value itself still has to stay a real `u8`
+                        // (`DragValue` requires `Numeric`, and the same field
+                        // backs the live, editable count on any device that
+                        // *does* support this), so emptiness lives at the
+                        // display layer, not the data.
+                        let blank_when_unsupported = move |n: f64, _: std::ops::RangeInclusive<usize>| {
+                            if retries_unsupported {
+                                String::new()
+                            } else {
+                                format!("{}", n as u8)
+                            }
+                        };
+                        ui.add_enabled(
+                            !retries_unsupported,
+                            egui::DragValue::new(&mut self.piv.retries_puk)
+                                .range(1..=15u8)
+                                .custom_formatter(blank_when_unsupported),
+                        );
+                        ui.label(
+                            egui::RichText::new("PUK tries")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                        ui.add_space(8.0);
+                        ui.add_enabled(
+                            !retries_unsupported,
+                            egui::DragValue::new(&mut self.piv.retries_pin)
+                                .range(1..=15u8)
+                                .custom_formatter(blank_when_unsupported),
+                        );
+                        ui.label(
+                            egui::RichText::new("PIN tries")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        );
+                    });
                 });
-            });
 
-            // CHUID: label + help left, the write action right-aligned.
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("CHUID")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
+                // Management key: label + help left, algorithm combo and change
+                // button right-aligned.
+                ui.add_space(10.0);
+                // Every candidate is offered on every device — including
+                // `PivMgmtAlgSel::Delete`, HID Crescendo's "remove the
+                // management key outright" choice, which renders disabled
+                // rather than omitted on a device that can't do that — see
+                // `PivMgmtAlgSel::ALL`'s own doc. Each option is gated
+                // individually by `mgmtalg_gate` below, the same "list every
+                // candidate, gate each one live" shape the Generate key
+                // card's algorithm combo already uses.
+                let mgmt_alg_options = &PivMgmtAlgSel::ALL[..];
+                // Same "don't leave a selection the combo can no longer
+                // offer" treatment as the Generate key card's algorithm
+                // combo: a prior selection that's since become
+                // known-unsupported (e.g. after switching devices) falls back
+                // to the first offered option that's actually selectable —
+                // see `piv_mgmtalg_unsupported_fallback`'s own doc for why
+                // that isn't simply `mgmt_alg_options[0]`.
+                self.piv.new_mgmt_alg = piv_mgmtalg_unsupported_fallback(
+                    self.piv.new_mgmt_alg,
+                    mgmt_alg_options,
+                    mgmtalg_gate,
                 );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-admin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "New CHUID\u{2026}").clicked() {
-                        open_new_chuid = true;
+                // Same `Unsupported`-only gate the "Change management key…"
+                // button and the combo below both use, so button, combo, and
+                // this per-algorithm warning all dim/suppress together — see
+                // `piv_mgmtalg_unverified_labels`'s own doc for why the
+                // warning specifically goes empty rather than merely
+                // disabled.
+                let mgmt_key_unsupported = matches!(change_mgmt_key_gate, FeatureGate::Unsupported);
+                let mgmt_alg_unverified =
+                    piv_mgmtalg_unverified_labels(change_mgmt_key_gate, mgmt_alg_options, mgmtalg_gate);
+                let mgmt_alg_unverified_hint = format!(
+                    "Unverified on this device: {}. May not be supported.",
+                    mgmt_alg_unverified.join(", ")
+                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Management key")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    let extension_unverified = matches!(change_mgmt_key_gate, FeatureGate::Unverified);
+                    if extension_unverified || !mgmt_alg_unverified.is_empty() {
+                        ui.add_space(4.0);
+                        // Both hints can apply at once (whether the
+                        // management key can be changed at all, and which
+                        // algorithms an actual change could use) — combined
+                        // into one tooltip rather than two markers, same as
+                        // this row's other pairs of caveats.
+                        let combined_hint = match (extension_unverified, mgmt_alg_unverified.is_empty()) {
+                            (true, false) => {
+                                format!("{change_mgmt_key_unverified_hint} {mgmt_alg_unverified_hint}")
+                            }
+                            (true, true) => change_mgmt_key_unverified_hint.clone(),
+                            (false, false) => mgmt_alg_unverified_hint.clone(),
+                            (false, true) => unreachable!("guarded by the `if` above"),
+                        };
+                        theme::warn_marker(ui, p).on_hover_text(combined_hint.as_str());
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if matches!(change_mgmt_key_gate, FeatureGate::Unsupported) {
+                            theme::button_disabled(ui, p, "Change management key\u{2026}")
+                                .on_hover_text(change_mgmt_key_blocked_hint.as_str());
+                        } else if theme::button(ui, p, BtnKind::Default, "Change management key\u{2026}")
+                            .clicked()
+                        {
+                            open_change_mgmt = true;
+                        }
+                        ui.add_space(8.0);
+                        // `mgmt_key_unsupported` (computed above, alongside
+                        // `mgmt_alg_unverified`) is the same `Unsupported`-only
+                        // gate the "Change management key…" button above
+                        // already uses, so button, combo, and the
+                        // per-algorithm warning all dim/suppress together.
+                        ui.add_enabled_ui(!mgmt_key_unsupported, |ui| {
+                            piv_mgmtalg_combo(
+                                ui,
+                                "piv-new-mgmt-alg",
+                                &mut self.piv.new_mgmt_alg,
+                                mgmt_alg_options,
+                                mgmtalg_gate,
+                            );
+                        })
+                        .response
+                        .on_disabled_hover_text(change_mgmt_key_blocked_hint.as_str());
+                    });
+                });
+
+                // CHUID: label + help left, the write action right-aligned.
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("CHUID")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-admin");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "New CHUID\u{2026}").clicked() {
+                            open_new_chuid = true;
+                        }
+                    });
                 });
             });
         });
@@ -14224,14 +17151,195 @@ impl App {
             &self.piv.slot_keys,
             self.piv.retired_occupancy.as_deref(),
         );
-        // Key deletion (Yubico MOVE/DELETE KEY) needs firmware 5.7+. The
-        // transport version-gates as a backstop; here we hide the button (and
-        // explain) when the loaded status reports an older — or unknown —
-        // version. Clearing a certificate works everywhere.
-        let can_delete_key = matches!(
-            self.piv.status.as_ref().and_then(|s| s.version.as_deref()),
-            Some(v) if v >= [5, 7].as_slice()
+        // Whether the active slot holds an X.509 certificate — gates Export.
+        // Standard slots read `status.slots`; retired slots carry no cert
+        // signal in the loaded state, and neither does the pane before its
+        // first status read, so both resolve optimistically (the button stays
+        // live and the low-level "slot holds no certificate" error still
+        // guards). Only a standard slot the card has read and found certless
+        // dims the button.
+        let selected_has_cert = match selected {
+            PivSlotSel::Retired(_) => true,
+            _ => {
+                !self.piv.loaded
+                    || self.piv.status.as_ref().is_some_and(|s| {
+                        s.slots
+                            .iter()
+                            .any(|sl| sl.slot == selected.to_slot() && sl.cert_present)
+                    })
+            }
+        };
+        // Move key / Delete key are Yubico extensions (MOVE/DELETE KEY), not
+        // SP 800-73-4. `keyroost_piv::compat` resolves a per-fingerprint
+        // known-support table against the applet's reported version into a
+        // three-way gate: enable, enable-but-flag (support unverified on this
+        // device), or dim. An unsupported card refuses the APDU on its own —
+        // there is no transport-side version gate any more. Clearing a
+        // certificate is standard PIV and works everywhere.
+        let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+            (
+                keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                None,
+                None,
+            ),
+            |s| {
+                (
+                    s.applet_fingerprint,
+                    s.version.as_deref(),
+                    s.version_firmware.as_deref(),
+                )
+            },
         );
+        let move_key_gate =
+            keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver, piv_fw_ver);
+        let delete_key_gate =
+            keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
+        // Whether this device has a confirmed, device-reported way to know a
+        // slot's key occupancy (GET METADATA, or HID Crescendo's own GET PIV
+        // PROPERTIES — see `keyroost_piv::compat::PivExtension::GetSlotKeyStatus`'s
+        // doc). Consulted below (`slot_confirmed_empty`) to decide whether
+        // "Delete key" can safely dim on an empty slot the same way "Delete
+        // certificate" dims on a certless one, and whether "Import
+        // certificate" can safely dim on one too (nothing there for a freshly
+        // imported certificate's key to possibly match) — only when this
+        // resolves `Supported` is `selected_has_key` trustworthy enough to
+        // block on; everywhere else `None` could just as easily mean "this
+        // device can't tell us" as "genuinely empty".
+        let get_slot_key_status_gate = keyroost_piv::compat::resolve(
+            PivExtension::GetSlotKeyStatus,
+            piv_fp,
+            piv_ver,
+            piv_fw_ver,
+        );
+        // Reset (Yubico RESET, `INS 0xFB`) is gated the same way, from the
+        // same fingerprint/version triple — see the "Reset applet" card
+        // below.
+        let reset_gate =
+            keyroost_piv::compat::resolve(PivExtension::Reset, piv_fp, piv_ver, piv_fw_ver);
+        // A device-wide reset directive that takes PIV down with it alongside
+        // at least one other applet — a distinct extension from `Reset`
+        // above, resolved independently (see
+        // `keyroost_piv::compat::PivExtension::ResetGlobal`'s doc). Checked
+        // here only to decide whether the "Reset applet" card below should
+        // point at the whole-device factory reset (Overview tab) as a known
+        // alternative when the PIV-only path can't be trusted — never to
+        // change what that card's own button does.
+        let reset_global_gate =
+            keyroost_piv::compat::resolve(PivExtension::ResetGlobal, piv_fp, piv_ver, piv_fw_ver);
+        let show_reset_global_alternative =
+            piv_reset_global_alternative_available(reset_gate, reset_global_gate);
+        // Whether this device is known to take unusually long to finish
+        // RESET (`PivQuirk::ResetLongRunning`, e.g. observed over a minute
+        // on ArekinathPivApplet::SwissbitIShield1) — surfaced below as a
+        // standing note on the "Reset applet" card, not just a hover, so it
+        // isn't missed the moment the device looks like it's hung.
+        let reset_long_running = keyroost_piv::compat::resolve_quirks(piv_fp, piv_ver, piv_fw_ver)
+            .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning);
+        // Per-algorithm gates for the "Generate key" card's algorithm combo,
+        // below — resolved eagerly here (an owned array, not a closure over
+        // `piv_ver`/`piv_fw_ver`) because those two borrow `self.piv.status`
+        // and the combo is drawn from deep inside closures that also need
+        // `&mut self`; holding the borrow that long would conflict. Not every
+        // algorithm is universally implemented, standardized or not — see
+        // `PivExtension::SlotKeyAlgorithm`'s own doc.
+        let keyalg_gates: [(keyroost_piv::KeyAlg, FeatureGate); keyroost_piv::KeyAlg::ALL.len()] =
+            keyroost_piv::KeyAlg::ALL.map(|alg| {
+                (
+                    alg,
+                    keyroost_piv::compat::resolve(
+                        PivExtension::SlotKeyAlgorithm(alg),
+                        piv_fp,
+                        piv_ver,
+                        piv_fw_ver,
+                    ),
+                )
+            });
+        let keyalg_gate = move |alg: keyroost_piv::KeyAlg| {
+            keyalg_gates
+                .iter()
+                .find_map(|&(a, gate)| (a == alg).then_some(gate))
+                .unwrap_or(FeatureGate::Unverified)
+        };
+        // Explanations for the non-standard slot operations when the
+        // fingerprint known-support table can't clear them — built from the shared
+        // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
+        // same thing: the extension's `requirement()` sentence, then a state
+        // suffix. Each string is a hover: on the \u{26a0} marker by the row's
+        // help dot for Unverified, on the dimmed button for Unsupported.
+        // "Key deletion" / "Moving keys" keep each distinct from the Delete
+        // row's other button, "Delete certificate\u{2026}" — and the Delete-key
+        // \u{26a0} hover additionally appends that "Delete certificate" is
+        // standard PIV and unaffected (see the hover call site).
+        let move_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::MoveKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let move_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::MoveKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        let delete_key_unverified_hint = format!(
+            "{} {}",
+            PivExtension::DeleteKey.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let delete_key_blocked_hint = format!(
+            "{} {}",
+            PivExtension::DeleteKey.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        let reset_unverified_hint = format!(
+            "{} {}",
+            PivExtension::Reset.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let reset_blocked_hint = format!(
+            "{} {}",
+            PivExtension::Reset.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        // Both certificate actions below (self-sign into the slot, and sign a
+        // CSR) are signed *by this slot's key*. With no key there is nothing to
+        // sign with and the on-card step fails deep in the flow ("slot has no
+        // key…"), so the buttons are dimmed until a key is present and say why
+        // on hover — same treatment as the Move/Delete-key rows.
+        let no_slot_key_hint = "This slot has no key. Generate a key in this slot first \u{2014} \
+             a self-signed certificate and a CSR are both signed by it.";
+        // Both certificate actions need the slot's key to actually sign —
+        // X25519 (and any future key-agreement-only algorithm) can only do
+        // ECDH on this card, so `keyroost_piv::x509::signature_hash` rejects
+        // it. Building a certificate for such a key needs a different
+        // enrollment mechanism (CRMF/CMP-style, proving possession via key
+        // agreement instead of a signature) that keyroost doesn't implement,
+        // so the buttons dim rather than fail deep in the signing flow.
+        // `None` (algorithm not yet known — e.g. a retired slot, which
+        // `slot_keys` never covers) doesn't block: same "don't guess"
+        // treatment the Test row gives an unknown algorithm.
+        let sel_key_can_sign = self
+            .piv_selected_test_target()
+            .0
+            .is_none_or(|a| keyroost_piv::x509::signature_hash(a).is_ok());
+        let cant_sign_hint = "This slot's key only supports key agreement, not signing \u{2014} \
+             it can't produce a self-signed certificate or a CSR. keyroost has no CRMF/CMP-style \
+             enrollment for that kind of key.";
+        let no_slot_cert_hint =
+            "This slot holds no certificate to export. Import one, or create a self-signed \
+             certificate above.";
+        let no_move_key_hint =
+            "This slot has no key to move \u{2014} generate one in this slot first.";
+        let no_del_cert_hint = "This slot holds no certificate to delete.";
+        let no_del_key_hint = "This slot holds no key to delete.";
+        // "Import certificate" dims only when this device *confirms* the
+        // slot is empty (same `slot_confirmed_empty` gate as "Delete key" —
+        // see its doc): a certificate can't possibly match a key this slot
+        // doesn't hold. When occupancy can't be confirmed, the button stays
+        // enabled — a matching key may have been loaded out of band and this
+        // session just can't see it; `PivSession::import_certificate` itself
+        // still compares against whatever key it *can* find before writing.
+        let no_import_cert_hint = "This slot has no key for a certificate to match \u{2014} \
+             generate or move one into this slot first.";
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
         // (Passkeys / Settings / Storage): an opaque surface strip behind a row
@@ -14412,203 +17520,255 @@ impl App {
                 .color(p.txt2),
         );
         ui.add_space(10.0);
-        theme::card_frame(p).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
+        // Same `add_enabled_ui` inheritance trick as the status card above —
+        // one wrap covers the per-slot action card and the "Reset applet"
+        // card below it, dimming Generate/Certificate/Delete/Move/Test and
+        // Reset together for any in-flight PIV job (`self.piv.inflight`).
+        // The slot tab strip and retired-slot rail above this point stay
+        // outside any wrap, so selecting a different slot (or a different
+        // retired key) still works while a job is in flight.
+        ui.add_enabled_ui(!self.piv.inflight, |ui| {
+            theme::card_frame(p).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
 
-            // --- Generate key: bold label + help left, algorithm combo
-            // and primary button pinned right (FIDO2 setting-row shape).
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Generate key")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
+                // --- Generate key: bold label + help left, algorithm combo
+                // and primary button pinned right (FIDO2 setting-row shape).
+                // Each algorithm is gated independently
+                // (`PivExtension::SlotKeyAlgorithm`, resolved eagerly into
+                // `keyalg_gate` above) the same way Move/Delete key are gated
+                // elsewhere in this pane — not every device implements every
+                // algorithm, standardized or not (see that extension's own
+                // doc).
+                //
+                // Same "don't leave a selection the combo can no longer
+                // offer" treatment as the PIN/touch policy combos in the
+                // Generate Key modal: a prior selection that's since become
+                // known-unsupported (e.g. after switching readers) falls back
+                // to the first selectable algorithm rather than staying
+                // selected-but-disabled — see
+                // `piv_keyalg_unsupported_fallback`'s own doc for why
+                // `EccP256` is only a fallback-of-last-resort here, not
+                // returned unconditionally.
+                self.piv.gen_alg = piv_keyalg_unsupported_fallback(
+                    self.piv.gen_alg,
+                    keyroost_piv::KeyAlg::EccP256,
+                    keyalg_gate,
                 );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-generate");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
-                        open_generate = true;
-                    }
-                    ui.add_space(8.0);
-                    piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg);
-                });
-            });
-            if let Some(pem) = &self.piv.gen_pubkey_pem {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut pem.as_str())
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
+                let unverified_algs: Vec<&str> = keyroost_piv::KeyAlg::ALL
+                    .into_iter()
+                    .filter(|&alg| keyalg_gate(alg) == FeatureGate::Unverified)
+                    .map(keyroost_piv::KeyAlg::label)
+                    .collect();
+                let gen_alg_unverified_hint = format!(
+                    "Unverified on this device: {}. May not be supported.",
+                    unverified_algs.join(", ")
                 );
-                ui.add_space(4.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
-                        copy_pem = Some(pem.clone());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Generate key")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-generate");
+                    // Same warn-triangle convention as Move/Delete/Reset key below:
+                    // sits right after the help dot rather than a printed line, so
+                    // "support unverified" reads the same way everywhere in this
+                    // pane instead of being the one section that just prints it.
+                    if !unverified_algs.is_empty() {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(gen_alg_unverified_hint.as_str());
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
+                            open_generate = true;
+                        }
+                        ui.add_space(8.0);
+                        piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg, keyalg_gate);
+                    });
                 });
-            }
+                // Derived from the per-device session cache rather than a
+                // dedicated field: that cache now survives switching to
+                // another device's tab and back (see `App::piv_session_state`'s
+                // doc), so this naturally does too, and it always reflects
+                // whichever slot is currently selected rather than "whatever
+                // was last generated, regardless of slot".
+                let gen_pubkey_pem = self
+                    .selected_device
+                    .as_ref()
+                    .and_then(|id| self.piv_session_state.get(id))
+                    .and_then(|state| state.cached_pubkey(self.piv.selected_slot.to_slot()))
+                    .and_then(|(alg, key)| {
+                        keyroost_piv::spki::subject_public_key_info(key, alg).ok()
+                    })
+                    .map(|der| keyroost_piv::spki::to_pem(&der));
+                if let Some(pem) = &gen_pubkey_pem {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut pem.as_str())
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.add_space(4.0);
+                    // `with_layout` must be nested inside a `ui.horizontal` (as
+                    // every other right-aligned action row in this pane does),
+                    // not called directly on the card's top-down `ui`: called
+                    // bare, its child `Ui` inherits the *entire remaining
+                    // vertical space* of the card as its max_rect, and
+                    // `Align::Center` then centers the button within all of
+                    // that leftover height — which the row then allocates back
+                    // into the parent as its own height. On a window taller
+                    // than default that reads as a big dead gap here with the
+                    // button floating in the middle of it.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button(ui, p, BtnKind::Ghost, "Copy public key").clicked() {
+                                copy_pem = Some(pem.clone());
+                            }
+                        });
+                    });
+                }
 
-            ui.add_space(12.0);
-            // --- Certificate: subject/validity inputs, then the two
-            // issue actions each right-aligned on their own row.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Certificate")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-certificate");
-            });
-            ui.add_space(6.0);
-            text_field(
-                ui,
-                p,
-                "Name",
-                &mut self.piv.cert_subject,
-                "e.g. Alice — or full CN=Alice,O=Example,C=US",
-                300.0,
-            );
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Valid for")
-                        .font(theme::f_reg(13.0))
-                        .color(p.txt2),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut self.piv.cert_days)
-                        .range(1..=keyroost_piv::max_valid_days(u64::from(unix_now())))
-                        .suffix(" days"),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot").clicked()
-                    {
-                        open_self_sign = true;
-                    }
+                ui.add_space(12.0);
+                // --- Certificate: title row carries both issue actions
+                // right-aligned — "Sign & save CSR" then "Self-signed -> slot" —
+                // same layout "Import/Export cert" below uses, rather than
+                // sharing a row with the subject/validity inputs (three "Valid
+                // for" fields plus two buttons would collapse/wrap at narrow
+                // window widths). Each is signed by the slot's key, so both dim
+                // with the same reason when the slot has none. "Sign & save
+                // CSR" opens a save dialog first (see `drain_file_dialogs`);
+                // "Self-signed -> slot" opens the PIN / management-key modal.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Certificate")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-certificate");
+                    // right_to_left: add "Self-signed" first so it sits at the
+                    // far right, then "Sign & save CSR" to its left.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if selected_has_key && sel_key_can_sign {
+                            if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
+                                .clicked()
+                            {
+                                open_self_sign = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Self-signed \u{2192} slot")
+                                .on_hover_text(if selected_has_key {
+                                    cant_sign_hint
+                                } else {
+                                    no_slot_key_hint
+                                });
+                        }
+                        ui.add_space(8.0);
+                        if selected_has_key && sel_key_can_sign {
+                            if theme::button(ui, p, BtnKind::Default, "Sign & save CSR\u{2026}")
+                                .clicked()
+                            {
+                                open_csr = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Sign & save CSR\u{2026}").on_hover_text(
+                                if selected_has_key {
+                                    cant_sign_hint
+                                } else {
+                                    no_slot_key_hint
+                                },
+                            );
+                        }
+                    });
                 });
-            });
-            ui.add_space(6.0);
-            let mut save_csr = false;
-            ui.horizontal(|ui| {
+                ui.add_space(6.0);
                 text_field(
                     ui,
                     p,
-                    "CSR file",
-                    &mut self.piv.csr_path,
-                    "/path/to/request.csr",
-                    240.0,
+                    "Name",
+                    &mut self.piv.cert_subject,
+                    "e.g. Alice — or full CN=Alice,O=Example,C=US",
+                    300.0,
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Sign & save CSR").clicked() {
-                        open_csr = true;
-                    }
-                    ui.add_space(8.0);
-                    save_csr = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
+                ui.horizontal(|ui| {
+                    // Same 96px label column `text_field` uses for the "Name" row
+                    // above, so this label lines up with it and the fields below
+                    // start at the same x.
+                    ui.add_sized(
+                        [96.0, 22.0],
+                        egui::Label::new(
+                            egui::RichText::new("Valid for")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt2),
+                        ),
+                    );
+                    piv_valid_for_fields(
+                        ui,
+                        unix_now(),
+                        &mut self.piv.cert_valid_years,
+                        &mut self.piv.cert_valid_months,
+                        &mut self.piv.cert_valid_days,
+                    );
                 });
-            });
-            if save_csr {
-                self.spawn_file_dialog(
-                    FileTarget::PivCsr,
-                    true,
-                    &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
-                    Some("request.csr"),
-                );
-            }
 
-            ui.add_space(12.0);
-            // --- Import cert: file path + Browse/Import right-aligned.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Import cert")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-import");
-            });
-            ui.add_space(6.0);
-            let mut browse_cert = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "File",
-                    &mut self.piv.cert_path,
-                    "/path/to/cert.pem",
-                    240.0,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Import certificate").clicked() {
-                        open_import = true;
-                    }
-                    ui.add_space(8.0);
-                    browse_cert =
-                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
+                ui.add_space(12.0);
+                // --- Import / Export cert: both buttons on one right-aligned row,
+                // "Import certificate" then "Export certificate". Import opens a
+                // file picker then the management-key modal; Export opens a save
+                // dialog and writes straight to the chosen path — no secret (see
+                // `drain_file_dialogs`). Export dims when the slot holds no cert.
+                // Import dims only when the slot is *confirmed* empty
+                // (`slot_confirmed_empty`, same gate "Delete key" uses) — an
+                // unconfirmed reading leaves it enabled, since a matching key may
+                // have been loaded out of band this session can't see.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Import/Export cert")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-import-export");
+                    // right_to_left: add "Export" first so it sits at the far
+                    // right, then "Import" to its left.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if selected_has_cert {
+                            if theme::button(ui, p, BtnKind::Default, "Export certificate\u{2026}")
+                                .clicked()
+                            {
+                                go_export = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Export certificate\u{2026}")
+                                .on_hover_text(no_slot_cert_hint);
+                        }
+                        ui.add_space(8.0);
+                        if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
+                            theme::button_disabled(ui, p, "Import certificate\u{2026}")
+                                .on_hover_text(no_import_cert_hint);
+                        } else if theme::button(
+                            ui,
+                            p,
+                            BtnKind::Default,
+                            "Import certificate\u{2026}",
+                        )
+                        .clicked()
+                        {
+                            open_import = true;
+                        }
+                    });
                 });
-            });
-            if browse_cert {
-                self.spawn_file_dialog(
-                    FileTarget::PivCert,
-                    false,
-                    &[
-                        ("Certificates", &["pem", "der", "crt", "cer"]),
-                        ("All files", &["*"]),
-                    ],
-                    None,
-                );
-            }
 
-            ui.add_space(12.0);
-            // --- Export cert: destination path + Save/Export right.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Export cert")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-export");
-            });
-            ui.add_space(6.0);
-            let mut save_export = false;
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "Destination",
-                    &mut self.piv.export_path,
-                    "/path/to/out.der",
-                    240.0,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Export certificate").clicked() {
-                        go_export = true;
-                    }
-                    ui.add_space(8.0);
-                    save_export = theme::button(ui, p, BtnKind::Default, "Save\u{2026}").clicked();
-                });
-            });
-            if save_export {
-                self.spawn_file_dialog(
-                    FileTarget::PivExport,
-                    true,
-                    &[
-                        ("Certificate (DER)", &["der", "cer"]),
-                        ("Certificate (PEM)", &["pem", "crt"]),
-                        ("All files", &["*"]),
-                    ],
-                    Some("cert.der"),
-                );
-            }
-
-            ui.add_space(12.0);
-            // --- Move key: its own row, above Delete. It used to be a button
-            // inside the Delete row, which put a deliberately non-destructive
-            // action under a destructive heading and left it sharing the delete
-            // help text — the one place a user checking "is this safe?" would
-            // look. Same 5.7+ gate as delete, plus a key in the active slot.
-            if can_delete_key && selected_has_key {
+                ui.add_space(12.0);
+                // --- Move key: its own row, above Delete. It used to be a button
+                // inside the Delete row, which put a deliberately non-destructive
+                // action under a destructive heading and left it sharing the delete
+                // help text — the one place a user checking "is this safe?" would
+                // look. The row is always shown so the capability stays
+                // discoverable; the button is dimmed with a hover reason when the
+                // slot has no key to move, or on pre-5.7 firmware.
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Move key")
@@ -14617,118 +17777,260 @@ impl App {
                     );
                     ui.add_space(6.0);
                     self.help_dot(ui, p, "piv-move");
+                    // Support-unverified warning sits right after the help dot, by
+                    // the operation's own explanation — not out by the button. It
+                    // reflects the device's MOVE KEY support, so it shows whether or
+                    // not this slot currently has a key for the button to act on
+                    // (the button may be dimmed for "no key" underneath it).
+                    if matches!(move_key_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}").clicked() {
-                            open_move_key = true;
+                        match move_key_gate {
+                            // Known-unsupported on this device wins over "no key": the
+                            // firmware reason is the one the user has to resolve
+                            // first, and it holds whether or not the slot is empty.
+                            FeatureGate::Unsupported => {
+                                theme::button_disabled(ui, p, "Move key\u{2026}")
+                                    .on_hover_text(move_key_blocked_hint.as_str());
+                            }
+                            // Unverified still runs — the card refuses if it truly
+                            // can't — so the button stays live where there is a key;
+                            // only the warning above marks the doubt.
+                            FeatureGate::Supported | FeatureGate::Unverified => {
+                                if !selected_has_key {
+                                    theme::button_disabled(ui, p, "Move key\u{2026}")
+                                        .on_hover_text(no_move_key_hint);
+                                } else if theme::button(ui, p, BtnKind::Default, "Move key\u{2026}")
+                                    .clicked()
+                                {
+                                    open_move_key = true;
+                                }
+                            }
                         }
                     });
                 });
                 ui.add_space(12.0);
-            }
-            // --- Delete: bold label + help left, the two delete
-            // actions right-aligned (Delete key is Danger, gated 5.7+).
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Delete")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-delete");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if can_delete_key {
-                        if theme::button(ui, p, BtnKind::Danger, "Delete key\u{2026}").clicked() {
-                            open_delete_key = true;
-                        }
-                        ui.add_space(6.0);
-                    }
-                    if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
-                        .clicked()
-                    {
-                        open_delete_cert = true;
-                    }
-                });
-            });
-
-            // --- Test: one button that runs every self-test the selected
-            // slot's key supports (decrypt / key-agree / sign, in that order)
-            // and reports each result. Read-only — the card operates but
-            // nothing is written. Live only when the slot holds a certificate
-            // with a key type keyroost can test.
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Test")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "piv-test");
-                let (test_alg, test_has_cert) = self.piv_selected_test_target();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if test_has_cert && test_alg.is_some() {
-                        if theme::button(ui, p, BtnKind::Default, "Test\u{2026}").clicked() {
-                            open_self_test = true;
-                        }
-                    } else {
-                        let why = if !test_has_cert {
-                            "Needs a certificate in this slot."
-                        } else {
-                            "The slot's key type is unknown."
-                        };
-                        ui.add_enabled_ui(false, |ui| {
-                            theme::button(ui, p, BtnKind::Default, "Test\u{2026}")
-                        })
-                        .inner
-                        .on_disabled_hover_text(why);
-                    }
-                });
-            });
-
-            if !can_delete_key {
-                ui.add_space(4.0);
-                note(ui, "Key deletion needs YubiKey 5.7+.");
-            }
-        });
-        ui.add_space(12.0);
-
-        // Reset applet — its own destructive card with a red stroke at the
-        // bottom of the pane (mirrors the FIDO2 "Reset this key" card exactly),
-        // full width, description left + red button right.
-        theme::card_frame(p)
-            .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
+                // --- Delete: bold label + help left, the two delete
+                // actions right-aligned (Delete key is Danger, gated 5.7+).
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Reset applet")
-                            .font(theme::f_sb(14.5))
-                            .color(p.err),
+                        egui::RichText::new("Delete")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
                     );
                     ui.add_space(6.0);
-                    self.help_dot(ui, p, "reset");
+                    self.help_dot(ui, p, "piv-delete");
+                    // Support-unverified warning for "Delete key" sits here, beside
+                    // the row's help dot — not out by the button — so its hover
+                    // text names "Delete key" explicitly and spells out that
+                    // "Delete certificate" (the other button on this row) is
+                    // standard PIV and unaffected.
+                    if matches!(delete_key_gate, FeatureGate::Unverified) {
+                        ui.add_space(4.0);
+                        theme::warn_marker(ui, p).on_hover_text(format!(
+                            "{delete_key_unverified_hint} \u{201c}Delete certificate\u{201d} is \
+                         standard PIV and unaffected."
+                        ));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
-                            arm_reset = true;
+                        match delete_key_gate {
+                            // Unsupported blocks outright, regardless of slot
+                            // content — an operation the device can't run at all
+                            // is the reason to lead with, not slot occupancy.
+                            FeatureGate::Unsupported => {
+                                // Kept visible but dimmed on pre-5.7 firmware so the
+                                // action is discoverable; the hover text says why it
+                                // can't run yet.
+                                theme::button_disabled(ui, p, "Delete key\u{2026}")
+                                    .on_hover_text(delete_key_blocked_hint.as_str());
+                            }
+                            // Unverified still runs — the card refuses if it truly
+                            // can't — so the button stays live unless the slot's
+                            // emptiness is independently confirmed below; only the
+                            // warning by the help dot marks the firmware doubt.
+                            FeatureGate::Supported | FeatureGate::Unverified => {
+                                if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key)
+                                {
+                                    theme::button_disabled(ui, p, "Delete key\u{2026}")
+                                        .on_hover_text(no_del_key_hint);
+                                } else if theme::button(
+                                    ui,
+                                    p,
+                                    BtnKind::Danger,
+                                    "Delete key\u{2026}",
+                                )
+                                .clicked()
+                                {
+                                    open_delete_key = true;
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                        // "Delete certificate" is standard PIV, so no firmware gate
+                        // — but like Export it needs a certificate to act on. Same
+                        // cert-presence signal, same optimistic fallback for retired
+                        // slots / pre-first-read. "Delete key" only gets the
+                        // equivalent empty-slot treatment when this device actually
+                        // confirms slot occupancy
+                        // (`PivExtension::GetSlotKeyStatus`, checked inside the
+                        // match above via `slot_confirmed_empty`) — everywhere
+                        // else it stays enabled whenever DELETE KEY itself is:
+                        // without a confirmed signal, key presence is simply
+                        // unknown, and a stale key is still worth an attempt to
+                        // erase.
+                        if selected_has_cert {
+                            if theme::button(ui, p, BtnKind::Default, "Delete certificate\u{2026}")
+                                .clicked()
+                            {
+                                open_delete_cert = true;
+                            }
+                        } else {
+                            theme::button_disabled(ui, p, "Delete certificate\u{2026}")
+                                .on_hover_text(no_del_cert_hint);
                         }
                     });
                 });
-                ui.label(
-                    egui::RichText::new(
-                        "Wipes ALL PIV keys, certificates, and PINs. Only works when both \
-                         the PIN and PUK are already blocked.",
-                    )
-                    .font(theme::f_reg(12.5))
-                    .color(p.txt2),
-                );
+
+                // --- Test: one button that runs every self-test the selected
+                // slot's key supports (decrypt / key-agree / sign, in that order)
+                // and reports each result. Read-only — the card operates but
+                // nothing is written. Live only when the slot holds a certificate
+                // with a key type keyroost can test. Placed last in the card,
+                // below the other slot actions, since it's a diagnostic rather
+                // than a slot-management action.
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Test")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    self.help_dot(ui, p, "piv-test");
+                    let (test_alg, test_has_cert) = self.piv_selected_test_target();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if test_has_cert && test_alg.is_some() {
+                            if theme::button(ui, p, BtnKind::Default, "Test\u{2026}").clicked() {
+                                open_self_test = true;
+                            }
+                        } else {
+                            let why = if !test_has_cert {
+                                "Needs a certificate in this slot."
+                            } else {
+                                "The slot's key type is unknown."
+                            };
+                            ui.add_enabled_ui(false, |ui| {
+                                theme::button(ui, p, BtnKind::Default, "Test\u{2026}")
+                            })
+                            .inner
+                            .on_disabled_hover_text(why);
+                        }
+                    });
+                });
             });
+            ui.add_space(12.0);
+
+            // Reset applet — its own destructive card with a red stroke at the
+            // bottom of the pane (mirrors the FIDO2 "Reset this key" card exactly),
+            // full width, description left + red button right.
+            theme::card_frame(p)
+                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Reset applet")
+                                .font(theme::f_sb(14.5))
+                                .color(p.err),
+                        );
+                        ui.add_space(6.0);
+                        self.help_dot(ui, p, "reset");
+                        // Same three-way gate as Move key / Delete key, from the
+                        // same `keyroost_piv::compat` known-support table — see
+                        // `reset_gate`'s definition above.
+                        if matches!(reset_gate, FeatureGate::Unverified) {
+                            ui.add_space(4.0);
+                            theme::warn_marker(ui, p).on_hover_text(reset_unverified_hint.as_str());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match reset_gate {
+                                // Unverified still runs — the card refuses if it
+                                // truly can't — so the button stays live; only
+                                // the warning above marks the doubt.
+                                FeatureGate::Supported | FeatureGate::Unverified => {
+                                    if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}")
+                                        .clicked()
+                                    {
+                                        arm_reset = true;
+                                    }
+                                }
+                                FeatureGate::Unsupported => {
+                                    // Kept visible but dimmed so the capability
+                                    // stays discoverable; the hover text says why
+                                    // it can't run yet.
+                                    theme::button_disabled(ui, p, "Reset applet\u{2026}")
+                                        .on_hover_text(reset_blocked_hint.as_str());
+                                }
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(if matches!(reset_gate, FeatureGate::Supported) {
+                            // Known-supported: `force_reset_if_known_supported`
+                            // burns the PIN/PUK retry counters itself when
+                            // needed, so the precondition below no longer
+                            // applies to what this button actually does.
+                            "Wipes ALL PIV keys, certificates, and PINs."
+                        } else {
+                            "Wipes ALL PIV keys, certificates, and PINs. Typically requires both \
+                         the PIN and PUK to already be blocked."
+                        })
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                    );
+                    if reset_long_running {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT,
+                            )
+                            .font(theme::f_reg(12.5))
+                            .color(p.warn),
+                        );
+                    }
+                    if show_reset_global_alternative {
+                        ui.add_space(6.0);
+                        // Same click-sense-label style as the Overview cards' own
+                        // "Manage →" jump (`App::card_head`) — an accent-colored
+                        // text link, not a button, since this isn't itself an
+                        // action, just a pointer to where the action lives; same
+                        // browser-style pointing-hand cursor on hover, too.
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new("Factory reset supported \u{2192}")
+                                        .font(theme::f_sb(12.5))
+                                        .color(p.accent),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            go_to_overview = true;
+                        }
+                    }
+                });
+        });
 
         // Apply collected intents now that the card borrows have ended.
         if let Some(slot) = clicked_slot {
             self.piv.selected_slot = slot;
         }
         if do_refresh {
-            self.load_piv_status(LogKind::User);
+            self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass);
         }
         // The three buttons open the centered credential modal; the modal itself
         // (rendered once per frame) runs the actual op. Opening wipes any stale
@@ -14748,26 +18050,48 @@ impl App {
         // The management-key-gated operations open the centered credential modal
         // (which collects their secrets and runs the op on Submit) rather than
         // running directly. Opening wipes any stale secret fields first so a
-        // fresh dialog starts blank. Export needs no secret, so it still runs
-        // inline.
+        // fresh dialog starts blank.
         if open_generate {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::GenerateKey));
         }
+        // Import / Export / CSR ask for the file first; the picked path is
+        // routed by `drain_file_dialogs`, which then opens the secret modal
+        // (import, CSR) or runs the write straight away (export).
         if open_import {
-            self.piv_cred_modal_close();
-            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportCert));
+            self.spawn_file_dialog(
+                FileTarget::PivCert,
+                false,
+                &[
+                    ("Certificates", &["pem", "der", "crt", "cer"]),
+                    ("All files", &["*"]),
+                ],
+                None,
+            );
         }
         if go_export {
-            self.piv_export_cert();
+            self.spawn_file_dialog(
+                FileTarget::PivExport,
+                true,
+                &[
+                    ("Certificate (DER)", &["der", "cer"]),
+                    ("Certificate (PEM)", &["pem", "crt"]),
+                    ("All files", &["*"]),
+                ],
+                Some("cert.der"),
+            );
         }
         if open_self_sign {
             self.piv_cred_modal_close();
             self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::SelfSign));
         }
         if open_csr {
-            self.piv_cred_modal_close();
-            self.piv.cred_modal = Some(PivCredModal::new(PivCredKind::RequestCsr));
+            self.spawn_file_dialog(
+                FileTarget::PivCsr,
+                true,
+                &[("CSR", &["csr", "pem"]), ("All files", &["*"])],
+                Some("request.csr"),
+            );
         }
         if open_set_retries {
             self.piv_cred_modal_close();
@@ -14835,6 +18159,9 @@ impl App {
         }
         if arm_reset {
             self.piv.confirm_reset = Some(String::new());
+        }
+        if go_to_overview {
+            self.cap_tab = CapTab::Overview;
         }
         if let Some(pem) = copy_pem {
             ui.ctx().copy_text(pem);
@@ -15926,6 +19253,108 @@ fn slot_summary(attrs: &[u8], fpr: &[u8; 20]) -> String {
 mod tests {
     use super::*;
 
+    /// A minimal `PivStatus` reporting just `fingerprint`/`version` — enough
+    /// to drive `App::piv_current_default_mgmt_key`'s resolution in a test.
+    /// `PivStatus` is `#[non_exhaustive]`, so this crate can't use struct-
+    /// literal syntax on it directly; go through `Default` and field
+    /// assignment instead, same as the existing `PivStatus::default()` tests
+    /// already do.
+    fn piv_status_with(
+        fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+        version: Option<Vec<u8>>,
+    ) -> keyroost_transport::PivStatus {
+        let mut status = keyroost_transport::PivStatus::default();
+        status.applet_fingerprint = fingerprint;
+        status.version = version;
+        status
+    }
+
+    /// A row built with `stable_selectable_value` must occupy the same
+    /// height whether or not the pointer is hovering it — the property every
+    /// PIV dropdown built from it (algorithm, management-key algorithm,
+    /// PIN/touch policy, move destination) relies on to keep a combo popup
+    /// sized close to its scroll cap from needing a scrollbar the instant
+    /// the pointer lands on a row. Plain `ui.selectable_value` doesn't have
+    /// this property: `Button::selectable` only reserves its frame's stroke
+    /// width for the *currently selected* row, and this app's theme gives
+    /// the `inactive` widget state a non-zero stroke width too (a text-field
+    /// boundary fix, where egui's own default is zero), so an *unselected*
+    /// row is measurably shorter at rest than hovered — see
+    /// `stable_selectable_value`'s own doc for the exact mechanism.
+    /// Exercises an *unselected* value, since that's the one plain
+    /// `ui.selectable_value` sized inconsistently.
+    #[test]
+    fn stable_selectable_value_row_height_is_hover_invariant() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        Palette::new(Mode::Dark, Palette::ACCENTS[0], false).apply(&ctx, Mode::Dark);
+        let mut current = keyroost_piv::KeyAlg::Rsa2048;
+        let unselected = keyroost_piv::KeyAlg::Rsa3072;
+        assert_ne!(current, unselected);
+        let mut heights = vec![];
+        let mut row_rect: Option<egui::Rect> = None;
+        // Frame 0: no pointer — establishes the unhovered row's rect.
+        // Frame 1: pointer moved onto that rect (registers as input, doesn't
+        // yet affect layout — egui reads *last* frame's response to decide
+        // *this* frame's widget state).
+        // Frame 2: rendered again under sustained hover.
+        for frame in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 1200.0),
+                )),
+                ..Default::default()
+            };
+            if let Some(r) = row_rect.filter(|_| frame >= 1) {
+                input.events.push(egui::Event::PointerMoved(r.center()));
+            }
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_min_width(160.0);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    let resp =
+                        stable_selectable_value(ui, &mut current, unselected, unselected.label());
+                    heights.push(resp.rect.height());
+                    row_rect = Some(resp.rect);
+                });
+            });
+        }
+        assert_eq!(
+            heights[0], heights[2],
+            "row height must not change once the pointer starts hovering it: {heights:?}"
+        );
+    }
+
+    /// `Palette::apply` must set solid (space-reserving) scroll bars as the
+    /// *ambient context style*, not a local `Ui`-scoped one — a `ComboBox`
+    /// popup (`egui::containers::Popup`) always rebuilds its content `Ui`
+    /// from `Context::style()`/`all_styles_mut`'s targets rather than
+    /// inheriting whatever the calling `Ui` had locally overridden, so this
+    /// is the only place a scroll style actually reaches a dropdown's own
+    /// list. Without it, the default floating scroll bar grows its hit-rect
+    /// on hover (`floating_width` -> `bar_width`) right over the row
+    /// underneath, and the two fight for hover each frame the pointer sits on
+    /// that boundary — the "generate key" algorithm dropdown's flickering
+    /// scrollbar. Checked on both themes since `all_styles_mut` (unlike
+    /// `set_visuals`) touches the style egui caches per `Theme`, not just
+    /// whichever one is active when `apply` runs.
+    #[test]
+    fn palette_apply_sets_solid_scroll_bars_for_both_themes() {
+        let ctx = egui::Context::default();
+        for mode in [Mode::Dark, Mode::Light] {
+            Palette::new(mode, Palette::ACCENTS[0], false).apply(&ctx, mode);
+        }
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            ctx.style_mut_of(theme, |s| {
+                assert!(
+                    !s.spacing.scroll.floating,
+                    "{theme:?} scroll style should be solid, not the default floating"
+                );
+            });
+        }
+    }
+
     #[test]
     fn openpgp_algorithm_choices_are_the_cards_list_or_everything() {
         use keyroost_transport::{KeyCrt, OpenPgpKeyAlg};
@@ -15978,11 +19407,21 @@ mod tests {
     #[test]
     fn factory_reset_summary_lists_applets_and_flags_piv_and_fido() {
         use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
         let mut caps = Caps::default();
         for c in [Caps::OATH, Caps::PIV, Caps::FIDO2] {
             caps.insert(c);
         }
-        let msg = factory_reset_confirm_summary("SN123", "Token2 PIN+", &factory_reset_plan(caps));
+        let msg = factory_reset_confirm_summary(
+            "SN123",
+            "Token2 PIN+",
+            &factory_reset_plan(caps),
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )),
+            false,
+            false,
+        );
         assert!(msg.contains("SN123") && msg.contains("Token2 PIN+"));
         assert!(msg.contains("OATH") && msg.contains("PIV") && msg.contains("FIDO2"));
         // PIV disclosure and FIDO replug note are present.
@@ -15991,6 +19430,299 @@ mod tests {
         // The summary must not promise an outcome the PIV path can't guarantee:
         // that path blocks the PIN and PUK before the wipe.
         assert!(!msg.contains("stays fully usable"));
+    }
+
+    /// The confirm dialog's PIV paragraph is fingerprinted ahead of time (see
+    /// `App::start_factory_reset_confirm`), so it must actually say something
+    /// different per `FactoryResetPivPreview` case — a user deciding whether
+    /// to proceed needs to know which one they're looking at.
+    #[test]
+    fn factory_reset_summary_piv_note_matches_the_fingerprinted_plan() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        // `needs_management_auth` only matters to the credential sentence,
+        // covered by dedicated tests below -- the PIV-only note text under
+        // test here never depends on it, so `false` is a neutral stand-in
+        // throughout.
+
+        let needs_mgmt_auth = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::NeedsManagementAuth,
+            )),
+            false,
+            false,
+        );
+        assert!(
+            needs_mgmt_auth.contains("management-key"),
+            "{needs_mgmt_auth}"
+        );
+        // Now genuinely attempted (authenticate, then RESET), not refused --
+        // unlike every other atomic case here, this one does NOT say "will
+        // NOT be wiped".
+        assert!(
+            !needs_mgmt_auth.contains("NOT be wiped"),
+            "{needs_mgmt_auth}"
+        );
+        // Atomic: authenticate-then-RESET is a clean pass/fail, no partial
+        // state for the step report to disambiguate, unlike the burn case.
+        assert!(
+            !needs_mgmt_auth.contains("the report below"),
+            "{needs_mgmt_auth}"
+        );
+
+        let unverified = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(FactoryResetPlan::Unverified)),
+            false,
+            false,
+        );
+        assert!(unverified.contains("unverified"), "{unverified}");
+        assert!(unverified.contains("without blocking"), "{unverified}");
+        // Also atomic (a bare RESET attempt, no PIN/PUK burn) -- same
+        // reasoning as NeedsManagementAuth above.
+        assert!(!unverified.contains("the report below"), "{unverified}");
+
+        let burn_then_reset = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )),
+            false,
+            false,
+        );
+        assert!(burn_then_reset.contains("PIN and PUK"), "{burn_then_reset}");
+        // The one multi-step case (block PIN, block PUK, then RESET): a
+        // failure partway through leaves PIV in a state this text alone
+        // can't describe, so -- unlike every atomic case above -- it must
+        // point at the step report.
+        assert!(
+            burn_then_reset.contains("the report below the button says what state it's in"),
+            "{burn_then_reset}"
+        );
+
+        // The device-wide mechanism has nothing PIV-specific to caveat --
+        // it's just another applet in the plan.
+        let global = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+            false,
+        );
+        assert!(!global.contains("PIV:"), "{global}");
+
+        let check_failed = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::CheckFailed,
+            false,
+            false,
+        );
+        assert!(check_failed.contains("couldn't confirm"), "{check_failed}");
+
+        // `NotOffered` inside a plan that DOES include PIV shouldn't happen in
+        // practice, but must not panic or claim something false about a step
+        // that was never fingerprinted -- it falls back to `CheckFailed`'s
+        // wording.
+        let not_offered = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::NotOffered,
+            false,
+            false,
+        );
+        assert_eq!(not_offered, check_failed);
+
+        // A plan without PIV never gets a PIV paragraph, regardless of preview.
+        let no_piv = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &factory_reset_plan(Caps::OATH),
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+            false,
+        );
+        assert!(!no_piv.contains("PIV:"), "{no_piv}");
+    }
+
+    /// `PivExtension::ResetGlobal` resolving `Global` means the PIV step, if
+    /// it runs, takes at least one other applet down with it — the "Wipes:"
+    /// list must say so up front (`PIV_GLOBAL_RESET_LABEL`), not report the
+    /// bare `ResetStep::Piv::label()` a caller would otherwise read as
+    /// "PIV, and only PIV, gets touched".
+    #[test]
+    fn factory_reset_summary_wipes_list_names_the_whole_device_when_global() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let mut caps = Caps::default();
+        for c in [Caps::OATH, Caps::PIV] {
+            caps.insert(c);
+        }
+        let plan = factory_reset_plan(caps);
+
+        let global = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+            false,
+        );
+        assert!(
+            global.contains(&format!(
+                "Wipes: OATH, {}",
+                keyroost_resolve::PIV_GLOBAL_RESET_LABEL
+            )),
+            "{global}"
+        );
+        assert!(!global.contains("Wipes: OATH, PIV"), "{global}");
+        // `PivResetPreview::Global` itself already folds `ResetGlobal`
+        // resolving `Supported` *or* `Unverified` into one value (see that
+        // variant's own doc) -- there's no separate case to test here, both
+        // get this same label for the same reason: an unconfirmed
+        // device-wide mechanism might still take other applets with it.
+
+        // A PIV-only mechanism -- confirmed *not* device-wide -- keeps the
+        // bare applet label.
+        let piv_only = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+                FactoryResetPlan::BurnPinPukThenReset,
+            )),
+            false,
+            false,
+        );
+        assert!(piv_only.contains("Wipes: OATH, PIV"), "{piv_only}");
+    }
+
+    /// `PivResetPreview::Unsupported` never actually reaches the summary in
+    /// practice (`start_factory_reset_confirm` excludes `ResetStep::Piv`
+    /// from the plan whenever it's resolved -- see
+    /// `factory_reset_piv_unresettable`), but the match still has to handle
+    /// it, and defensively (a stale plan built before a fresh fingerprint
+    /// changed the answer) it must not claim anything: empty string, same as
+    /// its nested-`Unsupported` sibling that `preview_factory_reset` never
+    /// actually produces.
+    #[test]
+    fn factory_reset_summary_unsupported_preview_says_nothing_if_ever_reached() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        for preview in [
+            PivResetPreview::Unsupported,
+            PivResetPreview::Piv(FactoryResetPlan::Unsupported),
+        ] {
+            let msg = factory_reset_confirm_summary(
+                "SN",
+                "Model",
+                &plan,
+                FactoryResetPivPreview::Resolved(preview),
+                false,
+                false,
+            );
+            assert!(!msg.contains("PIV:"), "{preview:?} {msg}");
+        }
+    }
+
+    /// The management-auth credential sentence is gated purely on
+    /// `needs_management_auth` (`PivQuirk::ResetNeedsManagementAuth`
+    /// applying), independent of which mechanism `piv_preview` says will
+    /// actually consume it -- appears exactly once whichever case is active,
+    /// never duplicated by the PIV-only note above it (which, for
+    /// `NeedsManagementAuth`, now separately says "authenticates ... then
+    /// wipes" but doesn't itself repeat "management auth").
+    #[test]
+    fn factory_reset_summary_credential_sentence_is_gated_on_needs_management_auth_alone() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        for preview in [
+            PivResetPreview::Global,
+            PivResetPreview::Piv(FactoryResetPlan::NeedsManagementAuth),
+        ] {
+            let with_credential = factory_reset_confirm_summary(
+                "SN",
+                "Model",
+                &plan,
+                FactoryResetPivPreview::Resolved(preview),
+                true,
+                false,
+            );
+            assert_eq!(
+                with_credential.matches("requires management auth").count(),
+                1,
+                "{preview:?} {with_credential}"
+            );
+
+            let without_credential = factory_reset_confirm_summary(
+                "SN",
+                "Model",
+                &plan,
+                FactoryResetPivPreview::Resolved(preview),
+                false,
+                false,
+            );
+            assert!(
+                !without_credential.contains("requires management auth"),
+                "{preview:?} {without_credential}"
+            );
+        }
+    }
+
+    /// `PivQuirk::ResetLongRunning` (e.g. ArekinathPivApplet::SwissbitIShield1)
+    /// appends the same hint text the PIV pane's "Reset applet" card and
+    /// `keyroostctl piv reset` already show, gated purely on the boolean --
+    /// independent of which `FactoryResetPivPreview` case is active -- and
+    /// only when the plan actually has a PIV step to warn about.
+    #[test]
+    fn factory_reset_summary_appends_the_long_running_hint_when_set() {
+        use keyroost_resolve::{factory_reset_plan, Caps};
+        use keyroost_transport::{FactoryResetPlan, PivResetPreview};
+        let plan = factory_reset_plan(Caps::PIV);
+        let preview = FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
+            FactoryResetPlan::BurnPinPukThenReset,
+        ));
+
+        let warned = factory_reset_confirm_summary("SN", "Model", &plan, preview, false, true);
+        assert!(
+            warned.contains(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT),
+            "{warned}"
+        );
+
+        let not_warned = factory_reset_confirm_summary("SN", "Model", &plan, preview, false, false);
+        assert!(
+            !not_warned.contains(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT),
+            "{not_warned}"
+        );
+
+        // A plan without PIV never gets the hint, even if the flag is set --
+        // there's no PIV step for it to attach to.
+        let no_piv_plan = factory_reset_plan(Caps::OATH);
+        let no_piv = factory_reset_confirm_summary(
+            "SN",
+            "Model",
+            &no_piv_plan,
+            FactoryResetPivPreview::Resolved(PivResetPreview::Global),
+            false,
+            true,
+        );
+        assert!(
+            !no_piv.contains(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT),
+            "{no_piv}"
+        );
     }
 
     /// Two "Save certificate…" dialogs can be open at once (the busy guard is
@@ -16214,31 +19946,65 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    /// A forced PIV wipe blocks the PIN and PUK before it erases, so a failure
-    /// in between leaves the applet locked but intact. The confirmation modal
-    /// promises the report says so — which means every failure that doesn't
-    /// already describe the card's state has to carry the disclosure, matching
-    /// what the CLI's factory reset prints for the same failures.
+    /// Only `PivSession::factory_reset`'s PIN/PUK burn-dance path blocks the
+    /// PIN and PUK before it erases, so only there can a failure in between
+    /// leave the applet locked but intact. The confirmation modal promises
+    /// the report says so — which means every failure that doesn't already
+    /// describe the card's state has to carry the disclosure, matching what
+    /// the CLI's factory reset prints for the same failures.
     #[test]
-    fn piv_force_reset_failures_disclose_the_blocked_credentials() {
+    fn piv_factory_reset_failures_disclose_the_blocked_credentials() {
         // Self-describing variants pass through untouched: appending "run the
-        // factory reset again" would contradict them (Unsupported never blocked
-        // anything; the other two already say what to do).
-        let unsupported = piv_force_reset_message(TransportError::PivForceResetUnsupported);
+        // factory reset again" would contradict them (Unsupported/
+        // NeedsManagementAuth never blocked anything; UnverifiedFailed/
+        // GlobalFailed/ManagementAuthFailed already explain themselves and
+        // never touched a PIN or PUK either; the other two already say what
+        // to do).
+        let unsupported = piv_factory_reset_message(TransportError::PivResetUnsupported);
+        assert_eq!(unsupported, TransportError::PivResetUnsupported.to_string());
+        let needs_mgmt_auth =
+            piv_factory_reset_message(TransportError::PivResetNeedsManagementAuth);
         assert_eq!(
-            unsupported,
-            TransportError::PivForceResetUnsupported.to_string()
+            needs_mgmt_auth,
+            TransportError::PivResetNeedsManagementAuth.to_string()
+        );
+        let unverified_failed = piv_factory_reset_message(
+            TransportError::PivResetUnverifiedFailed(Box::new(TransportError::PivResetNotAllowed)),
+        );
+        assert_eq!(
+            unverified_failed,
+            TransportError::PivResetUnverifiedFailed(Box::new(TransportError::PivResetNotAllowed))
+                .to_string()
+        );
+        let global_failed = piv_factory_reset_message(TransportError::PivResetGlobalFailed(
+            Box::new(TransportError::PivSecurityNotSatisfied),
+        ));
+        assert_eq!(
+            global_failed,
+            TransportError::PivResetGlobalFailed(Box::new(TransportError::PivSecurityNotSatisfied))
+                .to_string()
+        );
+        let mgmt_auth_failed =
+            piv_factory_reset_message(TransportError::PivResetManagementAuthFailed(Box::new(
+                TransportError::PivManagementAuthFailed,
+            )));
+        assert_eq!(
+            mgmt_auth_failed,
+            TransportError::PivResetManagementAuthFailed(Box::new(
+                TransportError::PivManagementAuthFailed
+            ))
+            .to_string()
         );
         let incomplete =
-            piv_force_reset_message(TransportError::PivForceResetIncomplete("card state here"));
+            piv_factory_reset_message(TransportError::PivResetIncomplete("card state here"));
         assert_eq!(incomplete, "card state here");
-        let guessed = piv_force_reset_message(TransportError::PivPukGuessAccepted);
+        let guessed = piv_factory_reset_message(TransportError::PivPukGuessAccepted);
         assert_eq!(guessed, TransportError::PivPukGuessAccepted.to_string());
 
         // Everything else says nothing about the blocking on its own — an
         // unexpected status word in the PIN/PUK loop renders as a bare APDU
         // failure — so the disclosure is appended.
-        let bare = piv_force_reset_message(TransportError::Apdu {
+        let bare = piv_factory_reset_message(TransportError::Apdu {
             label: "piv pin/puk",
             sw1: 0x6a,
             sw2: 0x80,
@@ -16255,6 +20021,86 @@ mod tests {
         // Not the single-applet reset: a fault in the PUK loop leaves the PUK
         // unblocked, and the card refuses a plain RESET until both are blocked.
         assert!(!bare.contains("piv reset"), "{bare}");
+    }
+
+    /// The "Reset applet" card only points at the whole-device factory reset
+    /// as a known alternative when a device-wide reset is itself confirmed
+    /// (`ResetGlobal` `Supported`, not merely `Unverified`) AND PIV's own
+    /// RESET isn't already the known-good path (`Reset` anything but
+    /// `Supported`) — matching the spec's three cases (Unsupported -> show
+    /// the link, Unverified -> show the link, Supported -> leave as-is) plus
+    /// the `ResetGlobal` axis those three cases were silent on.
+    #[test]
+    fn piv_reset_global_alternative_available_matches_spec() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // Reset::Supported -> leave as-is, regardless of ResetGlobal.
+        for global in [
+            FeatureGate::Supported,
+            FeatureGate::Unverified,
+            FeatureGate::Unsupported,
+        ] {
+            assert!(
+                !piv_reset_global_alternative_available(FeatureGate::Supported, global),
+                "Reset::Supported must never be redirected, ResetGlobal={global:?}"
+            );
+        }
+
+        // Reset::Unsupported / Unverified, but ResetGlobal isn't a known
+        // alternative either (Unverified or Unsupported) -> nothing to point at.
+        for reset in [FeatureGate::Unsupported, FeatureGate::Unverified] {
+            for global in [FeatureGate::Unverified, FeatureGate::Unsupported] {
+                assert!(
+                    !piv_reset_global_alternative_available(reset, global),
+                    "reset={reset:?} global={global:?}"
+                );
+            }
+        }
+
+        // The two cases the link actually shows for.
+        assert!(piv_reset_global_alternative_available(
+            FeatureGate::Unsupported,
+            FeatureGate::Supported
+        ));
+        assert!(piv_reset_global_alternative_available(
+            FeatureGate::Unverified,
+            FeatureGate::Supported
+        ));
+    }
+
+    /// The Generate Key modal's "Policy other than `default` requires
+    /// YubiKey or compatible token." caveat hides only when *both* the PIN
+    /// and touch policy gates are confirmed `Supported` — any other
+    /// combination (either axis `Unverified` or `Unsupported`) still needs
+    /// it, since the per-row markers only warn about one axis at a time.
+    #[test]
+    fn piv_policy_caveat_hint_needed_only_hides_when_both_gates_are_supported() {
+        use keyroost_piv::compat::FeatureGate;
+
+        assert!(!piv_policy_caveat_hint_needed(
+            FeatureGate::Supported,
+            FeatureGate::Supported
+        ));
+
+        for pin in [
+            FeatureGate::Supported,
+            FeatureGate::Unverified,
+            FeatureGate::Unsupported,
+        ] {
+            for touch in [
+                FeatureGate::Supported,
+                FeatureGate::Unverified,
+                FeatureGate::Unsupported,
+            ] {
+                if pin == FeatureGate::Supported && touch == FeatureGate::Supported {
+                    continue;
+                }
+                assert!(
+                    piv_policy_caveat_hint_needed(pin, touch),
+                    "pin={pin:?} touch={touch:?}"
+                );
+            }
+        }
     }
 
     /// Refusing to arm (KEY-005: no serial to re-identify the key by after a
@@ -16312,6 +20158,19 @@ mod tests {
             app.security_keys.error
         );
         assert!(app.log.iter().any(|l| l.text.contains("not armed")));
+        // The card sweep's own "factory reset finished" line was written
+        // before this ceremony even started (see `apply_factory_reset_sweep`)
+        // and never otherwise learns how FIDO ended — so the permanent record
+        // needs its own line naming the FIDO outcome, not just the earlier
+        // per-step summary.
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("factory reset") && l.text.contains("FIDO2")),
+            "the activity log must record the FIDO finale, not just the card \
+             sweep's earlier summary: {:?}",
+            app.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 
     /// The FIDO finale is the one step that survives the job that started it:
@@ -16425,6 +20284,18 @@ mod tests {
             "{:?}",
             app.security_keys.error
         );
+        // The Overview row isn't the only permanent record of this attempt —
+        // the activity log needs its own line, or a session that ends here
+        // (the user walks away instead of retrying) leaves only the card
+        // sweep's earlier "factory reset finished — wiped: OATH" line, with no
+        // mention that FIDO was ever attempted, let alone that it failed.
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("factory reset") && l.text.contains("refused the reset")),
+            "{:?}",
+            app.log.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
 
         // The retry lands: the row must be corrected, not appended to, or the
         // report claims passkeys survived on a key that is actually empty.
@@ -16442,6 +20313,15 @@ mod tests {
         assert!(
             app.security_keys.error.is_none(),
             "the retry clears the error"
+        );
+        // The successful retry gets its own log line too, distinct from the
+        // earlier failed attempt's.
+        assert!(
+            app.log
+                .iter()
+                .any(|l| l.text.contains("factory reset") && l.text.contains("FIDO2  wiped")),
+            "{:?}",
+            app.log.iter().map(|l| &l.text).collect::<Vec<_>>()
         );
         // Nothing was dropped on the floor, so nothing to warn about.
         assert!(!app
@@ -16637,6 +20517,233 @@ mod tests {
             .log
             .iter()
             .any(|l| l.text.contains("selection moved on")));
+    }
+
+    /// The success path used to report only through `factory_reset_report`
+    /// (the Overview pane's list) and never through the activity log — which
+    /// silently dropped any captured APDU trace too, since `App::push_log`
+    /// (the sole consumer of `App::pending_trace`) was never called. Both
+    /// gaps are covered here: a plain-language summary lands in the log
+    /// (wiped/failed/skipped, independent of tracing), and a trace captured
+    /// for the job actually attaches to that entry instead of being discarded.
+    #[test]
+    fn a_same_device_card_sweep_logs_a_summary_and_flushes_any_captured_trace() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            pending_trace: Some(vec!["> SELECT".into(), "< 9000".into()]),
+            ..Default::default()
+        };
+
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![
+                StepReport {
+                    step: ResetStep::Oath,
+                    outcome: StepOutcome::Wiped,
+                },
+                StepReport {
+                    step: ResetStep::Piv,
+                    outcome: StepOutcome::Skipped("PIV does not support RESET".into()),
+                },
+                StepReport {
+                    step: ResetStep::Token2Otp,
+                    outcome: StepOutcome::Failed("card refused".into()),
+                },
+            ],
+            false,
+        );
+
+        let entry = app
+            .log
+            .iter()
+            .find(|l| l.text.contains("factory reset finished"))
+            .expect("factory reset must log a summary line");
+        assert!(matches!(entry.severity, Severity::Warn)); // not everything wiped
+        assert!(entry.text.contains("OATH"), "{}", entry.text);
+        assert!(
+            entry.text.contains("PIV does not support RESET"),
+            "{}",
+            entry.text
+        );
+        assert!(entry.text.contains("card refused"), "{}", entry.text);
+        // The trace captured for this job attached to the summary line...
+        assert_eq!(
+            entry.trace.as_deref(),
+            Some(&["> SELECT".to_string(), "< 9000".to_string()][..])
+        );
+        // ...and was consumed, not left to attach to some later, unrelated line.
+        assert!(app.pending_trace.is_none());
+    }
+
+    /// All-`Wiped` reports log `Ok`, not `Warn` — the severity should read as
+    /// success when nothing failed or was skipped.
+    #[test]
+    fn a_fully_wiped_sweep_logs_ok_severity() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            ..Default::default()
+        };
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            }],
+            false,
+        );
+        let entry = app
+            .log
+            .iter()
+            .find(|l| l.text.contains("factory reset finished"))
+            .expect("factory reset must log a summary line");
+        assert!(matches!(entry.severity, Severity::Ok));
+    }
+
+    /// `WipedWithWarning` still re-initialises the applet's pane (it really
+    /// was wiped) but logs `Warn`, not `Ok` (there's still something for the
+    /// user to act on) -- the end-to-end path behind the exact scenario
+    /// reported: a device-wide reset whose courtesy XAUTH-key restore failed
+    /// showed up as "wiped: none; failed: PIV: ..." instead of naming PIV as
+    /// wiped.
+    #[test]
+    fn a_wiped_with_warning_sweep_reinits_the_pane_but_logs_warn_severity() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let a: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(a.clone()),
+            piv_tried: true,
+            ..Default::default()
+        };
+        App::apply_factory_reset_sweep(
+            &mut app,
+            Some(&a),
+            vec![StepReport {
+                step: ResetStep::Piv,
+                outcome: StepOutcome::WipedWithWarning("restoring XAUTH key 1 failed".into()),
+            }],
+            false,
+        );
+        assert!(
+            !app.piv_tried,
+            "the pane must re-list; PIV really was wiped"
+        );
+        assert_eq!(
+            factory_reset_row_line(&app.factory_reset_report[0]),
+            (
+                "PIV  wiped, but: restoring XAUTH key 1 failed".to_string(),
+                RowTone::Warn
+            )
+        );
+        let entry = app
+            .log
+            .iter()
+            .find(|l| l.text.contains("factory reset finished"))
+            .expect("factory reset must log a summary line");
+        assert!(matches!(entry.severity, Severity::Warn));
+        assert!(entry.text.contains("wiped: PIV"), "{}", entry.text);
+        assert!(
+            entry
+                .text
+                .contains("warnings: PIV: restoring XAUTH key 1 failed"),
+            "{}",
+            entry.text
+        );
+    }
+
+    #[test]
+    fn factory_reset_report_summary_names_every_bucket() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let summary = factory_reset_report_summary(&[
+            StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            },
+            StepReport {
+                step: ResetStep::OpenPgp,
+                outcome: StepOutcome::Failed("card refused".into()),
+            },
+            StepReport {
+                step: ResetStep::Piv,
+                outcome: StepOutcome::Skipped("not supported".into()),
+            },
+        ]);
+        assert!(summary.contains("wiped: OATH"), "{summary}");
+        assert!(
+            summary.contains("failed: OpenPGP: card refused"),
+            "{summary}"
+        );
+        assert!(summary.contains("skipped: PIV: not supported"), "{summary}");
+    }
+
+    /// A device-wide reset whose courtesy XAUTH-key restore fails is still a
+    /// wipe: the step must show up in the "wiped" list (a reader scanning
+    /// just that list must not conclude PIV was left untouched), and the
+    /// restore failure must still get its own line so it isn't lost. Exact
+    /// scenario reported: "wiped: none; failed: PIV: device wiped, but
+    /// restoring XAUTH key 1..." -- PIV belongs in "wiped", not only in
+    /// "failed".
+    #[test]
+    fn factory_reset_report_summary_counts_a_wiped_with_warning_step_as_wiped() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let summary = factory_reset_report_summary(&[StepReport {
+            step: ResetStep::Piv,
+            outcome: StepOutcome::WipedWithWarning("restoring XAUTH key 1 failed".into()),
+        }]);
+        assert!(summary.contains("wiped: PIV"), "{summary}");
+        assert!(!summary.contains("wiped: none"), "{summary}");
+        assert!(
+            summary.contains("warnings: PIV: restoring XAUTH key 1 failed"),
+            "{summary}"
+        );
+        assert!(!summary.contains("failed:"), "{summary}");
+    }
+
+    /// A PIV step wiped via the device-wide `ResetGlobal` mechanism took at
+    /// least one other applet down with it, so naming only "PIV" undersells
+    /// what happened — both the Overview row and the activity-log summary
+    /// must name the whole device instead.
+    #[test]
+    fn factory_reset_global_piv_wipe_names_the_whole_device() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let report = StepReport {
+            step: ResetStep::Piv,
+            outcome: StepOutcome::WipedGlobal,
+        };
+
+        let (text, tone) = factory_reset_row_line(&FactoryResetRow::Step(report.clone()));
+        assert_eq!(tone, RowTone::Done, "{text}");
+        assert_eq!(text, "Whole device (via PIV)  wiped");
+        assert!(!text.starts_with("PIV"), "{text}");
+
+        let summary = factory_reset_report_summary(&[
+            report,
+            StepReport {
+                step: ResetStep::Oath,
+                outcome: StepOutcome::Wiped,
+            },
+        ]);
+        assert!(
+            summary.contains("wiped: Whole device (via PIV), OATH"),
+            "{summary}"
+        );
+        assert!(!summary.contains("wiped: PIV"), "{summary}");
+    }
+
+    #[test]
+    fn factory_reset_report_summary_names_none_wiped_when_nothing_wiped() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let summary = factory_reset_report_summary(&[StepReport {
+            step: ResetStep::Oath,
+            outcome: StepOutcome::Failed("card refused".into()),
+        }]);
+        assert!(summary.contains("wiped: none"), "{summary}");
+        assert!(!summary.contains("skipped"), "{summary}");
     }
 
     /// Refusing to arm (KEY-005) ends the ceremony, exactly as Cancel does. An
@@ -16850,6 +20957,41 @@ mod tests {
             snap_subview(FidoSubview::Settings, &[]),
             FidoSubview::Passkeys
         );
+    }
+
+    /// `snap_cap_tab`'s own version of the rule directly above, one level up.
+    #[test]
+    fn cap_tab_snaps_to_an_offered_tab() {
+        let tabs = [CapTab::Overview, CapTab::Fido2, CapTab::Oath];
+        // Present pick is kept.
+        assert_eq!(snap_cap_tab(CapTab::Fido2, &tabs), CapTab::Fido2);
+        // Stale pick (tab not offered on this device) snaps to the first tab.
+        assert_eq!(snap_cap_tab(CapTab::Piv, &tabs), CapTab::Overview);
+        // Degenerate empty list (a Molto2 token, which has no capability
+        // tabs at all) falls back to the default.
+        assert_eq!(snap_cap_tab(CapTab::Fido2, &[]), CapTab::Overview);
+    }
+
+    /// Switching devices remembers each device's own last-shown `cap_tab`,
+    /// rather than resetting every device to Overview — the bug this pair
+    /// (`App::cap_tab_by_device` + `on_device_selected`) exists to fix.
+    #[test]
+    fn device_switch_restores_each_devices_own_cap_tab() {
+        let mut app = App {
+            selected_device: Some("serial:AAA".into()),
+            cap_tab: CapTab::Piv,
+            ..Default::default()
+        };
+        // Switch to a second device never seen before: starts fresh.
+        let previous = app.selected_device.replace("serial:BBB".into());
+        app.on_device_selected(previous);
+        assert_eq!(app.cap_tab, CapTab::Overview);
+        app.cap_tab = CapTab::Fido2;
+        // Switch back to the first device: its own pick (Piv) comes back —
+        // not Overview, and not the second device's Fido2 pick.
+        let previous = app.selected_device.replace("serial:AAA".into());
+        app.on_device_selected(previous);
+        assert_eq!(app.cap_tab, CapTab::Piv);
     }
 
     /// getInfo with no `clientPin` option means the key has no PIN feature —
@@ -17136,6 +21278,301 @@ mod tests {
         assert_eq!(app.piv.gen_touch_policy, keyroost_piv::TouchPolicy::Default);
     }
 
+    /// `PivMgmtAlgSel::Delete` maps to no algorithm at all — the "delete the
+    /// management key outright" choice HID Crescendo's own combo offers,
+    /// distinct from every real `MgmtAlg`. `to_choice()`, unlike `to_alg()`,
+    /// is total: `MgmtAlgChoice` has its own `Delete`-equivalent variant, so
+    /// every `PivMgmtAlgSel` (including `Delete` itself) round-trips.
+    #[test]
+    fn piv_mgmt_alg_sel_delete_has_no_algorithm() {
+        use keyroost_piv::compat::MgmtAlgChoice;
+        assert_eq!(PivMgmtAlgSel::Delete.to_alg(), None);
+        assert_eq!(PivMgmtAlgSel::Delete.label(), "Delete");
+        assert_eq!(PivMgmtAlgSel::Delete.to_choice(), MgmtAlgChoice::Delete);
+        for alg in [
+            PivMgmtAlgSel::Aes192,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Aes256,
+            PivMgmtAlgSel::TripleDes,
+        ] {
+            assert!(alg.to_alg().is_some());
+            assert_ne!(alg.to_choice(), MgmtAlgChoice::Delete);
+        }
+    }
+
+    /// The management-key combo offers every algorithm plus `Delete` last, on
+    /// every device — `Delete` isn't trimmed off the list for a standard
+    /// device the way it used to be; it's still offered there, just gated
+    /// disabled live (via `PivExtension::ManagementKeyAlgorithm`) since a
+    /// standard device's management key can't be removed outright.
+    #[test]
+    fn piv_mgmtalg_all_lists_delete_last() {
+        assert_eq!(
+            PivMgmtAlgSel::ALL,
+            [
+                PivMgmtAlgSel::TripleDes,
+                PivMgmtAlgSel::Aes128,
+                PivMgmtAlgSel::Aes192,
+                PivMgmtAlgSel::Aes256,
+                PivMgmtAlgSel::Delete,
+            ]
+        );
+        assert_eq!(PivMgmtAlgSel::ALL.last(), Some(&PivMgmtAlgSel::Delete));
+    }
+
+    /// The Generate key card's initial selection (`App::piv`'s `new_mgmt_alg`
+    /// field seeds from [`PivMgmtAlgSel::default`]) stays `Aes192` — a
+    /// widely-supported starting point — independent of [`PivMgmtAlgSel::ALL`]'s
+    /// own order. The two used to coincide (`Aes192` was `ALL[0]` too, before
+    /// `ALL` was alphabetized to `TripleDes` first); this pins the `#[default]`
+    /// attribute itself so a future reshuffle of `ALL` can't silently drag the
+    /// default combo selection along with it.
+    #[test]
+    fn piv_mgmtalg_default_stays_aes192_despite_the_alphabetized_all_order() {
+        assert_eq!(PivMgmtAlgSel::default(), PivMgmtAlgSel::Aes192);
+        assert_ne!(PivMgmtAlgSel::ALL[0], PivMgmtAlgSel::default());
+    }
+
+    /// `piv_mgmtalg_clamp` snaps a selection the given options don't offer
+    /// back to the first option, and leaves an already-valid selection
+    /// alone.
+    #[test]
+    fn piv_mgmtalg_clamp_snaps_an_unoffered_selection_to_the_first_option() {
+        // Already valid: left alone.
+        let mut sel = PivMgmtAlgSel::Delete;
+        piv_mgmtalg_clamp(&mut sel, &PivMgmtAlgSel::ALL);
+        assert_eq!(sel, PivMgmtAlgSel::Delete);
+
+        // A narrower list that excludes `Delete` (e.g. a hypothetical future
+        // device the combo restricts further) clamps it away to that list's
+        // first entry.
+        let without_delete = [
+            PivMgmtAlgSel::TripleDes,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Aes192,
+            PivMgmtAlgSel::Aes256,
+        ];
+        let mut sel = PivMgmtAlgSel::Delete;
+        piv_mgmtalg_clamp(&mut sel, &without_delete);
+        assert_eq!(sel, PivMgmtAlgSel::TripleDes);
+    }
+
+    /// `piv_mgmtalg_unsupported_fallback` snaps a selection gating
+    /// `Unsupported` to the first *selectable* offered option — not
+    /// `options[0]` unconditionally, since `options[0]` (`TripleDes` on the
+    /// alphabetized `ALL`) can itself be the disabled entry. A regression
+    /// test for exactly that bug: the combo used to preselect `options[0]`
+    /// even when it was disabled, because the old fallback snapped straight
+    /// back to it without checking whether *it* was selectable too.
+    #[test]
+    fn piv_mgmtalg_unsupported_fallback_skips_a_disabled_first_option() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // TripleDes (`options[0]`) is disabled; Aes128 is the next option in
+        // `ALL`'s order (`[TripleDes, Aes128, Aes192, Aes256]`) and is
+        // selectable, so it's the fallback.
+        let gate = |alg: PivMgmtAlgSel| match alg {
+            PivMgmtAlgSel::TripleDes => FeatureGate::Unsupported,
+            _ => FeatureGate::Supported,
+        };
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(PivMgmtAlgSel::TripleDes, &PivMgmtAlgSel::ALL, gate),
+            PivMgmtAlgSel::Aes128
+        );
+
+        // A selection that isn't `Unsupported` is left alone, even if a
+        // *different* option would also be selectable.
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(PivMgmtAlgSel::Aes128, &PivMgmtAlgSel::ALL, gate),
+            PivMgmtAlgSel::Aes128
+        );
+
+        // Every option disabled: nothing better to select, so it falls back
+        // to `options[0]` rather than panicking or leaving `sel` disabled
+        // forever with no path back to a selectable state.
+        let all_unsupported = |_: PivMgmtAlgSel| FeatureGate::Unsupported;
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(
+                PivMgmtAlgSel::TripleDes,
+                &PivMgmtAlgSel::ALL,
+                all_unsupported
+            ),
+            PivMgmtAlgSel::TripleDes
+        );
+
+        // Empty options: no-op regardless of gate.
+        assert_eq!(
+            piv_mgmtalg_unsupported_fallback(PivMgmtAlgSel::TripleDes, &[], gate),
+            PivMgmtAlgSel::TripleDes
+        );
+    }
+
+    /// `piv_mgmtalg_unverified_labels` suppresses the per-algorithm
+    /// "unverified" warning entirely once `SetManagementKey` itself gates
+    /// `Unsupported` — there's nothing to warn about picking an algorithm for
+    /// a change that can't be made at all, and the disabled button/combo
+    /// already carry their own blocked-hint tooltip.
+    #[test]
+    fn piv_mgmtalg_unverified_labels_are_suppressed_when_the_extension_is_unsupported() {
+        use keyroost_piv::compat::FeatureGate;
+
+        let all_unverified = |_: PivMgmtAlgSel| FeatureGate::Unverified;
+        // Extension unsupported: empty, regardless of what the per-algorithm
+        // gates would otherwise report.
+        assert!(piv_mgmtalg_unverified_labels(
+            FeatureGate::Unsupported,
+            &PivMgmtAlgSel::ALL,
+            all_unverified
+        )
+        .is_empty());
+
+        // Extension merely unverified, or fully supported: the per-algorithm
+        // list still comes through normally.
+        assert_eq!(
+            piv_mgmtalg_unverified_labels(
+                FeatureGate::Unverified,
+                &PivMgmtAlgSel::ALL,
+                all_unverified
+            )
+            .len(),
+            PivMgmtAlgSel::ALL.len()
+        );
+        assert_eq!(
+            piv_mgmtalg_unverified_labels(
+                FeatureGate::Supported,
+                &PivMgmtAlgSel::ALL,
+                all_unverified
+            )
+            .len(),
+            PivMgmtAlgSel::ALL.len()
+        );
+
+        // Extension supported, but no option is individually unverified:
+        // empty for an unrelated reason (nothing to report), not the
+        // suppression rule.
+        assert!(
+            piv_mgmtalg_unverified_labels(FeatureGate::Supported, &PivMgmtAlgSel::ALL, |_| {
+                FeatureGate::Supported
+            })
+            .is_empty()
+        );
+    }
+
+    /// `piv_keyalg_unsupported_fallback` — the slot key-algorithm counterpart
+    /// of `piv_mgmtalg_unsupported_fallback` — snaps a selection gating
+    /// `Unsupported` to the first selectable algorithm in `KeyAlg::ALL`
+    /// rather than unconditionally returning `fallback`: the caller's usual
+    /// "widely-supported default" (`EccP256` at the one call site in
+    /// `cap_piv`) is just another candidate and could itself be the disabled
+    /// entry on some fingerprint.
+    #[test]
+    fn piv_keyalg_unsupported_fallback_skips_a_disabled_fallback_algorithm() {
+        use keyroost_piv::compat::FeatureGate;
+        use keyroost_piv::KeyAlg;
+
+        // `EccP256` (the usual `fallback` argument) is itself disabled here;
+        // `Rsa1024` is the first selectable algorithm in `ALL`'s order.
+        let gate = |alg: KeyAlg| match alg {
+            KeyAlg::EccP256 => FeatureGate::Unsupported,
+            _ => FeatureGate::Supported,
+        };
+        assert_eq!(
+            piv_keyalg_unsupported_fallback(KeyAlg::EccP256, KeyAlg::EccP256, gate),
+            KeyAlg::Rsa1024
+        );
+
+        // A selection that isn't `Unsupported` is left alone.
+        assert_eq!(
+            piv_keyalg_unsupported_fallback(KeyAlg::Rsa2048, KeyAlg::EccP256, gate),
+            KeyAlg::Rsa2048
+        );
+
+        // Every algorithm disabled: falls back to `fallback` outright —
+        // nothing better to select.
+        assert_eq!(
+            piv_keyalg_unsupported_fallback(KeyAlg::EccP256, KeyAlg::EccP256, |_| {
+                FeatureGate::Unsupported
+            }),
+            KeyAlg::EccP256
+        );
+    }
+
+    /// `PivMgmtAlgSel::to_choice()` feeds `PivExtension::ManagementKeyAlgorithm`
+    /// correctly end to end: a HID Crescendo device gates 3DES/AES-128/Delete
+    /// `Supported` and AES-192/AES-256 `Unsupported`, while a YubiKey gates
+    /// every real algorithm `Supported` and `Delete` `Unsupported` — the same
+    /// verdicts `keyroost_piv::compat`'s own tests confirm directly against
+    /// `MgmtAlgChoice`, exercised here through the GUI-side selector instead.
+    #[test]
+    fn piv_mgmtalg_sel_to_choice_resolves_the_expected_gate_per_fingerprint() {
+        use keyroost_piv::compat::{FeatureGate, PivExtension};
+        use keyroost_piv::fingerprint::{AppletFingerprint, HidCrescendoVariant};
+
+        let gate = |fp: AppletFingerprint, sel: PivMgmtAlgSel| {
+            keyroost_piv::compat::resolve(
+                PivExtension::ManagementKeyAlgorithm(sel.to_choice()),
+                fp,
+                None,
+                None,
+            )
+        };
+        let hid = AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300);
+        for sel in [
+            PivMgmtAlgSel::TripleDes,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Delete,
+        ] {
+            assert_eq!(gate(hid, sel), FeatureGate::Supported, "{sel:?}");
+        }
+        for sel in [PivMgmtAlgSel::Aes192, PivMgmtAlgSel::Aes256] {
+            assert_eq!(gate(hid, sel), FeatureGate::Unsupported, "{sel:?}");
+        }
+        for sel in [
+            PivMgmtAlgSel::Aes192,
+            PivMgmtAlgSel::Aes128,
+            PivMgmtAlgSel::Aes256,
+            PivMgmtAlgSel::TripleDes,
+        ] {
+            assert_eq!(
+                gate(AppletFingerprint::YubiKey, sel),
+                FeatureGate::Supported,
+                "{sel:?}"
+            );
+        }
+        assert_eq!(
+            gate(AppletFingerprint::YubiKey, PivMgmtAlgSel::Delete),
+            FeatureGate::Unsupported
+        );
+    }
+
+    /// `piv_policy_clamp` — the PIN/touch policy counterpart of
+    /// `piv_mgmtalg_clamp` — snaps a selection a `PivQuirk` has dropped from
+    /// the offered list (e.g. `Once`/`Cached`) back to `Default`, and leaves
+    /// an already-offered selection alone.
+    #[test]
+    fn piv_policy_clamp_snaps_an_unoffered_selection_to_default() {
+        let cached_excluded: Vec<keyroost_piv::TouchPolicy> = keyroost_piv::TouchPolicy::ALL
+            .iter()
+            .copied()
+            .filter(|&opt| opt != keyroost_piv::TouchPolicy::Cached)
+            .collect();
+
+        let mut sel = keyroost_piv::TouchPolicy::Cached;
+        piv_policy_clamp(&mut sel, &cached_excluded);
+        assert_eq!(sel, keyroost_piv::TouchPolicy::Default);
+
+        // Already offered: left alone.
+        let mut sel = keyroost_piv::TouchPolicy::Always;
+        piv_policy_clamp(&mut sel, &cached_excluded);
+        assert_eq!(sel, keyroost_piv::TouchPolicy::Always);
+
+        // The full list never excludes `Default` itself, so a full-list
+        // clamp never moves a valid selection.
+        let mut sel = keyroost_piv::TouchPolicy::Cached;
+        piv_policy_clamp(&mut sel, keyroost_piv::TouchPolicy::ALL);
+        assert_eq!(sel, keyroost_piv::TouchPolicy::Cached);
+    }
+
     /// Each flow maps to its own title, busy caption, and success text.
     #[test]
     fn piv_cred_kind_strings_are_distinct() {
@@ -17287,6 +21724,22 @@ mod tests {
         assert!(!piv_slot_occupied(PivSlotSel::Retired(1), &slot_keys, None));
     }
 
+    #[test]
+    fn slot_confirmed_empty_only_fires_on_a_confirmed_empty_slot() {
+        use keyroost_piv::compat::FeatureGate;
+
+        // Confirmed empty on a device that can actually tell us -> blocked.
+        assert!(slot_confirmed_empty(FeatureGate::Supported, false));
+        // Confirmed to hold a key -> never blocked, regardless of the gate.
+        assert!(!slot_confirmed_empty(FeatureGate::Supported, true));
+        // No reliable device signal (Unverified or Unsupported) -> never
+        // blocked on emptiness, even if the (untrustworthy) reading says
+        // empty -- this is the whole point of gating on
+        // `GetSlotKeyStatus` rather than trusting `selected_has_key` alone.
+        assert!(!slot_confirmed_empty(FeatureGate::Unverified, false));
+        assert!(!slot_confirmed_empty(FeatureGate::Unsupported, false));
+    }
+
     /// Given occupancy (slot -> has_key), the eligible move destinations are the
     /// empty slots that aren't the source — across standard *and* retired slots.
     #[test]
@@ -17305,21 +21758,48 @@ mod tests {
     }
 
     /// The standard PIV factory default is 24 bytes of `01..08` ×3; Token2 PIN+
-    /// ships its own vendor default. Both decode to 24-byte keys.
+    /// ships its own vendor default. Both resolve via
+    /// `PivQuirk::Default9bManagementKey`, at any reported version.
     #[test]
     fn piv_default_mgmt_key_is_well_known() {
-        let std = piv_default_mgmt_key_hex(false);
-        assert_eq!(std, "010203040506070801020304050607080102030405060708");
-        let bytes = piv_mgmt_key_bytes(std).unwrap();
-        assert_eq!(bytes.len(), 24);
-        assert_eq!(&bytes[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let std = piv_default_mgmt_key(
+            keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+            Some(&[0]),
+            None,
+        )
+        .expect("YubiKey has a seeded default");
+        assert_eq!(&std[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
         // Repeated three times.
-        assert_eq!(&bytes[8..16], &bytes[..8]);
-        assert_eq!(&bytes[16..24], &bytes[..8]);
+        assert_eq!(&std[8..16], &std[..8]);
+        assert_eq!(&std[16..24], &std[..8]);
 
-        let t2 = piv_default_mgmt_key_hex(true);
-        assert_eq!(piv_mgmt_key_bytes(t2).unwrap().len(), 24);
+        let t2 = piv_default_mgmt_key(
+            keyroost_piv::fingerprint::AppletFingerprint::Token2,
+            Some(&[0]),
+            None,
+        )
+        .expect("Token2 has a seeded default");
         assert_ne!(std, t2);
+    }
+
+    /// A fingerprint keyroost has no seeded default for (`IdPrime`) resolves
+    /// `None` — the signal `App::piv_modal_mgmt_field` disables the "Use
+    /// default management key" checkbox on.
+    #[test]
+    fn piv_default_mgmt_key_none_for_an_unseeded_fingerprint() {
+        // IdPrime no longer fits this test — it now carries its own seeded
+        // default (`keyroost_piv::compat::IDPRIME_APPLET_QUIRKS`) — so this
+        // uses OpenFips201::Generic instead, which still has none.
+        assert_eq!(
+            piv_default_mgmt_key(
+                keyroost_piv::fingerprint::AppletFingerprint::OpenFips201(
+                    keyroost_piv::fingerprint::OpenFips201Variant::Generic
+                ),
+                Some(&[0]),
+                None
+            ),
+            None
+        );
     }
 
     /// `OathAddDialog::validate` trims the name, requires it, base32-decodes the
@@ -17409,23 +21889,32 @@ mod tests {
     }
 
     /// With "Use default management key" ticked, `piv_current_mgmt_key` ignores
-    /// the (possibly empty) hex field and yields the well-known default; with it
-    /// off, it decodes the typed hex.
+    /// the (possibly empty) hex field and yields this device's well-known
+    /// default; with it off, it decodes the typed hex.
     #[test]
     fn piv_current_mgmt_key_honours_use_default() {
         let mut app = App::default();
-        // Default toggle on, hex field empty → resolves to the non-Token2 default
-        // (no device selected ⇒ not Token2).
-        app.piv.use_default_mgmt = true;
+        app.piv.status = Some(piv_status_with(
+            keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+            Some(vec![5, 7]),
+        ));
+        // Default toggle on, hex field empty → resolves to this device's
+        // seeded default (YubiKey's, since that's the live fingerprint).
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
         app.piv.mgmt_key_input.clear();
         let key = app.piv_current_mgmt_key().expect("default fills");
         assert_eq!(
             &key[..],
-            &piv_mgmt_key_bytes(piv_default_mgmt_key_hex(false)).unwrap()[..]
+            piv_default_mgmt_key(
+                keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+                Some(&[5, 7]),
+                None
+            )
+            .unwrap()
         );
 
         // Toggle off → uses the typed hex.
-        app.piv.use_default_mgmt = false;
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Manual;
         app.piv.mgmt_key_input = "aabbccddeeff00112233445566778899aabbccddeeff0011".into();
         let typed = app.piv_current_mgmt_key().expect("valid hex");
         assert_eq!(typed.len(), 24);
@@ -17434,6 +21923,262 @@ mod tests {
         // Toggle off with bad hex → error surfaces.
         app.piv.mgmt_key_input = "nothex".into();
         assert!(app.piv_current_mgmt_key().is_err());
+    }
+
+    /// With "Use default management key" ticked but no live status read yet
+    /// (or a fingerprint keyroost has no seeded default for), there's no
+    /// default to fall back on — `piv_current_mgmt_key` surfaces an error
+    /// rather than guessing.
+    #[test]
+    fn piv_current_mgmt_key_default_errors_without_a_known_default() {
+        let mut app = App::default();
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
+        // No status read yet at all.
+        assert!(app.piv_current_mgmt_key().is_err());
+
+        // A live status, but for a fingerprint with no seeded default.
+        // IdPrime no longer fits here either — see
+        // `piv_default_mgmt_key_none_for_an_unseeded_fingerprint`.
+        app.piv.status = Some(piv_status_with(
+            keyroost_piv::fingerprint::AppletFingerprint::OpenFips201(
+                keyroost_piv::fingerprint::OpenFips201Variant::Generic,
+            ),
+            None,
+        ));
+        assert!(app.piv_current_mgmt_key().is_err());
+    }
+
+    /// With "Use PIN" ticked, `piv_current_mgmt_auth` yields a `Pin`, sourced
+    /// from `mgmt_key_input` for a flow with no PIN field of its own — the
+    /// same field the checkbox turns from "Management key" into "PIN".
+    #[test]
+    fn piv_current_mgmt_auth_use_pin_reads_mgmt_key_input_by_default() {
+        let mut app = App::default();
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Pin;
+        app.piv.mgmt_key_input = "123456".into();
+        match app.piv_current_mgmt_auth(PivCredKind::GenerateKey) {
+            Ok(PivMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "123456"),
+            other => panic!("expected Pin(\"123456\"), got {}", other.is_ok()),
+        }
+    }
+
+    /// For `SelfSign`/`SetRetries` — flows that already collect a PIN of
+    /// their own — "Use PIN" reuses *that* field instead of
+    /// `mgmt_key_input`: PIV has exactly one application PIN, so the two
+    /// boxes would otherwise ask for the same value twice.
+    #[test]
+    fn piv_current_mgmt_auth_use_pin_shares_the_dedicated_pin_field() {
+        let mut app = App::default();
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Pin;
+        // Left blank/stale on purpose — must not be what gets read.
+        app.piv.mgmt_key_input = "should-not-be-used".into();
+
+        app.piv.sign_pin = "111111".into();
+        match app.piv_current_mgmt_auth(PivCredKind::SelfSign) {
+            Ok(PivMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "111111"),
+            other => panic!("expected Pin(\"111111\"), got {}", other.is_ok()),
+        }
+
+        app.piv.retries_pin_auth = "222222".into();
+        match app.piv_current_mgmt_auth(PivCredKind::SetRetries) {
+            Ok(PivMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "222222"),
+            other => panic!("expected Pin(\"222222\"), got {}", other.is_ok()),
+        }
+    }
+
+    /// With "Use PIN" off, `piv_current_mgmt_auth` falls through to the
+    /// existing management-key resolution unchanged.
+    #[test]
+    fn piv_current_mgmt_auth_without_use_pin_falls_back_to_mgmt_key() {
+        let mut app = App::default();
+        app.piv.status = Some(piv_status_with(
+            keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+            Some(vec![5, 7]),
+        ));
+        app.piv.mgmt_auth_mode = PivMgmtAuthMode::Default;
+        match app.piv_current_mgmt_auth(PivCredKind::GenerateKey) {
+            Ok(PivMgmtAuth::Key(key)) => assert_eq!(
+                &key[..],
+                piv_default_mgmt_key(
+                    keyroost_piv::fingerprint::AppletFingerprint::YubiKey,
+                    Some(&[5, 7]),
+                    None
+                )
+                .unwrap()
+            ),
+            other => panic!("expected Key(default), got {}", other.is_ok()),
+        }
+    }
+
+    /// Regression test for a reported bug: check "Use PIN", check "Use
+    /// default management key" (which un-checks "Use PIN"), then un-check
+    /// "Use default management key" again. With two independent `bool`s —
+    /// each resetting the other on check but not consulting it on uncheck —
+    /// the third step left `use_pin` from step 1 stuck, so neither checkbox
+    /// was checked yet the field still asked for a PIN. `mgmt_auth_mode` is
+    /// a single field precisely to make that state unrepresentable: each
+    /// toggle is `piv_mgmt_mode_after_toggle`, applied unconditionally.
+    #[test]
+    fn mgmt_mode_toggle_sequence_ends_manual_not_stuck_on_pin() {
+        // 1. check "Use PIN". (Starting mode is Manual either way — the
+        // fresh-modal default — so the first toggle's result doesn't depend
+        // on it.)
+        let mut mode = piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Pin);
+        assert_eq!(mode, PivMgmtAuthMode::Pin);
+        // 2. check "Use default management key".
+        mode = piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Default);
+        assert_eq!(mode, PivMgmtAuthMode::Default);
+        // 3. uncheck "Use default management key" — neither box is checked
+        // now, so this must land on Manual (asking for the typed management
+        // key), not silently revert to Pin.
+        mode = piv_mgmt_mode_after_toggle(false, PivMgmtAuthMode::Default);
+        assert_eq!(mode, PivMgmtAuthMode::Manual);
+    }
+
+    /// `piv_mgmt_mode_after_toggle` unconditionally: checking always lands on
+    /// the given mode, unchecking always lands on `Manual`, regardless of
+    /// which mode was current beforehand.
+    #[test]
+    fn piv_mgmt_mode_after_toggle_ignores_the_other_toggle_entirely() {
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Default),
+            PivMgmtAuthMode::Default
+        );
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(true, PivMgmtAuthMode::Pin),
+            PivMgmtAuthMode::Pin
+        );
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(false, PivMgmtAuthMode::Default),
+            PivMgmtAuthMode::Manual
+        );
+        assert_eq!(
+            piv_mgmt_mode_after_toggle(false, PivMgmtAuthMode::Pin),
+            PivMgmtAuthMode::Manual
+        );
+    }
+
+    #[test]
+    fn reset_mgmt_auth_mode_after_toggle_ignores_the_other_toggle_entirely() {
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(true, ResetMgmtAuthMode::Default),
+            ResetMgmtAuthMode::Default
+        );
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(true, ResetMgmtAuthMode::Pin),
+            ResetMgmtAuthMode::Pin
+        );
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(false, ResetMgmtAuthMode::Default),
+            ResetMgmtAuthMode::Manual
+        );
+        assert_eq!(
+            reset_mgmt_auth_mode_after_toggle(false, ResetMgmtAuthMode::Pin),
+            ResetMgmtAuthMode::Manual
+        );
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_default_reads_the_armed_dialogs_resolved_key() {
+        let app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Default,
+            factory_reset_confirm: Some(FactoryResetConfirmState {
+                for_device: "serial:AAA".into(),
+                piv_preview: FactoryResetPivPreview::NotOffered,
+                needs_reset_mgmt_auth: true,
+                default_mgmt_key: Some(
+                    &keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY,
+                ),
+                reset_long_running: false,
+            }),
+            ..Default::default()
+        };
+        match app.reset_mgmt_current_auth() {
+            Ok(ResetMgmtAuth::Key(key)) => assert_eq!(
+                &*key,
+                &keyroost_piv::fingerprint::HID_CRESCENDO_ACA_FACTORY_XAUTH_KEY
+            ),
+            other => panic!("expected the factory-default key, got {}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_default_with_no_known_default_errors() {
+        // No `factory_reset_confirm` armed at all (e.g. a stale call) is the
+        // same "no known default" case as one armed with `default_mgmt_key:
+        // None` — both mean keyroost has nothing to offer for this device.
+        let app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Default,
+            ..Default::default()
+        };
+        assert!(app.reset_mgmt_current_auth().is_err());
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_pin_reads_the_typed_field() {
+        let app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Pin,
+            reset_mgmt_auth_input: "123456".into(),
+            ..Default::default()
+        };
+        match app.reset_mgmt_current_auth() {
+            Ok(ResetMgmtAuth::Pin(pin)) => assert_eq!(&*pin, "123456"),
+            other => panic!("expected Pin(\"123456\"), got {}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn reset_mgmt_current_auth_manual_decodes_typed_hex() {
+        let mut app = App {
+            reset_mgmt_auth_mode: ResetMgmtAuthMode::Manual,
+            reset_mgmt_auth_input: "00".repeat(24),
+            ..Default::default()
+        };
+        match app.reset_mgmt_current_auth() {
+            Ok(ResetMgmtAuth::Key(key)) => assert_eq!(&*key, &[0u8; 24]),
+            other => panic!("expected a 24-byte zero key, got {}", other.is_ok()),
+        }
+        // Bad hex surfaces a decode error, same as the PIV modal's field.
+        app.reset_mgmt_auth_input = "not hex".into();
+        assert!(app.reset_mgmt_current_auth().is_err());
+    }
+
+    /// `piv_cred_modal_close` resets `mgmt_auth_mode` to `Manual` — covering
+    /// both what `use_default_mgmt = false` already did and the previously
+    /// missing `use_pin` reset (a real gap the two-bool design had: closing
+    /// the modal left "Use PIN" ticked for the next flow that opens it).
+    #[test]
+    fn piv_cred_modal_close_resets_mgmt_auth_mode() {
+        let mut app = App::default();
+        for mode in [PivMgmtAuthMode::Default, PivMgmtAuthMode::Pin] {
+            app.piv.mgmt_auth_mode = mode;
+            app.piv_cred_modal_close();
+            assert_eq!(app.piv.mgmt_auth_mode, PivMgmtAuthMode::Manual);
+        }
+    }
+
+    /// `PivCredKind::shares_pin_field` covers exactly `SelfSign`/`SetRetries` —
+    /// every other management-gated flow gets its own PIN box (or none) from
+    /// `piv_modal_mgmt_field`, not a reused one.
+    #[test]
+    fn shares_pin_field_covers_exactly_self_sign_and_set_retries() {
+        for kind in [
+            PivCredKind::ChangePin,
+            PivCredKind::ChangePuk,
+            PivCredKind::UnblockPin,
+            PivCredKind::GenerateKey,
+            PivCredKind::ImportCert,
+            PivCredKind::RequestCsr,
+            PivCredKind::ChangeMgmtKey,
+            PivCredKind::DeleteCert,
+            PivCredKind::DeleteKey,
+            PivCredKind::MoveKey,
+            PivCredKind::NewChuid,
+        ] {
+            assert!(!kind.shares_pin_field(), "{kind:?} should not share");
+        }
+        assert!(PivCredKind::SelfSign.shares_pin_field());
+        assert!(PivCredKind::SetRetries.shares_pin_field());
     }
 
     /// `apply_piv_cred_result` mirrors the pane outcome into the open modal:
@@ -17709,7 +22454,7 @@ mod tests {
             molto_session_device: Some("serial:AAA".into()),
             ..Default::default()
         };
-        app.on_device_selected();
+        app.on_device_selected(None);
         assert!(app.molto_session_device.is_none());
     }
 
@@ -17749,7 +22494,7 @@ mod tests {
             force_change: false,
             device: Some("serial:AAA".into()),
         });
-        app.on_device_selected();
+        app.on_device_selected(None);
         assert!(app.security_keys.advanced.is_none());
     }
 
@@ -17768,7 +22513,7 @@ mod tests {
         let cancel = progress.lock().unwrap().cancel.clone();
         app.security_keys.fp_progress = Some(progress);
 
-        app.on_device_selected();
+        app.on_device_selected(None);
 
         assert!(app.security_keys.session_device.is_none());
         assert!(app.security_keys.fingerprints.is_none());
@@ -17834,7 +22579,7 @@ mod tests {
         ));
         app.security_keys.reset.open = true;
 
-        app.on_device_selected();
+        app.on_device_selected(None);
 
         assert!(app.oath.confirm_delete.is_none());
         assert!(app.openpgp.cred_modal.is_none());
