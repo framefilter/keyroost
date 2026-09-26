@@ -232,9 +232,9 @@ keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-
       <div class="kr-callout-title note">Which software reads compressed certificates</div>
       <p>Readers confirmed to handle them include ykman, yubico-piv-tool / libykpiv / ykcs11
         (when built with compression support), OpenSC (when built with zlib), the YubiKey
-        Minidriver 5.0 and later, and the Yubico .NET SDK 1.13.1 and later. Support in
-        Windows' built-in PIV smart-card driver and in macOS's built-in PIV support has not
-        been verified. A certificate that fits uncompressed is stored uncompressed unless you
+        Minidriver 5.0 and later, and the Yubico .NET SDK 1.13.1 and later. Windows' built-in
+        PIV smart-card driver read one in a community test on Windows 11 (#152); macOS's
+        built-in PIV support has not been verified. A certificate that fits uncompressed is stored uncompressed unless you
         ask otherwise.</p>
     </div>
   </section>

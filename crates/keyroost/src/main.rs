@@ -2416,8 +2416,8 @@ impl PivCertCompressionSel {
 /// the same note the CLI prints.
 const PIV_AUTO_COMPRESSED_NOTE: &str = "The certificate did not fit on the card \
     uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
-    software reads compressed certificates; support in Windows' built-in smart-card \
-    driver and in macOS's built-in PIV support has not been verified.";
+    software reads compressed certificates, including Windows' built-in smart-card \
+    driver in a community test; macOS's built-in PIV support has not been verified.";
 
 /// The pane notice after a certificate was stored: `base`, the stored size
 /// when compressed, and the Automatic note when that is why it was.

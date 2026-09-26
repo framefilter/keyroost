@@ -6,6 +6,7 @@
   `piv self-sign` take `--compress` / `--no-compress`, and the GUI's Import
   certificate and Self-signed dialogs have a matching Compression choice.
   Every compressed write is read back and checked. `piv status` and the GUI
-  show which certificates are stored compressed. ykman and OpenSC read
-  them; whether Windows' built-in smart-card driver and macOS's built-in PIV
-  support do has not been verified yet (testers welcome in [#152]). ([#154])
+  show which certificates are stored compressed. ykman, OpenSC and, in a
+  community test on Windows 11, Windows' built-in smart-card driver read
+  them; macOS's built-in PIV support has not been verified yet (testers
+  welcome in [#152]). ([#154])
