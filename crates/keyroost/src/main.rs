@@ -809,6 +809,48 @@ fn ssh_cert_summary(info: &keyroost_ctap::ssh_cert::SshCertInfo) -> String {
     )
 }
 
+/// How many user-facing PIV features keyroost's compatibility table lists as
+/// unsupported on this device — the number the PIV card's "Compatibility
+/// table" line shows. Counts only what "Ignore for this key" can actually
+/// unlock (see `keyroost_piv::compat::user_overridable`), so RESET and HID
+/// Crescendo's own commands never inflate it.
+fn piv_compat_unsupported_count(
+    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    version: Option<&[u8]>,
+    version_firmware: Option<&[u8]>,
+) -> usize {
+    use keyroost_piv::compat::{FeatureGate, MgmtAlgChoice, PivExtension};
+    let mut features = vec![
+        PivExtension::MoveKey,
+        PivExtension::DeleteKey,
+        PivExtension::GetMetadata,
+        PivExtension::Attest,
+        PivExtension::PinManagementAuth,
+        PivExtension::SetPinPukRetries,
+        PivExtension::SetManagementKey,
+        PivExtension::SlotPinPolicy,
+        PivExtension::SlotTouchPolicy,
+    ];
+    features.extend(keyroost_piv::KeyAlg::ALL.map(PivExtension::SlotKeyAlgorithm));
+    features.extend(
+        [
+            MgmtAlgChoice::TripleDes,
+            MgmtAlgChoice::Aes128,
+            MgmtAlgChoice::Aes192,
+            MgmtAlgChoice::Aes256,
+        ]
+        .map(PivExtension::ManagementKeyAlgorithm),
+    );
+    features
+        .into_iter()
+        .filter(|&f| keyroost_piv::compat::user_overridable(f))
+        .filter(|&f| {
+            keyroost_piv::compat::resolve(f, fingerprint, version, version_firmware)
+                == FeatureGate::Unsupported
+        })
+        .count()
+}
+
 /// Whether the FIDO Settings subview exists for the selected key.
 /// authenticatorReset is a baseline CTAP2 command (present since CTAP 2.0),
 /// so any key that answered getInfo with a CTAP2 version can be reset and
@@ -2670,6 +2712,13 @@ struct App {
     /// wherever a device disappears, so an unplugged key's cached identity
     /// doesn't linger indefinitely.
     piv_session_state: std::collections::HashMap<DeviceId, keyroost_transport::PivSessionState>,
+    /// Keys the user chose to "ignore the compatibility table" for, this app
+    /// run only (never persisted): features the table lists as unsupported
+    /// become unverified — usable, with a warning — except RESET. Applied to
+    /// every PIV session for the key via `piv_cached_piv_session_state`, and
+    /// to the pane's own gates via `piv_gate`. The GUI's counterpart of the
+    /// CLI's per-command `--force`.
+    piv_compat_ignored: std::collections::HashSet<DeviceId>,
     /// Token2 on-device OTP (TOTP/HOTP) view state.
     otp: OtpState,
     /// Dark / light theme (persisted via eframe storage).
@@ -7677,11 +7726,41 @@ impl App {
     /// through; see the `piv_session_state` field's doc for the full round
     /// trip.
     fn piv_cached_piv_session_state(&self) -> keyroost_transport::PivSessionState {
-        self.selected_device
+        let mut state: keyroost_transport::PivSessionState = self
+            .selected_device
             .as_ref()
             .and_then(|id| self.piv_session_state.get(id))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        state.set_ignore_compat_table(self.piv_compat_ignored_selected());
+        state
+    }
+
+    /// Whether the user chose to ignore the compatibility table for the
+    /// selected key (see `piv_compat_ignored`).
+    fn piv_compat_ignored_selected(&self) -> bool {
+        self.selected_device
+            .as_ref()
+            .is_some_and(|id| self.piv_compat_ignored.contains(id))
+    }
+
+    /// The compatibility table's gate for `extension` on this device, relaxed
+    /// ("unsupported" → "unverified", except RESET) when the user chose to
+    /// ignore the table for the selected key. Every PIV control's gate goes
+    /// through here rather than `compat::resolve` directly.
+    fn piv_gate(
+        &self,
+        extension: keyroost_piv::compat::PivExtension,
+        fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+        version: Option<&[u8]>,
+        version_firmware: Option<&[u8]>,
+    ) -> keyroost_piv::compat::FeatureGate {
+        let gate = keyroost_piv::compat::resolve(extension, fingerprint, version, version_firmware);
+        if self.piv_compat_ignored_selected() {
+            keyroost_piv::compat::relax(extension, gate)
+        } else {
+            gate
+        }
     }
 
     /// Store `state` as `device`'s cached PIV session state. Called from a
@@ -7764,7 +7843,15 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = match cache {
             PivCache::Reuse => Some(self.piv_cached_piv_session_state()),
-            PivCache::Bypass => None,
+            // A fresh read still honours "ignore the compatibility table":
+            // an empty state never matches the card, so this resolves
+            // everything from scratch exactly like the plain path, but with
+            // the user's choice carried in.
+            PivCache::Bypass => self.piv_compat_ignored_selected().then(|| {
+                let mut fresh = keyroost_transport::PivSessionState::default();
+                fresh.set_ignore_compat_table(true);
+                fresh
+            }),
         };
         self.spawn_piv_job("Reading PIV status\u{2026}", move || {
             // One transport call gathers the snapshot and every slot's
@@ -8880,12 +8967,7 @@ impl App {
                     )
                 },
             );
-            keyroost_piv::compat::resolve(
-                PivExtension::PinManagementAuth,
-                piv_fp,
-                piv_ver,
-                piv_fw_ver,
-            )
+            self.piv_gate(PivExtension::PinManagementAuth, piv_fp, piv_ver, piv_fw_ver)
         };
         let maintain_pin_unlock = !matches!(
             pin_unlock_gate,
@@ -14628,7 +14710,7 @@ impl App {
                     )
                 },
             );
-            keyroost_piv::compat::resolve(
+            self.piv_gate(
                 keyroost_piv::compat::PivExtension::PinManagementAuth,
                 fp,
                 ver,
@@ -15025,13 +15107,13 @@ impl App {
                                     )
                                 },
                             );
-                            let pin_policy_gate = keyroost_piv::compat::resolve(
+                            let pin_policy_gate = self.piv_gate(
                                 PivExtension::SlotPinPolicy,
                                 piv_fp,
                                 piv_ver,
                                 piv_fw_ver,
                             );
-                            let touch_policy_gate = keyroost_piv::compat::resolve(
+                            let touch_policy_gate = self.piv_gate(
                                 PivExtension::SlotTouchPolicy,
                                 piv_fp,
                                 piv_ver,
@@ -15405,7 +15487,7 @@ impl App {
                                                     )
                                                 },
                                             );
-                                        let pin_unlock_gate = keyroost_piv::compat::resolve(
+                                        let pin_unlock_gate = self.piv_gate(
                                             PivExtension::PinManagementAuth,
                                             piv_fp,
                                             piv_ver,
@@ -16620,6 +16702,7 @@ impl App {
         let mut open_move_key = false;
         let mut open_self_test = false;
         let mut open_new_chuid = false;
+        let mut toggle_compat_table = false;
         let mut click_retired_tab = false;
         let mut arm_reset = false;
         let mut go_to_overview = false;
@@ -16654,7 +16737,7 @@ impl App {
                     )
                 },
             );
-        let set_retries_gate = keyroost_piv::compat::resolve(
+        let set_retries_gate = self.piv_gate(
             PivExtension::SetPinPukRetries,
             retries_piv_fp,
             retries_piv_ver,
@@ -16673,7 +16756,7 @@ impl App {
         // Change management key (Yubico SET MANAGEMENT KEY) is gated the
         // same way, from the same fingerprint/version triple as the retry
         // counts above — see the "Management key" row below.
-        let change_mgmt_key_gate = keyroost_piv::compat::resolve(
+        let change_mgmt_key_gate = self.piv_gate(
             PivExtension::SetManagementKey,
             retries_piv_fp,
             retries_piv_ver,
@@ -16703,7 +16786,7 @@ impl App {
             PivMgmtAlgSel::ALL.map(|alg| {
                 (
                     alg,
-                    keyroost_piv::compat::resolve(
+                    self.piv_gate(
                         PivExtension::ManagementKeyAlgorithm(alg.to_choice()),
                         retries_piv_fp,
                         retries_piv_ver,
@@ -16821,6 +16904,60 @@ impl App {
                         .font(theme::f_reg(12.5))
                         .color(p.txt2),
                     );
+                    // Compatibility table: one line, only when it matters —
+                    // something is greyed out because the table says so, or
+                    // the user already chose to ignore it for this key.
+                    let ignored = self.piv_compat_ignored_selected();
+                    let unsupported = piv_compat_unsupported_count(
+                        st.applet_fingerprint,
+                        st.version.as_deref(),
+                        st.version_firmware.as_deref(),
+                    );
+                    if ignored || unsupported > 0 {
+                        ui.horizontal_wrapped(|ui| {
+                            let (text, link, tip) = if ignored {
+                                (
+                                    "Compatibility table ignored for this key: features it lists \
+                                     as unsupported are enabled, marked unverified."
+                                        .to_string(),
+                                    "Use the table",
+                                    "Grey out again the features keyroost's compatibility table \
+                                     lists as unsupported on this device.",
+                                )
+                            } else {
+                                (
+                                    format!(
+                                        "Compatibility table: {unsupported} feature{} listed as \
+                                         unsupported on this device.",
+                                        if unsupported == 1 { "" } else { "s" }
+                                    ),
+                                    "Ignore for this key",
+                                    "Enable the features keyroost's compatibility table lists as \
+                                     unsupported, so you can try them. If the device really can't \
+                                     do one, it refuses and nothing changes. PIV reset stays \
+                                     blocked, because trying it uses up the PIN and PUK retries. \
+                                     Lasts until keyroost is closed.",
+                                )
+                            };
+                            ui.label(
+                                egui::RichText::new(text).font(theme::f_reg(12.5)).color(p.txt2),
+                            );
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(link)
+                                            .font(theme::f_sb(12.0))
+                                            .color(p.accent),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                toggle_compat_table = true;
+                            }
+                        });
+                    }
                     // CHUID — GUID and expiration only. FASC-N carries no
                     // information worth showing here (it's a fixed filler, not
                     // real card data — see keyroost_piv::encode_chuid) and stays
@@ -17190,10 +17327,8 @@ impl App {
                 )
             },
         );
-        let move_key_gate =
-            keyroost_piv::compat::resolve(PivExtension::MoveKey, piv_fp, piv_ver, piv_fw_ver);
-        let delete_key_gate =
-            keyroost_piv::compat::resolve(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
+        let move_key_gate = self.piv_gate(PivExtension::MoveKey, piv_fp, piv_ver, piv_fw_ver);
+        let delete_key_gate = self.piv_gate(PivExtension::DeleteKey, piv_fp, piv_ver, piv_fw_ver);
         // Whether this device has a confirmed, device-reported way to know a
         // slot's key occupancy (GET METADATA, or HID Crescendo's own GET PIV
         // PROPERTIES — see `keyroost_piv::compat::PivExtension::GetSlotKeyStatus`'s
@@ -17205,17 +17340,12 @@ impl App {
         // resolves `Supported` is `selected_has_key` trustworthy enough to
         // block on; everywhere else `None` could just as easily mean "this
         // device can't tell us" as "genuinely empty".
-        let get_slot_key_status_gate = keyroost_piv::compat::resolve(
-            PivExtension::GetSlotKeyStatus,
-            piv_fp,
-            piv_ver,
-            piv_fw_ver,
-        );
+        let get_slot_key_status_gate =
+            self.piv_gate(PivExtension::GetSlotKeyStatus, piv_fp, piv_ver, piv_fw_ver);
         // Reset (Yubico RESET, `INS 0xFB`) is gated the same way, from the
         // same fingerprint/version triple — see the "Reset applet" card
         // below.
-        let reset_gate =
-            keyroost_piv::compat::resolve(PivExtension::Reset, piv_fp, piv_ver, piv_fw_ver);
+        let reset_gate = self.piv_gate(PivExtension::Reset, piv_fp, piv_ver, piv_fw_ver);
         // A device-wide reset directive that takes PIV down with it alongside
         // at least one other applet — a distinct extension from `Reset`
         // above, resolved independently (see
@@ -17225,7 +17355,7 @@ impl App {
         // alternative when the PIV-only path can't be trusted — never to
         // change what that card's own button does.
         let reset_global_gate =
-            keyroost_piv::compat::resolve(PivExtension::ResetGlobal, piv_fp, piv_ver, piv_fw_ver);
+            self.piv_gate(PivExtension::ResetGlobal, piv_fp, piv_ver, piv_fw_ver);
         let show_reset_global_alternative =
             piv_reset_global_alternative_available(reset_gate, reset_global_gate);
         // Whether this device is known to take unusually long to finish
@@ -17246,7 +17376,7 @@ impl App {
             keyroost_piv::KeyAlg::ALL.map(|alg| {
                 (
                     alg,
-                    keyroost_piv::compat::resolve(
+                    self.piv_gate(
                         PivExtension::SlotKeyAlgorithm(alg),
                         piv_fp,
                         piv_ver,
@@ -18125,6 +18255,16 @@ impl App {
             if self.piv.retired_occupancy.is_none() {
                 let _ = self.load_piv_retired_occupancy();
             }
+        }
+        if toggle_compat_table {
+            if let Some(id) = self.selected_device.clone() {
+                if !self.piv_compat_ignored.remove(&id) {
+                    self.piv_compat_ignored.insert(id);
+                }
+            }
+            // Re-read so the internal reads the table was suppressing (GET
+            // METADATA, ATTEST) run — or stop running — straight away.
+            self.load_piv_status_with_cache(LogKind::Background, PivCache::Bypass);
         }
         if open_new_chuid {
             self.piv_cred_modal_close();

@@ -650,9 +650,30 @@ pub struct PivSessionState {
     /// `identity` caches — storing it a second time here would just be the
     /// same value kept in two places.
     applet_cache: AppletCache,
+    /// The user chose to ignore the compatibility table for this key: every
+    /// [`keyroost_piv::compat::FeatureGate::Unsupported`] this session
+    /// resolves is downgraded to `Unverified` (see
+    /// [`keyroost_piv::compat::relax`]), except RESET. Owned by the caller —
+    /// it survives a card change (see [`PivSession::with_cached_transaction_traced`]),
+    /// unlike every cached card fact above.
+    ignore_compat_table: bool,
 }
 
 impl PivSessionState {
+    /// Ignore (or stop ignoring) the compatibility table for this key: while
+    /// set, features the table lists as unsupported resolve as unverified
+    /// instead, so they can be tried; RESET stays blocked. See
+    /// [`keyroost_piv::compat::relax`].
+    pub fn set_ignore_compat_table(&mut self, ignore: bool) {
+        self.ignore_compat_table = ignore;
+    }
+
+    /// Whether [`Self::set_ignore_compat_table`] is in effect.
+    #[must_use]
+    pub fn ignores_compat_table(&self) -> bool {
+        self.ignore_compat_table
+    }
+
     /// Algorithm + public key this state has cached for `slot`, if any — the
     /// same cache [`PivSession::slot_key`] consults internally, exposed so a
     /// caller holding a `PivSessionState` between sessions (e.g. to show a
@@ -1444,6 +1465,10 @@ impl<'tx> PivSession<'tx> {
             atr: session.atr(),
         };
 
+        // The caller's choice, not a card fact: kept even when the cached
+        // card facts are thrown away below.
+        let ignore_compat_table = cached.ignore_compat_table;
+        session.state.ignore_compat_table = ignore_compat_table;
         if piv_session_cache_reusable(
             pcsc_trustworthy,
             cached.pcsc_identity.matches(&fresh_identity),
@@ -2185,12 +2210,17 @@ impl<'tx> PivSession<'tx> {
             version_firmware,
             ..
         } = self.applet_fingerprint();
-        keyroost_piv::compat::resolve(
+        let gate = keyroost_piv::compat::resolve(
             feature,
             fingerprint,
             version.as_deref(),
             version_firmware.as_deref(),
-        )
+        );
+        if self.state.ignore_compat_table {
+            keyroost_piv::compat::relax(feature, gate)
+        } else {
+            gate
+        }
     }
 
     /// [`Self::status`] plus each slot's key algorithm, certificate Subject
@@ -2419,12 +2449,17 @@ impl<'tx> PivSession<'tx> {
             version,
             version_firmware,
         } = self.identity();
-        keyroost_piv::compat::resolve(
+        let gate = keyroost_piv::compat::resolve(
             extension,
             fingerprint,
             version.as_deref(),
             version_firmware.as_deref(),
-        )
+        );
+        if self.state.ignore_compat_table {
+            keyroost_piv::compat::relax(extension, gate)
+        } else {
+            gate
+        }
     }
 
     /// The wire algorithm-identifier byte to send for `alg` in this session's

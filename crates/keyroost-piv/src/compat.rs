@@ -3661,6 +3661,38 @@ impl FeatureGate {
 /// see `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s doc) is resolved through the ordinary per-axis
 /// machinery below, exactly like every other extension, and never
 /// consults [`PivExtension::GetMetadata`] at all.
+/// Whether the user may override a [`FeatureGate::Unsupported`] verdict for
+/// `extension` ("ignore the compatibility table for this key" in the GUI,
+/// `--force` in the CLI). Everything except RESET: reaching RESET means
+/// deliberately exhausting the PIN and PUK retries first, so trying it on a
+/// device that turns out not to support it would leave the applet locked with
+/// no way back. Nor removing the management key outright
+/// ([`MgmtAlgChoice::Delete`]): that is HID Crescendo's own command, not a
+/// feature another device might merely be untested for. For every other
+/// extension a device that really lacks it just refuses the command and
+/// nothing changes.
+#[must_use]
+pub const fn user_overridable(extension: PivExtension) -> bool {
+    !matches!(
+        extension,
+        PivExtension::Reset
+            | PivExtension::ResetGlobal
+            | PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete)
+    )
+}
+
+/// `gate` with the compatibility table's "unsupported" downgraded to
+/// "unverified" when the user chose to ignore the table and
+/// [`user_overridable`] allows it — the control works, with the same warning
+/// an untested feature gets. Any other gate is returned unchanged.
+#[must_use]
+pub const fn relax(extension: PivExtension, gate: FeatureGate) -> FeatureGate {
+    match gate {
+        FeatureGate::Unsupported if user_overridable(extension) => FeatureGate::Unverified,
+        other => other,
+    }
+}
+
 #[must_use]
 pub fn resolve(
     extension: PivExtension,
@@ -4082,6 +4114,37 @@ fn merge_quirk_sets(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relax_turns_unsupported_into_unverified_except_reset() {
+        let u = FeatureGate::Unsupported;
+        assert_eq!(relax(PivExtension::MoveKey, u), FeatureGate::Unverified);
+        assert_eq!(relax(PivExtension::GetMetadata, u), FeatureGate::Unverified);
+        assert_eq!(
+            relax(PivExtension::SlotKeyAlgorithm(KeyAlg::EccP384), u),
+            FeatureGate::Unverified
+        );
+        assert_eq!(relax(PivExtension::Reset, u), FeatureGate::Unsupported);
+        assert_eq!(
+            relax(PivExtension::ResetGlobal, u),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            relax(
+                PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete),
+                u
+            ),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            relax(PivExtension::MoveKey, FeatureGate::Supported),
+            FeatureGate::Supported
+        );
+        assert_eq!(
+            relax(PivExtension::MoveKey, FeatureGate::Unverified),
+            FeatureGate::Unverified
+        );
+    }
+
     use super::*;
 
     // --- User-facing wording: requirement() + a suffix -------------------
