@@ -151,6 +151,17 @@ find "${APPDIR}" -path "${FALLBACK_DIR}" -prune -o -name 'libpcsclite*.so*' \
     -exec mv {} "${FALLBACK_DIR}/" \;
 ls "${FALLBACK_DIR}"/libpcsclite.so.1 >/dev/null || {
   echo "ERROR: linuxdeploy did not bundle libpcsclite.so.1"; exit 1; }
+# Newer pcsc-lite (e.g. 2.3 on Debian 13) splits the client: libpcsclite.so.1
+# is a small wrapper that loads libpcsclite_real.so.1 by name at first use and
+# ends the process if it can't. Nothing links against the real library, so
+# linuxdeploy never bundles it; copy it next to the wrapper when the build
+# host has one. (Only libc is needed.) Older, single-file clients skip this.
+PCSC_REAL="$(PATH="/sbin:/usr/sbin:$PATH" ldconfig -p 2>/dev/null \
+  | awk '/libpcsclite_real\.so\.1/ && /x86-64/ {p=$NF} END {print p}')" || true
+if [ -n "${PCSC_REAL}" ]; then
+  echo ">> also bundling ${PCSC_REAL} (loaded by the libpcsclite wrapper)"
+  cp -L "${PCSC_REAL}" "${FALLBACK_DIR}/libpcsclite_real.so.1"
+fi
 
 # 3b-2. Wrap the generated AppRun with a libpcsclite preflight: when the host
 #       has no libpcsclite, point the loader at the fallback copy (and say so
