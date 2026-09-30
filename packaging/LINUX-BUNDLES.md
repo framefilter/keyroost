@@ -411,14 +411,13 @@ verified against the version you ship.)*
 
 - **PC/SC:** an AppImage has **no sandbox** — the bundled binary runs as the
   user against the host. It uses the **host `pcscd`** directly through the
-  host's `/run/pcscd/pcscd.comm` socket; no socket plumbing needed. The open
-  question is whether to **bundle `libpcsclite.so`** in the AppDir or rely on
-  the host's. Recommendation: **bundle it** (linuxdeploy will pull it in as a
-  dependency of the keyroost binary) so the AppImage is self-contained on
-  systems where pcsc-lite's *client lib* isn't installed even though pcscd is
-  reachable — but verify the bundled client lib version is protocol-compatible
-  with a range of host pcscd versions (the PC/SC client/daemon wire protocol is
-  stable, so this is low-risk; confirm).
+  host's `/run/pcscd/pcscd.comm` socket; no socket plumbing needed. Decided
+  (issue #47): use the **host's** `libpcsclite` whenever it exists (the only
+  client guaranteed to match its `pcscd`), and keep linuxdeploy's bundled copy
+  in `usr/lib/pcsc-fallback/`, outside the library path, for hosts that have
+  none. `AppRun.preflight` points the loader there only in that case, so the
+  AppImage still launches; with no `pcscd`, the smart-card features report
+  unavailable while FIDO works.
 - **HID:** pure-Rust sysfs/hidraw — works directly against the host. The user
   still needs the udev rules (`udev/70-keyroost-fido.rules`) for non-root hidraw
   access; the AppImage cannot install udev rules itself. Document this.

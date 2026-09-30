@@ -473,13 +473,12 @@ chmod +x keyroost-x86_64.AppImage
 ./keyroost-x86_64.AppImage --appimage-extract-and-run
 ```
 
-> **Needs the host's pcsc-lite.** Unlike the other bundles, this AppImage does
-> **not** ship the pcsc-lite client library — it uses the host's, so the smart-card
-> client always matches the host's `pcscd` daemon. Practically that means the
-> host must have `pcsc-lite` installed (it comes with `pcscd`; see
-> [Smart-card prerequisite](#smart-card-prerequisite)). Pure-FIDO use still needs
-> it present for now, since the GUI links libpcsclite at startup — a future
-> release will load it lazily so FIDO-only hosts can run without it.
+> **Uses the host's pcsc-lite.** The AppImage always prefers the host's
+> pcsc-lite client library, so the smart-card client matches the host's `pcscd`
+> daemon; smart cards need `pcscd` installed (see
+> [Smart-card prerequisite](#smart-card-prerequisite)). On a host without
+> pcsc-lite it still starts, using a bundled copy of the library: FIDO works and
+> the smart-card features report unavailable until `pcscd` is installed.
 
 ### Smart-card prerequisite
 

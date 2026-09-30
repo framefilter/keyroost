@@ -1,12 +1,12 @@
 #!/bin/sh
 # keyroost AppImage launcher preflight.
 #
-# keyroost currently hard-links libpcsclite (the PC/SC client), so on a host
-# without it the binary can't even start — the dynamic linker aborts with a
-# cryptic "libpcsclite.so.1: cannot open shared object file". This wrapper turns
-# that into an actionable message, then hands off to the real (linuxdeploy-
-# generated) launcher. Remove once keyroost dlopens PC/SC and degrades
-# gracefully — https://github.com/framefilter/keyroost/issues/47
+# keyroost hard-links libpcsclite (the PC/SC client). The host's own copy is
+# always preferred: it is the one guaranteed to match the host's pcscd. On a
+# host with no libpcsclite at all, point the loader at the copy bundled in
+# usr/lib/pcsc-fallback/ so keyroost still starts; with no pcscd there, the
+# smart-card features just report unavailable and FIDO works as usual.
+# https://github.com/framefilter/keyroost/issues/47
 HERE="$(dirname "$(readlink -f "$0")")"
 
 have_pcsclite() {
@@ -18,27 +18,10 @@ have_pcsclite() {
 }
 
 if ! have_pcsclite; then
-  msg="keyroost can't start: the PC/SC library 'libpcsclite.so.1' isn't installed.
-
-keyroost reaches smart cards (Molto2, OATH, OpenPGP, PIV) through your system's
-PC/SC service, and for now needs its client library present to launch. Install
-the PC/SC runtime for your distribution, then run keyroost again:
-
-  Debian/Ubuntu:  sudo apt install libpcsclite1 pcscd
-  Fedora:         sudo dnf install pcsc-lite
-  Arch:           sudo pacman -S pcsclite
-
-(pcscd is the smart-card daemon; libpcsclite1 provides the library above.)
-A future release will start without it and simply disable the smart-card
-features: https://github.com/framefilter/keyroost/issues/47"
-  printf '%s\n' "$msg" >&2
-  # Best-effort GUI dialog for double-click launches with no terminal.
-  if command -v zenity >/dev/null 2>&1; then
-    zenity --error --no-wrap --title="keyroost" --text="$msg" >/dev/null 2>&1 || true
-  elif command -v kdialog >/dev/null 2>&1; then
-    kdialog --title "keyroost" --error "$msg" >/dev/null 2>&1 || true
-  fi
-  exit 1
+  echo "keyroost: no PC/SC library (libpcsclite.so.1) on this system; smart-card" \
+    "features will be unavailable. Install pcscd to use them." >&2
+  LD_LIBRARY_PATH="$HERE/usr/lib/pcsc-fallback${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH
 fi
 
 exec "$HERE/AppRun.real" "$@"

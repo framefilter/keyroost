@@ -4,7 +4,8 @@
 # See ../LINUX-BUNDLES.md for the full design, caveats, and open decisions.
 #
 # What this produces: a single self-contained `keyroost-x86_64.AppImage` bundling
-# the GUI binary plus its shared libraries (incl. libpcsclite — see PC/SC note).
+# the GUI binary plus its shared libraries (libpcsclite only as a fallback — see
+# the PC/SC note).
 #
 # PORTABILITY: build this on the OLDEST glibc you intend to support (e.g. inside
 # an old Ubuntu LTS container). An AppImage built on a new glibc only runs on
@@ -13,10 +14,10 @@
 # RUNTIME (user side):
 #   * FIDO HID needs the host udev rules (udev/70-keyroost-fido.rules) for
 #     non-root /dev/hidraw access — the AppImage cannot install them itself.
-#   * Smart-card applets need a running HOST pcscd AND the host's libpcsclite:
-#     the AppImage deliberately does NOT bundle the pcsc-lite client (see step 3
-#     for why), so the host must provide libpcsclite.so.1 — which it does
-#     wherever pcscd is installed.
+#   * Smart-card applets need a running HOST pcscd, reached through the host's
+#     own libpcsclite whenever it has one (see step 3 for why). A host without
+#     libpcsclite still launches: the AppImage falls back to a bundled copy,
+#     and with no pcscd the smart-card features simply report unavailable.
 #   * AppImages mount via FUSE. On FUSE3-only distros users may need libfuse2,
 #     or can run with:  ./keyroost-x86_64.AppImage --appimage-extract-and-run
 #     (TODO(maintainer): pin the appimagetool/runtime version and state the
@@ -99,7 +100,8 @@ fetch "${LDP_BASE}/linuxdeploy-plugin-appimage-x86_64.AppImage" linuxdeploy-plug
 export APPIMAGE_EXTRACT_AND_RUN=1
 
 # ---------------------------------------------------------------------------
-# 3. Stage the AppDir, then DROP the bundled libpcsclite so the host's is used.
+# 3. Stage the AppDir, then set the bundled libpcsclite ASIDE so the host's is
+#    used, keeping it only as a fallback for hosts that have none.
 #
 #    Why not bundle it: libpcsclite is the PC/SC *client*, and it speaks a
 #    version-sensitive private protocol to the host's pcscd *daemon*. A client
@@ -111,15 +113,14 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 #    resolve it from the system at runtime — same as the cargo/Homebrew builds,
 #    which work on hosts where the bundling AppImage did not.
 #
-#    KNOWN LIMITATION: keyroost hard-links libpcsclite, so this AppImage needs
-#    libpcsclite.so.1 present on the host to LAUNCH at all. Any host set up for
-#    PC/SC has it (it ships with pcscd); a pure-FIDO host without it cannot start
-#    this AppImage. Step 3b-2 below wraps the launcher so that failure is a clear,
-#    actionable message rather than a cryptic linker error, but the app still
-#    can't run without the library. The real fix — dlopen pcsc at runtime and
-#    degrade gracefully when it is absent — is tracked in TODO.md; it
-#    removes this limitation and fixes the mismatch for every channel, not just
-#    the AppImage.
+#    Hosts WITHOUT libpcsclite: keyroost hard-links it, so it could not even
+#    start there. Instead of deleting the bundled copy we move it out of the
+#    library path into usr/lib/pcsc-fallback/, and the launcher (step 3b-2)
+#    points the loader at it only when the host has no libpcsclite of its own.
+#    Such a host has no pcscd to mismatch with, so the bundled client just
+#    finds no PC/SC service: keyroost starts, FIDO works, and the smart-card
+#    features report unavailable (issue #47). No code change and no unsafe
+#    FFI; the host's own copy still always wins when present.
 #
 #    Mechanics: deploy WITHOUT --output, delete the auto-bundled libpcsclite,
 #    then package with the appimage plugin directly. (Re-running linuxdeploy with
@@ -139,17 +140,22 @@ mkdir -p "${APPDIR}"
     --desktop-file "${DESKTOP_FILE}" \
     --icon-file "${ICON_FILE}"
 
-# 3b. Drop the auto-bundled libpcsclite so the host's copy (which matches its
-#     own pcscd) is used at runtime (issue #47 — see the rationale above).
-echo ">> dropping bundled libpcsclite (use the host's, which matches its pcscd)"
-find "${APPDIR}" -name 'libpcsclite.so*' -delete
+# 3b. Move the auto-bundled libpcsclite out of the library path, so the host's
+#     copy (which matches its own pcscd) is used whenever it exists, and keep
+#     it in usr/lib/pcsc-fallback/ for hosts that have none (issue #47 — see
+#     the rationale above).
+echo ">> moving bundled libpcsclite to the fallback dir (host's copy wins)"
+FALLBACK_DIR="${APPDIR}/usr/lib/pcsc-fallback"
+mkdir -p "${FALLBACK_DIR}"
+find "${APPDIR}" -path "${FALLBACK_DIR}" -prune -o -name 'libpcsclite*.so*' \
+    -exec mv {} "${FALLBACK_DIR}/" \;
+ls "${FALLBACK_DIR}"/libpcsclite.so.1 >/dev/null || {
+  echo "ERROR: linuxdeploy did not bundle libpcsclite.so.1"; exit 1; }
 
-# 3b-2. Wrap the generated AppRun with a libpcsclite preflight. keyroost
-#       hard-links libpcsclite, so on a host without it this AppImage aborts at
-#       the dynamic linker before main with a cryptic error. The preflight turns
-#       that into an actionable "install pcscd" message; when libpcsclite IS
-#       present it hands off to the real (linuxdeploy) launcher unchanged.
-#       Stopgap until PC/SC is dlopen'd and degrades gracefully (issue #47).
+# 3b-2. Wrap the generated AppRun with a libpcsclite preflight: when the host
+#       has no libpcsclite, point the loader at the fallback copy (and say so
+#       on stderr); otherwise hand off to the real (linuxdeploy) launcher
+#       unchanged.
 echo ">> installing libpcsclite preflight launcher"
 [ -f "${APPDIR}/AppRun" ] || { echo "ERROR: linuxdeploy produced no AppRun"; exit 1; }
 mv "${APPDIR}/AppRun" "${APPDIR}/AppRun.real"
