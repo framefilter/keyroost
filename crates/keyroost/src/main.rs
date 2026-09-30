@@ -16917,26 +16917,23 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             let (text, link, tip) = if ignored {
                                 (
-                                    "Compatibility table ignored for this key: features it lists \
-                                     as unsupported are enabled, marked unverified."
-                                        .to_string(),
-                                    "Use the table",
-                                    "Grey out again the features keyroost's compatibility table \
-                                     lists as unsupported on this device.",
+                                    "All features enabled.".to_string(),
+                                    "Undo",
+                                    "Grey out again the features that might not work on this \
+                                     key.",
                                 )
                             } else {
                                 (
                                     format!(
-                                        "Compatibility table: {unsupported} feature{} listed as \
-                                         unsupported on this device.",
+                                        "{unsupported} feature{} might not work on this key.",
                                         if unsupported == 1 { "" } else { "s" }
                                     ),
-                                    "Ignore for this key",
-                                    "Enable the features keyroost's compatibility table lists as \
-                                     unsupported, so you can try them. If the device really can't \
-                                     do one, it refuses and nothing changes. PIV reset stays \
-                                     blocked, because trying it uses up the PIN and PUK retries. \
-                                     Lasts until keyroost is closed.",
+                                    "Enable Anyway",
+                                    "keyroost's information about this device says these might \
+                                     not work, but it can be wrong, especially for newer firmware. \
+                                     If the key can't do one, it refuses and nothing changes. PIV \
+                                     reset stays off, because trying it uses up the PIN and PUK \
+                                     retries. Lasts until keyroost is closed.",
                                 )
                             };
                             ui.label(
