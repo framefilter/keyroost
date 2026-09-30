@@ -16919,8 +16919,7 @@ impl App {
                                 (
                                     "All features enabled.".to_string(),
                                     "Undo",
-                                    "Grey out again the features that might not work on this \
-                                     key.",
+                                    "Grey them out again.",
                                 )
                             } else {
                                 (
@@ -16929,11 +16928,7 @@ impl App {
                                         if unsupported == 1 { "" } else { "s" }
                                     ),
                                     "Enable Anyway",
-                                    "keyroost's information about this device says these might \
-                                     not work, but it can be wrong, especially for newer firmware. \
-                                     If the key can't do one, it refuses and nothing changes. PIV \
-                                     reset stays off, because trying it uses up the PIN and PUK \
-                                     retries. Lasts until keyroost is closed.",
+                                    "If this key can't do one of them, it will just refuse.",
                                 )
                             };
                             ui.label(
