@@ -185,9 +185,11 @@ plan's two-key manual steps were never executed):
   **Backburnered by the maintainer (2026-08-15): the last attempt required
   `unsafe` on more surface than they were comfortable with.** Do not pick this
   up without a design that keeps the unsafe footprint to a thin, isolated
-  loader crate — and maintainer sign-off on that design first. Also gates the
-  AppImageHub submission (#53): the catalog CI runs on a bare VM without
-  libpcsclite, where the hard link fails before main().
+  loader crate — and maintainer sign-off on that design first. The AppImage
+  no longer depends on it: since #157 it falls back to a bundled copy when
+  the host has no libpcsclite, which also unblocked AppImageHub (#53,
+  AppImage/appimage.github.io#9258). The other prebuilt binaries still
+  hard-link it.
 
 - **musl static Linux build** — under consideration, notes-only, not wired into
   any workflow. The draft design and runbook are in `packaging/musl/README.md`;
