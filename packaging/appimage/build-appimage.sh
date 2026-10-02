@@ -135,11 +135,30 @@ mkdir -p "${APPDIR}"
   echo "ERROR: no icon at ${ICON_FILE} — supply one (see ../icons/README.md)"; exit 1; }
 
 # 3a. Deploy: populate the AppDir + its libraries. No --output yet.
+#     The GUI's windowing layer loads libxkbcommon and libxkbcommon-x11 by name
+#     at runtime (xkbcommon-dl), so nothing links them and linuxdeploy would
+#     not bundle them; without libxkbcommon-x11 on the host the app panics at
+#     startup. Bundle both explicitly (linuxdeploy adds their dependencies).
+find_lib() { # soname -> path from the loader cache, or fail the build
+  local p
+  p="$(PATH="/sbin:/usr/sbin:$PATH" ldconfig -p 2>/dev/null \
+    | awk -v n="$1" '$1 == n && /x86-64/ {p=$NF} END {print p}')" || true
+  [ -n "${p}" ] || { echo "ERROR: $1 not found on the build host"; exit 1; }
+  echo "${p}"
+}
+XKB_LIB="$(find_lib libxkbcommon.so.0)"
+XKB_X11_LIB="$(find_lib libxkbcommon-x11.so.0)"
 ./linuxdeploy.AppImage \
     --appdir "${APPDIR}" \
     --executable "${BIN}" \
+    --library "${XKB_LIB}" \
+    --library "${XKB_X11_LIB}" \
     --desktop-file "${DESKTOP_FILE}" \
     --icon-file "${ICON_FILE}"
+for so in libxkbcommon.so.0 libxkbcommon-x11.so.0; do
+  ls "${APPDIR}"/usr/lib/"${so}" >/dev/null || {
+    echo "ERROR: ${so} was not bundled"; exit 1; }
+done
 
 # 3b. Move the auto-bundled libpcsclite out of the library path, so the host's
 #     copy (which matches its own pcscd) is used whenever it exists, and keep

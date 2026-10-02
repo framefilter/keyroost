@@ -100,7 +100,10 @@ jobs:
     # Gate behind the same manual-approval environment publish.yml uses, so the
     # whole release fanout waits for one approval before anything goes out.
     environment: release-publish
-    runs-on: ubuntu-latest
+    # The oldest still-supported Ubuntu LTS, not ubuntu-latest: an AppImage
+    # runs only where the glibc is at least the build host's, and catalogs
+    # such as AppImageHub test on older systems.
+    runs-on: ubuntu-22.04
     permissions:
       contents: write # gh release upload writes a release asset
       id-token: write # attest-build-provenance signs the AppImage
@@ -131,7 +134,8 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libx11-dev libxrandr-dev libxcb1-dev libdbus-1-dev \
             libgl1-mesa-dev libssl-dev \
-            libfuse2
+            libfuse2 \
+            libxkbcommon-x11-0 libxcb-xkb1
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable branch, 2026-06
         with:

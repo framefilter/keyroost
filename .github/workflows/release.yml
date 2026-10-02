@@ -30,7 +30,10 @@ permissions:
 jobs:
   linux-x86_64:
     name: Linux x86_64
-    runs-on: ubuntu-latest
+    # The oldest still-supported Ubuntu LTS, not ubuntu-latest: a Linux
+    # binary only runs where the glibc is at least the build host's
+    # (ubuntu-latest moves to a newer Ubuntu; actions/runner-images#14748).
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
