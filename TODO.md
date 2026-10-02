@@ -58,12 +58,23 @@ Being worked on right now — check with whoever holds it before starting.
   AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
   the packaging probe, not after a release. (S–M)
 
-- **Responsive layout at high zoom / narrow window.** At ~200% zoom in a
-  partial-screen window, horizontal rows overflow and overlap (top-bar Reset vs
-  the brand; section-header right-actions over the left text). Fullscreen is
-  fine. Fix: elide the left text in those header rows (`Label::truncate`) so the
-  right action always has room, and tidy/wrap the top-bar cluster. Cheap partial
-  fix: raise the minimum window width. Low-priority polish. (S–M)
+- **v0.12.0 goal: a holistic GUI design pass.** The interface has grown
+  enough features that the deliberately flat layout no longer fits. Seen in
+  AppImageHub's catalog screenshot (AppImage/appimage.github.io#9258): at an
+  ~800px-wide screen, below the 900px minimum, the top bar's left group
+  (version, "N connected") is drawn under the right group (accent dots,
+  Text size, icons); at ~200% zoom, section-header actions overlap their
+  titles too. Rows never give way, they overlap (`top_bar`,
+  crates/keyroost/src/main.rs). Scope:
+  * decide where a menu or overflow (dropdown) belongs — e.g. appearance
+    settings (accent, text size, colorblind, theme) — while keeping the main
+    flows flat;
+  * every horizontal row degrades gracefully: drop or collapse
+    lower-priority items, truncate long labels, never overlap;
+  * design first (brainstorm the layout before code), keep CLI/GUI parity,
+    and verify with screenshots on the virtual display at 800/900/1180px
+    widths and 100%/200% zoom, plus a real Wayland session.
+  (M–L)
 
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
   the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
