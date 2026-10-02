@@ -44,6 +44,20 @@ Being worked on right now — check with whoever holds it before starting.
 
 **Not in v0.11.0:**
 
+- **AppImage-only republish.** Add an `appimage_only` input to
+  `linux-bundles.yml`, mirroring `flatpak_only`. Republishing just the
+  AppImage today rebuilds the Flatpak too and relies on rejecting its publish
+  gate by hand; rejecting the wrong gate would double-publish the Flatpak.
+  (A full split into separate AppImage and Flatpak workflows is only worth it
+  if AppImage-specific work keeps growing.) (S)
+
+- **AppImage portability check in CI.** Fail the AppImage job when the
+  binary needs a glibc newer than the build image's (2.35 on Ubuntu 22.04,
+  via `objdump -T`), or when the AppImage doesn't start in a stripped-down
+  environment (no libpcsclite, no libxkbcommon, no pcscd socket), so
+  AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
+  the packaging probe, not after a release. (S–M)
+
 - **Responsive layout at high zoom / narrow window.** At ~200% zoom in a
   partial-screen window, horizontal rows overflow and overlap (top-bar Reset vs
   the brand; section-header right-actions over the left text). Fullscreen is
