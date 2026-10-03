@@ -110,7 +110,8 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       * **Audit from the inventory, not from memory**: the in-scope set is
         every `docs/*.html`, `README.md`, `SECURITY.md`, `CONTRIBUTING.md`,
         `TODO.md`, `CHANGELOG.md` (the new release section plus the emptied
-        `[Unreleased]` heading), `packaging/*.md`, `docs/*.md`. Regenerate the
+        `[Unreleased]` heading), `packaging/*.md`, `docs/*.md`, and the
+        AppStream metainfo (`packaging/flatpak/*.metainfo.xml`). Regenerate the
         file list with `ls`, hand it to the audit agents whole, and add a line
         here whenever a new documentation surface appears — scope gaps, not
         laziness alone, caused the #99 miss.
@@ -126,6 +127,19 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       * Findings are fixed on the prep branch, so the release ships
         accurate docs. Parallel agents (Learn pages / README / meta-docs)
         keep the pass tractable.
+- [ ] **Metainfo currency** (`packaging/flatpak/io.github.framefilter.keyroost.metainfo.xml`).
+      It travels inside the Flatpak and the AppImage, and software centers
+      and AppImage catalogs show it as the app's store page, so stale text
+      or a dead link ships to every listing:
+      * `appstreamcli validate packaging/flatpak/*.metainfo.xml` passes
+        (warnings reviewed);
+      * every `<screenshot>` `<image>` URL loads (`curl -sI` → 200) and the
+        picture shows the **current** interface;
+      * `<summary>`/`<description>` match what this release actually does
+        (new or removed features, supported devices), and the `<url>` links
+        load.
+      The `<releases>` block is generated from CHANGELOG.md at build time and
+      checked by CI — don't edit it by hand.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests, and
       `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`.
 - [ ] Land on main: push the prep branch directly —
