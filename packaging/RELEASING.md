@@ -133,13 +133,27 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       or a dead link ships to every listing:
       * `appstreamcli validate packaging/flatpak/*.metainfo.xml` passes
         (warnings reviewed);
-      * every `<screenshot>` `<image>` URL loads (`curl -sI` → 200) and the
-        picture shows the **current** interface;
+      * every `<screenshot>` `<image>` URL loads (`curl -sI` → 200) — the
+        pictures themselves are covered by the screenshot item below;
       * `<summary>`/`<description>` match what this release actually does
         (new or removed features, supported devices), and the `<url>` links
         load.
       The `<releases>` block is generated from CHANGELOG.md at build time and
       checked by CI — don't edit it by hand.
+- [ ] **Screenshot currency.** Every picture of the app that ships or is
+      published must show the **current** interface — after a GUI change,
+      retake rather than ship a stale one:
+      * the Learn site (GitHub Pages): `docs/assets/screenshots/*.webp`, used
+        by `docs/*.html` (`grep -o 'assets/screenshots/[^"]*' docs/*.html`
+        lists which page shows which), and the social-preview card
+        `docs/assets/og-cover.png`;
+      * the README: none today (only the logo) — any screenshot added there
+        falls under this item;
+      * the AppStream metainfo `<screenshots>` (the store-page pictures in
+        software centers and AppImage catalogs; see the item above).
+      Take them from the release build, with test keys only (no personal
+      device names or serials beyond the test keys'), at the default window
+      size and 100% zoom.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests.
 - [ ] Land on main: push the prep branch directly —
       `git push origin <branch>:main` (the require-PR rule's admin bypass
