@@ -50,17 +50,16 @@
 
   <content_rating type="oars-1.1"/>
 
-  <!-- Optional: software centers show screenshots; appstreamcli only WARNS
-       without them. Host a PNG (e.g. under the Pages site) then uncomment and
-       point <image> at it. -->
-  <!--
+  <!-- Software centers and AppImage catalogs show these. Each <image> is a
+       URL to a picture hosted on the Pages site (AppStream allows PNG, JPEG,
+       WebP or JXL; PNG is preferred). Refresh them with the v0.12.0 GUI
+       design pass. -->
   <screenshots>
     <screenshot type="default">
-      <image>https://framefilter.github.io/keyroost/screenshots/main.png</image>
+      <image>https://framefilter.github.io/keyroost/assets/screenshots/overview.webp</image>
       <caption>The keyroost device view</caption>
     </screenshot>
   </screenshots>
-  -->
 
   <!-- The <releases> body is GENERATED at bundle build time from CHANGELOG.md
        by packaging/flatpak/gen-metainfo-releases.py — do not hand-edit and do
