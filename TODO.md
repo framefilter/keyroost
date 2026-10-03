@@ -80,6 +80,23 @@ Being worked on right now — check with whoever holds it before starting.
     show the new design after the next release.
   (M–L)
 
+- **Duplicate keys on Windows/macOS with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — brainstorm first.**
+  On Windows as administrator, two Token2 PIN+ keys show as four entries:
+  each once from PC/SC (with serial) and once from FIDO HID (no serial).
+  Linux matches a HID node to its reader by USB bus/address; hidapi on
+  Windows and macOS reports no topology, so `keyroost-resolve` only matches
+  when there is a single candidate and deliberately refuses to guess among
+  several (`crates/keyroost-resolve/src/device.rs`). macOS likely shows the
+  same without admin (unverified). Directions, maintainer's preferences:
+  * **preferred where possible:** match by an identity the device reports on
+    both sides (e.g. the serial over HID via vendor commands — Token2's OTP
+    GET_INFO gives it); cross-vendor implications unknown (YubiKey etc.);
+  * **acceptable:** ask Windows which USB device each HID interface and
+    smart-card reader belong to (e.g. reader device instance → parent /
+    container ID), with all `unsafe` confined to the Windows-only crates; a
+    macOS IOKit equivalent only if unavoidable (maintainer is less keen).
+  Hold a dedicated brainstorm session before any code. (M–L)
+
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
   the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
   RSA keygen, the ~30s reset re-insert window, PC/SC enumeration) and a static
