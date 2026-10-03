@@ -65,7 +65,11 @@ Being worked on right now — check with whoever holds it before starting.
     lower-priority items, truncate long labels, never overlap;
   * design first (brainstorm the layout before code), keep CLI/GUI parity,
     and verify with screenshots on the virtual display at 800/900/1180px
-    widths and 100%/200% zoom, plus a real Wayland session.
+    widths and 100%/200% zoom, plus a real Wayland session;
+  * then refresh the screenshots: the Learn site's `docs/assets/screenshots/`
+    and the AppStream `<screenshots>` in the metainfo (used by software
+    centers and AppImage catalogs; PNG preferred, several views), so they
+    show the new design after the next release.
   (M–L)
 
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
