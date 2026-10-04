@@ -6939,11 +6939,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // Resolve and identify the target *before* the --yes gate, so the
             // refusal (and the consent the flag implies) names the exact card —
             // the same posture as `factory-reset` and `piv reset`.
-            let name = reset_reader(
-                || Ok(keyroost_transport::OpenPgpSession::list_openpgp_readers()?),
-                reader.as_deref(),
-                "OpenPGP",
-            )?;
+            let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             let status = session.status()?;
             let ident = match status.serial() {
@@ -8402,18 +8398,15 @@ fn open_openpgp(
     reader: Option<&str>,
     debug: bool,
 ) -> Result<keyroost_transport::OpenPgpSession, Box<dyn std::error::Error>> {
-    let readers = keyroost_transport::OpenPgpSession::list_openpgp_readers()?;
-    let by_name = reader_from_name()?;
-    let name = resolve_reader(readers, reader.or(by_name.as_deref()), "OpenPGP")?;
+    let name = crate::target::reader_for(Need::OpenPgp, reader)?;
     open_openpgp_at(&name, debug)
 }
 
-/// Open the OpenPGP session on an already-resolved reader, announcing it.
+/// Open the OpenPGP session on an exact, already-selected reader.
 fn open_openpgp_at(
     name: &str,
     debug: bool,
 ) -> Result<keyroost_transport::OpenPgpSession, Box<dyn std::error::Error>> {
-    eprintln!("\u{2192} OpenPGP on {}", sanitize_terminal(name));
     let mut session = keyroost_transport::OpenPgpSession::open(name)?;
     session.set_debug(debug);
     Ok(session)
