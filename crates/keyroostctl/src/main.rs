@@ -4700,60 +4700,6 @@ fn fido_target_hint(path: Option<&Path>) -> String {
     }
 }
 
-/// Pick one reader from `readers` by the same posture across applets: auto-use a
-/// lone reader, match an explicit `--reader` substring, and refuse to guess among
-/// several. `kind` ("OATH" / "OpenPGP") only shapes the messages.
-fn resolve_reader(
-    readers: Vec<String>,
-    explicit: Option<&str>,
-    kind: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    if readers.is_empty() {
-        return Err(format!(
-            "no {kind}-capable security key found (no reader's {kind} applet \
-             responded). Plug a key in, and check the smart-card (PC/SC) service is running."
-        )
-        .into());
-    }
-    match explicit {
-        Some(substr) => {
-            let needle = substr.to_ascii_lowercase();
-            let matches: Vec<&String> = readers
-                .iter()
-                .filter(|r| r.to_ascii_lowercase().contains(&needle))
-                .collect();
-            match matches.as_slice() {
-                [one] => Ok((*one).clone()),
-                [] => Err(format!(
-                    "no {kind} reader matches '{}'. Connected {kind} readers: {}",
-                    substr,
-                    readers.join("; ")
-                )
-                .into()),
-                _ => Err(format!(
-                    "'{}' matches several readers; be more specific: {}",
-                    substr,
-                    matches
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                )
-                .into()),
-            }
-        }
-        None => match readers.as_slice() {
-            [one] => Ok(one.clone()),
-            _ => Err(format!(
-                "{} {kind} keys connected; pass --reader <substring>: {}",
-                readers.len(),
-                readers.join("; ")
-            )
-            .into()),
-        },
-    }
-}
-
 /// Open an announced OATH session on the resolved reader, unlocking it if the
 /// applet is password-protected. A protected applet without a supplied password
 /// is a clear error rather than a confusing downstream `6982`.
@@ -4776,69 +4722,6 @@ fn open_oath(
     Ok(session)
 }
 
-/// Resolve exactly one device for a whole-device operation: the one matching
-/// the global `--device` selector, or the lone connected key when no selector
-/// is set. Fails closed on zero matches and refuses to guess among several
-/// (the same name-match/ambiguity posture the shared key finder applies,
-/// without an applet filter).
-fn resolve_single_device<'a>(
-    devices: &'a [keyroost_resolve::Device],
-    name: Option<&str>,
-) -> Result<&'a keyroost_resolve::Device, Box<dyn std::error::Error>> {
-    match name {
-        Some(name) => {
-            let matches: Vec<&keyroost_resolve::Device> = devices
-                .iter()
-                .filter(|d| d.name.as_deref() == Some(name))
-                .collect();
-            match matches.as_slice() {
-                [] => Err(format!(
-                    "no connected device is named '{name}' \
-                     (see `keyroostctl key-name list`)"
-                )
-                .into()),
-                [one] => Ok(*one),
-                many => Err(format!(
-                    "{} connected devices are named '{name}'; refusing to guess \
-                     which key to factory-reset",
-                    many.len()
-                )
-                .into()),
-            }
-        }
-        None => match devices {
-            [] => Err("no security key detected".into()),
-            [one] => Ok(one),
-            many => Err(format!(
-                "{} keys are connected; select one with `--device <name>` before \
-                 factory-resetting",
-                many.len()
-            )
-            .into()),
-        },
-    }
-}
-
-/// Whole-device factory reset: run every applet reset the key supports, in
-/// planner order, continue on failure, print a per-step report, and exit
-/// nonzero if anything failed. FIDO2 is last and needs a physical replug +
-/// touch, prompted interactively.
-/// A wipe command must not be handed a contradictory `--reader` and `--device`
-/// at once: the banner would name the `--device`-resolved key while the card
-/// steps opened the `--reader` one. Refuse the combination up front, mirroring
-/// how `target::select` reports `--path` + `--device` as a conflict.
-fn reader_device_conflict(
-    reader: Option<&str>,
-    device_name: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if reader.is_some() && device_name.is_some() {
-        return Err("pass either --reader or --device, not both (they may name \
-                    different keys, and this wipes the one you didn't mean to)"
-            .into());
-    }
-    Ok(())
-}
-
 /// What the user reads before consenting to a whole-device wipe.
 ///
 /// It does not promise the key "stays usable": PIV's wipe blocks the PIN and
@@ -4855,6 +4738,10 @@ const FACTORY_RESET_CONSENT: &str =
 // One more `--mgmt-key-*` source (`mgmt_key_default`) pushed this past
 // clippy's default 7-argument threshold; every argument here is a distinct
 // CLI flag, so a struct would just move the sprawl rather than reduce it.
+/// Whole-device factory reset: run every applet reset the key supports, in
+/// planner order, continue on failure, print a per-step report, and exit
+/// nonzero if anything failed. FIDO2 is last and needs a physical replug +
+/// touch; the replug is detected, not confirmed with a keypress.
 #[allow(clippy::too_many_arguments)]
 fn run_factory_reset(
     reader: Option<&str>,
@@ -4872,12 +4759,13 @@ fn run_factory_reset(
         return Err(FACTORY_RESET_CONSENT.into());
     }
 
-    // Resolve the one selected device (or a lone key) via the shared model,
-    // so a name/`--device` binds exactly like the other commands.
-    let devices = keyroost_resolve::enumerate()?;
-    let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
-    reader_device_conflict(reader, name)?;
-    let dev = resolve_single_device(&devices, name)?;
+    // Only rows with something to reset count; --reader resolves to a row too.
+    let dev = crate::target::select(Need::FactoryReset, reader, None)?;
+    // A `--reader` that matched no detected key passes through as a stand-in
+    // row with no capabilities — nothing to plan the steps from.
+    if dev.id.starts_with("override:") {
+        return Err("factory-reset needs a detected key; check `keyroostctl list`".into());
+    }
     // Pin the target's identity now, while it is still the key the user
     // confirmed against: the FIDO step below has to re-find it after a replug,
     // and by then the resolver would happily hand back whichever key is in the
@@ -5001,8 +4889,7 @@ fn run_factory_reset(
     }
 
     eprintln!(
-        "\u{2192} factory-resetting {} ({})",
-        sanitize_terminal(&dev.serial),
+        "factory reset steps: {}",
         plan.iter()
             .map(|s| s.label())
             .collect::<Vec<_>>()
@@ -5012,10 +4899,10 @@ fn run_factory_reset(
     let mut reports: Vec<StepReport> = Vec::new();
     for step in &plan {
         let outcome = match step {
-            ResetStep::Fido => {
-                if dev.hid_path.is_none() {
+            ResetStep::Fido => match dev.hid_path.as_deref() {
+                None => {
                     // A card in a reader: no replug exists and no touch surface
-                    // — the replug prompt below could never be satisfied
+                    // — the replug wait below could never be satisfied
                     // (issue #84). Power-cycle the card in place instead,
                     // which starts the same post-power-up window. The target
                     // cannot have been swapped mid-flow: the card never left
@@ -5029,16 +4916,32 @@ fn run_factory_reset(
                         Ok(()) => StepOutcome::Wiped,
                         Err(e) => StepOutcome::Failed(sanitize_terminal(&e)),
                     }
-                } else {
-                    // Interactive replug + touch; on its own so a card-step
-                    // failure above never skips the FIDO offer.
-                    match fido_reset_after_replug(&expected_serial, &expected_model, expected_ids) {
+                }
+                Some(armed) => {
+                    // Replug + touch; on its own so a card-step failure above
+                    // never skips the FIDO offer.
+                    match fido_reset_after_replug(
+                        armed,
+                        dev.name.as_deref().unwrap_or(&dev.model),
+                        &expected_serial,
+                        &expected_model,
+                        expected_ids,
+                        FACTORY_RESET_RERUN,
+                    ) {
                         Ok(()) => StepOutcome::Wiped,
+                        // Nobody replugged: nothing was sent, so this step was
+                        // skipped rather than failed.
+                        Err(e) if e.downcast_ref::<NoReplugSeen>().is_some() => {
+                            StepOutcome::Skipped(format!(
+                                "no replug seen within {} seconds",
+                                REPLUG_BUDGET.as_secs()
+                            ))
+                        }
                         Err(e) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
                     }
                 }
-            }
-            other => reset_one_card_applet(*other, reader, debug, reset_auth.as_ref()),
+            },
+            other => reset_one_card_applet(*other, &dev, debug, reset_auth.as_ref()),
         };
         let label = step.label();
         match &outcome {
@@ -5144,6 +5047,12 @@ fn not_present_reason(serials: &[&str]) -> NotPresentReason {
     }
 }
 
+/// The command that finishes a FIDO2 wipe on its own (named in replug
+/// messages so the user re-runs the right thing).
+const FIDO_RESET_RERUN: &str = "keyroostctl fido reset --yes";
+/// The command that re-runs the whole-device wipe.
+const FACTORY_RESET_RERUN: &str = "keyroostctl factory-reset --yes";
+
 /// What to tell the user when the pinned key wasn't among the keys visible
 /// after the replug — a refusal either way, but only one of them is an
 /// accusation, and only one of them names the right way out.
@@ -5153,13 +5062,13 @@ fn not_present_message(
     waited_secs: u64,
     present: &str,
     reason: NotPresentReason,
+    rerun: &str,
 ) -> String {
     match reason {
         NotPresentReason::DifferentKey => format!(
             "the key now connected is not the one this factory reset was confirmed \
              for: expected {} serial {}, found {present}. Nothing was reset over \
-             FIDO2 — plug the intended key in and re-run `keyroostctl \
-             factory-reset --yes`.",
+             FIDO2 — plug the intended key in and re-run `{rerun}`.",
             sanitize_terminal(expected_model),
             sanitize_terminal(expected_serial),
         ),
@@ -5170,11 +5079,20 @@ fn not_present_message(
              is read over the card interface, which re-registers with the \
              smart-card service a beat after the FIDO one, so a key that is simply \
              slow to settle looks exactly like this. Nothing was reset over FIDO2 \
-             — give it a moment, then run `keyroostctl fido reset --yes` to finish \
-             the wipe (re-running `keyroostctl factory-reset --yes` would repeat \
-             the applet resets and race the same way).",
+             — give it a moment, then run `{FIDO_RESET_RERUN}` to finish the \
+             wipe{}",
             sanitize_terminal(expected_model),
             sanitize_terminal(expected_serial),
+            if rerun == FIDO_RESET_RERUN {
+                ".".to_string()
+            } else {
+                // Re-running a whole-device wipe would repeat the applet
+                // resets and race the same way.
+                format!(
+                    " (re-running `{rerun}` would repeat the applet resets and race \
+                     the same way)."
+                )
+            },
         ),
     }
 }
@@ -5325,28 +5243,141 @@ fn describe_present(devices: &[keyroost_resolve::Device]) -> String {
         .join(", ")
 }
 
-/// The FIDO2 step of a whole-device factory reset: prompt for the replug the
-/// CTAP reset window requires, then *prove* the key that came back is the one
-/// the wipe was confirmed for before touching it.
+/// How long a FIDO2 reset waits for the armed key to be unplugged and plugged
+/// back in before giving up with nothing sent.
+const REPLUG_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the replug wait re-scans HID.
+const REPLUG_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The replug wait ran out: the armed key was never seen leaving and coming
+/// back, so no reset was sent.
+#[derive(Debug)]
+struct NoReplugSeen;
+
+impl std::fmt::Display for NoReplugSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no replug seen within {} seconds; nothing was wiped",
+            REPLUG_BUDGET.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for NoReplugSeen {}
+
+/// Watches successive HID scans for the armed key's node to disappear and a
+/// FIDO node to (re)appear afterwards.
 ///
-/// Resolving a FIDO device from scratch after the prompt is what makes this
+/// "Reappeared" means the armed path itself coming back, or a node that was
+/// not there when the wait started (a replugged key may come back under a new
+/// path). A key that was already connected elsewhere is never mistaken for the
+/// replug, and nothing counts while the armed node is still present.
+struct ReplugWatch<'a> {
+    armed: &'a Path,
+    baseline: Option<Vec<std::path::PathBuf>>,
+    removed: bool,
+}
+
+impl<'a> ReplugWatch<'a> {
+    fn new(armed: &'a Path) -> Self {
+        ReplugWatch {
+            armed,
+            baseline: None,
+            removed: false,
+        }
+    }
+
+    /// Feed one scan of FIDO HID node paths; true once the replug is complete.
+    fn observe(&mut self, nodes: &[std::path::PathBuf]) -> bool {
+        let baseline = self.baseline.get_or_insert_with(|| nodes.to_vec());
+        if !self.removed {
+            if nodes.iter().any(|n| n == self.armed) {
+                return false;
+            }
+            self.removed = true;
+        }
+        nodes
+            .iter()
+            .any(|n| n == self.armed || !baseline.contains(n))
+    }
+}
+
+/// Poll `fido_nodes` every `poll` until a [`ReplugWatch`] sees the armed key
+/// go and come back, or `elapsed` passes `budget`. Clock, sleep and scan are
+/// injected so the wait is testable without hardware or real time.
+fn wait_for_replug(
+    armed: &Path,
+    budget: std::time::Duration,
+    poll: std::time::Duration,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut fido_nodes: impl FnMut() -> Vec<std::path::PathBuf>,
+) -> Result<(), NoReplugSeen> {
+    let mut watch = ReplugWatch::new(armed);
+    loop {
+        if watch.observe(&fido_nodes()) {
+            return Ok(());
+        }
+        if elapsed() + poll > budget {
+            return Err(NoReplugSeen);
+        }
+        sleep(poll);
+    }
+}
+
+/// The FIDO HID nodes connected right now: the cheap scan the replug wait
+/// polls (no identity reads). A failed scan reads as "nothing connected".
+fn fido_hid_nodes() -> Vec<std::path::PathBuf> {
+    keyroost_hid::enumerate()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|h| h.is_fido())
+        .map(|h| h.path)
+        .collect()
+}
+
+/// A FIDO2 reset over USB (`fido reset`, and the FIDO2 step of a whole-device
+/// factory reset): wait for the replug the CTAP reset window requires (see
+/// [`wait_for_replug`]), then *prove* the key that came back is the one the
+/// wipe was confirmed for before touching it. `rerun` is the command the
+/// refusal messages tell the user to run again.
+///
+/// Resolving a FIDO device from scratch after the replug is what makes this
 /// dangerous: with one key connected the resolver auto-selects whatever is now
 /// plugged in, a same-model key is indistinguishable by product name and hidraw
 /// path, and `authenticatorReset` erases every passkey and the PIN with no
-/// further confirmation. So the identity captured before the prompt has to
+/// further confirmation. So the identity captured before the replug has to
 /// match afterwards. A key that has no serial to match on can't prove that by
 /// identity, so it falls back to proving it by exclusion — see
 /// `reinserted_serial_less_target` — and any second key in sight refuses.
 fn fido_reset_after_replug(
+    armed_path: &Path,
+    label: &str,
     expected_serial: &str,
     expected_model: &str,
     expected_ids: Option<(u16, u16)>,
+    rerun: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serial_less = expected_serial.is_empty();
 
-    println!("FIDO2  unplug the key, plug it back in, then press Enter\u{2026}");
-    let mut _line = String::new();
-    std::io::stdin().read_line(&mut _line).ok();
+    // No Enter to press: the replug itself is the go-ahead. Watching the cheap
+    // HID-only scan (no identity reads) keeps the poll light; a run nobody
+    // replugs for simply times out with nothing sent to the key.
+    println!(
+        "Unplug {} and plug it back in now (waiting up to {} seconds)\u{2026}",
+        sanitize_terminal(label),
+        REPLUG_BUDGET.as_secs()
+    );
+    let start = std::time::Instant::now();
+    wait_for_replug(
+        armed_path,
+        REPLUG_BUDGET,
+        REPLUG_POLL,
+        || start.elapsed(),
+        std::thread::sleep,
+        fido_hid_nodes,
+    )?;
 
     // A just-replugged key needs a beat before its interfaces re-register, and
     // the card one — where a YubiKey's serial is read from, it publishes no USB
@@ -5365,12 +5396,12 @@ fn fido_reset_after_replug(
     const REINSERT_POLL: std::time::Duration = std::time::Duration::from_millis(300);
     let deadline = std::time::Instant::now() + REINSERT_DEADLINE;
 
-    let mut present = keyroost_resolve::enumerate()?;
+    let mut present = crate::target::enumerate()?;
     let (mut found, mut settled) =
         match_reinsert(expected_serial, expected_model, expected_ids, &present);
     while !settled && std::time::Instant::now() + REINSERT_POLL < deadline {
         std::thread::sleep(REINSERT_POLL);
-        present = keyroost_resolve::enumerate()?;
+        present = crate::target::enumerate()?;
         (found, settled) = match_reinsert(expected_serial, expected_model, expected_ids, &present);
     }
     // Only keys that expose a FIDO interface can be the one we are waiting for,
@@ -5393,7 +5424,7 @@ fn fido_reset_after_replug(
                  only be reset when it is the single connected key and answers over \
                  FIDO2 — and that is not what came back: found {}. Nothing was reset \
                  over FIDO2 — plug the intended key in on its own and re-run \
-                 `keyroostctl factory-reset --yes`.",
+                 `{rerun}`.",
                 sanitize_terminal(expected_model),
                 describe_present(&present)
             )
@@ -5406,6 +5437,7 @@ fn fido_reset_after_replug(
                 REINSERT_DEADLINE.as_secs(),
                 &describe_present(&present),
                 not_present_reason(&serials),
+                rerun,
             )
             .into());
         }
@@ -5414,7 +5446,7 @@ fn fido_reset_after_replug(
                 "'{}' exposes no serial to re-identify it by after a replug, so it can \
                  only be told apart from other keys by being the only one connected — \
                  but more than one is: {}. Nothing was reset over FIDO2 — unplug the \
-                 others and re-run `keyroostctl factory-reset --yes` with only the \
+                 others and re-run `{rerun}` with only the \
                  intended key connected.",
                 sanitize_terminal(expected_model),
                 describe_present(&present)
@@ -5425,7 +5457,7 @@ fn fido_reset_after_replug(
             return Err(format!(
                 "more than one connected key reports serial {}, so the key that came \
                  back can't be told apart from the others. Nothing was reset over \
-                 FIDO2 — re-run `keyroostctl factory-reset --yes` with only the \
+                 FIDO2 — re-run `{rerun}` with only the \
                  intended key connected.",
                 sanitize_terminal(expected_serial)
             )
@@ -5437,7 +5469,7 @@ fn fido_reset_after_replug(
     let Some(path) = dev.hid_path.clone() else {
         return Err(format!(
             "'{}' came back without a FIDO HID interface, so it can't be reset over \
-             FIDO2 — re-plug it and re-run `keyroostctl factory-reset --yes`.",
+             FIDO2 — re-plug it and re-run `{rerun}`.",
             sanitize_terminal(&dev.model)
         )
         .into());
@@ -5587,11 +5619,19 @@ fn resolve_reset_cli_auth(
 /// device-wide mechanism or a plain PIV reset actually consumes it.
 fn reset_one_card_applet(
     step: keyroost_resolve::ResetStep,
-    reader: Option<&str>,
+    dev: &keyroost_resolve::Device,
     debug: bool,
     reset_auth: Option<&ResetCliAuth>,
 ) -> keyroost_resolve::StepOutcome {
     use keyroost_resolve::{ResetStep, StepOutcome};
+
+    // Every card step opens the resolved key's own reader — never a fresh
+    // lookup that could land on another key.
+    let reader = || {
+        dev.reader
+            .clone()
+            .ok_or("this key has no smart-card reader any more")
+    };
 
     // PIV gets its own path, ahead of the shared closure below:
     // `PivSession::factory_reset` decides on its own, from a live fingerprint,
@@ -5602,7 +5642,7 @@ fn reset_one_card_applet(
     // uniform Ok/Err mapping below can't express.
     if step == ResetStep::Piv {
         let outcome = (|| -> Result<StepOutcome, Box<dyn std::error::Error>> {
-            let name = crate::target::reader_for(Need::Piv, reader)?;
+            let name = reader()?;
             keyroost_transport::PivSession::with_transaction_traced(&name, debug, |s| {
                 let current = reset_auth.map(|auth| match auth {
                     ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
@@ -5665,25 +5705,17 @@ fn reset_one_card_applet(
     let run = || -> Result<(), Box<dyn std::error::Error>> {
         match step {
             ResetStep::Oath => {
-                let name = crate::target::reader_for(Need::Oath, reader)?;
-                let mut s = keyroost_transport::OathSession::open(&name)?;
+                let mut s = keyroost_transport::OathSession::open(&reader()?)?;
                 s.set_debug(debug);
                 s.factory_reset()?;
             }
             ResetStep::OpenPgp => {
-                let mut s = open_openpgp(reader, debug)?;
+                let mut s = open_openpgp_at(&reader()?, debug)?;
                 s.factory_reset()?;
             }
             ResetStep::Piv => unreachable!("handled above, before this closure"),
             ResetStep::Token2Otp => {
-                let mut s = open_otp(
-                    &OtpSelect {
-                        transport: OtpTransportArg::Auto,
-                        reader,
-                        path: None,
-                    },
-                    debug,
-                )?;
+                let mut s = open_otp_on(dev, OtpTransportArg::Auto, debug)?;
                 s.erase_all()?;
             }
             ResetStep::Fido => unreachable!("FIDO handled by the interactive path"),
@@ -8862,15 +8894,21 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 )
                 .into());
             }
-            // --path + --device is refused by target::select (SelectError::Conflict);
-            // refuse --reader + --device the same way instead of letting --reader win.
-            reader_device_conflict(
-                reader.as_deref(),
-                SELECTED_KEY_NAME.get().and_then(|o| o.as_deref()),
-            )?;
-            match reader {
-                Some(substr) => run_fido_reset_reader(substr)?,
-                None => run_fido_reset(path.as_deref())?,
+            let dev = crate::target::select(Need::FidoAny, reader.as_deref(), path.as_deref())?;
+            match fido_reset_route(&dev, reader.is_some())? {
+                FidoResetRoute::Card { reader } => run_fido_reset_reader(&reader)?,
+                FidoResetRoute::Replug { path } => {
+                    let ids =
+                        hid_ids_at(Some(&path), &keyroost_hid::enumerate().unwrap_or_default());
+                    fido_reset_after_replug(
+                        &path,
+                        dev.name.as_deref().unwrap_or(&dev.model),
+                        &dev.serial,
+                        &dev.model,
+                        ids,
+                        FIDO_RESET_RERUN,
+                    )?
+                }
             }
             Ok(())
         }
@@ -9976,8 +10014,33 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn run_fido_reset(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-    fido_reset_at(&crate::target::fido_path(path)?)
+/// How `fido reset` reaches the selected key's FIDO2 applet.
+#[derive(Debug, PartialEq, Eq)]
+enum FidoResetRoute {
+    /// Over USB HID: the key is replugged to open the reset window.
+    Replug { path: std::path::PathBuf },
+    /// A card in a PC/SC reader: power-cycled in place instead.
+    Card { reader: String },
+}
+
+/// Pick the route for a FIDO2 reset of `dev`: HID with a replug when the key
+/// has a FIDO HID node, unless `--reader` asked for the card interface (or
+/// there is no HID node, as for a card in a reader).
+fn fido_reset_route(
+    dev: &keyroost_resolve::Device,
+    reader_given: bool,
+) -> Result<FidoResetRoute, String> {
+    match (&dev.hid_path, &dev.reader) {
+        (Some(path), _) if !reader_given => Ok(FidoResetRoute::Replug { path: path.clone() }),
+        (_, Some(reader)) => Ok(FidoResetRoute::Card {
+            reader: reader.clone(),
+        }),
+        (Some(path), None) => Ok(FidoResetRoute::Replug { path: path.clone() }),
+        (None, None) => Err(format!(
+            "'{}' has neither a FIDO HID interface nor a smart-card reader to reset it over",
+            sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model))
+        )),
+    }
 }
 
 /// Reset the FIDO2 applet of an already-resolved device. Split out so callers
@@ -9992,18 +10055,25 @@ fn fido_reset_at(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Reset the FIDO2 applet of a card in the PC/SC reader matching `substr`.
+/// Reset the FIDO2 applet of a card in the exact PC/SC reader `exact_reader`.
 ///
 /// A card has no replug and no touch surface, so the "reset within ~10 s of
 /// power-up" window is opened another way: PC/SC power-cycles the card in the
 /// reader and the reset is sent the moment the applet answers (issue #84 —
 /// the replug ceremony can never complete for a card).
-fn run_fido_reset_reader(substr: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let readers = keyroost_transport::CtapPcscDevice::list_fido_readers()?;
-    let name = resolve_reader(readers, Some(substr), "FIDO")?;
-    eprintln!("\u{2192} FIDO on {}", sanitize_terminal(&name));
+fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !keyroost_transport::CtapPcscDevice::list_fido_readers()?
+        .iter()
+        .any(|r| r == exact_reader)
+    {
+        return Err(format!(
+            "'{}' has no FIDO applet answering over this reader",
+            sanitize_terminal(exact_reader)
+        )
+        .into());
+    }
     println!("Power-cycling the card and sending the reset\u{2026}");
-    let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(&name)?;
+    let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(exact_reader)?;
     keyroost_ctap::reset(&mut dev).map_err(|e| -> Box<dyn std::error::Error> {
         let s = e.to_string();
         if s.contains("NOT_ALLOWED") || s.contains("0x30") {
@@ -11027,15 +11097,129 @@ mod cli_tests {
     }
 
     #[test]
-    fn factory_reset_refuses_contradictory_reader_and_device() {
-        // Both --reader and --device set is a contradiction on a WIPE command
-        // (the banner would name one key while the card steps opened another);
-        // refuse rather than silently pick one.
-        assert!(reader_device_conflict(Some("Alcor 00"), Some("work-key")).is_err());
-        // Either alone, or neither, is fine.
-        assert!(reader_device_conflict(Some("Alcor 00"), None).is_ok());
-        assert!(reader_device_conflict(None, Some("work-key")).is_ok());
-        assert!(reader_device_conflict(None, None).is_ok());
+    fn fido_reset_route_prefers_replug_unless_a_reader_was_asked_for() {
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+        let mut caps = Caps::default();
+        caps.insert(Caps::FIDO2);
+        let both = Device {
+            id: "x".into(),
+            name: None,
+            vendor: "V".into(),
+            model: "M".into(),
+            serial: "1".into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps,
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: Some("/dev/hidraw3".into()),
+            reader: Some("R 00".into()),
+        };
+        assert_eq!(
+            fido_reset_route(&both, false),
+            Ok(FidoResetRoute::Replug {
+                path: "/dev/hidraw3".into()
+            })
+        );
+        assert_eq!(
+            fido_reset_route(&both, true),
+            Ok(FidoResetRoute::Card {
+                reader: "R 00".into()
+            })
+        );
+        let mut card = both.clone();
+        card.hid_path = None;
+        assert_eq!(
+            fido_reset_route(&card, false),
+            Ok(FidoResetRoute::Card {
+                reader: "R 00".into()
+            })
+        );
+        let mut none = card;
+        none.reader = None;
+        assert!(fido_reset_route(&none, false).is_err());
+    }
+
+    /// Run `wait_for_replug` against scripted HID scans (the last one repeats)
+    /// on a fake clock that only advances when the wait sleeps. Returns the
+    /// result and how much fake time passed.
+    fn scripted_replug_wait(
+        armed: &str,
+        scans: &[&[&str]],
+    ) -> (Result<(), NoReplugSeen>, std::time::Duration) {
+        use std::cell::Cell;
+        use std::path::PathBuf;
+        let clock = Cell::new(std::time::Duration::ZERO);
+        let next = Cell::new(0usize);
+        let result = wait_for_replug(
+            Path::new(armed),
+            REPLUG_BUDGET,
+            REPLUG_POLL,
+            || clock.get(),
+            |d| clock.set(clock.get() + d),
+            || {
+                let i = next.get().min(scans.len() - 1);
+                next.set(next.get() + 1);
+                scans[i].iter().map(PathBuf::from).collect()
+            },
+        );
+        (result, clock.get())
+    }
+
+    #[test]
+    fn replug_wait_succeeds_once_the_armed_node_goes_and_comes_back() {
+        // Same node path back.
+        let (r, t) = scripted_replug_wait(
+            "/dev/hidraw3",
+            &[&["/dev/hidraw3"], &["/dev/hidraw3"], &[], &["/dev/hidraw3"]],
+        );
+        assert!(r.is_ok());
+        assert_eq!(t, REPLUG_POLL * 3);
+        // Renumbered on the way back, with another key present throughout.
+        let (r, _) = scripted_replug_wait(
+            "/dev/hidraw3",
+            &[
+                &["/dev/hidraw1", "/dev/hidraw3"],
+                &["/dev/hidraw1"],
+                &["/dev/hidraw1", "/dev/hidraw7"],
+            ],
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn replug_wait_times_out_when_the_key_is_never_removed() {
+        let (r, t) = scripted_replug_wait("/dev/hidraw3", &[&["/dev/hidraw3"]]);
+        assert!(r.is_err());
+        assert!(
+            t <= REPLUG_BUDGET && t + REPLUG_POLL > REPLUG_BUDGET,
+            "{t:?}"
+        );
+        assert_eq!(
+            NoReplugSeen.to_string(),
+            "no replug seen within 60 seconds; nothing was wiped"
+        );
+    }
+
+    #[test]
+    fn replug_wait_times_out_when_the_key_never_comes_back() {
+        let (r, _) = scripted_replug_wait("/dev/hidraw3", &[&["/dev/hidraw3"], &[]]);
+        assert!(r.is_err());
+        // Another key that was already connected is not the key coming back.
+        let (r, _) = scripted_replug_wait(
+            "/dev/hidraw3",
+            &[&["/dev/hidraw1", "/dev/hidraw3"], &["/dev/hidraw1"]],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn replug_wait_ignores_a_new_node_while_the_armed_one_is_still_there() {
+        let (r, _) = scripted_replug_wait(
+            "/dev/hidraw3",
+            &[&["/dev/hidraw3"], &["/dev/hidraw3", "/dev/hidraw9"]],
+        );
+        assert!(r.is_err());
     }
 
     #[test]
@@ -11299,6 +11483,7 @@ mod cli_tests {
             3,
             "YubiKey 5 with no serial",
             not_present_reason(&[""]),
+            FACTORY_RESET_RERUN,
         );
         assert!(
             !msg.contains("is not the one this factory reset was confirmed for"),
@@ -11318,6 +11503,7 @@ mod cli_tests {
             3,
             "YubiKey 5 serial 87654321",
             not_present_reason(&["87654321"]),
+            FACTORY_RESET_RERUN,
         );
         assert!(
             msg.contains("is not the one this factory reset was confirmed for"),
