@@ -72,6 +72,23 @@ mod json_out {
         pub caps_unverified: Vec<&'static str>,
     }
 
+    /// One `keyroostctl list --json` row. `device` is the exact value to pass
+    /// to `--device` (name if unique, else serial, else list number).
+    #[derive(Serialize)]
+    pub struct ListRowJson {
+        pub number: usize,
+        pub device: String,
+        pub name: Option<String>,
+        pub vendor: String,
+        pub model: String,
+        pub serial: String,
+        pub kind: &'static str,
+        pub capabilities: Vec<&'static str>,
+        pub capabilities_unverified: Vec<&'static str>,
+        pub readers: Vec<String>,
+        pub hid_paths: Vec<String>,
+    }
+
     /// `keyroostctl molto --json info`.
     #[derive(Serialize)]
     pub struct MoltoInfoJson {
@@ -3613,6 +3630,44 @@ fn filter_rows<'d>(
     }
 }
 
+/// `list --json` rows for `rows` (already numbered/filtered by [`filter_rows`]).
+fn list_json_rows(
+    devices: &[keyroost_resolve::Device],
+    rows: &[(usize, &keyroost_resolve::Device)],
+) -> Vec<json_out::ListRowJson> {
+    use keyroost_resolve::{CapState, DeviceKind};
+    rows.iter()
+        .map(|(n, d)| {
+            let idx = devices
+                .iter()
+                .position(|x| std::ptr::eq(x, *d))
+                .unwrap_or(0);
+            json_out::ListRowJson {
+                number: *n,
+                device: keyroost_resolve::device_value(devices, idx),
+                name: d.name.clone(),
+                vendor: d.vendor.clone(),
+                model: d.model.clone(),
+                serial: d.serial.clone(),
+                kind: match d.kind {
+                    DeviceKind::Key => "key",
+                    DeviceKind::Token => "token",
+                    DeviceKind::ProgToken => "prog-token",
+                },
+                capabilities: d.cap_badges(),
+                capabilities_unverified: d
+                    .cap_badge_states()
+                    .into_iter()
+                    .filter(|(_, s)| *s == CapState::Unverified)
+                    .map(|(l, _)| l)
+                    .collect(),
+                readers: d.reader.iter().cloned().collect(),
+                hid_paths: d.hid_path.iter().map(|p| p.display().to_string()).collect(),
+            }
+        })
+        .collect()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     // Capture --device once so target::select() can honor it without threading
@@ -4723,6 +4778,15 @@ fn run_doctor() {
 }
 
 fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    // `--json`: one row per key, nothing else on stdout (announce lines, if
+    // any, stay on stderr — but filter_rows below never announces).
+    if json_output() {
+        let devices = target::enumerate()?;
+        let rows = filter_rows(&devices, device)?;
+        emit_json(&list_json_rows(&devices, &rows))?;
+        return Ok(());
+    }
+
     // `--device` narrows the human output to that one key's correlated row;
     // the raw reader/HID sections (which aren't per-key) are skipped.
     if device.is_none() {
@@ -14648,6 +14712,37 @@ mod cli_tests {
             Err(e) => assert!(e.to_string().contains("--device"), "{e}"),
             Ok(_) => panic!("expected an error for an unknown --device value"),
         }
+    }
+
+    #[test]
+    fn list_json_rows_carry_the_exact_device_value() {
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+        let mk = |name: Option<&str>, serial: &str, reader: Option<&str>| Device {
+            id: format!("s:{serial}"),
+            name: name.map(str::to_owned),
+            vendor: "Yubico".into(),
+            model: "YubiKey 5".into(),
+            serial: serial.into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps: Caps::FIDO2,
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: Some("/dev/hidraw1".into()),
+            reader: reader.map(str::to_owned),
+        };
+        let devs = [
+            mk(Some("yubi-test"), "2", Some("Y 00")),
+            mk(None, "1", None),
+        ];
+        let rows = list_json_rows(&devs, &overview::numbered(&devs));
+        let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[0]["number"], 1);
+        assert_eq!(v[0]["device"], "1");
+        assert_eq!(v[1]["device"], "yubi-test");
+        assert_eq!(v[1]["readers"], serde_json::json!(["Y 00"]));
+        assert_eq!(v[1]["hid_paths"], serde_json::json!(["/dev/hidraw1"]));
+        assert_eq!(v[1]["capabilities"], serde_json::json!(["FIDO2"]));
     }
 }
 
