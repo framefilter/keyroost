@@ -2408,7 +2408,7 @@ enum MoltoCmd {
     },
     /// Delete one profile's seed. The title, if any, survives. Keyless:
     /// the device accepts this from any card holder (hardware-verified),
-    /// so the only gate is --yes.
+    /// so the only gate is the confirmation.
     Delete {
         #[arg(short, long)]
         profile: u8,
@@ -3951,7 +3951,7 @@ fn run_molto(
         // first Molto2 reader found: with several tokens and no --device it
         // refuses instead of guessing.
         let dev = crate::target::select(Need::Molto2, exact, None)?;
-        let reader = crate::target::reader_for(Need::Molto2, exact)?;
+        let reader = crate::target::reader_of(&dev)?;
         let mut session = Session::open_named(&reader)?;
         session.set_debug(debug);
         let info = session.read_info()?;
@@ -4403,7 +4403,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 None
             };
             let dev = crate::target::select(Need::Prog, reader.as_deref(), None)?;
-            let name = crate::target::reader_for(Need::Prog, reader.as_deref())?;
+            let name = crate::target::reader_of(&dev)?;
             let mut session = Token2ProgSession::open_named(&name)?;
             session.set_debug(debug);
             // Refuse to program a device whose serial does not match a known
@@ -4427,7 +4427,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             yes,
         } => {
             let dev = crate::target::select(Need::Prog, reader.as_deref(), None)?;
-            let name = crate::target::reader_for(Need::Prog, reader.as_deref())?;
+            let name = crate::target::reader_of(&dev)?;
             let mut session = Token2ProgSession::open_named(&name)?;
             session.set_debug(debug);
             // Refuse to program an unrecognized device (see Seed above).
@@ -6011,7 +6011,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // Deliberately NOT open_oath(): reset must work on a
             // password-protected applet whose password is lost — that's its
             // entire purpose — so no unlock is attempted.
-            let name = crate::target::reader_for(Need::Oath, reader.as_deref())?;
+            let name = crate::target::reader_of(&dev)?;
             let mut session = keyroost_transport::OathSession::open(&name)?;
             session.set_debug(debug);
             session.factory_reset()?;
@@ -6955,7 +6955,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         OpenpgpCmd::Reset { yes, reader } => {
             let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
             crate::prompt::confirm_on(&dev, *yes, "wipe the OpenPGP applet")?;
-            let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
+            let name = crate::target::reader_of(&dev)?;
             let mut session = open_openpgp_at(&name, debug)?;
             let status = session.status()?;
             let ident = match status.serial() {
@@ -6990,7 +6990,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 admin_pin_env.as_deref(),
                 *admin_pin_stdin,
             )?;
-            let mut session = open_openpgp(reader.as_deref(), debug)?;
+            let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!(
                 "Generating {} key — touch the key if it blinks…",
@@ -7044,7 +7044,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 keyroost_rsakey::load_from_file(path)?
             };
 
-            let mut session = open_openpgp(reader.as_deref(), debug)?;
+            let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!("Importing {} key…", slot.label());
             let parts = keyroost_transport::RsaPrivateKeyParts {
@@ -7487,7 +7487,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 "set PIV retry counts (resets the PIN and PUK to factory defaults)",
             )?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8250,21 +8250,34 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_stdin,
         } => {
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
-            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
-            keyroost_transport::PivSession::with_transaction_traced(
+            let name = crate::target::reader_of(&dev)?;
+            // First, read-only transaction: the compatibility gate and the
+            // serial. The question is asked outside any transaction (a card
+            // held idle while the user answers can drop it), then a fresh
+            // transaction re-checks the gate quietly and does the wipe.
+            let serial = keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
-                |s| -> Result<(), Box<dyn std::error::Error>> {
+                |s| -> Result<String, Box<dyn std::error::Error>> {
                     // Gate on the applet's fingerprint before reading status — the
                     // fingerprint probe re-SELECTs PIV, same ordering concern
                     // `delete-key`/`move-key` document at their own call sites.
                     guard_piv_feature(s, keyroost_piv::compat::PivExtension::Reset, *force)?;
                     let st = s.status()?;
-                    let serial = st
+                    Ok(st
                         .serial
                         .map(|v| format!("serial {}", v))
-                        .unwrap_or_else(|| "this device".into());
-                    crate::prompt::confirm_on(&dev, *yes, "wipe the PIV applet")?;
+                        .unwrap_or_else(|| "this device".into()))
+                },
+            )?;
+            crate::prompt::confirm_on(&dev, *yes, "wipe the PIV applet")?;
+            keyroost_transport::PivSession::with_transaction_traced(
+                &name,
+                debug,
+                |s| -> Result<(), Box<dyn std::error::Error>> {
+                    // Same verdict as above (already shown); re-run so this
+                    // session carries --force's read override too.
+                    check_piv_feature(s, keyroost_piv::compat::PivExtension::Reset, *force)?;
                     // Some fingerprints need an authenticated management-key session
                     // before RESET is even accepted (`PivQuirk::
                     // ResetNeedsManagementAuth`) — the same precondition
@@ -8340,7 +8353,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 *yes,
                 &format!("delete the certificate in PIV slot {}", slot_name(*slot)),
             )?;
-            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8380,7 +8393,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
-            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8539,6 +8552,20 @@ fn guard_piv_feature(
     extension: keyroost_piv::compat::PivExtension,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(warning) = check_piv_feature(session, extension, force)? {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// [`guard_piv_feature`] without printing: the refusal as the error, and the
+/// warning (if any) returned for the caller to show. Lets a command that
+/// re-checks in a second transaction avoid printing the same warning twice.
+fn check_piv_feature(
+    session: &mut keyroost_transport::PivSession<'_>,
+    extension: keyroost_piv::compat::PivExtension,
+    force: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     use keyroost_piv::compat::{FeatureGate, PivExtension};
     // --force also covers the internal reads the table would skip (GET
     // METADATA, ATTEST) for the rest of this command, like the GUI's "Enable
@@ -8548,16 +8575,12 @@ fn guard_piv_feature(
     }
     let needs = extension.requirement();
     match session.feature_gate(extension) {
-        FeatureGate::Supported => {}
-        FeatureGate::Unverified => {
-            eprintln!("warning: {needs} {}", FeatureGate::UNVERIFIED_SUFFIX);
-        }
-        FeatureGate::Unsupported if force => {
-            eprintln!(
-                "warning: {needs} {} Running anyway because --force was given.",
-                FeatureGate::INCOMPATIBLE_SUFFIX
-            );
-        }
+        FeatureGate::Supported => Ok(None),
+        FeatureGate::Unverified => Ok(Some(format!("{needs} {}", FeatureGate::UNVERIFIED_SUFFIX))),
+        FeatureGate::Unsupported if force => Ok(Some(format!(
+            "{needs} {} Running anyway because --force was given.",
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        ))),
         FeatureGate::Unsupported => {
             let mut msg = format!(
                 "{needs} {} Pass --force to run anyway.",
@@ -8569,10 +8592,9 @@ fn guard_piv_feature(
                     msg.push_str(&hint);
                 }
             }
-            return Err(msg.into());
+            Err(msg.into())
         }
     }
-    Ok(())
 }
 
 /// When [`guard_piv_feature`] is about to refuse `PivExtension::Reset` as
@@ -9334,12 +9356,14 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             path,
         } => {
             let dev = crate::target::select_fido(path.as_deref())?;
-            crate::prompt::confirm_on(
-                &dev,
+            let pin = confirm_then_read_pin(
+                &mut crate::prompt::RealTerm,
                 *yes,
                 &format!("raise the minimum PIN length to {length} (only a reset lowers it again)"),
+                &crate::prompt::key_label(&dev),
+                pin_env.as_deref(),
+                *pin_stdin,
             )?;
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             let length = *length;
             let force_change = *force_change;
             with_configurator(path.as_deref(), &pin, move |cfg| {
@@ -9376,12 +9400,14 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             path,
         } => {
             let dev = crate::target::select_fido(path.as_deref())?;
-            crate::prompt::confirm_on(
-                &dev,
+            let pin = confirm_then_read_pin(
+                &mut crate::prompt::RealTerm,
                 *yes,
                 "enable enterprise attestation (only a reset turns it off)",
+                &crate::prompt::key_label(&dev),
+                pin_env.as_deref(),
+                *pin_stdin,
             )?;
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             with_configurator(path.as_deref(), &pin, |cfg| {
                 cfg.enable_enterprise_attestation()?;
                 println!("Enterprise attestation enabled. Disabling it again requires a reset.");
@@ -9991,8 +10017,14 @@ fn run_fido_large_blob_delete(
         );
     }
     let key = crate::target::select_fido(path)?;
-    crate::prompt::confirm_on(&key, yes, &format!("delete large-blob entry {index}"))?;
-    let pin = read_secret("PIN", pin_env, pin_stdin)?;
+    let pin = confirm_then_read_pin(
+        &mut crate::prompt::RealTerm,
+        yes,
+        &format!("delete large-blob entry {index}"),
+        &crate::prompt::key_label(&key),
+        pin_env,
+        pin_stdin,
+    )?;
 
     let mut entries = current.entries.clone();
     entries.remove(index);
@@ -10039,8 +10071,14 @@ fn run_fido_large_blob_clear(
         );
     }
     let key = crate::target::select_fido(path)?;
-    crate::prompt::confirm_on(&key, yes, "clear the whole large-blob array")?;
-    let pin = read_secret("PIN", pin_env, pin_stdin)?;
+    let pin = confirm_then_read_pin(
+        &mut crate::prompt::RealTerm,
+        yes,
+        "clear the whole large-blob array",
+        &crate::prompt::key_label(&key),
+        pin_env,
+        pin_stdin,
+    )?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
         &pin,
@@ -10786,6 +10824,20 @@ fn gather_secret(
     }))
 }
 
+/// Ask first, then read the PIN: a refusal or a "no" never consumes a PIN
+/// source (the FIDO one-way settings and the large-blob wipes).
+fn confirm_then_read_pin(
+    term: &mut dyn crate::prompt::Term,
+    yes: bool,
+    action: &str,
+    key: &str,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    crate::prompt::confirm(term, yes, action, key)?;
+    read_secret("PIN", pin_env, pin_stdin)
+}
+
 /// Returned wrapped in `Zeroizing` so the PIN/password is scrubbed from the
 /// heap when the caller's binding drops; `Deref` keeps call sites unchanged.
 fn read_secret(
@@ -11381,6 +11433,34 @@ mod cli_tests {
                 .unwrap_err()
                 .ends_with("add --yes")
         );
+    }
+
+    #[test]
+    fn fido_one_way_settings_ask_before_reading_the_pin() {
+        // Without a terminal and without --yes the refusal comes first: an
+        // unset PIN variable would otherwise be the error. With --yes the PIN
+        // is read next, so the same unset variable is what fails.
+        struct NoTty;
+        impl crate::prompt::Term for NoTty {
+            fn present(&self) -> bool {
+                false
+            }
+            fn say(&mut self, _: &str) {}
+            fn ask(&mut self, _: &str) -> std::io::Result<String> {
+                unreachable!("never asks without a terminal")
+            }
+        }
+        let unset = Some("KEYROOST_TEST_UNSET_PIN_VAR");
+        let action = "enable enterprise attestation (only a reset turns it off)";
+        let e = confirm_then_read_pin(&mut NoTty, false, action, "solo-test", unset, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.ends_with("add --yes"), "{e}");
+        assert!(!e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");
+        let e = confirm_then_read_pin(&mut NoTty, true, action, "solo-test", unset, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");
     }
 
     #[test]

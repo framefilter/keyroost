@@ -140,8 +140,13 @@ pub(crate) fn select(
 
 /// The exact reader of the selected key (never re-matched as a substring).
 pub(crate) fn reader_for(need: Need, reader: Option<&str>) -> Result<String, Box<dyn Error>> {
-    select(need, reader, None)?
-        .reader
+    reader_of(&select(need, reader, None)?)
+}
+
+/// The exact reader of an already-selected smart-card row.
+pub(crate) fn reader_of(dev: &Device) -> Result<String, Box<dyn Error>> {
+    dev.reader
+        .clone()
         .ok_or_else(|| Box::<dyn Error>::from("internal error: a smart-card row without a reader"))
 }
 
