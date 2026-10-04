@@ -23,8 +23,7 @@ use std::sync::OnceLock;
 
 use keyroost_keyring::Keyring;
 use keyroost_resolve::{
-    ccid_readers_if_needed, ccid_serial_for, connected_keys, effective_serials,
-    read_effective_serial, Need, VID_YUBICO,
+    ccid_readers_if_needed, ccid_serial_for, connected_keys, effective_serials, Need,
 };
 
 mod overview;
@@ -2106,6 +2105,9 @@ enum KeyNameCmd {
         /// Which connected key to name. Omit to auto-pick / choose interactively.
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
+        /// Name the key on this smart-card reader (substring).
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
     },
     /// List configured key names and whether each is currently connected.
     List,
@@ -4707,101 +4709,6 @@ fn reader_from_name() -> Result<Option<String>, Box<dyn std::error::Error>> {
     };
     let devices = keyroost_resolve::enumerate()?;
     Ok(Some(reader_for_name(&devices, &name)?))
-}
-
-/// The "no FIDO device" error, with a clear hint when a known security key is
-/// present but stuck in bootloader / DFU mode (it enumerates as plain HID and
-/// can't speak CTAP until re-plugged into application mode).
-fn no_fido_device_error() -> Box<dyn std::error::Error> {
-    let mut msg =
-        String::from("no FIDO HID device found. Plug a security key in, or pass --path/--device.");
-    if let Some(bl) = keyroost_hid::bootloader_device_present() {
-        msg.push_str(&format!(
-            " (Detected {bl} — re-plug it to return to application mode.)"
-        ));
-    }
-    msg.into()
-}
-
-/// Pick one device when no `--path`/`--device` was given: a lone key is used
-/// directly; with several, an interactive picker runs on the terminal, and in a
-/// non-interactive context we refuse rather than guess. Returns the chosen index
-/// into `devices`. `serials` is parallel to `devices` (used for name display).
-fn pick_from_devices(
-    devices: &[keyroost_hid::HidDevice],
-    keyring: &Keyring,
-    serials: &[Option<String>],
-) -> Result<usize, Box<dyn std::error::Error>> {
-    match devices.len() {
-        0 => Err(no_fido_device_error()),
-        1 => Ok(0),
-        _ => match pick_device_interactively(devices, keyring, serials)? {
-            Some(i) => Ok(i),
-            None => {
-                let paths: Vec<String> = devices
-                    .iter()
-                    .map(|d| d.path.display().to_string())
-                    .collect();
-                Err(format!(
-                    "{} FIDO devices connected; pass --device or --path \
-                     (or run in a terminal to choose): {}",
-                    devices.len(),
-                    paths.join(", ")
-                )
-                .into())
-            }
-        },
-    }
-}
-
-/// Numbered device picker driven over `/dev/tty` (not stdin, which may carry a
-/// piped PIN). Returns the chosen index, or `None` when there's no controlling
-/// terminal to prompt on.
-fn pick_device_interactively(
-    devices: &[keyroost_hid::HidDevice],
-    keyring: &Keyring,
-    serials: &[Option<String>],
-) -> Result<Option<usize>, Box<dyn std::error::Error>> {
-    use std::io::{BufRead, IsTerminal, Write};
-    let tty = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-    {
-        Ok(f) => f,
-        Err(_) => return Ok(None),
-    };
-    if !tty.is_terminal() {
-        return Ok(None);
-    }
-    let mut out = &tty;
-    writeln!(out, "Multiple security keys connected:")?;
-    for (i, d) in devices.iter().enumerate() {
-        let serial = serials.get(i).and_then(|s| s.as_deref());
-        let label = match keyring.name_for(serial) {
-            Some(name) => format!(
-                "{}  ({})",
-                sanitize_terminal(name),
-                sanitize_terminal(&d.product_name)
-            ),
-            None => sanitize_terminal(&d.product_name),
-        };
-        writeln!(out, "  {}) {:<30} {}", i + 1, label, d.path.display())?;
-    }
-    write!(out, "Select [1-{}]: ", devices.len())?;
-    out.flush()?;
-
-    let mut line = String::new();
-    std::io::BufReader::new(&tty).read_line(&mut line)?;
-    let choice: usize = line
-        .trim()
-        .parse()
-        .map_err(|_| format!("'{}' is not a valid selection", line.trim()))?;
-    if (1..=devices.len()).contains(&choice) {
-        Ok(Some(choice - 1))
-    } else {
-        Err(format!("selection {} out of range 1-{}", choice, devices.len()).into())
-    }
 }
 
 /// Pick one reader from `readers` by the same posture across applets: auto-use a
@@ -8893,46 +8800,80 @@ fn print_fingerprint(label: &str, fpr: &[u8; 20]) {
 
 fn run_key_name(cmd: &KeyNameCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        KeyNameCmd::Add { name, path } => key_name_add(name, path.as_deref()),
+        KeyNameCmd::Add { name, path, reader } => {
+            key_name_add(name, path.as_deref(), reader.as_deref())
+        }
         KeyNameCmd::List => key_name_list(),
         KeyNameCmd::Remove { name } => key_name_remove(name),
     }
 }
 
-fn key_name_add(name: &str, path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
-    keyroost_keyring::validate_name(name)?;
-    let devices: Vec<keyroost_hid::HidDevice> = keyroost_hid::enumerate()?
-        .into_iter()
-        .filter(|d| d.is_fido())
-        .collect();
-    let mut keyring = Keyring::load_default()?;
-    let dev = match path {
-        Some(p) => devices
-            .iter()
-            .find(|d| d.path == p)
-            .ok_or_else(|| format!("{} is not a connected FIDO device", p.display()))?,
-        None => {
-            let serials = effective_serials(&devices);
-            &devices[pick_from_devices(&devices, &keyring, &serials)?]
-        }
-    };
-    let (serial, source) = read_effective_serial(dev)?;
-    let vendor = (dev.vendor_id == VID_YUBICO).then(|| "yubico".to_string());
+/// Whether `dev` can be recorded in the name registry: it must be a row
+/// keyroost actually detected (not a synthetic `--reader`/`--path` override —
+/// `target::select` skips the capability check for those, so an override row
+/// can reach here) and it must carry a serial, which is the match key
+/// `key-name add` stores. A Molto2 is never connected during detection, so it
+/// always has an empty serial and can't be named yet.
+fn nameable(dev: &keyroost_resolve::Device) -> Result<(), String> {
+    if dev.id.starts_with("override:") {
+        return Err("can't name a key keyroost didn't detect; check `keyroostctl list`".into());
+    }
+    if dev.serial.is_empty() {
+        return Err(
+            "this key reports no serial without connecting, so it can't be named yet".into(),
+        );
+    }
+    Ok(())
+}
 
-    keyring.add(keyroost_keyring::KeyEntry {
+/// Build the registry entry for naming `dev`: the serial it was resolved
+/// with, and whether that serial came off the USB-HID node itself (vs. a
+/// smart-card applet read) — the same union the shared device model already
+/// correlated, so this never re-derives identity on its own.
+fn key_entry_for(
+    name: &str,
+    dev: &keyroost_resolve::Device,
+    hids: &[keyroost_hid::HidDevice],
+) -> keyroost_keyring::KeyEntry {
+    let usb = dev
+        .hid_path
+        .as_ref()
+        .and_then(|p| hids.iter().find(|h| &h.path == p))
+        .and_then(|h| h.serial_number.as_deref())
+        == Some(dev.serial.as_str());
+    keyroost_keyring::KeyEntry {
         name: name.to_string(),
-        serial: serial.clone(),
-        source,
-        vendor,
+        serial: dev.serial.clone(),
+        source: if usb {
+            keyroost_keyring::IdSource::Usb
+        } else {
+            keyroost_keyring::IdSource::Ccid
+        },
+        vendor: (dev.vendor == "Yubico").then(|| "yubico".to_string()),
         aaguid: None,
         note: None,
-    })?;
+    }
+}
+
+fn key_name_add(
+    name: &str,
+    path: Option<&Path>,
+    reader: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    keyroost_keyring::validate_name(name)?;
+    let mut keyring = Keyring::load_default()?;
+    // Any row with a serial (FIDO, card-only, prog token) — the same rows the
+    // GUI can name. The serial is the correlated one (whole-set attribution).
+    let dev = crate::target::select(Need::Nameable, reader, path)?;
+    nameable(&dev)?;
+    let hids = keyroost_hid::enumerate().unwrap_or_default();
+    keyring.add(key_entry_for(name, &dev, &hids))?;
     // Opt-in disclosure: state plainly what is stored, and how to undo it.
     eprintln!(
         "Recording \"{}\" \u{2192} serial {} ({}).",
         sanitize_terminal(name),
-        sanitize_terminal(&serial),
-        sanitize_terminal(&dev.product_name)
+        sanitize_terminal(&dev.serial),
+        sanitize_terminal(&dev.model)
     );
     eprintln!(
         "This saves the key's serial number to keys.json on this computer so the \
@@ -8951,16 +8892,11 @@ fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
         println!("(no named keys; add one with `keyroostctl key-name add <name>`)");
         return Ok(());
     }
-    let devices: Vec<keyroost_hid::HidDevice> = keyroost_hid::enumerate()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|d| d.is_fido())
-        .collect();
-    let connected = connected_keys(&devices);
+    let devices = crate::target::enumerate().unwrap_or_default();
     for k in &keyring.keys {
-        let here = connected
+        let here = devices
             .iter()
-            .any(|c| c.serial.as_deref() == Some(k.serial.as_str()));
+            .any(|d| !d.serial.is_empty() && d.serial.eq_ignore_ascii_case(&k.serial));
         let status = if here { "connected" } else { "not connected" };
         println!(
             "  {:<20} serial={} [{}]",
@@ -13738,6 +13674,109 @@ mod cli_tests {
             "--as-cert"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn key_entry_records_serial_and_where_it_came_from() {
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+        let yk = Device {
+            id: "serial:12345678".into(),
+            name: None,
+            vendor: "Yubico".into(),
+            model: "YubiKey 5 NFC".into(),
+            serial: "12345678".into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps: Caps::default(),
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: Some("/dev/hidraw16".into()),
+            reader: Some("Yubico 00".into()),
+        };
+        let hid = keyroost_hid::HidDevice {
+            path: "/dev/hidraw16".into(),
+            vendor_id: 0x1050,
+            product_id: 0x0407,
+            product_name: "YubiKey".into(),
+            usage_page: keyroost_hid::HID_USAGE_PAGE_FIDO,
+            usage: keyroost_hid::HID_USAGE_FIDO_AUTHENTICATOR,
+            serial_number: None,
+            usb_bus: None,
+            usb_address: None,
+        };
+        let e = key_entry_for("work", &yk, std::slice::from_ref(&hid));
+        assert_eq!(
+            (e.serial.as_str(), e.source, e.vendor.as_deref()),
+            ("12345678", keyroost_keyring::IdSource::Ccid, Some("yubico"))
+        );
+        let mut solo = yk.clone();
+        solo.vendor = "SoloKeys".into();
+        solo.serial = "07A9".into();
+        let mut solo_hid = hid;
+        solo_hid.serial_number = Some("07A9".into());
+        let e = key_entry_for("s", &solo, &[solo_hid]);
+        assert_eq!(
+            (e.source, e.vendor),
+            (keyroost_keyring::IdSource::Usb, None)
+        );
+    }
+
+    #[test]
+    fn key_name_add_takes_reader_or_path() {
+        assert!(parse(&[
+            "keyroostctl",
+            "key-name",
+            "add",
+            "desk",
+            "--reader",
+            "Molto"
+        ])
+        .is_ok());
+        assert!(parse(&[
+            "keyroostctl",
+            "key-name",
+            "add",
+            "desk",
+            "--path",
+            "/dev/hidraw3"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn nameable_refuses_an_override_row_and_a_blank_serial() {
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+        let base = Device {
+            id: "serial:1".into(),
+            name: None,
+            vendor: "Yubico".into(),
+            model: "YubiKey".into(),
+            serial: "1".into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps: Caps::default(),
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: None,
+            reader: None,
+        };
+        // A normal detected row with a serial is nameable.
+        assert!(nameable(&base).is_ok());
+
+        // A synthetic --reader/--path override (never detected) is refused,
+        // even though target::select skips the capability check for it.
+        let mut over = base.clone();
+        over.id = "override:Molto".into();
+        let err = nameable(&over).unwrap_err();
+        assert!(err.contains("didn't detect"), "{err}");
+
+        // A detected row with no serial (e.g. a Molto2, never connected
+        // during detection) is refused too, whatever picked it.
+        let mut no_serial = base.clone();
+        no_serial.serial = String::new();
+        no_serial.kind = DeviceKind::Token;
+        let err = nameable(&no_serial).unwrap_err();
+        assert!(err.contains("can't be named yet"), "{err}");
     }
 }
 
