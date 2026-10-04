@@ -28,6 +28,7 @@ use keyroost_resolve::{
 };
 
 mod overview;
+mod prompt;
 
 /// The global `--device` selector, captured once in `run()` so the FIDO device
 /// resolver can honor it without threading it through every subcommand handler.
