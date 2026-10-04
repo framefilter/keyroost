@@ -118,7 +118,6 @@ fn memoised(
 
 /// Resolve and announce the key this command acts on (once per process
 /// per need; later calls return the same row without re-enumerating).
-#[allow(dead_code)] // first called by a command handler in Task 9
 pub(crate) fn select(
     need: Need,
     reader: Option<&str>,
@@ -140,7 +139,7 @@ pub(crate) fn select(
 }
 
 /// The exact reader of the selected key (never re-matched as a substring).
-#[allow(dead_code)] // first called by a command handler in Task 9
+#[allow(dead_code)] // first used in Task 11
 pub(crate) fn reader_for(need: Need, reader: Option<&str>) -> Result<String, Box<dyn Error>> {
     select(need, reader, None)?
         .reader
@@ -160,16 +159,23 @@ pub(crate) fn add_bootloader_hint(e: Box<dyn Error>, bootloader: Option<&str>) -
     }
 }
 
+/// Extract the HID path a resolved FIDO row carries. Every row `select` can
+/// return for `Need::FidoHid` has one: a detected row admitted by that need
+/// requires `hid_path`, and an unmatched `--path` passes through as a typed
+/// row carrying the path it was given.
+fn hid_path_of(dev: &Device) -> Result<PathBuf, Box<dyn Error>> {
+    dev.hid_path.clone().ok_or_else(|| {
+        Box::<dyn Error>::from("internal error: a FIDO-over-USB row without a HID path")
+    })
+}
+
 /// The HID path of the selected FIDO key.
-#[allow(dead_code)] // first called by a command handler in Task 9
 pub(crate) fn fido_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
     let dev = select(Need::FidoHid, None, path).map_err(|e| {
         let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
         add_bootloader_hint(e, bl.as_deref())
     })?;
-    dev.hid_path.ok_or_else(|| {
-        Box::<dyn Error>::from("internal error: a FIDO-over-USB row without a HID path")
-    })
+    hid_path_of(&dev)
 }
 
 #[cfg(test)]
@@ -248,6 +254,17 @@ mod tests {
             line,
             "\u{2192} /dev/hidraw99 (not detected; using it as typed)"
         );
+    }
+
+    #[test]
+    fn fido_path_extracts_the_typed_path_from_an_unmatched_passthrough_row() {
+        // An unmatched --path --device::select/choose() passes through as a
+        // synthetic row carrying the typed path (see
+        // `unmatched_reader_or_path_passes_through_as_typed` above); fido_path()
+        // must hand that path back rather than treating it as an internal error.
+        let p = PathBuf::from("/dev/hidraw99");
+        let row = typed_device(None, Some(p.clone()), "/dev/hidraw99");
+        assert_eq!(hid_path_of(&row).unwrap(), p);
     }
 
     #[test]

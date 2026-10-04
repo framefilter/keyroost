@@ -18,7 +18,7 @@ use keyroost_proto::commands::{
 };
 use keyroost_transport::{SeedDeleteOutcome, Session, TransportError};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use keyroost_keyring::Keyring;
@@ -3457,8 +3457,8 @@ fn read_password(stdin: bool, env_var: Option<&str>) -> Option<zeroize::Zeroizin
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    // Capture --device once so resolve_fido_path() can honor it without threading
-    // it through every FIDO subcommand handler.
+    // Capture --device once so target::select() can honor it without threading
+    // it through every command handler.
     let _ = SELECTED_KEY_NAME.set(cli.device.clone());
     let _ = JSON_OUTPUT.set(cli.json);
     let _ = target::DEBUG.set(cli.debug);
@@ -4709,45 +4709,6 @@ fn reader_from_name() -> Result<Option<String>, Box<dyn std::error::Error>> {
     Ok(Some(reader_for_name(&devices, &name)?))
 }
 
-fn resolve_fido_path(explicit: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
-    if explicit.is_some() && name.is_some() {
-        return Err("pass either --path or --device, not both".into());
-    }
-    // An explicit --path is trusted as-is (preserves prior behavior).
-    if let Some(p) = explicit {
-        return Ok(p.to_path_buf());
-    }
-
-    let devices: Vec<keyroost_hid::HidDevice> = keyroost_hid::enumerate()?
-        .into_iter()
-        .filter(|d| d.is_fido())
-        .collect();
-
-    // Resolve by friendly name, if one was given.
-    if let Some(name) = name {
-        let keyring = Keyring::load_default()?;
-        let connected = connected_keys(&devices);
-        let dev = keyring.resolve(name, &connected)?;
-        announce_target(&keyring, &dev.path, &dev.label, dev.serial.as_deref());
-        return Ok(dev.path.clone());
-    }
-
-    // No name, no path: use a lone key, else pick interactively (never auto-pick
-    // among several — that's the multi-device safety guard).
-    let keyring = Keyring::load_default().unwrap_or_default();
-    let serials = effective_serials(&devices);
-    let i = pick_from_devices(&devices, &keyring, &serials)?;
-    let dev = &devices[i];
-    announce_target(
-        &keyring,
-        &dev.path,
-        &dev.product_name,
-        serials[i].as_deref(),
-    );
-    Ok(dev.path.clone())
-}
-
 /// The "no FIDO device" error, with a clear hint when a known security key is
 /// present but stuck in bootloader / DFU mode (it enumerates as plain HID and
 /// can't speak CTAP until re-plugged into application mode).
@@ -4760,23 +4721,6 @@ fn no_fido_device_error() -> Box<dyn std::error::Error> {
         ));
     }
     msg.into()
-}
-
-/// Print the resolved target to stderr so the user always sees which physical
-/// key a command is about to act on (annotated with its friendly name if set).
-fn announce_target(keyring: &Keyring, path: &Path, label: &str, serial: Option<&str>) {
-    // `label` is a device USB product string and the keyring name is
-    // user-editable; both reach the terminal, so flatten control chars.
-    let label = sanitize_terminal(label);
-    match keyring.name_for(serial) {
-        Some(name) => eprintln!(
-            "\u{2192} {} ({}, {})",
-            sanitize_terminal(name),
-            label,
-            path.display()
-        ),
-        None => eprintln!("\u{2192} {} ({})", label, path.display()),
-    }
 }
 
 /// Pick one device when no `--path`/`--device` was given: a lone key is used
@@ -5036,7 +4980,7 @@ fn resolve_single_device<'a>(
 /// A wipe command must not be handed a contradictory `--reader` and `--device`
 /// at once: the banner would name the `--device`-resolved key while the card
 /// steps opened the `--reader` one. Refuse the combination up front, mirroring
-/// how `resolve_fido_path` rejects `--path` + `--device`.
+/// how `target::select` reports `--path` + `--device` as a conflict.
 fn reader_device_conflict(
     reader: Option<&str>,
     device_name: Option<&str>,
@@ -9113,8 +9057,8 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 )
                 .into());
             }
-            // --path + --device is refused in resolve_fido_path; refuse
-            // --reader + --device the same way instead of letting --reader win.
+            // --path + --device is refused by target::select (SelectError::Conflict);
+            // refuse --reader + --device the same way instead of letting --reader win.
             reader_device_conflict(
                 reader.as_deref(),
                 SELECTED_KEY_NAME.get().and_then(|o| o.as_deref()),
@@ -9411,7 +9355,7 @@ fn enumerate_ssh_credentials(
     path: Option<&std::path::Path>,
     pin: &str,
 ) -> Result<SshCredEnumeration, Box<dyn std::error::Error>> {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 credential management not supported".into());
@@ -9582,7 +9526,7 @@ fn open_and_read_large_blobs(
     ),
     Box<dyn std::error::Error>,
 > {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 large blobs not supported".into());
@@ -10089,7 +10033,7 @@ fn hex_ascii_dump(bytes: &[u8]) -> String {
 }
 
 fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
     let json = json_output();
     let mut caps = Vec::new();
@@ -10228,7 +10172,7 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
 }
 
 fn run_fido_reset(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-    fido_reset_at(&resolve_fido_path(path)?)
+    fido_reset_at(&crate::target::fido_path(path)?)
 }
 
 /// Reset the FIDO2 applet of an already-resolved device. Split out so callers
@@ -10271,7 +10215,7 @@ fn run_fido_reset_reader(substr: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
     let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
     if json_output() {
@@ -10286,7 +10230,7 @@ fn run_fido_pin_set(
     path: Option<&std::path::Path>,
     new_pin: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
     keyroost_ctap::client_pin::set_pin(&mut dev, new_pin)?;
     println!("PIN set.");
@@ -10298,7 +10242,7 @@ fn run_fido_pin_change(
     old_pin: &str,
     new_pin: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
     keyroost_ctap::client_pin::change_pin(&mut dev, old_pin, new_pin)?;
     println!("PIN changed.");
@@ -10534,7 +10478,7 @@ where
         &mut keyroost_ctap::cred_mgmt::CredentialManager<'a, keyroost_ctap::CtapHidDevice>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 credential management not supported".into());
@@ -10563,7 +10507,7 @@ where
         &mut keyroost_ctap::bio_enroll::BioEnrollment<'a, keyroost_ctap::CtapHidDevice>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 bio enrollment not supported".into());
@@ -10606,7 +10550,7 @@ where
         &mut keyroost_ctap::config::Configurator<'a, keyroost_ctap::CtapHidDevice>,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let path = resolve_fido_path(path)?;
+    let path = crate::target::fido_path(path)?;
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
     if !init.supports_cbor() {
         return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
