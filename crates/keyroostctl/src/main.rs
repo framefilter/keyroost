@@ -459,15 +459,15 @@ struct Cli {
     /// Print every outgoing APDU and incoming response to stderr.
     #[arg(long, global = true)]
     debug: bool,
-    /// Target a security key by its friendly name (see the `key-name` command).
-    /// Resolves to the device's current path. Mutually exclusive with --path.
+    /// Target a key by friendly name, serial, or `list` number (prefix name:,
+    /// serial: or list: to force which). Can't be combined with --reader/--path.
     //
     // Named `device` (flag `--device`), not `name`: a *global* arg whose clap id
     // is `name` merges with every subcommand arg of the same id (e.g. the
     // `oath add <NAME>` positional, `fido fingerprint --name`), so a credential
     // or fingerprint name was being consumed as this device selector. A distinct
     // id keeps the global selector separate from all of them.
-    #[arg(long, global = true, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "KEY")]
     device: Option<String>,
     /// Emit machine-readable JSON instead of human text (where supported: status
     /// and query commands). Side-effect commands ignore it.
@@ -3568,6 +3568,51 @@ fn read_password(stdin: bool, env_var: Option<&str>) -> Option<zeroize::Zeroizin
     None
 }
 
+/// `--device` on a command that never touches a key is a mistake (it used
+/// to be silently ignored). `list` and the bare overview filter by it.
+fn inert_device_flag(cmd: Option<&Cmd>, list_readers: bool) -> Option<&'static str> {
+    if list_readers {
+        return Some("--list-readers");
+    }
+    match cmd? {
+        Cmd::Doctor => Some("doctor"),
+        Cmd::Completions { .. } => Some("completions"),
+        Cmd::Manpage { .. } => Some("manpage"),
+        Cmd::KeyName {
+            cmd: KeyNameCmd::List,
+        } => Some("key-name list"),
+        Cmd::KeyName {
+            cmd: KeyNameCmd::Remove { .. },
+        } => Some("key-name remove"),
+        _ => None,
+    }
+}
+
+/// Rows to show for `list` / the bare overview: every row numbered in `list`
+/// order with no `--device`, or the one row it names (an unknown value is an
+/// error naming the fix, via [`keyroost_resolve::resolve_target`]).
+fn filter_rows<'d>(
+    devices: &'d [keyroost_resolve::Device],
+    device: Option<&str>,
+) -> Result<Vec<(usize, &'d keyroost_resolve::Device)>, Box<dyn std::error::Error>> {
+    match device {
+        None => Ok(overview::numbered(devices)),
+        Some(v) => {
+            let s = keyroost_resolve::Selector {
+                device: Some(v),
+                ..Default::default()
+            };
+            let t = keyroost_resolve::resolve_target(
+                devices,
+                &s,
+                Need::Any,
+                &mut keyroost_resolve::NoPicker,
+            )?;
+            Ok(vec![(t.number, t.device)])
+        }
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     // Capture --device once so target::select() can honor it without threading
@@ -3575,6 +3620,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = SELECTED_KEY_NAME.set(cli.device.clone());
     let _ = JSON_OUTPUT.set(cli.json);
     let _ = target::DEBUG.set(cli.debug);
+
+    if cli.device.is_some() {
+        if let Some(what) = inert_device_flag(cli.command.as_ref(), cli.list_readers) {
+            return Err(format!("--device has no effect on `{what}`; remove it").into());
+        }
+    }
 
     if cli.list_readers {
         for r in Session::list_readers()? {
@@ -3585,13 +3636,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let Some(cmd) = cli.command.as_ref() else {
         // No subcommand → the friendly correlated overview of every connected
-        // device. (The Molto2 serial/clock still lives under `molto info`.)
+        // device, or (with --device) just the one key it names. (The Molto2
+        // serial/clock still lives under `molto info`.)
         let devices = target::enumerate()?;
+        let rows = filter_rows(&devices, cli.device.as_deref())?;
         if json_output() {
             use keyroost_resolve::DeviceKind;
-            let out: Vec<json_out::DeviceJson> = devices
+            let out: Vec<json_out::DeviceJson> = rows
                 .iter()
-                .map(|d| json_out::DeviceJson {
+                .map(|(_, d)| json_out::DeviceJson {
                     vendor: d.vendor.clone(),
                     model: d.model.clone(),
                     name: d.name.clone(),
@@ -3614,7 +3667,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             emit_json(&out)?;
             return Ok(());
         }
-        overview::print_overview(&overview::numbered(&devices));
+        overview::print_overview(&rows);
         return Ok(());
     };
 
@@ -3651,7 +3704,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // List touches neither PC/SC card state nor any HID device — just enumerates.
     if let Cmd::List { all_hid } = cmd {
-        run_list(*all_hid)?;
+        run_list(*all_hid, cli.device.as_deref())?;
         return Ok(());
     }
 
@@ -4669,70 +4722,80 @@ fn run_doctor() {
     }
 }
 
-fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
-    println!("PC/SC readers:");
-    match Session::list_readers() {
-        Ok(readers) if readers.is_empty() => println!("  (none)"),
-        Ok(readers) => {
-            for r in readers {
-                println!("  {}", sanitize_terminal(&r));
+fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    // `--device` narrows the human output to that one key's correlated row;
+    // the raw reader/HID sections (which aren't per-key) are skipped.
+    if device.is_none() {
+        println!("PC/SC readers:");
+        match Session::list_readers() {
+            Ok(readers) if readers.is_empty() => println!("  (none)"),
+            Ok(readers) => {
+                for r in readers {
+                    println!("  {}", sanitize_terminal(&r));
+                }
             }
+            Err(e) => println!("  (unavailable: {})", e),
         }
-        Err(e) => println!("  (unavailable: {})", e),
-    }
 
-    println!();
-    println!("Applet probe (per reader):");
+        println!();
+        println!("Applet probe (per reader):");
+    }
     let (probes, probe_ok) = match keyroost_transport::probe_readers() {
         Ok(p) => (p, true),
         Err(e) => {
-            println!("  (unavailable: {})", e);
+            if device.is_none() {
+                println!("  (unavailable: {})", e);
+            }
             (Vec::new(), false)
         }
     };
-    if probe_ok && probes.is_empty() {
-        println!("  (no readers)");
-    } else if probe_ok {
-        for p in &probes {
-            if p.is_molto2 {
-                println!("  {}  [Molto2 token]", sanitize_terminal(&p.reader_name));
-                continue;
+    if device.is_none() {
+        if probe_ok && probes.is_empty() {
+            println!("  (no readers)");
+        } else if probe_ok {
+            for p in &probes {
+                if p.is_molto2 {
+                    println!("  {}  [Molto2 token]", sanitize_terminal(&p.reader_name));
+                    continue;
+                }
+                let mut applets = Vec::new();
+                if p.has_oath {
+                    applets.push("OATH");
+                }
+                if p.has_openpgp {
+                    applets.push("OpenPGP");
+                }
+                if p.has_piv {
+                    applets.push("PIV");
+                }
+                let list = if applets.is_empty() {
+                    "(none detected)".to_string()
+                } else {
+                    applets.join(", ")
+                };
+                println!("  {}  ->  {}", sanitize_terminal(&p.reader_name), list);
             }
-            let mut applets = Vec::new();
-            if p.has_oath {
-                applets.push("OATH");
-            }
-            if p.has_openpgp {
-                applets.push("OpenPGP");
-            }
-            if p.has_piv {
-                applets.push("PIV");
-            }
-            let list = if applets.is_empty() {
-                "(none detected)".to_string()
-            } else {
-                applets.join(", ")
-            };
-            println!("  {}  ->  {}", sanitize_terminal(&p.reader_name), list);
         }
-    }
 
-    println!();
-    let header = if all_hid {
-        "HID devices:"
-    } else {
-        "FIDO HID devices:"
-    };
-    println!("{}", header);
+        println!();
+        let header = if all_hid {
+            "HID devices:"
+        } else {
+            "FIDO HID devices:"
+        };
+        println!("{}", header);
+    }
     let (hids, hids_ok) = match keyroost_hid::enumerate() {
         Ok(d) => (d, true),
         Err(e) => {
-            println!("  (unavailable: {})", e);
+            if device.is_none() {
+                println!("  (unavailable: {})", e);
+            }
             (Vec::new(), false)
         }
     };
     let keyring = Keyring::load_default().unwrap_or_default();
-    if hids_ok {
+    if device.is_none() && hids_ok {
         let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
         if filtered.is_empty() {
             println!("  (none)");
@@ -4801,10 +4864,13 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
     // on-demand identity reads correlate_live() needs to settle a case
     // topology alone can't decide), so the raw sections above and this
     // decision can't disagree.
-    println!();
+    if device.is_none() {
+        println!();
+    }
     let devices =
         keyroost_resolve::correlate_live(&hids, &probes, &keyring, crate::target::debug_on());
-    overview::print_correlated(&overview::numbered(&devices));
+    let rows = filter_rows(&devices, device)?;
+    overview::print_correlated(&rows);
 
     Ok(())
 }
@@ -14513,6 +14579,74 @@ mod cli_tests {
             let with: Vec<&str> = args.iter().copied().chain(["--yes"]).collect();
             let with = parse(&with).unwrap_or_else(|e| panic!("{args:?} --yes: {e}"));
             assert_eq!(confirm_yes(&with), Some(true), "{args:?} --yes");
+        }
+    }
+
+    #[test]
+    fn device_flag_is_refused_where_it_has_no_effect() {
+        for (args, what) in [
+            (&["keyroostctl", "doctor"][..], Some("doctor")),
+            (&["keyroostctl", "completions", "bash"], Some("completions")),
+            (&["keyroostctl", "manpage", "d"], Some("manpage")),
+            (&["keyroostctl", "key-name", "list"], Some("key-name list")),
+            (
+                &["keyroostctl", "key-name", "remove", "x"],
+                Some("key-name remove"),
+            ),
+            (&["keyroostctl", "list"], None),
+            (&["keyroostctl", "key-name", "add", "x"], None),
+            (&["keyroostctl", "piv", "status"], None),
+        ] {
+            let cli = parse(args).unwrap();
+            assert_eq!(
+                inert_device_flag(cli.command.as_ref(), cli.list_readers),
+                what,
+                "{args:?}"
+            );
+        }
+        let cli = parse(&["keyroostctl", "--list-readers"]).unwrap();
+        assert_eq!(
+            inert_device_flag(cli.command.as_ref(), cli.list_readers),
+            Some("--list-readers")
+        );
+    }
+
+    #[test]
+    fn filter_rows_matches_exactly_or_errors() {
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+        let mk = |name: Option<&str>, serial: &str, reader: Option<&str>| Device {
+            id: format!("s:{serial}"),
+            name: name.map(str::to_owned),
+            vendor: "Yubico".into(),
+            model: "YubiKey 5".into(),
+            serial: serial.into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps: Caps::FIDO2,
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: Some("/dev/hidraw1".into()),
+            reader: reader.map(str::to_owned),
+        };
+        let devs = [
+            mk(Some("yubi-test"), "2", Some("Y 00")),
+            mk(None, "1", None),
+        ];
+
+        // No --device: every row, numbered in list order.
+        let rows = filter_rows(&devs, None).unwrap();
+        assert_eq!(rows.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![1, 2]);
+
+        // --device given: exactly the matching row and its list number come back.
+        let rows = filter_rows(&devs, Some("yubi-test")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 2);
+        assert_eq!(rows[0].1.name.as_deref(), Some("yubi-test"));
+
+        // An unknown value is an error naming the fix (not a silent empty list).
+        match filter_rows(&devs, Some("nope")) {
+            Err(e) => assert!(e.to_string().contains("--device"), "{e}"),
+            Ok(_) => panic!("expected an error for an unknown --device value"),
         }
     }
 }
