@@ -5746,7 +5746,7 @@ fn reset_one_card_applet(
     // uniform Ok/Err mapping below can't express.
     if step == ResetStep::Piv {
         let outcome = (|| -> Result<StepOutcome, Box<dyn std::error::Error>> {
-            let name = resolve_piv_reader(reader)?;
+            let name = crate::target::reader_for(Need::Piv, reader)?;
             keyroost_transport::PivSession::with_transaction_traced(&name, debug, |s| {
                 let current = reset_auth.map(|auth| match auth {
                     ResetCliAuth::Key(key) => keyroost_transport::CurrentMgmtAuth::Key(key),
@@ -7259,7 +7259,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         PivCmd::Status { reader } => {
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7402,7 +7402,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let old = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
             let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7423,7 +7423,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let old = read_secret("old PUK", old_puk_env.as_deref(), *old_puk_stdin)?;
             let new = read_secret("new PUK", new_puk_env.as_deref(), *new_puk_stdin)?;
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7444,7 +7444,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let puk = read_secret("PUK", puk_env.as_deref(), *puk_stdin)?;
             let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7474,7 +7474,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 );
             }
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7527,7 +7527,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7682,7 +7682,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // PIV and would clear the auth. `default` is standard PIV and
             // needs neither extension, so both checks are skipped outright
             // when the caller didn't ask for anything non-default.
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7786,7 +7786,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let bytes =
                 std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
             let der = cert_to_der(&bytes)?;
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7817,7 +7817,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         PivCmd::ExportCert { reader, slot, file } => {
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7885,7 +7885,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             } else if let Some(path) = load_pubkey {
                 guard_signable_alg(load_pubkey_material(path)?.0)?;
             }
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7963,7 +7963,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
             // Know whether the target key can sign before spending the PIN
             // or the management key on a certificate that's doomed anyway.
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8047,7 +8047,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 None
             };
 
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8154,7 +8154,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 None => keyroost_transport::random_chuid_guid()?,
             };
             let expiration = valid_for.chuid_expiration(u64::from(unix_now()));
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8184,12 +8184,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_env,
             pin_stdin,
         } => {
-            let name = reset_reader(
-                || Ok(keyroost_transport::PivSession::list_piv_readers()?),
-                reader.as_deref(),
-                "PIV",
-            )?;
-            eprintln!("\u{2192} PIV on {}", sanitize_terminal(&name));
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8288,7 +8283,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )
                 .into());
             }
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8330,7 +8325,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8363,7 +8358,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_default,
             force,
         } => {
-            let name = resolve_piv_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8410,22 +8405,6 @@ fn open_openpgp_at(
     let mut session = keyroost_transport::OpenPgpSession::open(name)?;
     session.set_debug(debug);
     Ok(session)
-}
-
-/// Resolve the PIV reader to open — `reader` if given, else the sole PIV
-/// reader — and announce it on stderr. A `PivSession` can no longer be
-/// returned from a helper like the old `open_piv` did: it now lives inside
-/// one PC/SC transaction spanning the whole command, so every call site
-/// resolves the reader name here first, then opens the session itself via
-/// [`keyroost_transport::PivSession::with_transaction_traced`] (or
-/// [`keyroost_transport::PivSession::with_cached_transaction_traced`]),
-/// running the rest of the command inside that call's closure.
-fn resolve_piv_reader(reader: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    let readers = keyroost_transport::PivSession::list_piv_readers()?;
-    let by_name = reader_from_name()?;
-    let name = resolve_reader(readers, reader.or(by_name.as_deref()), "PIV")?;
-    eprintln!("\u{2192} PIV on {}", sanitize_terminal(&name));
-    Ok(name)
 }
 
 /// Authenticate the management key on an already-open [`keyroost_transport::PivSession`] against
