@@ -4926,6 +4926,7 @@ fn run_factory_reset(
                         &expected_serial,
                         &expected_model,
                         expected_ids,
+                        FACTORY_RESET_NOUN,
                         FACTORY_RESET_RERUN,
                     ) {
                         Ok(()) => StepOutcome::Wiped,
@@ -4961,16 +4962,39 @@ fn run_factory_reset(
         });
     }
 
-    let failed = reports
-        .iter()
-        .filter(|r| matches!(r.outcome, StepOutcome::Failed(_)))
-        .count();
-    let wiped = reports.len() - failed;
-    println!("factory reset: {wiped} wiped, {failed} failed");
-    if failed > 0 {
-        return Err(format!("{failed} applet(s) failed to reset").into());
-    }
-    Ok(())
+    let (summary, verdict) = factory_reset_summary(&reports);
+    println!("{summary}");
+    verdict.map_err(Into::into)
+}
+
+/// The closing line of a factory reset and whether the command succeeded.
+///
+/// Only a step that actually wiped counts as wiped. A skipped step (say, a
+/// FIDO2 step nobody replugged for) left that applet as it was, so the key was
+/// not fully reset and the command must not report success.
+fn factory_reset_summary(reports: &[keyroost_resolve::StepReport]) -> (String, Result<(), String>) {
+    use keyroost_resolve::StepOutcome;
+    let count = |f: fn(&StepOutcome) -> bool| reports.iter().filter(|r| f(&r.outcome)).count();
+    let wiped = count(|o| {
+        matches!(
+            o,
+            StepOutcome::Wiped | StepOutcome::WipedGlobal | StepOutcome::WipedWithWarning(_)
+        )
+    });
+    let skipped = count(|o| matches!(o, StepOutcome::Skipped(_)));
+    let failed = count(|o| matches!(o, StepOutcome::Failed(_)));
+    let summary = format!("factory reset: {wiped} wiped, {skipped} skipped, {failed} failed");
+    let verdict = match (failed, skipped) {
+        (0, 0) => Ok(()),
+        (f, 0) => Err(format!("{f} applet(s) failed to reset")),
+        (0, s) => Err(format!(
+            "{s} applet(s) skipped; the key was not fully reset"
+        )),
+        (f, s) => Err(format!(
+            "{f} applet(s) failed to reset and {s} skipped; the key was not fully reset"
+        )),
+    };
+    (summary, verdict)
 }
 
 /// Which connected key — if any — is the one the factory reset was confirmed
@@ -5052,6 +5076,9 @@ fn not_present_reason(serials: &[&str]) -> NotPresentReason {
 const FIDO_RESET_RERUN: &str = "keyroostctl fido reset --yes";
 /// The command that re-runs the whole-device wipe.
 const FACTORY_RESET_RERUN: &str = "keyroostctl factory-reset --yes";
+/// What the refusal messages call the operation, matching the rerun command.
+const FIDO_RESET_NOUN: &str = "FIDO2 reset";
+const FACTORY_RESET_NOUN: &str = "factory reset";
 
 /// What to tell the user when the pinned key wasn't among the keys visible
 /// after the replug — a refusal either way, but only one of them is an
@@ -5062,18 +5089,19 @@ fn not_present_message(
     waited_secs: u64,
     present: &str,
     reason: NotPresentReason,
+    noun: &str,
     rerun: &str,
 ) -> String {
     match reason {
         NotPresentReason::DifferentKey => format!(
-            "the key now connected is not the one this factory reset was confirmed \
-             for: expected {} serial {}, found {present}. Nothing was reset over \
+            "the key now connected is not the one this {noun} was confirmed for: \
+             expected {} serial {}, found {present}. Nothing was reset over \
              FIDO2 — plug the intended key in and re-run `{rerun}`.",
             sanitize_terminal(expected_model),
             sanitize_terminal(expected_serial),
         ),
         NotPresentReason::Unidentified => format!(
-            "the key this factory reset was confirmed for ({} serial {}) did not \
+            "the key this {noun} was confirmed for ({} serial {}) did not \
              come back with an identity to match within {waited_secs} seconds of \
              the replug: found {present}. That is not a different key — its serial \
              is read over the card interface, which re-registers with the \
@@ -5312,12 +5340,16 @@ fn wait_for_replug(
     poll: std::time::Duration,
     mut elapsed: impl FnMut() -> std::time::Duration,
     mut sleep: impl FnMut(std::time::Duration),
-    mut fido_nodes: impl FnMut() -> Vec<std::path::PathBuf>,
+    mut fido_nodes: impl FnMut() -> Option<Vec<std::path::PathBuf>>,
 ) -> Result<(), NoReplugSeen> {
     let mut watch = ReplugWatch::new(armed);
     loop {
-        if watch.observe(&fido_nodes()) {
-            return Ok(());
+        // A failed scan says nothing about the key: skip it rather than read
+        // it as "the armed node is gone" (or as an empty baseline).
+        if let Some(nodes) = fido_nodes() {
+            if watch.observe(&nodes) {
+                return Ok(());
+            }
         }
         if elapsed() + poll > budget {
             return Err(NoReplugSeen);
@@ -5327,14 +5359,14 @@ fn wait_for_replug(
 }
 
 /// The FIDO HID nodes connected right now: the cheap scan the replug wait
-/// polls (no identity reads). A failed scan reads as "nothing connected".
-fn fido_hid_nodes() -> Vec<std::path::PathBuf> {
-    keyroost_hid::enumerate()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|h| h.is_fido())
-        .map(|h| h.path)
-        .collect()
+/// polls (no identity reads). `None` when the scan itself failed.
+fn fido_hid_nodes() -> Option<Vec<std::path::PathBuf>> {
+    keyroost_hid::enumerate().ok().map(|hids| {
+        hids.into_iter()
+            .filter(|h| h.is_fido())
+            .map(|h| h.path)
+            .collect()
+    })
 }
 
 /// A FIDO2 reset over USB (`fido reset`, and the FIDO2 step of a whole-device
@@ -5357,6 +5389,7 @@ fn fido_reset_after_replug(
     expected_serial: &str,
     expected_model: &str,
     expected_ids: Option<(u16, u16)>,
+    noun: &str,
     rerun: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serial_less = expected_serial.is_empty();
@@ -5437,6 +5470,7 @@ fn fido_reset_after_replug(
                 REINSERT_DEADLINE.as_secs(),
                 &describe_present(&present),
                 not_present_reason(&serials),
+                noun,
                 rerun,
             )
             .into());
@@ -8906,6 +8940,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                         &dev.serial,
                         &dev.model,
                         ids,
+                        FIDO_RESET_NOUN,
                         FIDO_RESET_RERUN,
                     )?
                 }
@@ -11147,6 +11182,15 @@ mod cli_tests {
         armed: &str,
         scans: &[&[&str]],
     ) -> (Result<(), NoReplugSeen>, std::time::Duration) {
+        let scans: Vec<Option<&[&str]>> = scans.iter().map(|s| Some(*s)).collect();
+        scripted_replug_wait_with_failures(armed, &scans)
+    }
+
+    /// As `scripted_replug_wait`, where `None` is a scan that failed.
+    fn scripted_replug_wait_with_failures(
+        armed: &str,
+        scans: &[Option<&[&str]>],
+    ) -> (Result<(), NoReplugSeen>, std::time::Duration) {
         use std::cell::Cell;
         use std::path::PathBuf;
         let clock = Cell::new(std::time::Duration::ZERO);
@@ -11160,7 +11204,7 @@ mod cli_tests {
             || {
                 let i = next.get().min(scans.len() - 1);
                 next.set(next.get() + 1);
-                scans[i].iter().map(PathBuf::from).collect()
+                scans[i].map(|nodes| nodes.iter().map(PathBuf::from).collect())
             },
         );
         (result, clock.get())
@@ -11211,6 +11255,110 @@ mod cli_tests {
             &[&["/dev/hidraw1", "/dev/hidraw3"], &["/dev/hidraw1"]],
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn replug_wait_does_not_read_a_failed_scan_as_the_key_leaving() {
+        // A transient scan failure between two scans that both show the armed
+        // node is not a removal, so the wait runs out instead of completing.
+        let (r, _) = scripted_replug_wait_with_failures(
+            "/dev/hidraw3",
+            &[Some(&["/dev/hidraw3"]), None, Some(&["/dev/hidraw3"])],
+        );
+        assert!(r.is_err());
+        // A failed first scan is no baseline either: an already-connected key
+        // still does not count as the replug.
+        let (r, _) = scripted_replug_wait_with_failures(
+            "/dev/hidraw3",
+            &[
+                None,
+                Some(&["/dev/hidraw1", "/dev/hidraw3"]),
+                Some(&["/dev/hidraw1"]),
+            ],
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn factory_reset_summary_counts_only_real_wipes_and_fails_on_a_skip() {
+        use keyroost_resolve::{ResetStep, StepOutcome, StepReport};
+        let r = |step, outcome| StepReport { step, outcome };
+        let all_wiped = [
+            r(ResetStep::Oath, StepOutcome::Wiped),
+            r(ResetStep::Piv, StepOutcome::WipedGlobal),
+            r(
+                ResetStep::OpenPgp,
+                StepOutcome::WipedWithWarning("w".into()),
+            ),
+        ];
+        let (line, verdict) = factory_reset_summary(&all_wiped);
+        assert_eq!(line, "factory reset: 3 wiped, 0 skipped, 0 failed");
+        assert!(verdict.is_ok());
+
+        // Nobody replugged: the FIDO2 step was skipped, so the key was not
+        // fully reset and the command must not succeed.
+        let fido_skipped = [
+            r(ResetStep::Oath, StepOutcome::Wiped),
+            r(
+                ResetStep::Fido,
+                StepOutcome::Skipped("no replug seen within 60 seconds".into()),
+            ),
+        ];
+        let (line, verdict) = factory_reset_summary(&fido_skipped);
+        assert_eq!(line, "factory reset: 1 wiped, 1 skipped, 0 failed");
+        assert!(verdict.unwrap_err().contains("not fully reset"));
+
+        let failed = [
+            r(ResetStep::Oath, StepOutcome::Failed("x".into())),
+            r(ResetStep::Fido, StepOutcome::Skipped("y".into())),
+        ];
+        let (line, verdict) = factory_reset_summary(&failed);
+        assert_eq!(line, "factory reset: 0 wiped, 1 skipped, 1 failed");
+        let err = verdict.unwrap_err();
+        assert!(
+            err.contains("1 applet(s) failed") && err.contains("1 skipped"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn fido_reset_unidentified_message_names_itself_without_the_factory_reset_aside() {
+        let msg = not_present_message(
+            "YubiKey 5",
+            "12345678",
+            3,
+            "YubiKey 5 with no serial",
+            not_present_reason(&[""]),
+            FIDO_RESET_NOUN,
+            FIDO_RESET_RERUN,
+        );
+        assert!(
+            msg.contains("the key this FIDO2 reset was confirmed for"),
+            "{msg}"
+        );
+        assert!(
+            msg.ends_with("then run `keyroostctl fido reset --yes` to finish the wipe."),
+            "{msg}"
+        );
+        assert!(!msg.contains("factory"), "no factory-reset aside: {msg}");
+
+        let msg = not_present_message(
+            "YubiKey 5",
+            "12345678",
+            3,
+            "YubiKey 5 serial 87654321",
+            not_present_reason(&["87654321"]),
+            FIDO_RESET_NOUN,
+            FIDO_RESET_RERUN,
+        );
+        assert!(
+            msg.contains("is not the one this FIDO2 reset was confirmed for"),
+            "{msg}"
+        );
+        assert!(
+            msg.ends_with("re-run `keyroostctl fido reset --yes`."),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -11483,6 +11631,7 @@ mod cli_tests {
             3,
             "YubiKey 5 with no serial",
             not_present_reason(&[""]),
+            FACTORY_RESET_NOUN,
             FACTORY_RESET_RERUN,
         );
         assert!(
@@ -11503,6 +11652,7 @@ mod cli_tests {
             3,
             "YubiKey 5 serial 87654321",
             not_present_reason(&["87654321"]),
+            FACTORY_RESET_NOUN,
             FACTORY_RESET_RERUN,
         );
         assert!(
