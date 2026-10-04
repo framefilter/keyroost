@@ -21,7 +21,10 @@ pub use device::{
     correlate, enumerate, exclude_unresettable_piv, factory_reset_plan, CapState, Caps, Device,
     DeviceId, DeviceKind, ResetStep, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
 };
-pub use identity::{CanonicalId, IdScheme};
+pub use identity::{
+    plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
+    IdentityReader, IDENTITY_READERS,
+};
 
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.
 pub const VID_YUBICO: u16 = 0x1050;

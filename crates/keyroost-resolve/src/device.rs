@@ -316,6 +316,24 @@ fn reader_by_vendor(
 ///
 /// Deterministic: both passes walk `hids` and `probes` in slice order; the
 /// `claimed` map is only ever looked up by key, never iterated.
+/// Step 1 of matching: every reader goes to the node at its exact USB
+/// bus+address. Shared with the identity planner, which reads identities
+/// only for what this leaves unmatched.
+pub(crate) fn topology_bound(hids: &[&HidDevice], probes: &[ReaderProbe]) -> Vec<Option<String>> {
+    let mut bound: Vec<Option<String>> = vec![None; hids.len()];
+    let mut claimed: std::collections::HashMap<String, (Option<u8>, Option<u8>)> =
+        std::collections::HashMap::new();
+    for (i, hid) in hids.iter().enumerate() {
+        if let Some(p) = reader_by_topology(probes, hid) {
+            if reader_is_bindable(&claimed, &p.reader_name, hid) {
+                claimed.insert(p.reader_name.clone(), (hid.usb_bus, hid.usb_address));
+                bound[i] = Some(p.reader_name.clone());
+            }
+        }
+    }
+    bound
+}
+
 fn bind_readers(
     hids: &[&HidDevice],
     probes: &[ReaderProbe],
@@ -327,12 +345,10 @@ fn bind_readers(
     let mut claimed: std::collections::HashMap<String, (Option<u8>, Option<u8>)> =
         std::collections::HashMap::new();
 
-    for (i, hid) in hids.iter().enumerate() {
-        if let Some(p) = reader_by_topology(probes, hid) {
-            if reader_is_bindable(&claimed, &p.reader_name, hid) {
-                claimed.insert(p.reader_name.clone(), (hid.usb_bus, hid.usb_address));
-                bound[i] = Some(p.reader_name.clone());
-            }
+    for (i, reader) in topology_bound(hids, probes).into_iter().enumerate() {
+        if let Some(reader) = reader {
+            claimed.insert(reader.clone(), (hids[i].usb_bus, hids[i].usb_address));
+            bound[i] = Some(reader);
         }
     }
 
