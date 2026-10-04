@@ -49,37 +49,47 @@ fn short_transport(t: &str) -> String {
         .replace(" + ", "+")
 }
 
+/// Rows paired with their `list` number (1-based, `keyroost_resolve::list_order`)
+/// — the numbers `--device N` accepts.
+pub fn numbered(devices: &[Device]) -> Vec<(usize, &Device)> {
+    keyroost_resolve::list_order(devices)
+        .into_iter()
+        .enumerate()
+        .map(|(pos, i)| (pos + 1, &devices[i]))
+        .collect()
+}
+
 /// The aligned overview rows (the "Connected devices" header is added by the
-/// printer). Returns one line per device, columns padded to the widest value.
-pub fn overview_lines(devices: &[Device]) -> Vec<String> {
-    if devices.is_empty() {
+/// printer). Returns one line per row, columns padded to the widest value,
+/// prefixed with the row's `list` number.
+pub fn overview_lines(rows: &[(usize, &Device)]) -> Vec<String> {
+    if rows.is_empty() {
         return vec!["No devices connected.".to_string()];
     }
-    let wv = devices
+    let wv = rows
         .iter()
-        .map(|d| d.vendor.chars().count())
+        .map(|(_, d)| d.vendor.chars().count())
         .max()
         .unwrap_or(0);
-    let wm = devices
+    let wm = rows
         .iter()
-        .map(|d| label(d).chars().count())
+        .map(|(_, d)| label(d).chars().count())
         .max()
         .unwrap_or(0);
-    let wb = devices
+    let wb = rows
         .iter()
-        .map(|d| badge_line(d).chars().count())
+        .map(|(_, d)| badge_line(d).chars().count())
         .max()
         .unwrap_or(0);
-    let ws = devices
+    let ws = rows
         .iter()
-        .map(|d| short_serial(&d.serial).chars().count())
+        .map(|(_, d)| short_serial(&d.serial).chars().count())
         .max()
         .unwrap_or(0);
-    devices
-        .iter()
-        .map(|d| {
+    rows.iter()
+        .map(|(n, d)| {
             format!(
-                "  {:wv$}  {:wm$}  {:wb$}  {:ws$}  {}",
+                "{n:>2}) {:wv$}  {:wm$}  {:wb$}  {:ws$}  {}",
                 sanitize_terminal(&d.vendor),
                 label(d),
                 badge_line(d),
@@ -95,14 +105,13 @@ pub fn overview_lines(devices: &[Device]) -> Vec<String> {
 }
 
 /// One line per correlated physical device for the `list` diagnostic summary:
-/// kind · vendor model · badges · the reader/HID it paired.
-pub fn correlated_lines(devices: &[Device]) -> Vec<String> {
-    if devices.is_empty() {
+/// its `list` number · kind · vendor model · badges · the reader/HID it paired.
+pub fn correlated_lines(rows: &[(usize, &Device)]) -> Vec<String> {
+    if rows.is_empty() {
         return vec!["  (no devices)".to_string()];
     }
-    devices
-        .iter()
-        .map(|d| {
+    rows.iter()
+        .map(|(n, d)| {
             let kind = match d.kind {
                 DeviceKind::Token => "Token",
                 DeviceKind::ProgToken => "Programmable token",
@@ -122,7 +131,7 @@ pub fn correlated_lines(devices: &[Device]) -> Vec<String> {
                 (None, None) => "(none)".to_string(),
             };
             format!(
-                "  {:5}  {} {}  {}  {}",
+                "  {n:>2}) {:5}  {} {}  {}  {}",
                 kind,
                 sanitize_terminal(&d.vendor),
                 label(d),
@@ -134,18 +143,18 @@ pub fn correlated_lines(devices: &[Device]) -> Vec<String> {
 }
 
 /// Print the bare-invocation friendly overview to stdout.
-pub fn print_overview(devices: &[Device]) {
+pub fn print_overview(rows: &[(usize, &Device)]) {
     println!("Connected devices");
     println!();
-    for line in overview_lines(devices) {
+    for line in overview_lines(rows) {
         println!("{line}");
     }
 }
 
 /// Print the `list` "Correlated devices" summary section to stdout.
-pub fn print_correlated(devices: &[Device]) {
+pub fn print_correlated(rows: &[(usize, &Device)]) {
     println!("Correlated devices (what keyroost sees):");
-    for line in correlated_lines(devices) {
+    for line in correlated_lines(rows) {
         println!("{line}");
     }
 }
@@ -209,6 +218,40 @@ mod tests {
     }
 
     #[test]
+    fn rows_are_numbered_in_list_order() {
+        let a = dev(
+            "Yubico",
+            "YubiKey 5",
+            Some("b-key"),
+            "22222222",
+            "USB",
+            caps_of(&[Caps::FIDO2]),
+            DeviceKind::Key,
+        );
+        let b = dev(
+            "SoloKeys",
+            "Solo 2",
+            None,
+            "11111111",
+            "USB",
+            caps_of(&[Caps::FIDO2]),
+            DeviceKind::Key,
+        );
+        let devs = [a, b];
+        let lines = overview_lines(&numbered(&devs));
+        assert!(
+            lines[0].starts_with(" 1) ") && lines[0].contains("Solo 2"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with(" 2) ") && lines[1].contains("b-key"),
+            "{lines:?}"
+        );
+        let corr = correlated_lines(&numbered(&devs));
+        assert!(corr[0].starts_with("   1) "), "{corr:?}");
+    }
+
+    #[test]
     fn overview_aligns_columns_and_uses_name_over_model() {
         let devices = [
             dev(
@@ -230,7 +273,7 @@ mod tests {
                 DeviceKind::Token,
             ),
         ];
-        let lines = overview_lines(&devices);
+        let lines = overview_lines(&numbered(&devices));
         assert!(lines[0].contains("work-key"));
         assert!(lines[0].contains("FIDO2 · OATH · PGP · PIV"));
         assert!(lines[1].contains("Token2"));
@@ -255,13 +298,14 @@ mod tests {
         );
         d.reader = Some("Rd\x1b[2Jr".into());
 
-        for line in overview_lines(std::slice::from_ref(&d)) {
+        let devs = std::slice::from_ref(&d);
+        for line in overview_lines(&numbered(devs)) {
             assert!(
                 !line.chars().any(|c| c.is_control()),
                 "overview line leaked a control char: {line:?}"
             );
         }
-        for line in correlated_lines(std::slice::from_ref(&d)) {
+        for line in correlated_lines(&numbered(devs)) {
             assert!(
                 !line.chars().any(|c| c.is_control()),
                 "correlated line leaked a control char: {line:?}"
@@ -284,14 +328,16 @@ mod tests {
             DeviceKind::Key,
         );
         d.unverified.insert(Caps::OTP);
-        let lines = overview_lines(std::slice::from_ref(&d));
+        let devs = std::slice::from_ref(&d);
+        let lines = overview_lines(&numbered(devs));
         assert!(lines[0].contains("FIDO2 · OTP?"), "got: {}", lines[0]);
-        let lines = correlated_lines(std::slice::from_ref(&d));
+        let lines = correlated_lines(&numbered(devs));
         assert!(lines[0].contains("FIDO2 · OTP?"), "got: {}", lines[0]);
 
         // Verified capabilities keep the bare label.
         d.unverified = Caps::default();
-        let lines = overview_lines(std::slice::from_ref(&d));
+        let devs = std::slice::from_ref(&d);
+        let lines = overview_lines(&numbered(devs));
         assert!(lines[0].contains("FIDO2 · OTP"));
         assert!(!lines[0].contains("OTP?"));
     }
@@ -308,7 +354,8 @@ mod tests {
             DeviceKind::Token,
         );
         d.reader = Some("TOKEN2 Molto2 (5C7D) 02 00".into());
-        let lines = correlated_lines(&[d]);
+        let devs = [d];
+        let lines = correlated_lines(&numbered(&devs));
         assert!(lines[0].contains("Token"));
         assert!(lines[0].contains("TOTP token"));
         assert!(lines[0].contains("(no HID)"));

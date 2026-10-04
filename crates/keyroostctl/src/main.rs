@@ -3501,7 +3501,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             emit_json(&out)?;
             return Ok(());
         }
-        overview::print_overview(&devices);
+        overview::print_overview(&overview::numbered(&devices));
         return Ok(());
     };
 
@@ -4616,7 +4616,7 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
     // correlate(), so the raw sections above and this decision can't disagree.
     println!();
     let devices = keyroost_resolve::correlate(&hids, &probes, &keyring);
-    overview::print_correlated(&devices);
+    overview::print_correlated(&overview::numbered(&devices));
 
     Ok(())
 }
