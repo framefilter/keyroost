@@ -153,7 +153,6 @@ pub(crate) fn key_label(d: &Device) -> String {
     }
 }
 
-#[allow(dead_code)] // used from Task 18
 pub(crate) fn confirm_on(
     d: &Device,
     yes: bool,
@@ -162,7 +161,7 @@ pub(crate) fn confirm_on(
     Ok(confirm(&mut RealTerm, yes, action, &key_label(d))?)
 }
 
-#[allow(dead_code)] // used from Task 18
+#[allow(dead_code)] // first caller: the typed-word commands (factory-reset, otp interface)
 pub(crate) fn confirm_typed_on(
     d: &Device,
     yes: bool,
