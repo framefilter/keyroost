@@ -2,12 +2,12 @@
 //! `keyroostctl … | head`) must exit quietly, not dump a panic, a backtrace or
 //! a broken-pipe error.
 //!
-//! The output here comes from shell completion (`COMPLETE=fish keyroostctl --
-//! keyroostctl --device ""`) over a keys.json with thousands of saved names,
-//! so stdout is far larger than a pipe buffer and the write is guaranteed to
-//! hit the closed pipe. Completion reports that as an error rather than a
-//! panic, so this guards the closed-pipe handling around `CompleteEnv` in
-//! `main()`. The panic shapes the guard in `main()` catches
+//! The output here comes from shell completion (`KEYROOSTCTL_COMPLETE=fish
+//! keyroostctl -- keyroostctl --device ""`) over a keys.json with thousands of
+//! saved names, so stdout is far larger than a pipe buffer and the write is
+//! guaranteed to hit the closed pipe. Completion reports that as an error
+//! rather than a panic, so this guards the closed-pipe handling in
+//! `answer_completion_request()`. The panic shapes the guard in `main()` catches
 //! (`install_broken_pipe_guard` / `is_broken_pipe_panic`) — std's `println!`
 //! `Display` form and clap_complete's `Debug` form — are covered by the
 //! `broken_pipe_panic_detection` unit test in `main.rs`.
@@ -45,7 +45,7 @@ fn broken_pipe_exits_without_panicking() {
 
     // Completion needs no hardware: candidates come from keys.json only.
     let mut child = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
-        .env("COMPLETE", "fish")
+        .env("KEYROOSTCTL_COMPLETE", "fish")
         .env("XDG_CONFIG_HOME", &dir)
         .env("APPDATA", &dir)
         .args(["--", "keyroostctl", "--device", ""])

@@ -13,7 +13,7 @@ fn device_completes_saved_names() {
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
-        .env("COMPLETE", "fish")
+        .env("KEYROOSTCTL_COMPLETE", "fish")
         .env("XDG_CONFIG_HOME", &dir)
         .env("APPDATA", &dir)
         .args(["--", "keyroostctl", "--device", ""])
@@ -30,4 +30,18 @@ fn device_completes_saved_names() {
         stdout.lines().any(|l| l.starts_with("solo-test")),
         "{stdout}"
     );
+}
+
+/// A generic `COMPLETE` left in the environment (other clap-based tools use
+/// that name) must not turn a normal run into a completion request.
+#[test]
+fn generic_complete_var_is_ignored() {
+    let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+        .env("COMPLETE", "fish")
+        .arg("--version")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stdout.starts_with("keyroostctl "), "{stdout}");
 }

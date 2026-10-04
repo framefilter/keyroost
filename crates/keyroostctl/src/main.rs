@@ -11266,16 +11266,47 @@ fn is_broken_pipe_panic(msg: &str) -> bool {
     msg.contains("BrokenPipe") || msg.contains("(os error 32)") || msg.contains("Broken pipe")
 }
 
-/// Whether a completion-engine error message is a closed stdout pipe.
+/// Whether a completion-engine error is a closed stdout pipe.
 ///
-/// clap flattens the engine's `io::Error` into its `Display` text, so the
-/// error kind is gone by the time [`main`] sees it. EPIPE reads as
-/// `"Broken pipe (os error 32)"` on Unix, which [`is_broken_pipe_panic`]
-/// already matches; Windows reports a closed pipe as `ERROR_BROKEN_PIPE` (109)
-/// or `ERROR_NO_DATA` (232) with a localized message, so match those codes.
-fn is_closed_pipe_error(msg: &str) -> bool {
-    is_broken_pipe_panic(msg)
+/// clap flattens the engine's `io::Error` into an `Io`-kind error carrying
+/// only its `Display` text, so the io error kind is gone by the time we see
+/// it. EPIPE reads as `"Broken pipe (os error 32)"` on Unix, which
+/// [`is_broken_pipe_panic`] already matches; Windows reports a closed pipe as
+/// `ERROR_BROKEN_PIPE` (109) or `ERROR_NO_DATA` (232) with a localized
+/// message, so match those codes.
+fn is_closed_pipe_error(e: &clap::Error) -> bool {
+    if e.kind() != clap::error::ErrorKind::Io {
+        return false;
+    }
+    let msg = e.to_string();
+    is_broken_pipe_panic(&msg)
         || (cfg!(windows) && (msg.contains("(os error 109)") || msg.contains("(os error 232)")))
+}
+
+/// The environment variable a shell sets to ask keyroostctl for completions.
+/// Namespaced (rather than clap_complete's default `COMPLETE`) so a stray
+/// `COMPLETE` in a user's environment can't hijack every run.
+const COMPLETE_VAR: &str = "KEYROOSTCTL_COMPLETE";
+
+/// Answer a shell's completion request (`KEYROOSTCTL_COMPLETE=<shell>
+/// keyroostctl …`) if this run is one: `None` means a normal run, `Some` is
+/// the status to exit with. Candidates come from keys.json only, never
+/// hardware. Completion writes straight to stdout and reports a closed pipe
+/// as an error rather than panicking, so the panic guard never sees it —
+/// exit 141 quietly here instead, the same status the guard uses.
+fn answer_completion_request() -> Option<ExitCode> {
+    match clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command)
+        .var(COMPLETE_VAR)
+        .try_complete(std::env::args_os(), std::env::current_dir().ok().as_deref())
+    {
+        Ok(true) => Some(ExitCode::SUCCESS),
+        Ok(false) => None,
+        Err(e) if is_closed_pipe_error(&e) => Some(ExitCode::from(141)),
+        Err(e) => {
+            let _ = e.print();
+            Some(ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(2)))
+        }
+    }
 }
 
 /// `--device` candidates for `keyring`: every saved friendly name, in file order.
@@ -11309,24 +11340,17 @@ fn write_completion_registration(
         clap_complete::Shell::PowerShell => &Powershell,
         other => return Err(format!("no completion support for {other}").into()),
     };
-    completer.write_registration("COMPLETE", "keyroostctl", "keyroostctl", "keyroostctl", out)?;
+    completer.write_registration(
+        COMPLETE_VAR,
+        "keyroostctl",
+        "keyroostctl",
+        "keyroostctl",
+        out,
+    )?;
     Ok(())
 }
 
 fn main() -> ExitCode {
-    // `COMPLETE=<shell> keyroostctl …` is the shell asking for completions:
-    // answer from keys.json and exit before anything else runs. Completion
-    // writes straight to stdout and reports a closed pipe as an error rather
-    // than panicking, so the panic guard below never sees it — exit 141
-    // quietly here instead, the same status the guard uses.
-    match clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command)
-        .try_complete(std::env::args_os(), std::env::current_dir().ok().as_deref())
-    {
-        Ok(true) => return ExitCode::SUCCESS,
-        Ok(false) => {}
-        Err(e) if is_closed_pipe_error(&e.to_string()) => return ExitCode::from(141),
-        Err(e) => e.exit(),
-    }
     // A closed output pipe (`… | head`) should exit quietly, not panic.
     install_broken_pipe_guard();
     // HID enumeration (hidapi walking the system's device tree and parsing
@@ -11337,14 +11361,22 @@ fn main() -> ExitCode {
     // a generous 16 MiB stack so debug and release behave identically across
     // platforms. `run`'s error type is `Box<dyn Error>` (not `Send`), so flatten
     // it to a `String` inside the worker before it crosses the join boundary.
+    //
+    // A shell's completion request is answered first, on the worker too:
+    // building the full command tree also needs more than a small main-thread
+    // stack in debug builds.
     let worker = std::thread::Builder::new()
         .name("keyroostctl-main".into())
         .stack_size(16 * 1024 * 1024)
-        .spawn(|| run().map_err(|e| e.to_string()))
+        .spawn(|| match answer_completion_request() {
+            Some(code) => Ok(Some(code)),
+            None => run().map(|()| None).map_err(|e| e.to_string()),
+        })
         .expect("spawn worker thread");
 
     match worker.join() {
-        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Ok(Some(code))) => code,
+        Ok(Ok(None)) => ExitCode::SUCCESS,
         Ok(Err(e)) => {
             eprintln!("error: {}", e);
             ExitCode::FAILURE
@@ -11493,7 +11525,7 @@ mod cli_tests {
         let mut out = Vec::new();
         write_completion_registration(clap_complete::Shell::Bash, &mut out).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("COMPLETE") && s.contains("keyroostctl"));
+        assert!(s.contains("KEYROOSTCTL_COMPLETE=") && s.contains("keyroostctl"));
         // One completion mode only: there is no static-script variant.
         assert!(parse(&["keyroostctl", "completions", "bash"]).is_ok());
         assert!(parse(&["keyroostctl", "completions", "bash", "--static"]).is_err());
@@ -12714,22 +12746,29 @@ mod cli_tests {
 
     #[test]
     fn closed_pipe_error_detection() {
+        use clap::error::ErrorKind;
+        let io = |msg: &str| clap::Error::raw(ErrorKind::Io, msg);
         // What the completion engine's error reads as on a closed stdout pipe.
-        assert!(is_closed_pipe_error("error: Broken pipe (os error 32)"));
-        assert!(is_closed_pipe_error("error: Rohrbruch (os error 32)"));
+        assert!(is_closed_pipe_error(&io("Broken pipe (os error 32)")));
+        assert!(is_closed_pipe_error(&io("Rohrbruch (os error 32)")));
         // Windows' closed-pipe codes count only on Windows.
         assert_eq!(
-            is_closed_pipe_error("error: The pipe is being closed. (os error 232)"),
+            is_closed_pipe_error(&io("The pipe is being closed. (os error 232)")),
             cfg!(windows)
         );
         assert_eq!(
-            is_closed_pipe_error("error: The pipe has been ended. (os error 109)"),
+            is_closed_pipe_error(&io("The pipe has been ended. (os error 109)")),
             cfg!(windows)
         );
         // Other completion failures still surface.
-        assert!(!is_closed_pipe_error(
-            "error: unknown shell `tcsh`, expected one of bash, elvish, fish, powershell, zsh"
-        ));
+        assert!(!is_closed_pipe_error(&io(
+            "unknown shell `tcsh`, expected one of bash, elvish, fish, powershell, zsh"
+        )));
+        // Only I/O errors count, whatever their text says.
+        assert!(!is_closed_pipe_error(&clap::Error::raw(
+            ErrorKind::InvalidValue,
+            "Broken pipe (os error 32)"
+        )));
     }
 
     #[test]
