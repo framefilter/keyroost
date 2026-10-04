@@ -205,6 +205,12 @@ pub enum TransportError {
     /// permanently locked), so this is what the bare attempt got back from
     /// the card.
     PivResetUnverifiedFailed(Box<TransportError>),
+    /// A PIV RESET sent with `--force` on a card whose
+    /// [`keyroost_piv::compat::PivExtension::Reset`] support resolves
+    /// [`keyroost_piv::compat::FeatureGate::Unsupported`] was refused. Only the
+    /// bare RESET is sent on that path (the PIN and PUK are never blocked on
+    /// the support list's behalf), so this is what the card answered to it.
+    PivResetForcedFailed(Box<TransportError>),
     /// `PivSession::factory_reset`'s device-wide mechanism
     /// ([`keyroost_piv::compat::PivExtension::ResetGlobal`] — HID
     /// Crescendo's ACA RESET CARD today) failed: the SELECT, the
@@ -484,6 +490,22 @@ impl fmt::Display for TransportError {
                     )
                 }
             }
+            TransportError::PivResetForcedFailed(inner) => {
+                write!(
+                    f,
+                    "the card refused the PIV RESET sent with --force: {inner}. \
+                     The PIN and PUK were left as they were."
+                )?;
+                if matches!(inner.as_ref(), TransportError::PivResetNotAllowed) {
+                    write!(
+                        f,
+                        " If this card resets only once both are blocked, block \
+                         them deliberately, then run the reset again."
+                    )
+                } else {
+                    Ok(())
+                }
+            }
             TransportError::PivResetGlobalFailed(inner) => write!(
                 f,
                 "this device's device-wide reset mechanism failed: {inner}. No PIN \
@@ -618,6 +640,7 @@ impl std::error::Error for TransportError {
             TransportError::OpenPgpSlotMismatch(e) => Some(e),
             TransportError::PivParse(e) => Some(e),
             TransportError::PivResetUnverifiedFailed(e)
+            | TransportError::PivResetForcedFailed(e)
             | TransportError::PivResetGlobalFailed(e)
             | TransportError::PivResetManagementAuthFailed(e)
             | TransportError::PivDeleteKeyHidCrescendoGenericFailed(e) => Some(e.as_ref()),

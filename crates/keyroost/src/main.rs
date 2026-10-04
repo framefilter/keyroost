@@ -1498,6 +1498,7 @@ fn piv_factory_reset_message(e: TransportError) -> String {
         TransportError::PivResetUnsupported
         | TransportError::PivResetNeedsManagementAuth
         | TransportError::PivResetUnverifiedFailed(_)
+        | TransportError::PivResetForcedFailed(_)
         | TransportError::PivResetGlobalFailed(_)
         | TransportError::PivResetManagementAuthFailed(_)
         | TransportError::PivResetIncomplete(_)
@@ -9381,7 +9382,7 @@ impl App {
                     // nothing cached survives it — so `s.state()` below is
                     // already the post-reset state; there's nothing left to
                     // clear by hand.
-                    s.force_reset_if_known_supported(None)?;
+                    s.force_reset_if_known_supported(None, false)?;
                     let status = s.status()?;
                     Ok((status, s.state()))
                 });

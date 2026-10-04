@@ -556,7 +556,7 @@ enum Cmd {
         cmd: OtpCmd,
     },
     /// Factory-reset EVERY resettable applet on the selected key: OATH,
-    /// OpenPGP, PIV, Token2 OTP, then FIDO2. On a USB key the FIDO2 step ends
+    /// OpenPGP, Token2 OTP, PIV, then FIDO2. On a USB key the FIDO2 step ends
     /// with an unplug/replug + touch; a card in a smart-card reader is reset
     /// in place instead (no replug, no touch). Wipes all credentials, codes,
     /// keys, and PINs; each applet that completes comes back in factory
@@ -1335,7 +1335,7 @@ enum PivCmd {
         guid: Option<String>,
     },
     /// Reset the PIV application to factory defaults: Wipes all keys, certs,
-    /// and PINs.This typically requires both the PIN and PUK to already be
+    /// and PINs. This typically requires both the PIN and PUK to already be
     /// blocked. This is arranged automatically if the device is known to
     /// support RESET. On an unverified device, only a bare RESET is sent,
     /// with nothing done to arrange any precondition itself — if it does turn
@@ -1358,7 +1358,9 @@ enum PivCmd {
         reader: Option<String>,
         #[arg(long)]
         yes: bool,
-        /// Run even on a device known to be incompatible (the operation will likely fail).
+        /// Run even on a device listed as incompatible. There it sends one bare
+        /// RESET without blocking the PIN or PUK; if the card can't reset, it
+        /// refuses.
         #[arg(long)]
         force: bool,
         /// The management key, as hex, read from this environment variable
@@ -5657,6 +5659,7 @@ fn reset_one_card_applet(
                         e @ (TransportError::PivResetIncomplete(_)
                         | TransportError::PivPukGuessAccepted
                         | TransportError::PivResetUnverifiedFailed(_)
+                        | TransportError::PivResetForcedFailed(_)
                         | TransportError::PivResetGlobalFailed(_)
                         | TransportError::PivResetManagementAuthFailed(_)),
                     ) => StepOutcome::Failed(sanitize_terminal(&e.to_string())),
@@ -8113,8 +8116,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // since the authenticated session above is what actually
                     // satisfies `NeedsManagementAuth` here; threaded through anyway
                     // so nothing here needs to change if the plain PIV-only RESET
-                    // ever grows its own use for it.
-                    s.force_reset_if_known_supported(current)?;
+                    // ever grows its own use for it. `--force` on a card listed
+                    // without RESET sends one bare RESET and blocks nothing.
+                    s.force_reset_if_known_supported(current, *force)?;
                     println!("PIV application reset to factory defaults on {}.", serial);
                     Ok(())
                 },

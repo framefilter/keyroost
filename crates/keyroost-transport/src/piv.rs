@@ -5320,7 +5320,13 @@ impl<'tx> PivSession<'tx> {
     ///   blocked first.
     /// * [`FeatureGate::Unsupported`] — fails immediately with
     ///   [`TransportError::PivResetUnsupported`], without sending anything to
-    ///   the card: `PivExtension::Reset` is a confirmed dead end here.
+    ///   the card, unless `send_if_listed_unsupported` is set (the CLI's
+    ///   `--force`). Then a bare [`Self::reset`] is sent, exactly as for
+    ///   `Unverified`: the support list can be wrong (newer firmware), so the
+    ///   card gets to answer for itself, but the PIN and PUK are never blocked
+    ///   on the list's behalf — if the list is right, that would leave PIV
+    ///   locked with no way back. A refusal comes back as
+    ///   [`TransportError::PivResetForcedFailed`].
     ///
     /// `pre_reset_mgmt_auth` takes the same [`CurrentMgmtAuth`] shape
     /// [`Self::factory_reset`] does and is threaded straight through to
@@ -5336,15 +5342,20 @@ impl<'tx> PivSession<'tx> {
     pub fn force_reset_if_known_supported(
         &mut self,
         pre_reset_mgmt_auth: Option<CurrentMgmtAuth<'_>>,
+        send_if_listed_unsupported: bool,
     ) -> Result<FactoryResetOutcome, TransportError> {
-        use keyroost_piv::compat::{FeatureGate, PivExtension};
-        match self.extension_gate(PivExtension::Reset) {
-            FeatureGate::Unsupported => Err(TransportError::PivResetUnsupported),
-            FeatureGate::Unverified => self
+        let gate = self.extension_gate(keyroost_piv::compat::PivExtension::Reset);
+        match reset_route(gate, send_if_listed_unsupported) {
+            ResetRoute::Refuse => Err(TransportError::PivResetUnsupported),
+            ResetRoute::BareUnverified => self
                 .reset(pre_reset_mgmt_auth)
                 .map(|()| FactoryResetOutcome::Wiped)
                 .map_err(|e| TransportError::PivResetUnverifiedFailed(Box::new(e))),
-            FeatureGate::Supported => self.force_reset(pre_reset_mgmt_auth),
+            ResetRoute::BareForced => self
+                .reset(pre_reset_mgmt_auth)
+                .map(|()| FactoryResetOutcome::Wiped)
+                .map_err(|e| TransportError::PivResetForcedFailed(Box::new(e))),
+            ResetRoute::Escalating => self.force_reset(pre_reset_mgmt_auth),
         }
     }
 
@@ -5378,12 +5389,17 @@ impl<'tx> PivSession<'tx> {
     /// [`Self::transmit_full`]'s lazy-select guarantee and could send it to
     /// whatever applet happens to be selected instead of PIV.
     fn transmit_full_raw(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
-        let cmd_sensitive = piv_cmd_sensitive(apdu);
+        // The PIN-protected data object holds a copy of the management key:
+        // hide what PUT DATA writes there and what GET DATA reads back.
+        let pin_protected = targets_pin_protected_object(apdu);
+        let cmd_sensitive =
+            piv_cmd_sensitive(apdu) || (pin_protected && apdu.get(1) == Some(&0xDB));
         // GENERAL AUTHENTICATE responses today are only ciphertext (witness /
         // encrypted challenge), but the same INS in signing/decrypt mode
         // returns recovered plaintext — redact uniformly so a future caller
         // can't leak through a trace.
-        let resp_sensitive = apdu.get(1) == Some(&0x87);
+        let resp_sensitive =
+            apdu.get(1) == Some(&0x87) || (pin_protected && apdu.get(1) == Some(&0xCB));
         // `describe` makes `transmit_applet` bracket every transmitted APDU —
         // the caller's command and each GET RESPONSE / Le-corrected reissue —
         // with a `>` line naming the command and a `<` line reading its status
@@ -5586,6 +5602,54 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
         }
         _ if aid == keyroost_token2otp::OTP_APPLET_AID => Some("Token2 OTP applet"),
         _ => None,
+    }
+}
+
+/// Whether `apdu` is a GET DATA / PUT DATA aimed at
+/// [`keyroost_piv::OBJECT_PIN_PROTECTED_DATA`], whose contents include the
+/// management key. Reads the object selector (`5C 03 5F C1 09`) at the start
+/// of the command body, after a short or extended-length header.
+#[must_use]
+fn targets_pin_protected_object(apdu: &[u8]) -> bool {
+    if !matches!(apdu.get(1), Some(0xCB) | Some(0xDB)) {
+        return false;
+    }
+    let body = match apdu.get(4) {
+        Some(0) if apdu.len() > 7 => &apdu[7..],
+        Some(_) if apdu.len() > 5 => &apdu[5..],
+        _ => return false,
+    };
+    let obj = keyroost_piv::OBJECT_PIN_PROTECTED_DATA;
+    body.len() >= 2 + obj.len()
+        && body[0] == 0x5C
+        && body[1] == obj.len() as u8
+        && body[2..2 + obj.len()] == obj
+}
+
+/// How [`PivSession::force_reset_if_known_supported`] resets, given the
+/// card's RESET support and whether the caller asked to send it anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetRoute {
+    /// Send nothing: the support list says this card has no RESET.
+    Refuse,
+    /// One bare RESET, nothing blocked: the card isn't in the list.
+    BareUnverified,
+    /// One bare RESET, nothing blocked: listed unsupported, sent anyway.
+    BareForced,
+    /// RESET, blocking the PIN and then the PUK if the card asks for that.
+    Escalating,
+}
+
+fn reset_route(
+    gate: keyroost_piv::compat::FeatureGate,
+    send_if_listed_unsupported: bool,
+) -> ResetRoute {
+    use keyroost_piv::compat::FeatureGate;
+    match gate {
+        FeatureGate::Supported => ResetRoute::Escalating,
+        FeatureGate::Unverified => ResetRoute::BareUnverified,
+        FeatureGate::Unsupported if send_if_listed_unsupported => ResetRoute::BareForced,
+        FeatureGate::Unsupported => ResetRoute::Refuse,
     }
 }
 
@@ -5972,7 +6036,7 @@ fn internal_read_decision(
         ),
         (keyroost_piv::compat::FeatureGate::Unsupported, true) => (
             true,
-            Some("listed unsupported for this applet; sending anyway (Enable Anyway)"),
+            Some("listed unsupported for this applet; sending anyway (Enable Anyway / --force)"),
         ),
         _ => (true, None),
     }
@@ -7514,6 +7578,64 @@ mod tests {
             internal_read_decision(FeatureGate::Supported, true),
             (true, None)
         );
+    }
+
+    #[test]
+    fn pin_protected_management_key_never_reaches_a_trace() {
+        let obj = keyroost_piv::OBJECT_PIN_PROTECTED_DATA;
+        let key = [0xAB; 24];
+        let inner = keyroost_piv::build_pin_protected_management_key(&key);
+        let put = piv::put_data(&obj, &inner);
+        let get = piv::get_data(&obj);
+        assert!(targets_pin_protected_object(&put));
+        assert!(targets_pin_protected_object(&get));
+        // Other objects (certificates, CHUID) still trace in full.
+        assert!(!targets_pin_protected_object(&piv::get_data(&[
+            0x5F, 0xC1, 0x02
+        ])));
+        assert!(!targets_pin_protected_object(&piv::put_data(
+            &[0x5F, 0xC1, 0x05],
+            &[1, 2, 3]
+        )));
+        // The traced form of the PUT DATA carries no key byte.
+        let dumped = crate::dump_cmd(&put, true);
+        assert!(
+            !dumped.contains("AB AB") && !dumped.to_lowercase().contains("abab"),
+            "{dumped}"
+        );
+    }
+
+    #[test]
+    fn forced_reset_on_a_listed_unsupported_card_sends_only_a_bare_reset() {
+        use keyroost_piv::compat::FeatureGate;
+        assert_eq!(
+            reset_route(FeatureGate::Unsupported, false),
+            ResetRoute::Refuse
+        );
+        // --force: one bare RESET, never the PIN/PUK-blocking path.
+        assert_eq!(
+            reset_route(FeatureGate::Unsupported, true),
+            ResetRoute::BareForced
+        );
+        for force in [false, true] {
+            assert_eq!(
+                reset_route(FeatureGate::Unverified, force),
+                ResetRoute::BareUnverified
+            );
+            assert_eq!(
+                reset_route(FeatureGate::Supported, force),
+                ResetRoute::Escalating
+            );
+        }
+    }
+
+    #[test]
+    fn forced_reset_refusal_says_the_pin_and_puk_were_left_alone() {
+        let e = TransportError::PivResetForcedFailed(Box::new(TransportError::PivResetNotAllowed));
+        let msg = e.to_string();
+        assert!(msg.contains("--force"), "{msg}");
+        assert!(msg.contains("left as they were"), "{msg}");
+        assert!(msg.contains("block them deliberately"), "{msg}");
     }
 
     #[test]
