@@ -8358,6 +8358,12 @@ fn guard_piv_feature(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_piv::compat::{FeatureGate, PivExtension};
+    // --force also covers the internal reads the table would skip (GET
+    // METADATA, ATTEST) for the rest of this command, like the GUI's "Enable
+    // Anyway"; each one still leaves a --debug trace line.
+    if force {
+        session.set_send_unsupported_reads(true);
+    }
     let needs = extension.requirement();
     match session.feature_gate(extension) {
         FeatureGate::Supported => {}

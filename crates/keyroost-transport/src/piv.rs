@@ -2491,6 +2491,15 @@ impl<'tx> PivSession<'tx> {
         )
     }
 
+    /// Send internal reads the compatibility table lists as unsupported (GET
+    /// METADATA, ATTEST) for the rest of this session instead of skipping
+    /// them — the CLI's `--force`, matching what
+    /// [`PivSessionState::set_send_unsupported_reads`] does for a cached
+    /// state. RESET is unaffected.
+    pub fn set_send_unsupported_reads(&mut self, send: bool) {
+        self.state.send_unsupported_reads = send;
+    }
+
     /// Whether to send an internal read (GET METADATA / ATTEST) the
     /// compatibility table may list as unsupported. Skips it when the table
     /// says unsupported, unless the caller chose to send such reads anyway
