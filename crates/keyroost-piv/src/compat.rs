@@ -352,76 +352,75 @@ impl PivExtension {
     pub fn requirement(self) -> String {
         match self {
             PivExtension::MoveKey => {
-                "Moving keys between slots needs YubiKey 5.7+ or a compatible third-party device."
+                "Moving keys between slots is an extension to standard PIV (YubiKey 5.7+ and \
+                 other keys that implement it)."
                     .to_string()
             }
             PivExtension::DeleteKey => {
-                "Key deletion needs YubiKey 5.7+ or a compatible third-party device.".to_string()
+                "Deleting a key is an extension to standard PIV (YubiKey 5.7+ and other keys \
+                 that implement it)."
+                    .to_string()
             }
             PivExtension::GetMetadata => {
-                "Reading key/PIN metadata needs YubiKey firmware 5.3+ or a compatible \
-                 third-party device."
+                "Reading key/PIN metadata is an extension to standard PIV (YubiKey 5.3+ and \
+                 other keys that implement it)."
                     .to_string()
             }
             PivExtension::GetSlotKeyStatus => {
-                "Reading a slot's key occupancy directly needs YubiKey firmware 5.3+ or a \
-                 compatible third-party device."
+                "Reading a slot's key occupancy directly is an extension to standard PIV \
+                 (YubiKey 5.3+ and other keys that implement it)."
                     .to_string()
             }
             PivExtension::Attest => {
-                "Reading a key's attestation certificate needs YubiKey firmware 4.3+ or a \
-                 compatible third-party device."
+                "Reading a key's attestation certificate is an extension to standard PIV \
+                 (YubiKey 4.3+ and other keys that implement it)."
                     .to_string()
             }
             PivExtension::PinManagementAuth => {
-                "Unlocking management with a PIN instead of the management key needs \
-                 YubiKey 3+ or a compatible third-party device."
+                "Unlocking management with the PIN instead of the management key is an \
+                 extension to standard PIV (YubiKey 3+ and other keys that implement it)."
                     .to_string()
             }
             PivExtension::Reset => {
-                "Resetting the PIV applet needs a YubiKey or a compatible third-party device."
+                "Resetting the PIV applet is an extension to standard PIV (YubiKey and other \
+                 keys that implement it)."
                     .to_string()
             }
             PivExtension::ResetGlobal => {
-                "A device-wide reset that takes PIV with it needs a compatible third-party \
-                 device (e.g. HID Crescendo)."
+                "A device-wide reset that includes PIV uses the device's own command (e.g. \
+                 HID Crescendo)."
                     .to_string()
             }
             PivExtension::SetPinPukRetries => {
-                "Setting the PIN/PUK retry counts needs a YubiKey or a compatible third-party \
-                 device."
+                "Setting the PIN/PUK retry counts is an extension to standard PIV (YubiKey \
+                 and other keys that implement it)."
                     .to_string()
             }
             PivExtension::SetManagementKey => {
-                "Changing the management key needs a YubiKey or a compatible third-party device."
+                "Changing the management key is an extension to standard PIV (YubiKey and \
+                 other keys that implement it)."
                     .to_string()
             }
             PivExtension::SlotPinPolicy => {
-                "Setting a slot's PIN policy needs YubiKey firmware 4+ or a compatible \
-                 third-party device."
+                "Setting a slot's PIN policy is an extension to standard PIV (YubiKey 4+ and \
+                 other keys that implement it)."
                     .to_string()
             }
             PivExtension::SlotTouchPolicy => {
-                "Setting a slot's touch policy needs YubiKey firmware 4+ or a compatible \
-                 third-party device."
+                "Setting a slot's touch policy is an extension to standard PIV (YubiKey 4+ \
+                 and other keys that implement it)."
                     .to_string()
             }
             PivExtension::SlotKeyAlgorithm(alg) => {
-                format!(
-                    "Generating a {} key needs a compatible device.",
-                    alg.label()
-                )
+                format!("Not every key can generate {} keys.", alg.label())
             }
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete) => {
-                "Deleting the management key outright needs a compatible third-party device \
-                 (e.g. HID Crescendo)."
+                "Deleting the management key outright uses the device's own command (e.g. \
+                 HID Crescendo)."
                     .to_string()
             }
             PivExtension::ManagementKeyAlgorithm(alg) => {
-                format!(
-                    "Using a {} management key needs a compatible device.",
-                    alg.label()
-                )
+                format!("Not every key accepts a {} management key.", alg.label())
             }
         }
     }
@@ -3563,12 +3562,12 @@ impl FeatureGate {
     /// Sentence that follows [`PivExtension::requirement`] when a control is
     /// gated [`Unverified`](Self::Unverified): the device has no
     /// known-support data, so support can't be confirmed either way.
-    pub const UNVERIFIED_SUFFIX: &'static str =
-        "This device is unverified; the operation may fail.";
+    pub const UNVERIFIED_SUFFIX: &'static str = "keyroost's list has no entry for this key yet.";
     /// Sentence that follows [`PivExtension::requirement`] when a control is
     /// gated [`Unsupported`](Self::Unsupported): a known-unsupported verdict covers
     /// this device's version.
-    pub const INCOMPATIBLE_SUFFIX: &'static str = "This device is known to be incompatible.";
+    pub const INCOMPATIBLE_SUFFIX: &'static str =
+        "keyroost's list marks this key as not supporting it.";
 }
 
 /// Resolve `extension` for an applet fingerprinted as `fingerprint`, reporting

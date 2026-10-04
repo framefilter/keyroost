@@ -1169,8 +1169,8 @@ fn factory_reset_confirm_summary(
             FactoryResetPivPreview::Resolved(PivResetPreview::Piv(
                 FactoryResetPlan::Unverified,
             )) => {
-                "\n\nPIV: RESET support on this device is unverified. keyroost will \
-                 attempt it without blocking the PIN and PUK first \u{2014} consult \
+                "\n\nPIV: keyroost's list has no RESET entry for this key, so it will \
+                 try it without blocking the PIN and PUK first \u{2014} consult \
                  this device's own documentation for any precondition (commonly: \
                  the PIN and PUK both already blocked) and complete it manually if \
                  the attempt fails."
@@ -9305,8 +9305,8 @@ impl App {
                                     let action = if allow_pin_unlock { "enable" } else { "disable" };
                                     pin_unlock_warning = Some(format!(
                                         "Could not {action} PIN-protected management-key \
-                                         storage ({e}) — support for this is unverified on \
-                                         this device, so this may be expected."
+                                         storage ({e}). keyroost's list has no entry for \
+                                         this on this key."
                                     ));
                                 }
                             }
@@ -17380,7 +17380,7 @@ impl App {
                 let mgmt_alg_unverified =
                     piv_mgmtalg_unverified_labels(change_mgmt_key_gate, mgmt_alg_options, mgmtalg_gate);
                 let mgmt_alg_unverified_hint = format!(
-                    "Unverified on this device: {}. May not be supported.",
+                    "No entry for this key in keyroost's list: {}.",
                     mgmt_alg_unverified.join(", ")
                 );
                 ui.horizontal(|ui| {
@@ -17933,7 +17933,7 @@ impl App {
                     .map(keyroost_piv::KeyAlg::label)
                     .collect();
                 let gen_alg_unverified_hint = format!(
-                    "Unverified on this device: {}. May not be supported.",
+                    "No entry for this key in keyroost's list: {}.",
                     unverified_algs.join(", ")
                 );
                 ui.horizontal(|ui| {
@@ -19920,7 +19920,7 @@ mod tests {
             false,
             false,
         );
-        assert!(unverified.contains("unverified"), "{unverified}");
+        assert!(unverified.contains("no RESET entry"), "{unverified}");
         assert!(unverified.contains("without blocking"), "{unverified}");
         // Also atomic (a bare RESET attempt, no PIN/PUK burn) -- same
         // reasoning as NeedsManagementAuth above.

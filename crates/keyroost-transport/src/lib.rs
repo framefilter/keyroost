@@ -465,10 +465,9 @@ impl fmt::Display for TransportError {
             TransportError::PivResetUnverifiedFailed(inner) => {
                 write!(
                     f,
-                    "PIV RESET support on this card is unverified, so the factory \
-                     reset attempted it without first blocking the PIN and PUK \
-                     (doing so blindly risks a permanent lock if RESET turns out \
-                     unsupported here) \u{2014} and the card refused: {inner}."
+                    "keyroost's list has no RESET entry for this card, so the \
+                     factory reset sent it without first blocking the PIN and PUK \
+                     \u{2014} and the card refused: {inner}."
                 )?;
                 // `PivResetNotAllowed`'s own message already states the exact
                 // precondition the card reported (SW_AUTH_BLOCKED /

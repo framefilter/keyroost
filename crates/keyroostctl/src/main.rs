@@ -1018,21 +1018,19 @@ enum PivCmd {
     },
     /// Change the card-management (9B) key.
     ///
-    /// Changing the management key needs a YubiKey or a compatible
-    /// third-party device: refused on a device known to be incompatible
-    /// unless `--force`, runs with a warning on an unverified one, silent on a
-    /// known-good one.
+    /// Changing the management key is an extension to standard PIV (YubiKey
+    /// and other keys that implement it).
+    /// If keyroost's list marks this key as not supporting it, the command
+    /// stops unless `--force`; a key with no entry gets a warning.
     ///
     /// On every device except HID Crescendo (which unlocks management
     /// directly off the PIN, with no key material to store), this also
     /// maintains Yubico's PIN-protected management-key storage, enabling it
-    /// with `--allow-pin-unlock` or disabling it without — gated on
-    /// `PivExtension::PinManagementAuth`: silent on a known-good device, a
-    /// warning on an unverified one. On a device known unable to support it,
-    /// `--allow-pin-unlock` is refused unless `--force`; left unset, the
-    /// maintenance step is silently skipped instead — a plain key rotation on
-    /// such a device isn't blocked just because pin-unlock, which it never
-    /// asked to touch, is confirmed absent.
+    /// with `--allow-pin-unlock` or disabling it without. The same list
+    /// applies: a key with no entry gets a warning. If the list marks
+    /// this key as not supporting it, `--allow-pin-unlock` stops unless
+    /// `--force`, and without it the step is skipped, so a plain key rotation
+    /// isn't blocked.
     ChangeManagementKey {
         // Explicit `display_order` on every field here (10.. up, one per
         // field, matching declaration order): clap-derive's implicit order
@@ -1080,7 +1078,7 @@ enum PivCmd {
         /// no key material of its own to store.
         #[arg(long, display_order = 18)]
         allow_pin_unlock: bool,
-        /// Run even on a device known to be incompatible (the operation will likely fail).
+        /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long, display_order = 19)]
         force: bool,
     },
@@ -1123,8 +1121,8 @@ enum PivCmd {
         /// generation into the signing command.
         #[arg(long, value_name = "PATH")]
         save_pubkey: Option<std::path::PathBuf>,
-        /// Run even with a PIN/touch policy known to be incompatible with
-        /// this device (the operation will likely fail).
+        /// Run even if keyroost's list marks this key as not supporting the
+        /// chosen key type, PIN policy or touch policy.
         #[arg(long)]
         force: bool,
     },
@@ -1336,15 +1334,15 @@ enum PivCmd {
     },
     /// Reset the PIV application to factory defaults: Wipes all keys, certs,
     /// and PINs. This typically requires both the PIN and PUK to already be
-    /// blocked. This is arranged automatically if the device is known to
-    /// support RESET. On an unverified device, only a bare RESET is sent,
-    /// with nothing done to arrange any precondition itself — if it does turn
-    /// out to need PIN/PUK already blocked, the caller must prepare manually.
+    /// blocked; keyroost arranges that itself where its list says the key
+    /// supports RESET. A key with no entry gets a warning and a single bare
+    /// RESET with nothing blocked; if it needs the PIN and PUK blocked first,
+    /// block them yourself and run it again.
     ///
-    /// Resetting the PIV applet needs a YubiKey or a compatible third-party
-    /// device: refused on a device known to be incompatible unless
-    /// `--force`, runs with a warning on an unverified one, silent on a
-    /// known-good one.
+    /// Resetting the PIV applet is an extension to standard PIV (YubiKey and
+    /// other keys that implement it). If keyroost's list marks this key as
+    /// not supporting it, the command stops unless `--force`, which sends a
+    /// single bare RESET.
     ///
     /// Some cards protect reset behind management auth instead of the
     /// PIN/PUK convention above. Whether that applies to the selected device
@@ -1428,10 +1426,10 @@ enum PivCmd {
     /// key material — the certificate object is left in place. Needs the
     /// management key. DESTRUCTIVE: requires `--yes`.
     ///
-    /// Key deletion needs YubiKey 5.7+ or a compatible third-party device: on
-    /// a device known to be incompatible it is refused (pass `--force` to
-    /// run anyway), on an unverified device it runs with a warning that it
-    /// may fail, and on a known-good device it just runs.
+    /// Deleting a key is an extension to standard PIV (YubiKey 5.7+ and other
+    /// keys that implement it).
+    /// If keyroost's list marks this key as not supporting it, the command
+    /// stops unless `--force`; a key with no entry gets a warning.
     DeleteKey {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1447,7 +1445,7 @@ enum PivCmd {
         mgmt_key_default: bool,
         #[arg(long)]
         yes: bool,
-        /// Run even on a device known to be incompatible (the operation will likely fail).
+        /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long)]
         force: bool,
     },
@@ -1455,10 +1453,10 @@ enum PivCmd {
     /// Non-destructive; refuses an occupied destination. The certificate stays
     /// in the source slot.
     ///
-    /// Moving keys between slots needs YubiKey 5.7+ or a compatible
-    /// third-party device: refused on a device known to be incompatible
-    /// unless `--force`, runs with a warning on an unverified one, silent on a
-    /// known-good one.
+    /// Moving keys between slots is an extension to standard PIV (YubiKey 5.7+
+    /// and other keys that implement it).
+    /// If keyroost's list marks this key as not supporting it, the command
+    /// stops unless `--force`; a key with no entry gets a warning.
     MoveKey {
         /// Source slot (9a/9c/9d/9e/82–95).
         #[arg(long)]
@@ -1477,7 +1475,7 @@ enum PivCmd {
         /// one is known; fails with a clear error if it isn't.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
-        /// Run even on a device known to be incompatible (the operation will likely fail).
+        /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long)]
         force: bool,
     },
@@ -7528,8 +7526,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             }
                             eprintln!(
                                 "warning: management key changed, but could not {action} \
-                                 PIN-protected management-key storage ({e}) — support for \
-                                 this is unverified on this device, so this may be expected."
+                                 PIN-protected management-key storage ({e}). keyroost's list \
+                                 has no entry for this on this key."
                             );
                         }
                     }
@@ -8419,8 +8417,8 @@ fn reset_global_alternative_hint(
                 .to_string(),
         ),
         FeatureGate::Unverified => Some(
-            "Its whole-device factory reset is unverified but may work — run \
-             `keyroostctl factory-reset` instead."
+            "It may reset as a whole device instead — try \
+             `keyroostctl factory-reset`."
                 .to_string(),
         ),
         FeatureGate::Unsupported => None,
