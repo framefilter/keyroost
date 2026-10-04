@@ -2736,6 +2736,24 @@ impl<'tx> PivSession<'tx> {
         Some(clear_metadata_if_quirky(&self.quirks(), md))
     }
 
+    /// The bare status word of a GET METADATA for `key_ref`, reply body
+    /// discarded. Read-only. `None` when the read is not sent (same
+    /// compatibility gate as [`Self::metadata`]) or the transmit fails. For
+    /// a caller that must tell "the card says there is no key here"
+    /// ([`piv::SW_REFERENCE_NOT_FOUND`]) apart from every other answer,
+    /// which [`Self::metadata`] folds into one `None`.
+    pub fn metadata_status(&mut self, key_ref: u8) -> Option<u16> {
+        if !self.internal_read_allowed(
+            keyroost_piv::compat::PivExtension::GetMetadata,
+            "GET METADATA",
+        ) {
+            return None;
+        }
+        self.transmit_full(&piv::get_metadata(key_ref))
+            .ok()
+            .map(|(_, sw)| sw)
+    }
+
     /// One live [`Self::metadata`]`(slot.key_ref())` read, decoded straight
     /// into the *final* facts a caller actually wants — never kept around as
     /// an intermediate [`Metadata`] value:

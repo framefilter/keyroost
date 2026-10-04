@@ -4025,8 +4025,12 @@ fn run_molto(
              Rotate it first: keyroostctl molto customer-key (see --help)."
         );
     }
-    // Bulk import reads its file (and any vault password) up front: the
-    // slots it will write must be known before asking about them.
+    // Bulk import reads its file — and so any vault password, from the
+    // environment or stdin — before the question, unlike every other
+    // secret: which slots it writes, and so whether to ask at all, depends
+    // on the entries inside. A password on stdin means stdin is not a
+    // terminal, so it can never be mistaken for the answer (there is no
+    // question then; an occupied slot needs --yes).
     let bulk = match cmd {
         MoltoCmd::ImportFile {
             path,
@@ -4391,6 +4395,24 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             base32_stdin,
             yes,
         } => {
+            let resolve = || {
+                resolve_prog_seed(
+                    hex.as_deref(),
+                    base32.as_deref(),
+                    hex_env.as_deref(),
+                    base32_env.as_deref(),
+                    *hex_stdin,
+                    *base32_stdin,
+                )
+            };
+            // A seed given on the command line is checked before touching
+            // the device; one from the environment or stdin is read only
+            // after the answer.
+            let early = if hex.is_some() || base32.is_some() {
+                Some(resolve()?)
+            } else {
+                None
+            };
             let dev = crate::target::select(Need::Prog, reader.as_deref(), None)?;
             let name = crate::target::reader_for(Need::Prog, reader.as_deref())?;
             let mut session = Token2ProgSession::open_named(&name)?;
@@ -4400,14 +4422,10 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // wrong card on a shared reader.
             prog_guard_model(&mut session)?;
             crate::prompt::confirm_on(&dev, *yes, "overwrite the programmable token's seed")?;
-            let seed = resolve_prog_seed(
-                hex.as_deref(),
-                base32.as_deref(),
-                hex_env.as_deref(),
-                base32_env.as_deref(),
-                *hex_stdin,
-                *base32_stdin,
-            )?;
+            let seed = match early {
+                Some(seed) => seed,
+                None => resolve()?,
+            };
             session.authenticate()?;
             session.set_seed(&seed)?;
             println!("seed programmed ({} bytes).", seed.len());
@@ -6248,6 +6266,31 @@ fn otp_feature_capability(
 /// Best-effort by design: this only helps when the config read SUCCEEDS. A key
 /// whose exchange fails outright never yields a capability byte, and the command
 /// proceeds exactly as before so that failure is reported unchanged.
+/// Read-only look before asking: open a session, refuse a key without
+/// `feature` (as [`ensure_otp_feature`] does), and close the session again
+/// so nothing is held open while the user answers. Returns the device
+/// configuration, `None` when it couldn't be read.
+fn otp_precheck(
+    dev: &keyroost_resolve::Device,
+    transport: OtpTransportArg,
+    debug: bool,
+    feature: OtpFeature,
+) -> Result<Option<keyroost_token2otp::DeviceInfo>, Box<dyn std::error::Error>> {
+    let mut session = open_otp_on(dev, transport, debug)?;
+    let info = session.read_device_info().ok();
+    if otp_feature_capability(info.as_ref(), feature) == Some(false) {
+        return Err(feature.missing_message().into());
+    }
+    Ok(info)
+}
+
+/// Whether the HOTP-on-button slot may hold a seed. Fail-closed: an
+/// unreadable configuration, or a short reply without the config byte
+/// (some CCID/NFC paths), counts as configured.
+fn button_hotp_maybe_configured(info: Option<&keyroost_token2otp::DeviceInfo>) -> bool {
+    info.is_none_or(|i| !i.has_config_byte() || i.button_hotp_configured())
+}
+
 fn ensure_otp_feature(
     session: &mut keyroost_transport::Token2OtpSession,
     feature: OtpFeature,
@@ -6415,6 +6458,7 @@ fn run_otp(
                 format!("{app}:{account}")
             };
             let dev = select_otp(&sel)?;
+            otp_precheck(&dev, sel.transport, debug, OtpFeature::OnDevice)?;
             crate::prompt::confirm_on(&dev, *yes, &format!("delete OTP entry {label:?}"))?;
             let pin = if pin_env.is_some() || *pin_stdin {
                 Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
@@ -6422,7 +6466,6 @@ fn run_otp(
                 None
             };
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
-            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.delete_entry_pinned(app, account, pin.as_deref().map(|p| p.as_str()))?;
             println!("Deleted OTP entry {label:?}.");
         }
@@ -6461,18 +6504,10 @@ fn run_otp(
                 return Err("button HOTP --digits must be 6 or 8".into());
             }
             let dev = select_otp(&sel)?;
-            // Read-only look first, on a session closed again before asking:
-            // an unsupported key fails here, and an empty button slot needs
-            // no question. Unreadable configuration counts as configured.
-            let configured = {
-                let mut session = open_otp_on(&dev, sel.transport, debug)?;
-                let info = session.read_device_info().ok();
-                if otp_feature_capability(info.as_ref(), OtpFeature::ButtonHotp) == Some(false) {
-                    return Err(OtpFeature::ButtonHotp.missing_message().into());
-                }
-                info.is_none_or(|i| i.button_hotp_configured())
-            };
-            if configured {
+            // An unsupported key fails here, and an empty button slot needs
+            // no question.
+            let info = otp_precheck(&dev, sel.transport, debug, OtpFeature::ButtonHotp)?;
+            if button_hotp_maybe_configured(info.as_ref()) {
                 crate::prompt::confirm_on(&dev, *yes, "replace the HOTP-on-button seed")?;
             }
             let seed_b32 = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
@@ -6484,9 +6519,9 @@ fn run_otp(
         }
         OtpCmd::DeleteButtonHotp { yes } => {
             let dev = select_otp(&sel)?;
+            otp_precheck(&dev, sel.transport, debug, OtpFeature::ButtonHotp)?;
             crate::prompt::confirm_on(&dev, *yes, "delete the HOTP-on-button seed")?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
-            ensure_otp_feature(&mut session, OtpFeature::ButtonHotp)?;
             session.delete_button_hotp()?;
             println!("Deleted the HOTP-on-button keystroke slot.");
         }
@@ -8704,28 +8739,52 @@ fn slot_name(s: CliPivSlot) -> String {
         .unwrap_or_default()
 }
 
-/// Known empty = the card answers GET METADATA at all (probed on the
-/// management key, 9B) yet reports no key in the slot, and no certificate
-/// is stored. A card that can't tell is treated as occupied: ask.
+/// Whether `quirks` include one that makes this card's GET METADATA answer
+/// untrustworthy, so its "no key here" can't be taken at its word either.
+fn piv_metadata_quirky(
+    quirks: &std::collections::BTreeSet<keyroost_piv::compat::PivQuirk>,
+) -> bool {
+    use keyroost_piv::compat::PivQuirk;
+    quirks.contains(&PivQuirk::InsF7MetadataAlgorithmInvalid)
+        || quirks.contains(&PivQuirk::InsF7MetadataPinTouchPolicyInvalid)
+}
+
+/// The fail-closed "nothing to lose in this slot" decision. Only a card
+/// without a metadata quirk that answers the slot's GET METADATA with
+/// "reference data not found" says there is no key; anything else — no
+/// answer, a transmit error, a reply with a body (some cards answer that
+/// way for slots that were never used, which can't be told apart from a
+/// key) — counts as a key. The certificate must also be known absent.
+fn piv_slot_empty_from(metadata_sw: Option<u16>, metadata_quirky: bool, cert_absent: bool) -> bool {
+    !metadata_quirky && metadata_sw == Some(keyroost_piv::SW_REFERENCE_NOT_FOUND) && cert_absent
+}
+
+/// A certificate is known absent only when the read succeeded and found
+/// none; an unreadable one, or a failed read, counts as present.
+fn piv_cert_absent_from<E>(cert: &Result<Option<Vec<u8>>, E>) -> bool {
+    matches!(cert, Ok(None))
+}
+
+/// Known empty: see [`piv_slot_empty_from`]. A card that can't tell is
+/// treated as occupied, so the user is asked.
 fn piv_slot_known_empty(
     s: &mut keyroost_transport::PivSession<'_>,
     slot: keyroost_piv::Slot,
 ) -> Result<bool, TransportError> {
-    let metadata_supported = s.metadata(0x9B).is_some();
-    Ok(
-        metadata_supported
-            && !s.slot_has_key(slot)?
-            && matches!(s.read_certificate(slot), Ok(None)),
-    )
+    let quirky = piv_metadata_quirky(&s.quirks());
+    let sw = s.metadata_status(slot.key_ref());
+    // Only worth reading the certificate when the key answer allows "empty".
+    let cert_absent =
+        piv_slot_empty_from(sw, quirky, true) && piv_cert_absent_from(&s.read_certificate(slot));
+    Ok(piv_slot_empty_from(sw, quirky, cert_absent))
 }
 
-/// Known to hold no certificate: the read succeeded and found none. An
-/// unreadable certificate still counts as one.
+/// Known to hold no certificate (see [`piv_cert_absent_from`]).
 fn piv_cert_known_absent(
     s: &mut keyroost_transport::PivSession<'_>,
     slot: keyroost_piv::Slot,
 ) -> Result<bool, TransportError> {
-    Ok(matches!(s.read_certificate(slot), Ok(None)))
+    Ok(piv_cert_absent_from(&s.read_certificate(slot)))
 }
 
 /// Select the PIV key and, unless `known_empty` shows there is nothing in
@@ -14270,6 +14329,60 @@ mod cli_tests {
             _ => return None,
         };
         Some(*yes)
+    }
+
+    #[test]
+    fn piv_slot_counts_as_empty_only_on_reference_not_found() {
+        let not_found = Some(keyroost_piv::SW_REFERENCE_NOT_FOUND);
+        // The one empty case: no quirk, 6A88, no certificate.
+        assert!(piv_slot_empty_from(not_found, false, true));
+        // Transmit error, or the read not sent at all: ask.
+        assert!(!piv_slot_empty_from(None, false, true));
+        // A metadata quirk makes the card's answer untrustworthy: ask.
+        assert!(!piv_slot_empty_from(not_found, true, true));
+        // Any other reply — a key, or a body that may or may not be one: ask.
+        assert!(!piv_slot_empty_from(Some(keyroost_piv::SW_OK), false, true));
+        assert!(!piv_slot_empty_from(Some(0x6A82), false, true));
+        assert!(!piv_slot_empty_from(Some(0x6D00), false, true));
+        // No key but a certificate (or one that can't be read): ask.
+        assert!(!piv_slot_empty_from(not_found, false, false));
+    }
+
+    #[test]
+    fn piv_metadata_quirks_are_recognised() {
+        use keyroost_piv::compat::PivQuirk;
+        use std::collections::BTreeSet;
+        assert!(!piv_metadata_quirky(&BTreeSet::new()));
+        assert!(piv_metadata_quirky(&BTreeSet::from([
+            PivQuirk::InsF7MetadataAlgorithmInvalid
+        ])));
+        assert!(piv_metadata_quirky(&BTreeSet::from([
+            PivQuirk::InsF7MetadataPinTouchPolicyInvalid
+        ])));
+    }
+
+    #[test]
+    fn piv_certificate_is_absent_only_when_read_and_missing() {
+        assert!(piv_cert_absent_from::<()>(&Ok(None)));
+        assert!(!piv_cert_absent_from::<()>(&Ok(Some(vec![0x30]))));
+        assert!(!piv_cert_absent_from(&Err(())));
+    }
+
+    #[test]
+    fn button_hotp_is_assumed_configured_unless_the_config_says_not() {
+        use keyroost_token2otp::DeviceInfo;
+        // Unreadable configuration: ask.
+        assert!(button_hotp_maybe_configured(None));
+        // A short CCID/NFC stub without the config byte: ask.
+        let stub = DeviceInfo::parse(&[0x07]).unwrap();
+        assert!(!stub.has_config_byte());
+        assert!(button_hotp_maybe_configured(Some(&stub)));
+        // Config byte present, button seed bit set: ask.
+        let set = DeviceInfo::parse(&[0x07, 0x80, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert!(button_hotp_maybe_configured(Some(&set)));
+        // Config byte present, bit clear: genuinely empty, no question.
+        let clear = DeviceInfo::parse(&[0x07, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert!(!button_hotp_maybe_configured(Some(&clear)));
     }
 
     #[test]
