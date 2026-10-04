@@ -484,7 +484,12 @@ struct Cli {
     // `oath add <NAME>` positional, `fido fingerprint --name`), so a credential
     // or fingerprint name was being consumed as this device selector. A distinct
     // id keeps the global selector separate from all of them.
-    #[arg(long, global = true, value_name = "KEY")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "KEY",
+        add = clap_complete::ArgValueCandidates::new(device_candidates)
+    )]
     device: Option<String>,
     /// Emit machine-readable JSON instead of human text (where supported: status
     /// and query commands). Side-effect commands ignore it.
@@ -497,7 +502,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Print shell completions to stdout (e.g. `keyroostctl completions bash
+    /// Print shell completions to stdout; they call back into keyroostctl so
+    /// `--device` completes saved key names (e.g. `keyroostctl completions bash
     /// > /etc/bash_completion.d/keyroostctl`).
     Completions {
         #[arg(value_enum)]
@@ -3641,7 +3647,7 @@ fn list_json_rows(
             let idx = devices
                 .iter()
                 .position(|x| std::ptr::eq(x, *d))
-                .unwrap_or(0);
+                .expect("row device must come from the same device list");
             json_out::ListRowJson {
                 number: *n,
                 device: keyroost_resolve::device_value(devices, idx),
@@ -3728,9 +3734,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pure-output subcommands: no device, no session.
     if let Cmd::Completions { shell } = cmd {
-        use clap::CommandFactory;
-        let mut c = Cli::command();
-        clap_complete::generate(*shell, &mut c, "keyroostctl", &mut std::io::stdout());
+        write_completion_registration(*shell, &mut std::io::stdout())?;
         return Ok(());
     }
     if let Cmd::Manpage { dir } = cmd {
@@ -11245,12 +11249,12 @@ fn install_broken_pipe_guard() {
 /// Broken-pipe panics arrive in two structurally different shapes that share
 /// no common prefix: std's `println!` formats the `io::Error` via `Display`
 /// (`"failed printing to stdout: Broken pipe (os error 32)"`), while
-/// clap_complete's generator formats it via `Debug`
+/// clap_complete's static generator formats it via `Debug`
 /// (`"failed to write completion file: Os { code: 32, kind: BrokenPipe, … }"`).
 ///
 /// So the match is deliberately **unanchored** — do NOT add a message-prefix
-/// check, it silently misses the clap_complete source (a regression caught by
-/// `tests/broken_pipe.rs`). The tokens are locale-independent where it counts:
+/// check, it silently misses the `Debug` shape (both shapes are pinned by the
+/// `broken_pipe_panic_detection` unit test). The tokens are locale-independent where it counts:
 /// `BrokenPipe` (the `Debug` kind name) covers the Debug shape and
 /// `(os error 32)` (the Rust-appended EPIPE errno on Linux/macOS) covers the
 /// Display shape, each surviving a translated non-C `LC_MESSAGES`; the
@@ -11262,7 +11266,67 @@ fn is_broken_pipe_panic(msg: &str) -> bool {
     msg.contains("BrokenPipe") || msg.contains("(os error 32)") || msg.contains("Broken pipe")
 }
 
+/// Whether a completion-engine error message is a closed stdout pipe.
+///
+/// clap flattens the engine's `io::Error` into its `Display` text, so the
+/// error kind is gone by the time [`main`] sees it. EPIPE reads as
+/// `"Broken pipe (os error 32)"` on Unix, which [`is_broken_pipe_panic`]
+/// already matches; Windows reports a closed pipe as `ERROR_BROKEN_PIPE` (109)
+/// or `ERROR_NO_DATA` (232) with a localized message, so match those codes.
+fn is_closed_pipe_error(msg: &str) -> bool {
+    is_broken_pipe_panic(msg)
+        || (cfg!(windows) && (msg.contains("(os error 109)") || msg.contains("(os error 232)")))
+}
+
+/// `--device` candidates for `keyring`: every saved friendly name, in file order.
+fn device_candidates_from(keyring: &Keyring) -> Vec<clap_complete::CompletionCandidate> {
+    keyring
+        .keys
+        .iter()
+        .map(|e| clap_complete::CompletionCandidate::new(&e.name))
+        .collect()
+}
+
+/// `--device` completion: saved names from keys.json only — never hardware.
+/// An unreadable keys.json completes nothing rather than failing the shell.
+fn device_candidates() -> Vec<clap_complete::CompletionCandidate> {
+    device_candidates_from(&Keyring::load_default().unwrap_or_default())
+}
+
+/// Write the shell snippet that registers keyroostctl's completions. The
+/// snippet calls back into `COMPLETE=<shell> keyroostctl …`, which [`main`]
+/// answers, so completions always match the installed binary.
+fn write_completion_registration(
+    shell: clap_complete::Shell,
+    out: &mut dyn std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use clap_complete::env::{Bash, Elvish, EnvCompleter, Fish, Powershell, Zsh};
+    let completer: &dyn EnvCompleter = match shell {
+        clap_complete::Shell::Bash => &Bash,
+        clap_complete::Shell::Zsh => &Zsh,
+        clap_complete::Shell::Fish => &Fish,
+        clap_complete::Shell::Elvish => &Elvish,
+        clap_complete::Shell::PowerShell => &Powershell,
+        other => return Err(format!("no completion support for {other}").into()),
+    };
+    completer.write_registration("COMPLETE", "keyroostctl", "keyroostctl", "keyroostctl", out)?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
+    // `COMPLETE=<shell> keyroostctl …` is the shell asking for completions:
+    // answer from keys.json and exit before anything else runs. Completion
+    // writes straight to stdout and reports a closed pipe as an error rather
+    // than panicking, so the panic guard below never sees it — exit 141
+    // quietly here instead, the same status the guard uses.
+    match clap_complete::CompleteEnv::with_factory(<Cli as clap::CommandFactory>::command)
+        .try_complete(std::env::args_os(), std::env::current_dir().ok().as_deref())
+    {
+        Ok(true) => return ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(e) if is_closed_pipe_error(&e.to_string()) => return ExitCode::from(141),
+        Err(e) => e.exit(),
+    }
     // A closed output pipe (`… | head`) should exit quietly, not panic.
     install_broken_pipe_guard();
     // HID enumeration (hidapi walking the system's device tree and parsing
@@ -11391,6 +11455,48 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn device_completion_offers_saved_names_only() {
+        let entry = |name: &str, serial: &str| keyroost_keyring::KeyEntry {
+            name: name.into(),
+            serial: serial.into(),
+            source: keyroost_keyring::IdSource::Usb,
+            vendor: None,
+            aaguid: None,
+            note: None,
+        };
+        let mut k = Keyring::default();
+        k.add(entry("yubi-test", "1")).unwrap();
+        k.add(entry("solo test", "2")).unwrap();
+        let got: Vec<String> = device_candidates_from(&k)
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, vec!["yubi-test".to_string(), "solo test".to_string()]);
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "device")
+            .unwrap();
+        assert!(arg.get::<clap_complete::ArgValueCandidates>().is_some());
+    }
+
+    #[test]
+    fn completions_print_a_callback_registration() {
+        let mut out = Vec::new();
+        write_completion_registration(clap_complete::Shell::Zsh, &mut out).unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .starts_with("#compdef keyroostctl"));
+        let mut out = Vec::new();
+        write_completion_registration(clap_complete::Shell::Bash, &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("COMPLETE") && s.contains("keyroostctl"));
+        // One completion mode only: there is no static-script variant.
+        assert!(parse(&["keyroostctl", "completions", "bash"]).is_ok());
+        assert!(parse(&["keyroostctl", "completions", "bash", "--static"]).is_err());
     }
 
     #[test]
@@ -12584,7 +12690,7 @@ mod cli_tests {
         assert!(is_broken_pipe_panic(
             "failed printing to stdout: Broken pipe (os error 32)"
         ));
-        // clap_complete Debug shape (what `completions … | head` panics with).
+        // clap_complete's static generator Debug shape.
         assert!(is_broken_pipe_panic(
             "failed to write completion file: Os { code: 32, kind: BrokenPipe, message: \"Broken pipe\" }"
         ));
@@ -12603,6 +12709,26 @@ mod cli_tests {
         // Unrelated panics fall through to the default hook.
         assert!(!is_broken_pipe_panic(
             "index out of bounds: the len is 3 but the index is 5"
+        ));
+    }
+
+    #[test]
+    fn closed_pipe_error_detection() {
+        // What the completion engine's error reads as on a closed stdout pipe.
+        assert!(is_closed_pipe_error("error: Broken pipe (os error 32)"));
+        assert!(is_closed_pipe_error("error: Rohrbruch (os error 32)"));
+        // Windows' closed-pipe codes count only on Windows.
+        assert_eq!(
+            is_closed_pipe_error("error: The pipe is being closed. (os error 232)"),
+            cfg!(windows)
+        );
+        assert_eq!(
+            is_closed_pipe_error("error: The pipe has been ended. (os error 109)"),
+            cfg!(windows)
+        );
+        // Other completion failures still surface.
+        assert!(!is_closed_pipe_error(
+            "error: unknown shell `tcsh`, expected one of bash, elvish, fish, powershell, zsh"
         ));
     }
 
