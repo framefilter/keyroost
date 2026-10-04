@@ -161,7 +161,6 @@ pub(crate) fn confirm_on(
     Ok(confirm(&mut RealTerm, yes, action, &key_label(d))?)
 }
 
-#[allow(dead_code)] // first caller: the typed-word commands (factory-reset, otp interface)
 pub(crate) fn confirm_typed_on(
     d: &Device,
     yes: bool,

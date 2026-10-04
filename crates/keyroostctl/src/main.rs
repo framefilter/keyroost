@@ -22,9 +22,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use keyroost_keyring::Keyring;
-use keyroost_resolve::{
-    ccid_readers_if_needed, ccid_serial_for, connected_keys, effective_serials, Need,
-};
+use keyroost_resolve::{ccid_readers_if_needed, ccid_serial_for, Need};
 
 mod overview;
 mod prompt;
@@ -586,7 +584,7 @@ enum Cmd {
         /// smart-card applets).
         #[arg(long)]
         reader: Option<String>,
-        /// Confirm the wipe. Required — without it the command refuses.
+        /// Skip the typed confirmation (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         /// Some cards protect reset behind management auth, checked just
@@ -1639,7 +1637,7 @@ enum PivCmd {
     },
     /// Clear a slot's certificate object (standard PIV; works on every card).
     /// Removes ONLY the X.509 certificate — the slot's private key is left in
-    /// place. Needs the management key. DESTRUCTIVE: requires `--yes`.
+    /// place. Needs the management key. DESTRUCTIVE: asks first.
     DeleteCert {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
@@ -1653,12 +1651,13 @@ enum PivCmd {
         /// one is known; fails with a clear error if it isn't.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
     /// Delete a slot's private key (Yubico extension). Permanently erases the
     /// key material — the certificate object is left in place. Needs the
-    /// management key. DESTRUCTIVE: requires `--yes`.
+    /// management key. DESTRUCTIVE: asks first.
     ///
     /// Deleting a key is an extension to standard PIV (YubiKey 5.7+ and other
     /// keys that implement it).
@@ -1677,6 +1676,7 @@ enum PivCmd {
         /// one is known; fails with a clear error if it isn't.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         /// Run even if keyroost's list marks this key as not supporting it.
@@ -1758,10 +1758,10 @@ enum OpenpgpCmd {
         reader: Option<String>,
     },
     /// Factory-reset the OpenPGP applet: wipe ALL key slots and restore default
-    /// PINs (PW1 123456, PW3 12345678). DESTRUCTIVE. Requires `--yes`. Also works
+    /// PINs (PW1 123456, PW3 12345678). DESTRUCTIVE; asks first. Also works
     /// to recover a card whose PINs are blocked.
     Reset {
-        /// Confirm you really want to wipe the OpenPGP applet.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         #[arg(long, value_name = "SUBSTR")]
@@ -1809,7 +1809,7 @@ enum OpenpgpCmd {
         /// See `openpgp algorithms` for what this card accepts.
         #[arg(long, value_enum)]
         algorithm: Option<CliOpenpgpKeyAlg>,
-        /// Confirm you really want to overwrite the slot.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         /// Read the admin PIN (PW3) from the named environment variable.
@@ -1840,7 +1840,7 @@ enum OpenpgpCmd {
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
         #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
-        /// Confirm you really want to overwrite the slot.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         /// Read the admin PIN (PW3) from the named environment variable.
@@ -2266,7 +2266,7 @@ enum OathCmd {
         /// Substring of the PC/SC reader name to use (skips auto-detection).
         #[arg(long)]
         reader: Option<String>,
-        /// Confirm the wipe. Required: without it the command refuses to run.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
@@ -2412,7 +2412,7 @@ enum MoltoCmd {
     Delete {
         #[arg(short, long)]
         profile: u8,
-        /// Confirm you really want to delete this slot's seed.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
@@ -2539,7 +2539,7 @@ enum MoltoCmd {
     /// Factory-reset the device. Wipes profiles and restores default customer key.
     /// Requires physical button confirmation on the device.
     Reset {
-        /// Confirm you really want to wipe the device.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
@@ -2558,14 +2558,14 @@ enum FidoCmd {
     /// Run `authenticatorReset`, wiping all credentials on the key.
     ///
     /// Most authenticators only accept Reset within ~10s of plug-in and
-    /// require a physical touch. If `--yes` is missing this is a no-op.
+    /// require a physical touch. Asks first unless `--yes` is given.
     ///
     /// For a card in a smart-card reader (no USB interface), use `--reader`:
     /// the card is power-cycled in place — which starts the same
     /// just-after-power-up window a replug would — and the reset sent
     /// immediately. No touch is involved.
     Reset {
-        /// Confirm you really want to wipe credentials.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
@@ -2703,7 +2703,7 @@ enum FidoCmd {
     },
     /// Raise the minimum PIN length. The value can only be increased, never
     /// lowered (a reset is required to lower it), and may force a PIN change.
-    /// ONE-WAY: requires `--yes`. To only force a PIN change, use
+    /// ONE-WAY: asks first. To only force a PIN change, use
     /// `force-pin-change` instead.
     SetMinPin {
         /// New minimum PIN length (in code points). Must be >= the current one.
@@ -2712,7 +2712,7 @@ enum FidoCmd {
         /// Also require the user to change the PIN on next use.
         #[arg(long)]
         force_change: bool,
-        /// Confirm the change (required): only a reset lowers the minimum again.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2732,9 +2732,9 @@ enum FidoCmd {
         path: Option<std::path::PathBuf>,
     },
     /// Enable enterprise attestation. This is typically one-way: disabling it
-    /// again requires a device reset. Requires `--yes`.
+    /// again requires a device reset. Asks first.
     EnterpriseAttestation {
-        /// Confirm the change (required): only a reset turns it off again.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2856,12 +2856,12 @@ enum LargeBlobCmd {
     },
     /// Delete a single entry by its index.
     ///
-    /// Deleting an opaque (RP-owned) entry may break a service that stored it,
-    /// so that case requires `--yes`.
+    /// Deleting an opaque (RP-owned) entry may break a service that stored it;
+    /// the command warns before asking.
     Delete {
         /// Zero-based entry index as printed by `large-blob list`.
         index: usize,
-        /// Confirm the deletion (required for opaque RP-owned entries).
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2889,7 +2889,7 @@ enum LargeBlobCmd {
     },
     /// Erase the ENTIRE large-blob array, including any RP-owned entries.
     Clear {
-        /// Confirm wiping every entry (required).
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2982,10 +2982,10 @@ enum OtpCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Erase every OTP entry on the key. Requires a confirming button press and
-    /// the `--yes` acknowledgement.
+    /// Erase every OTP entry on the key. Asks first, then needs a confirming
+    /// button press.
     EraseAll {
-        /// Acknowledge that this wipes all on-device OTP entries.
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
@@ -3045,7 +3045,7 @@ enum OtpCmd {
         /// Enable the CCID/smart-card interface (PIV, OpenPGP, OTP over PC/SC).
         #[arg(long)]
         ccid: bool,
-        /// Skip the interactive confirmation (still refuses to disable all).
+        /// Skip the typed confirmation (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
@@ -3911,9 +3911,10 @@ fn run_molto(
         return Ok(());
     }
 
-    // Delete needs no auth (hardware-verified) — gate on --yes, and show
-    // what's in the slot before touching it.
+    // Delete needs no auth (hardware-verified) — show what's in the slot,
+    // then confirm before touching it.
     if let MoltoCmd::Delete { profile, yes } = cmd {
+        let dev = crate::target::select(Need::Molto2, exact, None)?;
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let info = session.read_info()?;
@@ -3929,14 +3930,7 @@ fn run_molto(
                 .map(sanitize_terminal)
                 .unwrap_or_else(|| "(none)".into()),
         );
-        if !yes {
-            return Err(format!(
-                "refusing to delete slot #{}'s seed on device serial {} without --yes",
-                profile,
-                sanitize_terminal(&info.serial)
-            )
-            .into());
-        }
+        crate::prompt::confirm_on(&dev, *yes, &format!("delete slot #{profile}'s seed"))?;
         match session.delete_seed(*profile)? {
             SeedDeleteOutcome::Deleted => {
                 println!(
@@ -3949,25 +3943,20 @@ fn run_molto(
         return Ok(());
     }
 
-    // Factory reset is a plain CLA 0x80 command and needs no auth. Read the
-    // (read-only) device info before the --yes gate so even the refusal names
-    // exactly which device would be wiped.
+    // Factory reset is a plain CLA 0x80 command and needs no auth. Show the
+    // (read-only) device info before asking, so the question comes after
+    // everything that identifies the token being wiped.
     if let MoltoCmd::Reset { yes } = cmd {
         // Unlike the other Molto commands, a wipe never falls back to the
         // first Molto2 reader found: with several tokens and no --device it
         // refuses instead of guessing.
+        let dev = crate::target::select(Need::Molto2, exact, None)?;
         let reader = crate::target::reader_for(Need::Molto2, exact)?;
         let mut session = Session::open_named(&reader)?;
         session.set_debug(debug);
         let info = session.read_info()?;
         print_info(&info);
-        if !yes {
-            return Err(format!(
-                "refusing to factory-reset device serial {} without --yes",
-                sanitize_terminal(&info.serial)
-            )
-            .into());
-        }
+        crate::prompt::confirm_on(&dev, *yes, "factory-reset the Molto2 (all 100 slots)")?;
         println!("requesting factory reset; confirm with the up-arrow button on the device");
         session.factory_reset()?;
         return Ok(());
@@ -4806,50 +4795,6 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Best-effort, non-interactive identification of the key a destructive FIDO
-/// command would hit — so a `--yes` refusal tells the user *which* device
-/// they're about to confirm against. Never prompts; empty when nothing
-/// useful can be said.
-fn fido_target_hint(path: Option<&Path>) -> String {
-    if let Some(p) = path {
-        return format!(" — target: {}", p.display());
-    }
-    let Ok(devices) = keyroost_hid::enumerate() else {
-        return String::new();
-    };
-    let devices: Vec<_> = devices.into_iter().filter(|d| d.is_fido()).collect();
-    let keyring = Keyring::load_default().unwrap_or_default();
-    if let Some(name) = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref()) {
-        let connected = connected_keys(&devices);
-        if let Ok(dev) = keyring.resolve(name, &connected) {
-            return format!(
-                " — target: {} at {}",
-                sanitize_terminal(&dev.label),
-                dev.path.display()
-            );
-        }
-        return String::new();
-    }
-    match devices.as_slice() {
-        [d] => {
-            let serials = effective_serials(&devices);
-            let label = keyring
-                .name_for(serials[0].as_deref())
-                .unwrap_or(&d.product_name);
-            format!(
-                " — target: {} at {}",
-                sanitize_terminal(label),
-                d.path.display()
-            )
-        }
-        [] => String::new(),
-        many => format!(
-            " — {} FIDO keys connected; pass --device or --path to choose",
-            many.len()
-        ),
-    }
-}
-
 /// Open an announced OATH session on the resolved reader, unlocking it if the
 /// applet is password-protected. A protected applet without a supplied password
 /// is a clear error rather than a confusing downstream `6982`.
@@ -4872,18 +4817,21 @@ fn open_oath(
     Ok(session)
 }
 
-/// What the user reads before consenting to a whole-device wipe.
+/// What the user confirms before a whole-device wipe, given the plan's
+/// applet labels ("OATH, OpenPGP, PIV, FIDO2").
 ///
 /// It does not promise the key "stays usable": PIV's wipe blocks the PIN and
 /// PUK on purpose before erasing, so a run that stops in between leaves that
 /// applet locked and un-wiped. What can be promised is per applet and per step
 /// — the same line the GUI's `factory_reset_confirm_summary` settled on, so the
 /// two front ends ask for consent to the same thing.
-const FACTORY_RESET_CONSENT: &str =
-    "refusing to factory-reset without --yes (wipes ALL applets: OATH, OpenPGP, \
-     PIV, Token2 OTP, and FIDO2; every credential, code, key, and PIN is erased. \
-     Each applet that completes comes back in factory condition, and every step \
-     reports its own outcome)";
+fn factory_reset_action(labels: &str) -> String {
+    format!(
+        "factory-reset {labels} (every credential, code, key and PIN is erased; \
+         each applet that completes comes back in factory condition, and every \
+         step reports its own outcome)"
+    )
+}
 
 // One more `--mgmt-key-*` source (`mgmt_key_default`) pushed this past
 // clippy's default 7-argument threshold; every argument here is a distinct
@@ -4904,10 +4852,6 @@ fn run_factory_reset(
     pin_stdin: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_resolve::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
-
-    if !yes {
-        return Err(FACTORY_RESET_CONSENT.into());
-    }
 
     // Only rows with something to reset count; --reader resolves to a row too.
     let dev = crate::target::select(Need::FactoryReset, reader, None)?;
@@ -4939,6 +4883,12 @@ fn run_factory_reset(
         )
         .into());
     }
+    let labels = plan
+        .iter()
+        .map(|s| s.label())
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::prompt::confirm_typed_on(&dev, yes, "reset", &factory_reset_action(&labels))?;
 
     // Fingerprint PIV before running anything destructive — mirrors the GUI's
     // `App::start_factory_reset_confirm`, just synchronous (the CLI has no
@@ -6056,12 +6006,8 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             println!("OATH password cleared.");
         }
         OathCmd::Reset { reader, yes } => {
-            if !*yes {
-                return Err("refusing to reset the OATH applet without --yes \
-                            (wipes ALL authenticator credentials and clears the \
-                            access password; this cannot be undone)"
-                    .into());
-            }
+            let dev = crate::target::select(Need::Oath, reader.as_deref(), None)?;
+            crate::prompt::confirm_on(&dev, *yes, "wipe the OATH applet")?;
             // Deliberately NOT open_oath(): reset must work on a
             // password-protected applet whose password is lost — that's its
             // entire purpose — so no unlock is attempted.
@@ -6261,11 +6207,6 @@ fn otp_feature_capability(
     })
 }
 
-/// Stop before the operation when the key's own config says it lacks `feature`.
-///
-/// Best-effort by design: this only helps when the config read SUCCEEDS. A key
-/// whose exchange fails outright never yields a capability byte, and the command
-/// proceeds exactly as before so that failure is reported unchanged.
 /// Read-only look before asking: open a session, refuse a key without
 /// `feature` (as [`ensure_otp_feature`] does), and close the session again
 /// so nothing is held open while the user answers. Returns the device
@@ -6291,6 +6232,11 @@ fn button_hotp_maybe_configured(info: Option<&keyroost_token2otp::DeviceInfo>) -
     info.is_none_or(|i| !i.has_config_byte() || i.button_hotp_configured())
 }
 
+/// Stop before the operation when the key's own config says it lacks `feature`.
+///
+/// Best-effort by design: this only helps when the config read SUCCEEDS. A key
+/// whose exchange fails outright never yields a capability byte, and the command
+/// proceeds exactly as before so that failure is reported unchanged.
 fn ensure_otp_feature(
     session: &mut keyroost_transport::Token2OtpSession,
     feature: OtpFeature,
@@ -6470,13 +6416,12 @@ fn run_otp(
             println!("Deleted OTP entry {label:?}.");
         }
         OtpCmd::EraseAll { yes } => {
-            if !yes {
-                return Err("refusing to erase all OTP entries without --yes".into());
-            }
-            let mut session = open_otp(&sel, debug)?;
-            // Checked before the touch prompt: no point asking for a physical
-            // touch on a key that has nothing to erase.
-            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            let dev = select_otp(&sel)?;
+            // Checked before the question and the touch prompt: no point
+            // asking on a key that has nothing to erase.
+            otp_precheck(&dev, sel.transport, debug, OtpFeature::OnDevice)?;
+            crate::prompt::confirm_on(&dev, *yes, "erase every OTP entry")?;
+            let mut session = open_otp_on(&dev, sel.transport, debug)?;
             eprintln!("touch your key to confirm the erase\u{2026}");
             session.erase_all()?;
             println!("Erased all OTP entries.");
@@ -6632,6 +6577,7 @@ fn run_otp(
             .filter_map(|(off, name)| off.then_some(name))
             .collect();
 
+            let dev = select_otp(&sel)?;
             eprintln!("This will reconfigure the key's USB interfaces:");
             eprintln!("  enable:  {}", enabled.join(", "));
             eprintln!(
@@ -6648,20 +6594,16 @@ fn run_otp(
                  able to reach the key to undo this. Proceed with caution."
             );
 
-            if !*yes {
-                // Require typing an exact phrase — not just "y" — for a hardware
-                // reconfiguration this consequential.
-                eprint!("Type EXACTLY 'reconfigure interfaces' to proceed: ");
-                use std::io::Write as _;
-                std::io::stderr().flush().ok();
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                if line.trim() != "reconfigure interfaces" {
-                    return Err("confirmation phrase did not match; aborted".into());
-                }
-            }
+            // A typed phrase — not just "y" — for a hardware reconfiguration
+            // this consequential; read from the terminal only.
+            crate::prompt::confirm_typed_on(
+                &dev,
+                *yes,
+                "reconfigure interfaces",
+                "reconfigure this key's USB interfaces",
+            )?;
 
-            let mut session = open_otp(&sel, debug)?;
+            let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.set_device_type(disable)?;
             println!("Interface configuration updated. Re-plug the key for it to take effect.");
         }
@@ -7011,9 +6953,8 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             }
         }
         OpenpgpCmd::Reset { yes, reader } => {
-            // Resolve and identify the target *before* the --yes gate, so the
-            // refusal (and the consent the flag implies) names the exact card —
-            // the same posture as `factory-reset` and `piv reset`.
+            let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
+            crate::prompt::confirm_on(&dev, *yes, "wipe the OpenPGP applet")?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             let status = session.status()?;
@@ -7021,14 +6962,6 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(serial) => format!("serial {}", serial),
                 None => format!("AID {}", hex_encode(&status.aid)),
             };
-            if !yes {
-                return Err(format!(
-                    "refusing to reset the OpenPGP applet on {} without --yes \
-                     (this wipes ALL OpenPGP keys and resets PINs to defaults)",
-                    ident
-                )
-                .into());
-            }
             session.factory_reset()?;
             println!(
                 "OpenPGP applet on {} reset. All keys wiped; PINs restored to defaults.",
@@ -7043,16 +6976,15 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             admin_pin_stdin,
             reader,
         } => {
-            if !yes {
-                return Err(format!(
-                    "refusing to generate without --yes (this OVERWRITES the {} key slot)",
-                    slot.label()
-                )
-                .into());
-            }
             if let Some(a) = algorithm {
                 a.to_alg().attributes(slot.to_crt())?;
             }
+            let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
+            crate::prompt::confirm_on(
+                &dev,
+                *yes,
+                &format!("overwrite the OpenPGP {} key", slot.label()),
+            )?;
             let admin_pin = read_secret(
                 "admin PIN (PW3)",
                 admin_pin_env.as_deref(),
@@ -7085,13 +7017,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             admin_pin_stdin,
             reader,
         } => {
-            if !yes {
-                return Err(format!(
-                    "refusing to import without --yes (this OVERWRITES the {} key slot)",
-                    slot.label()
-                )
-                .into());
-            }
+            let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
+            crate::prompt::confirm_on(
+                &dev,
+                *yes,
+                &format!("overwrite the OpenPGP {} key", slot.label()),
+            )?;
             let admin_pin = read_secret(
                 "admin PIN (PW3)",
                 admin_pin_env.as_deref(),
@@ -8318,6 +8249,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_env,
             pin_stdin,
         } => {
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8332,14 +8264,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .serial
                         .map(|v| format!("serial {}", v))
                         .unwrap_or_else(|| "this device".into());
-                    if !yes {
-                        return Err(format!(
-                            "refusing to reset the PIV application on {} without --yes \
-                     (this wipes all PIV keys, certificates, and PINs)",
-                            serial
-                        )
-                        .into());
-                    }
+                    crate::prompt::confirm_on(&dev, *yes, "wipe the PIV applet")?;
                     // Some fingerprints need an authenticated management-key session
                     // before RESET is even accepted (`PivQuirk::
                     // ResetNeedsManagementAuth`) — the same precondition
@@ -8409,14 +8334,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_default,
             yes,
         } => {
-            if !yes {
-                return Err(format!(
-                    "refusing to clear the certificate in {} without --yes \
-                     (this is irreversible; the slot's private key is left in place)",
-                    slot.to_slot().label()
-                )
-                .into());
-            }
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            crate::prompt::confirm_on(
+                &dev,
+                *yes,
+                &format!("delete the certificate in PIV slot {}", slot_name(*slot)),
+            )?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8449,14 +8372,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             yes,
             force,
         } => {
-            if !yes {
-                return Err(format!(
-                    "refusing to delete the private key in {} without --yes \
-                     (this is irreversible; the key material cannot be recovered)",
-                    slot.to_slot().label()
-                )
-                .into());
-            }
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            crate::prompt::confirm_on(
+                &dev,
+                *yes,
+                &format!("delete the key in PIV slot {}", slot_name(*slot)),
+            )?;
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
@@ -9253,14 +9174,8 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             Ok(())
         }
         FidoCmd::Reset { yes, path, reader } => {
-            if !*yes {
-                return Err(format!(
-                    "refusing to reset FIDO key without --yes (this wipes credentials){}",
-                    fido_target_hint(path.as_deref())
-                )
-                .into());
-            }
             let dev = crate::target::select(Need::FidoAny, reader.as_deref(), path.as_deref())?;
+            crate::prompt::confirm_on(&dev, *yes, "wipe every FIDO2 credential and the PIN")?;
             match fido_reset_route(&dev, reader.is_some())? {
                 FidoResetRoute::Card { reader } => run_fido_reset_reader(&reader)?,
                 FidoResetRoute::Replug { path } => {
@@ -9418,15 +9333,12 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            if !*yes {
-                return Err(format!(
-                    "refusing to raise the minimum PIN length to {length} without --yes \
-                     (it can only be lowered again by resetting the key, which wipes its \
-                     credentials){}",
-                    fido_target_hint(path.as_deref())
-                )
-                .into());
-            }
+            let dev = crate::target::select_fido(path.as_deref())?;
+            crate::prompt::confirm_on(
+                &dev,
+                *yes,
+                &format!("raise the minimum PIN length to {length} (only a reset lowers it again)"),
+            )?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             let length = *length;
             let force_change = *force_change;
@@ -9463,14 +9375,12 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            if !*yes {
-                return Err(format!(
-                    "refusing to enable enterprise attestation without --yes (it can only \
-                     be turned off again by resetting the key, which wipes its credentials){}",
-                    fido_target_hint(path.as_deref())
-                )
-                .into());
-            }
+            let dev = crate::target::select_fido(path.as_deref())?;
+            crate::prompt::confirm_on(
+                &dev,
+                *yes,
+                "enable enterprise attestation (only a reset turns it off)",
+            )?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             with_configurator(path.as_deref(), &pin, |cfg| {
                 cfg.enable_enterprise_attestation()?;
@@ -9513,10 +9423,13 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             pin_env,
             pin_stdin,
             path,
-        } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            run_fido_large_blob_delete(path.as_deref(), &pin, *index, *yes)
-        }
+        } => run_fido_large_blob_delete(
+            path.as_deref(),
+            pin_env.as_deref(),
+            *pin_stdin,
+            *index,
+            *yes,
+        ),
         LargeBlobCmd::Export {
             index,
             output,
@@ -9528,10 +9441,7 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             pin_env,
             pin_stdin,
             path,
-        } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-            run_fido_large_blob_clear(path.as_deref(), &pin, *yes)
-        }
+        } => run_fido_large_blob_clear(path.as_deref(), pin_env.as_deref(), *pin_stdin, *yes),
     }
 }
 
@@ -10062,7 +9972,8 @@ fn run_fido_large_blob_edit(
 
 fn run_fido_large_blob_delete(
     path: Option<&std::path::Path>,
-    pin: &str,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
     index: usize,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -10073,23 +9984,15 @@ fn run_fido_large_blob_delete(
         .ok_or_else(|| large_blob_bad_index(index, current.entries.len()))?;
     if !entry.is_kr_note() {
         // Opaque RP-owned entry: deleting it can break the owning service.
-        if !yes {
-            return Err(format!(
-                "REFUSING to delete entry {idx}: it was NOT created by keyroost \
-                 (it is an opaque, RP-encrypted record). Deleting it may break a \
-                 service that stored it. Re-run with --yes to delete it anyway.",
-                idx = index
-            )
-            .into());
-        }
         eprintln!(
-            "WARNING: entry {} was not created by keyroost; deleting it may break a \
-             service that stored it.",
+            "WARNING: entry {} was not created by keyroost (it is an opaque, \
+             RP-encrypted record); deleting it may break a service that stored it.",
             index
         );
-    } else if !yes {
-        return Err(format!("refusing to delete entry {} without --yes", index).into());
     }
+    let key = crate::target::select_fido(path)?;
+    crate::prompt::confirm_on(&key, yes, &format!("delete large-blob entry {index}"))?;
+    let pin = read_secret("PIN", pin_env, pin_stdin)?;
 
     let mut entries = current.entries.clone();
     entries.remove(index);
@@ -10099,7 +10002,7 @@ fn run_fido_large_blob_delete(
     };
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
-        pin,
+        &pin,
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
@@ -10111,7 +10014,8 @@ fn run_fido_large_blob_delete(
 
 fn run_fido_large_blob_clear(
     path: Option<&std::path::Path>,
-    pin: &str,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Re-read first so we can report exactly what will be wiped.
@@ -10127,18 +10031,19 @@ fn run_fido_large_blob_clear(
             plural = if total == 1 { "y" } else { "ies" },
             opaque = opaque,
         );
-        return Err("refusing to clear the large-blob array without --yes".into());
-    }
-    if opaque > 0 {
+    } else if opaque > 0 {
         eprintln!(
             "WARNING: wiping {} opaque/RP-owned entr{} along with everything else.",
             opaque,
             if opaque == 1 { "y" } else { "ies" }
         );
     }
+    let key = crate::target::select_fido(path)?;
+    crate::prompt::confirm_on(&key, yes, "clear the whole large-blob array")?;
+    let pin = read_secret("PIN", pin_env, pin_stdin)?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
-        pin,
+        &pin,
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
@@ -11446,37 +11351,36 @@ mod cli_tests {
     }
 
     #[test]
-    fn fido_one_way_settings_refuse_without_yes_before_any_io() {
-        // Without --yes the handler must refuse before it reads a PIN or opens
-        // the device. The PIN source here is an unset variable and the path does
-        // not exist, so reaching either would yield a different error than the
-        // --yes refusal; an explicit --path also keeps the target hint from
-        // enumerating devices.
-        let path = Some(std::path::PathBuf::from(
-            "/nonexistent/keyroost-test-hidraw",
-        ));
-        let pin_env = Some("KEYROOST_TEST_UNSET_PIN_VAR".to_string());
-        let cases = [
-            FidoCmd::SetMinPin {
-                length: 8,
-                force_change: false,
-                yes: false,
-                pin_env: pin_env.clone(),
-                pin_stdin: false,
-                path: path.clone(),
-            },
-            FidoCmd::EnterpriseAttestation {
-                yes: false,
-                pin_env,
-                pin_stdin: false,
-                path,
-            },
-        ];
-        for cmd in &cases {
-            let err = run_fido(cmd, false).unwrap_err().to_string();
-            assert!(err.contains("without --yes"), "unexpected error: {err}");
-            assert!(err.contains("/nonexistent/keyroost-test-hidraw"), "{err}");
+    fn refusals_name_the_key_and_the_fix() {
+        // The mechanism every --yes command now shares (prompt::confirm*);
+        // scripts see one line naming the key and "add --yes".
+        use crate::prompt::{confirm, confirm_typed, Term};
+        struct NoTty;
+        impl Term for NoTty {
+            fn present(&self) -> bool {
+                false
+            }
+            fn say(&mut self, _: &str) {}
+            fn ask(&mut self, _: &str) -> std::io::Result<String> {
+                unreachable!("never asks without a terminal")
+            }
         }
+        let e = confirm(
+            &mut NoTty,
+            false,
+            "raise the minimum PIN length to 8",
+            "solo-test",
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "refusing to raise the minimum PIN length to 8 on solo-test without confirmation; add --yes"
+        );
+        assert!(
+            confirm_typed(&mut NoTty, false, "reset", "factory-reset", "k")
+                .unwrap_err()
+                .ends_with("add --yes")
+        );
     }
 
     #[test]
@@ -12119,12 +12023,16 @@ mod cli_tests {
         // in between leaves that applet locked and un-wiped. Consent must not
         // be asked for on a promise the tool can't keep — same rule the GUI's
         // confirmation follows.
-        assert!(!FACTORY_RESET_CONSENT.contains("stays usable"));
-        assert!(!FACTORY_RESET_CONSENT.contains("stays fully usable"));
+        let action = factory_reset_action("OATH, OpenPGP, PIV, FIDO2");
+        assert!(!action.contains("stays usable"), "{action}");
+        assert!(!action.contains("stays fully usable"), "{action}");
         assert!(
-            FACTORY_RESET_CONSENT
-                .contains("Each applet that completes comes back in factory condition"),
-            "{FACTORY_RESET_CONSENT}"
+            action.contains("each applet that completes comes back in factory condition"),
+            "{action}"
+        );
+        assert!(
+            action.contains("every step reports its own outcome"),
+            "{action}"
         );
         // The command's own help text is the other place the user reads this
         // before consenting.

@@ -168,13 +168,17 @@ fn hid_path_of(dev: &Device) -> Result<PathBuf, Box<dyn Error>> {
     })
 }
 
-/// The HID path of the selected FIDO key.
-pub(crate) fn fido_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
-    let dev = select(Need::FidoHid, None, path).map_err(|e| {
+/// Select the FIDO-over-USB key, adding the bootloader hint when none is found.
+pub(crate) fn select_fido(path: Option<&Path>) -> Result<Device, Box<dyn Error>> {
+    select(Need::FidoHid, None, path).map_err(|e| {
         let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
         add_bootloader_hint(e, bl.as_deref())
-    })?;
-    hid_path_of(&dev)
+    })
+}
+
+/// The HID path of the selected FIDO key.
+pub(crate) fn fido_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
+    hid_path_of(&select_fido(path)?)
 }
 
 #[cfg(test)]
