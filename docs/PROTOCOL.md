@@ -34,8 +34,9 @@ behaviour of the Token2 device itself; none of it is copyrighted by anyone.
   "TOKEN2" and expose a CCID reader (e.g. `Token2 PIN+R3 00 00`,
   `TOKEN2 FIDO2 Security Key 00 00`), so any brand-level match mis-flags them
   as a Molto2 (issue #21). The only reliable signal is the product word: use
-  `keyroost_proto::is_molto2_reader`, which matches **`Molto2`** and nothing
-  else — every other Token2 device is a FIDO key or the NFC reader.
+  `keyroost_proto::is_molto2_reader`, which matches the product word
+  (**`molto`**, case-insensitive) and nothing else — every other Token2 device
+  is a FIDO key or the NFC reader.
 - On Linux the device requires an entry in libccid's `Info.plist` so that
   pcscd picks it up; recent libccid versions ship that entry pre-configured.
 

@@ -79,8 +79,8 @@
   <section class="kr-section">
     <h2>Updating the metadata</h2>
     <p>The bundled snapshot is embedded at build time, but keyroost <strong>also loads a
-      user-supplied copy at startup if present</strong> — so packaged builds (AppImage,
-      signed <code>.exe</code>, <code>.dmg</code>) can be refreshed without rebuilding.</p>
+      user-supplied copy at startup if present</strong> — so packaged builds (the AppImage and
+      the signed Windows and macOS builds) can be refreshed without rebuilding.</p>
 <pre><code>python3 tools/gen_mds_data.py --out mds_data.json            # downloads the live FIDO BLOB
 python3 tools/gen_mds_data.py --out mds_data.json --blob mds.jwt   # offline, from a local copy</code></pre>
     <p>Without <code>--out</code> the script writes to <code>crates/keyroost/assets/mds_data.json</code>

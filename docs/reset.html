@@ -83,13 +83,16 @@
         PINs. Anything encrypted to the card's encryption key becomes undecryptable.
         <a href="openpgp.html">OpenPGP →</a></li>
       <li><strong>PIV</strong> — clears slots, certificates, PIN/PUK, and management key.
-        A whole-device reset reaches PIV the manufacturer-intended way: the PIN and then the
-        PUK are deliberately blocked, and only then is the applet wiped. If the run stops in
-        between, PIV stays locked and un-wiped until a reset finishes — the per-step report
-        says which state it is in. keyroost checks for the vendor RESET instruction
-        <em>before</em> it blocks anything and refuses cards that show no sign of implementing
-        it, so a standards-only card is never left locked with no way back.
-        <a href="piv.html">PIV →</a></li>
+        PIV's reset is a vendor extension, so a whole-device reset first checks what keyroost
+        knows about the card's PIV applet. Where reset is known to work, it sends RESET; if
+        the card wants the PIN and PUK blocked first, keyroost blocks the PIN, tries again,
+        and only then blocks the PUK. If the run stops in between, PIV stays locked and
+        un-wiped until a reset finishes — the per-step report says which state it is in. A
+        card with no entry gets a single RESET and nothing is blocked; a card listed as not
+        supporting it is left out of the sweep, so it is never left locked with no way back.
+        Some cards reset the whole device through their own command instead, and some need
+        the management key or PIN for it — keyroost asks when they do.
+        <a href="piv.html#support">PIV →</a></li>
       <li><strong>Token2 on-device OTP</strong> — erases every OTP entry stored on the key's
         own applet. The key asks for a confirming button press before it wipes. On an R3.4+ key
         this is also the only way back from a blocked OTP PIN — there is no PIN reset.
@@ -140,7 +143,7 @@
   <section class="kr-section" id="whole-key">
     <h2>Resetting a whole key at once</h2>
     <p>One command wipes every resettable applet the key exposes, in order — OATH, OpenPGP,
-      PIV, Token2 on-device OTP, then FIDO2 last, because it ends with a ceremony:</p>
+      Token2 on-device OTP, PIV, then FIDO2 last, because it ends with a ceremony:</p>
 <pre><code>keyroostctl factory-reset --yes</code></pre>
     <p>The card applets run silently; the OTP step wants a confirming button press on the
       key. What the FIDO2 step asks for depends on the device's shape. A <strong>USB

@@ -60,6 +60,107 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-12-0">
+    <h2>v0.12.0</h2>
+    <p>PIV gained applet fingerprinting, per-key feature support and certificate
+      compression. Scripts should check the <code>piv status --json</code>
+      serial and any <code>piv reset</code> that relied on being refused.
+      Library consumers: <code>PivSession</code> now lives inside a
+      transaction closure, and several PIV signatures gained a parameter.</p>
+    <h3>CLI</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>piv status --json</code>: <code>"serial": 12345678</code></td>
+        <td><code>"serial": "12345678"</code> &mdash; a string, decimal, or
+          <code>0x</code>-hex when too long for decimal. Token2 serials now
+          match the number printed on the key. New fields:
+          <code>applet_fingerprint</code>, <code>applet_name</code>,
+          <code>version_firmware</code>, and <code>cert_compressed</code> on a
+          slot holding a compressed certificate.</td></tr>
+      <tr><td><code>piv reset --yes</code> failed unless the PIN and PUK were
+          both already blocked</td>
+        <td>On a key listed as supporting reset, it blocks them itself and
+          resets. A script that relied on the refusal as a stop will now wipe
+          PIV.</td></tr>
+      <tr><td><code>piv delete-key</code> / <code>move-key</code> refused
+          unless the card reported version 5.7 or newer</td>
+        <td>Decided per applet: run on a key listed as supporting them, run
+          with a warning on an unknown one, and need <code>--force</code> on
+          one listed without them (including a YubiKey older than 5.7).</td></tr>
+      <tr><td><code>change-management-key</code>, <code>generate-key</code>,
+          <code>reset</code> always sent the command</td>
+        <td>Refused on a key listed without the feature, policy or key type,
+          unless <code>--force</code>.</td></tr>
+      <tr><td><code>piv import-cert</code> wrote any certificate</td>
+        <td>Refuses a certificate whose public key doesn't match the slot's
+          key (when both are known); nothing is written.</td></tr>
+      <tr><td><code>self-sign</code> / <code>new-chuid</code> without a
+          validity: 365 days</td>
+        <td>One calendar year. <code>--years</code>, <code>--months</code> and
+          <code>--days</code> combine.</td></tr>
+      <tr><td><code>factory-reset</code> order: OATH, OpenPGP, PIV, Token2
+          OTP, FIDO2</td>
+        <td>OATH, OpenPGP, Token2 OTP, PIV, FIDO2.</td></tr>
+    </table>
+    </div>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>PivSession::open(reader)</code> and <code>set_debug</code> are
+          removed. Use <code>PivSession::with_transaction(reader, |s| { .. })</code>,
+          or <code>with_transaction_traced(reader, true, f)</code> for a trace
+          that includes the first SELECT; <code>with_cached_transaction</code>
+          reuses fingerprint state across calls. <code>PivSession</code> is now
+          <code>PivSession&lt;'tx&gt;</code>, holds the PC/SC transaction, can't
+          outlive the closure, and is no longer <code>UnwindSafe</code>.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td>New parameters:
+          <code>set_management_key(current, alg, key, touch)</code> (pass the
+          current <code>CurrentMgmtAuth</code>; only HID Crescendo uses it);
+          <code>import_certificate(slot, der, CertCompression)</code> returns a
+          <code>CertImport</code> (<code>CertCompression::Never</code> is the
+          old behaviour); <code>self_signed_certificate(.., pin, compression)</code>
+          returns <code>(Vec&lt;u8&gt;, CertImport)</code>;
+          <code>reset(None)</code>; <code>force_reset(None)</code> returns a
+          <code>FactoryResetOutcome</code>. Prefer
+          <code>factory_reset</code> or
+          <code>force_reset_if_known_supported(auth, force)</code>, which pick
+          the route for the applet.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>TransportError::PivForceResetUnsupported</code> &rarr;
+          <code>PivResetUnsupported</code>;
+          <code>PivForceResetIncomplete</code> &rarr;
+          <code>PivResetIncomplete</code>;
+          <code>PivFirmwareTooOld</code> is removed: <code>move_key</code> and
+          <code>delete_key</code> no longer check the version themselves &mdash;
+          call <code>PivSession::feature_gate</code> first (before management
+          authentication; it re-selects PIV). <code>PivCertTooLarge</code>
+          gains <code>compressed_len</code>.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>PivStatus::serial</code> is <code>Option&lt;u128&gt;</code>
+          (was <code>Option&lt;u32&gt;</code>); display it with
+          <code>keyroost_piv::format_serial_long</code> /
+          <code>format_serial_short</code>. GET METADATA and ATTEST are
+          skipped on an applet listed without them unless
+          <code>set_send_unsupported_reads(true)</code>.</td></tr>
+      <tr><td><code>keyroost-piv</code></td>
+        <td><code>encode_certificate(der)</code> &rarr;
+          <code>encode_certificate(payload, CertInfo::Uncompressed)</code>.
+          <code>KeyAlg::EccP521</code> and <code>SigHash::Sha512</code> are new
+          variants of exhaustive enums (add match arms); the implicit
+          discriminants of later variants shifted.</td></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td><code>ResetStep::Token2Otp</code> now comes before
+          <code>Piv</code>. <code>StepOutcome::Skipped</code> carries a reason
+          (<code>Skipped(String)</code>); new <code>WipedGlobal</code> and
+          <code>WipedWithWarning(String)</code>.</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-11-0">
     <h2>v0.11.0</h2>
     <p>Two CLI changes that can affect scripts, both making destructive or

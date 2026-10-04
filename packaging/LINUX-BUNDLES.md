@@ -386,8 +386,11 @@ tarballs.
 
 - **linuxdeploy** (`linuxdeploy/linuxdeploy`) — builds and maintains the AppDir,
   bundles dependent `.so`s, and (via its appimage plugin) produces the final
-  AppImage. Use the continuous-release `linuxdeploy-x86_64.AppImage` +
-  `linuxdeploy-plugin-appimage-x86_64.AppImage`.
+  AppImage. The build downloads the continuous-release
+  `linuxdeploy-x86_64.AppImage` + `linuxdeploy-plugin-appimage-x86_64.AppImage`
+  and checks each against a pinned sha256 before running it; upstream rebuilds
+  them about monthly, so expect to re-pin (how: the comment above the pins in
+  `build-appimage.sh`).
 - **appimagetool** — what the appimage plugin calls under the hood; can be used
   directly if you prefer to assemble the AppDir by hand.
 - The build script is `packaging/appimage/build-appimage.sh`.
@@ -428,6 +431,7 @@ cargo build --release -p keyroost --features keyroost/qr   # GUI binary (glibc)
 # stage AppDir, copy binary + desktop + icon, let linuxdeploy bundle libs:
 linuxdeploy --appdir AppDir \
     --executable target/release/keyroost \
+    --library <libxkbcommon.so.0> --library <libxkbcommon-x11.so.0> \
     --desktop-file packaging/flatpak/io.github.framefilter.keyroost.desktop \
     --icon-file <icon.png>
 # move libpcsclite into usr/lib/pcsc-fallback/, wrap AppRun, then package:
@@ -435,7 +439,10 @@ linuxdeploy-plugin-appimage --appdir AppDir
 ```
 
 (The desktop file + icon are **reused from the Flatpak drafts** — same app-id,
-same metadata.)
+same metadata.) The two libxkbcommon libraries are passed explicitly because
+the GUI's windowing layer loads them by name at runtime, so linuxdeploy cannot
+see them as link dependencies; without them the app fails to start on hosts
+that lack libxkbcommon-x11.
 
 ### Publish mechanism
 
@@ -446,9 +453,10 @@ is proven for this app.
 
 ### Known limitations
 
-- glibc-based: built on an **old** glibc (build in an old-baseline container,
-  e.g. an older Ubuntu LTS) or the AppImage only runs on systems with glibc ≥
-  the build machine's. This is the classic AppImage portability footgun.
+- glibc-based: the AppImage only runs on systems with glibc ≥ the build
+  machine's, so `linux-bundles.yml` builds it on the oldest still-supported
+  Ubuntu LTS runner (`ubuntu-22.04`, glibc 2.35), not `ubuntu-latest`. This is
+  the classic AppImage portability footgun.
 - FUSE dependency on the user's machine (see above).
 - Updates go through AppImageUpdate: the build embeds gh-releases zsync update
   info and ships the `.zsync` file.

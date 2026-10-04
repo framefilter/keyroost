@@ -89,6 +89,8 @@
       <li><strong>Aegis</strong> export (plaintext or encrypted)</li>
       <li><strong>2FAS</strong> export</li>
       <li>a list of <code>otpauth://</code> URIs</li>
+      <li>a QR code in a PNG/JPEG screenshot, including a Google Authenticator export
+        (most desktop builds can also capture one from the screen)</li>
     </ul>
     <p>keyroost can also <strong>sync the device clock</strong> to the host — important,
       because TOTP depends on accurate time, and a drifted clock shows wrong codes.</p>
@@ -122,7 +124,7 @@
       <span class="kr-mark mono">k</span>
       <p>Read slot occupancy and titles; program a slot from an <code>otpauth://</code> URI;
         set a slot's title or delete its seed (the title stays); bulk-import from Aegis / 2FAS / an
-        <code>otpauth://</code> list; sync the host clock; rotate the customer key; and
+        <code>otpauth://</code> list or a QR screenshot; sync the host clock; rotate the customer key; and
         factory-reset — over a pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC)
         with no external crypto dependencies.</p>
     </div>

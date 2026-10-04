@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- AppStream metainfo for the Flatpak/AppImage build.
      Validate: appstreamcli validate io.github.framefilter.keyroost.metainfo.xml
-     App-id, icon (packaging/icons/), homepage, and license are set; only the
-     optional <screenshots> and the per-cut <release> remain (see notes below). -->
+     App-id, icon (packaging/icons/), homepage, license and a screenshot are
+     set; see the notes below on <screenshots> and the generated <releases>. -->
 <component type="desktop-application">
   <id>io.github.framefilter.keyroost</id>
 
@@ -22,10 +22,11 @@
     <p>It speaks to devices over PC/SC (smart-card readers) and USB HID (FIDO), and supports:</p>
     <ul>
       <li>Token2 Molto2 / Molto2v2 TOTP slot programming</li>
+      <li>Token2 single-profile programmable TOTP tokens, and on-device OTP on Token2 FIDO keys</li>
       <li>FIDO2 / CTAP credential management and PIN handling</li>
       <li>OATH (TOTP/HOTP) on Yubico/Trussed-style applets</li>
       <li>OpenPGP Card v3.4 management</li>
-      <li>PIV (NIST SP 800-73-4) management: keys, certificates, PIN/PUK/management-key</li>
+      <li>PIV (NIST SP 800-73-4) management: keys, certificates (stored compressed when they don't fit), PIN/PUK/management-key, with controls matched to the detected applet</li>
     </ul>
     <p>
       A command-line tool (keyroostctl) and a desktop GUI (keyroost) share the
@@ -52,7 +53,7 @@
 
   <!-- Software centers and AppImage catalogs show these. Each <image> is a
        URL to a picture hosted on the Pages site (AppStream allows PNG, JPEG,
-       WebP or JXL; PNG is preferred). Refresh them with the v0.12.0 GUI
+       WebP or JXL; PNG is preferred). Refresh them with the v0.13.0 GUI
        design pass. -->
   <screenshots>
     <screenshot type="default">

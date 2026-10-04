@@ -108,8 +108,8 @@
       <tr><td><strong>Swissbit iShield Key 2 Pro</strong></td>
         <td>PIV (partial)</td>
         <td>Key generation and certificate handling verified by episource on
-          their own card. Slot status is not yet trustworthy: the card reports
-          every slot's key type as ECC P-384 (#113). Answers the Yubico version
+          their own card. keyroost doesn't take a slot's key type or PIN/touch
+          policy from this card's GET METADATA reply (#113). Answers the Yubico version
           extension with four bytes instead of three; keyroost keeps the reply
           as sent. Other applets not yet exercised by this project.</td></tr>
     </table>
@@ -134,7 +134,9 @@
       including ones not listed above (Thales, Feitian, Titan, and others). Optional
       features such as fingerprints, large-blob storage and authenticator configuration
       appear only when the key advertises them. The OATH / OpenPGP / PIV panes apply to
-      any card exposing those applets over PC/SC.</p>
+      any card exposing those applets over PC/SC. For PIV, keyroost identifies the card's
+      applet and dims vendor extensions listed as unsupported for it, with an override —
+      see <a href="piv.html#support">what each key supports</a>.</p>
     <p class="kr-muted">Older U2F-only (CTAP1) keys are detected by <code>list</code> but
       don't support the CTAP2 management commands.</p>
   </section>

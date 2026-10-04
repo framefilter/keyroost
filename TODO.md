@@ -8,10 +8,11 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: nothing release-bound. v0.11.0 shipped with compressed PIV
-certificate reading (#147), clear errors for oversized certificate imports
-(#151) and an AppImage that starts without a host libpcsclite (#157). PIV
-fingerprinting (#128) anchors the next release once its author is ready.
+Current work: v0.12.0 is being released — PIV applet fingerprinting with
+per-device feature gates and "Enable Anyway" (#128, #161), storing PIV
+certificates compressed when they don't fit (#154), and an AppImage built on
+Ubuntu 22.04 with libxkbcommon bundled (#160). All merged; follow
+`packaging/RELEASING.md`.
 
 ---
 
@@ -50,7 +51,7 @@ Being worked on right now — check with whoever holds it before starting.
   AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
   the packaging probe, not after a release. (S–M)
 
-- **v0.12.0 goal: a holistic GUI design pass.** The interface has grown
+- **v0.13.0 goal: a holistic GUI design pass.** The interface has grown
   enough features that the deliberately flat layout no longer fits. Seen in
   AppImageHub's catalog screenshot (AppImage/appimage.github.io#9258): at an
   ~800px-wide screen, below the 900px minimum, the top bar's left group
@@ -109,15 +110,6 @@ Being worked on right now — check with whoever holds it before starting.
 ---
 
 ## Blocked / needs someone else
-
-- **PIV applet fingerprinting + device feature gates
-  ([#128](https://github.com/framefilter/keyroost/pull/128), episource, draft)**
-  — resolves [#113](https://github.com/framefilter/keyroost/issues/113) and
-  [#125](https://github.com/framefilter/keyroost/issues/125). Waiting on the
-  author. When it is ready: rebase onto `main` (expect conflicts with #148/#149/#151
-  in the PIV files), re-review against `packaging/REVIEWING.md` (check the
-  agreed fixes: per-session fingerprint cache, serial as a JSON string), and
-  verify on YubiKey 5.7, Nitrokey 3, Token2 and Solo 2.
 
 - **OnlyKey recognition
   ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
@@ -290,6 +282,10 @@ Not tasks. Kept so they are not re-litigated or re-researched.
   and colouring an error message. Never for granting or withholding a surface.
   `TOKEN2_PRODUCTS` says as much in its own docs — "nothing here may be treated
   as proof that an applet is present" — and the inverse is no safer.
+  Scope: the PIV support list (`keyroost-piv/src/compat.rs`, #128) is keyed on
+  what the applet itself reports, not a USB product id, and it never hides a
+  control: an unknown applet keeps everything, and anything it greys out comes
+  back with "Enable Anyway" (GUI) or `--force` (CLI).
 
 - **Windows signing: keep signing with Token2; winget always waits for the
   signed zip.** No own signing identity for now — Azure Artifact Signing /

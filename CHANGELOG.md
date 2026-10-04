@@ -6,6 +6,88 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-04
+
+### Added
+- **PIV applet fingerprinting and per-key feature support.** keyroost now
+  identifies which PIV implementation a card runs (YubiKey, Token2, Nitrokey,
+  uTrust, HID Crescendo, Authentrend, OpenFIPS201 and others) from its ATR,
+  SELECT response and a few AID probes, and shows it in `piv status` and the
+  GUI's status line, with the device firmware next to the applet version
+  where it differs. A built-in list says which vendor extensions (move and
+  delete key, reset, key types, PIN and touch policies) each applet supports.
+  Unknown applets keep every control, with a warning; a feature the list
+  marks unsupported is greyed with the reason on hover, and the GUI's
+  **Enable Anyway** line at the bottom of the PIV pane turns those back on
+  for that key until the app closes. In the CLI, `--force` does the same.
+  Contributed by @episource. ([#128])
+- **More PIV key and certificate options.** ECC P-521 keys
+  (`--algorithm eccp521`) and SHA-512 signatures; `--years`, `--months` and
+  `--days` combine for certificate and CHUID validity (default: one calendar
+  year), with matching GUI fields; `--mgmt-key-default` uses the card's
+  factory management key. ([#128])
+- **PIN-protected management key.** `piv change-management-key
+  --allow-pin-unlock` (GUI: "Allow PIN unlock") stores the management key so
+  the PIN alone unlocks management, and the GUI can authenticate with the PIN.
+  The Change management key dialog can generate a random key and copy it; the
+  clipboard is cleared after 45 seconds. ([#128])
+- **HID Crescendo management.** Management-key authentication and rotation,
+  Delete key, the serial number, and a whole-device factory reset, each
+  through HID's own commands. ([#128])
+- **Serial numbers match the device.** Token2 PIV and OpenPGP serials now show
+  the number printed on the key, a Nitrokey shows its own serial, and serials
+  too long for decimal display as hex. ([#128])
+- **PIV certificates too large for a slot can be stored compressed.**
+  keyroost can now write a certificate in the PIV standard's gzip form
+  (CertInfo `0x01`, NIST SP 800-73-4). By default it stores certificates
+  uncompressed and only compresses one the card refuses as too large (about
+  3 KB on a YubiKey), saying so when it does. `piv import-cert` and
+  `piv self-sign` take `--compress` / `--no-compress`, and the GUI's Import
+  certificate and Self-signed dialogs have a matching Compression choice.
+  Every compressed write is read back and checked. `piv status` and the GUI
+  show which certificates are stored compressed. ykman, OpenSC and, in a
+  community test on Windows 11, Windows' built-in smart-card driver read
+  them; macOS's built-in PIV support has not been verified yet (testers
+  welcome in [#152]). ([#154])
+- **"Enable Anyway" and `--force` also cover keyroost's own reads.** GET
+  METADATA and ATTEST, which keyroost skips on an applet listed without them,
+  are sent too, so key details and attestation still show if the list is out
+  of date. Every skipped or overridden read leaves a line in the `--debug`
+  trace and the GUI activity log. ([#161])
+
+### Changed
+- **`piv reset` blocks the PIN and PUK itself where needed.** On a key listed
+  as supporting reset, it now locks the PIN and then the PUK if the card asks
+  for that before resetting; it used to fail unless both were already
+  blocked. On a key that isn't listed, or with `--force` on one listed
+  without reset, it sends one reset and locks nothing.
+  Some cards also need the management key or PIN for reset, and keyroost asks
+  for it. `factory-reset` now runs Token2 OTP before PIV, and on HID Crescendo
+  uses the device-wide reset. ([#128])
+- **PIV safety checks before writing.** `piv import-cert` refuses a
+  certificate whose public key doesn't match the key in the slot;
+  `generate-key` refuses a PIN or touch policy the card doesn't accept (unless
+  `--force`) and clears the slot's old certificate; `self-sign` and
+  `request-cert` refuse an X25519 slot before asking for the PIN. ([#128])
+- **`piv status --json` reports `serial` as a string.** A serial can now be
+  up to 128 bits, and a bare JSON number past 2^53 loses precision in most
+  consumers, so it is a decimal string, or `0x`-hex when too long for
+  decimal, matching the text output. It was a number through 0.11.0.
+  New fields: `applet_fingerprint`, `applet_name`, `version_firmware`.
+  ([#128])
+- **PIV pane layout.** Every slot action stays visible and is greyed with a
+  reason when it can't run; Import and Export certificate share a row; the
+  pane is locked while a card command runs; PIN, PUK and management-key fields
+  have a show/hide button. ([#128])
+
+### Fixed
+- **The AppImage runs on older Linux systems and minimal setups.** It is now
+  built on Ubuntu 22.04, so it needs glibc 2.35 rather than 2.39, and it
+  bundles the keyboard libraries (`libxkbcommon`, `libxkbcommon-x11`) the
+  windowing layer loads at runtime; without them it crashed at startup on
+  systems that lack `libxkbcommon-x11`. The Linux release tarball is built
+  on Ubuntu 22.04 as well. ([#160])
+
 ## [0.11.0] - 2026-09-30
 
 ### Changed
@@ -1144,12 +1226,18 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#119]: https://github.com/framefilter/keyroost/pull/119
 [#124]: https://github.com/framefilter/keyroost/issues/124
 [#127]: https://github.com/framefilter/keyroost/issues/127
+[#128]: https://github.com/framefilter/keyroost/issues/128
 [#130]: https://github.com/framefilter/keyroost/issues/130
 [#131]: https://github.com/framefilter/keyroost/issues/131
 [#147]: https://github.com/framefilter/keyroost/issues/147
 [#151]: https://github.com/framefilter/keyroost/issues/151
+[#152]: https://github.com/framefilter/keyroost/issues/152
+[#154]: https://github.com/framefilter/keyroost/issues/154
 [#157]: https://github.com/framefilter/keyroost/issues/157
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.11.0...HEAD
+[#160]: https://github.com/framefilter/keyroost/issues/160
+[#161]: https://github.com/framefilter/keyroost/issues/161
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/framefilter/keyroost/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/framefilter/keyroost/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/framefilter/keyroost/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/framefilter/keyroost/compare/v0.8.0...v0.9.0

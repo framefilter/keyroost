@@ -60,16 +60,24 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   signature with the Authentication key via INTERNAL AUTHENTICATE); set
   cardholder name / URL; change the user / admin PIN and unblock a locked PIN;
   factory-reset the applet.
-- **PIV (SP 800-73-4)** — full management: status (applet/firmware version,
-  serial, PIN retries, which slots 9A/9C/9D/9E hold a certificate), on-card key
-  generation, certificate import / export, self-signed certs or a CSR for a CA,
-  clearing a slot's certificate (`delete-cert`) or key (`delete-key`, on YubiKey
-  5.7+), moving a key between slots (`move-key`, on YubiKey 5.7+), writing a
+- **PIV (SP 800-73-4)** — full management: status (detected applet,
+  applet/firmware version, serial, PIN retries, which slots 9A/9C/9D/9E hold a
+  certificate), on-card key generation (RSA, ECC P-256/384/521, Ed25519,
+  X25519), certificate import / export, self-signed certs or a CSR for a CA,
+  clearing a slot's certificate (`delete-cert`) or key (`delete-key`), moving a
+  key between slots (`move-key`), writing a
   fresh CHUID with a random GUID (`new-chuid`) so Windows re-reads a
   reprovisioned card, and PIN / PUK / management-key changes and applet reset.
+  A certificate too large for a slot can be stored gzip-compressed, as the PIV
+  standard allows (`--compress` / `--no-compress`).
   A read-only `test` runs every private-key operation a slot's key supports
   (decrypt for RSA, key-agree for the ECDH curves, sign for RSA / ECDSA /
   Ed25519) and checks each result against the slot certificate's public key.
+  keyroost identifies which PIV implementation a card runs (YubiKey, Token2,
+  Nitrokey, Swissbit, HID Crescendo and others) and offers vendor extensions
+  such as `move-key` and `delete-key` according to a built-in list of what each
+  supports. A feature the list marks unsupported stays visible, and the GUI's
+  **Enable Anyway** or the CLI's `--force` turns it on.
   Every slot-taking command addresses
   9A/9C/9D/9E *and* the 20 Yubico retired key-management slots (82–95), so keys
   can be archived and rotated. The GUI collects the
@@ -125,11 +133,11 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 |---|---|---|
 | **Token2 Molto2 / Molto2v2** | TOTP slot programming, bulk import | Hardware-verified. Programmed over the vendor-specific SM4-MAC protocol ([docs/PROTOCOL.md](docs/PROTOCOL.md)); supports bulk import from Aegis / 2FAS / otpauth-list, clock sync, and customer-key rotation. |
 | **Token2 single-profile tokens** (OTPC-P1-i / P2-i, miniOTP-2-i / 3-i, C301-i, C302-i) | Single-account TOTP seed + config programming | Programmed over the vendor-specific SM4-MAC protocol with a fixed device key ([docs/PROTOCOL-token2prog.md](docs/PROTOCOL-token2prog.md)); writes the seed and the TOTP algorithm / time-step / display-timeout over a contact or contactless PC/SC reader. The model is recognized from the device serial. |
-| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys without it answer the capability probe with "no such command" and are unaffected. Contributed by [@token2](https://github.com/token2). The OATH / OpenPGP / PIV smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
+| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys without it answer the capability probe with "no such command" and are unaffected. Contributed by [@token2](https://github.com/token2). PIV management was exercised on Token2 hardware by [@episource](https://github.com/episource) ([#128](https://github.com/framefilter/keyroost/pull/128)), and keyroost decodes the BCD-coded serial Token2's PIV and OpenPGP applets report. The OATH / OpenPGP smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
 | **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
-| **Nitrokey 3** | FIDO2, OATH, PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource). The OpenPGP applet is detected but not yet exercised by this project. |
-| **Swissbit iShield Key 2 Pro** | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own card. Slot status is not yet trustworthy: the card reports every slot's key type as ECC P-384 ([#113](https://github.com/framefilter/keyroost/issues/113)). Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. Other applets not yet exercised by this project. |
+| **Nitrokey 3** | FIDO2, OATH, PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. The OpenPGP applet is detected but not yet exercised by this project. |
+| **Swissbit iShield Key 2 Pro** | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own card. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)). Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. Other applets not yet exercised by this project. |
 | **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, large-blob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
 
 Each listed row notes what's actually been verified on that device; the final,
@@ -223,9 +231,11 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   on `self-sign` / `request-cert`
   ([#116](https://github.com/framefilter/keyroost/pull/116)), status-word
   meanings in errors ([#118](https://github.com/framefilter/keyroost/pull/118)),
-  and the PIV-refresh APDU deduplication
-  ([#119](https://github.com/framefilter/keyroost/pull/119)) — most of it
-  hardware-verified on their own cards.
+  the PIV-refresh APDU deduplication
+  ([#119](https://github.com/framefilter/keyroost/pull/119)), and PIV applet
+  fingerprinting with per-device feature gates, HID Crescendo management and
+  ECC P-521 ([#128](https://github.com/framefilter/keyroost/pull/128)) — most
+  of it hardware-verified on their own cards.
 
 (This credits their contributions to the codebase; it does not change keyroost's
 independent status described above.)
@@ -258,7 +268,8 @@ an open industry standard.
 
 **PIV**
 - **NIST SP 800-73-4** / FIPS 201 Personal Identity Verification card interface,
-  including X.509 certificate slots.
+  including X.509 certificate slots and their gzip-compressed form
+  ([RFC 1952](https://www.rfc-editor.org/rfc/rfc1952)).
   [Spec](https://csrc.nist.gov/pubs/sp/800/73/4/final)
 
 **Token2 Molto2 / Molto2v2 (vendor-specific)**
@@ -467,7 +478,9 @@ you still need that daemon running on the host (see
 
 Download `keyroost-x86_64.AppImage` from the
 [latest release](https://github.com/framefilter/keyroost/releases/latest) — the
-asset name is version-less, so this URL always fetches the current build:
+asset name is version-less, so this URL always fetches the current build. It
+needs glibc 2.35 or newer (see the note under
+[Smart-card prerequisite](#smart-card-prerequisite)):
 
 ```bash
 curl -LO https://github.com/framefilter/keyroost/releases/latest/download/keyroost-x86_64.AppImage
@@ -538,10 +551,11 @@ setup. The CLI has no build script.)
 > interface) and shows an "Administrator rights needed" card with a button to
 > relaunch elevated or open Windows' own security-key settings.
 
-> **Prebuilt binaries:** the release artifacts are built on Ubuntu and linked
-> against its glibc, so they run on glibc-current distros (Arch, recent Fedora)
-> but may fail on older ones (e.g. RHEL 9) with a `GLIBC_…` error. When in doubt,
-> build from source with the commands above — `cargo install` handles the rest.
+> **Prebuilt binaries:** the Linux release tarball and the AppImage are built on
+> Ubuntu 22.04 and need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36
+> and later); on an older system (e.g. RHEL 9) they fail with a `GLIBC_…` error.
+> There, build from source with the commands above — `cargo install` handles
+> the rest.
 
 > **Wayland and clipboard auto-clear:** after copying an OTP code the GUI
 > clears the clipboard ~45 s later, but only if the clipboard still holds that
@@ -675,13 +689,13 @@ old script.
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (inflate gzip-compressed PIV certs); `hidapi` on macOS/Windows |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for per-credential largeBlob, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
-| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM | `zeroize` |
-| `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against the slot certificate's public key | `rsa`, `p256`, `p384`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
+| `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM, applet fingerprinting and per-device feature gates | `zeroize` |
+| `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against the slot certificate's public key | `rsa`, `p256`, `p384`, `p521`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |

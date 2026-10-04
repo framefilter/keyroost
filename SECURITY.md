@@ -105,10 +105,11 @@ What keyroost does **not** defend against:
   under `forbid(unsafe_code)` — RustCrypto (`sha2`, `hmac`, `aes`, `des`,
   `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `zeroize`, `scrypt`
   (Aegis vaults), `rsa`/`rand` (host RSA keygen, confined to
-  `keyroost-rsakey`), `p384`/`ed25519-dalek`/`x25519-dalek` (host-side
-  verification of the PIV slot self-test, confined to `keyroost-pivtest`),
-  and `miniz_oxide` (CTAP large-blob deflate, and inflating gzip-compressed
-  PIV certificates, both size-capped). QR and
+  `keyroost-rsakey`), `p384`/`p521`/`ed25519-dalek`/`x25519-dalek`
+  (host-side verification of the PIV slot self-test, confined to
+  `keyroost-pivtest`), and `miniz_oxide` (CTAP large-blob deflate, and
+  reading and writing gzip-compressed PIV certificates; decompression is
+  size-capped). QR and
   image decoding (`rqrr`, `png`, `jpeg-decoder`) is confined to
   `keyroost-qr`. The README's "Workspace layout" table lists them per
   crate. No new dependency lands without that justification.
@@ -125,8 +126,8 @@ What keyroost does **not** defend against:
   threat model are covered by seventeen `cargo-fuzz` targets
   (`fuzz/fuzz_targets/`), all of which run on a weekly schedule; a RUSTSEC scan
   (`cargo audit`) runs weekly and on every change to a manifest or the
-  lockfile, and Dependabot proposes monthly updates for both the cargo and
-  the GitHub-Actions dependency sets. The fuzz harness is its own workspace
+  lockfile, and Dependabot proposes monthly updates for the cargo,
+  GitHub-Actions and Nix flake dependency sets. The fuzz harness is its own workspace
   so its nightly-only toolchain requirement never enters the shipped
   dependency tree.
 - **Reviewable releases.** Release binaries are built by CI from tagged
