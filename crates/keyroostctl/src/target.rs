@@ -1,0 +1,311 @@
+//! Target selection glue: the global `--device` plus a command's
+//! `--reader` / `--path` → one `Device` via `keyroost_resolve::resolve_target`,
+//! the one announce line every device command prints, and a per-process
+//! memo so a command never resolves (or announces) twice.
+
+use std::error::Error;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use keyroost_resolve::{
+    endpoint, resolve_target, Caps, Device, DeviceKind, EnumerateOptions, Need, Picker,
+    SelectError, Selector,
+};
+
+use crate::prompt::{RealTerm, TermPicker};
+use crate::sanitize_terminal;
+
+/// The global `--debug`, captured once in `run()`.
+pub(crate) static DEBUG: OnceLock<bool> = OnceLock::new();
+static RESOLVED: Mutex<Option<(Need, Device)>> = Mutex::new(None);
+
+pub(crate) fn debug_on() -> bool {
+    DEBUG.get().copied().unwrap_or(false)
+}
+
+pub(crate) fn device_flag() -> Option<&'static str> {
+    crate::SELECTED_KEY_NAME.get().and_then(|o| o.as_deref())
+}
+
+/// The shared device model, with identity reads traced under `--debug`.
+pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
+    Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
+        debug: debug_on(),
+    })?)
+}
+
+/// `→ <name or model> · serial <S> · <reader | path>` (serial omitted when
+/// unknown; reader or path chosen by what `need` opens).
+pub(crate) fn announce_line(d: &Device, need: Need) -> String {
+    let mut line = format!(
+        "\u{2192} {}",
+        sanitize_terminal(d.name.as_deref().unwrap_or(&d.model))
+    );
+    if !d.serial.is_empty() {
+        line.push_str(&format!(" \u{b7} serial {}", sanitize_terminal(&d.serial)));
+    }
+    let via = endpoint(d, need);
+    if !via.is_empty() {
+        line.push_str(&format!(" \u{b7} {via}"));
+    }
+    line
+}
+
+/// The announce line for a `--reader` / `--path` that matched no detected key.
+fn typed_announce_line(typed: &str) -> String {
+    format!(
+        "\u{2192} {} (not detected; using it as typed)",
+        sanitize_terminal(typed)
+    )
+}
+
+/// A stand-in row for an expert `--reader` / `--path` that matched no
+/// detected key: the command opens exactly what was typed.
+fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) -> Device {
+    Device {
+        id: format!("override:{typed}"),
+        name: None,
+        vendor: String::new(),
+        model: "key not detected".into(),
+        serial: String::new(),
+        transport: String::new(),
+        firmware: String::new(),
+        caps: Caps::default(),
+        unverified: Caps::default(),
+        kind: DeviceKind::Key,
+        hid_path,
+        reader,
+    }
+}
+
+/// Pick the row and its announce line. An unmatched `--reader` / `--path`
+/// passes through as typed; every other selection error is returned.
+fn choose(
+    devices: &[Device],
+    sel: &Selector<'_>,
+    need: Need,
+    picker: &mut dyn Picker,
+) -> Result<(Device, String), SelectError> {
+    match resolve_target(devices, sel, need, picker) {
+        Ok(t) => Ok((t.device.clone(), announce_line(t.device, need))),
+        Err(SelectError::ReaderNotFound { reader }) => Ok((
+            typed_device(Some(reader.clone()), None, &reader),
+            typed_announce_line(&reader),
+        )),
+        Err(SelectError::PathNotFound { path }) => Ok((
+            typed_device(None, Some(PathBuf::from(&path)), &path),
+            typed_announce_line(&path),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// Return the memoised row for `need`, else run `resolve` and remember it.
+fn memoised(
+    memo: &Mutex<Option<(Need, Device)>>,
+    need: Need,
+    resolve: impl FnOnce() -> Result<Device, Box<dyn Error>>,
+) -> Result<Device, Box<dyn Error>> {
+    if let Some((n, d)) = memo.lock().map_err(|_| "target lock poisoned")?.as_ref() {
+        if *n == need {
+            return Ok(d.clone());
+        }
+    }
+    let dev = resolve()?;
+    *memo.lock().map_err(|_| "target lock poisoned")? = Some((need, dev.clone()));
+    Ok(dev)
+}
+
+/// Resolve and announce the key this command acts on (once per process
+/// per need; later calls return the same row without re-enumerating).
+#[allow(dead_code)] // first called by a command handler in Task 9
+pub(crate) fn select(
+    need: Need,
+    reader: Option<&str>,
+    path: Option<&Path>,
+) -> Result<Device, Box<dyn Error>> {
+    memoised(&RESOLVED, need, || {
+        let devices = enumerate()?;
+        let sel = Selector {
+            device: device_flag(),
+            reader,
+            path,
+        };
+        let mut term = RealTerm;
+        let mut picker = TermPicker::new(&mut term);
+        let (dev, line) = choose(&devices, &sel, need, &mut picker)?;
+        eprintln!("{line}");
+        Ok(dev)
+    })
+}
+
+/// The exact reader of the selected key (never re-matched as a substring).
+#[allow(dead_code)] // first called by a command handler in Task 9
+pub(crate) fn reader_for(need: Need, reader: Option<&str>) -> Result<String, Box<dyn Error>> {
+    select(need, reader, None)?
+        .reader
+        .ok_or_else(|| Box::<dyn Error>::from("internal error: a smart-card row without a reader"))
+}
+
+pub(crate) fn add_bootloader_hint(e: Box<dyn Error>, bootloader: Option<&str>) -> Box<dyn Error> {
+    let no_key = matches!(
+        e.downcast_ref::<SelectError>(),
+        Some(SelectError::NoCandidates { .. })
+    );
+    match (no_key, bootloader) {
+        (true, Some(bl)) => {
+            format!("{e} (Detected {bl} \u{2014} re-plug it to return to application mode.)").into()
+        }
+        _ => e,
+    }
+}
+
+/// The HID path of the selected FIDO key.
+#[allow(dead_code)] // first called by a command handler in Task 9
+pub(crate) fn fido_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
+    let dev = select(Need::FidoHid, None, path).map_err(|e| {
+        let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
+        add_bootloader_hint(e, bl.as_deref())
+    })?;
+    dev.hid_path.ok_or_else(|| {
+        Box::<dyn Error>::from("internal error: a FIDO-over-USB row without a HID path")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyroost_resolve::NoPicker;
+    use std::cell::Cell;
+
+    fn dev(name: Option<&str>, serial: &str) -> Device {
+        Device {
+            id: "t".into(),
+            name: name.map(str::to_owned),
+            vendor: "Yubico".into(),
+            model: "YubiKey 5 NFC".into(),
+            serial: serial.into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps: Caps::default(),
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: Some("/dev/hidraw16".into()),
+            reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00".into()),
+        }
+    }
+
+    #[test]
+    fn announce_names_key_serial_and_endpoint() {
+        assert_eq!(
+            announce_line(&dev(Some("yubi-test"), "12345678"), Need::Piv),
+            "\u{2192} yubi-test \u{b7} serial 12345678 \u{b7} Yubico YubiKey OTP+FIDO+CCID 00 00"
+        );
+        assert_eq!(
+            announce_line(&dev(None, ""), Need::FidoHid),
+            "\u{2192} YubiKey 5 NFC \u{b7} /dev/hidraw16"
+        );
+        let mut evil = dev(Some("a\u{1b}[2Jb"), "1\u{1b}");
+        evil.reader = None;
+        evil.hid_path = Some("/dev/x\u{1b}[2J".into());
+        assert!(!announce_line(&evil, Need::Piv).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn announce_without_any_endpoint_has_no_trailing_separator() {
+        let mut d = dev(None, "");
+        d.reader = None;
+        d.hid_path = None;
+        assert_eq!(announce_line(&d, Need::Piv), "\u{2192} YubiKey 5 NFC");
+    }
+
+    #[test]
+    fn unmatched_reader_or_path_passes_through_as_typed() {
+        let devices = vec![dev(Some("k"), "1")];
+        let sel = Selector {
+            device: None,
+            reader: Some("Other\u{1b}[2J Reader"),
+            path: None,
+        };
+        let (d, line) = choose(&devices, &sel, Need::Piv, &mut NoPicker).unwrap();
+        assert_eq!(d.reader.as_deref(), Some("Other\u{1b}[2J Reader"));
+        assert!(d.hid_path.is_none());
+        assert_eq!(d.model, "key not detected");
+        assert!(d.id.starts_with("override:"));
+        assert!(line.ends_with("(not detected; using it as typed)"));
+        assert!(!line.contains('\u{1b}'));
+
+        let p = PathBuf::from("/dev/hidraw99");
+        let sel = Selector {
+            device: None,
+            reader: None,
+            path: Some(&p),
+        };
+        let (d, line) = choose(&devices, &sel, Need::FidoHid, &mut NoPicker).unwrap();
+        assert_eq!(d.hid_path.as_deref(), Some(p.as_path()));
+        assert!(d.reader.is_none());
+        assert_eq!(
+            line,
+            "\u{2192} /dev/hidraw99 (not detected; using it as typed)"
+        );
+    }
+
+    #[test]
+    fn other_selection_errors_propagate() {
+        let devices = vec![dev(Some("k"), "1")];
+        let p = PathBuf::from("/dev/hidraw16");
+        let sel = Selector {
+            device: Some("k"),
+            reader: None,
+            path: Some(&p),
+        };
+        assert!(matches!(
+            choose(&devices, &sel, Need::FidoHid, &mut NoPicker),
+            Err(SelectError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn memo_resolves_once_per_need() {
+        let memo = Mutex::new(None);
+        let calls = Cell::new(0);
+        let resolve = |serial: &'static str| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                Ok(dev(None, serial))
+            }
+        };
+        assert_eq!(
+            memoised(&memo, Need::Piv, resolve("1")).unwrap().serial,
+            "1"
+        );
+        // Same need: the remembered row, resolver not called again.
+        assert_eq!(
+            memoised(&memo, Need::Piv, resolve("2")).unwrap().serial,
+            "1"
+        );
+        assert_eq!(calls.get(), 1);
+        // A different need resolves afresh.
+        assert_eq!(
+            memoised(&memo, Need::FidoHid, resolve("3")).unwrap().serial,
+            "3"
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn bootloader_hint_only_on_no_candidates() {
+        let none: Box<dyn std::error::Error> = Box::new(SelectError::NoCandidates {
+            need: Need::FidoHid,
+            connected: Vec::new(),
+        });
+        assert!(add_bootloader_hint(none, Some("Solo 2 bootloader"))
+            .to_string()
+            .contains("re-plug it"));
+        let other: Box<dyn std::error::Error> = Box::new(SelectError::Conflict);
+        assert!(!add_bootloader_hint(other, Some("x"))
+            .to_string()
+            .contains("re-plug"));
+    }
+}

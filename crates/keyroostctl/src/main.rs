@@ -29,6 +29,7 @@ use keyroost_resolve::{
 
 mod overview;
 mod prompt;
+mod target;
 
 /// The global `--device` selector, captured once in `run()` so the FIDO device
 /// resolver can honor it without threading it through every subcommand handler.
@@ -3460,6 +3461,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // it through every FIDO subcommand handler.
     let _ = SELECTED_KEY_NAME.set(cli.device.clone());
     let _ = JSON_OUTPUT.set(cli.json);
+    let _ = target::DEBUG.set(cli.debug);
 
     if cli.list_readers {
         for r in Session::list_readers()? {
@@ -3471,7 +3473,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let Some(cmd) = cli.command.as_ref() else {
         // No subcommand → the friendly correlated overview of every connected
         // device. (The Molto2 serial/clock still lives under `molto info`.)
-        let devices = keyroost_resolve::enumerate()?;
+        let devices = target::enumerate()?;
         if json_output() {
             use keyroost_resolve::DeviceKind;
             let out: Vec<json_out::DeviceJson> = devices

@@ -12,7 +12,6 @@ use crate::sanitize_terminal;
 
 pub(crate) trait Term {
     fn present(&self) -> bool;
-    #[allow(dead_code)] // only called via TermPicker, wired up in Task 18
     fn say(&mut self, line: &str);
     fn ask(&mut self, prompt: &str) -> std::io::Result<String>;
 }
@@ -48,12 +47,10 @@ impl Term for RealTerm {
     }
 }
 
-#[allow(dead_code)] // constructed from Task 18
 pub(crate) struct TermPicker<'a> {
     term: &'a mut dyn Term,
 }
 impl<'a> TermPicker<'a> {
-    #[allow(dead_code)] // used from Task 18
     pub(crate) fn new(term: &'a mut dyn Term) -> Self {
         Self { term }
     }
