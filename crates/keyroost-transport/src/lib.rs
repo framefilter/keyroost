@@ -85,6 +85,10 @@ pub use token2otp::{
 /// module doc for why this is thread-local instead of a passed-in sink.
 pub mod trace;
 
+/// Read-only identity reads (#51) used to match a key's FIDO-HID node to its
+/// smart-card reader.
+pub mod identity;
+
 /// Re-exported so front-ends can name a key slot without depending on
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{
