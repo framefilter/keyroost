@@ -561,6 +561,17 @@ enum Cmd {
         /// USB-HID and falls back to CCID/NFC when HID is disabled on the key.
         #[arg(long, value_enum, default_value_t = OtpTransportArg::Auto, global = true)]
         transport: OtpTransportArg,
+        /// Smart-card reader name (substring) of the key, instead of --device.
+        #[arg(
+            id = "otp_reader",
+            long = "reader",
+            value_name = "SUBSTR",
+            global = true
+        )]
+        reader: Option<String>,
+        /// HID device path of the key, instead of --device.
+        #[arg(id = "otp_path", long = "path", value_name = "PATH", global = true)]
+        path: Option<std::path::PathBuf>,
         #[command(subcommand)]
         cmd: OtpCmd,
     },
@@ -3079,6 +3090,24 @@ enum OtpTransportArg {
     Ccid,
 }
 
+/// The selectors an `otp` invocation was given: the transport plus the
+/// group's own `--reader` / `--path` (an alternative to the global `--device`).
+#[derive(Clone, Copy)]
+struct OtpSelect<'a> {
+    transport: OtpTransportArg,
+    reader: Option<&'a str>,
+    path: Option<&'a Path>,
+}
+
+/// What the shared key finder needs to admit a device for this transport pick.
+fn otp_need(t: OtpTransportArg) -> Need {
+    match t {
+        OtpTransportArg::Auto => Need::Otp,
+        OtpTransportArg::Hid => Need::OtpHid,
+        OtpTransportArg::Ccid => Need::OtpCcid,
+    }
+}
+
 #[derive(Copy, Clone, ValueEnum)]
 enum OtpTypeArg {
     Totp,
@@ -3584,8 +3613,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Token2 on-device OTP talks to the FIDO key's OTP applet over USB-HID
     // (with a PC/SC fallback), not the Molto2 — handle it before the Molto2
     // PC/SC auth flow below.
-    if let Cmd::Otp { cmd, transport } = cmd {
-        run_otp(cmd, *transport, cli.debug)?;
+    if let Cmd::Otp {
+        cmd,
+        transport,
+        reader,
+        path,
+    } = cmd
+    {
+        run_otp(
+            cmd,
+            OtpSelect {
+                transport: *transport,
+                reader: reader.as_deref(),
+                path: path.as_deref(),
+            },
+            cli.debug,
+        )?;
         return Ok(());
     }
 
@@ -4736,8 +4779,8 @@ fn open_oath(
 /// Resolve exactly one device for a whole-device operation: the one matching
 /// the global `--device` selector, or the lone connected key when no selector
 /// is set. Fails closed on zero matches and refuses to guess among several
-/// (mirrors `resolve_otp_target`'s name-match/ambiguity posture, without an
-/// applet filter).
+/// (the same name-match/ambiguity posture the shared key finder applies,
+/// without an applet filter).
 fn resolve_single_device<'a>(
     devices: &'a [keyroost_resolve::Device],
     name: Option<&str>,
@@ -5633,7 +5676,14 @@ fn reset_one_card_applet(
             }
             ResetStep::Piv => unreachable!("handled above, before this closure"),
             ResetStep::Token2Otp => {
-                let mut s = open_otp(OtpTransportArg::Auto, debug)?;
+                let mut s = open_otp(
+                    &OtpSelect {
+                        transport: OtpTransportArg::Auto,
+                        reader,
+                        path: None,
+                    },
+                    debug,
+                )?;
                 s.erase_all()?;
             }
             ResetStep::Fido => unreachable!("FIDO handled by the interactive path"),
@@ -5858,123 +5908,80 @@ enum OtpTarget {
     HidThenReader(std::path::PathBuf, String),
 }
 
-/// Resolve the global `--device` selector to a concrete OTP transport target so
-/// an OTP command binds to the key the user named rather than the first key that
-/// enumerates. Returns `Ok(None)` when no `--device` is set (the caller then uses
-/// the auto/HID/CCID detection path). Fails closed when the name matches zero or
-/// more than one live OTP-capable device, or when the device cannot satisfy the
-/// requested transport.
-fn resolve_otp_target(
-    devices: &[keyroost_resolve::Device],
-    name: Option<&str>,
+/// The OTP endpoint(s) on an already-selected key. Both interfaces under
+/// `auto`: HID first, the SAME key's reader as an open-time fallback (#82).
+fn otp_target_for(
+    dev: &keyroost_resolve::Device,
     transport: OtpTransportArg,
-) -> Result<Option<OtpTarget>, Box<dyn std::error::Error>> {
-    use keyroost_resolve::Caps;
-    let Some(name) = name else { return Ok(None) };
-    let matches: Vec<&keyroost_resolve::Device> = devices
-        .iter()
-        .filter(|d| d.name.as_deref() == Some(name) && d.caps.has(Caps::OTP))
-        .collect();
-    let dev = match matches.as_slice() {
-        [] => {
-            return Err(format!(
-                "no connected OTP-capable device is named '{name}' \
-                 (see `keyroostctl key-name list`)"
-            )
-            .into());
-        }
-        [one] => *one,
-        many => {
-            return Err(format!(
-                "{} connected devices are named '{name}'; refusing to guess which \
-                 OTP key to use",
-                many.len()
-            )
-            .into());
-        }
-    };
-    let target =
-        match transport {
-            OtpTransportArg::Hid => OtpTarget::HidPath(dev.hid_path.clone().ok_or_else(|| {
-                format!("device '{name}' has no USB-HID interface for --transport hid")
-            })?),
-            OtpTransportArg::Ccid => OtpTarget::Reader(dev.reader.clone().ok_or_else(|| {
-                format!("device '{name}' has no PC/SC reader for --transport ccid")
-            })?),
-            OtpTransportArg::Auto => {
-                match (dev.hid_path.clone(), dev.reader.clone()) {
-                    // Both interfaces: HID first, the same key's reader as an
-                    // open-time fallback (#82).
-                    (Some(p), Some(r)) => OtpTarget::HidThenReader(p, r),
-                    (Some(p), None) => OtpTarget::HidPath(p),
-                    (None, Some(r)) => OtpTarget::Reader(r),
-                    (None, None) => {
-                        return Err(format!(
-                            "device '{name}' exposes no OTP transport (neither USB-HID nor PC/SC)"
-                        )
-                        .into());
-                    }
-                }
-            }
-        };
-    Ok(Some(target))
+) -> Result<OtpTarget, String> {
+    let label = sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model));
+    match transport {
+        OtpTransportArg::Hid => dev
+            .hid_path
+            .clone()
+            .map(OtpTarget::HidPath)
+            .ok_or_else(|| format!("'{label}' has no USB-HID interface for --transport hid")),
+        OtpTransportArg::Ccid => dev
+            .reader
+            .clone()
+            .map(OtpTarget::Reader)
+            .ok_or_else(|| format!("'{label}' has no smart-card reader for --transport ccid")),
+        OtpTransportArg::Auto => match (dev.hid_path.clone(), dev.reader.clone()) {
+            (Some(p), Some(r)) => Ok(OtpTarget::HidThenReader(p, r)),
+            (Some(p), None) => Ok(OtpTarget::HidPath(p)),
+            (None, Some(r)) => Ok(OtpTarget::Reader(r)),
+            (None, None) => Err(format!(
+                "'{label}' exposes no OTP transport (neither USB-HID nor PC/SC)"
+            )),
+        },
+    }
 }
 
-/// Open a Token2 OTP session on the requested transport and register a touch
-/// prompt for button-required commands. When a global `--device` selector is
-/// set the session binds to that exact device (KEY-003) and fails closed on an
-/// unknown or ambiguous name; without a selector it uses first-match detection.
-fn open_otp(
+/// Resolve the key this `otp` invocation acts on through the shared finder
+/// (KEY-003: never the first OTP-capable key that happens to enumerate).
+fn select_otp(sel: &OtpSelect<'_>) -> Result<keyroost_resolve::Device, Box<dyn std::error::Error>> {
+    crate::target::select(otp_need(sel.transport), sel.reader, sel.path)
+}
+
+/// Open a Token2 OTP session on an already-selected device and register a
+/// touch prompt for button-required commands.
+fn open_otp_on(
+    dev: &keyroost_resolve::Device,
     transport: OtpTransportArg,
     debug: bool,
 ) -> Result<keyroost_transport::Token2OtpSession, Box<dyn std::error::Error>> {
-    let name = SELECTED_KEY_NAME.get().and_then(|o| o.as_deref());
-    let mut session = if name.is_some() {
-        let devices = keyroost_resolve::enumerate()?;
-        match resolve_otp_target(&devices, name, transport)? {
-            Some(OtpTarget::HidPath(p)) => {
-                keyroost_transport::Token2OtpSession::open_hid_path(&p, debug)?
+    use keyroost_transport::Token2OtpSession as S;
+    let mut session = match otp_target_for(dev, transport)? {
+        OtpTarget::HidPath(p) => S::open_hid_path(&p, debug)?,
+        OtpTarget::Reader(r) => S::open_pcsc_reader(&r, debug)?,
+        OtpTarget::HidThenReader(p, r) => match S::open_hid_path(&p, debug) {
+            Ok(s) => s,
+            Err(hid_err) => {
+                eprintln!(
+                    "{}",
+                    sanitize_terminal(&format!(
+                        "USB-HID path failed ({hid_err}); trying the same key's \
+                         smart-card reader\u{2026}"
+                    ))
+                );
+                S::open_pcsc_reader(&r, debug)?
             }
-            Some(OtpTarget::Reader(r)) => {
-                keyroost_transport::Token2OtpSession::open_pcsc_reader(&r, debug)?
-            }
-            Some(OtpTarget::HidThenReader(p, r)) => {
-                match keyroost_transport::Token2OtpSession::open_hid_path(&p, debug) {
-                    Ok(s) => s,
-                    Err(hid_err) => {
-                        eprintln!(
-                            "{}",
-                            sanitize_terminal(&format!(
-                                "USB-HID path failed ({hid_err}); trying the same \
-                                 key's smart-card reader\u{2026}"
-                            ))
-                        );
-                        keyroost_transport::Token2OtpSession::open_pcsc_reader(&r, debug)?
-                    }
-                }
-            }
-            None => unreachable!("a set --device always yields a target or an error"),
-        }
-    } else {
-        match transport {
-            OtpTransportArg::Auto => keyroost_transport::Token2OtpSession::detect_debug(debug)?,
-            OtpTransportArg::Hid => keyroost_transport::Token2OtpSession::detect_hid_only(debug)?,
-            OtpTransportArg::Ccid => keyroost_transport::Token2OtpSession::detect_pcsc_only(debug)?,
-        }
+        },
     };
     session.set_debug(debug);
-    eprintln!(
-        "\u{2192} Token2 OTP on {}",
-        if session.is_pcsc() {
-            "CCID/NFC"
-        } else {
-            "USB-HID"
-        }
-    );
     session.set_button_prompt(Box::new(|| {
         eprintln!("touch your key to continue\u{2026}");
     }));
     Ok(session)
+}
+
+/// Select the key for this `otp` invocation and open its OTP session.
+fn open_otp(
+    sel: &OtpSelect<'_>,
+    debug: bool,
+) -> Result<keyroost_transport::Token2OtpSession, Box<dyn std::error::Error>> {
+    let dev = select_otp(sel)?;
+    open_otp_on(&dev, sel.transport, debug)
 }
 
 /// A Token2 OTP function that ships as a separate product configuration. Which
@@ -6054,12 +6061,12 @@ fn ensure_otp_feature(
 
 fn run_otp(
     cmd: &OtpCmd,
-    transport: OtpTransportArg,
+    sel: OtpSelect<'_>,
     debug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         OtpCmd::List { pin_env, pin_stdin } => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             // If a PIN was supplied, unlock the protected read window first; if
@@ -6109,7 +6116,7 @@ fn run_otp(
             }
         }
         OtpCmd::Get { app, account } => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             let entry = session.read_entry(now, app, account)?;
@@ -6175,7 +6182,7 @@ fn run_otp(
             };
             let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let entry = keyroost_token2otp::WriteEntry {
                 otp_type: otp_type.to_t2(),
@@ -6206,7 +6213,7 @@ fn run_otp(
             } else {
                 None
             };
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.delete_entry_pinned(app, account, pin.as_deref().map(|p| p.as_str()))?;
             let label = if app.is_empty() {
@@ -6220,7 +6227,7 @@ fn run_otp(
             if !yes {
                 return Err("refusing to erase all OTP entries without --yes".into());
             }
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             // Checked before the touch prompt: no point asking for a physical
             // touch on a key that has nothing to erase.
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
@@ -6229,7 +6236,7 @@ fn run_otp(
             println!("Erased all OTP entries.");
         }
         OtpCmd::Serial => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             let sn = session.read_serial()?;
             let hex: String = sn.iter().map(|b| format!("{b:02x}")).collect();
             if json_output() {
@@ -6252,19 +6259,19 @@ fn run_otp(
             let seed_b32 = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
             let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::ButtonHotp)?;
             session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
             println!("Configured the HOTP-on-button keystroke slot.");
         }
         OtpCmd::DeleteButtonHotp => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::ButtonHotp)?;
             session.delete_button_hotp()?;
             println!("Deleted the HOTP-on-button keystroke slot.");
         }
         OtpCmd::Config => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             // Show the raw READ_CONFIG bytes first (diagnostic), then the parse.
             match session.read_config() {
                 Ok(raw) => {
@@ -6399,12 +6406,12 @@ fn run_otp(
                 }
             }
 
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             session.set_device_type(disable)?;
             println!("Interface configuration updated. Re-plug the key for it to take effect.");
         }
         OtpCmd::PinStatus => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             // `None` = the key never answered the flag read, i.e. it has no
             // OTP-PIN feature. That is a fact about the key, not a failure.
@@ -6431,14 +6438,14 @@ fn run_otp(
         }
         OtpCmd::SetPin { pin_env, pin_stdin } => {
             let pin = read_secret("new OTP PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_pin(pin.as_str())?;
             println!("OTP PIN set. Codes now require the PIN to read.");
         }
         OtpCmd::Verify { pin_env, pin_stdin } => {
             let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.verify_pin(pin.as_str())?;
             println!("OTP PIN verified; read window open for this connection.");
@@ -6470,20 +6477,20 @@ fn run_otp(
                 let new = read_secret("new OTP PIN", new_env.as_deref(), false)?;
                 (current, new)
             };
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.change_pin(current.as_str(), new.as_str())?;
             println!("OTP PIN changed.");
         }
         OtpCmd::RemovePin { pin_env, pin_stdin } => {
             let current = read_secret("current OTP PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.remove_pin(current.as_str())?;
             println!("OTP PIN removed. Codes are readable without a PIN again.");
         }
         OtpCmd::FpStatus => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             match session.fp_supported()? {
                 Some(true) => println!("Fingerprint-protected OTP: enabled"),
@@ -6493,20 +6500,20 @@ fn run_otp(
         }
         OtpCmd::FpEnable { pin_env, pin_stdin } => {
             let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), true)?;
             println!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
         }
         OtpCmd::FpDisable { pin_env, pin_stdin } => {
             let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), false)?;
             println!("Fingerprint protection disabled.");
         }
         OtpCmd::FpList => {
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             eprintln!("Touch the fingerprint sensor to unlock OTP codes\u{2026}");
@@ -6543,7 +6550,7 @@ fn run_otp(
             } else {
                 None
             };
-            let mut session = open_otp(transport, debug)?;
+            let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             if !*pin_only && session.fp_is_enabled().unwrap_or(false) {
@@ -11808,7 +11815,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn resolve_otp_target_binds_selected_device_or_fails_closed() {
+    fn otp_target_for_binds_selected_device_or_fails_closed() {
         use keyroost_resolve::{Caps, Device, DeviceKind};
 
         fn otp_dev(name: &str, hid: Option<&str>, reader: Option<&str>) -> Device {
@@ -11832,52 +11839,74 @@ mod cli_tests {
 
         let a = otp_dev("keyA", Some("/dev/hidraw0"), Some("Token2 A 00 00"));
         let b = otp_dev("keyB", Some("/dev/hidraw1"), Some("Token2 B 00 00"));
-        let devices = vec![a, b];
+        let devices = [a, b];
 
-        // No selector -> None, so the caller falls back to detect_*.
-        assert!(matches!(
-            resolve_otp_target(&devices, None, OtpTransportArg::Auto),
-            Ok(None)
-        ));
-
-        // Named + Auto on a dual-interface key -> the *selected* device's HID
-        // path with ITS OWN reader kept as an open-time fallback (#82: some
-        // firmware botches the HID probe while CCID works), never the first
-        // device on the bus.
-        match resolve_otp_target(&devices, Some("keyB"), OtpTransportArg::Auto) {
-            Ok(Some(OtpTarget::HidThenReader(p, r))) => {
+        // Auto on a dual-interface key -> the SELECTED device's own HID path
+        // with ITS OWN reader kept as an open-time fallback (#82: some
+        // firmware botches the HID probe while CCID works), never another
+        // device's.
+        match otp_target_for(&devices[1], OtpTransportArg::Auto) {
+            Ok(OtpTarget::HidThenReader(p, r)) => {
                 assert_eq!(p, std::path::PathBuf::from("/dev/hidraw1"));
                 assert_eq!(r, "Token2 B 00 00");
             }
             other => panic!("expected keyB HID path + reader fallback, got {other:?}"),
         }
 
-        // Named + Auto on a HID-only key -> a plain HID target.
-        let hid_only = vec![otp_dev("solo", Some("/dev/hidraw7"), None)];
-        match resolve_otp_target(&hid_only, Some("solo"), OtpTransportArg::Auto) {
-            Ok(Some(OtpTarget::HidPath(p))) => {
-                assert_eq!(p, std::path::PathBuf::from("/dev/hidraw7"))
-            }
+        // Auto on a HID-only key -> a plain HID target.
+        let hid_only = otp_dev("solo", Some("/dev/hidraw7"), None);
+        match otp_target_for(&hid_only, OtpTransportArg::Auto) {
+            Ok(OtpTarget::HidPath(p)) => assert_eq!(p, std::path::PathBuf::from("/dev/hidraw7")),
             other => panic!("expected plain HID target, got {other:?}"),
         }
 
-        // Named + Ccid -> that device's reader.
-        match resolve_otp_target(&devices, Some("keyA"), OtpTransportArg::Ccid) {
-            Ok(Some(OtpTarget::Reader(r))) => assert_eq!(r, "Token2 A 00 00"),
+        // Ccid -> that device's reader.
+        match otp_target_for(&devices[0], OtpTransportArg::Ccid) {
+            Ok(OtpTarget::Reader(r)) => assert_eq!(r, "Token2 A 00 00"),
             other => panic!("expected keyA reader, got {other:?}"),
         }
 
-        // Unknown name -> error, never opens anything.
-        assert!(resolve_otp_target(&devices, Some("ghost"), OtpTransportArg::Auto).is_err());
-
-        // Ambiguous (two live devices share the selected name) -> fail closed.
-        let mut dup = devices.clone();
-        dup[0].name = Some("keyB".to_string());
-        assert!(resolve_otp_target(&dup, Some("keyB"), OtpTransportArg::Auto).is_err());
-
         // Transport a device can't satisfy -> error (no HID interface for --transport hid).
-        let ccid_only = vec![otp_dev("nfc", None, Some("ACS reader 00"))];
-        assert!(resolve_otp_target(&ccid_only, Some("nfc"), OtpTransportArg::Hid).is_err());
+        let ccid_only = otp_dev("nfc", None, Some("ACS reader 00"));
+        assert!(otp_target_for(&ccid_only, OtpTransportArg::Hid).is_err());
+    }
+
+    #[test]
+    fn otp_target_for_maps_a_synthetic_reader_only_row_under_auto() {
+        // `target::select` turns an unmatched --reader/--path into a synthetic
+        // row carrying only that endpoint (see target.rs's `typed_device`);
+        // `otp_target_for` must map it like any other reader-only device.
+        use keyroost_resolve::{Caps, Device, DeviceKind};
+
+        let row = Device {
+            id: "override:Some Reader".into(),
+            name: None,
+            vendor: String::new(),
+            model: "key not detected".into(),
+            serial: String::new(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps: Caps::default(),
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: None,
+            reader: Some("Some Reader".to_string()),
+        };
+        match otp_target_for(&row, OtpTransportArg::Auto) {
+            Ok(OtpTarget::Reader(r)) => assert_eq!(r, "Some Reader"),
+            other => {
+                panic!("expected a Reader target for a synthetic reader-only row, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn otp_takes_reader_and_path_and_needs_follow_transport() {
+        assert!(parse(&["keyroostctl", "otp", "--reader", "Token2", "list"]).is_ok());
+        assert!(parse(&["keyroostctl", "otp", "list", "--path", "/dev/hidraw3"]).is_ok());
+        assert_eq!(otp_need(OtpTransportArg::Hid), Need::OtpHid);
+        assert_eq!(otp_need(OtpTransportArg::Ccid), Need::OtpCcid);
+        assert_eq!(otp_need(OtpTransportArg::Auto), Need::Otp);
     }
 
     #[test]
@@ -13686,63 +13715,46 @@ mod prop_tests {
             }
         }
 
-        /// `resolve_otp_target` binds to the one OTP-capable device carrying
-        /// the name, honors the transport pick, and fails closed on zero /
-        /// ambiguous matches or an unsatisfiable transport (KEY-003).
+        /// `otp_target_for` maps an already-selected device's HID path
+        /// and/or reader to the requested transport's endpoint — HID first,
+        /// the device's own reader as the `auto` open-time fallback (#82) —
+        /// and fails closed when the device lacks the endpoint a specific
+        /// transport needs. Device name-match / ambiguity is the shared
+        /// resolver's job now (`resolve_target`, covered in Task 5), so this
+        /// only varies the one selected device's endpoints.
         #[test]
-        fn resolve_otp_target_binds_exactly_or_errors(
-            specs in any_devices(),
+        fn otp_target_for_maps_every_endpoint(
+            hid in proptest::option::of(Just("/dev/hidraw9")),
+            reader in proptest::option::of(Just("Acme CCID 00")),
             transport in any_transport(),
         ) {
-            let devices: Vec<_> =
-                specs.iter().map(|(n, o, h, r)| dev(*n, *o, *h, *r)).collect();
-
-            // No selector: never an error, never a target.
-            prop_assert!(matches!(
-                resolve_otp_target(&devices, None, transport),
-                Ok(None)
-            ));
-
-            let named: Vec<_> = devices
-                .iter()
-                .filter(|d| {
-                    d.name.as_deref() == Some("alpha")
-                        && d.caps.has(keyroost_resolve::Caps::OTP)
-                })
-                .collect();
-            let got = resolve_otp_target(&devices, Some("alpha"), transport);
-            let [only] = named.as_slice() else {
-                prop_assert!(got.is_err(), "0 or >1 OTP matches must error");
-                return Ok(());
-            };
-            let expected_endpoint = match transport {
-                OtpTransportArg::Hid => only.hid_path.clone().map(|p| (Some(p), None)),
-                OtpTransportArg::Ccid => only.reader.clone().map(|r| (None, Some(r))),
-                // Auto binds every interface the selected device offers:
-                // both → HID first, its own reader as fallback (#82).
-                OtpTransportArg::Auto => match (&only.hid_path, &only.reader) {
-                    (Some(p), Some(r)) => Some((Some(p.clone()), Some(r.clone()))),
-                    (Some(p), None) => Some((Some(p.clone()), None)),
-                    (None, Some(r)) => Some((None, Some(r.clone()))),
-                    (None, None) => None,
+            let device = dev(None, false, hid, reader);
+            let got = otp_target_for(&device, transport);
+            match transport {
+                OtpTransportArg::Hid => match (got, hid) {
+                    (Ok(OtpTarget::HidPath(p)), Some(h)) => prop_assert_eq!(p, PathBuf::from(h)),
+                    (Err(_), None) => {}
+                    (got, hid) => prop_assert!(false, "got={got:?} hid={hid:?}"),
                 },
-            };
-            match (got, expected_endpoint) {
-                (Ok(Some(OtpTarget::HidPath(p))), Some((Some(exp), None))) => {
-                    prop_assert_eq!(p, exp)
-                }
-                (Ok(Some(OtpTarget::Reader(r))), Some((None, Some(exp)))) => {
-                    prop_assert_eq!(r, exp)
-                }
-                (Ok(Some(OtpTarget::HidThenReader(p, r))), Some((Some(ep), Some(er)))) => {
-                    prop_assert_eq!(p, ep);
-                    prop_assert_eq!(r, er);
-                }
-                (Err(_), None) => {}
-                (got, exp) => prop_assert!(
-                    false,
-                    "target must be exactly the contracted endpoint: got={got:?} exp={exp:?}"
-                ),
+                OtpTransportArg::Ccid => match (got, reader) {
+                    (Ok(OtpTarget::Reader(r)), Some(rd)) => prop_assert_eq!(r, rd),
+                    (Err(_), None) => {}
+                    (got, reader) => prop_assert!(false, "got={got:?} reader={reader:?}"),
+                },
+                OtpTransportArg::Auto => match (got, hid, reader) {
+                    (Ok(OtpTarget::HidThenReader(p, r)), Some(h), Some(rd)) => {
+                        prop_assert_eq!(p, PathBuf::from(h));
+                        prop_assert_eq!(r, rd);
+                    }
+                    (Ok(OtpTarget::HidPath(p)), Some(h), None) => {
+                        prop_assert_eq!(p, PathBuf::from(h))
+                    }
+                    (Ok(OtpTarget::Reader(r)), None, Some(rd)) => prop_assert_eq!(r, rd),
+                    (Err(_), None, None) => {}
+                    (got, hid, reader) => {
+                        prop_assert!(false, "got={got:?} hid={hid:?} reader={reader:?}")
+                    }
+                },
             }
         }
 
