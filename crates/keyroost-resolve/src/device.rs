@@ -226,6 +226,64 @@ fn clean_model(raw: &str, vendor: &str) -> String {
     }
 }
 
+/// How a HID node came to own its reader (traced under `--debug`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchStep {
+    Topology,
+    Identity,
+    Vendor,
+}
+
+impl MatchStep {
+    pub fn label(self) -> &'static str {
+        match self {
+            MatchStep::Topology => "USB topology",
+            MatchStep::Identity => "identity",
+            MatchStep::Vendor => "vendor fallback",
+        }
+    }
+}
+
+/// Matching switches. Defaults are what ships; the skips exist for the
+/// equivalence check (spec F2) and are reachable from a live run only
+/// through the `match-test-switch` feature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatchOptions {
+    pub skip_topology: bool,
+    /// Also turns off the single-reader CCID serial guess, so with this set
+    /// nothing but topology and identity can join a node to a reader's row.
+    pub skip_vendor_fallback: bool,
+    /// Print one `[match]` line per FIDO node to stderr (`--debug`).
+    pub trace: bool,
+}
+
+/// The same snapshot with every USB bus+address dropped — what a backend
+/// that reports no topology (hidapi on Windows and macOS) would have seen.
+fn without_topology(
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+) -> (Vec<HidDevice>, Vec<ReaderProbe>) {
+    let hids = hids
+        .iter()
+        .cloned()
+        .map(|mut h| {
+            h.usb_bus = None;
+            h.usb_address = None;
+            h
+        })
+        .collect();
+    let probes = probes
+        .iter()
+        .cloned()
+        .map(|mut p| {
+            p.usb_bus = None;
+            p.usb_address = None;
+            p
+        })
+        .collect();
+    (hids, probes)
+}
+
 /// True when some FIDO HID node shares this reader's USB topology (bus+address) —
 /// i.e. they are the same physical device. Used to keep a Token2 *FIDO key* from
 /// ever being classified as a Molto2 (the Molto2 has no FIDO HID interface).
@@ -302,20 +360,6 @@ fn reader_by_vendor(
     }
 }
 
-/// Decide which reader (if any) each FIDO HID node owns, by *strength of
-/// evidence* rather than enumeration order. Returns one entry per node, parallel
-/// to `hids`.
-///
-/// Pass 1 hands every reader to the node that matches it on exact USB
-/// bus+address. Pass 2 lets the vendor guess take only what pass 1 left over, so
-/// a weak name-only match can never claim a reader ahead of the node that proved
-/// it is that reader's own sibling — which is how card operations ended up on one
-/// physical key while FIDO operations went to another, under a single row. Pass 2
-/// also fails closed when two nodes guess the same reader: an unresolvable tie
-/// binds nobody rather than whoever the backend happened to enumerate first.
-///
-/// Deterministic: both passes walk `hids` and `probes` in slice order; the
-/// `claimed` map is only ever looked up by key, never iterated.
 /// Step 1 of matching: every reader goes to the node at its exact USB
 /// bus+address. Shared with the identity planner, which reads identities
 /// only for what this leaves unmatched.
@@ -334,64 +378,142 @@ pub(crate) fn topology_bound(hids: &[&HidDevice], probes: &[ReaderProbe]) -> Vec
     bound
 }
 
+/// Decide which reader (if any) each FIDO HID node owns, by *strength of
+/// evidence* rather than enumeration order. Returns one entry per node, parallel
+/// to `hids`, with the step that made the bind.
+///
+/// Pass 1 hands every reader to the node that matches it on exact USB
+/// bus+address. Pass 2 binds a node to the one reader that reported the same
+/// device identity (#51), but only when that identity is unique on both sides
+/// and at most one side has topology to contradict it. Pass 3 lets the vendor
+/// guess take only what passes 1 and 2 left over, so a weak name-only match can
+/// never claim a reader ahead of the node that proved it is that reader's own
+/// sibling — which is how card operations ended up on one physical key while
+/// FIDO operations went to another, under a single row. Pass 3 also fails closed
+/// when two nodes guess the same reader: an unresolvable tie binds nobody rather
+/// than whoever the backend happened to enumerate first.
+///
+/// Deterministic: every pass walks `hids` and `probes` in slice order; the
+/// `claimed` map is only ever looked up by key, never iterated.
 fn bind_readers(
     hids: &[&HidDevice],
     probes: &[ReaderProbe],
     yk_readers: &[YubiKeyCcid],
-) -> Vec<Option<String>> {
-    let mut bound: Vec<Option<String>> = vec![None; hids.len()];
+    ids: &crate::identity::Identities,
+    opts: &MatchOptions,
+) -> Vec<Option<(String, MatchStep)>> {
+    let mut bound: Vec<Option<(String, MatchStep)>> = vec![None; hids.len()];
     // Readers already bound, keyed by reader name and carrying the claiming
     // node's USB topology (see `reader_is_bindable`).
     let mut claimed: std::collections::HashMap<String, (Option<u8>, Option<u8>)> =
         std::collections::HashMap::new();
 
-    for (i, reader) in topology_bound(hids, probes).into_iter().enumerate() {
-        if let Some(reader) = reader {
-            claimed.insert(reader.clone(), (hids[i].usb_bus, hids[i].usb_address));
-            bound[i] = Some(reader);
+    // Step 1 — exact USB bus+address.
+    if !opts.skip_topology {
+        for (i, reader) in topology_bound(hids, probes).into_iter().enumerate() {
+            if let Some(reader) = reader {
+                claimed.insert(reader.clone(), (hids[i].usb_bus, hids[i].usb_address));
+                bound[i] = Some((reader, MatchStep::Topology));
+            }
         }
     }
 
+    // Step 2 — the identity each side reported (#51). Evidence only when
+    // unique on BOTH sides: two keys reporting one identity are not told
+    // apart by it (KEY-015), so neither binds.
     for (i, hid) in hids.iter().enumerate() {
-        // Already paired on hard evidence, or it reported its own bus/address and
-        // matched no reader — positive evidence it is a different physical
-        // device. Only backends that report no topology at all (usb_bus is None —
-        // hidapi on Windows and macOS) may guess, or correlation breaks there.
-        if bound[i].is_some() || hid.usb_bus.is_some() {
+        if bound[i].is_some() {
             continue;
         }
-        let Some(name) = reader_by_vendor(probes, yk_readers, hid)
-            .filter(|n| reader_is_bindable(&claimed, n, hid))
-        else {
+        let Some(id) = ids.hid.get(&hid.path) else {
             continue;
         };
-        // Fail closed on contention: with no topology on either side, several
-        // same-vendor nodes are *equally* good guesses for the one reader, and
-        // one of them is a FIDO-only key that has no card interface at all. The
-        // guess would then be pure enumeration order, and a wrong bind is not a
-        // cosmetic error — it points every FIDO operation on that row (PIN
-        // change, credential deletion, authenticatorReset) at a key the user did
-        // not select. Bind none of them and let the card and the FIDO node show
-        // as separate rows, exactly as they do when a reader is absent.
-        let contended = hids.iter().enumerate().any(|(j, h)| {
-            j != i
-                && bound[j].is_none()
-                && h.usb_bus.is_none()
-                && reader_by_vendor(probes, yk_readers, h).as_deref() == Some(name.as_str())
-        });
-        if contended {
+        let twins = hids
+            .iter()
+            .enumerate()
+            .filter(|(j, h)| bound[*j].is_none() && ids.hid.get(&h.path) == Some(id))
+            .count();
+        let owners: Vec<&ReaderProbe> = probes
+            .iter()
+            .filter(|p| !p.is_molto2 && ids.reader.get(&p.reader_name) == Some(id))
+            .collect();
+        let [owner] = owners.as_slice() else {
+            continue;
+        };
+        if twins != 1 || (hid.usb_bus.is_some() && owner.usb_bus.is_some()) {
             continue;
         }
-        claimed.insert(name.clone(), (hid.usb_bus, hid.usb_address));
-        bound[i] = Some(name);
+        if !reader_is_bindable(&claimed, &owner.reader_name, hid) {
+            continue;
+        }
+        claimed.insert(owner.reader_name.clone(), (hid.usb_bus, hid.usb_address));
+        bound[i] = Some((owner.reader_name.clone(), MatchStep::Identity));
+    }
+
+    // Step 3 — the existing single-candidate-per-vendor guess, unchanged
+    // except that two identities that both answered and differ veto it.
+    if !opts.skip_vendor_fallback {
+        for (i, hid) in hids.iter().enumerate() {
+            // Already paired on hard evidence, or it reported its own bus/address
+            // and matched no reader — positive evidence it is a different
+            // physical device. Only backends that report no topology at all
+            // (usb_bus is None — hidapi on Windows and macOS) may guess, or
+            // correlation breaks there.
+            if bound[i].is_some() || hid.usb_bus.is_some() {
+                continue;
+            }
+            let Some(name) = reader_by_vendor(probes, yk_readers, hid)
+                .filter(|n| reader_is_bindable(&claimed, n, hid))
+            else {
+                continue;
+            };
+            if let (Some(a), Some(b)) = (ids.hid.get(&hid.path), ids.reader.get(&name)) {
+                if a != b {
+                    continue;
+                }
+            }
+            // Fail closed on contention: with no topology on either side, several
+            // same-vendor nodes are *equally* good guesses for the one reader, and
+            // one of them is a FIDO-only key that has no card interface at all. The
+            // guess would then be pure enumeration order, and a wrong bind is not a
+            // cosmetic error — it points every FIDO operation on that row (PIN
+            // change, credential deletion, authenticatorReset) at a key the user did
+            // not select. Bind none of them and let the card and the FIDO node show
+            // as separate rows, exactly as they do when a reader is absent.
+            let contended = hids.iter().enumerate().any(|(j, h)| {
+                j != i
+                    && bound[j].is_none()
+                    && h.usb_bus.is_none()
+                    && reader_by_vendor(probes, yk_readers, h).as_deref() == Some(name.as_str())
+            });
+            if contended {
+                continue;
+            }
+            claimed.insert(name.clone(), (hid.usb_bus, hid.usb_address));
+            bound[i] = Some((name, MatchStep::Vendor));
+        }
     }
     bound
 }
 
 /// Correlate FIDO-HID nodes and PC/SC reader probes into one device per physical
-/// key. Pure: all I/O is done by the caller ([`enumerate`]). The `hids` slice may
+/// key. Pure: all I/O is done by the caller ([`enumerate`], [`correlate_live`]),
+/// including the device-reported identities in `ids`. The `hids` slice may
 /// contain non-FIDO nodes; they are filtered here.
-pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) -> Vec<Device> {
+pub fn correlate_with(
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    keyring: &Keyring,
+    ids: &crate::identity::Identities,
+    opts: &MatchOptions,
+) -> Vec<Device> {
+    let stripped: (Vec<HidDevice>, Vec<ReaderProbe>);
+    let (hids, probes): (&[HidDevice], &[ReaderProbe]) = if opts.skip_topology {
+        stripped = without_topology(hids, probes);
+        (&stripped.0, &stripped.1)
+    } else {
+        (hids, probes)
+    };
     let hids: Vec<&HidDevice> = hids.iter().filter(|h| h.is_fido()).collect();
 
     let yk_readers: Vec<YubiKeyCcid> = probes
@@ -408,11 +530,27 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
     // Whole-set attribution: the single-reader fallback is refused when several
     // topology-free nodes could each own that reader, so a FIDO-only key can
     // never inherit another key's CCID serial (which would also defeat the
-    // re-check that a reset is talking to the key the user picked).
+    // re-check that a reset is talking to the key the user picked). With the
+    // vendor fallback off, the single-reader serial guess is off too: it would
+    // otherwise join the rows through the serial merge below.
     let serials: Vec<Option<String>> = hids
         .iter()
-        .zip(crate::ccid_serials_for(&hids, &yk_readers))
-        .map(|(h, s)| h.serial_number.clone().or(s))
+        .zip(crate::ccid_serials_attributed(
+            &hids,
+            &yk_readers,
+            !opts.skip_vendor_fallback,
+        ))
+        .map(|(h, s)| {
+            h.serial_number
+                .clone()
+                // The node's own identity report beats a CCID serial attributed by guess.
+                .or_else(|| {
+                    ids.hid
+                        .get(&h.path)
+                        .and_then(crate::identity::CanonicalId::row_serial)
+                })
+                .or(s)
+        })
         .collect();
 
     // Serials duplicated across the live HID set are NOT unique identity: two
@@ -537,7 +675,19 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
 
     // --- 3. Merge FIDO HID nodes into their physical key. Reader ownership is
     // settled up front by strength of evidence, not enumeration order.
-    let bound = bind_readers(&hids, probes, &yk_readers);
+    let bound = bind_readers(&hids, probes, &yk_readers, ids, opts);
+    if opts.trace {
+        for (hid, b) in hids.iter().zip(&bound) {
+            match b {
+                Some((r, step)) => eprintln!(
+                    "[match] {} -> '{r}' by {}",
+                    hid.path.display(),
+                    step.label()
+                ),
+                None => eprintln!("[match] {} -> no reader", hid.path.display()),
+            }
+        }
+    }
     for (i, hid) in hids.iter().enumerate() {
         let serial = serials.get(i).cloned().flatten().unwrap_or_default();
         let is_token2 = hid.vendor_id == keyroost_proto::USB_VID;
@@ -564,7 +714,7 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
         // Do not re-narrow this on the PID table without Token2 confirming what
         // a function set actually asserts about applet presence per channel.
         let has_otp = is_token2;
-        let reader_name: Option<String> = bound.get(i).cloned().flatten();
+        let reader_name: Option<String> = bound.get(i).cloned().flatten().map(|(r, _)| r);
 
         let existing = devices.iter_mut().find(|d| {
             d.kind == DeviceKind::Key
@@ -661,14 +811,77 @@ pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) 
     devices
 }
 
-/// Build the unified device list. Blocking: enumerates FIDO HID nodes and probes
-/// PC/SC readers, then correlates. A HID-layer failure is a hard error; PC/SC
-/// problems degrade to an empty probe list (FIDO-only keys still appear).
-pub fn enumerate() -> Result<Vec<Device>, String> {
+/// [`correlate_with`] with no identities and default options — the
+/// pre-#51 behaviour, kept for callers holding a snapshot without I/O.
+pub fn correlate(hids: &[HidDevice], probes: &[ReaderProbe], keyring: &Keyring) -> Vec<Device> {
+    correlate_with(
+        hids,
+        probes,
+        keyring,
+        &crate::identity::Identities::default(),
+        &MatchOptions::default(),
+    )
+}
+
+#[cfg(feature = "match-test-switch")]
+fn apply_test_switch(opts: &mut MatchOptions) {
+    if std::env::var("KEYROOST_MATCH_TEST").as_deref() == Ok("identity-only") {
+        opts.skip_topology = true;
+        opts.skip_vendor_fallback = true;
+        eprintln!("[match] test switch: topology and vendor steps disabled");
+    }
+}
+#[cfg(not(feature = "match-test-switch"))]
+fn apply_test_switch(_opts: &mut MatchOptions) {}
+
+/// Correlate a live snapshot: plan identity reads for what topology
+/// leaves unmatched, perform them (read-only, traced under `debug`),
+/// then correlate. Linux with topology sends no identity traffic.
+pub fn correlate_live(
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    keyring: &Keyring,
+    debug: bool,
+) -> Vec<Device> {
+    let mut opts = MatchOptions {
+        trace: debug,
+        ..MatchOptions::default()
+    };
+    apply_test_switch(&mut opts);
+    let stripped: (Vec<HidDevice>, Vec<ReaderProbe>);
+    let (h, p): (&[HidDevice], &[ReaderProbe]) = if opts.skip_topology {
+        stripped = without_topology(hids, probes);
+        (&stripped.0, &stripped.1)
+    } else {
+        (hids, probes)
+    };
+    let registry = crate::identity::IDENTITY_READERS;
+    let plan = crate::identity::plan_identity_reads(h, p, registry);
+    let ids = crate::identity::read_identities(&plan, h, p, registry, debug);
+    correlate_with(h, p, keyring, &ids, &opts)
+}
+
+/// Options for [`enumerate_with`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnumerateOptions {
+    /// Trace identity reads and match decisions to stderr.
+    pub debug: bool,
+}
+
+/// Build the unified device list (see [`enumerate`]) with options.
+pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
     let probes = keyroost_transport::probe_readers().unwrap_or_default();
     let keyring = Keyring::load_default().unwrap_or_default();
-    Ok(correlate(&hids, &probes, &keyring))
+    Ok(correlate_live(&hids, &probes, &keyring, opts.debug))
+}
+
+/// Build the unified device list. Blocking: enumerates FIDO HID nodes and probes
+/// PC/SC readers, then correlates, matching by device-reported identity where
+/// topology is unavailable. A HID-layer failure is a hard error; PC/SC
+/// problems degrade to an empty probe list (FIDO-only keys still appear).
+pub fn enumerate() -> Result<Vec<Device>, String> {
+    enumerate_with(&EnumerateOptions::default())
 }
 
 /// One applet-reset step in a whole-device factory reset.
@@ -824,7 +1037,9 @@ pub struct StepReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{CanonicalId, IdScheme, Identities};
     use keyroost_hid::{HID_USAGE_FIDO_AUTHENTICATOR, HID_USAGE_PAGE_FIDO};
+    use std::path::PathBuf;
 
     fn hid(
         vid: u16,
@@ -2020,6 +2235,332 @@ mod tests {
             );
             assert!(alone.serial.is_empty());
         }
+    }
+
+    const Y: IdScheme = IdScheme::YubicoSerial;
+    const S: IdScheme = IdScheme::Solo2Uuid;
+    const YK0: &str = "Yubico YubiKey OTP+FIDO+CCID 00 00";
+    const YK1: &str = "Yubico YubiKey OTP+FIDO+CCID 01 00";
+
+    fn ids(hid: &[(&str, IdScheme, &str)], reader: &[(&str, IdScheme, &str)]) -> Identities {
+        let mut out = Identities::default();
+        for (p, s, v) in hid {
+            out.hid.insert(
+                PathBuf::from(p),
+                CanonicalId {
+                    scheme: *s,
+                    value: v.to_string(),
+                },
+            );
+        }
+        for (r, s, v) in reader {
+            out.reader.insert(
+                r.to_string(),
+                CanonicalId {
+                    scheme: *s,
+                    value: v.to_string(),
+                },
+            );
+        }
+        out
+    }
+
+    type Row = (
+        String,
+        String,
+        Option<PathBuf>,
+        Option<String>,
+        Vec<&'static str>,
+        String,
+    );
+    fn rows(devs: &[Device]) -> Vec<Row> {
+        let mut v: Vec<Row> = devs
+            .iter()
+            .map(|d| {
+                (
+                    d.id.clone(),
+                    d.serial.clone(),
+                    d.hid_path.clone(),
+                    d.reader.clone(),
+                    d.cap_badges(),
+                    d.transport.clone(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn yk_pair_probes() -> [ReaderProbe; 2] {
+        [
+            probe(YK0, false, true, false, false, Some("11111111"), None, None),
+            probe(YK1, false, true, false, false, Some("22222222"), None, None),
+        ]
+    }
+    fn yk_pair_hids() -> [HidDevice; 2] {
+        [
+            hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None),
+            hid(0x1050, 0x0407, "/dev/hidraw18", None, None, None),
+        ]
+    }
+
+    #[test]
+    fn identity_matches_two_topology_free_yubikeys() {
+        let (hids, probes) = (yk_pair_hids(), yk_pair_probes());
+        // Today's #51 shape: nothing can be attributed, four rows.
+        assert_eq!(correlate(&hids, &probes, &Keyring::default()).len(), 4);
+        let ids = ids(
+            &[
+                ("/dev/hidraw17", Y, "22222222"),
+                ("/dev/hidraw18", Y, "11111111"),
+            ],
+            &[(YK0, Y, "11111111"), (YK1, Y, "22222222")],
+        );
+        let devs = correlate_with(
+            &hids,
+            &probes,
+            &Keyring::default(),
+            &ids,
+            &MatchOptions::default(),
+        );
+        assert_eq!(devs.len(), 2, "one physical key = one row");
+        let one = devs.iter().find(|d| d.serial == "11111111").unwrap();
+        assert_eq!(
+            one.hid_path.as_deref(),
+            Some(std::path::Path::new("/dev/hidraw18"))
+        );
+        assert_eq!(one.reader.as_deref(), Some(YK0));
+        let two = devs.iter().find(|d| d.serial == "22222222").unwrap();
+        assert_eq!(
+            two.hid_path.as_deref(),
+            Some(std::path::Path::new("/dev/hidraw17"))
+        );
+        assert_eq!(two.reader.as_deref(), Some(YK1));
+    }
+
+    #[test]
+    fn identity_on_one_side_only_keeps_rows_split() {
+        // The HID side never answered: no identity bind, rows as today.
+        let (hids, probes) = (yk_pair_hids(), yk_pair_probes());
+        let ids = ids(&[], &[(YK0, Y, "11111111"), (YK1, Y, "22222222")]);
+        let devs = correlate_with(
+            &hids,
+            &probes,
+            &Keyring::default(),
+            &ids,
+            &MatchOptions::default(),
+        );
+        assert_eq!(
+            rows(&devs),
+            rows(&correlate(&hids, &probes, &Keyring::default()))
+        );
+        assert!(devs
+            .iter()
+            .all(|d| !(d.hid_path.is_some() && d.reader.is_some())));
+    }
+
+    #[test]
+    fn identical_identities_never_bind_and_stay_distinct() {
+        let hids = yk_pair_hids();
+        let probes = [
+            probe(YK0, false, true, false, false, Some("11111111"), None, None),
+            probe(YK1, false, true, false, false, Some("11111111"), None, None),
+        ];
+        let ids = ids(
+            &[
+                ("/dev/hidraw17", Y, "11111111"),
+                ("/dev/hidraw18", Y, "11111111"),
+            ],
+            &[(YK0, Y, "11111111"), (YK1, Y, "11111111")],
+        );
+        let devs = correlate_with(
+            &hids,
+            &probes,
+            &Keyring::default(),
+            &ids,
+            &MatchOptions::default(),
+        );
+        assert_eq!(devs.len(), 4);
+        assert!(devs
+            .iter()
+            .all(|d| !(d.hid_path.is_some() && d.reader.is_some())));
+        let mut ids_seen: Vec<&str> = devs.iter().map(|d| d.id.as_str()).collect();
+        ids_seen.sort();
+        ids_seen.dedup();
+        assert_eq!(
+            ids_seen.len(),
+            4,
+            "duplicate identities get #-suffixed ids (KEY-015)"
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_blocks_the_vendor_guess() {
+        // One topology-free Yubico node + one Yubico reader: v0.12.0 binds them
+        // by vendor; if both answered and the answers differ, they are two keys.
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None)];
+        let probes = [probe(
+            YK0,
+            false,
+            true,
+            false,
+            false,
+            Some("11111111"),
+            None,
+            None,
+        )];
+        assert_eq!(correlate(&hids, &probes, &Keyring::default()).len(), 1);
+        let ids = ids(&[("/dev/hidraw17", Y, "99999999")], &[(YK0, Y, "11111111")]);
+        let devs = correlate_with(
+            &hids,
+            &probes,
+            &Keyring::default(),
+            &ids,
+            &MatchOptions::default(),
+        );
+        assert_eq!(devs.len(), 2);
+        let fido = devs.iter().find(|d| d.hid_path.is_some()).unwrap();
+        assert_eq!(
+            fido.serial, "99999999",
+            "the node's own report, not the reader's serial"
+        );
+    }
+
+    #[test]
+    fn skip_vendor_fallback_disables_step_three_only() {
+        // A lone topology-free Yubico node and a lone Yubico reader: the only
+        // link between them is a guess (the reader-by-vendor bind, or the
+        // single-reader CCID serial attribution that would let the serial
+        // merge join the rows). With the fallback off, neither may happen.
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None)];
+        let probes = [probe(
+            YK0,
+            false,
+            true,
+            false,
+            false,
+            Some("11111111"),
+            None,
+            None,
+        )];
+        let opts = MatchOptions {
+            skip_vendor_fallback: true,
+            ..MatchOptions::default()
+        };
+        let devs = correlate_with(
+            &hids,
+            &probes,
+            &Keyring::default(),
+            &Identities::default(),
+            &opts,
+        );
+        assert_eq!(devs.len(), 2, "no guess joins the two sides");
+        assert!(devs
+            .iter()
+            .all(|d| !(d.hid_path.is_some() && d.reader.is_some())));
+        let fido = devs.iter().find(|d| d.hid_path.is_some()).unwrap();
+        assert!(
+            fido.serial.is_empty(),
+            "the reader's serial is not guessed onto the node"
+        );
+        // Identity still binds with the fallback off (step 2 is untouched).
+        let ids = ids(&[("/dev/hidraw17", Y, "11111111")], &[(YK0, Y, "11111111")]);
+        let devs = correlate_with(&hids, &probes, &Keyring::default(), &ids, &opts);
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].reader.as_deref(), Some(YK0));
+    }
+
+    #[test]
+    fn identity_step_alone_reproduces_topology_rows() {
+        // Spec F2 in miniature: topology rows == identity-only rows.
+        let solo = "SoloKeys Solo 2 [CCID/ICCD Interface] 01 00";
+        let probes = [
+            probe(
+                YK0,
+                false,
+                true,
+                true,
+                true,
+                Some("11111111"),
+                Some(9),
+                Some(53),
+            ),
+            probe(solo, false, true, false, false, None, Some(9), Some(15)),
+            probe(
+                "TOKEN2 Molto2 00 00",
+                true,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let hids = [
+            hid(0x1050, 0x0407, "/dev/hidraw16", None, Some(9), Some(53)),
+            hid(
+                0x1209,
+                0xbeee,
+                "/dev/hidraw14",
+                Some("07A9568FBE31AD5DAD1F2298476CF0D4"),
+                Some(9),
+                Some(15),
+            ),
+        ];
+        let topo = correlate(&hids, &probes, &Keyring::default());
+        let ids = ids(
+            &[
+                ("/dev/hidraw16", Y, "11111111"),
+                ("/dev/hidraw14", S, "07a9568fbe31ad5dad1f2298476cf0d4"),
+            ],
+            &[
+                (YK0, Y, "11111111"),
+                (solo, S, "07a9568fbe31ad5dad1f2298476cf0d4"),
+            ],
+        );
+        let opts = MatchOptions {
+            skip_topology: true,
+            skip_vendor_fallback: true,
+            trace: false,
+        };
+        let only_identity = correlate_with(&hids, &probes, &Keyring::default(), &ids, &opts);
+        assert_eq!(rows(&topo), rows(&only_identity));
+    }
+
+    #[cfg(not(feature = "match-test-switch"))]
+    #[test]
+    fn test_switch_is_compiled_out_of_default_builds() {
+        let mut o = MatchOptions::default();
+        apply_test_switch(&mut o);
+        assert_eq!(o, MatchOptions::default());
+    }
+
+    // The only test that touches KEYROOST_MATCH_TEST, so setting it here
+    // cannot race another test reading it.
+    #[cfg(feature = "match-test-switch")]
+    #[test]
+    fn test_switch_disables_topology_and_vendor_steps_when_set() {
+        std::env::remove_var("KEYROOST_MATCH_TEST");
+        let mut o = MatchOptions::default();
+        apply_test_switch(&mut o);
+        assert_eq!(o, MatchOptions::default(), "unset: options unchanged");
+
+        std::env::set_var("KEYROOST_MATCH_TEST", "identity-only");
+        let mut o = MatchOptions {
+            trace: true,
+            ..MatchOptions::default()
+        };
+        apply_test_switch(&mut o);
+        std::env::remove_var("KEYROOST_MATCH_TEST");
+        assert_eq!(
+            o,
+            MatchOptions {
+                skip_topology: true,
+                skip_vendor_fallback: true,
+                trace: true
+            }
+        );
     }
 }
 

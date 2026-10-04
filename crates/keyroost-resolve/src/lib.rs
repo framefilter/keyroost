@@ -18,8 +18,9 @@ use keyroost_transport::YubiKeyCcid;
 pub mod device;
 pub mod identity;
 pub use device::{
-    correlate, enumerate, exclude_unresettable_piv, factory_reset_plan, CapState, Caps, Device,
-    DeviceId, DeviceKind, ResetStep, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
+    correlate, correlate_live, correlate_with, enumerate, enumerate_with, exclude_unresettable_piv,
+    factory_reset_plan, CapState, Caps, Device, DeviceId, DeviceKind, EnumerateOptions,
+    MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
 };
 pub use identity::{
     plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
@@ -59,6 +60,18 @@ pub fn effective_serials(devices: &[HidDevice]) -> Vec<Option<String>> {
 /// identity — and a caller that re-checks the serial to confirm it is talking to
 /// the key the user chose would then accept the wrong one.
 pub fn ccid_serials_for(devices: &[&HidDevice], readers: &[YubiKeyCcid]) -> Vec<Option<String>> {
+    ccid_serials_attributed(devices, readers, true)
+}
+
+/// [`ccid_serials_for`] with the single-reader fallback switchable: with
+/// `allow_guess` off, a serial is attributed only on exact USB topology, so a
+/// topology-free node gets none. Matching uses this when its vendor fallback
+/// is disabled, so no guessed serial can join rows behind the matcher's back.
+pub(crate) fn ccid_serials_attributed(
+    devices: &[&HidDevice],
+    readers: &[YubiKeyCcid],
+    allow_guess: bool,
+) -> Vec<Option<String>> {
     // Serials proven to belong to a node by exact USB topology. Those readers
     // are spoken for, so they are not available to a topology-free guess.
     let taken: Vec<String> = devices
@@ -77,7 +90,7 @@ pub fn ccid_serials_for(devices: &[&HidDevice], readers: &[YubiKeyCcid]) -> Vec<
         .map(|d| {
             let serial = ccid_serial_for(d, readers);
             let contended = claimants > 1 || serial.as_ref().is_some_and(|s| taken.contains(s));
-            if d.usb_bus.is_none() && contended {
+            if d.usb_bus.is_none() && (contended || !allow_guess) {
                 return None;
             }
             serial
