@@ -2792,7 +2792,7 @@ enum SshCertCmd {
         out: Option<std::path::PathBuf>,
         /// Overwrite the output file if it exists.
         #[arg(long)]
-        force: bool,
+        overwrite: bool,
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         #[arg(long)]
@@ -9499,7 +9499,7 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
         SshCertCmd::Extract {
             credential,
             out,
-            force,
+            overwrite,
             pin_env,
             pin_stdin,
             path,
@@ -9510,7 +9510,7 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
                 &pin,
                 credential.as_deref(),
                 out.as_deref(),
-                *force,
+                *overwrite,
             )
         }
     }
@@ -9603,7 +9603,7 @@ fn run_fido_ssh_cert_extract(
     pin: &str,
     credential: Option<&str>,
     out: Option<&std::path::Path>,
-    force: bool,
+    overwrite: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (creds, array) = enumerate_ssh_credentials(path, pin)?;
     if creds.is_empty() {
@@ -9677,9 +9677,9 @@ fn run_fido_ssh_cert_extract(
         Some(p) => p.to_path_buf(),
         None => std::path::PathBuf::from(keyroost_ctap::ssh_cert::default_cert_filename(rp_id)),
     };
-    if out_path.exists() && !force {
+    if out_path.exists() && !overwrite {
         return Err(format!(
-            "{} already exists; pass --force to overwrite",
+            "{} already exists; pass --overwrite to overwrite",
             out_path.display()
         )
         .into());
@@ -11274,7 +11274,7 @@ mod cli_tests {
             "ssh:demo",
             "--out",
             "id-cert.pub",
-            "--force",
+            "--overwrite",
             "--pin-stdin",
         ])
         .unwrap()
@@ -11287,7 +11287,7 @@ mod cli_tests {
                             SshCertCmd::Extract {
                                 credential,
                                 out,
-                                force,
+                                overwrite,
                                 pin_stdin,
                                 ..
                             },
@@ -11295,10 +11295,42 @@ mod cli_tests {
             }) => {
                 assert_eq!(credential.as_deref(), Some("ssh:demo"));
                 assert_eq!(out.as_deref(), Some(std::path::Path::new("id-cert.pub")));
-                assert!(force && pin_stdin);
+                assert!(overwrite && pin_stdin);
             }
             _ => panic!("expected fido ssh-cert extract"),
         }
+    }
+
+    // `--force` was renamed to `--overwrite` with no alias, so that "force" has
+    // one meaning across the CLI (piv/oath/otp/fido/molto/prog resets use it for
+    // "proceed without the usual confirmation" — a different question from
+    // "overwrite this file"). The old spelling must be rejected, not silently
+    // accepted.
+    #[test]
+    fn ssh_cert_extract_overwrite_flag() {
+        match parse(&["keyroostctl", "fido", "ssh-cert", "extract", "--overwrite"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Fido {
+                cmd:
+                    FidoCmd::SshCert {
+                        cmd: SshCertCmd::Extract { overwrite, .. },
+                    },
+            }) => assert!(overwrite),
+            _ => panic!("expected ssh-cert extract"),
+        }
+        assert!(parse(&["keyroostctl", "fido", "ssh-cert", "extract", "--force"]).is_err());
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand_mut("fido")
+            .unwrap()
+            .find_subcommand_mut("ssh-cert")
+            .unwrap()
+            .find_subcommand_mut("extract")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(help.contains("--overwrite") && !help.contains("--force"));
     }
 
     #[test]
