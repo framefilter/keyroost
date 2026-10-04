@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use keyroost_keyring::Keyring;
 use keyroost_resolve::{
     ccid_readers_if_needed, ccid_serial_for, connected_keys, effective_serials,
-    read_effective_serial, VID_YUBICO,
+    read_effective_serial, Need, VID_YUBICO,
 };
 
 mod overview;
@@ -4804,14 +4804,6 @@ fn pick_device_interactively(
     }
 }
 
-/// Resolve which PC/SC reader to drive OATH on. Mirrors the FIDO picker posture:
-/// auto-use a lone OATH key, match an explicit `--reader` substring, and refuse
-/// to guess among several. Returns the full reader name.
-fn resolve_oath_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    let readers = keyroost_transport::OathSession::list_oath_readers()?;
-    resolve_reader(readers, explicit, "OATH")
-}
-
 /// Pick one reader from `readers` by the same posture across applets: auto-use a
 /// lone reader, match an explicit `--reader` substring, and refuse to guess among
 /// several. `kind` ("OATH" / "OpenPGP") only shapes the messages.
@@ -4913,9 +4905,7 @@ fn open_oath(
     access: &OathAccess,
     debug: bool,
 ) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
-    let by_name = reader_from_name()?;
-    let name = resolve_oath_reader(access.reader.as_deref().or(by_name.as_deref()))?;
-    eprintln!("\u{2192} OATH on {}", sanitize_terminal(&name));
+    let name = crate::target::reader_for(Need::Oath, access.reader.as_deref())?;
     let mut session = keyroost_transport::OathSession::open(&name)?;
     session.set_debug(debug);
     match access.password()? {
@@ -5819,8 +5809,7 @@ fn reset_one_card_applet(
     let run = || -> Result<(), Box<dyn std::error::Error>> {
         match step {
             ResetStep::Oath => {
-                let by_name = reader_from_name()?;
-                let name = resolve_oath_reader(reader.or(by_name.as_deref()))?;
+                let name = crate::target::reader_for(Need::Oath, reader)?;
                 let mut s = keyroost_transport::OathSession::open(&name)?;
                 s.set_debug(debug);
                 s.factory_reset()?;
@@ -5995,12 +5984,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // Deliberately NOT open_oath(): reset must work on a
             // password-protected applet whose password is lost — that's its
             // entire purpose — so no unlock is attempted.
-            let name = reset_reader(
-                || Ok(keyroost_transport::OathSession::list_oath_readers()?),
-                reader.as_deref(),
-                "OATH",
-            )?;
-            eprintln!("\u{2192} OATH on {}", sanitize_terminal(&name));
+            let name = crate::target::reader_for(Need::Oath, reader.as_deref())?;
             let mut session = keyroost_transport::OathSession::open(&name)?;
             session.set_debug(debug);
             session.factory_reset()?;

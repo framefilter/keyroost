@@ -139,7 +139,6 @@ pub(crate) fn select(
 }
 
 /// The exact reader of the selected key (never re-matched as a substring).
-#[allow(dead_code)] // first used in Task 11
 pub(crate) fn reader_for(need: Need, reader: Option<&str>) -> Result<String, Box<dyn Error>> {
     select(need, reader, None)?
         .reader
