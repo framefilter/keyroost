@@ -810,11 +810,14 @@ fn ssh_cert_summary(info: &keyroost_ctap::ssh_cert::SshCertInfo) -> String {
 }
 
 /// Whether the user may override an `Unsupported` verdict for `extension`
-/// ("Unlock Anyway" below the Reset card; the CLI's `--force` is separate).
+/// ("Enable Anyway" below the Reset card; the CLI's `--force` is separate).
 ///
-/// Only features the pane exposes as controls. Not overridable:
+/// Only features the pane exposes as controls. Not overridable here:
 /// - The internal reads GET METADATA, ATTEST and GET SLOT KEY STATUS: nothing
-///   to switch on, the transport consumes them from the real table.
+///   to switch on in the pane. "Enable Anyway" reaches GET METADATA and ATTEST
+///   through the transport instead (`PivSessionState::set_send_unsupported_reads`,
+///   set by `piv_cached_piv_session_state`), and the transport traces every
+///   read the table skips or overrides.
 /// - RESET (and the device-wide reset). It is potentially destructive, and a
 ///   one-click unlock would invite people to just try it. Reaching it means
 ///   deliberately exhausting the PIN and PUK retries first, so a failed
@@ -829,9 +832,10 @@ fn ssh_cert_summary(info: &keyroost_ctap::ssh_cert::SshCertInfo) -> String {
 /// For every other extension a device that really lacks the feature just
 /// refuses the command and nothing changes.
 ///
-/// GUI-only: applied to the pane's controls, never to the transport's internal
-/// gates (GET METADATA, ATTEST, reset mechanism choice), which keep resolving
-/// from the real table.
+/// Applied to the pane's controls. The transport's own gates keep resolving
+/// from the real table, except that GET METADATA and ATTEST are sent anyway
+/// for a key with "Enable Anyway" on (see above); the reset mechanism choice
+/// is never overridden.
 fn piv_user_overridable(extension: keyroost_piv::compat::PivExtension) -> bool {
     use keyroost_piv::compat::{MgmtAlgChoice, PivExtension};
     !matches!(
@@ -7920,11 +7924,16 @@ impl App {
     /// through; see the `piv_session_state` field's doc for the full round
     /// trip.
     fn piv_cached_piv_session_state(&self) -> keyroost_transport::PivSessionState {
-        self.selected_device
+        let mut state: keyroost_transport::PivSessionState = self
+            .selected_device
             .as_ref()
             .and_then(|id| self.piv_session_state.get(id))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // "Enable Anyway" also lets the transport send the internal reads
+        // (GET METADATA, ATTEST) the table would otherwise skip for this key.
+        state.set_send_unsupported_reads(self.piv_compat_ignored_selected());
+        state
     }
 
     /// Whether the user chose to ignore the compatibility table for the
@@ -8063,7 +8072,14 @@ impl App {
         let for_device = self.selected_device.clone();
         let cached_state = match cache {
             PivCache::Reuse => Some(self.piv_cached_piv_session_state()),
-            PivCache::Bypass => None,
+            // A fresh read still honours "Enable Anyway": an empty state never
+            // matches the card, so this resolves everything from scratch like
+            // the plain path, but with the user's choice carried in.
+            PivCache::Bypass => self.piv_compat_ignored_selected().then(|| {
+                let mut fresh = keyroost_transport::PivSessionState::default();
+                fresh.set_send_unsupported_reads(true);
+                fresh
+            }),
         };
         self.spawn_piv_job("Reading PIV status\u{2026}", move || {
             // One transport call gathers the snapshot and every slot's
@@ -18395,7 +18411,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let (text, link, tip) = if ignored {
                         (
-                            "Unsupported PIV features are unlocked for this key.".to_string(),
+                            "Unsupported PIV features are enabled for this key.".to_string(),
                             "Undo",
                             "Grey them out again.",
                         )
@@ -18408,7 +18424,7 @@ impl App {
                                     "{unsupported} PIV features are marked unsupported for this key."
                                 )
                             },
-                            "Unlock Anyway",
+                            "Enable Anyway",
                             "If this key can't do one of them, it will just refuse.",
                         )
                     };
@@ -18543,6 +18559,9 @@ impl App {
                     self.piv_compat_ignored.insert(id);
                 }
             }
+            // Re-read so the internal reads the table was skipping (GET
+            // METADATA, ATTEST) run — or stop running — straight away.
+            self.load_piv_status_with_cache(LogKind::Background, PivCache::Bypass);
         }
         if open_new_chuid {
             self.piv_cred_modal_close();

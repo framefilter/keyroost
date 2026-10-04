@@ -683,9 +683,29 @@ pub struct PivSessionState {
     /// `identity` caches — storing it a second time here would just be the
     /// same value kept in two places.
     applet_cache: AppletCache,
+    /// The user chose "Enable Anyway" for this key: internal reads the
+    /// compatibility table lists as unsupported (GET METADATA, ATTEST) are
+    /// sent anyway instead of skipped — the table can be wrong, e.g. for
+    /// newer firmware. Owned by the caller, so it survives a card change (see
+    /// [`PivSession::with_cached_transaction_traced`]), unlike the cached
+    /// card facts above.
+    send_unsupported_reads: bool,
 }
 
 impl PivSessionState {
+    /// Send internal reads the compatibility table lists as unsupported
+    /// (GET METADATA, ATTEST) instead of skipping them — the transport side
+    /// of the GUI's "Enable Anyway" for this key. RESET is unaffected.
+    pub fn set_send_unsupported_reads(&mut self, send: bool) {
+        self.send_unsupported_reads = send;
+    }
+
+    /// Whether [`Self::set_send_unsupported_reads`] is in effect.
+    #[must_use]
+    pub fn sends_unsupported_reads(&self) -> bool {
+        self.send_unsupported_reads
+    }
+
     /// Algorithm + public key this state has cached for `slot`, if any — the
     /// same cache [`PivSession::slot_key`] consults internally, exposed so a
     /// caller holding a `PivSessionState` between sessions (e.g. to show a
@@ -1484,6 +1504,9 @@ impl<'tx> PivSession<'tx> {
             atr: session.atr(),
         };
 
+        // The caller's choice, not a card fact: set before anything is read,
+        // and kept even when the cached card facts are thrown away below.
+        session.state.send_unsupported_reads = cached.send_unsupported_reads;
         if piv_session_cache_reusable(
             pcsc_trustworthy,
             cached.pcsc_identity.matches(&fresh_identity),
@@ -2468,6 +2491,28 @@ impl<'tx> PivSession<'tx> {
         )
     }
 
+    /// Whether to send an internal read (GET METADATA / ATTEST) the
+    /// compatibility table may list as unsupported. Skips it when the table
+    /// says unsupported, unless the caller chose to send such reads anyway
+    /// ([`PivSessionState::set_send_unsupported_reads`]). Either way it leaves
+    /// a `--debug` / activity-log trace line, so a wrong table entry that
+    /// hides information can be spotted.
+    fn internal_read_allowed(
+        &mut self,
+        extension: keyroost_piv::compat::PivExtension,
+        what: &'static str,
+    ) -> bool {
+        let gate = self.extension_gate(extension);
+        let (send, note) = internal_read_decision(gate, self.state.send_unsupported_reads);
+        if let Some(note) = note {
+            let fingerprint = self.identity().fingerprint;
+            trace::line(self.traced, || {
+                format!("! piv {what}: {note} ({fingerprint:?})")
+            });
+        }
+        send
+    }
+
     /// The wire algorithm-identifier byte to send for `alg` in this session's
     /// GENERATE ASYMMETRIC KEY PAIR / GENERAL AUTHENTICATE APDUs: this
     /// fingerprint's own override if it has one, or [`KeyAlg::id`]'s
@@ -2533,9 +2578,10 @@ impl<'tx> PivSession<'tx> {
     /// algorithm/key/policy) rather than the reply itself; see that
     /// method's doc for why.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
-        if self.extension_gate(keyroost_piv::compat::PivExtension::GetMetadata)
-            == keyroost_piv::compat::FeatureGate::Unsupported
-        {
+        if !self.internal_read_allowed(
+            keyroost_piv::compat::PivExtension::GetMetadata,
+            "GET METADATA",
+        ) {
             return None;
         }
         let (data, sw) = self.transmit_full(&piv::get_metadata(key_ref)).ok()?;
@@ -4305,9 +4351,7 @@ impl<'tx> PivSession<'tx> {
     /// exactly what a real unsupported-instruction refusal looks like, so
     /// every caller of `attest` sees the same error shape either way.
     pub fn attest(&mut self, slot: Slot) -> Result<Vec<u8>, TransportError> {
-        if self.extension_gate(keyroost_piv::compat::PivExtension::Attest)
-            == keyroost_piv::compat::FeatureGate::Unsupported
-        {
+        if !self.internal_read_allowed(keyroost_piv::compat::PivExtension::Attest, "ATTEST") {
             // `6D 00` (instruction not supported) is exactly what this
             // fingerprint's real refusal looks like — see `Self::attest`'s
             // doc for why this is worth faking rather than sending anything.
@@ -5905,6 +5949,26 @@ fn certificate_key_mismatches(
     slot_alg != cert_alg || slot_key != cert_key
 }
 
+/// [`PivSession::internal_read_allowed`]'s decision, pure for testing: send
+/// unless the table says unsupported and the caller didn't override; the note
+/// is the trace text for the two table-driven outcomes.
+fn internal_read_decision(
+    gate: keyroost_piv::compat::FeatureGate,
+    send_unsupported: bool,
+) -> (bool, Option<&'static str>) {
+    match (gate, send_unsupported) {
+        (keyroost_piv::compat::FeatureGate::Unsupported, false) => (
+            false,
+            Some("skipped: the compatibility table lists it unsupported for this applet"),
+        ),
+        (keyroost_piv::compat::FeatureGate::Unsupported, true) => (
+            true,
+            Some("listed unsupported for this applet; sending anyway (Enable Anyway)"),
+        ),
+        _ => (true, None),
+    }
+}
+
 /// Behind [`PivSession::reject_certificate_key_mismatch`]'s secondary,
 /// algorithm-only path: `Some((slot_algorithm, certificate_algorithm))` when
 /// `get_slot_key_status_gate` resolves
@@ -7419,6 +7483,29 @@ mod tests {
     // `PivSession::reject_certificate_key_mismatch`'s secondary,
     // algorithm-only path — see that method's (and
     // `PivSession::import_certificate`'s) doc for what feeds it.
+
+    #[test]
+    fn internal_reads_skip_unsupported_unless_overridden_and_always_trace() {
+        use keyroost_piv::compat::FeatureGate;
+        assert_eq!(
+            internal_read_decision(FeatureGate::Supported, false),
+            (true, None)
+        );
+        assert_eq!(
+            internal_read_decision(FeatureGate::Unverified, false),
+            (true, None)
+        );
+        let (send, note) = internal_read_decision(FeatureGate::Unsupported, false);
+        assert!(!send);
+        assert!(note.unwrap().contains("skipped"));
+        let (send, note) = internal_read_decision(FeatureGate::Unsupported, true);
+        assert!(send);
+        assert!(note.unwrap().contains("sending anyway"));
+        assert_eq!(
+            internal_read_decision(FeatureGate::Supported, true),
+            (true, None)
+        );
+    }
 
     #[test]
     fn algorithm_only_mismatch_fires_only_when_the_gate_is_supported() {
