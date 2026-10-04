@@ -17,3 +17,4 @@ keyroost-transport = { path = "../keyroost-transport", version = "0.12.0" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.12.0" }
 keyroost-proto = { path = "../keyroost-proto", version = "0.12.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.12.0" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.12.0" }

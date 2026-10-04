@@ -2301,6 +2301,7 @@ dependencies = [
  "keyroost-keyring",
  "keyroost-openpgp",
  "keyroost-proto",
+ "keyroost-token2otp",
  "keyroost-token2prog",
  "keyroost-transport",
 ]
