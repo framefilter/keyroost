@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use keyroost_keyring::Keyring;
-use keyroost_resolve::{ccid_readers_if_needed, ccid_serial_for, Need};
+use keyroost_resolve::{ccid_readers_if_needed, ccid_serials_for, Need};
 
 mod overview;
 mod prompt;
@@ -4740,7 +4740,15 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                 println!("  note: detected {bl} — re-plug it to return to application mode.");
             }
         } else {
-            let ccid = ccid_readers_if_needed(&hids);
+            // CCID attribution only ever applies to FIDO HID nodes (a YubiKey's
+            // other interfaces aren't candidates), and matching `correlate`'s
+            // own FIDO-only view here keeps `--all-hid` from having a non-FIDO
+            // interface count as a claimant and starve a real contended case.
+            let fido_hids: Vec<keyroost_hid::HidDevice> =
+                hids.iter().filter(|d| d.is_fido()).cloned().collect();
+            let ccid = ccid_readers_if_needed(&fido_hids);
+            let fido_refs: Vec<&keyroost_hid::HidDevice> = fido_hids.iter().collect();
+            let attributed = ccid_serials_for(&fido_refs, &ccid);
             for d in &filtered {
                 let tag = if d.is_fido() {
                     " [FIDO]"
@@ -4749,10 +4757,13 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     ""
                 };
-                let eff = d
-                    .serial_number
-                    .clone()
-                    .or_else(|| ccid_serial_for(d, &ccid));
+                let eff = d.serial_number.clone().or_else(|| {
+                    if !d.is_fido() {
+                        return None;
+                    }
+                    let i = fido_hids.iter().position(|h| h.path == d.path)?;
+                    attributed.get(i).cloned().flatten()
+                });
                 let serial = match (&d.serial_number, &eff) {
                     (Some(s), _) => format!(" serial={}", sanitize_terminal(s)),
                     (None, Some(s)) => format!(" serial={}(ccid)", sanitize_terminal(s)),
@@ -4786,10 +4797,13 @@ fn run_list(all_hid: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Correlated summary — built from the SAME hid+probe snapshot via the pure
-    // correlate(), so the raw sections above and this decision can't disagree.
+    // Correlated summary — built from the SAME hid+probe snapshot (plus any
+    // on-demand identity reads correlate_live() needs to settle a case
+    // topology alone can't decide), so the raw sections above and this
+    // decision can't disagree.
     println!();
-    let devices = keyroost_resolve::correlate(&hids, &probes, &keyring);
+    let devices =
+        keyroost_resolve::correlate_live(&hids, &probes, &keyring, crate::target::debug_on());
     overview::print_correlated(&overview::numbered(&devices));
 
     Ok(())

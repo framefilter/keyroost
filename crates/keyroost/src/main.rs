@@ -6780,9 +6780,11 @@ impl App {
     /// full `keyroost_resolve` correlation (HID + PC/SC probe), not just a
     /// USB iSerialNumber or a YubiKey CCID serial.
     ///
-    /// This used to call [`keyroost_resolve::read_effective_serial`], which
-    /// only ever resolves a HID `iSerialNumber` or — for `VID_YUBICO`
-    /// specifically — a YubiKey CCID serial; every other card-derived serial
+    /// This used to call the former HID-only resolver
+    /// (`keyroost_resolve::read_effective_serial`, removed once every front
+    /// end moved onto the device model), which only ever resolved a HID
+    /// `iSerialNumber` or — for `VID_YUBICO` specifically — a YubiKey CCID
+    /// serial; every other card-derived serial
     /// (a Token2 PIN+/Bio3 key's OpenPGP-applet serial among them) made it
     /// return `Err` unconditionally. `target_effective_serial`, by contrast,
     /// comes from `self.selected_device()`, i.e. the *full* `correlate()`

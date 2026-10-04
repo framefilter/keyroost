@@ -3,16 +3,18 @@
 //! Bridges raw device enumeration ([`keyroost_hid`]) and the friendly-name
 //! registry ([`keyroost_keyring`]) into one place, so the CLI (`keyroostctl`) and the
 //! GUI (`keyroost`) are thin front-ends over a single resolver rather than each
-//! re-implementing serial computation.
+//! re-implementing identity matching.
 //!
-//! The key job is computing a device's *effective serial*: the USB
-//! `iSerialNumber` when present, else a serial read over CCID for YubiKeys
-//! (which expose none). YubiKeys are matched to their CCID reader by USB
-//! topology so two connected YubiKeys are never confused — see
-//! [`ccid_serial_for`].
+//! The device-model path ([`device::correlate`] / [`device::correlate_live`])
+//! is how every front end identifies a key: it merges HID enumeration with a
+//! PC/SC applet probe and, where topology alone can't decide, an on-demand
+//! identity read ([`identity::read_identities`]), then hands the result to
+//! [`select::resolve_target`] for `--key`/`--reader`/picker matching. A USB
+//! `iSerialNumber` or a CCID-read YubiKey serial ([`ccid_serial_for`]) is one
+//! input into that merge, not a resolver of its own — this module no longer
+//! exposes a HID-only name lookup; use the device model instead.
 
 use keyroost_hid::HidDevice;
-use keyroost_keyring::{ConnectedKey, IdSource};
 use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
@@ -104,20 +106,6 @@ pub(crate) fn ccid_serials_attributed(
         .collect()
 }
 
-/// Map enumerated HID devices into the keyring resolver's view, filling in a
-/// CCID-read serial for YubiKeys that expose no USB serial.
-pub fn connected_keys(devices: &[HidDevice]) -> Vec<ConnectedKey> {
-    devices
-        .iter()
-        .zip(effective_serials(devices))
-        .map(|(d, serial)| ConnectedKey {
-            path: d.path.clone(),
-            serial,
-            label: d.product_name.clone(),
-        })
-        .collect()
-}
-
 /// Read YubiKey CCID serials once, but only if some device actually needs one.
 /// PC/SC failures (e.g. pcscd down) degrade to an empty list rather than erroring
 /// — a missing CCID serial just means that key can't be matched, which is safe.
@@ -164,34 +152,6 @@ pub fn ccid_serial_for(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String>
         [only] => only.serial.clone(),
         _ => None,
     }
-}
-
-/// The effective serial + its source for a single device, reading the YubiKey
-/// CCID serial on demand. Used when naming one chosen device, where a clear
-/// error is wanted if a YubiKey serial can't be read. The `Err` is a
-/// ready-to-display message (front-ends convert it into their own error type).
-pub fn read_effective_serial(d: &HidDevice) -> Result<(String, IdSource), String> {
-    if let Some(s) = &d.serial_number {
-        return Ok((s.clone(), IdSource::Usb));
-    }
-    if d.vendor_id == VID_YUBICO {
-        let readers = keyroost_transport::yubikey_ccid_serials().map_err(|e| e.to_string())?;
-        if let Some(s) = ccid_serial_for(d, &readers) {
-            return Ok((s, IdSource::Ccid));
-        }
-        return Err(format!(
-            "{} ({}) is a YubiKey, but its serial couldn't be read over CCID. \
-             Check that the smart-card (PC/SC) service is running and that this key's CCID reader is \
-             present (`keyroostctl list` shows connected readers).",
-            d.path.display(),
-            d.product_name
-        ));
-    }
-    Err(format!(
-        "{} ({}) exposes no USB serial, so it can't be named yet.",
-        d.path.display(),
-        d.product_name
-    ))
 }
 
 #[cfg(test)]
