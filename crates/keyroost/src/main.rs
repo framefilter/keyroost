@@ -15085,16 +15085,19 @@ impl App {
 
     /// The Compression row of the Import certificate and Self-signed
     /// certificate dialogs (the CLI's `--compress` / `--no-compress`), with
-    /// the same help the CLI gives.
-    fn piv_modal_compression_field(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    /// the same help the CLI gives. `label_w` is the dialog's label column, so
+    /// the row lines up with the management-key and PIN rows above it.
+    fn piv_modal_compression_field(&mut self, ui: &mut egui::Ui, p: &Palette, label_w: f32) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Compression")
-                    .font(theme::f_reg(13.0))
-                    .color(p.txt2),
+            ui.add_sized(
+                [label_w, 22.0],
+                egui::Label::new(
+                    egui::RichText::new("Compression")
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt2),
+                ),
             );
-            ui.add_space(8.0);
             piv_cert_compression_combo(ui, "piv-cert-compression", &mut self.piv.cert_compression);
         });
         card_note(
@@ -15533,7 +15536,9 @@ impl App {
                         PivCredKind::ImportCert => {
                             card_note(ui, p, &format!("Reading {}", self.piv.cert_path));
                             self.piv_modal_mgmt_field(ui, p, kind);
-                            self.piv_modal_compression_field(ui, p);
+                            // Same label column as the management-key row
+                            // (ImportCert uses the default 96px box).
+                            self.piv_modal_compression_field(ui, p, 96.0);
                             // Importing only replaces the public certificate
                             // object (no key loss) — a lighter note, not a red
                             // warning.
@@ -15566,7 +15571,7 @@ impl App {
                                 chuid_label_width(ui.ctx()),
                             );
                             self.secret_reveal.insert("piv-sign-pin", sign_pin_rev);
-                            self.piv_modal_compression_field(ui, p);
+                            self.piv_modal_compression_field(ui, p, chuid_label_width(ui.ctx()));
                             card_note(
                                 ui,
                                 p,
