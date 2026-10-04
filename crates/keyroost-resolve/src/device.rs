@@ -467,6 +467,7 @@ fn bind_readers(
             else {
                 continue;
             };
+            // Differing identities (including differing schemes) fail closed by design.
             if let (Some(a), Some(b)) = (ids.hid.get(&hid.path), ids.reader.get(&name)) {
                 if a != b {
                     continue;
@@ -552,11 +553,27 @@ pub fn correlate_with(
                 .or(s)
         })
         .collect();
+    // Which of those serials came from the node's own identity report. Such a
+    // serial is shown on the row, but joins a card row only through a reader
+    // bound by matching — never through the serial-only merge, which would
+    // otherwise bypass the uniqueness checks the identity step makes.
+    let serial_from_identity: Vec<bool> = hids
+        .iter()
+        .map(|h| {
+            h.serial_number.is_none()
+                && ids
+                    .hid
+                    .get(&h.path)
+                    .and_then(crate::identity::CanonicalId::row_serial)
+                    .is_some()
+        })
+        .collect();
 
     // Serials duplicated across the live HID set are NOT unique identity: two
     // keys that advertise the same serial must stay distinct (KEY-015). Track
-    // them so the serial-only merge below is suppressed for them.
-    let dup_serials: std::collections::HashSet<String> = {
+    // them so the serial-only merge below is suppressed for them. Card-row
+    // duplicates are added once those rows exist (step 3).
+    let mut dup_serials: std::collections::HashSet<String> = {
         let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for s in serials.iter().flatten() {
             *seen.entry(s.as_str()).or_default() += 1;
@@ -673,6 +690,22 @@ pub fn correlate_with(
         });
     }
 
+    // Two card rows with one serial are just as ambiguous: the serial-only
+    // merge must never pick one of them by enumeration order.
+    {
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for d in devices.iter().filter(|d| d.kind == DeviceKind::Key) {
+            if !d.serial.is_empty() {
+                *seen.entry(d.serial.as_str()).or_default() += 1;
+            }
+        }
+        dup_serials.extend(
+            seen.into_iter()
+                .filter(|(_, n)| *n > 1)
+                .map(|(s, _)| s.to_string()),
+        );
+    }
+
     // --- 3. Merge FIDO HID nodes into their physical key. Reader ownership is
     // settled up front by strength of evidence, not enumeration order.
     let bound = bind_readers(&hids, probes, &yk_readers, ids, opts);
@@ -719,7 +752,10 @@ pub fn correlate_with(
         let existing = devices.iter_mut().find(|d| {
             d.kind == DeviceKind::Key
                 && ((reader_name.is_some() && d.reader == reader_name)
-                    || (!serial.is_empty() && !dup_serials.contains(&serial) && d.serial == serial))
+                    || (!serial.is_empty()
+                        && !serial_from_identity[i]
+                        && !dup_serials.contains(&serial)
+                        && d.serial == serial))
         });
         if let Some(dev) = existing {
             // The HID node itself is the evidence for FIDO2 — verified.
@@ -2526,6 +2562,63 @@ mod tests {
         };
         let only_identity = correlate_with(&hids, &probes, &Keyring::default(), &ids, &opts);
         assert_eq!(rows(&topo), rows(&only_identity));
+    }
+
+    #[test]
+    fn duplicate_card_serials_never_take_an_identity_serial_by_order() {
+        // Two readers report one serial (KEY-015) and a topology-free node's
+        // identity read returns that same serial. Step 2 sees two owners and
+        // refuses; the serial-only merge must not pick one by enumeration order.
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None)];
+        let probes = [
+            probe(YK0, false, true, false, false, Some("11111111"), None, None),
+            probe(YK1, false, true, false, false, Some("11111111"), None, None),
+        ];
+        let ids = ids(
+            &[("/dev/hidraw17", Y, "11111111")],
+            &[(YK0, Y, "11111111"), (YK1, Y, "11111111")],
+        );
+        let devs = correlate_with(
+            &hids,
+            &probes,
+            &Keyring::default(),
+            &ids,
+            &MatchOptions::default(),
+        );
+        assert_eq!(devs.len(), 3);
+        assert!(devs
+            .iter()
+            .all(|d| !(d.hid_path.is_some() && d.reader.is_some())));
+    }
+
+    #[test]
+    fn one_sided_identity_serial_never_merges_without_a_bound_reader() {
+        // Only the HID side answered; its identity matches the card row's
+        // serial, but with the vendor fallback off nothing bound a reader, so
+        // the rows stay apart (the serial is still shown on the FIDO row).
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None)];
+        let probes = [probe(
+            YK0,
+            false,
+            true,
+            false,
+            false,
+            Some("11111111"),
+            None,
+            None,
+        )];
+        let ids = ids(&[("/dev/hidraw17", Y, "11111111")], &[]);
+        let opts = MatchOptions {
+            skip_vendor_fallback: true,
+            ..MatchOptions::default()
+        };
+        let devs = correlate_with(&hids, &probes, &Keyring::default(), &ids, &opts);
+        assert_eq!(devs.len(), 2);
+        assert!(devs
+            .iter()
+            .all(|d| !(d.hid_path.is_some() && d.reader.is_some())));
+        let fido = devs.iter().find(|d| d.hid_path.is_some()).unwrap();
+        assert_eq!(fido.serial, "11111111");
     }
 
     #[cfg(not(feature = "match-test-switch"))]
