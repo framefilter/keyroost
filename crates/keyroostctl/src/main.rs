@@ -4189,20 +4189,13 @@ fn run_molto(
     Ok(())
 }
 
-/// Resolve a reader for the single-profile programmable token: auto-use a lone
-/// connected reader, or match an explicit `--reader` substring.
-fn prog_pick_reader(explicit: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    let readers = keyroost_transport::Session::list_readers()?;
-    resolve_reader(readers, explicit, "programmable-token")
-}
-
 fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_token2prog as prog;
     use keyroost_transport::Token2ProgSession;
 
     match cmd {
         ProgCmd::Info { reader } => {
-            let name = prog_pick_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Prog, reader.as_deref())?;
             let mut session = Token2ProgSession::open_named(&name)?;
             session.set_debug(debug);
             let info = session.read_info()?;
@@ -4242,7 +4235,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 *hex_stdin,
                 *base32_stdin,
             )?;
-            let name = prog_pick_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Prog, reader.as_deref())?;
             let mut session = Token2ProgSession::open_named(&name)?;
             session.set_debug(debug);
             // Refuse to program a device whose serial does not match a known
@@ -4280,7 +4273,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 },
                 utc_time: now,
             };
-            let name = prog_pick_reader(reader.as_deref())?;
+            let name = crate::target::reader_for(Need::Prog, reader.as_deref())?;
             let mut session = Token2ProgSession::open_named(&name)?;
             session.set_debug(debug);
             // Refuse to program an unrecognized device (see Seed above).
@@ -13543,6 +13536,45 @@ mod cli_tests {
         no_serial.kind = DeviceKind::Token;
         let err = nameable(&no_serial).unwrap_err();
         assert!(err.contains("can't be named yet"), "{err}");
+    }
+
+    #[test]
+    fn prog_selection_ignores_other_readers_and_honours_device() {
+        use keyroost_resolve::{resolve_target, Caps, Device, DeviceKind, NoPicker, Selector};
+        fn d(name: &str, caps: Caps, kind: DeviceKind, reader: &str) -> Device {
+            Device {
+                id: format!("r:{reader}"),
+                name: Some(name.into()),
+                vendor: "V".into(),
+                model: "M".into(),
+                serial: name.into(),
+                transport: String::new(),
+                firmware: String::new(),
+                caps,
+                unverified: Caps::default(),
+                kind,
+                hid_path: None,
+                reader: Some(reader.into()),
+            }
+        }
+        let devs = [
+            d("yubi-test", Caps::OATH, DeviceKind::Key, "Yubico 00"),
+            d("card", Caps::PROG, DeviceKind::ProgToken, "NFC 01"),
+        ];
+        let t = resolve_target(&devs, &Selector::default(), Need::Prog, &mut NoPicker).unwrap();
+        assert_eq!(
+            t.device.reader.as_deref(),
+            Some("NFC 01"),
+            "a YubiKey reader is not a prog candidate"
+        );
+        let s = Selector {
+            device: Some("yubi-test"),
+            ..Default::default()
+        };
+        assert!(
+            resolve_target(&devs, &s, Need::Prog, &mut NoPicker).is_err(),
+            "--device naming another key must refuse, not write"
+        );
     }
 }
 
