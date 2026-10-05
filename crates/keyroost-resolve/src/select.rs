@@ -336,7 +336,13 @@ impl fmt::Debug for Target<'_> {
     }
 }
 
-/// Why no row was chosen. Every message is one line and names the exact fix.
+/// Why no detected row was chosen. Every message is one line.
+///
+/// Two variants are not refusals: [`SelectError::ReaderNotFound`] and
+/// [`SelectError::PathNotFound`] report an expert `--reader` / `--path` that
+/// matched no detected key, and the caller passes the typed value to its
+/// opener unchanged (their messages say "using it as typed"). Every other
+/// variant is a refusal whose message names the exact fix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SelectError {
     Conflict,
@@ -723,6 +729,104 @@ mod tests {
             reader,
             path,
         }
+    }
+
+    #[test]
+    fn card_applet_needs_require_the_cap_and_a_reader() {
+        for (need, cap) in [(Need::Oath, Caps::OATH), (Need::OpenPgp, Caps::PGP)] {
+            let card = row(None, "1", &[cap], None, Some("R 00 00"), DeviceKind::Key);
+            assert!(need.admits(&card), "{need:?}");
+            let hid_only = row(
+                None,
+                "1",
+                &[cap],
+                Some("/dev/hidraw1"),
+                None,
+                DeviceKind::Key,
+            );
+            assert!(!need.admits(&hid_only), "{need:?} over HID only");
+            let other = row(
+                None,
+                "1",
+                &[Caps::PIV],
+                Some("/dev/hidraw1"),
+                Some("R 00 00"),
+                DeviceKind::Key,
+            );
+            assert!(!need.admits(&other), "{need:?} without the cap");
+        }
+    }
+
+    #[test]
+    fn otp_needs_follow_the_transport_they_name() {
+        let both = row(
+            None,
+            "1",
+            &[Caps::OTP],
+            Some("/dev/hidraw1"),
+            Some("R 00 00"),
+            DeviceKind::Key,
+        );
+        let hid = row(
+            None,
+            "1",
+            &[Caps::OTP],
+            Some("/dev/hidraw1"),
+            None,
+            DeviceKind::Key,
+        );
+        let card = row(
+            None,
+            "1",
+            &[Caps::OTP],
+            None,
+            Some("R 00 00"),
+            DeviceKind::Key,
+        );
+        let none = row(
+            None,
+            "1",
+            &[Caps::FIDO2],
+            Some("/dev/hidraw1"),
+            Some("R 00 00"),
+            DeviceKind::Key,
+        );
+        for d in [&both, &hid, &card] {
+            assert!(Need::Otp.admits(d));
+        }
+        assert!(Need::OtpHid.admits(&both) && Need::OtpHid.admits(&hid));
+        assert!(!Need::OtpHid.admits(&card));
+        assert!(Need::OtpCcid.admits(&both) && Need::OtpCcid.admits(&card));
+        assert!(!Need::OtpCcid.admits(&hid));
+        for need in [Need::Otp, Need::OtpHid, Need::OtpCcid] {
+            assert!(!need.admits(&none), "{need:?} without the cap");
+        }
+    }
+
+    #[test]
+    fn prog_needs_a_programmable_token_with_a_reader() {
+        let prog = row(
+            None,
+            "",
+            &[Caps::PROG],
+            None,
+            Some("TOKEN2 Prog 00"),
+            DeviceKind::ProgToken,
+        );
+        assert!(Need::Prog.admits(&prog));
+        let mut no_reader = prog.clone();
+        no_reader.reader = None;
+        assert!(!Need::Prog.admits(&no_reader));
+        assert!(!Need::Prog.admits(&molto()));
+        assert!(!Need::Prog.admits(&yubi()));
+        assert!(!Need::Molto2.admits(&prog));
+    }
+
+    #[test]
+    fn nameable_needs_a_serial() {
+        assert!(Need::Nameable.admits(&yubi()));
+        assert!(Need::Nameable.admits(&solo()));
+        assert!(!Need::Nameable.admits(&molto()));
     }
 
     #[test]

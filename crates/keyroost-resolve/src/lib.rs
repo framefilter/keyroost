@@ -9,7 +9,8 @@
 //! is how every front end identifies a key: it merges HID enumeration with a
 //! PC/SC applet probe and, where topology alone can't decide, an on-demand
 //! identity read ([`identity::read_identities`]), then hands the result to
-//! [`select::resolve_target`] for `--key`/`--reader`/picker matching. A USB
+//! [`select::resolve_target`] for `--device`/`--reader`/`--path`/picker
+//! matching. A USB
 //! `iSerialNumber` or a CCID-read YubiKey serial ([`ccid_serial_for`]) is one
 //! input into that merge, not a resolver of its own — this module no longer
 //! exposes a HID-only name lookup; use the device model instead.

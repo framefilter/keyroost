@@ -3607,6 +3607,10 @@ fn inert_device_flag(cmd: Option<&Cmd>, list_readers: bool) -> Option<&'static s
         Cmd::KeyName {
             cmd: KeyNameCmd::Remove { .. },
         } => Some("key-name remove"),
+        Cmd::Molto {
+            cmd: MoltoCmd::ImportFile { dry_run: true, .. },
+            ..
+        } => Some("molto import-file --dry-run"),
         _ => None,
     }
 }
@@ -5645,7 +5649,7 @@ fn fido_reset_after_replug(
     // No Enter to press: the replug itself is the go-ahead. Watching the cheap
     // HID-only scan (no identity reads) keeps the poll light; a run nobody
     // replugs for simply times out with nothing sent to the key.
-    println!(
+    eprintln!(
         "Unplug {} and plug it back in now (waiting up to {} seconds)\u{2026}",
         sanitize_terminal(label),
         REPLUG_BUDGET.as_secs()
@@ -5759,7 +5763,7 @@ fn fido_reset_after_replug(
         )
         .into());
     };
-    println!("FIDO2  touch the key now\u{2026}");
+    eprintln!("FIDO2  touch the key now\u{2026}");
     fido_reset_at(&path)
 }
 
@@ -10552,7 +10556,7 @@ fn same_piv_card(confirmed: Option<u128>, now: Option<u128>) -> bool {
 /// possibly landing on a different key.
 fn fido_reset_at(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let (mut dev, _init) = keyroost_ctap::CtapHidDevice::open(path)?;
-    println!("Resetting {} — touch the key now…", path.display());
+    eprintln!("Resetting {} — touch the key now…", path.display());
     keyroost_ctap::reset(&mut dev)?;
     println!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
@@ -14868,6 +14872,11 @@ mod cli_tests {
                 &["keyroostctl", "key-name", "remove", "x"],
                 Some("key-name remove"),
             ),
+            (
+                &["keyroostctl", "molto", "import-file", "--dry-run", "x.json"],
+                Some("molto import-file --dry-run"),
+            ),
+            (&["keyroostctl", "molto", "import-file", "x.json"], None),
             (&["keyroostctl", "list"], None),
             (&["keyroostctl", "key-name", "add", "x"], None),
             (&["keyroostctl", "piv", "status"], None),

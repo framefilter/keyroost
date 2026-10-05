@@ -247,7 +247,7 @@ impl IdentityReader for Token2Identity {
             &p.reader_name,
             &build_select(&FIDO_APPLET_AID),
             &req,
-            false,
+            !token2_lax_fido_select(p),
             debug,
         )
         .and_then(|r| token2_from_fido_reply(&r))
@@ -262,6 +262,15 @@ impl IdentityReader for Token2Identity {
             .and_then(|r| token2_from_otp_reply(&r))
         })
     }
+}
+
+/// Whether the Token2 identity read may ignore a refused FIDO-applet SELECT
+/// on this reader (some Token2 firmware answers 6A81 yet switches applets).
+/// Only for readers that look like a Token2 key — the OTP applet answered,
+/// or the reader name says Token2 — so the vendor read never reaches
+/// whatever applet happens to be selected on another vendor's key.
+fn token2_lax_fido_select(p: &ReaderProbe) -> bool {
+    p.has_otp || p.reader_name.to_ascii_lowercase().contains("token2")
 }
 
 /// Every vendor that can be matched by identity.
@@ -538,6 +547,19 @@ mod tests {
             usb_address: addr,
         }
     }
+    #[test]
+    fn token2_lax_select_only_on_token2_looking_readers() {
+        let mut solo = reader(SOLO, None, None, None);
+        solo.has_fido = true;
+        assert!(!token2_lax_fido_select(&solo));
+        let mut by_name = reader("TOKEN2 FIDO2 Security Key 00 00", None, None, None);
+        by_name.has_fido = true;
+        assert!(token2_lax_fido_select(&by_name));
+        let mut by_otp = reader("Generic CCID Reader 00 00", None, None, None);
+        by_otp.has_otp = true;
+        assert!(token2_lax_fido_select(&by_otp));
+    }
+
     const YK0: &str = "Yubico YubiKey OTP+FIDO+CCID 00 00";
     const YK1: &str = "Yubico YubiKey OTP+FIDO+CCID 01 00";
     const SOLO: &str = "SoloKeys Solo 2 [CCID/ICCD Interface] 02 00";
