@@ -261,16 +261,32 @@ pub(crate) fn recheck(before: &Device, now: &[Device]) -> Recheck {
     }
 }
 
+/// Decide whether `first` (the identity-read-free look) is final, or
+/// whether `full_look` — the second look, with identity reads — must be
+/// consulted and trusted instead. `Same` and `Gone` are final: the first
+/// look can tell those apart without identity reads. `Changed` and
+/// `Unconfirmed` cannot be trusted on their own, because the first look
+/// can't bind a HID row and a reader row by identity — a split (or
+/// unreadable) serial there can look like `Changed` even when the two rows
+/// are the same key — so both escalate to the full look, which decides.
+fn reverify_verdict(
+    first: Recheck,
+    full_look: impl FnOnce() -> Result<Recheck, Box<dyn Error>>,
+) -> Result<Recheck, Box<dyn Error>> {
+    if matches!(first, Recheck::Changed | Recheck::Unconfirmed) {
+        full_look()
+    } else {
+        Ok(first)
+    }
+}
+
 /// After a question was actually shown, make sure the key the command is
 /// about to reopen (by reader name or HID path) is still the one confirmed:
-/// a same-model key plugged in meanwhile can reuse both. The first look
-/// sends no identity reads; only a key whose serial that look can't see is
-/// looked at again with them.
+/// a same-model key plugged in meanwhile can reuse both. See
+/// [`reverify_verdict`] for which first-look results are escalated.
 pub(crate) fn reverify(before: &Device) -> Result<(), Box<dyn Error>> {
-    let mut verdict = recheck(before, &enumerate_without_identity_reads()?);
-    if verdict == Recheck::Unconfirmed {
-        verdict = recheck(before, &enumerate()?);
-    }
+    let first = recheck(before, &enumerate_without_identity_reads()?);
+    let verdict = reverify_verdict(first, || Ok(recheck(before, &enumerate()?)))?;
     let label = crate::prompt::key_label(before);
     match verdict {
         Recheck::Same => Ok(()),
@@ -471,6 +487,34 @@ mod tests {
         // A stand-in for an undetected --reader / --path is never re-found.
         let typed = typed_device(Some("Some Reader".into()), None, "Some Reader");
         assert_eq!(recheck(&typed, &[]), Recheck::Skip);
+    }
+
+    #[test]
+    fn reverify_escalates_past_a_false_changed_or_unconfirmed_first_look() {
+        // A first look that can't bind sides by identity may call a split
+        // row Changed, or see no serial at all (Unconfirmed); neither is
+        // final — the full look (with identity reads) decides instead.
+        assert_eq!(
+            reverify_verdict(Recheck::Changed, || Ok(Recheck::Same)).unwrap(),
+            Recheck::Same
+        );
+        assert_eq!(
+            reverify_verdict(Recheck::Unconfirmed, || Ok(Recheck::Same)).unwrap(),
+            Recheck::Same
+        );
+        // A full look can still confirm the swap.
+        assert_eq!(
+            reverify_verdict(Recheck::Changed, || Ok(Recheck::Changed)).unwrap(),
+            Recheck::Changed
+        );
+        // Same, Gone and Skip are final: the (hardware-touching) full look
+        // is never consulted for them.
+        for first in [Recheck::Same, Recheck::Gone, Recheck::Skip] {
+            assert_eq!(
+                reverify_verdict(first, || panic!("full look must not run")).unwrap(),
+                first
+            );
+        }
     }
 
     #[test]
