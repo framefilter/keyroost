@@ -5677,12 +5677,15 @@ fn fido_reset_after_replug(
     const REINSERT_POLL: std::time::Duration = std::time::Duration::from_millis(300);
     let deadline = std::time::Instant::now() + REINSERT_DEADLINE;
 
-    let mut present = crate::target::enumerate()?;
+    // No identity reads here: the just-replugged key is exactly the kind of
+    // unmatched node they would target, and an unanswered one would spend
+    // the post-power-up window the reset has to land in.
+    let mut present = crate::target::enumerate_without_identity_reads()?;
     let (mut found, mut settled) =
         match_reinsert(expected_serial, expected_model, expected_ids, &present);
     while !settled && std::time::Instant::now() + REINSERT_POLL < deadline {
         std::thread::sleep(REINSERT_POLL);
-        present = crate::target::enumerate()?;
+        present = crate::target::enumerate_without_identity_reads()?;
         (found, settled) = match_reinsert(expected_serial, expected_model, expected_ids, &present);
     }
     // Only keys that expose a FIDO interface can be the one we are waiting for,
@@ -9357,22 +9360,25 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         }
         FidoCmd::Reset { yes, path, reader } => {
             let dev = crate::target::select(Need::FidoAny, reader.as_deref(), path.as_deref())?;
+            // The USB ids are what a key with no serial is re-found by after
+            // the replug; read them now, while the key is surely connected,
+            // not after a question the user may answer with it unplugged.
+            let ids = hid_ids_at(
+                dev.hid_path.as_deref(),
+                &keyroost_hid::enumerate().unwrap_or_default(),
+            );
             crate::prompt::confirm_on(&dev, *yes, "wipe every FIDO2 credential and the PIN")?;
             match fido_reset_route(&dev, reader.is_some())? {
                 FidoResetRoute::Card { reader } => run_fido_reset_reader(&reader)?,
-                FidoResetRoute::Replug { path } => {
-                    let ids =
-                        hid_ids_at(Some(&path), &keyroost_hid::enumerate().unwrap_or_default());
-                    fido_reset_after_replug(
-                        &path,
-                        dev.name.as_deref().unwrap_or(&dev.model),
-                        &dev.serial,
-                        &dev.model,
-                        ids,
-                        FIDO_RESET_NOUN,
-                        FIDO_RESET_RERUN,
-                    )?
-                }
+                FidoResetRoute::Replug { path } => fido_reset_after_replug(
+                    &path,
+                    dev.name.as_deref().unwrap_or(&dev.model),
+                    &dev.serial,
+                    &dev.model,
+                    ids,
+                    FIDO_RESET_NOUN,
+                    FIDO_RESET_RERUN,
+                )?,
             }
             Ok(())
         }
