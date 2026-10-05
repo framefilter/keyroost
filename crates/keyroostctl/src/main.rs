@@ -5180,6 +5180,7 @@ fn run_factory_reset(
                         expected_ids,
                         FACTORY_RESET_NOUN,
                         FACTORY_RESET_RERUN,
+                        Some(step.label()),
                     ) {
                         Ok(()) => StepOutcome::Wiped,
                         // Nobody replugged: nothing was sent, so this step was
@@ -5635,6 +5636,13 @@ fn fido_hid_nodes() -> Option<Vec<std::path::PathBuf>> {
 /// match afterwards. A key that has no serial to match on can't prove that by
 /// identity, so it falls back to proving it by exclusion — see
 /// `reinserted_serial_less_target` — and any second key in sight refuses.
+///
+/// `step_name` is this step's name in a multi-step factory reset (`"FIDO2"`),
+/// printed with the touch prompt instead of [`fido_reset_at`]'s own generic
+/// one, so the two callers (the factory reset and the standalone `fido
+/// reset`) each print exactly one touch prompt, not both. `None` for the
+/// standalone reset, which has no step name to show and keeps the generic one.
+#[allow(clippy::too_many_arguments)]
 fn fido_reset_after_replug(
     armed_path: &Path,
     label: &str,
@@ -5643,6 +5651,7 @@ fn fido_reset_after_replug(
     expected_ids: Option<(u16, u16)>,
     noun: &str,
     rerun: &str,
+    step_name: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serial_less = expected_serial.is_empty();
 
@@ -5763,8 +5772,19 @@ fn fido_reset_after_replug(
         )
         .into());
     };
-    eprintln!("FIDO2  touch the key now\u{2026}");
-    fido_reset_at(&path)
+    // Exactly one touch prompt: this step's name when there is one (factory
+    // reset), else `fido_reset_at`'s own generic one (standalone `fido reset`).
+    if let Some(name) = step_name {
+        eprintln!("{name}  touch the key now\u{2026}");
+    }
+    fido_reset_at(&path, needs_generic_touch_prompt(step_name))
+}
+
+/// Whether [`fido_reset_at`] must print its own generic touch prompt: only
+/// when the caller had no step name of its own to print instead, so a reset
+/// shows exactly one touch prompt regardless of which caller it came from.
+fn needs_generic_touch_prompt(step_name: Option<&str>) -> bool {
+    step_name.is_none()
 }
 
 /// The resolved devices reduced to what the post-replug match reads, parallel
@@ -9382,6 +9402,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     ids,
                     FIDO_RESET_NOUN,
                     FIDO_RESET_RERUN,
+                    None,
                 )?,
             }
             Ok(())
@@ -10554,9 +10575,19 @@ fn same_piv_card(confirmed: Option<u128>, now: Option<u128>) -> bool {
 /// that have *proved* which physical key they hold (the factory reset, after
 /// its replug prompt) reset exactly that one, instead of re-resolving and
 /// possibly landing on a different key.
-fn fido_reset_at(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `announce_touch` prints this function's own generic touch prompt; the
+/// caller sets it `false` when it already printed its own (naming its step)
+/// right before calling in, so the two never stack into two prompts for one
+/// reset ([`fido_reset_after_replug`]).
+fn fido_reset_at(
+    path: &std::path::Path,
+    announce_touch: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mut dev, _init) = keyroost_ctap::CtapHidDevice::open(path)?;
-    eprintln!("Resetting {} — touch the key now…", path.display());
+    if announce_touch {
+        eprintln!("Resetting {} — touch the key now…", path.display());
+    }
     keyroost_ctap::reset(&mut dev)?;
     println!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
@@ -11825,6 +11856,14 @@ mod cli_tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");
+    }
+
+    #[test]
+    fn fido_reset_shows_exactly_one_touch_prompt_per_caller() {
+        // A factory-reset step names itself and `fido_reset_at` stays quiet;
+        // the standalone reset has no step name and keeps the generic prompt.
+        assert!(!needs_generic_touch_prompt(Some("FIDO2")));
+        assert!(needs_generic_touch_prompt(None));
     }
 
     #[test]
