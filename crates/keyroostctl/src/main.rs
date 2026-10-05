@@ -6580,12 +6580,17 @@ fn run_otp(
             };
             let dev = select_otp(&sel)?;
             otp_precheck(&dev, sel.transport, debug, OtpFeature::OnDevice)?;
-            crate::prompt::confirm_on(&dev, *yes, &format!("delete OTP entry {label:?}"))?;
+            let asked = crate::prompt::confirm_then_read(
+                &dev,
+                *yes,
+                &format!("delete OTP entry {label:?}"),
+            )?;
             let pin = if pin_env.is_some() || *pin_stdin {
                 Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
             } else {
                 None
             };
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.delete_entry_pinned(app, account, pin.as_deref().map(|p| p.as_str()))?;
             println!("Deleted OTP entry {label:?}.");
@@ -6627,12 +6632,15 @@ fn run_otp(
             // An unsupported key fails here, and an empty button slot needs
             // no question.
             let info = otp_precheck(&dev, sel.transport, debug, OtpFeature::ButtonHotp)?;
-            if button_hotp_maybe_configured(info.as_ref()) {
-                crate::prompt::confirm_on(&dev, *yes, "replace the HOTP-on-button seed")?;
-            }
+            let asked = if button_hotp_maybe_configured(info.as_ref()) {
+                crate::prompt::confirm_then_read(&dev, *yes, "replace the HOTP-on-button seed")?
+            } else {
+                false
+            };
             let seed_b32 = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
             let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
             println!("Configured the HOTP-on-button keystroke slot.");
@@ -7155,7 +7163,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 a.to_alg().attributes(slot.to_crt())?;
             }
             let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
-            crate::prompt::confirm_on(
+            let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("overwrite the OpenPGP {} key", slot.label()),
@@ -7165,6 +7173,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 admin_pin_env.as_deref(),
                 *admin_pin_stdin,
             )?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!(
@@ -7193,7 +7202,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             reader,
         } => {
             let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
-            crate::prompt::confirm_on(
+            let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("overwrite the OpenPGP {} key", slot.label()),
@@ -7219,6 +7228,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 keyroost_rsakey::load_from_file(path)?
             };
 
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!("Importing {} key…", slot.label());
@@ -7656,12 +7666,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 );
             }
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
-            crate::prompt::confirm_on(
+            let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 "set PIV retry counts (resets the PIN and PUK to factory defaults)",
             )?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -9461,12 +9472,13 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 hex_decode(cred_id).map_err(|e| format!("--cred-id is not valid hex: {}", e))?;
             crate::target::fido_path(path.as_deref())?;
             let dev = crate::target::select(Need::FidoHid, None, path.as_deref())?;
-            crate::prompt::confirm_on(
+            let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete FIDO credential {}", hex_short(&cred_id_bytes)),
             )?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
             Ok(())
         }
@@ -9513,12 +9525,13 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 .map_err(|e| format!("--template-id is not valid hex: {}", e))?;
             crate::target::fido_path(path.as_deref())?;
             let dev = crate::target::select(Need::FidoHid, None, path.as_deref())?;
-            crate::prompt::confirm_on(
+            let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete fingerprint template {}", hex_short(&id)),
             )?;
             let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             run_fido_fingerprint_delete(path.as_deref(), &pin, &id)?;
             Ok(())
         }
@@ -11038,9 +11051,11 @@ fn gather_secret(
 
 /// Ask first, then read the PIN: a refusal or a "no" never consumes a PIN
 /// source (the FIDO one-way settings and the large-blob wipes). `reopened`
-/// is the key a command reopens after the question; when the question was
-/// shown it is re-found first ([`crate::target::reverify`]). Callers that
-/// hold the key's handle open across the question pass `None`.
+/// is the key a command reopens after this returns; when the question was
+/// shown, it is re-found ([`crate::target::reverify`]) only after the PIN
+/// has been read — immediately before the reopen, not while the person is
+/// still typing the PIN. Callers that hold the key's handle open across the
+/// question pass `None`.
 fn confirm_then_read_pin(
     term: &mut dyn crate::prompt::Term,
     yes: bool,
@@ -11050,12 +11065,33 @@ fn confirm_then_read_pin(
     pin_env: Option<&str>,
     pin_stdin: bool,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
-    if crate::prompt::confirm(term, yes, action, key)? {
-        if let Some(dev) = reopened {
-            crate::target::reverify(dev)?;
+    confirm_then_read_pin_ordered(term, yes, action, key, pin_env, pin_stdin, |asked| {
+        if asked {
+            if let Some(dev) = reopened {
+                crate::target::reverify(dev)?;
+            }
         }
-    }
-    read_secret("PIN", pin_env, pin_stdin)
+        Ok(())
+    })
+}
+
+/// The pure ask → read → re-verify ordering behind [`confirm_then_read_pin`],
+/// with the re-verify step injectable so the ordering can be asserted
+/// without talking to hardware: `reverify` must run after `read_secret`
+/// succeeds, never before.
+fn confirm_then_read_pin_ordered(
+    term: &mut dyn crate::prompt::Term,
+    yes: bool,
+    action: &str,
+    key: &str,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
+    reverify: impl FnOnce(bool) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    let asked = crate::prompt::confirm(term, yes, action, key)?;
+    let pin = read_secret("PIN", pin_env, pin_stdin)?;
+    reverify(asked)?;
+    Ok(pin)
 }
 
 /// Returned wrapped in `Zeroizing` so the PIN/password is scrubbed from the
@@ -11856,6 +11892,78 @@ mod cli_tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");
+    }
+
+    #[test]
+    fn confirm_then_read_pin_reverifies_only_after_the_pin_is_read() {
+        // The re-check must never run ahead of the PIN read: if reading the
+        // PIN fails, nothing has been reopened yet and there is nothing to
+        // re-check. This is what would regress if the re-check moved back
+        // to right after the question, ahead of the (possibly slow, typed)
+        // PIN entry.
+        struct YesTerm;
+        impl crate::prompt::Term for YesTerm {
+            fn present(&self) -> bool {
+                true
+            }
+            fn say(&mut self, _: &str) {}
+            fn ask(&mut self, _: &str) -> std::io::Result<String> {
+                Ok("y\n".into())
+            }
+        }
+        let reverify_ran = std::cell::Cell::new(false);
+        let unset = Some("KEYROOST_TEST_ORDER_UNSET_PIN_VAR");
+        let e = confirm_then_read_pin_ordered(
+            &mut YesTerm,
+            false,
+            "action",
+            "k",
+            unset,
+            false,
+            |_asked| {
+                reverify_ran.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("KEYROOST_TEST_ORDER_UNSET_PIN_VAR"), "{e}");
+        assert!(!reverify_ran.get(), "re-check ran before the PIN was read");
+    }
+
+    #[test]
+    fn confirm_then_read_pin_reverifies_after_a_successful_read() {
+        struct YesTerm;
+        impl crate::prompt::Term for YesTerm {
+            fn present(&self) -> bool {
+                true
+            }
+            fn say(&mut self, _: &str) {}
+            fn ask(&mut self, _: &str) -> std::io::Result<String> {
+                Ok("y\n".into())
+            }
+        }
+        let var = "KEYROOST_TEST_ORDER_SET_PIN_VAR";
+        std::env::set_var(var, "1234");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let pin = confirm_then_read_pin_ordered(
+            &mut YesTerm,
+            false,
+            "action",
+            "k",
+            Some(var),
+            false,
+            |asked| {
+                seen.borrow_mut().push(asked);
+                Ok(())
+            },
+        )
+        .unwrap();
+        std::env::remove_var(var);
+        assert_eq!(&*pin, "1234");
+        // The read already happened (the PIN above came from it); the
+        // re-check runs once more, right after, with `asked` carried through.
+        assert_eq!(*seen.borrow(), vec![true]);
     }
 
     #[test]

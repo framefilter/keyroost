@@ -159,19 +159,42 @@ pub(crate) fn key_label(d: &Device) -> String {
     }
 }
 
+/// Ask only, for a command that must still read a secret (a PIN, a seed)
+/// before it reopens `d`. Returns whether the question was actually shown
+/// and answered yes. Call [`reverify_if_asked`] with that result right
+/// before the reopen — after the secret has been read, so nothing sits
+/// between the re-check and the reopen while the person is typing it.
+/// `--yes` and scripts return `Ok(false)`.
+pub(crate) fn confirm_then_read(
+    d: &Device,
+    yes: bool,
+    action: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(confirm(&mut RealTerm, yes, action, &key_label(d))?)
+}
+
+/// Re-find `d` ([`crate::target::reverify`]) only when the question was
+/// actually shown (`asked`, from [`confirm_then_read`] or
+/// `confirm_then_read_pin`): the user may have swapped keys while it was
+/// up. A no-op under `--yes` and in scripts.
+pub(crate) fn reverify_if_asked(d: &Device, asked: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if asked {
+        crate::target::reverify(d)?;
+    }
+    Ok(())
+}
+
 /// Ask before acting on `d`, which the command reopens afterwards by reader
-/// name or HID path. When the question was actually shown, the key is
-/// re-found first ([`crate::target::reverify`]): the user may have swapped
-/// keys while it was up. `--yes` and scripts skip both.
+/// name or HID path, with no secret read in between. See
+/// [`confirm_then_read`] / [`reverify_if_asked`] for a command that reads a
+/// secret first.
 pub(crate) fn confirm_on(
     d: &Device,
     yes: bool,
     action: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if confirm(&mut RealTerm, yes, action, &key_label(d))? {
-        crate::target::reverify(d)?;
-    }
-    Ok(())
+    let asked = confirm_then_read(d, yes, action)?;
+    reverify_if_asked(d, asked)
 }
 
 /// [`confirm_on`] for a command that holds the key's session or handle open
@@ -193,10 +216,8 @@ pub(crate) fn confirm_typed_on(
     word: &str,
     action: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if confirm_typed(&mut RealTerm, yes, word, action, &key_label(d))? {
-        crate::target::reverify(d)?;
-    }
-    Ok(())
+    let asked = confirm_typed(&mut RealTerm, yes, word, action, &key_label(d))?;
+    reverify_if_asked(d, asked)
 }
 
 #[cfg(test)]
