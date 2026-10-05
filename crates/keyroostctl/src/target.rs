@@ -31,6 +31,17 @@ pub(crate) fn device_flag() -> Option<&'static str> {
 pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
     Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
         debug: debug_on(),
+        skip_identity_reads: false,
+    })?)
+}
+
+/// The device list without identity reads (topology, vendor and reported
+/// serials only): for scans that must stay fast or must not talk to an
+/// unidentified key, such as the FIDO reset's post-replug look.
+pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn Error>> {
+    Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
+        debug: debug_on(),
+        skip_identity_reads: true,
     })?)
 }
 
@@ -59,11 +70,19 @@ fn typed_announce_line(typed: &str) -> String {
     )
 }
 
+const OVERRIDE_PREFIX: &str = "override:";
+
+/// The `--reader` / `--path` typed for a stand-in row (see [`typed_device`]);
+/// `None` for a detected key.
+pub(crate) fn typed_value(d: &Device) -> Option<&str> {
+    d.id.strip_prefix(OVERRIDE_PREFIX)
+}
+
 /// A stand-in row for an expert `--reader` / `--path` that matched no
 /// detected key: the command opens exactly what was typed.
 fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) -> Device {
     Device {
-        id: format!("override:{typed}"),
+        id: format!("{OVERRIDE_PREFIX}{typed}"),
         name: None,
         vendor: String::new(),
         model: "key not detected".into(),
@@ -184,6 +203,94 @@ pub(crate) fn select_fido(path: Option<&Path>) -> Result<Device, Box<dyn Error>>
 /// The HID path of the selected FIDO key.
 pub(crate) fn fido_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
     hid_path_of(&select_fido(path)?)
+}
+
+/// What re-enumerating after a confirmation question says about the key
+/// the user confirmed against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recheck {
+    /// Still there, and its serial (if it reports one) is unchanged.
+    Same,
+    /// Nothing to re-find: a stand-in row for an undetected `--reader` /
+    /// `--path`, or a row without any endpoint.
+    Skip,
+    /// One of its endpoints is no longer present.
+    Gone,
+    /// A different serial now answers at one of its endpoints.
+    Changed,
+    /// Its endpoints are present, but none reports a serial to compare.
+    Unconfirmed,
+}
+
+/// Re-find `before` in a fresh enumeration `now`, by the exact reader and
+/// HID path it was selected at.
+pub(crate) fn recheck(before: &Device, now: &[Device]) -> Recheck {
+    if typed_value(before).is_some() || (before.reader.is_none() && before.hid_path.is_none()) {
+        return Recheck::Skip;
+    }
+    let reader_back = before
+        .reader
+        .as_ref()
+        .is_none_or(|r| now.iter().any(|d| d.reader.as_ref() == Some(r)));
+    let path_back = before
+        .hid_path
+        .as_ref()
+        .is_none_or(|p| now.iter().any(|d| d.hid_path.as_ref() == Some(p)));
+    if !reader_back || !path_back {
+        return Recheck::Gone;
+    }
+    if before.serial.is_empty() {
+        return Recheck::Same;
+    }
+    let shares_endpoint = |d: &&Device| {
+        (before.reader.is_some() && d.reader == before.reader)
+            || (before.hid_path.is_some() && d.hid_path == before.hid_path)
+    };
+    let serials: Vec<&str> = now
+        .iter()
+        .filter(shares_endpoint)
+        .map(|d| d.serial.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if serials.iter().any(|s| *s != before.serial) {
+        Recheck::Changed
+    } else if serials.is_empty() {
+        Recheck::Unconfirmed
+    } else {
+        Recheck::Same
+    }
+}
+
+/// After a question was actually shown, make sure the key the command is
+/// about to reopen (by reader name or HID path) is still the one confirmed:
+/// a same-model key plugged in meanwhile can reuse both. The first look
+/// sends no identity reads; only a key whose serial that look can't see is
+/// looked at again with them.
+pub(crate) fn reverify(before: &Device) -> Result<(), Box<dyn Error>> {
+    let mut verdict = recheck(before, &enumerate_without_identity_reads()?);
+    if verdict == Recheck::Unconfirmed {
+        verdict = recheck(before, &enumerate()?);
+    }
+    let label = crate::prompt::key_label(before);
+    match verdict {
+        Recheck::Same => Ok(()),
+        Recheck::Skip => {
+            if debug_on() {
+                eprintln!(
+                    "[target] {label}: not a detected key; not re-checked after the question"
+                );
+            }
+            Ok(())
+        }
+        Recheck::Gone | Recheck::Changed => Err(format!(
+            "the key changed while waiting for confirmation ({label}); nothing was changed"
+        )
+        .into()),
+        Recheck::Unconfirmed => Err(format!(
+            "could not re-read the serial of {label} after the confirmation; nothing was changed"
+        )
+        .into()),
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +424,80 @@ mod tests {
             "3"
         );
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn recheck_after_the_question() {
+        let before = dev(Some("k"), "12345678");
+        // Same serial at the same endpoints.
+        assert_eq!(
+            recheck(&before, std::slice::from_ref(&before)),
+            Recheck::Same
+        );
+        // A different key now answers at the same reader / path.
+        let swapped = dev(None, "87654321");
+        assert_eq!(recheck(&before, &[swapped]), Recheck::Changed);
+        // Gone entirely, or one of its endpoints is.
+        assert_eq!(recheck(&before, &[]), Recheck::Gone);
+        let mut no_hid = before.clone();
+        no_hid.hid_path = None;
+        assert_eq!(recheck(&before, &[no_hid.clone()]), Recheck::Gone);
+        // Split rows (no identity reads): the reader row keeps the serial.
+        let mut hid_only = dev(None, "");
+        hid_only.reader = None;
+        assert_eq!(
+            recheck(&before, &[no_hid.clone(), hid_only.clone()]),
+            Recheck::Same
+        );
+        // …but any different serial at either endpoint is a swap.
+        let mut other_on_hid = dev(None, "87654321");
+        other_on_hid.reader = None;
+        assert_eq!(recheck(&before, &[no_hid, other_on_hid]), Recheck::Changed);
+        // Present but no serial visible anywhere: can't confirm.
+        let mut no_serial_reader = dev(None, "");
+        no_serial_reader.hid_path = None;
+        assert_eq!(
+            recheck(&before, &[no_serial_reader, hid_only]),
+            Recheck::Unconfirmed
+        );
+        // A serial-less key passes when its endpoints are still there…
+        let serial_less = dev(None, "");
+        assert_eq!(
+            recheck(&serial_less, std::slice::from_ref(&serial_less)),
+            Recheck::Same
+        );
+        // …and is refused when they are not.
+        assert_eq!(recheck(&serial_less, &[]), Recheck::Gone);
+        // A stand-in for an undetected --reader / --path is never re-found.
+        let typed = typed_device(Some("Some Reader".into()), None, "Some Reader");
+        assert_eq!(recheck(&typed, &[]), Recheck::Skip);
+    }
+
+    #[test]
+    fn typed_value_only_for_stand_in_rows() {
+        let typed = typed_device(None, Some("/dev/hidraw99".into()), "/dev/hidraw99");
+        assert_eq!(typed_value(&typed), Some("/dev/hidraw99"));
+        assert_eq!(typed_value(&dev(None, "1")), None);
+    }
+
+    #[test]
+    fn prompt_label_for_a_stand_in_row_is_what_was_typed() {
+        let typed = typed_device(
+            Some("Other\u{1b}[2J Reader".into()),
+            None,
+            "Other\u{1b}[2J Reader",
+        );
+        let label = crate::prompt::key_label(&typed);
+        assert!(!label.contains("not detected"), "{label}");
+        assert!(
+            label.starts_with("Other") && label.ends_with("Reader"),
+            "{label}"
+        );
+        assert!(!label.contains('\u{1b}'));
+        assert_eq!(
+            crate::prompt::key_label(&dev(Some("k"), "1")),
+            "k (serial 1)"
+        );
     }
 
     #[test]

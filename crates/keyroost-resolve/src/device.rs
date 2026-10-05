@@ -902,6 +902,10 @@ pub fn correlate_live(
 pub struct EnumerateOptions {
     /// Trace identity reads and match decisions to stderr.
     pub debug: bool,
+    /// Match by topology, vendor and reported serials only, sending no
+    /// identity reads to any key ([`correlate`]). For time-critical or
+    /// re-check scans where an unanswered identity read would only cost time.
+    pub skip_identity_reads: bool,
 }
 
 /// Build the unified device list (see [`enumerate`]) with options.
@@ -909,6 +913,9 @@ pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
     let probes = keyroost_transport::probe_readers().unwrap_or_default();
     let keyring = Keyring::load_default().unwrap_or_default();
+    if opts.skip_identity_reads {
+        return Ok(correlate(&hids, &probes, &keyring));
+    }
     Ok(correlate_live(&hids, &probes, &keyring, opts.debug))
 }
 

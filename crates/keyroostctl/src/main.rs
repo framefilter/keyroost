@@ -4042,7 +4042,7 @@ fn run_molto(
                 .map(sanitize_terminal)
                 .unwrap_or_else(|| "(none)".into()),
         );
-        crate::prompt::confirm_on(&dev, *yes, &format!("delete slot #{profile}'s seed"))?;
+        crate::prompt::confirm_on_held(&dev, *yes, &format!("delete slot #{profile}'s seed"))?;
         match session.delete_seed(*profile)? {
             SeedDeleteOutcome::Deleted => {
                 println!(
@@ -4068,7 +4068,7 @@ fn run_molto(
         session.set_debug(debug);
         let info = session.read_info()?;
         print_info(&info);
-        crate::prompt::confirm_on(&dev, *yes, "factory-reset the Molto2 (all 100 slots)")?;
+        crate::prompt::confirm_on_held(&dev, *yes, "factory-reset the Molto2 (all 100 slots)")?;
         println!("requesting factory reset; confirm with the up-arrow button on the device");
         session.factory_reset()?;
         return Ok(());
@@ -4177,7 +4177,7 @@ fn run_molto(
             let busy = molto_occupied(&mut session, slots)?;
             if !busy.is_empty() {
                 let list: Vec<String> = busy.iter().map(|p| format!("#{p}")).collect();
-                crate::prompt::confirm_on(
+                crate::prompt::confirm_on_held(
                     &dev,
                     yes,
                     &format!("overwrite occupied Molto2 slot(s) {}", list.join(", ")),
@@ -4522,7 +4522,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // Token2 programmable-token model — guards against writing to the
             // wrong card on a shared reader.
             prog_guard_model(&mut session)?;
-            crate::prompt::confirm_on(&dev, *yes, "overwrite the programmable token's seed")?;
+            crate::prompt::confirm_on_held(&dev, *yes, "overwrite the programmable token's seed")?;
             let seed = match early {
                 Some(seed) => seed,
                 None => resolve()?,
@@ -4544,7 +4544,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             session.set_debug(debug);
             // Refuse to program an unrecognized device (see Seed above).
             prog_guard_model(&mut session)?;
-            crate::prompt::confirm_on(
+            crate::prompt::confirm_on_held(
                 &dev,
                 *yes,
                 "overwrite the programmable token's configuration",
@@ -8403,19 +8403,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // serial. The question is asked outside any transaction (a card
             // held idle while the user answers can drop it), then a fresh
             // transaction re-checks the gate quietly and does the wipe.
-            let serial = keyroost_transport::PivSession::with_transaction_traced(
+            let confirmed_serial = keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
-                |s| -> Result<String, Box<dyn std::error::Error>> {
+                |s| -> Result<Option<u128>, Box<dyn std::error::Error>> {
                     // Gate on the applet's fingerprint before reading status — the
                     // fingerprint probe re-SELECTs PIV, same ordering concern
                     // `delete-key`/`move-key` document at their own call sites.
                     guard_piv_feature(s, keyroost_piv::compat::PivExtension::Reset, *force)?;
-                    let st = s.status()?;
-                    Ok(st
-                        .serial
-                        .map(|v| format!("serial {}", v))
-                        .unwrap_or_else(|| "this device".into()))
+                    Ok(s.status()?.serial)
                 },
             )?;
             crate::prompt::confirm_on(&dev, *yes, "wipe the PIV applet")?;
@@ -8426,6 +8422,22 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // Same verdict as above (already shown); re-run so this
                     // session carries --force's read override too.
                     check_piv_feature(s, keyroost_piv::compat::PivExtension::Reset, *force)?;
+                    // The question above ran outside any transaction, and a
+                    // same-model key plugged in meanwhile gets the same reader
+                    // name: re-read the serial before any auth or RESET, and
+                    // report the card this transaction actually wipes.
+                    let serial = s.status()?.serial;
+                    if !same_piv_card(confirmed_serial, serial) {
+                        return Err(format!(
+                            "the card in {} changed while waiting for confirmation; \
+                             nothing was reset",
+                            sanitize_terminal(&name)
+                        )
+                        .into());
+                    }
+                    let serial = serial
+                        .map(|v| format!("serial {v}"))
+                        .unwrap_or_else(|| "this device".into());
                     // Some fingerprints need an authenticated management-key session
                     // before RESET is even accepted (`PivQuirk::
                     // ResetNeedsManagementAuth`) — the same precondition
@@ -9509,6 +9521,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 *yes,
                 &format!("raise the minimum PIN length to {length} (only a reset lowers it again)"),
                 &crate::prompt::key_label(&dev),
+                Some(&dev),
                 pin_env.as_deref(),
                 *pin_stdin,
             )?;
@@ -9553,6 +9566,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 *yes,
                 "enable enterprise attestation (only a reset turns it off)",
                 &crate::prompt::key_label(&dev),
+                Some(&dev),
                 pin_env.as_deref(),
                 *pin_stdin,
             )?;
@@ -10170,6 +10184,7 @@ fn run_fido_large_blob_delete(
         yes,
         &format!("delete large-blob entry {index}"),
         &crate::prompt::key_label(&key),
+        None,
         pin_env,
         pin_stdin,
     )?;
@@ -10224,6 +10239,7 @@ fn run_fido_large_blob_clear(
         yes,
         "clear the whole large-blob array",
         &crate::prompt::key_label(&key),
+        None,
         pin_env,
         pin_stdin,
     )?;
@@ -10515,6 +10531,13 @@ fn fido_reset_route(
             sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model))
         )),
     }
+}
+
+/// Whether the PIV card a transaction reads now is the one the user
+/// confirmed against: the serials must agree, and a serial known on one side
+/// only is a different card (two unknowns can't be told apart, so they pass).
+fn same_piv_card(confirmed: Option<u128>, now: Option<u128>) -> bool {
+    confirmed == now
 }
 
 /// Reset the FIDO2 applet of an already-resolved device. Split out so callers
@@ -10973,16 +10996,24 @@ fn gather_secret(
 }
 
 /// Ask first, then read the PIN: a refusal or a "no" never consumes a PIN
-/// source (the FIDO one-way settings and the large-blob wipes).
+/// source (the FIDO one-way settings and the large-blob wipes). `reopened`
+/// is the key a command reopens after the question; when the question was
+/// shown it is re-found first ([`crate::target::reverify`]). Callers that
+/// hold the key's handle open across the question pass `None`.
 fn confirm_then_read_pin(
     term: &mut dyn crate::prompt::Term,
     yes: bool,
     action: &str,
     key: &str,
+    reopened: Option<&keyroost_resolve::Device>,
     pin_env: Option<&str>,
     pin_stdin: bool,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
-    crate::prompt::confirm(term, yes, action, key)?;
+    if crate::prompt::confirm(term, yes, action, key)? {
+        if let Some(dev) = reopened {
+            crate::target::reverify(dev)?;
+        }
+    }
     read_secret("PIN", pin_env, pin_stdin)
 }
 
@@ -11485,6 +11516,15 @@ mod cli_tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn piv_reset_refuses_a_card_swapped_during_the_question() {
+        assert!(same_piv_card(Some(12345678), Some(12345678)));
+        assert!(same_piv_card(None, None));
+        assert!(!same_piv_card(Some(12345678), Some(87654321)));
+        assert!(!same_piv_card(Some(12345678), None));
+        assert!(!same_piv_card(None, Some(12345678)));
+    }
+
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
     }
@@ -11766,12 +11806,12 @@ mod cli_tests {
         }
         let unset = Some("KEYROOST_TEST_UNSET_PIN_VAR");
         let action = "enable enterprise attestation (only a reset turns it off)";
-        let e = confirm_then_read_pin(&mut NoTty, false, action, "solo-test", unset, false)
+        let e = confirm_then_read_pin(&mut NoTty, false, action, "solo-test", None, unset, false)
             .unwrap_err()
             .to_string();
         assert!(e.ends_with("add --yes"), "{e}");
         assert!(!e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");
-        let e = confirm_then_read_pin(&mut NoTty, true, action, "solo-test", unset, false)
+        let e = confirm_then_read_pin(&mut NoTty, true, action, "solo-test", None, unset, false)
             .unwrap_err()
             .to_string();
         assert!(e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");

@@ -95,14 +95,15 @@ fn refusal(action: &str, key: &str) -> String {
 
 /// `[y/N]` before erasing or replacing something the host can't restore.
 /// `--yes` skips it; without a terminal it refuses with "add --yes".
+/// `Ok(true)` means the question was shown and answered yes.
 pub(crate) fn confirm(
     term: &mut dyn Term,
     yes: bool,
     action: &str,
     key: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if yes {
-        return Ok(());
+        return Ok(false);
     }
     if !term.present() {
         return Err(refusal(action, key));
@@ -111,22 +112,23 @@ pub(crate) fn confirm(
         .ask(&format!("{action} on {key}? [y/N] "))
         .map_err(|e| e.to_string())?;
     match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(()),
+        "y" | "yes" => Ok(true),
         _ => Err("cancelled; nothing was changed".into()),
     }
 }
 
 /// The stronger check (factory-reset, otp interface): a typed word, read
-/// from the terminal only. `--yes` skips it deliberately.
+/// from the terminal only. `--yes` skips it deliberately. `Ok(true)` means
+/// the question was shown and answered.
 pub(crate) fn confirm_typed(
     term: &mut dyn Term,
     yes: bool,
     word: &str,
     action: &str,
     key: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if yes {
-        return Ok(());
+        return Ok(false);
     }
     if !term.present() {
         return Err(refusal(action, key));
@@ -135,7 +137,7 @@ pub(crate) fn confirm_typed(
         .ask(&format!("Type '{word}' to {action} on {key}: "))
         .map_err(|e| e.to_string())?;
     if answer.trim() == word {
-        Ok(())
+        Ok(true)
     } else {
         Err(format!(
             "the confirmation did not match '{word}'; nothing was changed"
@@ -143,8 +145,12 @@ pub(crate) fn confirm_typed(
     }
 }
 
-/// "yubi-test (serial 12345678)" / model when unnamed.
+/// "yubi-test (serial 12345678)" / model when unnamed / the reader or path
+/// as typed for a key that was not detected.
 pub(crate) fn key_label(d: &Device) -> String {
+    if let Some(typed) = crate::target::typed_value(d) {
+        return sanitize_terminal(typed);
+    }
     let who = sanitize_terminal(d.name.as_deref().unwrap_or(&d.model));
     if d.serial.is_empty() {
         who
@@ -153,27 +159,44 @@ pub(crate) fn key_label(d: &Device) -> String {
     }
 }
 
+/// Ask before acting on `d`, which the command reopens afterwards by reader
+/// name or HID path. When the question was actually shown, the key is
+/// re-found first ([`crate::target::reverify`]): the user may have swapped
+/// keys while it was up. `--yes` and scripts skip both.
 pub(crate) fn confirm_on(
     d: &Device,
     yes: bool,
     action: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Ok(confirm(&mut RealTerm, yes, action, &key_label(d))?)
+    if confirm(&mut RealTerm, yes, action, &key_label(d))? {
+        crate::target::reverify(d)?;
+    }
+    Ok(())
 }
 
+/// [`confirm_on`] for a command that holds the key's session or handle open
+/// across the question, which already ties it to the key the user saw. No
+/// re-enumeration: that would SELECT applets on the held card.
+pub(crate) fn confirm_on_held(
+    d: &Device,
+    yes: bool,
+    action: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    confirm(&mut RealTerm, yes, action, &key_label(d))?;
+    Ok(())
+}
+
+/// The typed-word form of [`confirm_on`], with the same re-check.
 pub(crate) fn confirm_typed_on(
     d: &Device,
     yes: bool,
     word: &str,
     action: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Ok(confirm_typed(
-        &mut RealTerm,
-        yes,
-        word,
-        action,
-        &key_label(d),
-    )?)
+    if confirm_typed(&mut RealTerm, yes, word, action, &key_label(d))? {
+        crate::target::reverify(d)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -237,8 +260,9 @@ mod tests {
     #[test]
     fn yes_skips_the_question() {
         let mut t = FakeTerm::new(true, &[]);
-        assert!(confirm(&mut t, true, "x", "k").is_ok());
-        assert!(confirm_typed(&mut t, true, "reset", "x", "k").is_ok());
+        // Ok(false): nothing was asked, so nothing to re-check afterwards.
+        assert_eq!(confirm(&mut t, true, "x", "k"), Ok(false));
+        assert_eq!(confirm_typed(&mut t, true, "reset", "x", "k"), Ok(false));
         assert!(t.asked.is_empty());
     }
 
@@ -253,8 +277,9 @@ mod tests {
             ("yep\n", false),
         ] {
             let mut t = FakeTerm::new(true, &[answer]);
+            // Ok(true): the question was shown and answered yes.
             assert_eq!(
-                confirm(&mut t, false, "wipe PIV", "k").is_ok(),
+                confirm(&mut t, false, "wipe PIV", "k") == Ok(true),
                 ok,
                 "{answer:?}"
             );
@@ -265,7 +290,10 @@ mod tests {
     #[test]
     fn typed_word_must_match_exactly() {
         let mut t = FakeTerm::new(true, &["reset\n"]);
-        assert!(confirm_typed(&mut t, false, "reset", "factory-reset", "k").is_ok());
+        assert_eq!(
+            confirm_typed(&mut t, false, "reset", "factory-reset", "k"),
+            Ok(true)
+        );
         for wrong in ["RESET\n", "y\n", "\n"] {
             let mut t = FakeTerm::new(true, &[wrong]);
             assert!(
