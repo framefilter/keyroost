@@ -96,7 +96,7 @@ This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, 
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset --yes` does **not** require the customer key (it's a plain CLA `0x80` command): it wipes **every one of the 100 profiles** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
+**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset` does **not** require the customer key (it's a plain CLA `0x80` command; it names the token and asks y/N first, or takes `--yes` in a script): it wipes **every one of the 100 profiles** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 
@@ -114,7 +114,9 @@ keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY \
   'otpauth://totp/MoltoTest?secret=JBSWY3DPEHPK3PXPJBSWY3DP&algorithm=SHA1&digits=6&period=30'
 ```
 
-This writes seed + title + config in one authenticated session.
+This writes seed + title + config in one authenticated session. If slot #99
+already holds a seed, keyroost asks y/N before overwriting it (a script adds
+`--yes`).
 
 > **Expected stderr here:** keyroost warns that you're programming a seed under
 > the factory-default customer key, which is public, so anyone who captures the
@@ -206,15 +208,17 @@ the form `<path> <vid>:<pid> usage=f1d0:0001 <model> serial=… [FIDO]`. A
 `serial=…(ccid)` suffix means the serial came from the card interface because
 the key exposes none over USB; `name=…` appears once you've named the key with
 `keyroostctl key-name`. Below the raw sections, `list` prints a correlated
-per-device summary built from the same snapshot. With multiple keys plugged in
-you'll get one line each — every `keyroostctl fido <subcommand>` accepts
-`--path /dev/hidrawN` (or the global `--device <NAME>`) to disambiguate, and
-kernel hidraw numbers **change on each replug**, so enumerate fresh.
+per-device summary built from the same snapshot, numbered. With multiple keys
+plugged in you'll get one numbered line each; pick one with the global
+`--device N` (that number, a serial, or a saved name). Without it, a terminal
+shows a numbered list and a script is refused. `--path /dev/hidrawN` still
+works as an override, but kernel hidraw numbers **change on each replug**, so
+enumerate fresh.
 
 ### Step F2: GetInfo round-trips
 
 ```bash
-keyroostctl fido info --path /dev/hidrawN
+keyroostctl fido info --device N
 ```
 
 **Expected** (sample from a SoloKeys Solo 2, firmware 2.3.196):
@@ -238,7 +242,7 @@ factory-reset before putting the key into real service.
 
 ```bash
 printf 'YOUR_TEST_PIN\n' | keyroostctl fido pin-set \
-    --path /dev/hidrawN --new-pin-stdin
+    --device N --new-pin-stdin
 ```
 
 **Expected:** `PIN set.` Re-run `fido info`: `clientPin` should now be
@@ -249,9 +253,9 @@ the initial set doesn't consume a retry.
 
 ```bash
 printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-metadata \
-    --path /dev/hidrawN --pin-stdin
+    --device N --pin-stdin
 printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
-    --path /dev/hidrawN --pin-stdin
+    --device N --pin-stdin
 ```
 
 **Expected on a fresh key:** `0 resident credential(s) stored, room for N
@@ -272,15 +276,16 @@ ssh-keygen -t ecdsa-sk -O resident -O application=ssh:moltotest \
 
 # Read back — confirm it appears, copy the FULL id= value.
 printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
-    --path /dev/hidrawN --pin-stdin
+    --device N --pin-stdin
 
-# Destructive: delete by full credentialId.
+# Destructive: delete by full credentialId. The PIN is piped, so there is
+# no terminal to ask y/N on: --yes confirms.
 printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-delete \
-    --path /dev/hidrawN --cred-id <full hex from id=> --pin-stdin
+    --device N --cred-id <full hex from id=> --pin-stdin --yes
 
 # Confirm empty.
 printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
-    --path /dev/hidrawN --pin-stdin
+    --device N --pin-stdin
 ```
 
 The `id=` line is the value you copy — the `cred …` summary above it is

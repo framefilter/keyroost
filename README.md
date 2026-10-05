@@ -48,7 +48,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   extracted from largeBlob to a `-cert.pub` file (`fido ssh-cert`).
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock, and a factory reset of the
-  applet (`oath reset --yes`) — the recovery path for a forgotten password. In
+  applet (`oath reset`) — the recovery path for a forgotten password. In
   the GUI, secret fields have a reveal (eye) toggle so you can check an OTP
   secret before committing it.
 - **OpenPGP card (v3.4)** — read status; generate keys on-card in any algorithm
@@ -110,10 +110,11 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   `otp fp-enable`, `otp fp-disable`, `otp fp-list`, and `otp unlock-list`,
   which tries the fingerprint and falls back to the PIN); fingerprint
   enrollment itself is done through the key's FIDO2 fingerprint setup.
-- **One-shot factory reset** — `keyroostctl factory-reset --yes` (and a card on
+- **One-shot factory reset** — `keyroostctl factory-reset` (and a card on
   the GUI device Overview tab) resets every resettable applet on a key in turn:
-  OATH, OpenPGP, PIV, Token2 OTP, then FIDO2. On a USB key the FIDO2 step ends
-  with an unplug/replug and a touch; a card in a smart-card reader is instead
+  OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. In a terminal you confirm by
+  typing `reset`; a script passes `--yes`. On a USB key the FIDO2 step ends
+  with an unplug/replug (detected automatically) and a touch; a card in a smart-card reader is instead
   reset in place (no replug, no touch — the card is power-cycled in the
   reader). Only manufacturer-intended resets are used, and each step reports
   its own outcome rather than being folded into one "done".
@@ -123,9 +124,10 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   target, never a default. The registry lives under `%APPDATA%` on Windows (the
   platform config dir elsewhere), and names are validated with anti-spoofing
   checks while allowing a relaxed, readable character set.
-  On Windows and macOS the OS reports no USB position, so when two keys of the
-  same make could each own the same card reader keyroost shows them separately
-  rather than guessing which reader belongs to which key.
+  On Windows and macOS the OS reports no USB position, so keyroost asks each
+  side of a key for the identity it reports (a YubiKey's serial, a Solo 2's
+  ID, a Token2 key's serial) and joins them into one entry when they match. A
+  key that doesn't answer is shown as two entries rather than guessed at.
 
 ## Supported devices
 
@@ -591,6 +593,31 @@ they apply before the hidraw node is created, and cover the common FIDO vendors
 (Yubico, SoloKeys, Nitrokey, Feitian, Token2, and others). Re-plug the key after
 installing them.
 
+### Shell completions
+
+The Homebrew and AUR packages install `keyroostctl`'s completions (bash, zsh,
+fish) and man pages. Otherwise, set completions up once for your shell:
+
+```bash
+# bash: this session only, or for every session
+source <(keyroostctl completions bash)
+keyroostctl completions bash > ~/.local/share/bash-completion/completions/keyroostctl
+
+# zsh: into a directory on your $fpath
+keyroostctl completions zsh > ~/.zfunc/_keyroostctl
+
+# fish
+keyroostctl completions fish > ~/.config/fish/completions/keyroostctl.fish
+
+# PowerShell: add this line to your $PROFILE
+keyroostctl completions powershell | Out-String | Invoke-Expression
+```
+
+The script asks `keyroostctl` for suggestions as you type, so
+`--device <Tab>` offers the names you saved with `key-name add` (it reads
+only your saved names, never the keys). If you installed a completion file
+from v0.12.0 or earlier, generate it again to get this.
+
 ## Quick start
 
 ```bash
@@ -609,16 +636,16 @@ keyroostctl fido ssh-cert list --pin-stdin     # list SSH certs stored in reside
 keyroostctl fido ssh-cert extract --credential ssh:demo --out demo-cert.pub --pin-stdin
 
 # --- OATH over PC/SC ---
-keyroostctl oath list --reader yubikey
-keyroostctl oath code 'GitHub:me@x.com' --reader yubikey
+keyroostctl oath list
+keyroostctl oath code 'GitHub:me@x.com' --device my-yubikey
 
 # --- OpenPGP card ---
-keyroostctl openpgp status --reader yubikey
-keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey
-keyroostctl openpgp authenticate --in chal.bin --pin-stdin --reader yubikey  # client/SSH auth (Auth key)
+keyroostctl openpgp status --device my-yubikey
+keyroostctl openpgp sign --in msg.txt --pin-stdin --device my-yubikey
+keyroostctl openpgp authenticate --in chal.bin --pin-stdin --device my-yubikey  # client/SSH auth (Auth key)
 
 # --- PIV (read-only status) ---
-keyroostctl piv status --reader yubikey
+keyroostctl piv status --device my-yubikey
 
 # bulk-provision several slots: management key + PIN from env once, loop the rest.
 # (the GUI asks per operation; the CLI is the path for many slots/keys)
@@ -626,10 +653,12 @@ export PIV_MGMT=...   # AES-192 / 3DES management key, hex; never put it in argv
 export PIV_PIN=...
 for slot in 9a 9c 9d 9e; do
   keyroostctl piv generate-key --slot "$slot" --algorithm eccp256 \
-      --mgmt-key-env PIV_MGMT --reader yubikey
+      --mgmt-key-env PIV_MGMT --device my-yubikey
   keyroostctl piv self-sign --slot "$slot" --subject "CN=$USER" \
-      --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --reader yubikey
+      --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --device my-yubikey
 done
+# (in a terminal, a step that would replace a slot in use asks y/N first;
+#  add --yes to overwrite without asking)
 # on a card without GET METADATA (non-Yubico PIV, or Yubico firmware < 5.3)
 # the two steps can't share the key by slot name across invocations; fold
 # them into one so the fresh public key never needs a temp file:
@@ -652,17 +681,19 @@ keyroostctl otp list
 keyroostctl otp add --app GitHub --account me@x.com --seed-stdin   # seed from stdin, never argv
 keyroostctl otp get --app GitHub --account me@x.com
 
-# --- Destructive operations ---
-keyroostctl factory-reset --device my-yubikey --yes   # reset every applet on that key
+# --- Destructive operations (ask y/N, or type "reset", in a terminal) ---
+keyroostctl factory-reset --device my-yubikey          # asks you to type "reset"
+keyroostctl factory-reset --device my-yubikey --yes    # in a script
 
 # name a key to target it when several are plugged in (opt-in)
+keyroostctl key-name add my-yubikey
 keyroostctl key-name list
 
 # machine-readable output for scripts (status and query commands)
-keyroostctl --json piv status --reader yubikey
+keyroostctl --json list                     # one row per key, with its --device value
+keyroostctl --json piv status --device my-yubikey
 
-# shell completions and man pages
-keyroostctl completions bash > /etc/bash_completion.d/keyroostctl
+# man pages (completions: see "Shell completions" above)
 keyroostctl manpage ./man && man -l ./man/keyroostctl-piv.1
 
 # launch the GUI (per-device tabs: Overview, FIDO2, Authenticator, OpenPGP, PIV,
@@ -670,12 +701,30 @@ keyroostctl manpage ./man && man -l ./man/keyroostctl-piv.1
 keyroost
 ```
 
+### Choosing a key
+
+With one key connected, every command uses it. With several, a command run in
+a terminal shows a numbered list to pick from; a script is refused with the
+exact `--device` value for each key. `--device` takes a saved name, a serial,
+or the number `keyroostctl list` shows (prefix `name:`, `serial:` or `list:`
+to say which you mean); `keyroostctl --json list` gives scripts the same
+values. `--reader` and `--path` are expert overrides, used exactly as typed;
+neither can be combined with `--device`.
+
+Commands that erase or replace something keyroost can't restore name the key
+and ask y/N first (`factory-reset` and `otp interface` ask you to type a
+phrase). A script has no terminal to ask on, so it adds `--yes`; so does a
+command whose PIN or seed is piped in on stdin. If you answered a question,
+keyroost checks it is still the same key before acting.
+
 ## Breaking changes & migration
 
 Breaking changes are tracked per release on the site's
 [migration notes](https://framefilter.github.io/keyroost/migration.html)
-page, with the exact before → after for scripts and library consumers. The
-two to know about: **v0.7.5** renames the global device selector from
+page, with the exact before → after for scripts and library consumers.
+**v0.13.0** makes more commands ask before they erase or replace something
+(scripts pass `--yes`) and refuses, in a script, to pick among several keys.
+Two older ones to know about: **v0.7.5** renames the global device selector from
 `--name` to `--device`, and **v0.6.0** moved the Molto2 / FIDO commands under
 the `molto` and `fido` groups.
 

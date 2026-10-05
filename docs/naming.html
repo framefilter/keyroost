@@ -90,6 +90,10 @@
       in a crowded, hard-to-disambiguate set a key may read as not connected rather than being
       confidently mistaken for its neighbour — deliberately, since a wrong match would send
       card operations and FIDO operations to two different physical keys.</p>
+    <p>Windows and macOS don't report that bus address. There, keyroost asks each side of the
+      key for the identity it reports (a YubiKey's serial, a Solo 2's ID, a Token2 key's
+      serial) and joins the two only when they match. These reads change nothing on the key.
+      A key that doesn't answer is shown as two entries rather than guessed at.</p>
     <div class="kr-callout tip">
       <div class="kr-callout-title tip">Naming is opt-in and stays on your computer</div>
       <p>Nothing is written to disk until you explicitly add a name. When you do, keyroost
@@ -114,8 +118,11 @@
     <ul>
       <li><strong><code>add</code></strong> — record a friendly name for a connected key.
         Pass the label as the first argument; keyroost reads the connected key's serial and
-        writes it to <code>keys.json</code>. If several keys are plugged in it asks which one
-        to name (or pass <code>--path</code> to point at a specific device).</li>
+        writes it to <code>keys.json</code>. If several keys are plugged in, a terminal shows
+        a numbered list to pick from; in a script, say which one with <code>--device</code>
+        (a serial or a <code>list</code> number), <code>--reader</code> or
+        <code>--path</code>. Any key that reports a serial can be named; Molto2 tokens can't
+        be named yet.</li>
       <li><strong><code>list</code></strong> — show every configured name, its serial, and
         whether that key is currently connected.</li>
       <li><strong><code>remove</code></strong> — delete a configured name by its label.</li>
@@ -125,7 +132,10 @@ keyroostctl key-name list
 keyroostctl key-name remove signing-yubikey</code></pre>
     <p>Once a key is named, commands that target a single key accept
       <code>--device signing-yubikey</code> to pick it out, instead of a device path that
-      changes between plugs.</p>
+      changes between plugs. <code>--device</code> also takes a serial or the number
+      <code>keyroostctl list</code> shows; prefix <code>name:</code>, <code>serial:</code> or
+      <code>list:</code> to say which you mean. With the shell completions installed,
+      pressing Tab after <code>--device</code> offers your saved names.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Label rules</div>
       <p>A label is 1–64 characters and otherwise free-form: letters of any case or script,

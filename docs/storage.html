@@ -96,14 +96,15 @@
       clear.</p>
     <p><strong>Edit a note.</strong> keyroost's own notes have an <em>Edit</em> button that
       replaces the text in place. Relying-party entries cannot be edited.</p>
-    <p><strong>Delete an entry.</strong> Any entry can be deleted, and every delete needs an
-      explicit <code>--yes</code> on the CLI (the desktop app asks you to confirm). Deleting an
-      entry a relying party owns may break the service that stored it, so that case is refused
-      with a stronger message and, once you pass <code>--yes</code>, warns before it proceeds.
+    <p><strong>Delete an entry.</strong> Any entry can be deleted, and every delete is confirmed:
+      the CLI asks <strong>y/N</strong> in a terminal and needs <code>--yes</code> in a script or
+      when the PIN is piped in (the desktop app asks you to confirm). Deleting an entry a
+      relying party owns may break the service that stored it, so keyroost prints a warning
+      before it asks or proceeds.
       keyroost then rewrites the array without the entry.</p>
     <p><strong>Erase everything.</strong> A separate wipe-all action clears the entire array —
       relying-party data included, not just keyroost notes. It is irreversible, needs your PIN,
-      and is double-confirmed in the app (<code>--yes</code> on the CLI).</p>
+      and is double-confirmed in the app (y/N or <code>--yes</code> on the CLI).</p>
   </section>
 
   <section class="kr-section">
@@ -127,7 +128,7 @@ keyroostctl fido large-blob add "spare key in the desk drawer" --pin-stdin
 keyroostctl fido large-blob edit 2 "moved to the safe" --pin-stdin
 keyroostctl fido large-blob export 1 entry.bin              # raw bytes, no PIN
 keyroostctl fido large-blob export 1 id_ecdsa_sk-cert.pub --as-cert
-keyroostctl fido large-blob delete 1 --pin-stdin --yes      # --yes is required for every delete; RP-owned entries also print a warning
+keyroostctl fido large-blob delete 1 --pin-stdin --yes      # piped PIN, so --yes; RP-owned entries also print a warning
 keyroostctl fido large-blob clear --pin-stdin --yes         # wipes the whole array</code></pre>
     <p class="kr-muted">Reading (<code>list</code>, <code>get</code>, <code>export</code>) needs
       no PIN — the array is world-readable. Note that <code>add</code> and <code>edit</code>
@@ -150,7 +151,7 @@ keyroostctl fido large-blob clear --pin-stdin --yes         # wipes the whole ar
 keyroostctl fido ssh-cert extract --credential ssh:demo --out id_ecdsa_sk-cert.pub --pin-stdin</code></pre>
     <p><code>--credential</code> is needed only to disambiguate when the key holds several SSH
       credentials, and <code>--out</code> defaults to a sanitised
-      <code>&lt;rp-id&gt;-cert.pub</code>; pass <code>--force</code> to overwrite an existing
+      <code>&lt;rp-id&gt;-cert.pub</code>; pass <code>--overwrite</code> to replace an existing
       file. In the desktop app the same thing is <strong>Save certificate…</strong> on the
       <strong>Passkeys</strong> tab, next to the SSH credential it belongs to.</p>
   </section>

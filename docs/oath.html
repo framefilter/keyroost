@@ -93,7 +93,7 @@
       <div class="kr-callout-title note">Optional applet password</div>
       <p>The OATH applet can be protected by a password that must be presented before codes
         can be listed or computed — a useful extra gate if the key is shared or lost. Forget
-        it and the only way back is <code>keyroostctl oath reset --yes</code>, which needs no
+        it and the only way back is <code>keyroostctl oath reset</code>, which needs no
         password but wipes every stored seed with it.
         <a href="reset.html">See resetting →</a></p>
     </div>
@@ -107,15 +107,18 @@
         <strong>delete</strong> them, <strong>compute codes</strong>, and set / clear /
         unlock the applet password — all with an in-tree, pure-Rust OATH byte layer.</p>
     </div>
-<pre><code>keyroostctl oath list --reader yubikey
-keyroostctl oath code &lt;name&gt; --reader yubikey</code></pre>
+<pre><code>keyroostctl oath list
+keyroostctl oath code &lt;name&gt; --device my-yubikey
+keyroostctl oath delete &lt;name&gt;      # asks y/N first; a script adds --yes</code></pre>
     <p class="kr-muted">In the desktop app, credentials can be added from an
       <code>otpauth://</code> URI (the same format behind setup QR codes); on the CLI the
       secret is supplied to <code>oath add</code> via <code>--secret-stdin</code> /
       <code>--secret-env</code>. This works on any card exposing the OATH applet —
       YubiKey, Nitrokey, SoloKeys, Feitian, Token2 (experimental) and others — over USB or an
-      NFC / PC-SC reader; <code>--reader yubikey</code> above is just an example reader-name
-      filter, not a vendor requirement.</p>
+      NFC / PC-SC reader. With one key connected keyroost uses it; with several, a terminal
+      shows a numbered list and a script names one with <code>--device</code> (a saved name,
+      a serial, or the number <code>keyroostctl list</code> shows). Deleting a credential
+      and <code>oath reset</code> ask <strong>y/N</strong> first, naming the key.</p>
   </section>
 
   <section class="kr-section kr-res-section">

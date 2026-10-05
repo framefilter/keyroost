@@ -164,7 +164,12 @@ keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
       (a Yubico extension: YubiKey firmware 5.7 or newer, or another card that implements
       it; where it isn't available, overwrite the slot with a fresh
       <code>generate-key</code> instead). Both need
-      the management key and are destructive, so they require an explicit <code>--yes</code>.</p>
+      the management key and are destructive, so they name the key and ask <strong>y/N</strong>
+      first. A script has no terminal to ask on and adds <code>--yes</code>; so does a command
+      whose management key is piped in with <code>--mgmt-key-stdin</code>.
+      <code>generate-key</code>, <code>import-cert</code>, <code>self-sign</code> and
+      <code>--generate-key</code> ask the same way when the slot already holds a key or
+      certificate, and <code>set-retries</code> always asks.</p>
 <pre><code>keyroostctl piv delete-cert --slot 9a --mgmt-key-stdin --yes
 keyroostctl piv delete-key  --slot 9a --mgmt-key-stdin --yes   # Yubico extension</code></pre>
     <span id="move-key"></span>
@@ -286,9 +291,9 @@ export PIV_PIN=123456
 
 for slot in 9a 9c 9d 9e; do
   keyroostctl piv generate-key --slot "$slot" --algorithm eccp256 \
-      --mgmt-key-env PIV_MGMT --reader yubikey
+      --mgmt-key-env PIV_MGMT --device my-yubikey
   keyroostctl piv self-sign --slot "$slot" --subject "CN=$USER" --days 365 \
-      --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --reader yubikey
+      --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --device my-yubikey
 done
 
 unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
@@ -298,12 +303,14 @@ unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
       — the CSR signature itself needs only the PIN; the management key is for the
       key-generation step:</p>
 <pre><code>  keyroostctl piv request-cert --slot "$slot" --subject "CN=$USER" \
-      --pin-env PIV_PIN --file "slot-$slot.csr" --reader yubikey</code></pre>
+      --pin-env PIV_PIN --file "slot-$slot.csr" --device my-yubikey</code></pre>
     <p>Import each issued certificate later with
       <code>import-cert --slot "$slot" --file … --mgmt-key-env PIV_MGMT</code>.
-      Use <code>--reader &lt;substr&gt;</code>
-      (or <code>--device</code> with a <a href="naming.html">friendly name</a>) to pin the loop
-      to one device when several are plugged in.</p>
+      <code>--device</code> keeps the loop on one key when several are plugged in: it takes a
+      <a href="naming.html">friendly name</a>, a serial, or the number
+      <code>keyroostctl list</code> shows (<code>--reader &lt;substr&gt;</code> works too).
+      Run in a terminal, each step that would replace a slot in use asks first; add
+      <code>--yes</code> to let the loop overwrite without asking.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">One slot? The GUI is fine.</div>
       <p>None of this replaces the desktop app — provisioning a slot or two there is

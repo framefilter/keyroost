@@ -152,7 +152,15 @@
       the gate and clears the session for all of them.</p>
 <pre><code>keyroostctl fido info
 keyroostctl fido pin-retries
-keyroostctl fido creds-list --pin-stdin   # PIN read from stdin, never argv</code></pre>
+keyroostctl fido creds-list --pin-stdin   # PIN read from stdin, never argv
+keyroostctl fido creds-delete --cred-id &lt;hex&gt; --pin-env KR_PIN   # asks y/N first
+keyroostctl fido reset                    # asks y/N, then waits for a replug and a touch</code></pre>
+    <p>Deleting a credential or fingerprint and resetting name the key and ask
+      <strong>y/N</strong> first. A script has no terminal to ask on, so it adds
+      <code>--yes</code>; so does a command whose PIN is piped in with
+      <code>--pin-stdin</code>. <code>fido reset</code> on a USB key then asks you to unplug
+      it and plug it back in within 60 seconds (keyroost notices the replug itself), checks
+      it is the same key, and asks for a touch.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">On Windows</div>
       <p>Windows reserves direct FIDO access for elevated processes, so managing a key needs

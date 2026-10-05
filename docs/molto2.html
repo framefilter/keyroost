@@ -128,6 +128,13 @@
         factory-reset — over a pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC)
         with no external crypto dependencies.</p>
     </div>
+    <p>On the command line, writing to a slot that already holds a seed, deleting a seed
+      and <code>molto reset</code> name the token and ask <strong>y/N</strong> first. A
+      script, or a command whose seed is piped in, adds <code>--yes</code>. With several
+      Molto2 tokens connected, a terminal shows a numbered list to pick from and a script
+      names one with <code>--device</code> (the number <code>keyroostctl list</code> shows)
+      or <code>--reader</code>; keyroost never uses the first one it finds. Molto2 tokens
+      can't be given a friendly name yet.</p>
   </section>
 
   <section class="kr-section" id="single-profile">
@@ -160,8 +167,11 @@
         <code>keyroostctl prog seed</code> (seed from stdin or an environment variable —
         <code>--base32-stdin</code> / <code>--base32-env</code>, so it stays out of
         <code>ps</code> and shell history), and
-        <code>keyroostctl prog config</code> (algorithm, time-step, display timeout). The GUI
-        offers the same on a dedicated programmable-token pane.</p>
+        <code>keyroostctl prog config</code> (algorithm, time-step, display timeout).
+        <code>seed</code> and <code>config</code> ask <strong>y/N</strong> before overwriting
+        (a script adds <code>--yes</code>), and only programmable tokens are considered when
+        keyroost picks the token. The GUI offers the same on a dedicated programmable-token
+        pane.</p>
     </div>
   </section>
 

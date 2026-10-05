@@ -70,7 +70,9 @@
       <p>Some of these are <strong>one-way</strong>: a higher minimum PIN length can't be
         lowered again, and enterprise attestation can't be turned off, without a full reset
         of the key. keyroost confirms before applying those: the app asks you to type a
-        confirmation, and the command line refuses them unless you add <code>--yes</code>.</p>
+        confirmation, and the command line asks <strong>y/N</strong>, naming the key. A script, or
+        a command whose PIN is piped in with <code>--pin-stdin</code>, adds <code>--yes</code>
+        instead.</p>
     </div>
   </section>
 
@@ -114,10 +116,11 @@ keyroostctl fido set-min-pin --length 8 --force-change --yes --pin-env KR_PIN
 keyroostctl fido force-pin-change                            --pin-env KR_PIN
 keyroostctl fido enterprise-attestation --yes                --pin-env KR_PIN</code></pre>
     <p class="kr-muted">Each command takes the PIN via <code>--pin-env</code> (an environment
-      variable name), <code>--pin-stdin</code>, and an optional <code>--path</code> to select a
-      specific key. The two one-way commands, <code>set-min-pin</code> and
-      <code>enterprise-attestation</code>, also need <code>--yes</code>; without it they refuse
-      and change nothing.</p>
+      variable name), <code>--pin-stdin</code>; with several keys connected, pick one with
+      <code>--device</code> (or <code>--path</code>). The two one-way commands,
+      <code>set-min-pin</code> and <code>enterprise-attestation</code>, ask first in a
+      terminal; in a script they need <code>--yes</code>, and without it they refuse and
+      change nothing.</p>
   </section>
 
   <section class="kr-section">

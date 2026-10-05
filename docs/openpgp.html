@@ -116,11 +116,14 @@
         PKCS#1 for RSA, <code>r||s</code> (not DER) for ECDSA, <code>R||S</code> for
         Ed25519.</p>
     </div>
-<pre><code>keyroostctl openpgp status --reader yubikey
-keyroostctl openpgp generate-key --slot sign --algorithm ed25519 --yes --admin-pin-stdin --reader yubikey
-keyroostctl openpgp sign --in msg.txt --pin-stdin --reader yubikey
-keyroostctl openpgp authenticate --in chal.bin --pin-stdin --reader yubikey
-keyroostctl openpgp change-pin --old-pin-stdin --new-pin-stdin --reader yubikey</code></pre>
+<pre><code>keyroostctl openpgp status --device my-yubikey
+keyroostctl openpgp generate-key --slot sign --algorithm ed25519 --yes --admin-pin-stdin --device my-yubikey
+keyroostctl openpgp sign --in msg.txt --pin-stdin --device my-yubikey
+keyroostctl openpgp authenticate --in chal.bin --pin-stdin --device my-yubikey
+keyroostctl openpgp change-pin --old-pin-stdin --new-pin-stdin --device my-yubikey</code></pre>
+    <p class="kr-muted"><code>generate-key</code>, <code>import-key</code> and
+      <code>reset</code> name the key and ask <strong>y/N</strong> in a terminal; with the admin
+      PIN piped in, as above, or in a script, add <code>--yes</code>.</p>
     <p class="kr-muted">The card byte layer is a pure-Rust, in-tree implementation of the
       OpenPGP Card spec (APDU + BER-TLV); RSA keygen/parsing is the one scoped host-side
       dependency. Host-side import of ECC keys and local signature verification are not
