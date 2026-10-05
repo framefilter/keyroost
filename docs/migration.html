@@ -60,6 +60,133 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-13-0">
+    <h2>v0.13.0</h2>
+    <p>Every command now finds its key the same way, and more commands ask
+      before they erase or replace something. In a terminal you answer a
+      y/N question; a script must pass <code>--yes</code>. With several keys
+      connected and no selector, a script is refused instead of acting on
+      the first key found: pick one with <code>--device</code> (the refusal
+      lists the exact values, and <code>list --json</code> gives them too).
+      Library consumers: <code>keyroost-resolve</code> drops its HID-only
+      name resolver for the shared device model.</p>
+    <h3>CLI</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td>These ran without asking: <code>oath delete</code>,
+          <code>otp delete</code>, <code>otp button-hotp</code> (with a seed
+          already set), <code>otp delete-button-hotp</code>,
+          <code>fido creds-delete</code>, <code>fido fingerprint-delete</code>,
+          <code>molto seed</code> / <code>import</code> /
+          <code>import-file</code> (on used slots), <code>prog seed</code>,
+          <code>prog config</code>, <code>piv set-retries</code>, and
+          <code>piv generate-key</code> / <code>import-cert</code> /
+          <code>self-sign</code> / <code>--generate-key</code> on
+          <code>self-sign</code> and <code>request-cert</code> (on a slot in
+          use)</td>
+        <td>A y/N question in a terminal. A script must add
+          <code>--yes</code>, or the command refuses and changes
+          nothing.</td></tr>
+      <tr><td>Commands that already took <code>--yes</code> refused without
+          it, even in a terminal</td>
+        <td>In a terminal they ask y/N instead. Scripts still need
+          <code>--yes</code>.</td></tr>
+      <tr><td><code>factory-reset</code> needed <code>--yes</code></td>
+        <td>In a terminal, type <code>reset</code> to confirm.
+          <code>--yes</code> skips the question; scripts still need it.</td></tr>
+      <tr><td><code>factory-reset</code> printed <code>N wiped, K
+          failed</code>, counted a skipped step as wiped, and exited 0</td>
+        <td>Prints <code>N wiped, M skipped, K failed</code> and exits with
+          an error if any step was skipped or failed (the key was not fully
+          reset).</td></tr>
+      <tr><td><code>factory-reset</code>'s FIDO2 step waited for Enter
+          after the replug; <code>fido reset</code> sent the reset at
+          once</td>
+        <td>Both wait (up to 60 seconds) for you to unplug and replug the
+          USB key, check it is the same key, then ask for a touch. No
+          replug: nothing is wiped. A card in a reader is still reset in
+          place.</td></tr>
+      <tr><td><code>otp interface</code> read its confirmation phrase from
+          stdin</td>
+        <td>The phrase is read from the terminal only. A script passes
+          <code>--yes</code>.</td></tr>
+      <tr><td>With several keys and no selector, <code>molto</code> (except
+          <code>molto reset</code>) and <code>otp</code> used the first key
+          found; <code>fido</code> and
+          <code>key-name add</code> showed a picker (not on Windows)</td>
+        <td>Every command: a numbered picker in a terminal (on every
+          platform), a refusal in a script that lists each key's
+          <code>--device</code> value. A lone key is still used
+          automatically.</td></tr>
+      <tr><td><code>prog</code> ignored <code>--device</code> and used
+          whichever reader was alone</td>
+        <td>Only programmable tokens qualify, and <code>--device</code> /
+          <code>--reader</code> are honoured.</td></tr>
+      <tr><td><code>--reader</code> with <code>--device</code> was refused
+          only by the reset commands</td>
+        <td>Refused by every command (they may name different
+          keys).</td></tr>
+      <tr><td><code>--device</code> took a friendly name</td>
+        <td>A name, a serial or a <code>list</code> number. Prefix
+          <code>name:</code>, <code>serial:</code> or <code>list:</code> to
+          force which. A value that matches several keys is refused.</td></tr>
+      <tr><td><code>--device</code> was ignored by commands that touch no
+          key</td>
+        <td>Refused on <code>doctor</code>, <code>key-name list</code>,
+          <code>key-name remove</code>, <code>completions</code>,
+          <code>manpage</code>, <code>molto import-file --dry-run</code> and
+          <code>--list-readers</code>. Remove it.</td></tr>
+      <tr><td><code>fido ssh-cert extract --force</code></td>
+        <td><code>fido ssh-cert extract --overwrite</code>. The old flag is
+          gone.</td></tr>
+      <tr><td><code>completions &lt;shell&gt;</code> printed a full static
+          script</td>
+        <td>Prints a short script that calls back into
+          <code>keyroostctl</code> (through the
+          <code>KEYROOSTCTL_COMPLETE</code> variable), so
+          <code>--device</code> completes saved names. Regenerate an installed
+          completion file to get this.</td></tr>
+      <tr><td><code>list</code> had no numbers and no JSON</td>
+        <td>Each key has a stable number (usable as <code>--device
+          N</code>). <code>list --json</code> prints one row per key with
+          the exact <code>--device</code> value; <code>list --device
+          X</code> shows just that key.</td></tr>
+    </table>
+    </div>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td><code>connected_keys</code> and <code>read_effective_serial</code>
+          are removed. Use <code>enumerate()</code> and pick a row with
+          <code>select::resolve_target</code>; a row's <code>serial</code>
+          replaces the effective serial.</td></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td>New: <code>correlate_with</code>, <code>correlate_live</code>,
+          <code>enumerate_with</code>, <code>MatchOptions</code>,
+          <code>EnumerateOptions</code> and <code>MatchStep</code>; the
+          <code>identity</code> module (<code>IdentityReader</code>,
+          <code>read_identities</code>, <code>plan_identity_reads</code>) and
+          the <code>select</code> module (<code>resolve_target</code>,
+          <code>Need</code>, <code>Selector</code>, <code>Picker</code>,
+          <code>SelectError</code>, <code>list_order</code>,
+          <code>device_value</code>). <code>enumerate()</code> now also reads
+          each side's identity where USB position can't match a key
+          (read-only; <code>enumerate_with</code> with
+          <code>skip_identity_reads</code> turns it off).
+          <code>correlate()</code> keeps its signature. New dependency on
+          <code>keyroost-token2otp</code>.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td>New <code>identity</code> module (read-only identity reads:
+          <code>ctaphid_vendor_read</code>, <code>ccid_applet_read</code>,
+          <code>token2_serial_reply_hid</code>) and
+          <code>PivSession::metadata_status</code>.</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-12-0">
     <h2>v0.12.0</h2>
     <p>PIV gained applet fingerprinting, per-key feature support and certificate
