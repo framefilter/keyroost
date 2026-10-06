@@ -45,7 +45,7 @@ tool. Workspace contains:
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots + Google Authenticator migration batches (always built; the GUI's separate `qr` feature gates *screen capture*, not this) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-screengrab` | Windows-only GDI screen capture for QR-from-screen; the sole `unsafe` FFI crate; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-winwebauthn` | Windows-only non-admin FIDO2 helper: detect a FIDO key, open Windows' security-key settings, relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
-| `keyroostctl` | CLI binary | `clap` (+ `clap_complete`/`clap_mangen`), `serde`/`serde_json`, `zeroize` |
+| `keyroostctl` | CLI binary | `clap` (+ `clap_complete`/`clap_mangen`), `serde`/`serde_json`, `zeroize`, `rpassword` (=7.5.4, hidden PIN/password prompt; pulls `rtoolbox`, `libc`/`windows-sys` per platform) |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `serde`/`serde_json`, `zeroize`, `base64`, plus platform UI deps (`arboard`, `rfd`, `pollster`, `png`; Linux `ashpd`/`x11rb` behind the `qr` feature); `winresource` as a Windows-only **build**-dependency (embeds the icon + version info into `keyroost.exe`; never linked into any binary, never compiled off Windows) |
 
 ## Where to start reading
@@ -110,7 +110,8 @@ workflow during bring-up is:
 - **Vendor over depend.** SM4, SHA-1, base32, hex, CBOR, TLV, and otpauth
   parsing are all in-tree. External deps are limited to a small, deliberate set
   of scoped exceptions — the transport/UI boundary (`pcsc`, `clap`,
-  `eframe`/`egui` + platform UI crates, `serde`), FFI-only crates
+  `eframe`/`egui` + platform UI crates, `serde`, `rpassword` for the hidden
+  terminal prompt), FFI-only crates
   (`hidapi` off-Linux, `windows-sys` on Windows), and vetted RustCrypto/`rsa`/
   `scrypt`/`aes-gcm`/`zeroize`/`getrandom` where hand-rolling the primitive
   would be irresponsible (see the per-crate deps in the table above). No new

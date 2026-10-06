@@ -46,6 +46,10 @@ clap_mangen = "0.3"
 # Already in the workspace tree (via rsa and p256); wraps PINs/seeds read from
 # env/stdin so they're scrubbed from memory on drop.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# Hidden (no-echo) terminal prompt for PINs, passwords and keys, like sudo/ssh.
+# Approved scoped exception, pinned exactly; pulls `rtoolbox`, plus `libc`
+# on Unix and `windows-sys` on Windows (both already in the tree).
+rpassword = "=7.5.4"
 # Structured output for the global `--json` flag (status/query commands).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
