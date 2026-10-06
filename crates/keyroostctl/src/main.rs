@@ -26,6 +26,7 @@ use keyroost_resolve::{ccid_readers_if_needed, ccid_serials_for, Need};
 
 mod overview;
 mod prompt;
+mod secrets;
 mod target;
 
 /// The global `--device` selector, captured once in `run()` so the FIDO device
