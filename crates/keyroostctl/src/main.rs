@@ -7791,6 +7791,22 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let mut sec = Secrets::real();
             let src = Source::new(admin_pin_env.as_deref(), *admin_pin_stdin);
             sec.check(&PGP_ADMIN_PIN, src)?;
+
+            // Obtain the RSA-2048 key parts (full CRT set, big-endian) either by
+            // host keygen or by loading a key file. Both go through the shared
+            // `keyroost-rsakey` crate (which owns the scoped `rsa` dep); the card
+            // decides which parts it wants. A key file is loaded and checked
+            // first, so a wrong path or key type fails before the question and
+            // the admin PIN; keygen waits until the question is answered.
+            let loaded = if *generate {
+                None
+            } else {
+                let path = in_file
+                    .as_deref()
+                    .ok_or("provide --generate or --in <FILE>")?;
+                println!("Loading RSA key from {}…", path.display());
+                Some(keyroost_rsakey::load_from_file(path)?)
+            };
             let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
@@ -7798,20 +7814,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 &format!("overwrite the OpenPGP {} key", slot.label()),
             )?;
             let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
-
-            // Obtain the RSA-2048 key parts (full CRT set, big-endian) either by
-            // host keygen or by loading a key file. Both go through the shared
-            // `keyroost-rsakey` crate (which owns the scoped `rsa` dep); the card
-            // decides which parts it wants.
-            let k = if *generate {
-                println!("Generating an RSA-2048 key on the host…");
-                keyroost_rsakey::generate_2048()?
-            } else {
-                let path = in_file
-                    .as_deref()
-                    .ok_or("provide --generate or --in <FILE>")?;
-                println!("Loading RSA key from {}…", path.display());
-                keyroost_rsakey::load_from_file(path)?
+            let k = match loaded {
+                Some(k) => k,
+                None => {
+                    println!("Generating an RSA-2048 key on the host…");
+                    keyroost_rsakey::generate_2048()?
+                }
             };
 
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;

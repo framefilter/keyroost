@@ -184,3 +184,39 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `openpgp import-key --in` loads and checks the key file before any key
+/// is looked at, so a wrong path or a file that isn't an RSA-2048 key fails
+/// before the question and the admin PIN.
+#[test]
+fn import_key_checks_the_key_file_before_selecting_a_key() {
+    let dir = std::env::temp_dir().join(format!("keyroost-import-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let junk = dir.join("not-a-key.bin");
+    std::fs::write(&junk, b"this is not a key\n").unwrap();
+    let missing = dir.join("missing.bin");
+    for (path, want) in [
+        (&missing, "cannot read key file"),
+        (&junk, "could not parse RSA private key"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+            .args(["openpgp", "import-key", "--yes", "--admin-pin-env"])
+            .arg("KR_TEST_ADMIN_PIN")
+            .arg("--in")
+            .arg(path)
+            .env("KR_TEST_ADMIN_PIN", "12345678")
+            .stdin(Stdio::null())
+            .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{path:?}: {err}");
+        assert!(err.contains(want), "{path:?}: {err}");
+        assert!(
+            !err.contains('\u{2192}'),
+            "{path:?}: a key was selected before the file was checked: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
