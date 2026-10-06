@@ -210,6 +210,24 @@ pub(crate) fn confirm_on_held(
     Ok(())
 }
 
+/// The typed-word form of [`confirm_then_read`]: ask only, returning whether
+/// the question was shown; the caller reads its secret, then calls
+/// [`reverify_if_asked`].
+pub(crate) fn confirm_typed_then_read(
+    d: &Device,
+    yes: bool,
+    word: &str,
+    action: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(confirm_typed(
+        &mut RealTerm,
+        yes,
+        word,
+        action,
+        &key_label(d),
+    )?)
+}
+
 /// The typed-word form of [`confirm_on`], with the same re-check.
 pub(crate) fn confirm_typed_on(
     d: &Device,
@@ -217,7 +235,7 @@ pub(crate) fn confirm_typed_on(
     word: &str,
     action: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let asked = confirm_typed(&mut RealTerm, yes, word, action, &key_label(d))?;
+    let asked = confirm_typed_then_read(d, yes, word, action)?;
     reverify_if_asked(d, asked)
 }
 

@@ -5343,7 +5343,21 @@ fn run_factory_reset(
         .map(|s| s.label())
         .collect::<Vec<_>>()
         .join(", ");
-    crate::prompt::confirm_typed_on(&dev, yes, "reset", &factory_reset_action(&labels))?;
+    let asked =
+        crate::prompt::confirm_typed_then_read(&dev, yes, "reset", &factory_reset_action(&labels))?;
+    // The PIV credential, if one was given, is read now — after the question
+    // and before any card session; only the probe below can say whether it
+    // is needed.
+    let mut sec = Secrets::real();
+    let reset_input = read_reset_auth_input(
+        &mut sec,
+        mgmt_key_env,
+        mgmt_key_stdin,
+        mgmt_key_default,
+        pin_env,
+        pin_stdin,
+    )?;
+    crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
 
     // Fingerprint PIV before running anything destructive — mirrors the GUI's
     // `App::start_factory_reset_confirm`, just synchronous (the CLI has no
@@ -5397,11 +5411,7 @@ fn run_factory_reset(
                         // discover it partway through the plan.
                         let pin_gate = s.pin_management_auth_gate();
                         Some(resolve_reset_cli_auth(
-                            mgmt_key_env,
-                            mgmt_key_stdin,
-                            mgmt_key_default,
-                            pin_env,
-                            pin_stdin,
+                            reset_input.as_ref(),
                             pin_gate,
                             Some(s),
                         ))
@@ -6127,31 +6137,72 @@ fn piv_factory_reset_failure(err: &str) -> String {
     )
 }
 
-/// How `--mgmt-key-env`/`--mgmt-key-stdin`/`--mgmt-key-default`/`--pin-env`/
-/// `--pin-stdin` resolved: the management key or a PIN for whichever RESET
-/// mechanism actually consumes it — `PivSession::factory_reset` (today,
-/// always HID Crescendo's ACA instance when it runs the device-wide step)
-/// for `factory-reset`'s PIV step, or a plain
+/// The credential a RESET resolved to: the management key or a PIN for
+/// whichever RESET mechanism actually consumes it — `PivSession::
+/// factory_reset` (today, always HID Crescendo's ACA instance when it runs
+/// the device-wide step) for `factory-reset`'s PIV step, or a plain
 /// `PivSession::authenticate_management_current` + `PivSession::reset` for
-/// `piv reset`'s own credential prompt — see `resolve_reset_cli_auth`'s doc.
-/// Mirrors the GUI's `GlobalResetAuth` — same two-way shape, same eventual
-/// conversion into `keyroost_transport::CurrentMgmtAuth`.
+/// `piv reset` — see `resolve_reset_cli_auth`'s doc. Mirrors the GUI's
+/// `GlobalResetAuth` — same two-way shape, same eventual conversion into
+/// `keyroost_transport::CurrentMgmtAuth`.
 enum ResetCliAuth {
     Key(zeroize::Zeroizing<Vec<u8>>),
     Pin(zeroize::Zeroizing<String>),
 }
 
-/// Resolve [`ResetCliAuth`] from a RESET command's five `--mgmt-key-*`/
+/// A RESET credential as given on the command line, read before any card
+/// session: a management key (hex), `--mgmt-key-default` (resolved inside the
+/// session, from the applet's fingerprint), or a PIN.
+enum ResetAuthInput {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Default,
+    Pin(zeroize::Zeroizing<String>),
+}
+
+const RESET_MGMT_KEY: Spec = Spec::current("PIV management key", "mgmt-key").hex();
+const RESET_PIN: Spec = Spec::current("PIV PIN", "pin");
+
+/// Read a RESET command's optional credential from its five `--mgmt-key-*`/
 /// `--pin-*` flags, already mutually exclusive by construction (each
-/// `conflicts_with_all`s the other four) — shared by `factory-reset`'s PIV
-/// step and `piv reset`, the two commands that can hit `PivQuirk::
-/// ResetNeedsManagementAuth`'s precondition. `--mgmt-key-default` is the CLI
-/// equivalent of the GUI's "Use default XAUTH key" convenience: unlike the
-/// typed/piped forms, it never touches argv or stdin and instead reaches for
-/// keyroost's own per-fingerprint quirks-table default
-/// (`PivSession::default_management_key`) — a deliberate CLI-side opt-in, so
-/// a scripted `--yes` run only reaches for a well-known key when the caller
-/// explicitly asked it to via this flag, not silently.
+/// `conflicts_with_all`s the other four) — shared by `factory-reset` and
+/// `piv reset`, the two commands that can hit `PivQuirk::
+/// ResetNeedsManagementAuth`'s precondition. Only the flag given is read;
+/// with none, nothing is — never a prompt: whether a credential is needed at
+/// all, and of which kind, is only known once the card is open, and nothing
+/// may be read while it is. `--mgmt-key-stdin`/`--pin-stdin` typed at a
+/// terminal read hidden ([`Secrets::prompted`]).
+///
+/// `--mgmt-key-default` is the CLI equivalent of the GUI's "Use default XAUTH
+/// key" convenience: it reads nothing and instead reaches for keyroost's own
+/// per-fingerprint quirks-table default (`PivSession::default_management_key`)
+/// — a deliberate opt-in, so a scripted `--yes` run only reaches for a
+/// well-known key when the caller explicitly asked for it.
+fn read_reset_auth_input<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    mgmt_key_env: Option<&str>,
+    mgmt_key_stdin: bool,
+    mgmt_key_default: bool,
+    pin_env: Option<&str>,
+    pin_stdin: bool,
+) -> Result<Option<ResetAuthInput>, Box<dyn std::error::Error>> {
+    if mgmt_key_default {
+        return Ok(Some(ResetAuthInput::Default));
+    }
+    let key_src = Source::new(mgmt_key_env, mgmt_key_stdin);
+    if key_src.given() {
+        return Ok(Some(ResetAuthInput::Key(read_mgmt_key_hex(
+            sec,
+            &RESET_MGMT_KEY,
+            key_src,
+        )?)));
+    }
+    Ok(sec
+        .read_given(&RESET_PIN, Source::new(pin_env, pin_stdin))?
+        .map(ResetAuthInput::Pin))
+}
+
+/// Resolve [`ResetCliAuth`] from what [`read_reset_auth_input`] read, once
+/// the open session has said a credential is needed.
 ///
 /// `pin_gate` is `PivSession::pin_management_auth_gate`'s live verdict for
 /// the device being reset, consulted only for the error below: the abort
@@ -6165,44 +6216,30 @@ enum ResetCliAuth {
 /// ignores it. Both real call sites already have one open (fingerprinting
 /// the device is how `PivQuirk::ResetNeedsManagementAuth` gets checked in
 /// the first place) and pass `Some`; it's `Option` rather than a required
-/// reference purely so the credential-resolution unit tests below, which
-/// exercise `mgmt_key_default: false` and have no reader to open a real
-/// session against, can pass `None`.
+/// reference purely so the unit tests below, which have no reader to open a
+/// real session against, can pass `None`.
 fn resolve_reset_cli_auth(
-    mgmt_key_env: Option<&str>,
-    mgmt_key_stdin: bool,
-    mgmt_key_default: bool,
-    pin_env: Option<&str>,
-    pin_stdin: bool,
+    input: Option<&ResetAuthInput>,
     pin_gate: keyroost_piv::compat::FeatureGate,
     session: Option<&mut keyroost_transport::PivSession<'_>>,
 ) -> Result<ResetCliAuth, Box<dyn std::error::Error>> {
-    if mgmt_key_default {
-        let session = session.expect(
-            "--mgmt-key-default always runs with an already-open PivSession at both call sites",
-        );
-        return session
-            .default_management_key()
-            .map(|key| ResetCliAuth::Key(zeroize::Zeroizing::new(key.to_vec())))
-            .ok_or_else(|| {
-                "--mgmt-key-default: keyroost has no known factory-default management key \
-                 on record for this device; pass --mgmt-key-env/--mgmt-key-stdin instead"
-                    .into()
-            });
-    }
-    if mgmt_key_env.is_some() || mgmt_key_stdin {
-        return Ok(ResetCliAuth::Key(read_mgmt_key(
-            "reset management key",
-            mgmt_key_env,
-            mgmt_key_stdin,
-        )?));
-    }
-    if pin_env.is_some() || pin_stdin {
-        return Ok(ResetCliAuth::Pin(read_secret(
-            "reset PIN",
-            pin_env,
-            pin_stdin,
-        )?));
+    match input {
+        Some(ResetAuthInput::Default) => {
+            let session = session.expect(
+                "--mgmt-key-default always runs with an already-open PivSession at both call sites",
+            );
+            return session
+                .default_management_key()
+                .map(|key| ResetCliAuth::Key(zeroize::Zeroizing::new(key.to_vec())))
+                .ok_or_else(|| {
+                    "--mgmt-key-default: keyroost has no known factory-default management key \
+                     on record for this device; pass --mgmt-key-env/--mgmt-key-stdin instead"
+                        .into()
+                });
+        }
+        Some(ResetAuthInput::Key(key)) => return Ok(ResetCliAuth::Key(key.clone())),
+        Some(ResetAuthInput::Pin(pin)) => return Ok(ResetCliAuth::Pin(pin.clone())),
+        None => {}
     }
     use keyroost_piv::compat::FeatureGate;
     let pin_hint = match pin_gate {
@@ -8934,7 +8971,19 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     Ok(s.status()?.serial)
                 },
             )?;
-            crate::prompt::confirm_on(&dev, *yes, "wipe the PIV applet")?;
+            let asked = crate::prompt::confirm_then_read(&dev, *yes, "wipe the PIV applet")?;
+            // The credential, if one was given, is read before the session
+            // opens; only the session can say whether it is needed.
+            let mut sec = Secrets::real();
+            let reset_input = read_reset_auth_input(
+                &mut sec,
+                mgmt_key_env.as_deref(),
+                *mgmt_key_stdin,
+                *mgmt_key_default,
+                pin_env.as_deref(),
+                *pin_stdin,
+            )?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8971,11 +9020,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         keyroost_transport::FactoryResetPlan::NeedsManagementAuth => {
                             let pin_gate = s.pin_management_auth_gate();
                             Some(resolve_reset_cli_auth(
-                                mgmt_key_env.as_deref(),
-                                *mgmt_key_stdin,
-                                *mgmt_key_default,
-                                pin_env.as_deref(),
-                                *pin_stdin,
+                                reset_input.as_ref(),
                                 pin_gate,
                                 Some(s),
                             )?)
@@ -9132,8 +9177,6 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Open the OpenPGP session on the reader matching `reader` (or the sole
-/// OpenPGP reader), announcing the target on stderr.
 /// Re-find the selected key before reopening it when a secret was typed at
 /// the hidden prompt: the person may have swapped keys while typing. The
 /// selection is memoised, so this never announces a second time; env and
@@ -9150,6 +9193,8 @@ fn reverify_if_prompted<I: crate::secrets::SecretIo>(
     Ok(())
 }
 
+/// Open the OpenPGP session on the reader matching `reader` (or the sole
+/// OpenPGP reader), announcing the target on stderr.
 fn open_openpgp(
     reader: Option<&str>,
     debug: bool,
@@ -9553,16 +9598,6 @@ fn inline_generate_key(
         );
     }
     Ok(())
-}
-
-/// Read a management key (a hex string) from env/stdin and decode it to bytes.
-fn read_mgmt_key(
-    label: &str,
-    env: Option<&str>,
-    from_stdin: bool,
-) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-    let hex = read_secret(label, env, from_stdin)?;
-    Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
 }
 
 /// A PIV management key as given: read before any card session (env /
@@ -11714,9 +11749,10 @@ fn gather_secret(
 /// Ask first, then read the PIN: a refusal or a "no" never consumes a PIN
 /// source (the FIDO one-way settings and the large-blob wipes). `reopened`
 /// is the key a command reopens after this returns; when the question was
-/// shown or the PIN was typed at the hidden prompt, it is re-found ([`crate::target::reverify`]) only after the PIN
-/// has been read — immediately before the reopen, not while the person is
-/// still typing the PIN. Nothing may hold the key's handle open across the
+/// shown or the PIN was typed at the hidden prompt, it is re-found
+/// ([`crate::target::reverify`]) only after the PIN has been read —
+/// immediately before the reopen, not while the person is still typing the
+/// PIN. Nothing may hold the key's handle open across the
 /// question or the PIN entry.
 fn confirm_then_read_pin<I: crate::secrets::SecretIo>(
     term: &mut dyn crate::prompt::Term,
@@ -11756,68 +11792,6 @@ fn confirm_then_read_pin_ordered<I: crate::secrets::SecretIo>(
     // which the key could have been swapped.
     reverify(asked || sec.prompted())?;
     Ok(pin)
-}
-
-/// Returned wrapped in `Zeroizing` so the PIN/password is scrubbed from the
-/// heap when the caller's binding drops; `Deref` keeps call sites unchanged.
-fn read_secret(
-    label: &str,
-    env: Option<&str>,
-    from_stdin: bool,
-) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
-    if let Some(var) = env {
-        return std::env::var(var)
-            .map(zeroize::Zeroizing::new)
-            .map_err(|_| format!("env var {} (for {}) is not set", var, label).into());
-    }
-    if from_stdin {
-        use std::io::{BufRead, IsTerminal};
-        let stdin = std::io::stdin();
-        // The --*-stdin flags are meant for piping. Typed at a terminal the
-        // value echoes (and lands in scrollback); warn rather than refuse so
-        // one-off interactive use still works.
-        if stdin.is_terminal() {
-            eprintln!(
-                "warning: reading {} from a terminal — input will be visible; \
-                 prefer piping (e.g. from a password manager)",
-                label
-            );
-        }
-        // The raw line buffer holds the secret too — wipe it on drop.
-        let mut line = zeroize::Zeroizing::new(String::new());
-        stdin.lock().read_line(&mut line)?;
-        return Ok(zeroize::Zeroizing::new(
-            line.trim_end_matches(['\r', '\n']).to_owned(),
-        ));
-    }
-    Err(format!(
-        "no source for {}: pass --{}env VAR or --{}stdin",
-        label,
-        env_prefix_for(label),
-        env_prefix_for(label),
-    )
-    .into())
-}
-
-fn env_prefix_for(label: &str) -> &'static str {
-    match label {
-        "PIN" | "OpenPGP PIN" | "signing PIN (PW1)" | "user PIN (PW1)" => "pin-",
-        "new PIN" => "new-pin-",
-        "old PIN" => "old-pin-",
-        "PUK" => "puk-",
-        "new PUK" => "new-puk-",
-        "old PUK" => "old-puk-",
-        "management key" => "mgmt-key-",
-        "old management key" => "old-mgmt-key-",
-        "new management key" => "new-mgmt-key-",
-        "admin PIN (PW3)" => "admin-pin-",
-        "secret" => "secret-",
-        "OATH password" => "password-",
-        "new OATH password" => "new-password-",
-        // A label without a mapping would render a broken hint ("--env VAR");
-        // fall back to something generic rather than nothing.
-        _ => "…-",
-    }
 }
 
 fn hex_short(bytes: &[u8]) -> String {
@@ -13558,16 +13532,12 @@ mod cli_tests {
         // No `Debug` on `ResetCliAuth` (it carries secret material — same
         // reason the GUI's analogous `PivMgmtAuth` skips it too), so match
         // rather than `.expect_err()`.
+        use crate::secrets::fake::FakeIo;
         use keyroost_piv::compat::FeatureGate;
-        match resolve_reset_cli_auth(
-            None,
-            false,
-            false,
-            None,
-            false,
-            FeatureGate::Unsupported,
-            None,
-        ) {
+        let mut sec = Secrets::new(FakeIo::default());
+        let input = read_reset_auth_input(&mut sec, None, false, false, None, false).unwrap();
+        assert!(input.is_none());
+        match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Unsupported, None) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
@@ -13576,15 +13546,7 @@ mod cli_tests {
                 assert!(!msg.contains("--pin-env"), "{msg}");
             }
         }
-        match resolve_reset_cli_auth(
-            None,
-            false,
-            false,
-            None,
-            false,
-            FeatureGate::Supported,
-            None,
-        ) {
+        match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Supported, None) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
@@ -13593,15 +13555,7 @@ mod cli_tests {
                 assert!(!msg.contains("unverified"), "{msg}");
             }
         }
-        match resolve_reset_cli_auth(
-            None,
-            false,
-            false,
-            None,
-            false,
-            FeatureGate::Unverified,
-            None,
-        ) {
+        match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Unverified, None) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
@@ -13610,6 +13564,74 @@ mod cli_tests {
                 assert!(msg.contains("unverified"), "{msg}");
             }
         }
+    }
+
+    #[test]
+    fn reset_credentials_are_never_prompted_for() {
+        // Optional, and of two possible kinds: with no flag, a terminal is
+        // not asked for either.
+        use crate::secrets::fake::FakeIo;
+        let mut sec = Secrets::new(FakeIo::terminal());
+        let input = read_reset_auth_input(&mut sec, None, false, false, None, false).unwrap();
+        assert!(input.is_none());
+        assert!(sec.io.prompts.is_empty());
+        assert!(!sec.prompted());
+    }
+
+    #[test]
+    fn reset_credentials_come_from_the_flag_given() {
+        use crate::secrets::fake::FakeIo;
+        use keyroost_piv::compat::FeatureGate;
+        // Management key from env: hex, surrounding whitespace trimmed.
+        let mut sec = Secrets::new(FakeIo::terminal().var("K", " 0102ff \n"));
+        let input = read_reset_auth_input(&mut sec, Some("K"), false, false, None, false).unwrap();
+        match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Unsupported, None) {
+            Ok(ResetCliAuth::Key(k)) => assert_eq!(&k[..], &[0x01, 0x02, 0xff]),
+            _ => panic!("expected the management key"),
+        }
+        assert!(!sec.prompted());
+        // PIN from piped stdin: kept exactly, line ending stripped.
+        let mut sec = Secrets::new(FakeIo::piped(&["12 34\n"]));
+        let input = read_reset_auth_input(&mut sec, None, false, false, None, true).unwrap();
+        match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Supported, None) {
+            Ok(ResetCliAuth::Pin(p)) => assert_eq!(p.as_str(), "12 34"),
+            _ => panic!("expected the PIN"),
+        }
+        assert!(!sec.prompted());
+        // --mgmt-key-default reads nothing; it resolves inside the session.
+        let mut sec = Secrets::new(FakeIo::terminal());
+        let input = read_reset_auth_input(&mut sec, None, false, true, None, false).unwrap();
+        assert!(matches!(input, Some(ResetAuthInput::Default)));
+        assert!(sec.io.prompts.is_empty());
+        // Unset env var names the variable and the flag.
+        let mut sec = Secrets::new(FakeIo::default());
+        match read_reset_auth_input(&mut sec, None, false, false, Some("NOPE"), false) {
+            Ok(_) => panic!("the variable is unset"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("NOPE") && msg.contains("--pin-env"), "{msg}");
+            }
+        }
+        // Bad hex says so without echoing the input.
+        let mut sec = Secrets::new(FakeIo::default().var("K", "zz"));
+        match read_reset_auth_input(&mut sec, Some("K"), false, false, None, false) {
+            Ok(_) => panic!("not hex"),
+            Err(e) => assert!(e.to_string().contains("not valid hex"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn reset_stdin_flag_at_a_terminal_reads_hidden_and_counts_as_prompted() {
+        use crate::secrets::fake::FakeIo;
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["0102"]));
+        let input = read_reset_auth_input(&mut sec, None, true, false, None, false).unwrap();
+        match input {
+            Some(ResetAuthInput::Key(k)) => assert_eq!(&k[..], &[0x01, 0x02]),
+            _ => panic!("expected the management key"),
+        }
+        assert_eq!(sec.io.prompts.len(), 1);
+        // The caller re-finds the key before opening it.
+        assert!(sec.prompted());
     }
 
     #[test]
