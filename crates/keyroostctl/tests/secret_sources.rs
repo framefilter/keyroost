@@ -76,6 +76,40 @@ fn retired_secret_flags_name_their_replacement() {
     );
 }
 
+/// A stray value on a command that takes a secret may be the secret itself
+/// (a literal otpauth URI after `-`, or a seed after `--hex-stdin`): clap's
+/// "unexpected argument" message would repeat it, so keyroostctl replaces
+/// it with one that doesn't.
+#[test]
+fn a_stray_value_on_a_secret_command_is_not_repeated() {
+    for (args, help) in [
+        (
+            &[
+                "molto",
+                "import",
+                "-p",
+                "99",
+                "-",
+                "otpauth://totp/x?secret=S3CRET",
+            ][..],
+            "see `keyroostctl molto import --help`",
+        ),
+        (
+            &["molto", "seed", "-p", "99", "--hex-stdin", "S3CRET"],
+            "see `keyroostctl molto seed --help`",
+        ),
+    ] {
+        let (code, err) = run(args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+        assert!(
+            err.contains("unexpected extra argument (not shown, in case it is a secret)")
+                && err.contains(help),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains("S3CRET"), "{args:?} echoed the value: {err}");
+    }
+}
+
 const TABLE: &str = include_str!("secret_flags.txt");
 
 /// A well-formed value for a secret supplied by env so a later one is

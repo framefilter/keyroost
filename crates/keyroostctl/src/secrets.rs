@@ -285,17 +285,9 @@ impl<I: SecretIo> Secrets<I> {
         if let Some(var) = src.env {
             let raw = match self.io.env(var) {
                 EnvValue::Set(v) => v,
-                EnvValue::Unset => {
-                    return Err(format!(
-                        "environment variable {var} is not set (--{}-env)",
-                        spec.flag
-                    ))
-                }
+                EnvValue::Unset => return Err(env_problem(var, spec.flag, "is not set")),
                 EnvValue::NotUnicode => {
-                    return Err(format!(
-                        "environment variable {var} is not valid UTF-8 (--{}-env)",
-                        spec.flag
-                    ))
+                    return Err(env_problem(var, spec.flag, "is not valid UTF-8"))
                 }
             };
             return finish(spec, raw, Origin::Env(var));
@@ -386,6 +378,30 @@ impl<I: SecretIo> Secrets<I> {
     }
 }
 
+/// Whether `name` looks like an environment variable name. A name that
+/// doesn't may be the secret itself, passed where the name belongs.
+fn plausible_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.len() <= 64
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// "environment variable VAR is not set (--X-env)", without repeating VAR
+/// when it doesn't look like a variable name (it may be the secret itself).
+fn env_problem(var: &str, flag: &str, problem: &str) -> String {
+    if plausible_var_name(var) {
+        format!("environment variable {var} {problem} (--{flag}-env)")
+    } else {
+        format!(
+            "the environment variable named by --{flag}-env {problem} (the name isn't shown; \
+             it doesn't look like a variable name — did you pass the secret itself?)"
+        )
+    }
+}
+
 fn strip_line_ending(line: &str) -> &str {
     let l = line.strip_suffix('\n').unwrap_or(line);
     l.strip_suffix('\r').unwrap_or(l)
@@ -409,7 +425,7 @@ fn finish(
         return Ok(value);
     }
     Err(match origin {
-        Origin::Env(var) => format!("environment variable {var} is empty (--{}-env)", spec.flag),
+        Origin::Env(var) => env_problem(var, spec.flag, "is empty"),
         Origin::Stdin(n) => format!("the {} on stdin line {n} is empty", spec.label),
         Origin::Prompt => format!("no {} entered; nothing was changed", spec.label),
     })
@@ -554,6 +570,49 @@ mod tests {
             s.io.prompts.is_empty(),
             "an env source never falls back to the prompt"
         );
+    }
+
+    #[test]
+    fn an_env_name_that_may_be_the_secret_is_never_repeated() {
+        let hidden = "the environment variable named by --pin-env is not set (the name isn't \
+                      shown; it doesn't look like a variable name — did you pass the secret itself?)";
+        for name in [
+            "1234S3CRET",
+            "otpauth://totp/x?secret=S3CRET",
+            "S3CRET-PASS",
+            "S3CRET pass",
+            "",
+        ] {
+            let mut s = sec(FakeIo::terminal());
+            let e = s.read(&PIN, Source::env(name)).unwrap_err();
+            assert_eq!(e, hidden, "{name:?}");
+        }
+        let long = "A".repeat(65);
+        let mut s = sec(FakeIo::terminal());
+        let e = s.read(&PIN, Source::env(&long)).unwrap_err();
+        assert!(!e.contains(&long) && e.contains("isn't shown"), "{e}");
+        // Empty and non-UTF-8 values are reported the same way.
+        let mut s = sec(FakeIo::default().var("12S3CRET", ""));
+        let e = s.read(&PIN, Source::env("12S3CRET")).unwrap_err();
+        assert!(
+            !e.contains("S3CRET") && e.contains("--pin-env is empty"),
+            "{e}"
+        );
+        let mut s = sec(FakeIo::default().not_unicode_var("12S3CRET"));
+        let e = s.read(&PIN, Source::env("12S3CRET")).unwrap_err();
+        assert!(
+            !e.contains("S3CRET") && e.contains("--pin-env is not valid UTF-8"),
+            "{e}"
+        );
+        // A plausible name, up to 64 characters, is still named.
+        for name in ["_X", "KR_PIN_2", &"B".repeat(64)] {
+            let mut s = sec(FakeIo::terminal());
+            let e = s.read(&PIN, Source::env(name)).unwrap_err();
+            assert_eq!(
+                e,
+                format!("environment variable {name} is not set (--pin-env)")
+            );
+        }
     }
 
     #[test]

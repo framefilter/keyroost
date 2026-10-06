@@ -4187,23 +4187,66 @@ fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<&'static str> {
         .map(|(_, _, msg)| *msg)
 }
 
+/// The message to print instead of clap's for a parse error that could
+/// repeat a secret, or `None` to let clap print its own.
+///
+/// A retired secret flag gets its replacement hint. An unexpected
+/// non-flag argument on a command that takes a secret is not repeated:
+/// clap's "unexpected argument 'X' found" would echo X, which may be the
+/// secret itself (`molto seed --hex-stdin DEADBEEF`, or an otpauth:// URI
+/// after `molto import -`). Errors about flags (a value starting with `-`)
+/// keep clap's message: clap names only the flag, never its value.
+fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    use clap::CommandFactory;
+    if e.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let Some(ContextValue::String(arg)) = e.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    if let Some(msg) = retired_flag_hint(arg, argv) {
+        return Some(msg.to_string());
+    }
+    if arg.starts_with('-') {
+        return None;
+    }
+    // The deepest subcommand named in argv, and whether it takes a secret.
+    let mut cmd = Cli::command();
+    cmd.build();
+    let mut cmd = &cmd;
+    let mut path = vec!["keyroostctl".to_string()];
+    for word in argv.iter().skip(1) {
+        if word == "--" {
+            break;
+        }
+        if let Some(sub) = cmd.find_subcommand(word) {
+            path.push(sub.get_name().to_string());
+            cmd = sub;
+        }
+    }
+    let takes_secret = cmd.get_arguments().any(|a| {
+        a.get_long()
+            .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
+    });
+    takes_secret.then(|| {
+        format!(
+            "unexpected extra argument (not shown, in case it is a secret); see `{} --help`",
+            path.join(" ")
+        )
+    })
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
-            use clap::error::{ContextKind, ContextValue, ErrorKind};
-            if e.kind() == ErrorKind::UnknownArgument {
-                if let Some(ContextValue::String(flag)) = e.get(ContextKind::InvalidArg) {
-                    // clap reports the flag name only, never `=value` or the
-                    // next token, so there is no secret value in argv here.
-                    let argv: Vec<String> = std::env::args_os()
-                        .map(|a| a.to_string_lossy().into_owned())
-                        .collect();
-                    if let Some(msg) = retired_flag_hint(flag, &argv) {
-                        eprintln!("error: {msg}");
-                        std::process::exit(2);
-                    }
-                }
+            let argv: Vec<String> = std::env::args_os()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if let Some(msg) = redacted_parse_error(&e, &argv) {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
             }
             e.exit()
         }
@@ -12786,6 +12829,91 @@ mod cli_tests {
         // Scoped: an unknown --pin elsewhere is not "renamed --which".
         assert!(retired_flag_hint("--pin", &argv("keyroostctl fido info --pin")).is_none());
         assert!(retired_flag_hint("--hex", &argv("keyroostctl oath add n --hex")).is_none());
+    }
+
+    #[test]
+    fn an_unexpected_value_on_a_secret_command_is_never_repeated() {
+        let argv: fn(&[&str]) -> Vec<String> =
+            |a| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let redacted = |args: &[&str]| {
+            let e = parse(args)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} parsed"));
+            redacted_parse_error(&e, &argv(args))
+        };
+        for (args, path) in [
+            (
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "import",
+                    "-p",
+                    "99",
+                    "-",
+                    "otpauth://totp/x?secret=S3CRET",
+                ][..],
+                "keyroostctl molto import",
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "seed",
+                    "-p",
+                    "99",
+                    "--hex-stdin",
+                    "S3CRET",
+                ],
+                "keyroostctl molto seed",
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "piv",
+                    "change-pin",
+                    "--old-pin-stdin",
+                    "S3CRET",
+                ],
+                "keyroostctl piv change-pin",
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "oath",
+                    "add",
+                    "n",
+                    "--seed-stdin",
+                    "--",
+                    "S3CRET",
+                ],
+                "keyroostctl oath add",
+            ),
+        ] {
+            let msg = redacted(args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
+            assert_eq!(
+                msg,
+                format!(
+                    "unexpected extra argument (not shown, in case it is a secret); \
+                     see `{path} --help`"
+                )
+            );
+            assert!(!msg.contains("S3CRET"), "{msg}");
+        }
+        // A misspelled flag keeps clap's message (it names only the flag),
+        // and a command without a secret flag keeps clap's message too.
+        assert!(redacted(&["keyroostctl", "molto", "seed", "-p", "99", "--hexx-stdin"]).is_none());
+        assert!(redacted(&["keyroostctl", "list", "extra"]).is_none());
+        // A retired flag still gets its replacement hint.
+        assert!(redacted(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "-p",
+            "99",
+            "--hex",
+            "S3CRET"
+        ])
+        .is_some_and(|m| m.contains("--hex-env VAR") && !m.contains("S3CRET")));
     }
 
     #[test]
