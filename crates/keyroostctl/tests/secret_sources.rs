@@ -110,6 +110,62 @@ fn a_stray_value_on_a_secret_command_is_not_repeated() {
     }
 }
 
+/// `--X-stdin` takes no value: `--X-stdin=VALUE` is clap's own "unexpected
+/// value" error, which names the flag and repeats the value. The value may
+/// be the secret itself, typed where the variable name or nothing at all
+/// was expected.
+#[test]
+fn a_stdin_flag_given_a_value_is_not_repeated() {
+    for args in [
+        &["molto", "seed", "-p", "99", "--hex-stdin=S3CRET"][..],
+        &[
+            "piv",
+            "change-pin",
+            "--old-pin-stdin",
+            "--new-pin-stdin=S3CRET",
+        ],
+    ] {
+        let (code, err) = run(args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+        assert!(
+            err.contains("takes no value") && err.contains("standard input"),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains("S3CRET"), "{args:?} echoed the value: {err}");
+    }
+}
+
+/// A dash-led word right after a `-stdin` flag (`--old-pin-stdin -123456`)
+/// is hidden the same way as a bare stray value: clap reports only the
+/// short-flag prefix it choked on, which isn't the whole word.
+#[test]
+fn a_dash_led_value_after_a_stdin_flag_is_not_repeated() {
+    let (code, err) = run(&["piv", "change-pin", "--old-pin-stdin", "-123456"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("unexpected extra argument (not shown, in case it is a secret)"),
+        "{err}"
+    );
+    assert!(!err.contains("123456"), "echoed the value: {err}");
+}
+
+/// A genuine typo — a subcommand or a `--`-prefixed flag name made only of
+/// letters and dashes — is never a secret, so it still gets clap's own
+/// message and "similar" tip, even right after a `-stdin` flag.
+#[test]
+fn a_typo_still_gets_claps_similar_name_tip() {
+    let (code, err) = run(&["molto", "sed"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("a similar subcommand exists: 'seed'"), "{err}");
+
+    let (code, err) = run(&["piv", "change-pin", "--old-pin-stdin", "--new-pin-stdn"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("a similar argument exists: '--new-pin-stdin'"),
+        "{err}"
+    );
+}
+
 const TABLE: &str = include_str!("secret_flags.txt");
 
 /// A well-formed value for a secret supplied by env so a later one is

@@ -3478,7 +3478,7 @@ fn customer_key<I: crate::secrets::SecretIo>(
         let hex = sec.read(&MOLTO_KEY_HEX, Source::env(var))?;
         return hex_decode(&hex)
             .map(zeroize::Zeroizing::new)
-            .map_err(|e| format!("the customer key in {var} (--key-env) is not valid hex: {e}"));
+            .map_err(|e| format!("the customer key given by --key-env is not valid hex: {e}"));
     }
     if let Some(var) = &args.key_ascii_env {
         let text = sec.read(&MOLTO_KEY_ASCII, Source::env(var))?;
@@ -4187,6 +4187,25 @@ fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<&'static str> {
         .map(|(_, _, msg)| *msg)
 }
 
+/// A double-dash word made only of letters and dashes — a typo'd flag name
+/// (`--hexx-stdin`), never a secret. clap's own "similar argument" tip is
+/// more useful here than hiding it, so this shape is always let through.
+fn looks_like_flag_typo(word: &str) -> bool {
+    word.strip_prefix("--").is_some_and(|rest| {
+        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+    })
+}
+
+/// Whether `argv` has a `-stdin` flag immediately before a word starting
+/// with `prefix`. clap's `UnknownArgument` context sometimes names only a
+/// prefix of the real word: a dash-led value like `-123456` is parsed as a
+/// run of short flags and the error stops at the first unknown one (`-1`),
+/// not the whole thing — so this matches by prefix rather than equality.
+fn stdin_flag_precedes(argv: &[String], prefix: &str) -> bool {
+    argv.windows(2)
+        .any(|w| w[1].starts_with(prefix) && w[0].ends_with("-stdin"))
+}
+
 /// The message to print instead of clap's for a parse error that could
 /// repeat a secret, or `None` to let clap print its own.
 ///
@@ -4194,11 +4213,32 @@ fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<&'static str> {
 /// non-flag argument on a command that takes a secret is not repeated:
 /// clap's "unexpected argument 'X' found" would echo X, which may be the
 /// secret itself (`molto seed --hex-stdin DEADBEEF`, or an otpauth:// URI
-/// after `molto import -`). Errors about flags (a value starting with `-`)
-/// keep clap's message: clap names only the flag, never its value.
+/// after `molto import -`). A `--X-stdin` flag given a value (`--hex-stdin
+/// DEADBEEF` or `--hex-stdin=DEADBEEF`, both of which clap reports as
+/// `TooManyValues` for a flag that takes none) is redacted the same way, and
+/// so is a dash-led word right after a `-stdin` flag (`--old-pin-stdin
+/// -123456`) unless it's shaped like a typo'd flag name. Any other error
+/// about a flag keeps clap's message: clap names only the flag, never a
+/// value.
 fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     use clap::CommandFactory;
+
+    // A bare flag given a value it doesn't take. For a `--X-stdin` flag the
+    // value may be the secret itself, typed where the variable name or
+    // nothing at all was expected.
+    if e.kind() == ErrorKind::TooManyValues {
+        let Some(ContextValue::String(flag)) = e.get(ContextKind::InvalidArg) else {
+            return None;
+        };
+        return flag.ends_with("-stdin").then(|| {
+            format!(
+                "{flag} takes no value (value not shown, in case it is a secret); pipe the \
+                 secret on standard input"
+            )
+        });
+    }
+
     if e.kind() != ErrorKind::UnknownArgument {
         return None;
     }
@@ -4208,9 +4248,7 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
     if let Some(msg) = retired_flag_hint(arg, argv) {
         return Some(msg.to_string());
     }
-    if arg.starts_with('-') {
-        return None;
-    }
+
     // The deepest subcommand named in argv, and whether it takes a secret.
     let mut cmd = Cli::command();
     cmd.build();
@@ -4229,7 +4267,13 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
         a.get_long()
             .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
     });
-    takes_secret.then(|| {
+
+    let hidden = if arg.starts_with('-') {
+        !looks_like_flag_typo(arg) && stdin_flag_precedes(argv, arg)
+    } else {
+        takes_secret
+    };
+    hidden.then(|| {
         format!(
             "unexpected extra argument (not shown, in case it is a secret); see `{} --help`",
             path.join(" ")
@@ -12550,14 +12594,14 @@ mod cli_tests {
         );
         let mut sec = Secrets::new(FakeIo::default());
         let e = customer_key(&mut sec, &args(Some("V"), None)).unwrap_err();
-        assert_eq!(e, "environment variable V is not set (--key-env)");
+        assert_eq!(e, "the environment variable given to --key-env is not set");
         let mut sec = Secrets::new(FakeIo::default().var("A", "my key "));
         let k = customer_key(&mut sec, &args(None, Some("A"))).unwrap();
         assert_eq!(&k[..], b"my key ");
         let mut sec = Secrets::new(FakeIo::default().var("V", "zz"));
         let e = customer_key(&mut sec, &args(Some("V"), None)).unwrap_err();
-        assert!(e.contains("(--key-env) is not valid hex"), "{e}");
-        assert!(!e.contains("zz"), "{e}");
+        assert!(e.contains("given by --key-env is not valid hex"), "{e}");
+        assert!(!e.contains("zz") && !e.contains('V'), "{e}");
     }
 
     #[test]
@@ -12916,6 +12960,86 @@ mod cli_tests {
         .is_some_and(|m| m.contains("--hex-env VAR") && !m.contains("S3CRET")));
     }
 
+    /// `--X-stdin` takes no value, so `--X-stdin=VALUE` or a following bare
+    /// word is clap's `TooManyValues`, naming the flag and repeating the
+    /// value — the value may be the secret itself.
+    #[test]
+    fn a_stdin_flag_given_a_value_is_never_repeated() {
+        let argv: fn(&[&str]) -> Vec<String> =
+            |a| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let redacted = |args: &[&str]| {
+            let e = parse(args)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} parsed"));
+            redacted_parse_error(&e, &argv(args))
+        };
+        for args in [
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "-p",
+                "99",
+                "--hex-stdin=S3CRET",
+            ][..],
+            &[
+                "keyroostctl",
+                "piv",
+                "change-pin",
+                "--old-pin-stdin",
+                "--new-pin-stdin=S3CRET",
+            ],
+        ] {
+            let msg = redacted(args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
+            assert!(
+                msg.contains("takes no value") && msg.contains("standard input"),
+                "{msg}"
+            );
+            assert!(!msg.contains("S3CRET"), "{msg}");
+        }
+    }
+
+    /// A dash-led word right after a `-stdin` flag (`--old-pin-stdin
+    /// -123456`) is hidden the same way as a bare stray value — clap only
+    /// reports the short-flag prefix it choked on (`-1`), but the rest of
+    /// the word never reached argv's own InvalidArg context, so it must be
+    /// kept out some other way. A word shaped like a typo'd flag name is
+    /// still shown: that's useful, and never a secret.
+    #[test]
+    fn a_dash_led_value_after_a_stdin_flag_is_never_repeated() {
+        let argv: fn(&[&str]) -> Vec<String> =
+            |a| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let redacted = |args: &[&str]| {
+            let e = parse(args)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} parsed"));
+            redacted_parse_error(&e, &argv(args))
+        };
+        let args = [
+            "keyroostctl",
+            "piv",
+            "change-pin",
+            "--old-pin-stdin",
+            "-123456",
+        ];
+        let msg = redacted(&args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
+        assert!(
+            msg.contains("unexpected extra argument (not shown, in case it is a secret)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("123456"), "{msg}");
+        // A typo'd flag name after the same `-stdin` flag is still clap's
+        // own message, with its "similar argument" tip.
+        assert!(redacted(&[
+            "keyroostctl",
+            "piv",
+            "change-pin",
+            "--old-pin-stdin",
+            "--new-pin-stdn"
+        ])
+        .is_none());
+    }
+
     #[test]
     fn device_completion_offers_saved_names_only() {
         let entry = |name: &str, serial: &str| keyroost_keyring::KeyEntry {
@@ -13212,7 +13336,7 @@ mod cli_tests {
         let e = confirm_then_read_pin(&mut NoTty, &mut sec, true, action, "solo-test", None, unset)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("KR_UNSET"), "{e}");
+        assert!(!e.contains("KR_UNSET"), "{e}");
         assert!(e.contains("--pin-env"), "{e}");
     }
 
@@ -13253,7 +13377,7 @@ mod cli_tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(e.contains("KR_T"), "{e}");
+        assert!(!e.contains("KR_T") && e.contains("--pin-env"), "{e}");
         assert!(!reverify_ran.get(), "re-check ran before the PIN was read");
     }
 
@@ -14206,13 +14330,13 @@ mod cli_tests {
         let input = read_reset_auth_input(&mut sec, None, false, true, None, false).unwrap();
         assert!(matches!(input, Some(ResetAuthInput::Default)));
         assert!(sec.io.prompts.is_empty());
-        // Unset env var names the variable and the flag.
+        // Unset env var names the flag, never the variable.
         let mut sec = Secrets::new(FakeIo::default());
         match read_reset_auth_input(&mut sec, None, false, false, Some("NOPE"), false) {
             Ok(_) => panic!("the variable is unset"),
             Err(e) => {
                 let msg = e.to_string();
-                assert!(msg.contains("NOPE") && msg.contains("--pin-env"), "{msg}");
+                assert!(!msg.contains("NOPE") && msg.contains("--pin-env"), "{msg}");
             }
         }
         // Bad hex says so without echoing the input.
