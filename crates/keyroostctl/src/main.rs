@@ -3686,8 +3686,109 @@ fn list_json_rows(
         .collect()
 }
 
+/// Removed or renamed secret-bearing flags, keyed by (the flag as clap
+/// reports it, words that must all appear in argv to disambiguate which
+/// subcommand's flag this is, the message to print). The message never
+/// repeats the value the user passed — clap only hands us the flag name,
+/// never its value or the next token, so there is nothing to leak here.
+const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
+    (
+        "--key",
+        &["molto"],
+        "--key was removed: secrets on the command line end up in shell history and `ps`; use --key-env VAR",
+    ),
+    (
+        "--key-ascii",
+        &["molto"],
+        "--key-ascii was removed: secrets on the command line end up in shell history and `ps`; use --key-ascii-env VAR",
+    ),
+    (
+        "--hex",
+        &["seed"],
+        "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
+    ),
+    (
+        "--base32",
+        &["seed"],
+        "--base32 was removed: secrets on the command line end up in shell history and `ps`; use --base32-env VAR or --base32-stdin",
+    ),
+    (
+        "--hex",
+        &["customer-key"],
+        "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
+    ),
+    (
+        "--ascii",
+        &["customer-key"],
+        "--ascii was removed: secrets on the command line end up in shell history and `ps`; use --ascii-env VAR or --ascii-stdin",
+    ),
+    (
+        "--secret-env",
+        &["oath"],
+        "--secret-env was renamed --seed-env (the same name `otp add` uses)",
+    ),
+    (
+        "--secret-stdin",
+        &["oath"],
+        "--secret-stdin was renamed --seed-stdin (the same name `otp add` uses)",
+    ),
+    (
+        "--pin",
+        &["openpgp", "verify"],
+        "--pin (which PIN to check) was renamed --which user|admin; the PIN itself comes from --pin-env VAR, --pin-stdin or the prompt",
+    ),
+    (
+        "--current-env",
+        &["otp", "change-pin"],
+        "--current-env was renamed --old-pin-env",
+    ),
+    (
+        "--new-env",
+        &["otp", "change-pin"],
+        "--new-env was renamed --new-pin-env",
+    ),
+    (
+        "--pin-stdin",
+        &["otp", "change-pin"],
+        "--pin-stdin was split: use --old-pin-stdin (first line) and --new-pin-stdin (second line)",
+    ),
+];
+
+/// A friendly hint for a removed or renamed secret-bearing flag, or `None` if
+/// `invalid` isn't one of ours (or the surrounding argv doesn't match, so an
+/// unrelated flag of the same name elsewhere isn't misdiagnosed). The rows
+/// stay inert until each flag is actually removed from its `clap` struct:
+/// clap only raises `UnknownArgument` for flags it no longer knows about.
+fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<&'static str> {
+    RETIRED_FLAGS
+        .iter()
+        .find(|(flag, words, _)| {
+            *flag == invalid && words.iter().all(|w| argv.iter().any(|a| a == w))
+        })
+        .map(|(_, _, msg)| *msg)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::{ContextKind, ContextValue, ErrorKind};
+            if e.kind() == ErrorKind::UnknownArgument {
+                if let Some(ContextValue::String(flag)) = e.get(ContextKind::InvalidArg) {
+                    // clap reports the flag name only, never `=value` or the
+                    // next token, so there is no secret value in argv here.
+                    let argv: Vec<String> = std::env::args_os()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .collect();
+                    if let Some(msg) = retired_flag_hint(flag, &argv) {
+                        eprintln!("error: {msg}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            e.exit()
+        }
+    };
     // Capture --device once so target::select() can honor it without threading
     // it through every command handler.
     let _ = SELECTED_KEY_NAME.set(cli.device.clone());
@@ -11612,6 +11713,78 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn retired_flags_name_their_replacement_and_never_the_value() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for (flag, line, want) in [
+            (
+                "--key",
+                "keyroostctl molto --key 00aa seed -p 1",
+                "use --key-env VAR",
+            ),
+            (
+                "--key-ascii",
+                "keyroostctl molto --key-ascii x info",
+                "use --key-ascii-env VAR",
+            ),
+            (
+                "--hex",
+                "keyroostctl molto seed -p 1 --hex 00",
+                "use --hex-env VAR or --hex-stdin",
+            ),
+            (
+                "--base32",
+                "keyroostctl prog seed --base32 AA",
+                "use --base32-env VAR or --base32-stdin",
+            ),
+            (
+                "--hex",
+                "keyroostctl molto customer-key --hex 00",
+                "use --hex-env VAR or --hex-stdin",
+            ),
+            (
+                "--ascii",
+                "keyroostctl molto customer-key --ascii x",
+                "use --ascii-env VAR or --ascii-stdin",
+            ),
+            (
+                "--secret-env",
+                "keyroostctl oath add n --secret-env V",
+                "--seed-env",
+            ),
+            (
+                "--secret-stdin",
+                "keyroostctl oath add n --secret-stdin",
+                "--seed-stdin",
+            ),
+            ("--pin", "keyroostctl openpgp verify --pin admin", "--which"),
+            (
+                "--current-env",
+                "keyroostctl otp change-pin --current-env V",
+                "--old-pin-env",
+            ),
+            (
+                "--new-env",
+                "keyroostctl otp change-pin --new-env V",
+                "--new-pin-env",
+            ),
+            (
+                "--pin-stdin",
+                "keyroostctl otp change-pin --pin-stdin",
+                "--old-pin-stdin",
+            ),
+        ] {
+            let msg = retired_flag_hint(flag, &argv(line)).unwrap_or_else(|| panic!("{line}"));
+            assert!(msg.contains(want), "{line}: {msg}");
+            for value in ["00aa", "AA"] {
+                assert!(!msg.contains(value), "{msg}");
+            }
+        }
+        // Scoped: an unknown --pin elsewhere is not "renamed --which".
+        assert!(retired_flag_hint("--pin", &argv("keyroostctl fido info --pin")).is_none());
+        assert!(retired_flag_hint("--hex", &argv("keyroostctl oath add n --hex")).is_none());
     }
 
     #[test]
