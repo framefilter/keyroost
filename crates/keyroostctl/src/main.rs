@@ -3521,7 +3521,7 @@ fn read_new_customer_key<I: crate::secrets::SecretIo>(
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
     let (i, text) = sec.read_one_of("new customer key", options)?;
     let bytes = if i == 0 {
-        hex_decode(&text)?
+        hex_decode(&text).map_err(|e| format!("the new customer key is not valid hex: {e}"))?
     } else {
         text.as_bytes().to_vec()
     };
@@ -3534,10 +3534,11 @@ fn read_seed<I: crate::secrets::SecretIo>(
     options: &[(Spec, Source<'_>); 2],
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
     let (i, text) = sec.read_one_of("seed", options)?;
+    // The decode errors name the problem, never the input.
     let bytes = if i == 0 {
-        hex_decode(&text)?
+        hex_decode(&text).map_err(|e| format!("the seed is not valid hex: {e}"))?
     } else {
-        base32_decode(&text)?
+        base32_decode(&text).map_err(|e| format!("the seed is not valid base32: {e}"))?
     };
     Ok(zeroize::Zeroizing::new(bytes))
 }
@@ -12540,6 +12541,32 @@ mod cli_tests {
         let mut sec = Secrets::new(FakeIo::piped(&["abc\n"]));
         let k = read_new_customer_key(&mut sec, &new_key_options(None, false, None, true)).unwrap();
         assert_eq!(&k[..], b"abc");
+    }
+
+    #[test]
+    fn seed_and_new_key_decode_errors_name_the_value_but_never_echo_it() {
+        use crate::secrets::fake::FakeIo;
+        let mut sec = Secrets::new(FakeIo::piped(&["zzS3CRET\n"]));
+        let e = read_seed(&mut sec, &seed_options(None, true, None, false))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "the seed is not valid hex: invalid character in input");
+        let mut sec = Secrets::new(FakeIo::default().var("B", "S3CRET!1"));
+        let e = read_seed(&mut sec, &seed_options(None, false, Some("B"), false))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "the seed is not valid base32: invalid character in input"
+        );
+        let mut sec = Secrets::new(FakeIo::piped(&["zzS3CRET\n"]));
+        let e = read_new_customer_key(&mut sec, &new_key_options(None, true, None, false))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "the new customer key is not valid hex: invalid character in input"
+        );
     }
 
     fn molto_cmd(args: &[&str]) -> MoltoCmd {
