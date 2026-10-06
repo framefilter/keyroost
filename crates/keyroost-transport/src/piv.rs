@@ -1682,6 +1682,93 @@ impl<'tx> PivSession<'tx> {
         serial
     }
 
+    /// Query the Swissbit Management Application
+    /// ([`keyroost_piv::fingerprint::SWISSBIT_MANAGEMENT_AID`]) of an
+    /// iShield 1 or 2, SELECTing it once (the few bytes it answers with are
+    /// per-token constants and ignored). `need_serial` sends `GET SERIAL`
+    /// ([`keyroost_piv::fingerprint::SWISSBIT_GET_SERIAL`], an unsigned
+    /// big-endian 64-bit integer) — the fallback for the Yubico `GET SERIAL`
+    /// extension giving no proper answer; `need_name` sends `GET DEVICE INFO`
+    /// ([`keyroost_piv::fingerprint::SWISSBIT_GET_DEVICE_INFO`]) and extracts
+    /// the device name. Returns `(name, serial)`; each is `None` when not
+    /// requested, when the applet doesn't SELECT, the command is refused, or
+    /// the reply doesn't parse (serial: not exactly 8 bytes). Always
+    /// re-SELECTs PIV afterward, like every other probe here.
+    fn probe_swissbit_management(
+        &mut self,
+        need_name: bool,
+        need_serial: bool,
+    ) -> (Option<String>, Option<u128>) {
+        use keyroost_piv::fingerprint;
+
+        if !need_name && !need_serial {
+            return (None, None);
+        }
+        let selected = matches!(
+            self.transmit_full_raw(&piv::select_by_aid(&fingerprint::SWISSBIT_MANAGEMENT_AID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let out = if selected {
+            let name = need_name
+                .then(|| {
+                    self.transmit_full_raw(&fingerprint::SWISSBIT_GET_DEVICE_INFO)
+                        .ok()
+                        .filter(|(_, sw)| *sw == piv::SW_OK)
+                        .and_then(|(data, _)| fingerprint::parse_swissbit_device_name(&data))
+                })
+                .flatten();
+            let serial = need_serial
+                .then(|| {
+                    self.transmit_full_raw(&fingerprint::SWISSBIT_GET_SERIAL)
+                        .ok()
+                        .filter(|(data, sw)| *sw == piv::SW_OK && data.len() == 8)
+                        .and_then(|(data, _)| piv::parse_serial(&data).ok())
+                })
+                .flatten();
+            (name, serial)
+        } else {
+            (None, None)
+        };
+        let _ = self.select();
+        out
+    }
+
+    /// Read a Swissbit iShield Key 1's device name and firmware version from
+    /// its Card Manager ([`keyroost_piv::fingerprint::SWISSBIT_CARD_MANAGER_AID`])
+    /// via the vendor commands
+    /// [`keyroost_piv::fingerprint::SWISSBIT_GET_DEVICE_NAME`] and
+    /// [`keyroost_piv::fingerprint::SWISSBIT_GET_FIRMWARE_VERSION`]. The
+    /// firmware ASCII is split into byte components like Nitrokey's
+    /// ([`keyroost_piv::fingerprint::parse_dotted_version`]), so a string
+    /// that isn't dotted decimal reads as no firmware version. The two
+    /// commands degrade independently; PIV is always re-SELECTed afterward.
+    fn probe_swissbit_card_manager(&mut self) -> (Option<String>, Option<Vec<u8>>) {
+        use keyroost_piv::fingerprint;
+
+        let selected = matches!(
+            self.transmit_full_raw(&piv::select_by_aid(&fingerprint::SWISSBIT_CARD_MANAGER_AID)),
+            Ok((_, sw)) if sw == piv::SW_OK
+        );
+        let out = if selected {
+            let name = self
+                .transmit_full_raw(&fingerprint::SWISSBIT_GET_DEVICE_NAME)
+                .ok()
+                .filter(|(_, sw)| *sw == piv::SW_OK)
+                .and_then(|(data, _)| fingerprint::parse_swissbit_text(&data));
+            let firmware = self
+                .transmit_full_raw(&fingerprint::SWISSBIT_GET_FIRMWARE_VERSION)
+                .ok()
+                .filter(|(_, sw)| *sw == piv::SW_OK)
+                .and_then(|(data, _)| fingerprint::parse_swissbit_text(&data))
+                .and_then(|s| fingerprint::parse_dotted_version(&s));
+            (name, firmware)
+        } else {
+            (None, None)
+        };
+        let _ = self.select();
+        out
+    }
+
     /// Names of connected readers whose PIV applet answers `SELECT` with `9000`.
     pub fn list_piv_readers() -> Result<Vec<String>, TransportError> {
         let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
@@ -1836,7 +1923,8 @@ impl<'tx> PivSession<'tx> {
     /// device-reported/derived distinction between Token2 and Nitrokey's own
     /// values on this same axis. `serial` is resolved here too, by whichever
     /// source is right for the matched fingerprint (a dedicated probe, or —
-    /// `YubiKey` and the generic catch-all only — Yubico's GET SERIAL,
+    /// `YubiKey`, the generic catch-all and the Swissbit iShields (which fall
+    /// back to their Management Application) — Yubico's GET SERIAL,
     /// BCD-decoded when this fingerprint's quirks call for it): unlike
     /// `version`, there's no single shared call site that fits every arm, so
     /// each arm resolves its own rather than this method doing it once
@@ -2046,6 +2134,51 @@ impl<'tx> PivSession<'tx> {
                 version_firmware: None,
                 serial: self.probe_token2_otp_serial(),
             },
+            // Try the Yubico GET SERIAL extension first, then fall back to
+            // the Swissbit Management Application's own GET SERIAL. The
+            // iShield 1 answers the Yubico command with its real serial. The
+            // iShield 2 firmwares seen so far (v1.0.4 / applet v1.0.0.0 and
+            // v1.1.2 / applet v1.4.1) recognise it too, and mimic other
+            // Yubico extensions, but answer GET SERIAL specifically with
+            // `SW 6982` (security status not satisfied). That looks like a
+            // firmware bug, so the Yubico read is kept first in case a later
+            // firmware fixes it, and the Management Application read covers
+            // the failure today.
+            fingerprint::AppletFingerprint::OpenFips201(
+                fingerprint::OpenFips201Variant::SwissbitIShield2,
+            )
+            | fingerprint::AppletFingerprint::ArekinathPivApplet(
+                fingerprint::ArekinathVariant::SwissbitIShield1,
+            ) => {
+                let yubico_serial =
+                    decode_serial_if_bcd(id, version.as_deref(), None, self.serial());
+                // The iShield 2's name comes from the Management
+                // Application's GET DEVICE INFO; the iShield 1's from its
+                // Card Manager below.
+                let is_ishield2 = matches!(
+                    id,
+                    fingerprint::AppletFingerprint::OpenFips201(
+                        fingerprint::OpenFips201Variant::SwissbitIShield2,
+                    )
+                );
+                let (mgmt_name, mgmt_serial) =
+                    self.probe_swissbit_management(is_ishield2, yubico_serial.is_none());
+                let serial = yubico_serial.or(mgmt_serial);
+                // The Card Manager name/firmware commands are only supported
+                // by the iShield 1; don't send them to an iShield 2.
+                let (name, version_firmware) = if is_ishield2 {
+                    (mgmt_name, None)
+                } else {
+                    self.probe_swissbit_card_manager()
+                };
+                AppletFingerprintResult {
+                    fingerprint: id,
+                    name: name.unwrap_or_default(),
+                    version,
+                    version_firmware,
+                    serial,
+                }
+            }
             // Unclassified/generic PIV applet — plenty of non-Yubico
             // implementations answer this extension too (see
             // `PivStatus::version`'s own doc), and there's no dedicated
@@ -2361,10 +2494,12 @@ impl<'tx> PivSession<'tx> {
     /// Yubico GET SERIAL; `None` if unsupported (older firmware / non-Yubico).
     /// Widened to `u128` — see [`keyroost_piv::parse_serial`] for why the
     /// reply isn't always the standard 4-byte `u32`. Called at most once per
-    /// lineage, from `Self::applet_fingerprint`'s `YubiKey` and generic
-    /// catch-all arms only — every fingerprint with its own dedicated serial
-    /// probe (Token2, Thetis, Nitrokey, HID Crescendo) never calls this at
-    /// all. Resolving it during fingerprinting rather than lazily in
+    /// lineage, from `Self::applet_fingerprint`'s `YubiKey`, generic
+    /// catch-all and Swissbit iShield arms — every fingerprint with its own
+    /// dedicated serial probe (Token2, Thetis, Nitrokey, HID Crescendo) never
+    /// calls this at all. The iShield arms try this first and fall back to
+    /// the Swissbit Management Application's serial when it yields none (the
+    /// iShield 2 answers it with `SW 6982`). Resolving it during fingerprinting rather than lazily in
     /// [`Self::status`]/[`Self::status_detailed`] means it rides along in
     /// `identity`'s own unconditional cache — safe, because a card's serial
     /// cannot change while the physical card stays the same, exactly like
@@ -5600,6 +5735,8 @@ fn known_aid_name(aid: &[u8]) -> Option<&'static str> {
         _ if aid == fingerprint::GLOBAL_PLATFORM_ISD_AID => {
             Some("GlobalPlatform Issuer Security Domain")
         }
+        _ if aid == fingerprint::SWISSBIT_CARD_MANAGER_AID => Some("Swissbit iShield Card Manager"),
+        _ if aid == fingerprint::SWISSBIT_MANAGEMENT_AID => Some("Swissbit Management Application"),
         _ if aid == keyroost_token2otp::OTP_APPLET_AID => Some("Token2 OTP applet"),
         _ => None,
     }
@@ -5795,6 +5932,29 @@ fn describe_apdu(apdu: &[u8]) -> String {
         // unit's full serial, after that probe has already SELECTed the OTP
         // applet.
         None if ins == 0x33 => "GET_INFO (Token2 OTP applet)".to_string(),
+        // Swissbit iShield Key 1 Card Manager's vendor commands (CLA 0xB1,
+        // INS 0x05; P1 picks the field), read by
+        // `PivSession::probe_swissbit_card_manager`. Matched on the exact
+        // constants — INS 0x05 isn't a `piv::Instruction`.
+        None if apdu == piv::fingerprint::SWISSBIT_GET_DEVICE_NAME => {
+            "GET DEVICE NAME (Swissbit Card Manager)".to_string()
+        }
+        None if apdu == piv::fingerprint::SWISSBIT_GET_FIRMWARE_VERSION => {
+            "GET FIRMWARE VERSION (Swissbit Card Manager)".to_string()
+        }
+        // Swissbit Management Application's own `GET SERIAL` (INS 0x28) —
+        // the fallback `PivSession::probe_swissbit_management` sends once
+        // its AID is selected. Named with the applet so it isn't read as
+        // Yubico's GET SERIAL extension (INS 0xF8).
+        None if apdu == piv::fingerprint::SWISSBIT_GET_SERIAL => {
+            "GET SERIAL (Swissbit Management Application)".to_string()
+        }
+        // Swissbit Management Application's `GET DEVICE INFO` (INS 0x10),
+        // read by `PivSession::probe_swissbit_management` for the iShield
+        // 2's device name.
+        None if apdu == piv::fingerprint::SWISSBIT_GET_DEVICE_INFO => {
+            "GET DEVICE INFO (Swissbit Management Application)".to_string()
+        }
         None => format!("INS {ins:#04X}"),
     }
 }
@@ -6497,6 +6657,46 @@ mod tests {
             describe_apdu(&keyroost_piv::fingerprint::hid_crescendo_aca_put_xauth_key_remove()),
             "PUT XAUTH KEY (HID ACA, delete)"
         );
+    }
+
+    #[test]
+    fn describe_apdu_names_the_swissbit_card_manager() {
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::SWISSBIT_CARD_MANAGER_AID
+            )),
+            "SELECT (Swissbit iShield Card Manager)"
+        );
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::SWISSBIT_GET_DEVICE_NAME),
+            "GET DEVICE NAME (Swissbit Card Manager)"
+        );
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::SWISSBIT_GET_FIRMWARE_VERSION),
+            "GET FIRMWARE VERSION (Swissbit Card Manager)"
+        );
+        // A lookalike with a different P1 stays unnamed.
+        assert_eq!(describe_apdu(&[0xB1, 0x05, 0x43, 0x00, 0x00]), "INS 0x05");
+    }
+
+    #[test]
+    fn describe_apdu_names_the_swissbit_management_app() {
+        assert_eq!(
+            describe_apdu(&piv::select_by_aid(
+                &keyroost_piv::fingerprint::SWISSBIT_MANAGEMENT_AID
+            )),
+            "SELECT (Swissbit Management Application)"
+        );
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::SWISSBIT_GET_SERIAL),
+            "GET SERIAL (Swissbit Management Application)"
+        );
+        assert_eq!(
+            describe_apdu(&keyroost_piv::fingerprint::SWISSBIT_GET_DEVICE_INFO),
+            "GET DEVICE INFO (Swissbit Management Application)"
+        );
+        // A lookalike with a different P1 stays unnamed.
+        assert_eq!(describe_apdu(&[0x00, 0x28, 0x01, 0x00]), "INS 0x28");
     }
 
     #[test]

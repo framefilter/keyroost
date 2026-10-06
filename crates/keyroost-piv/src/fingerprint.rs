@@ -81,6 +81,88 @@ pub const NITROKEY_GET_VERSION_STRING: [u8; 5] = [0x00, 0x61, 0x01, 0x00, 0x00];
 /// and passes the result to [`classify`] as `swissbit_rid_selectable`.
 pub const SWISSBIT_RID: [u8; 5] = [0xD2, 0x76, 0x00, 0x01, 0x62];
 
+/// Swissbit Management Application AID (`D2 76 00 01 62 4B 65 79 01`) — the
+/// RID plus Swissbit's own PIX. SELECTing it answers with a few bytes
+/// (3 on an iShield 2, 2 on an iShield 1) that are constant per token but
+/// differ between tokens, so the content is ignored. Only used as the
+/// fallback serial source for [`OpenFips201Variant::SwissbitIShield2`] and
+/// [`ArekinathVariant::SwissbitIShield1`] when
+/// the PIV applet's own Yubico `GET SERIAL` extension gives no usable answer.
+pub const SWISSBIT_MANAGEMENT_AID: [u8; 9] = [0xD2, 0x76, 0x00, 0x01, 0x62, 0x4B, 0x65, 0x79, 0x01];
+
+/// Swissbit Management Application `GET SERIAL` (`INS 0x28`), a bare case-1
+/// APDU answering with the serial as an unsigned big-endian 64-bit integer
+/// (exactly 8 bytes), decoded by [`crate::parse_serial`]. Only meaningful once
+/// [`SWISSBIT_MANAGEMENT_AID`] is selected.
+pub const SWISSBIT_GET_SERIAL: [u8; 4] = [0x00, 0x28, 0x00, 0x00];
+
+/// Swissbit Management Application `GET DEVICE INFO` (`INS 0x10`, one data
+/// byte `01`, case 4), answering with a `30` SEQUENCE of single-byte-tag
+/// fields. Tag `8C` carries the device name as ASCII (e.g. `iShield Key 2 Pro
+/// MIFARE`); [`parse_swissbit_device_name`] extracts it. Only meaningful once
+/// [`SWISSBIT_MANAGEMENT_AID`] is selected.
+pub const SWISSBIT_GET_DEVICE_INFO: [u8; 7] = [0x00, 0x10, 0x00, 0x00, 0x01, 0x01, 0x00];
+
+/// Extract the device name (tag `8C`) from a [`SWISSBIT_GET_DEVICE_INFO`]
+/// reply. Walks the TLV structure rather than scanning for the tag byte,
+/// because other fields' values can contain `8C` (e.g. tag `8B`'s). `None` if
+/// the reply isn't a well-formed `30` SEQUENCE, has no `8C`, or its name is
+/// empty after [`parse_swissbit_text`]'s trimming.
+#[must_use]
+pub fn parse_swissbit_device_name(data: &[u8]) -> Option<String> {
+    fn split_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = data.split_first()?;
+        let (&first, rest) = rest.split_first()?;
+        let (len, rest) = match first {
+            0x81 => {
+                let (&n, rest) = rest.split_first()?;
+                (usize::from(n), rest)
+            }
+            n if n < 0x80 => (usize::from(n), rest),
+            _ => return None,
+        };
+        (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+    }
+    let (tag, mut body, _) = split_tlv(data)?;
+    if tag != 0x30 {
+        return None;
+    }
+    while !body.is_empty() {
+        let (tag, value, rest) = split_tlv(body)?;
+        if tag == 0x8C {
+            return parse_swissbit_text(value);
+        }
+        body = rest;
+    }
+    None
+}
+
+/// Card Manager AID (`A0 00 00 01 51 00 00 00`) on a Swissbit iShield Key 1 —
+/// the 8-byte form, unlike the 7-byte [`GLOBAL_PLATFORM_ISD_AID`] HID
+/// Crescendo answers to. Hosts the two vendor commands below.
+pub const SWISSBIT_CARD_MANAGER_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x01, 0x51, 0x00, 0x00, 0x00];
+
+/// Swissbit Card Manager command (`CLA B1 INS 05 P1 42`, case 2) answering
+/// with the firmware version as ASCII. Supported by the iShield Key 1 only; only meaningful once [`SWISSBIT_CARD_MANAGER_AID`] is
+/// selected. Decode with [`parse_swissbit_text`].
+pub const SWISSBIT_GET_FIRMWARE_VERSION: [u8; 5] = [0xB1, 0x05, 0x42, 0x00, 0x00];
+
+/// Swissbit Card Manager command (`CLA B1 INS 05 P1 41`, case 2) answering
+/// with the device name as ASCII. Supported by the iShield Key 1 only;
+/// only meaningful once [`SWISSBIT_CARD_MANAGER_AID`] is selected. Decode
+/// with [`parse_swissbit_text`].
+pub const SWISSBIT_GET_DEVICE_NAME: [u8; 5] = [0xB1, 0x05, 0x41, 0x00, 0x00];
+
+/// Decode a Swissbit Card Manager ASCII reply ([`SWISSBIT_GET_FIRMWARE_VERSION`],
+/// [`SWISSBIT_GET_DEVICE_NAME`]): lossy UTF-8 with surrounding whitespace and
+/// NUL padding trimmed. `None` when nothing is left.
+#[must_use]
+pub fn parse_swissbit_text(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    let text = text.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
 /// HID Crescendo C2300's GET PIV PROPERTIES data object tag — read like any
 /// other PIV data object, via [`crate::get_data`] (which frames it as `5C 03
 /// FF FF 7F`), per HID's own C2300 low-level API reference:
@@ -1467,6 +1549,10 @@ pub fn classify(
 mod tests {
     use super::*;
 
+    fn hex(s: &str) -> Vec<u8> {
+        keyroost_proto::codec::hex_decode(&s.split_whitespace().collect::<String>()).unwrap()
+    }
+
     // --- atr_historical_bytes: interface-byte walk ------------------------
 
     #[test]
@@ -1566,6 +1652,56 @@ mod tests {
     fn select_identity_absent_is_none() {
         let resp = [0x6F, 0x02, 0x84, 0x00];
         assert_eq!(select_identity(&resp), None);
+    }
+
+    #[test]
+    fn parse_swissbit_device_name_reads_tag_8c_not_a_stray_8c_byte() {
+        // Real iShield Key 2 Pro reply: tag 8B's value contains an 0x8C byte
+        // that a naive scan would mistake for the name tag.
+        let reply = hex(
+            "30 57 81 0A D2 76 00 01 62 54 4F 54 50 01 82 01 0A 83 01 05 84 01 DC \
+             85 01 28 86 01 32 87 01 00 88 01 00 89 01 00 8A 01 05 \
+             8B 08 00 00 00 8C 57 A2 AB B1 \
+             8C 18 69 53 68 69 65 6C 64 20 4B 65 79 20 32 20 50 72 6F 20 4D 49 46 41 52 45 \
+             8D 01 01 8E 01 0A 8F 04 00 00 00 00",
+        );
+        assert_eq!(
+            parse_swissbit_device_name(&reply),
+            Some("iShield Key 2 Pro MIFARE".into())
+        );
+    }
+
+    #[test]
+    fn parse_swissbit_device_name_rejects_malformed_replies() {
+        assert_eq!(parse_swissbit_device_name(&[]), None);
+        // Wrong outer tag.
+        assert_eq!(
+            parse_swissbit_device_name(&[0x31, 0x03, 0x8C, 0x01, 0x41]),
+            None
+        );
+        // No 8C field.
+        assert_eq!(
+            parse_swissbit_device_name(&[0x30, 0x03, 0x82, 0x01, 0x0A]),
+            None
+        );
+        // Truncated field.
+        assert_eq!(
+            parse_swissbit_device_name(&[0x30, 0x03, 0x8C, 0x05, 0x41]),
+            None
+        );
+        // Empty name.
+        assert_eq!(parse_swissbit_device_name(&[0x30, 0x02, 0x8C, 0x00]), None);
+    }
+
+    #[test]
+    fn parse_swissbit_text_trims_padding_and_rejects_empty() {
+        assert_eq!(
+            parse_swissbit_text(b"iShield Key 2\0\0"),
+            Some("iShield Key 2".into())
+        );
+        assert_eq!(parse_swissbit_text(b" 1.1.2\r\n"), Some("1.1.2".into()));
+        assert_eq!(parse_swissbit_text(b""), None);
+        assert_eq!(parse_swissbit_text(b"\0\0 "), None);
     }
 
     // --- wants_swissbit_probe -----------------------------------------
