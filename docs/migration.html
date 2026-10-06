@@ -71,7 +71,8 @@
       No secret is taken on the command line any more: the flags that took
       one as a plain argument are gone, a few secret flags are renamed, and
       with no <code>-env</code> / <code>-stdin</code> flag a terminal asks
-      for the secret at a hidden prompt (see
+      for the secret at a hidden prompt, except for the Molto2 seed and
+      key commands, which need a flag to choose the encoding (see
       <a href="#v0-13-0-secrets">secrets</a> below).
       Library consumers: <code>keyroost-resolve</code> drops its HID-only
       name resolver for the shared device model.</p>
@@ -172,6 +173,9 @@
     <p>Every PIN, password, key, seed and <code>otpauth://</code> URI now
       comes from <code>--X-env VAR</code>, from <code>--X-stdin</code> (one
       line), or, with neither and a terminal present, from a hidden prompt.
+      The exceptions are <code>molto seed</code>, <code>prog seed</code> and
+      <code>molto customer-key</code>: the flag you use says whether the
+      value is hex, base32 or ASCII, so one of those flags is required.
       New PINs, passwords and keys typed at the prompt are asked twice. A
       script with no source is refused with an error naming the flags. A
       removed or renamed flag is refused with an error naming its
@@ -226,7 +230,8 @@
         <td>The current key is line 1 and the new one line 2. Swap the
           lines in a script that pipes both.</td></tr>
       <tr><td>No <code>-env</code> / <code>-stdin</code> flag: refused, even in a terminal. A <code>-stdin</code> flag typed at a terminal showed the secret, with a warning</td>
-        <td>In a terminal: a hidden prompt (<code>--X-stdin</code> typed
+        <td>In a terminal: a hidden prompt, except for the Molto2 seed and
+          key commands above (<code>--X-stdin</code> typed
           at a terminal is hidden too). In a script: refused, naming the
           flags. After a secret is typed at the prompt, keyroost checks it
           is still the same key before acting.</td></tr>
