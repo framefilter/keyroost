@@ -2998,12 +2998,14 @@ enum LargeBlobCmd {
 enum OtpCmd {
     /// List the OTP entries stored on the key, with their live codes where the
     /// device returns them (TOTP without button-press). On a PIN-protected
-    /// (R3.4+) key, supply the PIN via `--pin-stdin` or `--pin-env` to unlock.
+    /// (R3.4+) key the PIN comes from `--pin-env`/`--pin-stdin` or, with
+    /// neither, a hidden prompt; a key without a PIN is never asked.
     List {
         /// Read the OTP PIN from the named environment variable (protected keys).
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (one line) to unlock a protected key.
+        /// Read the OTP PIN from stdin (hidden when typed at a terminal) to
+        /// unlock a protected key.
         #[arg(long)]
         pin_stdin: bool,
     },
@@ -3017,8 +3019,10 @@ enum OtpCmd {
         #[arg(long)]
         account: String,
     },
-    /// Add (or overwrite) an OTP entry. The base32 seed is read from stdin or an
-    /// env var — never argv.
+    /// Add (or overwrite) an OTP entry. The base32 seed comes from an
+    /// environment variable, stdin or, with neither, a hidden prompt — never
+    /// argv. A PIN-protected (R3.4+) key also needs its PIN: piped together
+    /// with the seed, the seed is the first line and the PIN the second.
     Add {
         /// Application/issuer name (0..=64 ASCII chars; may be empty).
         #[arg(long, default_value = "")]
@@ -3044,18 +3048,20 @@ enum OtpCmd {
         /// Read the base32 seed from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
         seed_env: Option<String>,
-        /// Read the base32 seed from stdin (one line).
+        /// Read the base32 seed from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         seed_stdin: bool,
         /// OTP PIN for a protected (R3.4+) key, from this env var.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (SECOND line, after the seed) to unlock a
-        /// protected key.
+        /// Read the OTP PIN from stdin (second line, after the seed; hidden when
+        /// typed at a terminal) to unlock a protected key.
         #[arg(long)]
         pin_stdin: bool,
     },
-    /// Delete one OTP entry by app and account.
+    /// Delete one OTP entry by app and account. A PIN-protected (R3.4+) key's
+    /// PIN comes from `--pin-env`/`--pin-stdin` or, with neither, a hidden
+    /// prompt after the question.
     Delete {
         /// Application/issuer name as stored (may be empty).
         #[arg(long, default_value = "")]
@@ -3066,7 +3072,8 @@ enum OtpCmd {
         /// OTP PIN for a protected (R3.4+) key, from this env var.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (one line) to unlock a protected key.
+        /// Read the OTP PIN from stdin (hidden when typed at a terminal) to
+        /// unlock a protected key.
         #[arg(long)]
         pin_stdin: bool,
         /// Confirm without asking (required when not run from a terminal).
@@ -3083,8 +3090,9 @@ enum OtpCmd {
     /// Read the device serial number (over USB, or NFC where the model allows).
     Serial,
     /// Configure the single HOTP-on-button keystroke slot: the key types this
-    /// code when touched outside a session. The base32 seed is read from stdin
-    /// or an env var — never argv.
+    /// code when touched outside a session. The base32 seed comes from an
+    /// environment variable, stdin or, with neither, a hidden prompt — never
+    /// argv.
     ButtonHotp {
         /// Code length — must be 6 or 8.
         #[arg(long, default_value_t = 6)]
@@ -3101,7 +3109,7 @@ enum OtpCmd {
         /// Read the base32 seed from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
         seed_env: Option<String>,
-        /// Read the base32 seed from stdin (one line).
+        /// Read the base32 seed from stdin (hidden when typed at a terminal).
         #[arg(long)]
         seed_stdin: bool,
         /// Confirm without asking (required when not run from a terminal).
@@ -3143,45 +3151,55 @@ enum OtpCmd {
     /// Report OTP-PIN status (R3.4+ keys): whether a PIN is set and retries left.
     PinStatus,
     /// Set an OTP PIN on a currently-unprotected key. After this, codes are
-    /// readable only after `verify`. The PIN is read from stdin or an env var —
-    /// never argv.
+    /// readable only after `verify`. The PIN comes from an environment
+    /// variable, stdin or, with neither, a hidden prompt (asked twice) — never
+    /// argv.
     ///
     /// There is no PIN reset: wrong attempts count down a retry counter, and a
     /// blocked PIN is recoverable only by erasing every OTP entry on the key
     /// (`otp erase-all`). Keep a record of the PIN somewhere you trust.
     SetPin {
-        /// Read the PIN from the named environment variable.
+        /// Read the new OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
-        /// Read the PIN from stdin (one line).
+        /// Read the new OTP PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
     },
     /// Verify the OTP PIN, opening the read window for this connection (mostly
-    /// for testing; `list`/`get` take `--pin-*` directly). PIN via stdin or env.
+    /// for testing; `list` takes `--pin-*` directly). PIN via env, stdin or,
+    /// with neither, a hidden prompt.
     Verify {
+        /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
     },
-    /// Change the OTP PIN. Reads the current PIN from stdin (first line) and the
-    /// new PIN from stdin (second line), or from two env vars.
+    /// Change the OTP PIN: current first, then new (stdin lines 1 and 2, env
+    /// vars, or the prompt).
     ChangePin {
-        /// Env var holding the current PIN.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        current_env: Option<String>,
-        /// Env var holding the new PIN.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        new_env: Option<String>,
-        /// Read current PIN (line 1) and new PIN (line 2) from stdin.
+        /// Read the current OTP PIN from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
+        old_pin_env: Option<String>,
+        /// Read the current OTP PIN from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
-        pin_stdin: bool,
+        old_pin_stdin: bool,
+        /// Read the new OTP PIN from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
+        /// Read the new OTP PIN from stdin (second line; hidden when typed at a terminal).
+        #[arg(long)]
+        new_pin_stdin: bool,
     },
-    /// Remove the OTP PIN (requires the current PIN). PIN via stdin or env.
+    /// Remove the OTP PIN (requires the current PIN). PIN via env, stdin or,
+    /// with neither, a hidden prompt.
     RemovePin {
+        /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
     },
@@ -3190,15 +3208,19 @@ enum OtpCmd {
     /// Enable fingerprint protection for OTP (needs the current PIN). After this,
     /// codes can be unlocked by a fingerprint touch as well as the PIN.
     FpEnable {
+        /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
     },
     /// Disable fingerprint protection for OTP (needs the current PIN).
     FpDisable {
+        /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
     },
@@ -3207,10 +3229,13 @@ enum OtpCmd {
     FpList,
     /// List codes, unlocking with a fingerprint if enabled and falling back to
     /// the PIN if the touch fails (or if fingerprint protection is off). Supply
-    /// the PIN via `--pin-stdin`/`--pin-env` to enable the fallback.
+    /// the PIN via `--pin-stdin`/`--pin-env` to enable the fallback (never
+    /// prompted for: without a flag there is no PIN fallback).
     UnlockList {
+        /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
         /// Skip the fingerprint attempt and go straight to the PIN.
@@ -6657,6 +6682,80 @@ fn ensure_otp_feature(
     Ok(())
 }
 
+const OTP_PIN: Spec = Spec::current("OTP PIN", "pin");
+const OTP_NEW_PIN_SET: Spec = Spec::new_secret("new OTP PIN", "pin");
+const OTP_OLD_PIN: Spec = Spec::current("current OTP PIN", "old-pin");
+const OTP_NEW_PIN: Spec = Spec::new_secret("new OTP PIN", "new-pin");
+const OTP_SEED: Spec = Spec::value("seed", "seed").base32();
+
+/// The OTP PIN for a command that needs it only when the key has one set
+/// (list, add, delete). A PIN given by flag is read as is; otherwise a
+/// short session asks the key, is closed, and only then does a terminal
+/// get the hidden prompt.
+fn otp_pin_if_needed(
+    sec: &mut Secrets,
+    dev: &keyroost_resolve::Device,
+    transport: OtpTransportArg,
+    debug: bool,
+    src: Source<'_>,
+) -> Result<Option<zeroize::Zeroizing<String>>, Box<dyn std::error::Error>> {
+    if let Some(pin) = sec.read_given(&OTP_PIN, src)? {
+        return Ok(Some(pin));
+    }
+    let pinned = {
+        let mut probe = open_otp_on(dev, transport, debug)?;
+        probe.pin_is_set()
+    }; // the probe session is closed here, before any prompt
+    if let Err(e) = &pinned {
+        if sec.terminal_present() {
+            eprintln!(
+                "{}",
+                sanitize_terminal(&format!(
+                    "could not tell whether this key has an OTP PIN ({e}); asking for it in case"
+                ))
+            );
+        }
+    }
+    Ok(otp_pin_after_probe(sec, pinned)?)
+}
+
+/// A secret every run of the command needs: refused before any device I/O
+/// when it has no source, read after the key is announced and before its
+/// session opens.
+fn otp_required_secret(
+    sel: &OtpSelect<'_>,
+    spec: &Spec,
+    env: &Option<String>,
+    stdin: bool,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    let mut sec = Secrets::real();
+    let src = Source::new(env.as_deref(), stdin);
+    sec.check(spec, src)?;
+    select_otp(sel)?;
+    Ok(sec.read(spec, src)?)
+}
+
+/// What the key's answer means for the PIN: none needed when it has no PIN;
+/// the hidden prompt (or a refusal naming the flags) when it has one. A
+/// probe that failed is never taken as "no PIN" — that would carry on
+/// without one and fail later with a less helpful error — so it is treated
+/// like a PIN-protected key.
+fn otp_pin_after_probe<I: crate::secrets::SecretIo, E: std::fmt::Display>(
+    sec: &mut Secrets<I>,
+    pinned: Result<bool, E>,
+) -> Result<Option<zeroize::Zeroizing<String>>, String> {
+    let why = match pinned {
+        Ok(false) => return Ok(None),
+        Ok(true) => "this key's OTP codes are PIN-protected".to_string(),
+        Err(e) => sanitize_terminal(&format!(
+            "could not tell whether this key's OTP codes are PIN-protected ({e})"
+        )),
+    };
+    sec.read(&OTP_PIN, Source::NONE)
+        .map(Some)
+        .map_err(|e| format!("{why}; {e}"))
+}
+
 fn run_otp(
     cmd: &OtpCmd,
     sel: OtpSelect<'_>,
@@ -6664,17 +6763,19 @@ fn run_otp(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         OtpCmd::List { pin_env, pin_stdin } => {
-            let mut session = open_otp(&sel, debug)?;
+            let dev = select_otp(&sel)?;
+            let pin = otp_pin_if_needed(
+                &mut Secrets::real(),
+                &dev,
+                sel.transport,
+                debug,
+                Source::new(pin_env.as_deref(), *pin_stdin),
+            )?;
+            let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
-            // If a PIN was supplied, unlock the protected read window first; if
-            // the key is protected and none was given, enumerate_pinned surfaces
-            // a clear "PIN required" error the user can act on.
-            let pin = if pin_env.is_some() || *pin_stdin {
-                Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
-            } else {
-                None
-            };
+            // A key whose PIN was set since the probe still surfaces a clear
+            // "PIN required" error from enumerate_pinned.
             let entries = session.enumerate_pinned(now, pin.as_deref().map(|p| p.as_str()))?;
             if json_output() {
                 let out: Vec<json_out::OtpEntryJson> = entries
@@ -6749,38 +6850,23 @@ fn run_otp(
             if !(4..=10).contains(digits) {
                 return Err("--digits must be between 4 and 10".into());
             }
-            // On stdin the seed is line 1 and (if --pin-stdin) the PIN is line 2.
-            let (seed_b32, pin): (
-                zeroize::Zeroizing<String>,
-                Option<zeroize::Zeroizing<String>>,
-            ) = if *seed_stdin && *pin_stdin {
-                use std::io::BufRead;
-                let stdin = std::io::stdin();
-                let mut lines = stdin.lock().lines();
-                let seed = lines
-                    .next()
-                    .transpose()?
-                    .ok_or("expected base32 seed on stdin line 1")?;
-                let pin = lines
-                    .next()
-                    .transpose()?
-                    .ok_or("expected OTP PIN on stdin line 2")?;
-                (
-                    zeroize::Zeroizing::new(seed),
-                    Some(zeroize::Zeroizing::new(pin)),
-                )
-            } else {
-                let seed = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
-                let pin = if pin_env.is_some() || *pin_stdin {
-                    Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
-                } else {
-                    None
-                };
-                (seed, pin)
-            };
-            let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
+            let mut sec = Secrets::real();
+            let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
+            sec.check(&OTP_SEED, seed_src)?;
+            let dev = select_otp(&sel)?;
+            // The seed first (stdin line 1); the OTP PIN, if the key has one,
+            // second.
+            let seed_b32 = sec.read(&OTP_SEED, seed_src)?;
+            let seed = keyroost_token2otp::decode_base32_seed(&seed_b32)
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
-            let mut session = open_otp(&sel, debug)?;
+            let pin = otp_pin_if_needed(
+                &mut sec,
+                &dev,
+                sel.transport,
+                debug,
+                Source::new(pin_env.as_deref(), *pin_stdin),
+            )?;
+            let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let entry = keyroost_token2otp::WriteEntry {
                 otp_type: otp_type.to_t2(),
@@ -6819,11 +6905,13 @@ fn run_otp(
                 *yes,
                 &format!("delete OTP entry {label:?}"),
             )?;
-            let pin = if pin_env.is_some() || *pin_stdin {
-                Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
-            } else {
-                None
-            };
+            let pin = otp_pin_if_needed(
+                &mut Secrets::real(),
+                &dev,
+                sel.transport,
+                debug,
+                Source::new(pin_env.as_deref(), *pin_stdin),
+            )?;
             crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.delete_entry_pinned(app, account, pin.as_deref().map(|p| p.as_str()))?;
@@ -6862,6 +6950,9 @@ fn run_otp(
             if *digits != 6 && *digits != 8 {
                 return Err("button HOTP --digits must be 6 or 8".into());
             }
+            let mut sec = Secrets::real();
+            let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
+            sec.check(&OTP_SEED, seed_src)?;
             let dev = select_otp(&sel)?;
             // An unsupported key fails here, and an empty button slot needs
             // no question.
@@ -6871,8 +6962,8 @@ fn run_otp(
             } else {
                 false
             };
-            let seed_b32 = read_secret("seed", seed_env.as_deref(), *seed_stdin)?;
-            let seed = keyroost_token2otp::decode_base32_seed(seed_b32.trim())
+            let seed_b32 = sec.read(&OTP_SEED, seed_src)?;
+            let seed = keyroost_token2otp::decode_base32_seed(&seed_b32)
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
             crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
@@ -7051,53 +7142,43 @@ fn run_otp(
             }
         }
         OtpCmd::SetPin { pin_env, pin_stdin } => {
-            let pin = read_secret("new OTP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = otp_required_secret(&sel, &OTP_NEW_PIN_SET, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_pin(pin.as_str())?;
             println!("OTP PIN set. Codes now require the PIN to read.");
         }
         OtpCmd::Verify { pin_env, pin_stdin } => {
-            let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.verify_pin(pin.as_str())?;
             println!("OTP PIN verified; read window open for this connection.");
         }
         OtpCmd::ChangePin {
-            current_env,
-            new_env,
-            pin_stdin,
+            old_pin_env,
+            old_pin_stdin,
+            new_pin_env,
+            new_pin_stdin,
         } => {
-            let (current, new) = if *pin_stdin {
-                // Two lines from stdin: current, then new.
-                use std::io::BufRead;
-                let stdin = std::io::stdin();
-                let mut lines = stdin.lock().lines();
-                let current = lines
-                    .next()
-                    .transpose()?
-                    .ok_or("expected current PIN on stdin line 1")?;
-                let new = lines
-                    .next()
-                    .transpose()?
-                    .ok_or("expected new PIN on stdin line 2")?;
-                (
-                    zeroize::Zeroizing::new(current),
-                    zeroize::Zeroizing::new(new),
-                )
-            } else {
-                let current = read_secret("current OTP PIN", current_env.as_deref(), false)?;
-                let new = read_secret("new OTP PIN", new_env.as_deref(), false)?;
-                (current, new)
-            };
+            let mut sec = Secrets::real();
+            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
+            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            sec.check(&OTP_OLD_PIN, first_src)?;
+            sec.check(&OTP_NEW_PIN, second_src)?;
+            select_otp(&sel)?;
+            let (current, new) = read_secret_pair(
+                &mut sec,
+                (&OTP_OLD_PIN, first_src),
+                (&OTP_NEW_PIN, second_src),
+            )?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.change_pin(current.as_str(), new.as_str())?;
             println!("OTP PIN changed.");
         }
         OtpCmd::RemovePin { pin_env, pin_stdin } => {
-            let current = read_secret("current OTP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let current = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.remove_pin(current.as_str())?;
@@ -7113,14 +7194,14 @@ fn run_otp(
             }
         }
         OtpCmd::FpEnable { pin_env, pin_stdin } => {
-            let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), true)?;
             println!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
         }
         OtpCmd::FpDisable { pin_env, pin_stdin } => {
-            let pin = read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), false)?;
@@ -7159,11 +7240,10 @@ fn run_otp(
             pin_stdin,
             pin_only,
         } => {
-            let pin = if pin_env.is_some() || *pin_stdin {
-                Some(read_secret("OTP PIN", pin_env.as_deref(), *pin_stdin)?)
-            } else {
-                None
-            };
+            // The PIN is only the fingerprint's fallback: read when a flag
+            // names it, never prompted for.
+            let pin = Secrets::real()
+                .read_given(&OTP_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
@@ -13338,6 +13418,117 @@ mod cli_tests {
             let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
             assert!(help.contains(line), "oath {sub} --{flag}: {help:?}");
         }
+    }
+
+    #[test]
+    fn otp_change_pin_takes_old_and_new_pin_flags() {
+        match parse(&[
+            "keyroostctl",
+            "otp",
+            "change-pin",
+            "--old-pin-env",
+            "A",
+            "--new-pin-stdin",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(Cmd::Otp {
+                cmd:
+                    OtpCmd::ChangePin {
+                        old_pin_env,
+                        old_pin_stdin,
+                        new_pin_env,
+                        new_pin_stdin,
+                    },
+                ..
+            }) => {
+                assert_eq!(old_pin_env.as_deref(), Some("A"));
+                assert!(!old_pin_stdin);
+                assert!(new_pin_env.is_none());
+                assert!(new_pin_stdin);
+            }
+            _ => panic!("expected otp change-pin"),
+        }
+        for old in [
+            &["--current-env", "V"][..],
+            &["--new-env", "V"][..],
+            &["--pin-stdin"][..],
+        ] {
+            let mut argv = vec!["keyroostctl", "otp", "change-pin"];
+            argv.extend_from_slice(old);
+            let e = parse(&argv).err().unwrap();
+            assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "{old:?}");
+        }
+        // Each source of one PIN excludes the other.
+        assert!(parse(&[
+            "keyroostctl",
+            "otp",
+            "change-pin",
+            "--old-pin-env",
+            "A",
+            "--old-pin-stdin",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn otp_two_secret_flags_name_their_stdin_line() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let otp = cmd.find_subcommand("otp").unwrap();
+        for (sub, flag, line) in [
+            ("change-pin", "old-pin-stdin", "first line"),
+            ("change-pin", "new-pin-stdin", "second line"),
+            ("add", "seed-stdin", "first line"),
+            ("add", "pin-stdin", "second line"),
+        ] {
+            let arg = otp
+                .find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .find(|a| a.get_long() == Some(flag))
+                .unwrap_or_else(|| panic!("{sub} --{flag}"));
+            let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(help.contains(line), "otp {sub} --{flag}: {help:?}");
+        }
+    }
+
+    #[test]
+    fn otp_pin_is_asked_only_when_the_key_has_one() {
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::Secrets;
+        // No PIN on the key: nothing is asked, even at a terminal.
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["1234"]));
+        assert!(otp_pin_after_probe(&mut sec, Ok::<_, String>(false))
+            .unwrap()
+            .is_none());
+        assert!(sec.io.prompts.is_empty());
+        // A PIN on the key: the hidden prompt, once.
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["1234"]));
+        let pin = otp_pin_after_probe(&mut sec, Ok::<_, String>(true)).unwrap();
+        assert_eq!(pin.as_deref().map(String::as_str), Some("1234"));
+        assert_eq!(sec.io.prompts, vec!["OTP PIN: ".to_string()]);
+        // A PIN on the key and no terminal: refuse naming the flags.
+        let mut sec = Secrets::new(FakeIo::default());
+        let e = otp_pin_after_probe(&mut sec, Ok::<_, String>(true)).unwrap_err();
+        assert!(e.contains("PIN-protected"), "{e}");
+        assert!(e.contains("--pin-env VAR or --pin-stdin"), "{e}");
+    }
+
+    #[test]
+    fn otp_pin_probe_failure_is_never_taken_as_no_pin() {
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::Secrets;
+        // At a terminal: ask rather than carry on without a PIN.
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["1234"]));
+        let pin = otp_pin_after_probe(&mut sec, Err("read failed")).unwrap();
+        assert_eq!(pin.as_deref().map(String::as_str), Some("1234"));
+        // Without one: refuse, naming the probe failure and the flags.
+        let mut sec = Secrets::new(FakeIo::default());
+        let e = otp_pin_after_probe(&mut sec, Err("read failed")).unwrap_err();
+        assert!(e.contains("read failed"), "{e}");
+        assert!(e.contains("--pin-env VAR or --pin-stdin"), "{e}");
     }
 
     #[test]
