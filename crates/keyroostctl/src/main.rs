@@ -629,8 +629,8 @@ enum Cmd {
             conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
         )]
         mgmt_key_env: Option<String>,
-        /// Same credential, read from stdin (one line, hex) instead of an
-        /// environment variable.
+        /// Same credential, read from stdin (one line, hex; hidden when typed
+        /// at a terminal) instead of an environment variable.
         #[arg(
             long,
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
@@ -653,8 +653,8 @@ enum Cmd {
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
         )]
         pin_env: Option<String>,
-        /// Same PIN, read from stdin (one line) instead of an environment
-        /// variable.
+        /// Same PIN, read from stdin (one line; hidden when typed at a
+        /// terminal) instead of an environment variable.
         #[arg(
             long,
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
@@ -1210,7 +1210,8 @@ enum PivCmd {
         /// Read the new PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (second line; hidden when typed at a terminal).
+        /// Read the new PIN from stdin (second line when --old-pin-stdin is also given; hidden when
+        /// typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
     },
@@ -1229,7 +1230,8 @@ enum PivCmd {
         /// Read the new PUK from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_puk_stdin")]
         new_puk_env: Option<String>,
-        /// Read the new PUK from stdin (second line; hidden when typed at a terminal).
+        /// Read the new PUK from stdin (second line when --old-puk-stdin is also given; hidden when
+        /// typed at a terminal).
         #[arg(long)]
         new_puk_stdin: bool,
     },
@@ -1246,7 +1248,8 @@ enum PivCmd {
         /// Read the new PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (second line; hidden when typed at a terminal).
+        /// Read the new PIN from stdin (second line when --puk-stdin is also given; hidden when
+        /// typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
     },
@@ -1262,7 +1265,8 @@ enum PivCmd {
         /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (second line; hidden when typed at a terminal).
+        /// Read the management key (hex) from stdin (second line when --pin-stdin is also given;
+        /// hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
         /// Use the factory-default management key keyroost knows for this device.
@@ -1328,8 +1332,8 @@ enum PivCmd {
             display_order = 14
         )]
         new_mgmt_key_env: Option<String>,
-        /// Read the new management key (hex) from stdin (second line; hidden when typed at a
-        /// terminal).
+        /// Read the new management key (hex) from stdin (second line when --old-mgmt-key-stdin is
+        /// also given; hidden when typed at a terminal).
         #[arg(long, display_order = 15)]
         new_mgmt_key_stdin: bool,
         /// Algorithm of the NEW management key.
@@ -1484,8 +1488,8 @@ enum PivCmd {
             requires = "generate_key"
         )]
         mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (second line; hidden when typed at a terminal).
-        /// Only with --generate-key.
+        /// Read the management key (hex) from stdin (second line when --pin-stdin is also given;
+        /// hidden when typed at a terminal). Only with --generate-key.
         #[arg(
             long,
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"],
@@ -1547,7 +1551,8 @@ enum PivCmd {
         /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (second line; hidden when typed at a terminal).
+        /// Read the management key (hex) from stdin (second line when --pin-stdin is also given;
+        /// hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
         /// Use the factory-default management key keyroost knows for this device.
@@ -1675,8 +1680,8 @@ enum PivCmd {
             conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
         )]
         mgmt_key_env: Option<String>,
-        /// Same credential, read from stdin (one line, hex) instead of an
-        /// environment variable.
+        /// Same credential, read from stdin (one line, hex; hidden when typed
+        /// at a terminal) instead of an environment variable.
         #[arg(
             long,
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
@@ -1699,8 +1704,8 @@ enum PivCmd {
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
         )]
         pin_env: Option<String>,
-        /// Same PIN, read from stdin (one line) instead of an environment
-        /// variable.
+        /// Same PIN, read from stdin (one line; hidden when typed at a
+        /// terminal) instead of an environment variable.
         #[arg(
             long,
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
@@ -2021,8 +2026,8 @@ enum OpenpgpCmd {
         /// Read the new user PIN (PW1) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new user PIN (PW1) from stdin (second line; hidden when typed at a
-        /// terminal).
+        /// Read the new user PIN (PW1) from stdin (second line when --old-pin-stdin is also given;
+        /// hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
         #[arg(long, value_name = "SUBSTR")]
@@ -2042,8 +2047,8 @@ enum OpenpgpCmd {
         /// Read the new admin PIN (PW3) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new admin PIN (PW3) from stdin (second line; hidden when typed at a
-        /// terminal).
+        /// Read the new admin PIN (PW3) from stdin (second line when --old-pin-stdin is also given;
+        /// hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
         #[arg(long, value_name = "SUBSTR")]
@@ -2064,8 +2069,8 @@ enum OpenpgpCmd {
         /// Read the new user PIN (PW1) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new user PIN (PW1) from stdin (second line; hidden when typed at a
-        /// terminal).
+        /// Read the new user PIN (PW1) from stdin (second line when --admin-pin-stdin is also
+        /// given; hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
         #[arg(long, value_name = "SUBSTR")]
@@ -2254,8 +2259,9 @@ struct OathAccess {
     #[arg(long, value_name = "VAR", conflicts_with = "password_stdin")]
     password_env: Option<String>,
     /// Read the applet password from stdin (hidden when typed at a terminal).
-    /// With a second piped secret: `set-password` reads it first line, before
-    /// the new password; `add` reads it second line, after the seed.
+    /// `set-password` reads it on the first line, before the new password;
+    /// `add` reads it after the seed (second line when --seed-stdin is also
+    /// given).
     #[arg(long)]
     password_stdin: bool,
 }
@@ -2328,7 +2334,8 @@ enum OathCmd {
     },
     /// Set (or replace) the applet password — never from argv. The current
     /// password, if one is set, is read first (env, stdin line 1, or the
-    /// prompt), then the new one.
+    /// prompt), then the new one. To remove the password, use
+    /// `clear-password`.
     SetPassword {
         /// Read the new password from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_password_stdin")]
@@ -2681,7 +2688,8 @@ enum FidoCmd {
         /// Read the new PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (second line; hidden when typed at a terminal).
+        /// Read the new PIN from stdin (second line when --old-pin-stdin is also given; hidden when
+        /// typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -3092,10 +3100,10 @@ enum OtpCmd {
         /// Read the base32 seed from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         seed_stdin: bool,
-        /// OTP PIN for a protected (R3.4+) key, from this env var.
+        /// Read the OTP PIN from the named environment variable (protected keys).
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (second line, after the seed; hidden when
+        /// Read the OTP PIN from stdin (second line when --seed-stdin is also given; hidden when
         /// typed at a terminal) to unlock a protected key.
         #[arg(long)]
         pin_stdin: bool,
@@ -3110,7 +3118,7 @@ enum OtpCmd {
         /// Account name as stored.
         #[arg(long)]
         account: String,
-        /// OTP PIN for a protected (R3.4+) key, from this env var.
+        /// Read the OTP PIN from the named environment variable (protected keys).
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
         /// Read the OTP PIN from stdin (hidden when typed at a terminal) to
@@ -3230,7 +3238,8 @@ enum OtpCmd {
         /// Read the new OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new OTP PIN from stdin (second line; hidden when typed at a terminal).
+        /// Read the new OTP PIN from stdin (second line when --old-pin-stdin is also given; hidden
+        /// when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
     },
@@ -8059,15 +8068,15 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
 }
 
 const PIV_PIN: Spec = Spec::current("PIN", "pin");
-const PIV_OLD_PIN: Spec = Spec::current("old PIN", "old-pin");
+const PIV_OLD_PIN: Spec = Spec::current("current PIN", "old-pin");
 const PIV_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
 const PIV_PUK: Spec = Spec::current("PUK", "puk");
-const PIV_OLD_PUK: Spec = Spec::current("old PUK", "old-puk");
+const PIV_OLD_PUK: Spec = Spec::current("current PUK", "old-puk");
 const PIV_NEW_PUK: Spec = Spec::new_secret("new PUK", "new-puk");
 const PIV_MGMT_KEY: Spec = Spec::current("management key", "mgmt-key")
     .hex()
     .also("--mgmt-key-default");
-const PIV_OLD_MGMT_KEY: Spec = Spec::current("old management key", "old-mgmt-key")
+const PIV_OLD_MGMT_KEY: Spec = Spec::current("current management key", "old-mgmt-key")
     .hex()
     .also("--old-mgmt-key-default");
 const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key").hex();
@@ -13135,7 +13144,10 @@ mod cli_tests {
         let change = fido.find_subcommand("pin-change").unwrap();
         for (flag, line) in [
             ("old-pin-stdin", "first line"),
-            ("new-pin-stdin", "second line"),
+            (
+                "new-pin-stdin",
+                "second line when --old-pin-stdin is also given",
+            ),
         ] {
             let help = change
                 .get_arguments()
@@ -14177,9 +14189,17 @@ mod cli_tests {
         let oath = cmd.find_subcommand("oath").unwrap();
         for (sub, flag, line) in [
             ("set-password", "password-stdin", "first line"),
-            ("set-password", "new-password-stdin", "second line"),
+            (
+                "set-password",
+                "new-password-stdin",
+                "second line when --password-stdin is also given",
+            ),
             ("add", "seed-stdin", "first line"),
-            ("add", "password-stdin", "second line"),
+            (
+                "add",
+                "password-stdin",
+                "second line when --seed-stdin is also given",
+            ),
         ] {
             let arg = oath
                 .find_subcommand(sub)
@@ -14245,15 +14265,59 @@ mod cli_tests {
     }
 
     #[test]
+    fn openpgp_two_secret_flags_name_their_stdin_line() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let openpgp = cmd.find_subcommand("openpgp").unwrap();
+        for (sub, flag, line) in [
+            ("change-pin", "old-pin-stdin", "first line"),
+            (
+                "change-pin",
+                "new-pin-stdin",
+                "second line when --old-pin-stdin is also given",
+            ),
+            ("change-admin-pin", "old-pin-stdin", "first line"),
+            (
+                "change-admin-pin",
+                "new-pin-stdin",
+                "second line when --old-pin-stdin is also given",
+            ),
+            ("unblock-pin", "admin-pin-stdin", "first line"),
+            (
+                "unblock-pin",
+                "new-pin-stdin",
+                "second line when --admin-pin-stdin is also given",
+            ),
+        ] {
+            let arg = openpgp
+                .find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .find(|a| a.get_long() == Some(flag))
+                .unwrap_or_else(|| panic!("{sub} --{flag}"));
+            let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(help.contains(line), "openpgp {sub} --{flag}: {help:?}");
+        }
+    }
+
+    #[test]
     fn otp_two_secret_flags_name_their_stdin_line() {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let otp = cmd.find_subcommand("otp").unwrap();
         for (sub, flag, line) in [
             ("change-pin", "old-pin-stdin", "first line"),
-            ("change-pin", "new-pin-stdin", "second line"),
+            (
+                "change-pin",
+                "new-pin-stdin",
+                "second line when --old-pin-stdin is also given",
+            ),
             ("add", "seed-stdin", "first line"),
-            ("add", "pin-stdin", "second line"),
+            (
+                "add",
+                "pin-stdin",
+                "second line when --seed-stdin is also given",
+            ),
         ] {
             let arg = otp
                 .find_subcommand(sub)
@@ -15562,6 +15626,26 @@ mod cli_tests {
     }
 
     #[test]
+    fn piv_current_secrets_are_called_current_like_every_other_group() {
+        use crate::secrets::fake::FakeIo;
+        let sec = crate::secrets::Secrets::new(FakeIo::default());
+        for (spec, label, flag) in [
+            (&PIV_OLD_PIN, "current PIN", "old-pin"),
+            (&PIV_OLD_PUK, "current PUK", "old-puk"),
+            (&PIV_OLD_MGMT_KEY, "current management key", "old-mgmt-key"),
+        ] {
+            let e = sec.check(spec, Source::NONE).unwrap_err();
+            assert!(
+                e.starts_with(&format!("no {label} given: pass --{flag}-env")),
+                "{e}"
+            );
+        }
+        let mut sec = crate::secrets::Secrets::new(FakeIo::terminal().typing(&["123456"]));
+        sec.read(&PIV_OLD_PIN, Source::NONE).unwrap();
+        assert_eq!(sec.io.prompts, vec!["Current PIN: ".to_string()]);
+    }
+
+    #[test]
     fn mgmt_key_default_is_deferred_and_hex_is_decoded() {
         use crate::secrets::fake::FakeIo;
         let mut sec = crate::secrets::Secrets::new(FakeIo::piped(&[
@@ -15595,7 +15679,7 @@ mod cli_tests {
             .unwrap()
             .to_string();
         assert!(
-            e.starts_with("the old management key is not valid hex"),
+            e.starts_with("the current management key is not valid hex"),
             "{e}"
         );
         assert!(!e.contains("secretish") && !e.contains("zz01"), "{e}");
@@ -15608,19 +15692,47 @@ mod cli_tests {
         let piv = cmd.find_subcommand("piv").unwrap();
         for (sub, flag, line) in [
             ("change-pin", "old-pin-stdin", "first line"),
-            ("change-pin", "new-pin-stdin", "second line"),
+            (
+                "change-pin",
+                "new-pin-stdin",
+                "second line when --old-pin-stdin is also given",
+            ),
             ("change-puk", "old-puk-stdin", "first line"),
-            ("change-puk", "new-puk-stdin", "second line"),
+            (
+                "change-puk",
+                "new-puk-stdin",
+                "second line when --old-puk-stdin is also given",
+            ),
             ("unblock-pin", "puk-stdin", "first line"),
-            ("unblock-pin", "new-pin-stdin", "second line"),
+            (
+                "unblock-pin",
+                "new-pin-stdin",
+                "second line when --puk-stdin is also given",
+            ),
             ("set-retries", "pin-stdin", "first line"),
-            ("set-retries", "mgmt-key-stdin", "second line"),
+            (
+                "set-retries",
+                "mgmt-key-stdin",
+                "second line when --pin-stdin is also given",
+            ),
             ("change-management-key", "old-mgmt-key-stdin", "first line"),
-            ("change-management-key", "new-mgmt-key-stdin", "second line"),
+            (
+                "change-management-key",
+                "new-mgmt-key-stdin",
+                "second line when --old-mgmt-key-stdin is also given",
+            ),
             ("self-sign", "pin-stdin", "first line"),
-            ("self-sign", "mgmt-key-stdin", "second line"),
+            (
+                "self-sign",
+                "mgmt-key-stdin",
+                "second line when --pin-stdin is also given",
+            ),
             ("request-cert", "pin-stdin", "first line"),
-            ("request-cert", "mgmt-key-stdin", "second line"),
+            (
+                "request-cert",
+                "mgmt-key-stdin",
+                "second line when --pin-stdin is also given",
+            ),
         ] {
             let arg = piv
                 .find_subcommand(sub)
@@ -15745,6 +15857,16 @@ mod cli_tests {
                     "{path} --{} has no help",
                     a.get_long().unwrap()
                 );
+                // Every stdin flag falls back to a hidden prompt at a
+                // terminal, and its help says so.
+                if a.get_long().is_some_and(|l| l.ends_with("-stdin")) {
+                    let help = a.get_help().unwrap().to_string();
+                    assert!(
+                        help.contains("hidden when typed at a terminal"),
+                        "{path} --{}: {help}",
+                        a.get_long().unwrap()
+                    );
+                }
             }
             // Two stdin flags that can be combined: each states its line.
             let stdin_args: Vec<&clap::Arg> = cmd
