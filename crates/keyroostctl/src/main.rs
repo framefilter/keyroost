@@ -2253,22 +2253,17 @@ struct OathAccess {
     /// password-protected applets (e.g. a YubiKey with an OATH password set).
     #[arg(long, value_name = "VAR", conflicts_with = "password_stdin")]
     password_env: Option<String>,
-    /// Read the applet password from stdin (one line).
+    /// Read the applet password from stdin (hidden when typed at a terminal).
+    /// With a second piped secret: `set-password` reads it first line, before
+    /// the new password; `add` reads it second line, after the seed.
     #[arg(long)]
     password_stdin: bool,
 }
 
 impl OathAccess {
-    /// Resolve the password from its env/stdin source, if one was given.
-    fn password(&self) -> Result<Option<zeroize::Zeroizing<String>>, Box<dyn std::error::Error>> {
-        if self.password_env.is_none() && !self.password_stdin {
-            return Ok(None);
-        }
-        Ok(Some(read_secret(
-            "OATH password",
-            self.password_env.as_deref(),
-            self.password_stdin,
-        )?))
+    /// Where the applet password comes from, if a flag names a source.
+    fn source(&self) -> Source<'_> {
+        Source::new(self.password_env.as_deref(), self.password_stdin)
     }
 }
 
@@ -2290,20 +2285,22 @@ enum OathCmd {
         #[command(flatten)]
         access: OathAccess,
     },
-    /// Add (provision) a TOTP or HOTP credential. The base32 secret is read from
-    /// stdin or an env var — never argv.
+    /// Add (provision) a TOTP or HOTP credential. The base32 seed comes from an
+    /// environment variable, stdin or, with neither, a hidden prompt — never
+    /// argv. Piped together with the applet password, the seed is the first
+    /// line and the password the second.
     Add {
         /// Credential name to store (e.g. "issuer:account").
         name: String,
         /// Credential type: time-based (TOTP) or counter-based (HOTP).
         #[arg(long = "type", value_enum, default_value_t = OathTypeArg::Totp)]
         oath_type: OathTypeArg,
-        /// Read the base32 secret from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "secret_stdin")]
-        secret_env: Option<String>,
-        /// Read the base32 secret from stdin (one line).
+        /// Read the base32 seed from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
+        seed_env: Option<String>,
+        /// Read the base32 seed from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
-        secret_stdin: bool,
+        seed_stdin: bool,
         /// HMAC algorithm.
         #[arg(long, value_enum, default_value_t = OathAlgoArg::Sha1)]
         algorithm: OathAlgoArg,
@@ -2329,21 +2326,22 @@ enum OathCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Set (or replace) the applet password. The new password is read from an
-    /// env var or stdin — never argv. If a password is already set, supply the
-    /// current one via `--password-env`/`--password-stdin` to unlock first.
+    /// Set (or replace) the applet password — never from argv. The current
+    /// password, if one is set, is read first (env, stdin line 1, or the
+    /// prompt), then the new one.
     SetPassword {
         /// Read the new password from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_password_stdin")]
         new_password_env: Option<String>,
-        /// Read the new password from stdin (one line).
+        /// Read the new password from stdin (second line when --password-stdin
+        /// is also given; hidden when typed at a terminal).
         #[arg(long)]
         new_password_stdin: bool,
         #[command(flatten)]
         access: OathAccess,
     },
-    /// Remove the applet password. Supply the current password via
-    /// `--password-env`/`--password-stdin` to unlock first.
+    /// Remove the applet password. The current password comes from
+    /// `--password-env`/`--password-stdin` or, with neither, a hidden prompt.
     ClearPassword {
         #[command(flatten)]
         access: OathAccess,
@@ -5118,22 +5116,72 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Open an announced OATH session on the resolved reader, unlocking it if the
-/// applet is password-protected. A protected applet without a supplied password
-/// is a clear error rather than a confusing downstream `6982`.
+const OATH_PASSWORD: Spec = Spec::current("OATH password", "password");
+const OATH_NEW_PASSWORD: Spec = Spec::new_secret("new OATH password", "new-password");
+const OATH_SEED: Spec = Spec::value("seed", "seed").base32();
+
+/// Open the OATH applet on the announced key, unlocking it when it is
+/// password-protected. Nothing is held while a password is typed: see
+/// [`oath_current_password`].
 fn open_oath(
+    sec: &mut Secrets,
     access: &OathAccess,
     debug: bool,
 ) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
+    let (name, password) = oath_current_password(sec, access, debug)?;
+    open_oath_unlocked(&name, password.as_deref().map(String::as_str), debug)
+}
+
+/// The announced OATH key's exact reader and, when it needs one, its
+/// current password.
+type OathReaderPassword = (String, Option<zeroize::Zeroizing<String>>);
+
+/// Announce the OATH key and get its current password, if it needs one. A
+/// password named by flag is read without touching the card. Otherwise a
+/// short read-only session asks the applet whether it is protected and is
+/// closed again before the hidden prompt, so nothing is held while the
+/// password is typed.
+fn oath_current_password(
+    sec: &mut Secrets,
+    access: &OathAccess,
+    debug: bool,
+) -> Result<OathReaderPassword, Box<dyn std::error::Error>> {
     let name = crate::target::reader_for(Need::Oath, access.reader.as_deref())?;
-    let mut session = keyroost_transport::OathSession::open(&name)?;
+    if let Some(pw) = sec.read_given(&OATH_PASSWORD, access.source())? {
+        return Ok((name, Some(pw)));
+    }
+    let required = {
+        let mut probe = keyroost_transport::OathSession::open(&name)?;
+        probe.set_debug(debug);
+        probe.password_required()
+    }; // the probe session is closed here, before any prompt
+    if !required {
+        return Ok((name, None));
+    }
+    let pw = sec
+        .read(&OATH_PASSWORD, Source::NONE)
+        .map_err(|e| format!("this OATH applet is password-protected; {e}"))?;
+    Ok((name, Some(pw)))
+}
+
+/// Open the OATH applet on `name` and unlock it with `password`. A protected
+/// applet without one is a clear error rather than a confusing downstream
+/// `6982` (the key may have been swapped since the password was asked for).
+fn open_oath_unlocked(
+    name: &str,
+    password: Option<&str>,
+    debug: bool,
+) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
+    let mut session = keyroost_transport::OathSession::open(name)?;
     session.set_debug(debug);
-    match access.password()? {
-        Some(pw) => session.unlock(&pw)?,
+    match password {
+        Some(pw) => session.unlock(pw)?,
         None if session.password_required() => {
-            return Err("this OATH applet is password-protected; supply it with \
-                        --password-env VAR or --password-stdin"
-                .into());
+            return Err(format!(
+                "this OATH applet is password-protected; pass {}",
+                OATH_PASSWORD.sources_hint()
+            )
+            .into());
         }
         None => {}
     }
@@ -6211,7 +6259,7 @@ fn reset_one_card_applet(
 fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         OathCmd::List { access } => {
-            let mut session = open_oath(access, debug)?;
+            let mut session = open_oath(&mut Secrets::real(), access, debug)?;
             let listing = session.list()?;
             if listing.skipped > 0 {
                 // The listing is PARTIAL — say so loudly, on stderr so it also
@@ -6257,7 +6305,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             period,
             access,
         } => {
-            let mut session = open_oath(access, debug)?;
+            let mut session = open_oath(&mut Secrets::real(), access, debug)?;
             // Dispatch on the stored credential type: HOTP uses the card's own
             // counter (empty challenge), TOTP a time counter.
             let is_hotp = session
@@ -6288,8 +6336,8 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         OathCmd::Add {
             name,
             oath_type,
-            secret_env,
-            secret_stdin,
+            seed_env,
+            seed_stdin,
             algorithm,
             digits,
             counter,
@@ -6302,10 +6350,17 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             if *counter != 0 && !matches!(oath_type, OathTypeArg::Hotp) {
                 return Err("--counter only applies to --type hotp".into());
             }
-            let secret_b32 = read_secret("secret", secret_env.as_deref(), *secret_stdin)?;
-            let secret = base32_decode(secret_b32.trim())
-                .map_err(|e| format!("invalid base32 secret: {}", e))?;
-            let mut session = open_oath(access, debug)?;
+            let mut sec = Secrets::real();
+            let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
+            sec.check(&OATH_SEED, seed_src)?;
+            crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
+            // The seed first (stdin line 1); the applet password, if it needs
+            // one, second.
+            let seed_b32 = sec.read(&OATH_SEED, seed_src)?;
+            let secret = zeroize::Zeroizing::new(
+                base32_decode(&seed_b32).map_err(|e| format!("invalid base32 seed: {}", e))?,
+            );
+            let mut session = open_oath(&mut sec, access, debug)?;
             let params = keyroost_oath::PutParams {
                 name,
                 secret: &secret,
@@ -6324,8 +6379,15 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         }
         OathCmd::Delete { name, access, yes } => {
             let dev = crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
-            crate::prompt::confirm_on(&dev, *yes, &format!("delete OATH credential {name:?}"))?;
-            let mut session = open_oath(access, debug)?;
+            let asked = crate::prompt::confirm_then_read(
+                &dev,
+                *yes,
+                &format!("delete OATH credential {name:?}"),
+            )?;
+            let (reader, password) = oath_current_password(&mut Secrets::real(), access, debug)?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
+            let mut session =
+                open_oath_unlocked(&reader, password.as_deref().map(String::as_str), debug)?;
             session.delete(name)?;
             println!("Deleted OATH credential {:?}.", name);
         }
@@ -6334,20 +6396,21 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             new_password_stdin,
             access,
         } => {
-            let new_pw = read_secret(
-                "new OATH password",
-                new_password_env.as_deref(),
-                *new_password_stdin,
-            )?;
-            if new_pw.is_empty() {
-                return Err("new password is empty; use `clear-password` to remove it".into());
-            }
-            let mut session = open_oath(access, debug)?;
+            let mut sec = Secrets::real();
+            let new_src = Source::new(new_password_env.as_deref(), *new_password_stdin);
+            sec.check(&OATH_NEW_PASSWORD, new_src)?;
+            // The current password first (stdin line 1, when the applet has
+            // one), then the new one. The helper refuses an empty new
+            // password; `clear-password` removes it.
+            let (name, current) = oath_current_password(&mut sec, access, debug)?;
+            let new_pw = sec.read(&OATH_NEW_PASSWORD, new_src)?;
+            let mut session =
+                open_oath_unlocked(&name, current.as_deref().map(String::as_str), debug)?;
             session.set_password(&new_pw)?;
             println!("OATH password set.");
         }
         OathCmd::ClearPassword { access } => {
-            let mut session = open_oath(access, debug)?;
+            let mut session = open_oath(&mut Secrets::real(), access, debug)?;
             session.clear_password()?;
             println!("OATH password cleared.");
         }
@@ -13210,14 +13273,7 @@ mod cli_tests {
         // the clap id `name` (a global arg merges with same-id subcommand args),
         // so `oath add <NAME>` routed the credential name into device resolution
         // and could never run. The global selector's id/flag is now `--device`.
-        let cli = parse(&[
-            "keyroostctl",
-            "oath",
-            "add",
-            "issuer:acct",
-            "--secret-stdin",
-        ])
-        .unwrap();
+        let cli = parse(&["keyroostctl", "oath", "add", "issuer:acct", "--seed-stdin"]).unwrap();
         assert!(
             cli.device.is_none(),
             "the global --device selector must stay unset when only a positional is given"
@@ -13232,6 +13288,56 @@ mod cli_tests {
         // And --device still selects a device, independent of any positional.
         let cli2 = parse(&["keyroostctl", "--device", "mykey", "oath", "list"]).unwrap();
         assert_eq!(cli2.device.as_deref(), Some("mykey"));
+    }
+
+    #[test]
+    fn oath_add_takes_seed_flags_not_secret() {
+        match parse(&["keyroostctl", "oath", "add", "n", "--seed-stdin"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Oath {
+                cmd: OathCmd::Add { seed_stdin, .. },
+            }) => assert!(seed_stdin),
+            _ => panic!("expected oath add"),
+        }
+        match parse(&["keyroostctl", "oath", "add", "n", "--seed-env", "V"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Oath {
+                cmd: OathCmd::Add { seed_env, .. },
+            }) => assert_eq!(seed_env.as_deref(), Some("V")),
+            _ => panic!("expected oath add"),
+        }
+        for old in ["--secret-stdin", "--secret-env"] {
+            let e = parse(&["keyroostctl", "oath", "add", "n", old, "V"])
+                .err()
+                .unwrap();
+            assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "{old}");
+        }
+    }
+
+    #[test]
+    fn oath_two_secret_flags_name_their_stdin_line() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let oath = cmd.find_subcommand("oath").unwrap();
+        for (sub, flag, line) in [
+            ("set-password", "password-stdin", "first line"),
+            ("set-password", "new-password-stdin", "second line"),
+            ("add", "seed-stdin", "first line"),
+            ("add", "password-stdin", "second line"),
+        ] {
+            let arg = oath
+                .find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .find(|a| a.get_long() == Some(flag))
+                .unwrap_or_else(|| panic!("{sub} --{flag}"));
+            let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(help.contains(line), "oath {sub} --{flag}: {help:?}");
+        }
     }
 
     #[test]
