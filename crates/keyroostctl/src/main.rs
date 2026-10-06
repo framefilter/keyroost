@@ -3550,6 +3550,231 @@ fn read_import_uri<I: crate::secrets::SecretIo>(
     sec.read(&IMPORT_URI, Source::new(uri_env, uri == Some("-")))
 }
 
+/// What a Molto2 write command was given, read before the token is
+/// authenticated (and before any session is held while the user types).
+enum MoltoInput {
+    Nothing,
+    Seed(zeroize::Zeroizing<Vec<u8>>),
+    NewKey(zeroize::Zeroizing<Vec<u8>>),
+    Entry {
+        entry: keyroost_import::BulkEntry,
+        title: String,
+    },
+}
+
+fn check_profile(profile: u8) -> Result<(), String> {
+    if profile > 99 {
+        return Err(format!("profile must be 0..=99, got {profile}"));
+    }
+    Ok(())
+}
+
+fn check_title(title: &str) -> Result<(), &'static str> {
+    if title.is_empty() || title.len() > 12 {
+        return Err("title must be 1..=12 bytes");
+    }
+    Ok(())
+}
+
+/// Everything that can fail without the token: source counts, a literal URI,
+/// profile/title shape. Reads nothing and does no device I/O.
+fn molto_validate<I: crate::secrets::SecretIo>(
+    cmd: &MoltoCmd,
+    sec: &Secrets<I>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        MoltoCmd::Seed { profile, .. }
+        | MoltoCmd::Title { profile, .. }
+        | MoltoCmd::Delete { profile, .. }
+        | MoltoCmd::Config { profile, .. }
+        | MoltoCmd::Import { profile, .. }
+        | MoltoCmd::SyncTime {
+            profile: Some(profile),
+            ..
+        } => check_profile(*profile)?,
+        _ => {}
+    }
+    match cmd {
+        MoltoCmd::Seed {
+            hex_env,
+            base32_env,
+            hex_stdin,
+            base32_stdin,
+            ..
+        } => sec.check_one_of(
+            "seed",
+            &seed_options(
+                hex_env.as_deref(),
+                *hex_stdin,
+                base32_env.as_deref(),
+                *base32_stdin,
+            ),
+        )?,
+        MoltoCmd::CustomerKey {
+            hex_env,
+            ascii_env,
+            hex_stdin,
+            ascii_stdin,
+        } => sec.check_one_of(
+            "new customer key",
+            &new_key_options(
+                hex_env.as_deref(),
+                *hex_stdin,
+                ascii_env.as_deref(),
+                *ascii_stdin,
+            ),
+        )?,
+        MoltoCmd::Import {
+            uri,
+            uri_env,
+            qr,
+            title,
+            ..
+        } => {
+            check_import_source(uri.as_deref())?;
+            if qr.is_none() {
+                sec.check(
+                    &IMPORT_URI,
+                    Source::new(uri_env.as_deref(), uri.as_deref() == Some("-")),
+                )?;
+            }
+            if let Some(t) = title {
+                check_title(t)?;
+            }
+        }
+        MoltoCmd::Title { title: Some(t), .. } => check_title(t)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Read the secret (or QR image) a write command needs and finish checking
+/// it: the seed's length, the import's title. No session may be held.
+fn read_molto_input<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    cmd: &MoltoCmd,
+) -> Result<MoltoInput, Box<dyn std::error::Error>> {
+    Ok(match cmd {
+        MoltoCmd::Seed {
+            hex_env,
+            base32_env,
+            hex_stdin,
+            base32_stdin,
+            ..
+        } => {
+            let seed = read_seed(
+                sec,
+                &seed_options(
+                    hex_env.as_deref(),
+                    *hex_stdin,
+                    base32_env.as_deref(),
+                    *base32_stdin,
+                ),
+            )?;
+            if seed.is_empty() || seed.len() > 63 {
+                return Err(format!("seed must be 1..=63 bytes, got {}", seed.len()).into());
+            }
+            MoltoInput::Seed(seed)
+        }
+        MoltoCmd::CustomerKey {
+            hex_env,
+            ascii_env,
+            hex_stdin,
+            ascii_stdin,
+        } => MoltoInput::NewKey(read_new_customer_key(
+            sec,
+            &new_key_options(
+                hex_env.as_deref(),
+                *hex_stdin,
+                ascii_env.as_deref(),
+                *ascii_stdin,
+            ),
+        )?),
+        MoltoCmd::Import {
+            title,
+            qr,
+            uri,
+            uri_env,
+            ..
+        } => {
+            let entry = match qr {
+                Some(image_path) => molto_entry_from_qr(image_path)?,
+                None => {
+                    // The URI embeds the seed in its secret= parameter; it is
+                    // held in Zeroizing so our copy is scrubbed after
+                    // parse_otpauth (which wipes its own copies).
+                    let uri = read_import_uri(sec, uri.as_deref(), uri_env.as_deref())?;
+                    keyroost_import::parse_otpauth(&uri)?.into()
+                }
+            };
+            let title = title.clone().unwrap_or_else(|| entry.suggested_title());
+            if title.is_empty() || title.len() > 12 {
+                return Err(format!(
+                    "derived title {title:?} must be 1..=12 bytes; pass --title to override"
+                )
+                .into());
+            }
+            MoltoInput::Entry { entry, title }
+        }
+        _ => MoltoInput::Nothing,
+    })
+}
+
+/// Decode the one account in a QR screenshot, through the same hardened
+/// parsers as text input.
+fn molto_entry_from_qr(
+    image_path: &std::path::Path,
+) -> Result<keyroost_import::BulkEntry, Box<dyn std::error::Error>> {
+    let bytes =
+        std::fs::read(image_path).map_err(|e| format!("read {}: {}", image_path.display(), e))?;
+    let import = keyroost_qr::entries_from_image(&bytes)?;
+    for s in &import.skipped {
+        eprintln!("skipped {:?}: {}", s.label, s.reason);
+    }
+    // A GA export can span several QR images; a clean single-slot import of
+    // QR 1 must not read as "migration complete".
+    if let Some((i, n)) = import.batch {
+        eprintln!(
+            "note: this is QR {} of {} in the export — import the other images too",
+            i + 1,
+            n
+        );
+    }
+    match import.entries.len() {
+        0 => Err("QR decoded, but no account could be imported (see skips above)".into()),
+        1 => Ok(import.entries.into_iter().next().unwrap()),
+        n => Err(format!(
+            "QR contains {} accounts — use `import-file {}` to program them \
+             into consecutive slots",
+            n,
+            image_path.display()
+        )
+        .into()),
+    }
+}
+
+/// The token reopened after a question must be the one the question was
+/// about. `None`: no session was open before (nothing to compare).
+fn same_molto(before: Option<&str>, now: &str) -> Result<(), String> {
+    match before {
+        Some(b) if b != now => {
+            Err("the Molto2 changed while waiting for confirmation; nothing was changed".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`same_molto`] for the programmable token.
+fn same_prog_token(before: &str, now: &str) -> Result<(), String> {
+    if before != now {
+        return Err(
+            "the programmable token changed while waiting for confirmation; nothing was changed"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn unix_now() -> u32 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs() as u32,
@@ -4169,51 +4394,9 @@ fn run_molto(
     debug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
-    // A secret given the wrong way (or not at all, with no terminal to ask)
-    // is refused before any device I/O.
-    match cmd {
-        MoltoCmd::Seed {
-            hex_env,
-            base32_env,
-            hex_stdin,
-            base32_stdin,
-            ..
-        } => sec.check_one_of(
-            "seed",
-            &seed_options(
-                hex_env.as_deref(),
-                *hex_stdin,
-                base32_env.as_deref(),
-                *base32_stdin,
-            ),
-        )?,
-        MoltoCmd::CustomerKey {
-            hex_env,
-            ascii_env,
-            hex_stdin,
-            ascii_stdin,
-        } => sec.check_one_of(
-            "new customer key",
-            &new_key_options(
-                hex_env.as_deref(),
-                *hex_stdin,
-                ascii_env.as_deref(),
-                *ascii_stdin,
-            ),
-        )?,
-        MoltoCmd::Import {
-            uri, uri_env, qr, ..
-        } => {
-            check_import_source(uri.as_deref())?;
-            if qr.is_none() {
-                sec.check(
-                    &IMPORT_URI,
-                    Source::new(uri_env.as_deref(), uri.as_deref() == Some("-")),
-                )?;
-            }
-        }
-        _ => {}
-    }
+    // Arguments and secret sources are checked before any file is read or
+    // the token is touched (a wrong profile, a literal URI, no seed source).
+    molto_validate(cmd, &sec)?;
 
     // --dry-run on bulk import doesn't need the device at all.
     if let MoltoCmd::ImportFile {
@@ -4471,11 +4654,12 @@ fn run_molto(
         );
     }
     // Bulk import reads its file — and so any vault password, from the
-    // environment or stdin — before the question, unlike every other
-    // secret: which slots it writes, and so whether to ask at all, depends
-    // on the entries inside. A password on stdin means stdin is not a
-    // terminal, so it can never be mistaken for the answer (there is no
-    // question then; an occupied slot needs --yes).
+    // environment, stdin or the hidden prompt — before the question, unlike
+    // every other secret: which slots it writes, and so whether to ask at
+    // all, depends on the entries inside. No token session is open yet. A
+    // password piped on stdin means stdin is not a terminal, so it can never
+    // be mistaken for the answer (there is no question then; an occupied
+    // slot needs --yes).
     let bulk = match cmd {
         MoltoCmd::ImportFile {
             path,
@@ -4513,22 +4697,37 @@ fn run_molto(
         _ => None,
     };
     let dev = crate::target::select(Need::Molto2, exact, None)?;
+    // Occupancy is read in a short unauthenticated session, closed before
+    // the question and before any secret is typed. The write session reopens
+    // afterwards and must find the same token.
+    let mut asked = false;
+    let mut seen_serial: Option<String> = None;
+    if let Some((slots, false)) = &writes {
+        let mut probe = open_molto_session(exact)?;
+        probe.set_debug(debug);
+        let info = probe.read_info()?;
+        print_info(&info);
+        let busy = molto_occupied(&mut probe, slots.iter().copied())?;
+        seen_serial = Some(info.serial.clone());
+        drop(probe);
+        if !busy.is_empty() {
+            let list: Vec<String> = busy.iter().map(|p| format!("#{p}")).collect();
+            asked = crate::prompt::confirm_then_read(
+                &dev,
+                false,
+                &format!("overwrite occupied Molto2 slot(s) {}", list.join(", ")),
+            )?;
+        }
+    }
+    // The seed, new key or URI (or the QR image), read with nothing held.
+    let input = read_molto_input(&mut sec, cmd)?;
+    crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
     let mut session = open_molto_session(exact)?;
     session.set_debug(debug);
     let info = session.read_info()?;
-    print_info(&info);
-    if let Some((slots, yes)) = writes {
-        if !yes {
-            let busy = molto_occupied(&mut session, slots)?;
-            if !busy.is_empty() {
-                let list: Vec<String> = busy.iter().map(|p| format!("#{p}")).collect();
-                crate::prompt::confirm_on_held(
-                    &dev,
-                    yes,
-                    &format!("overwrite occupied Molto2 slot(s) {}", list.join(", ")),
-                )?;
-            }
-        }
+    same_molto(seen_serial.as_deref(), &info.serial)?;
+    if seen_serial.is_none() {
+        print_info(&info);
     }
     match session.authenticate(&key) {
         Ok(()) => println!("authenticated"),
@@ -4541,36 +4740,18 @@ fn run_molto(
         MoltoCmd::Info => unreachable!("handled above before auth"),
         MoltoCmd::Slots { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Delete { .. } => unreachable!("handled above before auth"),
-        MoltoCmd::Seed {
-            profile,
-            hex_env,
-            base32_env,
-            hex_stdin,
-            base32_stdin,
-            yes: _,
-        } => {
-            let seed = read_seed(
-                &mut sec,
-                &seed_options(
-                    hex_env.as_deref(),
-                    *hex_stdin,
-                    base32_env.as_deref(),
-                    *base32_stdin,
-                ),
-            )?;
-            if seed.is_empty() || seed.len() > 63 {
-                return Err(format!("seed must be 1..=63 bytes, got {}", seed.len()).into());
-            }
-            session.set_seed(*profile, &seed)?;
+        MoltoCmd::Seed { profile, .. } => {
+            let MoltoInput::Seed(seed) = &input else {
+                unreachable!("read before authentication")
+            };
+            session.set_seed(*profile, seed)?;
             println!("seed written to profile #{}", profile);
         }
         MoltoCmd::Title { profile, title } => {
+            // Checked by molto_validate before the token was touched.
             let title = title
                 .as_deref()
                 .expect("title read mode is handled before auth");
-            if title.is_empty() || title.len() > 12 {
-                return Err("title must be 1..=12 bytes".into());
-            }
             session.set_title(*profile, title)?;
             println!("title set on profile #{}", profile);
         }
@@ -4606,85 +4787,28 @@ fn run_molto(
                 return Err("sync-time requires --profile <N> or --all".into());
             }
         }
-        MoltoCmd::CustomerKey {
-            hex_env,
-            ascii_env,
-            hex_stdin,
-            ascii_stdin,
-        } => {
-            let new_key = read_new_customer_key(
-                &mut sec,
-                &new_key_options(
-                    hex_env.as_deref(),
-                    *hex_stdin,
-                    ascii_env.as_deref(),
-                    *ascii_stdin,
-                ),
-            )?;
-            session.set_customer_key(&new_key)?;
+        MoltoCmd::CustomerKey { .. } => {
+            let MoltoInput::NewKey(new_key) = &input else {
+                unreachable!("read before authentication")
+            };
+            session.set_customer_key(new_key)?;
             println!("customer-key rotation requested. Press the up-arrow button on the device to confirm.");
         }
         MoltoCmd::Import {
             profile,
-            title,
             display_timeout,
             qr,
-            uri,
-            uri_env,
-            yes: _,
+            ..
         } => {
-            let entry: keyroost_import::BulkEntry = if let Some(image_path) = qr {
-                // Screenshot import: decode the QR, route through the same
-                // hardened parsers as text input.
-                let bytes = std::fs::read(image_path)
-                    .map_err(|e| format!("read {}: {}", image_path.display(), e))?;
-                let import = keyroost_qr::entries_from_image(&bytes)?;
-                for s in &import.skipped {
-                    eprintln!("skipped {:?}: {}", s.label, s.reason);
-                }
-                // A GA export can span several QR images; a clean single-slot
-                // import of QR 1 must not read as "migration complete".
-                if let Some((i, n)) = import.batch {
-                    eprintln!(
-                        "note: this is QR {} of {} in the export — import the other images too",
-                        i + 1,
-                        n
-                    );
-                }
-                match import.entries.len() {
-                    0 => {
-                        return Err(
-                            "QR decoded, but no account could be imported (see skips above)".into(),
-                        )
-                    }
-                    1 => import.entries.into_iter().next().unwrap(),
-                    n => {
-                        return Err(format!(
-                            "QR contains {} accounts — use `import-file {}` to program them \
-                             into consecutive slots",
-                            n,
-                            image_path.display()
-                        )
-                        .into())
-                    }
-                }
-            } else {
-                // The URI embeds the seed in its secret= parameter; hold it in
-                // Zeroizing so our copy is scrubbed after parse_otpauth (which
-                // wipes its own copies).
-                let uri = read_import_uri(&mut sec, uri.as_deref(), uri_env.as_deref())?;
-                keyroost_import::parse_otpauth(&uri)?.into()
+            let MoltoInput::Entry {
+                entry,
+                title: final_title,
+            } = &input
+            else {
+                unreachable!("read before authentication")
             };
-            let final_title = title.clone().unwrap_or_else(|| entry.suggested_title());
-            if final_title.is_empty() || final_title.len() > 12 {
-                return Err(format!(
-                    "derived title {:?} must be 1..=12 bytes; pass --title to override",
-                    final_title
-                )
-                .into());
-            }
             session.set_seed(*profile, &entry.secret)?;
-            session.set_title(*profile, &final_title)?;
+            session.set_title(*profile, final_title)?;
             session.set_config(
                 *profile,
                 &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
@@ -4805,14 +4929,27 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             sec.check_one_of("seed", &options)?;
             let dev = crate::target::select(Need::Prog, reader.as_deref(), None)?;
             let name = crate::target::reader_of(&dev)?;
-            let mut session = Token2ProgSession::open_named(&name)?;
-            session.set_debug(debug);
             // Refuse to program a device whose serial does not match a known
             // Token2 programmable-token model — guards against writing to the
-            // wrong card on a shared reader.
-            prog_guard_model(&mut session)?;
-            crate::prompt::confirm_on_held(&dev, *yes, "overwrite the programmable token's seed")?;
+            // wrong card on a shared reader. This first session is closed
+            // before the question and before the seed is typed.
+            let seen_serial = {
+                let mut probe = Token2ProgSession::open_named(&name)?;
+                probe.set_debug(debug);
+                prog_guard_model(&mut probe)?;
+                probe.read_info()?.serial
+            };
+            let asked = crate::prompt::confirm_then_read(
+                &dev,
+                *yes,
+                "overwrite the programmable token's seed",
+            )?;
             let seed = prog_seed(read_seed(&mut sec, &options)?)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
+            let mut session = Token2ProgSession::open_named(&name)?;
+            session.set_debug(debug);
+            prog_guard_model(&mut session)?;
+            same_prog_token(&seen_serial, &session.read_info()?.serial)?;
             session.authenticate()?;
             session.set_seed(&seed)?;
             println!("seed programmed ({} bytes).", seed.len());
@@ -12394,6 +12531,145 @@ mod cli_tests {
         let mut sec = Secrets::new(FakeIo::piped(&["abc\n"]));
         let k = read_new_customer_key(&mut sec, &new_key_options(None, false, None, true)).unwrap();
         assert_eq!(&k[..], b"abc");
+    }
+
+    fn molto_cmd(args: &[&str]) -> MoltoCmd {
+        match parse(args)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+            .command
+        {
+            Some(Cmd::Molto { cmd, .. }) => cmd,
+            _ => panic!("expected a molto command"),
+        }
+    }
+
+    #[test]
+    fn molto_arguments_are_checked_without_the_token() {
+        use crate::secrets::fake::FakeIo;
+        let sec = Secrets::new(FakeIo::default());
+        let err = |args: &[&str]| {
+            molto_validate(&molto_cmd(args), &sec)
+                .expect_err("must refuse")
+                .to_string()
+        };
+        assert_eq!(
+            err(&["keyroostctl", "molto", "seed", "-p", "99"]),
+            "no seed given: pass --hex-env VAR, --hex-stdin, --base32-env VAR or --base32-stdin"
+        );
+        let e = err(&["keyroostctl", "molto", "seed", "-p", "100", "--hex-stdin"]);
+        assert!(e.contains("profile must be 0..=99"), "{e}");
+        let e = err(&["keyroostctl", "molto", "title", "-p", "1", "thirteen-chars"]);
+        assert!(e.contains("title must be 1..=12 bytes"), "{e}");
+        assert_eq!(
+            err(&["keyroostctl", "molto", "import", "-p", "1"]),
+            "no otpauth:// URI given: pass `-` to read it from stdin, --uri-env VAR or --qr IMAGE"
+        );
+        let e = err(&[
+            "keyroostctl",
+            "molto",
+            "import",
+            "-p",
+            "1",
+            "--title",
+            "thirteen-chars",
+            "--qr",
+            "f.png",
+        ]);
+        assert!(e.contains("title must be 1..=12 bytes"), "{e}");
+        assert_eq!(
+            err(&[
+                "keyroostctl",
+                "molto",
+                "import",
+                "-p",
+                "1",
+                "otpauth://totp/x?secret=JBSWY3DP"
+            ]),
+            IMPORT_URI_IN_ARGV
+        );
+        assert_eq!(
+            err(&["keyroostctl", "molto", "customer-key"]),
+            "no new customer key given: pass --hex-env VAR, --hex-stdin, --ascii-env VAR or --ascii-stdin"
+        );
+        // Nothing was read to find any of that out.
+        assert!(sec.io.prompts.is_empty() && sec.io.lines_read == 0);
+
+        // Accepted: a source given, or a terminal that can ask for the URI.
+        for args in [
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "-p",
+                "99",
+                "--base32-env",
+                "V",
+            ][..],
+            &["keyroostctl", "molto", "import", "-p", "1", "-"],
+            &["keyroostctl", "molto", "import", "-p", "1", "--qr", "f.png"],
+            &["keyroostctl", "molto", "title", "-p", "1", "twelve-chars"],
+            &["keyroostctl", "molto", "config", "-p", "99"],
+        ] {
+            molto_validate(&molto_cmd(args), &sec).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+        let term = Secrets::new(FakeIo::terminal());
+        molto_validate(
+            &molto_cmd(&["keyroostctl", "molto", "import", "-p", "1"]),
+            &term,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn molto_input_is_read_and_checked_before_the_token() {
+        use crate::secrets::fake::FakeIo;
+        // A seed over 63 bytes is refused once read.
+        let long = format!("{}\n", "00".repeat(64));
+        let mut sec = Secrets::new(FakeIo::piped(&[&long]));
+        let cmd = molto_cmd(&["keyroostctl", "molto", "seed", "-p", "1", "--hex-stdin"]);
+        let e = read_molto_input(&mut sec, &cmd).err().expect("too long");
+        assert_eq!(e.to_string(), "seed must be 1..=63 bytes, got 64");
+        let mut sec = Secrets::new(FakeIo::piped(&["0102\n"]));
+        match read_molto_input(&mut sec, &cmd).unwrap() {
+            MoltoInput::Seed(s) => assert_eq!(&s[..], &[1, 2]),
+            _ => panic!("expected a seed"),
+        }
+        // An import's title is settled before authentication.
+        let cmd = molto_cmd(&["keyroostctl", "molto", "import", "-p", "1", "-"]);
+        let mut sec = Secrets::new(FakeIo::piped(&["otpauth://totp/?secret=JBSWY3DP\n"]));
+        let e = read_molto_input(&mut sec, &cmd).err().expect("no title");
+        assert!(e.to_string().contains("must be 1..=12 bytes"), "{e}");
+        let mut sec = Secrets::new(FakeIo::piped(&["otpauth://totp/acct?secret=JBSWY3DP\n"]));
+        match read_molto_input(&mut sec, &cmd).unwrap() {
+            MoltoInput::Entry { entry, title } => {
+                assert_eq!(title, "acct");
+                assert_eq!(&entry.secret[..], b"Hello");
+            }
+            _ => panic!("expected an entry"),
+        }
+        // Commands with no secret read nothing.
+        let mut sec = Secrets::new(FakeIo::terminal());
+        let cmd = molto_cmd(&["keyroostctl", "molto", "config", "-p", "1"]);
+        assert!(matches!(
+            read_molto_input(&mut sec, &cmd).unwrap(),
+            MoltoInput::Nothing
+        ));
+        assert!(sec.io.prompts.is_empty());
+    }
+
+    #[test]
+    fn the_same_molto_must_be_present_after_the_question() {
+        assert_eq!(
+            same_molto(Some("A1"), "A2").unwrap_err(),
+            "the Molto2 changed while waiting for confirmation; nothing was changed"
+        );
+        assert!(same_molto(None, "x").is_ok());
+        assert!(same_molto(Some("A"), "A").is_ok());
+        assert_eq!(
+            same_prog_token("A1", "A2").unwrap_err(),
+            "the programmable token changed while waiting for confirmation; nothing was changed"
+        );
+        assert!(same_prog_token("A", "A").is_ok());
     }
 
     #[test]
