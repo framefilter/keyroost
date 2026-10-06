@@ -173,10 +173,11 @@ pub(crate) fn confirm_then_read(
     Ok(confirm(&mut RealTerm, yes, action, &key_label(d))?)
 }
 
-/// Re-find `d` ([`crate::target::reverify`]) only when the question was
-/// actually shown (`asked`, from [`confirm_then_read`] or
-/// `confirm_then_read_pin`): the user may have swapped keys while it was
-/// up. A no-op under `--yes` and in scripts.
+/// Re-find `d` ([`crate::target::reverify`]) only when the person was kept
+/// waiting: callers pass `asked || sec.prompted()` — the question was shown
+/// ([`confirm_then_read`]) or a secret was typed at the hidden prompt — since
+/// keys may have been swapped meanwhile. A no-op for scripts (`--yes`, env
+/// and piped secrets).
 pub(crate) fn reverify_if_asked(d: &Device, asked: bool) -> Result<(), Box<dyn std::error::Error>> {
     if asked {
         crate::target::reverify(d)?;

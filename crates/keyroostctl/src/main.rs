@@ -5212,6 +5212,7 @@ fn open_oath(
     debug: bool,
 ) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
     let (name, password) = oath_current_password(sec, access, debug)?;
+    reverify_if_prompted(sec, Need::Oath, access.reader.as_deref())?;
     open_oath_unlocked(&name, password.as_deref().map(String::as_str), debug)
 }
 
@@ -6467,8 +6468,9 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 *yes,
                 &format!("delete OATH credential {name:?}"),
             )?;
-            let (reader, password) = oath_current_password(&mut Secrets::real(), access, debug)?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            let mut sec = Secrets::real();
+            let (reader, password) = oath_current_password(&mut sec, access, debug)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session =
                 open_oath_unlocked(&reader, password.as_deref().map(String::as_str), debug)?;
             session.delete(name)?;
@@ -6487,6 +6489,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // password; `clear-password` removes it.
             let (name, current) = oath_current_password(&mut sec, access, debug)?;
             let new_pw = sec.read(&OATH_NEW_PASSWORD, new_src)?;
+            reverify_if_prompted(&sec, Need::Oath, access.reader.as_deref())?;
             let mut session =
                 open_oath_unlocked(&name, current.as_deref().map(String::as_str), debug)?;
             session.set_password(&new_pw)?;
@@ -6750,16 +6753,25 @@ const OTP_SEED: Spec = Spec::value("seed", "seed").base32();
 /// (list, add, delete). A PIN given by flag is read as is; otherwise a
 /// short session asks the key, is closed, and only then does a terminal
 /// get the hidden prompt.
+///
+/// `waited` is whether the person has already been kept waiting (a question
+/// shown, or an earlier secret typed at the prompt). On return the key has
+/// been re-found whenever anything kept them waiting — before the probe
+/// opens it, and again after a PIN typed at the prompt — so the caller can
+/// open it straight away.
 fn otp_pin_if_needed(
     sec: &mut Secrets,
     dev: &keyroost_resolve::Device,
     transport: OtpTransportArg,
     debug: bool,
     src: Source<'_>,
+    waited: bool,
 ) -> Result<Option<zeroize::Zeroizing<String>>, Box<dyn std::error::Error>> {
     if let Some(pin) = sec.read_given(&OTP_PIN, src)? {
+        crate::prompt::reverify_if_asked(dev, waited || sec.prompted())?;
         return Ok(Some(pin));
     }
+    crate::prompt::reverify_if_asked(dev, waited)?;
     let pinned = {
         let mut probe = open_otp_on(dev, transport, debug)?;
         probe.pin_is_set()
@@ -6774,7 +6786,10 @@ fn otp_pin_if_needed(
             );
         }
     }
-    Ok(otp_pin_after_probe(sec, pinned)?)
+    let pin = otp_pin_after_probe(sec, pinned)?;
+    // With no PIN flag, a PIN can only have come from the hidden prompt.
+    crate::prompt::reverify_if_asked(dev, pin.is_some())?;
+    Ok(pin)
 }
 
 /// A secret every run of the command needs: refused before any device I/O
@@ -6789,8 +6804,10 @@ fn otp_required_secret(
     let mut sec = Secrets::real();
     let src = Source::new(env.as_deref(), stdin);
     sec.check(spec, src)?;
-    select_otp(sel)?;
-    Ok(sec.read(spec, src)?)
+    let dev = select_otp(sel)?;
+    let secret = sec.read(spec, src)?;
+    crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
+    Ok(secret)
 }
 
 /// What the key's answer means for the PIN: none needed when it has no PIN;
@@ -6828,6 +6845,7 @@ fn run_otp(
                 sel.transport,
                 debug,
                 Source::new(pin_env.as_deref(), *pin_stdin),
+                false,
             )?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
@@ -6917,12 +6935,14 @@ fn run_otp(
             let seed_b32 = sec.read(&OTP_SEED, seed_src)?;
             let seed = keyroost_token2otp::decode_base32_seed(&seed_b32)
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
+            let waited = sec.prompted();
             let pin = otp_pin_if_needed(
                 &mut sec,
                 &dev,
                 sel.transport,
                 debug,
                 Source::new(pin_env.as_deref(), *pin_stdin),
+                waited,
             )?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
@@ -6963,14 +6983,16 @@ fn run_otp(
                 *yes,
                 &format!("delete OTP entry {label:?}"),
             )?;
+            // Re-checks the key before its probe session and again after a
+            // typed PIN, so nothing is left to re-check here.
             let pin = otp_pin_if_needed(
                 &mut Secrets::real(),
                 &dev,
                 sel.transport,
                 debug,
                 Source::new(pin_env.as_deref(), *pin_stdin),
+                asked,
             )?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.delete_entry_pinned(app, account, pin.as_deref().map(|p| p.as_str()))?;
             println!("Deleted OTP entry {label:?}.");
@@ -7023,7 +7045,7 @@ fn run_otp(
             let seed_b32 = sec.read(&OTP_SEED, seed_src)?;
             let seed = keyroost_token2otp::decode_base32_seed(&seed_b32)
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
             println!("Configured the HOTP-on-button keystroke slot.");
@@ -7224,13 +7246,14 @@ fn run_otp(
             let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
             sec.check(&OTP_OLD_PIN, first_src)?;
             sec.check(&OTP_NEW_PIN, second_src)?;
-            select_otp(&sel)?;
+            let dev = select_otp(&sel)?;
             let (current, new) = read_secret_pair(
                 &mut sec,
                 (&OTP_OLD_PIN, first_src),
                 (&OTP_NEW_PIN, second_src),
             )?;
-            let mut session = open_otp(&sel, debug)?;
+            crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
+            let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.change_pin(current.as_str(), new.as_str())?;
             println!("OTP PIN changed.");
@@ -7300,9 +7323,11 @@ fn run_otp(
         } => {
             // The PIN is only the fingerprint's fallback: read when a flag
             // names it, never prompted for.
-            let pin = Secrets::real()
-                .read_given(&OTP_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
-            let mut session = open_otp(&sel, debug)?;
+            let mut sec = Secrets::real();
+            let dev = select_otp(&sel)?;
+            let pin = sec.read_given(&OTP_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
+            crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
+            let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
             if !*pin_only && session.fp_is_enabled().unwrap_or(false) {
@@ -7491,6 +7516,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             sec.check(spec, src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let pin = sec.read(spec, src)?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             session.verify_pin(which.pw_ref(), pin.as_bytes())?;
             println!("{} PIN verified.", which.label());
@@ -7561,7 +7587,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 &format!("overwrite the OpenPGP {} key", slot.label()),
             )?;
             let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!(
@@ -7615,7 +7641,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 keyroost_rsakey::load_from_file(path)?
             };
 
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             println!("Importing {} key…", slot.label());
@@ -7649,6 +7675,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             sec.check(&PGP_ADMIN_PIN, src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             session.set_cardholder_name(cardholder.as_bytes())?;
@@ -7665,6 +7692,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             sec.check(&PGP_ADMIN_PIN, src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
             session.set_url(url.as_bytes())?;
@@ -7685,6 +7713,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let pin = sec.read(&PGP_SIGN_PIN, src)?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             session.verify_pin(keyroost_openpgp::PW1_SIGN, pin.as_bytes())?;
             // RSA slots want a PKCS#1 v1.5 DigestInfo (the card EMSA-pads and
@@ -7716,6 +7745,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let pin = sec.read(&PGP_USER_PIN, src)?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             // Decryption authorizes under PW1 in the "other"/decipher context
             // (ref 0x82), not the signing context (0x81).
@@ -7766,6 +7796,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let pin = sec.read(&PGP_USER_PIN, src)?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             // INTERNAL AUTHENTICATE authorizes under PW1 in the "other" context
             // (ref 0x82) — the same context as decipher, not the signing context.
@@ -7806,6 +7837,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 (&PGP_OLD_USER_PIN, first_src),
                 (&PGP_NEW_USER_PIN, second_src),
             )?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             // CHANGE REFERENCE DATA carries the old PIN itself — no prior VERIFY.
             let mut session = open_openpgp_at(&name, debug)?;
             session.change_user_pin(old.as_bytes(), new.as_bytes())?;
@@ -7829,6 +7861,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 (&PGP_OLD_ADMIN_PIN, first_src),
                 (&PGP_NEW_ADMIN_PIN, second_src),
             )?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             session.change_admin_pin(old.as_bytes(), new.as_bytes())?;
             println!("Admin PIN (PW3) changed.");
@@ -7851,6 +7884,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 (&PGP_ADMIN_PIN, first_src),
                 (&PGP_NEW_USER_PIN, second_src),
             )?;
+            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             // reset_retry_counter verifies PW3 internally, then RESET RETRY
             // COUNTER sets the new user PIN — don't double-verify here.
@@ -8030,6 +8064,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 (&PIV_OLD_PIN, first_src),
                 (&PIV_NEW_PIN, second_src),
             )?;
+            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8059,6 +8094,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 (&PIV_OLD_PUK, first_src),
                 (&PIV_NEW_PUK, second_src),
             )?;
+            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8085,6 +8121,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             let (puk, new) =
                 read_secret_pair(&mut sec, (&PIV_PUK, first_src), (&PIV_NEW_PIN, second_src))?;
+            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8127,7 +8164,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
             let pin = sec.read(&PIV_PIN, pin_src)?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8180,6 +8217,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
+            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8341,7 +8379,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| piv_slot_known_empty(s, slot.to_slot()),
             )?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
-            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
                 debug,
@@ -8452,7 +8490,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| piv_cert_known_absent(s, slot.to_slot()),
             )?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
-            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
                 debug,
@@ -8579,7 +8617,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             } else {
                 None
             };
-            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
                 debug,
@@ -8678,7 +8716,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // auth covers the certificate import (line 2).
             let pin = sec.read(&PIV_PIN, pin_src)?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
-            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
                 debug,
@@ -8741,8 +8779,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // without one. When given, verify it once up front so a wrong
             // PIN fails before any op and costs just one retry.
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
-            let pin = Secrets::real()
-                .read_given(&PIV_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
+            let mut sec = Secrets::real();
+            let pin = sec.read_given(&PIV_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
+            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8854,6 +8893,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let expiration = valid_for.chuid_expiration(u64::from(unix_now()));
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8997,7 +9037,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 &format!("delete the certificate in PIV slot {}", slot_name(*slot)),
             )?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -9034,7 +9074,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 &format!("delete the key in PIV slot {}", slot_name(*slot)),
             )?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
             let name = crate::target::reader_of(&dev)?;
@@ -9069,6 +9109,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -9093,6 +9134,22 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
 /// Open the OpenPGP session on the reader matching `reader` (or the sole
 /// OpenPGP reader), announcing the target on stderr.
+/// Re-find the selected key before reopening it when a secret was typed at
+/// the hidden prompt: the person may have swapped keys while typing. The
+/// selection is memoised, so this never announces a second time; env and
+/// piped sources skip it.
+fn reverify_if_prompted<I: crate::secrets::SecretIo>(
+    sec: &Secrets<I>,
+    need: Need,
+    reader: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if sec.prompted() {
+        let dev = crate::target::select(need, reader, None)?;
+        crate::target::reverify(&dev)?;
+    }
+    Ok(())
+}
+
 fn open_openpgp(
     reader: Option<&str>,
     debug: bool,
@@ -9379,8 +9436,9 @@ struct ReplaceGate {
 /// before `action` on the already-selected PIV key `dev`. The check runs in
 /// its own short, read-only transaction (skipped under `--yes`), so no PC/SC
 /// transaction is held while waiting for an answer. Callers read their
-/// secrets next, then call `reverify_if_asked(&gate.dev, gate.asked)`
-/// right before opening the session.
+/// secrets next, then call
+/// `reverify_if_asked(&gate.dev, gate.asked || sec.prompted())` right
+/// before opening the session.
 fn piv_confirm_replace(
     dev: keyroost_resolve::Device,
     debug: bool,
@@ -9916,7 +9974,20 @@ fn fido_pin(
     let src = Source::new(env.as_deref(), stdin);
     sec.check(&FIDO_PIN, src)?;
     let _ = crate::target::select_fido(path)?;
-    Ok(sec.read(&FIDO_PIN, src)?)
+    let pin = sec.read(&FIDO_PIN, src)?;
+    fido_reverify_if_prompted(&sec, path)?;
+    Ok(pin)
+}
+
+/// [`reverify_if_prompted`] for the FIDO-over-USB key.
+fn fido_reverify_if_prompted<I: crate::secrets::SecretIo>(
+    sec: &Secrets<I>,
+    path: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if sec.prompted() {
+        crate::target::reverify(&crate::target::select_fido(path)?)?;
+    }
+    Ok(())
 }
 
 fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -9968,6 +10039,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             sec.check(&FIDO_NEW_PIN, src)?;
             let _ = crate::target::select_fido(path.as_deref())?;
             let new_pin = sec.read(&FIDO_NEW_PIN, src)?;
+            fido_reverify_if_prompted(&sec, path.as_deref())?;
             run_fido_pin_set(path.as_deref(), &new_pin)?;
             Ok(())
         }
@@ -9989,6 +10061,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 (&FIDO_OLD_PIN, first_src),
                 (&FIDO_NEW_PIN, second_src),
             )?;
+            fido_reverify_if_prompted(&sec, path.as_deref())?;
             run_fido_pin_change(path.as_deref(), &old_pin, &new_pin)?;
             Ok(())
         }
@@ -10029,7 +10102,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 &format!("delete FIDO credential {}", hex_short(&cred_id_bytes)),
             )?;
             let pin = sec.read(&FIDO_PIN, src)?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
             Ok(())
         }
@@ -10084,7 +10157,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 &format!("delete fingerprint template {}", hex_short(&id)),
             )?;
             let pin = sec.read(&FIDO_PIN, src)?;
-            crate::prompt::reverify_if_asked(&dev, asked)?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             run_fido_fingerprint_delete(path.as_deref(), &pin, &id)?;
             Ok(())
         }
@@ -10797,7 +10870,7 @@ fn run_fido_large_blob_delete(
         src,
     )?;
     let (mut dev, info, again) = open_and_read_large_blobs(path)?;
-    if again.raw_array != current.raw_array {
+    if !large_blob_unchanged(&current, &again) {
         return Err(LARGE_BLOB_CHANGED.into());
     }
 
@@ -10858,7 +10931,7 @@ fn run_fido_large_blob_clear(
         src,
     )?;
     let (mut dev, info, again) = open_and_read_large_blobs(path)?;
-    if again.raw_array != current.raw_array {
+    if !large_blob_unchanged(&current, &again) {
         return Err(LARGE_BLOB_CHANGED.into());
     }
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
@@ -10877,6 +10950,16 @@ fn run_fido_large_blob_clear(
 /// delete or clear refuses when it no longer matches what was shown.
 const LARGE_BLOB_CHANGED: &str =
     "the large-blob array changed while waiting for confirmation; nothing was changed";
+
+/// Whether the array read after the question and the PIN is the one the
+/// person was shown. An extra guard on top of re-finding the key: two keys
+/// with identical arrays (e.g. both empty) pass it.
+fn large_blob_unchanged(
+    before: &keyroost_ctap::large_blobs::LargeBlobArray,
+    after: &keyroost_ctap::large_blobs::LargeBlobArray,
+) -> bool {
+    before.raw_array == after.raw_array
+}
 
 /// A consistent "index out of range" error for the large-blob commands.
 fn large_blob_bad_index(index: usize, len: usize) -> Box<dyn std::error::Error> {
@@ -11631,7 +11714,7 @@ fn gather_secret(
 /// Ask first, then read the PIN: a refusal or a "no" never consumes a PIN
 /// source (the FIDO one-way settings and the large-blob wipes). `reopened`
 /// is the key a command reopens after this returns; when the question was
-/// shown, it is re-found ([`crate::target::reverify`]) only after the PIN
+/// shown or the PIN was typed at the hidden prompt, it is re-found ([`crate::target::reverify`]) only after the PIN
 /// has been read — immediately before the reopen, not while the person is
 /// still typing the PIN. Nothing may hold the key's handle open across the
 /// question or the PIN entry.
@@ -11644,8 +11727,8 @@ fn confirm_then_read_pin<I: crate::secrets::SecretIo>(
     reopened: Option<&keyroost_resolve::Device>,
     src: Source<'_>,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
-    confirm_then_read_pin_ordered(term, sec, yes, action, key, src, |asked| {
-        if asked {
+    confirm_then_read_pin_ordered(term, sec, yes, action, key, src, |waited| {
+        if waited {
             if let Some(dev) = reopened {
                 crate::target::reverify(dev)?;
             }
@@ -11669,7 +11752,9 @@ fn confirm_then_read_pin_ordered<I: crate::secrets::SecretIo>(
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     let asked = crate::prompt::confirm(term, yes, action, key)?;
     let pin = sec.read(&FIDO_PIN, src)?;
-    reverify(asked)?;
+    // A question shown or a PIN typed at the prompt both leave a gap in
+    // which the key could have been swapped.
+    reverify(asked || sec.prompted())?;
     Ok(pin)
 }
 
@@ -12674,15 +12759,64 @@ mod cli_tests {
             "action",
             "k",
             Source::NONE,
-            |asked| {
-                order.borrow_mut().push(format!("reverify asked={asked}"));
+            |waited| {
+                order.borrow_mut().push(format!("reverify waited={waited}"));
                 Ok(())
             },
         )
         .unwrap();
         assert_eq!(&*pin, "1234");
         assert_eq!(sec.io.prompts, vec!["PIN: ".to_string()]);
-        assert_eq!(*order.borrow(), vec!["reverify asked=false".to_string()]);
+        // No question under --yes, but the PIN was typed: the key is
+        // re-found anyway.
+        assert_eq!(*order.borrow(), vec!["reverify waited=true".to_string()]);
+    }
+
+    #[test]
+    fn confirm_then_read_pin_skips_the_recheck_for_a_piped_pin_under_yes() {
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let mut sec = Secrets::new(FakeIo::piped(&["1234\n"]));
+        let seen = std::cell::RefCell::new(Vec::new());
+        let pin = confirm_then_read_pin_ordered(
+            &mut YesTerm,
+            &mut sec,
+            true,
+            "action",
+            "k",
+            Source::new(None, true),
+            |waited| {
+                seen.borrow_mut().push(waited);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*pin, "1234");
+        assert_eq!(*seen.borrow(), vec![false]);
+    }
+
+    #[test]
+    fn reverify_if_prompted_is_free_for_scripts() {
+        // Env and piped sources never re-enumerate (no device I/O at all).
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let mut sec = Secrets::new(FakeIo::piped(&["1234\n"]).var("V", "1"));
+        sec.read(&PIV_PIN, Source::env("V")).unwrap();
+        sec.read(&PIV_PIN, Source::new(None, true)).unwrap();
+        assert!(reverify_if_prompted(&sec, Need::Piv, None).is_ok());
+        assert!(fido_reverify_if_prompted(&sec, None).is_ok());
+    }
+
+    #[test]
+    fn large_blob_unchanged_compares_the_raw_array() {
+        use keyroost_ctap::large_blobs::LargeBlobArray;
+        let arr = |raw: &[u8]| LargeBlobArray {
+            entries: Vec::new(),
+            raw_array: raw.to_vec(),
+        };
+        assert!(large_blob_unchanged(&arr(&[0x80]), &arr(&[0x80])));
+        assert!(!large_blob_unchanged(&arr(&[0x80]), &arr(&[0x81, 0x40])));
+        assert!(!large_blob_unchanged(&arr(&[0x81, 0x40]), &arr(&[0x80])));
     }
 
     #[test]

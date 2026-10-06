@@ -218,6 +218,7 @@ impl SecretIo for RealIo {
 pub(crate) struct Secrets<I: SecretIo = RealIo> {
     pub(crate) io: I,
     stdin_lines: usize,
+    prompted: bool,
 }
 
 impl Secrets<RealIo> {
@@ -234,7 +235,18 @@ enum Origin<'a> {
 
 impl<I: SecretIo> Secrets<I> {
     pub(crate) fn new(io: I) -> Self {
-        Secrets { io, stdin_lines: 0 }
+        Secrets {
+            io,
+            stdin_lines: 0,
+            prompted: false,
+        }
+    }
+
+    /// Whether any secret so far came from a hidden prompt (no flag at a
+    /// terminal, or `--X-stdin` typed at one). A person typing is a gap of
+    /// human length: the caller re-finds the key before opening it.
+    pub(crate) fn prompted(&self) -> bool {
+        self.prompted
     }
 
     pub(crate) fn terminal_present(&self) -> bool {
@@ -350,6 +362,7 @@ impl<I: SecretIo> Secrets<I> {
     }
 
     fn hidden(&mut self, spec: &Spec, repeat: bool) -> Result<Zeroizing<String>, String> {
+        self.prompted = true;
         self.io
             .read_hidden(&spec.prompt_text(repeat))
             .map_err(|e| match e.kind() {
@@ -796,6 +809,30 @@ mod tests {
                 .unwrap_err(),
             "give only one seed source"
         );
+    }
+
+    #[test]
+    fn prompted_only_after_a_hidden_read() {
+        let mut s = sec(FakeIo::piped(&["1234\n"]).var("V", "9"));
+        s.read(&PIN, Source::env("V")).unwrap();
+        s.read(&PIN, Source::new(None, true)).unwrap();
+        assert!(!s.prompted(), "env and piped stdin are not a prompt");
+        s.read_given(&PIN, Source::NONE).unwrap();
+        assert!(!s.prompted(), "nothing read");
+
+        let mut s = sec(FakeIo::terminal().typing(&["1234"]));
+        assert!(!s.prompted());
+        s.read(&PIN, Source::NONE).unwrap();
+        assert!(s.prompted(), "no flag at a terminal");
+
+        let mut s = sec(FakeIo::terminal().typing(&["1234"]));
+        s.read(&PIN, Source::new(None, true)).unwrap();
+        assert!(s.prompted(), "--pin-stdin typed at a terminal");
+
+        // A cancelled prompt still counts: the person was at the keyboard.
+        let mut s = sec(FakeIo::terminal());
+        assert!(s.read(&PIN, Source::NONE).is_err());
+        assert!(s.prompted());
     }
 
     #[test]
