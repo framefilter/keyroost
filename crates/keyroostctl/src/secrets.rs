@@ -35,12 +35,17 @@ pub(crate) enum Form {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Spec {
+    /// What the user is asked for: "PIN", "new PIN", "admin PIN (PW3)".
     pub(crate) label: &'static str,
+    /// The flag prefix: "pin" means `--pin-env` / `--pin-stdin`.
     pub(crate) flag: &'static str,
     pub(crate) kind: Kind,
     pub(crate) form: Form,
+    /// One more accepted flag named in the refusal (`--mgmt-key-default`).
     pub(crate) also: Option<&'static str>,
+    /// Replaces the "--X-env VAR or --X-stdin" part (molto import's `-`).
     pub(crate) hint: Option<&'static str>,
+    /// Replaces the prompt's label.
     pub(crate) prompt: Option<&'static str>,
 }
 
@@ -178,7 +183,13 @@ impl SecretIo for RealIo {
         match std::env::var(var) {
             Ok(v) => EnvValue::Set(Zeroizing::new(v)),
             Err(std::env::VarError::NotPresent) => EnvValue::Unset,
-            Err(std::env::VarError::NotUnicode(_)) => EnvValue::NotUnicode,
+            Err(std::env::VarError::NotUnicode(os)) => {
+                // The lossy bytes may still be the secret; wipe them rather
+                // than letting them drop unwiped.
+                let mut b = os.into_encoded_bytes();
+                zeroize::Zeroize::zeroize(&mut b);
+                EnvValue::NotUnicode
+            }
         }
     }
     // A unit test must never block on the developer's terminal.
@@ -190,7 +201,10 @@ impl SecretIo for RealIo {
     }
     fn read_line(&mut self) -> std::io::Result<Option<Zeroizing<String>>> {
         // std's Stdin buffer is shared, so a second call continues at line 2.
-        let mut line = Zeroizing::new(String::new());
+        // Pre-sized so a long secret doesn't grow the buffer through an
+        // unwiped reallocation copy; std's own internal BufReader for stdin
+        // keeps its own copy of the bytes that we have no way to wipe.
+        let mut line = Zeroizing::new(String::with_capacity(256));
         let n = std::io::stdin().lock().read_line(&mut line)?;
         Ok((n > 0).then_some(line))
     }
@@ -339,6 +353,12 @@ impl<I: SecretIo> Secrets<I> {
         self.io
             .read_hidden(&spec.prompt_text(repeat))
             .map_err(|e| match e.kind() {
+                // rpassword turns off ISIG, so Ctrl-C arrives as a plain byte
+                // and it raises SIGINT itself before returning — that kills
+                // the process outright (and the terminal's echo may stay
+                // off unless the shell restores it), so `Interrupted` here
+                // is never actually reached from a live Ctrl-C. Only Ctrl-D
+                // (UnexpectedEof) reaches this branch.
                 ErrorKind::Interrupted | ErrorKind::UnexpectedEof => {
                     "cancelled; nothing was changed".to_string()
                 }
@@ -405,9 +425,11 @@ pub(crate) mod fake {
     #[derive(Default)]
     pub(crate) struct FakeIo {
         pub(crate) env: HashMap<String, String>,
+        pub(crate) not_unicode: std::collections::HashSet<String>,
         pub(crate) stdin_tty: bool,
         pub(crate) stderr_tty: bool,
         pub(crate) lines: VecDeque<String>,
+        pub(crate) line_errors: VecDeque<std::io::ErrorKind>,
         pub(crate) typed: VecDeque<Result<String, std::io::ErrorKind>>,
         pub(crate) prompts: Vec<String>,
         pub(crate) lines_read: usize,
@@ -430,6 +452,10 @@ pub(crate) mod fake {
             self.env.insert(k.into(), v.into());
             self
         }
+        pub(crate) fn not_unicode_var(mut self, k: &str) -> Self {
+            self.not_unicode.insert(k.into());
+            self
+        }
         pub(crate) fn typing(mut self, answers: &[&str]) -> Self {
             self.typed = answers.iter().map(|a| Ok(a.to_string())).collect();
             self
@@ -437,6 +463,9 @@ pub(crate) mod fake {
     }
     impl SecretIo for FakeIo {
         fn env(&self, var: &str) -> EnvValue {
+            if self.not_unicode.contains(var) {
+                return EnvValue::NotUnicode;
+            }
             match self.env.get(var) {
                 Some(v) => EnvValue::Set(Zeroizing::new(v.clone())),
                 None => EnvValue::Unset,
@@ -450,6 +479,9 @@ pub(crate) mod fake {
         }
         fn read_line(&mut self) -> std::io::Result<Option<Zeroizing<String>>> {
             self.lines_read += 1;
+            if let Some(kind) = self.line_errors.pop_front() {
+                return Err(kind.into());
+            }
             Ok(self.lines.pop_front().map(Zeroizing::new))
         }
         fn read_hidden(&mut self, prompt: &str) -> std::io::Result<Zeroizing<String>> {
@@ -730,5 +762,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!((i, v.as_str()), (1, "JBSWY3DP"));
+    }
+
+    #[test]
+    fn not_unicode_env_var_names_the_variable_and_flag() {
+        let mut s = sec(FakeIo::terminal().not_unicode_var("KR_BAD"));
+        assert_eq!(
+            s.read(&PIN, Source::env("KR_BAD")).unwrap_err(),
+            "environment variable KR_BAD is not valid UTF-8 (--pin-env)"
+        );
+        assert!(
+            s.io.prompts.is_empty(),
+            "an env source never falls back to the prompt"
+        );
+    }
+
+    #[test]
+    fn read_line_io_error_names_the_secret() {
+        let mut io = FakeIo::piped(&[]);
+        io.line_errors.push_back(std::io::ErrorKind::BrokenPipe);
+        let mut s = sec(io);
+        let e = s.read(&PIN, Source::new(None, true)).unwrap_err();
+        assert!(e.starts_with("could not read the PIN from stdin: "), "{e}");
+    }
+
+    #[test]
+    fn check_one_of_refuses_two_given_sources() {
+        const HEX: Spec = Spec::value("seed", "hex").hex();
+        const B32: Spec = Spec::value("seed", "base32").base32();
+        let s = sec(FakeIo::default().var("A", "00").var("B", "AA"));
+        assert_eq!(
+            s.check_one_of("seed", &[(HEX, Source::env("A")), (B32, Source::env("B"))])
+                .unwrap_err(),
+            "give only one seed source"
+        );
+    }
+
+    #[test]
+    fn new_secret_empty_repeat_is_refused() {
+        let mut s = sec(FakeIo::terminal().typing(&["5678", ""]));
+        assert_eq!(
+            s.read(&NEW_PIN, Source::NONE).unwrap_err(),
+            "no new PIN entered; nothing was changed"
+        );
     }
 }
