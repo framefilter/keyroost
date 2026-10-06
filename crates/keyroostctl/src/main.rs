@@ -504,7 +504,7 @@ struct Cli {
 enum Cmd {
     /// Print shell completions to stdout; they call back into keyroostctl so
     /// `--device` completes saved key names (e.g. `keyroostctl completions bash
-    /// > /etc/bash_completion.d/keyroostctl`).
+    /// > ~/.local/share/bash-completion/completions/keyroostctl`).
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
@@ -2574,14 +2574,17 @@ enum MoltoCmd {
 enum FidoCmd {
     /// Run `authenticatorGetInfo` against a connected FIDO authenticator.
     Info {
-        /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
+        /// hidraw path to use — an expert override that targets that path as
+        /// typed. If omitted, auto-pick the only connected FIDO device.
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
     /// Run `authenticatorReset`, wiping all credentials on the key.
     ///
     /// Most authenticators only accept Reset within ~10s of plug-in and
-    /// require a physical touch. Asks first unless `--yes` is given.
+    /// require a physical touch. Asks first unless `--yes` is given, then
+    /// (over USB-HID) waits up to 60 seconds for the key to be unplugged and
+    /// plugged back in before sending the reset.
     ///
     /// For a card in a smart-card reader (no USB interface), use `--reader`:
     /// the card is power-cycled in place — which starts the same
@@ -2591,7 +2594,8 @@ enum FidoCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// hidraw path to use. If omitted, auto-pick the only connected FIDO device.
+        /// hidraw path to use — an expert override that targets that path as
+        /// typed. If omitted, auto-pick the only connected FIDO device.
         #[arg(long, value_name = "PATH", conflicts_with = "reader")]
         path: Option<std::path::PathBuf>,
         /// Substring of the PC/SC reader holding the card to reset. Routes the
