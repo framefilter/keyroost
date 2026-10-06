@@ -2138,12 +2138,12 @@ impl<'tx> PivSession<'tx> {
             // the Swissbit Management Application's own GET SERIAL. The
             // iShield 1 answers the Yubico command with its real serial. The
             // iShield 2 firmwares seen so far (v1.0.4 / applet v1.0.0.0 and
-            // v1.1.2 / applet v1.4.1) recognise it too, and mimic other
+            // v1.1.2 / applet v1.4.1) recognize it too, and mimic other
             // Yubico extensions, but answer GET SERIAL specifically with
-            // `SW 6982` (security status not satisfied). That looks like a
-            // firmware bug, so the Yubico read is kept first in case a later
-            // firmware fixes it, and the Management Application read covers
-            // the failure today.
+            // `SW 6982` (security status not satisfied), possibly a firmware
+            // bug, so the Yubico read is kept first in case a later firmware
+            // changes it, and the Management Application read covers it
+            // today.
             fingerprint::AppletFingerprint::OpenFips201(
                 fingerprint::OpenFips201Variant::SwissbitIShield2,
             )
