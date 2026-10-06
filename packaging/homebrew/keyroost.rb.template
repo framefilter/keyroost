@@ -21,7 +21,8 @@ class Keyroost < Formula
   def install
     bin.install "keyroostctl"
     bin.install "keyroost"
-    generate_completions_from_executable(bin/"keyroostctl", "completions", shells: [:bash, :zsh, :fish])
+    # zsh only works when sourced from ~/.zshrc (see the README), not autoloaded.
+    generate_completions_from_executable(bin/"keyroostctl", "completions", shells: [:bash, :fish])
     system bin/"keyroostctl", "manpage", buildpath/"man"
     man1.install Dir[buildpath/"man/*.1"]
   end

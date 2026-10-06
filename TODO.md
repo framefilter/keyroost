@@ -191,6 +191,13 @@ plan's two-key manual steps were never executed):
 
 ## Deferred to a later release
 
+- **Submit keyroost to Flathub** — not in v0.13.0. Flathub's generative-AI
+  policy allows AI-generated app code with full disclosure (parts and extent),
+  but the Flathub manifest itself and the submission PR, its description and
+  replies must be written by the maintainer. Claude may explain requirements
+  and review in words; it doesn't write the manifest or the submission text.
+  The manifest in `packaging/flatpak/` can't be reused for this.
+
 - **Friendly names for Molto2 tokens** — detection never connects to a
   Molto2, so its row carries no serial and `key-name add` can't name it.
   Needs a way to get the token's serial during detection, without logging in
