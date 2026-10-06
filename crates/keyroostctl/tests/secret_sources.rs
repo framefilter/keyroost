@@ -75,3 +75,112 @@ fn retired_secret_flags_name_their_replacement() {
         "{err}"
     );
 }
+
+const TABLE: &str = include_str!("secret_flags.txt");
+
+/// A well-formed value for a secret supplied by env so a later one is
+/// reached. It never reaches a key: one secret is always missing, and every
+/// secret is checked before any device is opened.
+fn dummy(prefix: &str) -> &'static str {
+    match prefix {
+        "hex" | "mgmt-key" | "old-mgmt-key" | "new-mgmt-key" => "00",
+        "base32" | "seed" => "AAAA",
+        _ => "0000",
+    }
+}
+
+/// A fresh working directory holding the files the table's rows name, so a
+/// command that reads its input file first gets past it to the secrets.
+fn fixture_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("keyroost-secret-sources-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, body) in [
+        ("message.txt", &b"keyroost test message\n"[..]),
+        (
+            "cert.der",
+            include_bytes!("../../keyroost-piv/tests/fixtures/rsa_piv.der"),
+        ),
+    ] {
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+    dir
+}
+
+/// Every required secret, missing with no terminal, is refused before any
+/// device I/O, and every flag the refusal names exists in that command's
+/// --help. Earlier required secrets are supplied by env so each later one
+/// is reached.
+#[test]
+fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
+    let dir = fixture_dir();
+    for line in TABLE
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
+        let cols: Vec<&str> = line.split('\t').filter(|c| !c.is_empty()).collect();
+        let path: Vec<&str> = cols[0].split(' ').collect();
+        let extra: Vec<&str> = if cols.len() == 4 {
+            cols[1].split(' ').collect()
+        } else {
+            vec![]
+        };
+        let required = cols[cols.len() - 1];
+        if required == "-" {
+            continue;
+        }
+        let required: Vec<&str> = required.split(' ').collect();
+        let help = {
+            let mut a = path.clone();
+            a.push("--help");
+            let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+                .args(&a)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        for i in 0..required.len() {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_keyroostctl"));
+            cmd.args(&path)
+                .args(&extra)
+                .current_dir(&dir)
+                .stdin(Stdio::null())
+                .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc");
+            for (j, prev) in required[..i].iter().enumerate() {
+                let p = prev.split('|').next().unwrap();
+                let var = format!("KR_TEST_SECRET_{j}");
+                cmd.arg(format!("--{p}-env")).arg(&var).env(&var, dummy(p));
+            }
+            let out = cmd.output().unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{line} #{i}: {err}");
+            assert!(
+                err.contains(" given: pass "),
+                "{line} #{i}: expected a no-source refusal, got: {err}"
+            );
+            // The `→ key` announce line comes from device selection: its
+            // absence shows the refusal came before any key was looked at.
+            assert!(
+                !err.contains('\u{2192}'),
+                "{line} #{i}: a key was selected before the refusal: {err}"
+            );
+            for p in required[i].split('|') {
+                assert!(
+                    err.contains(&format!("--{p}-env VAR")),
+                    "{line} #{i}: {err}"
+                );
+            }
+            for flag in err
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|w| w.starts_with("--"))
+            {
+                assert!(
+                    help.contains(flag),
+                    "{line}: refusal names {flag}, which `--help` doesn't list"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

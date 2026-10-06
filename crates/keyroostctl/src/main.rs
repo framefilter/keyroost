@@ -15656,6 +15656,117 @@ mod cli_tests {
         }
     }
 
+    const SECRET_TABLE: &str = include_str!("../tests/secret_flags.txt");
+
+    /// (path, every -env/-stdin prefix pair) for each subcommand, from the
+    /// clap tree.
+    fn secret_pairs() -> std::collections::BTreeMap<String, Vec<String>> {
+        use clap::CommandFactory;
+        fn walk(
+            cmd: &clap::Command,
+            path: String,
+            out: &mut std::collections::BTreeMap<String, Vec<String>>,
+        ) {
+            let longs: Vec<&str> = cmd
+                .get_arguments()
+                .filter(|a| !a.is_global_set())
+                .filter_map(|a| a.get_long())
+                .collect();
+            let mut pairs: Vec<String> = longs
+                .iter()
+                .filter_map(|l| l.strip_suffix("-stdin"))
+                .filter(|p| longs.contains(&format!("{p}-env").as_str()))
+                .map(str::to_owned)
+                .collect();
+            pairs.sort();
+            if !pairs.is_empty() {
+                out.insert(path.clone(), pairs);
+            }
+            for sub in cmd.get_subcommands() {
+                let p = if path.is_empty() {
+                    sub.get_name().to_owned()
+                } else {
+                    format!("{path} {}", sub.get_name())
+                };
+                walk(sub, p, out);
+            }
+        }
+        let mut root = Cli::command();
+        root.build();
+        let mut out = std::collections::BTreeMap::new();
+        walk(&root, String::new(), &mut out);
+        out
+    }
+
+    /// Whether clap refuses `a` and `b` together: a direct conflict, or both
+    /// in an exclusive (`multiple(false)`) group.
+    fn args_conflict(cmd: &clap::Command, a: &clap::Arg, b: &clap::Arg) -> bool {
+        cmd.get_arg_conflicts_with(a)
+            .iter()
+            .any(|c| c.get_id() == b.get_id())
+            || cmd.get_groups().any(|g| {
+                let ids: Vec<&clap::Id> = g.get_args().collect();
+                !g.clone().is_multiple() && ids.contains(&a.get_id()) && ids.contains(&b.get_id())
+            })
+    }
+
+    #[test]
+    fn every_secret_flag_pair_is_in_the_table_with_help_and_line_order() {
+        use clap::CommandFactory;
+        let tree = secret_pairs();
+        let mut table = std::collections::BTreeMap::new();
+        for line in SECRET_TABLE
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        {
+            let cols: Vec<&str> = line.split('\t').filter(|c| !c.is_empty()).collect();
+            assert!(cols.len() == 3 || cols.len() == 4, "bad row: {line:?}");
+            let mut all: Vec<String> = cols[cols.len() - 2].split(' ').map(str::to_owned).collect();
+            all.sort();
+            assert!(
+                table.insert(cols[0].to_owned(), all).is_none(),
+                "duplicate row: {line:?}"
+            );
+        }
+        assert_eq!(tree, table, "tests/secret_flags.txt is out of date");
+        let mut root = Cli::command();
+        root.build();
+        for path in tree.keys() {
+            let mut cmd = &root;
+            for name in path.split(' ') {
+                cmd = cmd.find_subcommand(name).unwrap();
+            }
+            for a in cmd.get_arguments().filter(|a| {
+                a.get_long()
+                    .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
+            }) {
+                assert!(
+                    a.get_help().is_some(),
+                    "{path} --{} has no help",
+                    a.get_long().unwrap()
+                );
+            }
+            // Two stdin flags that can be combined: each states its line.
+            let stdin_args: Vec<&clap::Arg> = cmd
+                .get_arguments()
+                .filter(|a| a.get_long().is_some_and(|l| l.ends_with("-stdin")))
+                .collect();
+            for a in &stdin_args {
+                let combinable = stdin_args
+                    .iter()
+                    .any(|b| b.get_id() != a.get_id() && !args_conflict(cmd, a, b));
+                if combinable {
+                    let help = a.get_help().unwrap().to_string();
+                    assert!(
+                        help.contains("first line") || help.contains("second line"),
+                        "{path} --{}: {help}",
+                        a.get_long().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn piv_policy_values_map_one_to_one_onto_the_byte_layer() {
         use keyroost_piv::{PinPolicy, TouchPolicy};
