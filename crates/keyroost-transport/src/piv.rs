@@ -4769,7 +4769,8 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Build a PKCS#10 certificate-signing request for the key in `slot`,
-    /// signed on the card, returned as PEM. The slot must hold a key
+    /// signed on the card, returned as PEM. `key_usage`, when given, is
+    /// requested as a `keyUsage` extension; `None` requests no extensions. The slot must hold a key
     /// (generated or imported). Verifies `pin` itself, deliberately placed
     /// *after* resolving the slot's key material ([`Self::slot_key`]) and
     /// *immediately* before the signing [`Self::sign`] call — see
@@ -4779,12 +4780,13 @@ impl<'tx> PivSession<'tx> {
         slot: Slot,
         subject: &str,
         pin: &[u8],
+        key_usage: Option<piv::x509::KeyUsageExt>,
     ) -> Result<String, TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
         let spki = piv::spki::subject_public_key_info(&key, alg)
             .map_err(|_| TransportError::MalformedResponse("slot key/algorithm mismatch"))?;
-        let cri = piv::x509::csr_info(&subject, &spki);
+        let cri = piv::x509::csr_info(&subject, &spki, key_usage).map_err(TransportError::X509)?;
         let prepared = prepared_block(alg, &cri)?;
         self.verify_pin(pin)?;
         let sig = self.sign(slot, alg, &prepared)?;
@@ -4800,6 +4802,7 @@ impl<'tx> PivSession<'tx> {
     /// slot's key material ([`Self::slot_key`]) and *immediately* before the
     /// signing [`Self::sign`] call — see `slot_key`'s doc comment for why
     /// that ordering matters.
+    #[allow(clippy::too_many_arguments)]
     pub fn self_signed_certificate(
         &mut self,
         slot: Slot,
@@ -4808,6 +4811,7 @@ impl<'tx> PivSession<'tx> {
         not_after: i64,
         pin: &[u8],
         compression: CertCompression,
+        key_usage: Option<piv::x509::KeyUsageExt>,
     ) -> Result<(Vec<u8>, CertImport), TransportError> {
         let (alg, key) = self.slot_key(slot)?;
         let subject = piv::x509::SubjectName::parse(subject).map_err(TransportError::X509)?;
@@ -4817,8 +4821,10 @@ impl<'tx> PivSession<'tx> {
         // 20-octet ceiling even after the positive-INTEGER zero prefix.
         let mut serial = [0u8; 16];
         getrandom::getrandom(&mut serial).map_err(|_| TransportError::HostRngFailed)?;
-        let tbs = piv::x509::tbs_certificate(&serial, alg, &subject, not_before, not_after, &spki)
-            .map_err(TransportError::X509)?;
+        let tbs = piv::x509::tbs_certificate(
+            &serial, alg, &subject, not_before, not_after, &spki, key_usage,
+        )
+        .map_err(TransportError::X509)?;
         let prepared = prepared_block(alg, &tbs)?;
         self.verify_pin(pin)?;
         let sig = self.sign(slot, alg, &prepared)?;

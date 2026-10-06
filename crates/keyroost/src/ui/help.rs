@@ -104,7 +104,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "piv-certificate" => &Help {
             title: "Create a certificate",
-            body: "A self-signed certificate is stored straight into the slot and is ready to use. A CSR is a request file you send to a certificate authority so they can issue one for you. Either way the signing happens on the card, so it needs the PIN; for a CSR, keyroost first asks where to save the request file.",
+            body: "A self-signed certificate is stored straight into the slot and is ready to use. A CSR is a request file you send to a certificate authority so they can issue one for you. Either way the signing happens on the card, so it needs the PIN; for a CSR, keyroost first asks where to save the request file. Key usage is optional: left at Undefined, no key usage extension is written. It starts out set to the PIV standard's value for the slot (Undefined where the standard defines none), and you can select multiple usages.",
             slug: "/piv#certificate",
         },
         "piv-import-export" => &Help {
