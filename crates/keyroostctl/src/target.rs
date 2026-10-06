@@ -293,17 +293,17 @@ pub(crate) fn reverify(before: &Device) -> Result<(), Box<dyn Error>> {
         Recheck::Skip => {
             if debug_on() {
                 eprintln!(
-                    "[target] {label}: not a detected key; not re-checked after the question"
+                    "[target] {label}: not a detected key; not re-checked after waiting for input"
                 );
             }
             Ok(())
         }
         Recheck::Gone | Recheck::Changed => Err(format!(
-            "the key changed while waiting for confirmation ({label}); nothing was changed"
+            "the key changed while waiting for a confirmation or a typed secret ({label}); nothing was changed"
         )
         .into()),
         Recheck::Unconfirmed => Err(format!(
-            "could not re-read the serial of {label} after the confirmation; nothing was changed"
+            "could not re-read the serial of {label} after waiting for input; nothing was changed"
         )
         .into()),
     }

@@ -3768,7 +3768,7 @@ fn molto_entry_from_qr(
 fn same_molto(before: Option<&str>, now: &str) -> Result<(), String> {
     match before {
         Some(b) if b != now => {
-            Err("the Molto2 changed while waiting for confirmation; nothing was changed".into())
+            Err("the Molto2 changed while waiting for a confirmation or a typed secret; nothing was changed".into())
         }
         _ => Ok(()),
     }
@@ -3778,7 +3778,7 @@ fn same_molto(before: Option<&str>, now: &str) -> Result<(), String> {
 fn same_prog_token(before: &str, now: &str) -> Result<(), String> {
     if before != now {
         return Err(
-            "the programmable token changed while waiting for confirmation; nothing was changed"
+            "the programmable token changed while waiting for a confirmation or a typed secret; nothing was changed"
                 .into(),
         );
     }
@@ -9142,7 +9142,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let serial = s.status()?.serial;
                     if !same_piv_card(confirmed_serial, serial) {
                         return Err(format!(
-                            "the card in {} changed while waiting for confirmation; \
+                            "the card in {} changed while waiting for a confirmation or a typed secret; \
                              nothing was reset",
                             sanitize_terminal(&name)
                         )
@@ -11128,7 +11128,7 @@ fn run_fido_large_blob_clear(
 /// The large-blob array is re-read after the question and the PIN; a
 /// delete or clear refuses when it no longer matches what was shown.
 const LARGE_BLOB_CHANGED: &str =
-    "the large-blob array changed while waiting for confirmation; nothing was changed";
+    "the large-blob array changed while waiting for a confirmation or a typed secret; nothing was changed";
 
 /// Whether the array read after the question and the PIN is the one the
 /// person was shown. An extra guard on top of re-finding the key: two keys
@@ -12705,13 +12705,13 @@ mod cli_tests {
     fn the_same_molto_must_be_present_after_the_question() {
         assert_eq!(
             same_molto(Some("A1"), "A2").unwrap_err(),
-            "the Molto2 changed while waiting for confirmation; nothing was changed"
+            "the Molto2 changed while waiting for a confirmation or a typed secret; nothing was changed"
         );
         assert!(same_molto(None, "x").is_ok());
         assert!(same_molto(Some("A"), "A").is_ok());
         assert_eq!(
             same_prog_token("A1", "A2").unwrap_err(),
-            "the programmable token changed while waiting for confirmation; nothing was changed"
+            "the programmable token changed while waiting for a confirmation or a typed secret; nothing was changed"
         );
         assert!(same_prog_token("A", "A").is_ok());
     }
