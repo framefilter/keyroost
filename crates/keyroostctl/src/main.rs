@@ -871,9 +871,8 @@ enum CliKeyUsage {
     /// marked critical. Valid on its own or next to exactly those usages plus
     /// `critical`; needs a slot the standard defines a usage for.
     Default,
-    /// Write no keyUsage extension — same as omitting `--key-usage`. Can't be
-    /// combined with other values, except `default` for a slot whose PIV
-    /// default is itself undefined.
+    /// Write no keyUsage extension. Can't be combined with other values,
+    /// except `default` for a slot whose PIV default is itself undefined.
     Undefined,
     /// Mark the keyUsage extension critical. Needs at least one usage (or
     /// `default`).
@@ -914,7 +913,7 @@ struct KeyUsageArgs {
     /// is not). `default` selects the PIV standard's extension for the slot
     /// (its usages, critical) and may only be combined with exactly those
     /// usages plus `critical`. `undefined` writes no extension. Without this
-    /// option no keyUsage extension is written.
+    /// option the slot's default is used, as with `default`.
     #[arg(
         long = "key-usage",
         value_enum,
@@ -1000,10 +999,14 @@ fn resolve_key_usage(
     slot: keyroost_piv::Slot,
     alg: Option<keyroost_piv::KeyAlg>,
 ) -> Result<Option<keyroost_piv::x509::KeyUsageExt>, String> {
+    // No `--key-usage` at all means the slot's PIV default, exactly as if
+    // `default` had been given (the GUI preselects the same).
+    let args = if args.is_empty() {
+        &[CliKeyUsage::Default][..]
+    } else {
+        args
+    };
     check_key_usage_args(args, slot, alg)?;
-    if args.is_empty() {
-        return Ok(None);
-    }
     if args.contains(&CliKeyUsage::Undefined) {
         // Alone it simply means "no extension". Next to `default` it is only
         // consistent if the slot's PIV default is itself "undefined" — which
@@ -13881,7 +13884,6 @@ mod cli_tests {
         use CliKeyUsage as U;
         let ext = |usages, critical| Some(KeyUsageExt { usages, critical });
         let sign_default = ext(K::DIGITAL_SIGNATURE.union(K::NON_REPUDIATION), true);
-        assert_eq!(resolve_key_usage(&[], Slot::Signature, None), Ok(None));
         // `default` is the PIV extension: usages plus critical.
         assert_eq!(
             resolve_key_usage(&[U::Default], Slot::Signature, None),
@@ -13956,6 +13958,47 @@ mod cli_tests {
         // critical needs a usage; invalid combinations are rejected.
         assert!(resolve_key_usage(&[U::Critical], Slot::Authentication, None).is_err());
         assert!(check_key_usage_args(&[U::EncipherOnly], Slot::Signature, None).is_err());
+    }
+
+    /// No `--key-usage` behaves exactly like `--key-usage default`: the
+    /// slot's PIV extension, the same "no extension" for a key type that
+    /// can't back it, and the same error where the default can't be known.
+    #[test]
+    fn key_usage_absent_is_the_slot_default() {
+        use keyroost_piv::{KeyAlg, Slot};
+        let slots = [
+            Slot::Authentication,
+            Slot::Signature,
+            Slot::KeyManagement,
+            Slot::CardAuthentication,
+            Slot::Retired(1),
+            Slot::Retired(20),
+        ];
+        let algs = [
+            None,
+            Some(KeyAlg::Rsa2048),
+            Some(KeyAlg::EccP256),
+            Some(KeyAlg::EccP384),
+            Some(KeyAlg::Ed25519),
+            Some(KeyAlg::X25519),
+        ];
+        for slot in slots {
+            for alg in algs {
+                assert_eq!(
+                    resolve_key_usage(&[], slot, alg),
+                    resolve_key_usage(&[CliKeyUsage::Default], slot, alg),
+                );
+            }
+        }
+        // Spot checks of what that default is.
+        assert_eq!(
+            resolve_key_usage(&[], Slot::Signature, None).map(|e| e.map(|e| e.critical)),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            resolve_key_usage(&[], Slot::KeyManagement, Some(KeyAlg::Ed25519)),
+            Ok(None)
+        );
     }
 
     #[test]
