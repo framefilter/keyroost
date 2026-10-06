@@ -1,5 +1,3 @@
-#![allow(dead_code)] // removed in Task 10 once every Spec builder has a caller
-
 //! One way to read a secret: a PIN, password, management or customer key,
 //! a seed or an otpauth URI. Sources, in order: `--X-env VAR`; `--X-stdin`
 //! (one line, or a hidden prompt when stdin is a terminal); with neither
@@ -45,7 +43,7 @@ pub(crate) struct Spec {
     pub(crate) also: Option<&'static str>,
     /// Replaces the "--X-env VAR or --X-stdin" part (molto import's `-`).
     pub(crate) hint: Option<&'static str>,
-    /// Replaces the prompt's label.
+    /// Replaces the prompt's label, shown as written (not capitalized).
     pub(crate) prompt: Option<&'static str>,
 }
 
@@ -126,6 +124,10 @@ impl Spec {
         let label = self.prompt.unwrap_or(self.label);
         if repeat {
             return format!("Repeat {label}{suffix}: ");
+        }
+        // An explicit prompt is shown as written ("otpauth:// URI").
+        if self.prompt.is_some() {
+            return format!("{label}{suffix}: ");
         }
         let mut chars = label.chars();
         let first: String = chars
