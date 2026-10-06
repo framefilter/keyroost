@@ -231,8 +231,8 @@ impl Secrets<RealIo> {
     }
 }
 
-enum Origin<'a> {
-    Env(&'a str),
+enum Origin {
+    Env,
     Stdin(usize),
     Prompt,
 }
@@ -258,8 +258,19 @@ impl<I: SecretIo> Secrets<I> {
     }
 
     /// Refuse early (no device I/O, nothing read) when a required secret
-    /// has no source and no terminal can ask for it.
+    /// has no source and no terminal can ask for it, or when an `--X-env`
+    /// source is given but unusable (unset, empty, or not valid UTF-8) — a
+    /// bad environment variable is caught before any key is selected, not
+    /// after. A variable that disappears between this call and [`Self::read`]
+    /// is still caught there.
     pub(crate) fn check(&self, spec: &Spec, src: Source<'_>) -> Result<(), String> {
+        if let Some(var) = src.env {
+            return match self.io.env(var) {
+                EnvValue::Set(v) => finish(spec, v, Origin::Env).map(|_| ()),
+                EnvValue::Unset => Err(env_problem(spec.flag, "is not set")),
+                EnvValue::NotUnicode => Err(env_problem(spec.flag, "is not valid UTF-8")),
+            };
+        }
         if src.given() || self.terminal_present() {
             Ok(())
         } else {
@@ -287,12 +298,10 @@ impl<I: SecretIo> Secrets<I> {
         if let Some(var) = src.env {
             let raw = match self.io.env(var) {
                 EnvValue::Set(v) => v,
-                EnvValue::Unset => return Err(env_problem(var, spec.flag, "is not set")),
-                EnvValue::NotUnicode => {
-                    return Err(env_problem(var, spec.flag, "is not valid UTF-8"))
-                }
+                EnvValue::Unset => return Err(env_problem(spec.flag, "is not set")),
+                EnvValue::NotUnicode => return Err(env_problem(spec.flag, "is not valid UTF-8")),
             };
-            return finish(spec, raw, Origin::Env(var));
+            return finish(spec, raw, Origin::Env);
         }
         if src.stdin && !self.io.stdin_is_terminal() {
             self.stdin_lines += 1;
@@ -384,28 +393,12 @@ impl<I: SecretIo> Secrets<I> {
     }
 }
 
-/// Whether `name` looks like an environment variable name. A name that
-/// doesn't may be the secret itself, passed where the name belongs.
-fn plausible_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.len() <= 64
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// "environment variable VAR is not set (--X-env)", without repeating VAR
-/// when it doesn't look like a variable name (it may be the secret itself).
-fn env_problem(var: &str, flag: &str, problem: &str) -> String {
-    if plausible_var_name(var) {
-        format!("environment variable {var} {problem} (--{flag}-env)")
-    } else {
-        format!(
-            "the environment variable named by --{flag}-env {problem} (the name isn't shown; \
-             it doesn't look like a variable name — did you pass the secret itself?)"
-        )
-    }
+/// "the environment variable given to --X-env is not set" — never the
+/// variable's name, which may be the secret itself: a user migrating from
+/// the old command line sometimes passes the secret where the name goes
+/// (`--pin-env DEADBEEF` instead of `--pin-env KR_PIN`).
+fn env_problem(flag: &str, problem: &str) -> String {
+    format!("the environment variable given to --{flag}-env {problem}")
 }
 
 fn strip_line_ending(line: &str) -> &str {
@@ -418,7 +411,7 @@ fn strip_line_ending(line: &str) -> &str {
 fn finish(
     spec: &Spec,
     raw: Zeroizing<String>,
-    origin: Origin<'_>,
+    origin: Origin,
 ) -> Result<Zeroizing<String>, String> {
     let value = match spec.form {
         Form::Text => raw,
@@ -431,7 +424,7 @@ fn finish(
         return Ok(value);
     }
     Err(match origin {
-        Origin::Env(var) => env_problem(var, spec.flag, "is empty"),
+        Origin::Env => env_problem(spec.flag, "is empty"),
         Origin::Stdin(n) => format!("the {} on stdin line {n} is empty", spec.label),
         Origin::Prompt => format!("no {} entered; nothing was changed", spec.label),
     })
@@ -566,11 +559,11 @@ mod tests {
     }
 
     #[test]
-    fn unset_env_var_names_the_variable_and_flag() {
+    fn unset_env_var_names_the_flag_never_the_variable() {
         let mut s = sec(FakeIo::terminal());
         assert_eq!(
             s.read(&PIN, Source::env("KR_NOPE")).unwrap_err(),
-            "environment variable KR_NOPE is not set (--pin-env)"
+            "the environment variable given to --pin-env is not set"
         );
         assert!(
             s.io.prompts.is_empty(),
@@ -578,55 +571,49 @@ mod tests {
         );
     }
 
+    /// An env var's *name* is never echoed, however plausible it looks — a
+    /// user migrating from the old command line may have passed the secret
+    /// itself where the name goes.
     #[test]
-    fn an_env_name_that_may_be_the_secret_is_never_repeated() {
-        let hidden = "the environment variable named by --pin-env is not set (the name isn't \
-                      shown; it doesn't look like a variable name — did you pass the secret itself?)";
+    fn an_env_var_name_is_never_repeated_in_an_error() {
         for name in [
             "1234S3CRET",
             "otpauth://totp/x?secret=S3CRET",
             "S3CRET-PASS",
             "S3CRET pass",
             "",
+            "PIN",
+            "DEADBEEF",
+            "_X",
+            "KR_PIN_2",
         ] {
             let mut s = sec(FakeIo::terminal());
             let e = s.read(&PIN, Source::env(name)).unwrap_err();
-            assert_eq!(e, hidden, "{name:?}");
-        }
-        let long = "A".repeat(65);
-        let mut s = sec(FakeIo::terminal());
-        let e = s.read(&PIN, Source::env(&long)).unwrap_err();
-        assert!(!e.contains(&long) && e.contains("isn't shown"), "{e}");
-        // Empty and non-UTF-8 values are reported the same way.
-        let mut s = sec(FakeIo::default().var("12S3CRET", ""));
-        let e = s.read(&PIN, Source::env("12S3CRET")).unwrap_err();
-        assert!(
-            !e.contains("S3CRET") && e.contains("--pin-env is empty"),
-            "{e}"
-        );
-        let mut s = sec(FakeIo::default().not_unicode_var("12S3CRET"));
-        let e = s.read(&PIN, Source::env("12S3CRET")).unwrap_err();
-        assert!(
-            !e.contains("S3CRET") && e.contains("--pin-env is not valid UTF-8"),
-            "{e}"
-        );
-        // A plausible name, up to 64 characters, is still named.
-        for name in ["_X", "KR_PIN_2", &"B".repeat(64)] {
-            let mut s = sec(FakeIo::terminal());
-            let e = s.read(&PIN, Source::env(name)).unwrap_err();
             assert_eq!(
-                e,
-                format!("environment variable {name} is not set (--pin-env)")
+                e, "the environment variable given to --pin-env is not set",
+                "{name:?}"
             );
+            assert!(!e.contains(name) || name.is_empty(), "{name:?}: {e}");
         }
+        // Empty and non-UTF-8 values are reported the same way, by flag only.
+        let mut s = sec(FakeIo::default().var("DEADBEEF", ""));
+        assert_eq!(
+            s.read(&PIN, Source::env("DEADBEEF")).unwrap_err(),
+            "the environment variable given to --pin-env is empty"
+        );
+        let mut s = sec(FakeIo::default().not_unicode_var("DEADBEEF"));
+        assert_eq!(
+            s.read(&PIN, Source::env("DEADBEEF")).unwrap_err(),
+            "the environment variable given to --pin-env is not valid UTF-8"
+        );
     }
 
     #[test]
-    fn empty_env_var_is_refused() {
+    fn empty_env_var_is_refused_without_naming_it() {
         let mut s = sec(FakeIo::default().var("KR_E", ""));
         assert_eq!(
             s.read(&PIN, Source::env("KR_E")).unwrap_err(),
-            "environment variable KR_E is empty (--pin-env)"
+            "the environment variable given to --pin-env is empty"
         );
     }
 
@@ -635,7 +622,7 @@ mod tests {
         let mut s = sec(FakeIo::default().var("KR_K", "  \t "));
         assert_eq!(
             s.read(&MGMT, Source::env("KR_K")).unwrap_err(),
-            "environment variable KR_K is empty (--mgmt-key-env)"
+            "the environment variable given to --mgmt-key-env is empty"
         );
     }
 
@@ -805,13 +792,50 @@ mod tests {
     fn check_is_pure_and_accepts_a_terminal_or_any_flag() {
         let s = sec(FakeIo::terminal());
         assert!(s.check(&PIN, Source::NONE).is_ok());
-        let s = sec(FakeIo::default());
+        let s = sec(FakeIo::default().var("KR_SET", "1111"));
         assert!(
-            s.check(&PIN, Source::env("KR_UNSET")).is_ok(),
-            "env is checked when read, after any question"
+            s.check(&PIN, Source::env("KR_SET")).is_ok(),
+            "a usable env source is accepted up front"
         );
         assert!(s.check(&PIN, Source::new(None, true)).is_ok());
         assert_eq!(s.io.lines_read, 0);
+    }
+
+    /// `check` validates an `--X-env` source immediately (unset, empty, or
+    /// not UTF-8), so a bad environment variable is caught before any key
+    /// is selected — not only later, when the secret is actually read.
+    #[test]
+    fn check_refuses_an_unusable_env_source_before_any_read() {
+        let s = sec(FakeIo::default());
+        assert_eq!(
+            s.check(&PIN, Source::env("KR_NOPE")).unwrap_err(),
+            "the environment variable given to --pin-env is not set"
+        );
+        let s = sec(FakeIo::default().var("KR_E", ""));
+        assert_eq!(
+            s.check(&PIN, Source::env("KR_E")).unwrap_err(),
+            "the environment variable given to --pin-env is empty"
+        );
+        let s = sec(FakeIo::default().not_unicode_var("KR_BAD"));
+        assert_eq!(
+            s.check(&PIN, Source::env("KR_BAD")).unwrap_err(),
+            "the environment variable given to --pin-env is not valid UTF-8"
+        );
+        assert_eq!(s.io.lines_read, 0);
+    }
+
+    /// A variable that was fine at `check` time and disappears before
+    /// [`Secrets::read`] still gets a clear refusal there, naming only the
+    /// flag — `check` validating up front doesn't make `read` trust it.
+    #[test]
+    fn read_still_catches_an_env_var_that_vanishes_after_check() {
+        let mut s = sec(FakeIo::default().var("KR_GONE", "1111"));
+        assert!(s.check(&PIN, Source::env("KR_GONE")).is_ok());
+        s.io.env.remove("KR_GONE");
+        assert_eq!(
+            s.read(&PIN, Source::env("KR_GONE")).unwrap_err(),
+            "the environment variable given to --pin-env is not set"
+        );
     }
 
     #[test]
@@ -845,11 +869,11 @@ mod tests {
     }
 
     #[test]
-    fn not_unicode_env_var_names_the_variable_and_flag() {
+    fn not_unicode_env_var_names_the_flag_never_the_variable() {
         let mut s = sec(FakeIo::terminal().not_unicode_var("KR_BAD"));
         assert_eq!(
             s.read(&PIN, Source::env("KR_BAD")).unwrap_err(),
-            "environment variable KR_BAD is not valid UTF-8 (--pin-env)"
+            "the environment variable given to --pin-env is not valid UTF-8"
         );
         assert!(
             s.io.prompts.is_empty(),
