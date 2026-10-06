@@ -29,6 +29,8 @@ mod prompt;
 mod secrets;
 mod target;
 
+use crate::secrets::{Secrets, Source, Spec};
+
 /// The global `--device` selector, captured once in `run()` so the FIDO device
 /// resolver can honor it without threading it through every subcommand handler.
 static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
@@ -1193,31 +1195,41 @@ enum PivCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
-    /// Change the PIV PIN. PINs are sourced from env vars or stdin (stdin
-    /// reads two consecutive lines: old then new).
+    /// Change the PIV PIN. Each PIN comes from an environment variable,
+    /// stdin (the current PIN on the first line, the new one on the second)
+    /// or, with neither, a hidden prompt.
     ChangePin {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
+        /// Read the current PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
         old_pin_env: Option<String>,
+        /// Read the current PIN from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         old_pin_stdin: bool,
+        /// Read the new PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
+        /// Read the new PIN from stdin (second line; hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
     },
-    /// Change the PUK (PIN Unblocking Key). PUKs are sourced from env vars or
-    /// stdin (stdin reads two consecutive lines: old then new).
+    /// Change the PUK (PIN Unblocking Key). Each PUK comes from an
+    /// environment variable, stdin (the current PUK on the first line, the
+    /// new one on the second) or, with neither, a hidden prompt.
     ChangePuk {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
+        /// Read the current PUK from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "old_puk_stdin")]
         old_puk_env: Option<String>,
+        /// Read the current PUK from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         old_puk_stdin: bool,
+        /// Read the new PUK from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_puk_stdin")]
         new_puk_env: Option<String>,
+        /// Read the new PUK from stdin (second line; hidden when typed at a terminal).
         #[arg(long)]
         new_puk_stdin: bool,
     },
@@ -1225,12 +1237,16 @@ enum PivCmd {
     UnblockPin {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
+        /// Read the PUK from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "puk_stdin")]
         puk_env: Option<String>,
+        /// Read the PUK from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         puk_stdin: bool,
+        /// Read the new PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
+        /// Read the new PIN from stdin (second line; hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
     },
@@ -1243,23 +1259,29 @@ enum PivCmd {
         pin_tries: u8,
         #[arg(long, value_name = "N")]
         puk_tries: u8,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (second line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
-    /// Change the card-management (9B) key.
+    /// Change the card-management (9B) key. Both keys are hex; from stdin,
+    /// the current key comes on the first line and the new one on the
+    /// second.
     ///
     /// Changing the management key is an extension to standard PIV (YubiKey
     /// and other keys that implement it).
@@ -1286,17 +1308,19 @@ enum PivCmd {
         // args — the `--old-mgmt-key-*` trio in particular — together.
         #[arg(long, value_name = "SUBSTR", display_order = 10)]
         reader: Option<String>,
+        /// Read the current management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["old_mgmt_key_stdin", "old_mgmt_key_default"], display_order = 11)]
         old_mgmt_key_env: Option<String>,
+        /// Read the current management key (hex) from stdin (first line; hidden when typed at a
+        /// terminal).
         #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_default"], display_order = 12)]
         old_mgmt_key_stdin: bool,
-        /// Authenticate with this device's well-known factory-default
-        /// management key, if one is known; fails with a clear error if it
-        /// isn't. Only applies to the OLD (current) key — there's no
-        /// equivalent for NEW, since installing a known-weak key on purpose
-        /// isn't what this convenience is for.
+        /// Use the factory-default management key keyroost knows for this device
+        /// as the current key. PIV only: other applets have default PINs you
+        /// already know. There is no such option for the new key.
         #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_stdin"], display_order = 13)]
         old_mgmt_key_default: bool,
+        /// Read the new management key (hex) from the named environment variable.
         #[arg(
             long,
             value_name = "VAR",
@@ -1304,6 +1328,8 @@ enum PivCmd {
             display_order = 14
         )]
         new_mgmt_key_env: Option<String>,
+        /// Read the new management key (hex) from stdin (second line; hidden when typed at a
+        /// terminal).
         #[arg(long, display_order = 15)]
         new_mgmt_key_stdin: bool,
         /// Algorithm of the NEW management key.
@@ -1344,12 +1370,14 @@ enum PivCmd {
         /// (firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         touch_policy: CliTouchPolicy,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
         /// Also write the generated public key (PEM) to this path. Needed to
@@ -1391,12 +1419,14 @@ enum PivCmd {
         /// Path to a `.der` or `.pem` certificate file.
         #[arg(long, value_name = "PATH")]
         file: std::path::PathBuf,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
         #[command(flatten)]
@@ -1427,8 +1457,11 @@ enum PivCmd {
         /// (supported attributes: CN, O, OU, C, L, ST).
         #[arg(long, value_name = "DN")]
         subject: String,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (first line, the only one without --generate-key; hidden when
+        /// typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
         /// Output path; omit to print the PEM to stdout.
@@ -1441,8 +1474,9 @@ enum PivCmd {
         /// the slot's key material. `--generate-key` sidesteps this entirely.
         #[arg(long, value_name = "PATH")]
         load_pubkey: Option<std::path::PathBuf>,
-        /// Management key — required only with `--generate-key` (for the
-        /// key-generation step; the CSR signature itself needs just the PIN).
+        /// Read the management key (hex) from the named environment variable. Only with
+        /// --generate-key, for the key-generation step; the request itself needs
+        /// just the PIN.
         #[arg(
             long,
             value_name = "VAR",
@@ -1450,16 +1484,17 @@ enum PivCmd {
             requires = "generate_key"
         )]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (second line; hidden when typed at a terminal).
+        /// Only with --generate-key.
         #[arg(
             long,
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"],
             requires = "generate_key"
         )]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't. Same
-        /// scope as `--mgmt-key-env`/`--mgmt-key-stdin` above — only
-        /// consulted with `--generate-key`.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know. Only with
+        /// --generate-key.
         #[arg(
             long,
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"],
@@ -1503,16 +1538,20 @@ enum PivCmd {
         /// days from now); defaults to 1 year if none of the three is given.
         #[arg(long, value_name = "N")]
         days: Option<u32>,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (second line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
         /// Also write the certificate as PEM to this path.
@@ -1548,8 +1587,12 @@ enum PivCmd {
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
+        /// Read the PIN from the named environment variable.
+        /// Optional; omit it to test without a PIN.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (one line; hidden when typed at a terminal).
+        /// Optional; omit it to test without a PIN.
         #[arg(long)]
         pin_stdin: bool,
     },
@@ -1561,12 +1604,14 @@ enum PivCmd {
     NewChuid {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
         /// CHUID expiration, in whole calendar years from now, applied
@@ -1670,12 +1715,14 @@ enum PivCmd {
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
         /// Confirm without asking (required when not run from a terminal).
@@ -1695,12 +1742,14 @@ enum PivCmd {
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
         /// Confirm without asking (required when not run from a terminal).
@@ -1728,12 +1777,14 @@ enum PivCmd {
         /// PC/SC reader substring (skips auto-detection).
         #[arg(long)]
         reader: Option<String>,
+        /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
         mgmt_key_env: Option<String>,
+        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
         mgmt_key_stdin: bool,
-        /// Use this device's well-known factory-default management key, if
-        /// one is known; fails with a clear error if it isn't.
+        /// Use the factory-default management key keyroost knows for this device.
+        /// PIV only: other applets have default PINs you already know.
         #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
         mgmt_key_default: bool,
         /// Run even if keyroost's list marks this key as not supporting it.
@@ -7556,6 +7607,20 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+const PIV_PIN: Spec = Spec::current("PIN", "pin");
+const PIV_OLD_PIN: Spec = Spec::current("old PIN", "old-pin");
+const PIV_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
+const PIV_PUK: Spec = Spec::current("PUK", "puk");
+const PIV_OLD_PUK: Spec = Spec::current("old PUK", "old-puk");
+const PIV_NEW_PUK: Spec = Spec::new_secret("new PUK", "new-puk");
+const PIV_MGMT_KEY: Spec = Spec::current("management key", "mgmt-key")
+    .hex()
+    .also("--mgmt-key-default");
+const PIV_OLD_MGMT_KEY: Spec = Spec::current("old management key", "old-mgmt-key")
+    .hex()
+    .also("--old-mgmt-key-default");
+const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key").hex();
+
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         PivCmd::Status { reader } => {
@@ -7700,9 +7765,17 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             new_pin_env,
             new_pin_stdin,
         } => {
-            let old = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
-            let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut sec = Secrets::real();
+            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
+            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            sec.check(&PIV_OLD_PIN, first_src)?;
+            sec.check(&PIV_NEW_PIN, second_src)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let (old, new) = read_piv_pair(
+                &mut sec,
+                (&PIV_OLD_PIN, first_src),
+                (&PIV_NEW_PIN, second_src),
+            )?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7721,9 +7794,17 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             new_puk_env,
             new_puk_stdin,
         } => {
-            let old = read_secret("old PUK", old_puk_env.as_deref(), *old_puk_stdin)?;
-            let new = read_secret("new PUK", new_puk_env.as_deref(), *new_puk_stdin)?;
+            let mut sec = Secrets::real();
+            let first_src = Source::new(old_puk_env.as_deref(), *old_puk_stdin);
+            let second_src = Source::new(new_puk_env.as_deref(), *new_puk_stdin);
+            sec.check(&PIV_OLD_PUK, first_src)?;
+            sec.check(&PIV_NEW_PUK, second_src)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let (old, new) = read_piv_pair(
+                &mut sec,
+                (&PIV_OLD_PUK, first_src),
+                (&PIV_NEW_PUK, second_src),
+            )?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7742,9 +7823,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             new_pin_env,
             new_pin_stdin,
         } => {
-            let puk = read_secret("PUK", puk_env.as_deref(), *puk_stdin)?;
-            let new = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut sec = Secrets::real();
+            let first_src = Source::new(puk_env.as_deref(), *puk_stdin);
+            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            sec.check(&PIV_PUK, first_src)?;
+            sec.check(&PIV_NEW_PIN, second_src)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let (puk, new) =
+                read_piv_pair(&mut sec, (&PIV_PUK, first_src), (&PIV_NEW_PIN, second_src))?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -7774,26 +7860,26 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         .into(),
                 );
             }
+            let mut sec = Secrets::real();
+            let pin_src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            sec.check(&PIV_PIN, pin_src)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 "set PIV retry counts (resets the PIN and PUK to factory defaults)",
             )?;
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = sec.read(&PIV_PIN, pin_src)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             crate::prompt::reverify_if_asked(&dev, asked)?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     s.verify_pin(pin.as_bytes())?;
                     s.set_pin_retries(*pin_tries, *puk_tries)?;
@@ -7818,11 +7904,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             allow_pin_unlock,
             force,
         } => {
-            let new = read_mgmt_key(
-                "new management key",
-                new_mgmt_key_env.as_deref(),
-                *new_mgmt_key_stdin,
-            )?;
+            let mut sec = Secrets::real();
+            let old_src = Source::new(old_mgmt_key_env.as_deref(), *old_mgmt_key_stdin);
+            let new_src = Source::new(new_mgmt_key_env.as_deref(), *new_mgmt_key_stdin);
+            check_mgmt_key(&sec, &PIV_OLD_MGMT_KEY, old_src, *old_mgmt_key_default)?;
+            sec.check(&PIV_NEW_MGMT_KEY, new_src)?;
+            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            // The current key first (stdin line 1), then the new one (line 2).
+            let old =
+                read_mgmt_key_input(&mut sec, &PIV_OLD_MGMT_KEY, old_src, *old_mgmt_key_default)?;
+            let new = read_mgmt_key_hex(&mut sec, &PIV_NEW_MGMT_KEY, new_src)?;
             let new_alg = new_algorithm.to_alg();
             if new.len() != new_alg.key_len() {
                 return Err(format!(
@@ -7835,18 +7926,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
-            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let old = resolve_mgmt_key(
-                        "old management key",
-                        old_mgmt_key_env.as_deref(),
-                        *old_mgmt_key_stdin,
-                        *old_mgmt_key_default,
-                        s,
-                    )?;
+                    let old = mgmt_key_bytes(&old, &PIV_OLD_MGMT_KEY, s)?;
                     guard_piv_feature(
                         s,
                         keyroost_piv::compat::PivExtension::SetManagementKey,
@@ -7991,24 +8075,24 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // PIV and would clear the auth. `default` is standard PIV and
             // needs neither extension, so both checks are skipped outright
             // when the caller didn't ask for anything non-default.
-            let name = piv_confirm_replace(
-                reader.as_deref(),
+            let mut sec = Secrets::real();
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            let gate = piv_confirm_replace(
+                dev,
                 debug,
                 *yes,
                 &format!("replace the key in PIV slot {}", slot_name(*slot)),
                 |s| piv_slot_known_empty(s, slot.to_slot()),
             )?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
             keyroost_transport::PivSession::with_transaction_traced(
-                &name,
+                &gate.name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     // Unlike PIN/touch policy, every algorithm choice is gated —
                     // there's no "default" that's exempt: even the SP 800-73-4
                     // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
@@ -8099,27 +8183,27 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             compression,
             yes,
         } => {
+            let mut sec = Secrets::real();
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             let bytes =
                 std::fs::read(file).map_err(|e| format!("read {}: {}", file.display(), e))?;
             let der = cert_to_der(&bytes)?;
-            let name = piv_confirm_replace(
-                reader.as_deref(),
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            let gate = piv_confirm_replace(
+                dev,
                 debug,
                 *yes,
                 &format!("replace the certificate in PIV slot {}", slot_name(*slot)),
                 |s| piv_cert_known_absent(s, slot.to_slot()),
             )?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
             keyroost_transport::PivSession::with_transaction_traced(
-                &name,
+                &gate.name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     let choice = compression.choice();
                     let stored = s
@@ -8192,55 +8276,62 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             key_usage,
             yes,
         } => {
-            check_key_usage_args(
-                &key_usage.key_usage,
-                slot.to_slot(),
-                early_key_alg(keygen, load_pubkey.as_deref())?,
-            )?;
-            // Know whether the target key can sign before spending the PIN
-            // or the management key on a request that's doomed anyway — the
-            // algorithm is knowable from `--algorithm`/`--load-pubkey` with
-            // no card I/O at all, or from the slot's existing key with a
-            // read-only GET METADATA/certificate read once a session is
-            // open.
+            let mut sec = Secrets::real();
+            let pin_src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            sec.check(&PIV_PIN, pin_src)?;
             if keygen.generate_key {
-                guard_signable_alg(keygen.algorithm.to_alg())?;
-            } else if let Some(path) = load_pubkey {
-                guard_signable_alg(load_pubkey_material(path)?.0)?;
+                check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            }
+            // Judge `--key-usage` and whether the target key can sign before
+            // the PIN or the management key is asked for: the algorithm is
+            // knowable from `--algorithm`/`--load-pubkey` with no card I/O,
+            // or else from a read-only look at the slot once it's selected.
+            let known_alg = early_key_alg(keygen, load_pubkey.as_deref())?;
+            check_signing_key(&key_usage.key_usage, slot.to_slot(), known_alg)?;
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            if known_alg.is_none() {
+                let probed =
+                    piv_probe_slot_alg(&crate::target::reader_of(&dev)?, debug, slot.to_slot())?;
+                check_signing_key(&key_usage.key_usage, slot.to_slot(), probed)?;
             }
             // Only `--generate-key` replaces anything; a plain request
             // just reads the slot's key.
-            let name = if keygen.generate_key {
+            let gate = if keygen.generate_key {
                 piv_confirm_replace(
-                    reader.as_deref(),
+                    dev,
                     debug,
                     *yes,
                     &format!("replace the key in PIV slot {}", slot_name(*slot)),
                     |s| piv_slot_known_empty(s, slot.to_slot()),
                 )?
             } else {
-                crate::target::reader_for(Need::Piv, reader.as_deref())?
+                ReplaceGate {
+                    name: crate::target::reader_of(&dev)?,
+                    dev,
+                    asked: false,
+                }
             };
+            let pin = sec.read(&PIV_PIN, pin_src)?;
+            // The key-generation step needs management-key auth; the CSR
+            // signature that follows still only needs the PIN.
+            let mgmt = if keygen.generate_key {
+                Some(read_mgmt_key_input(
+                    &mut sec,
+                    &PIV_MGMT_KEY,
+                    mgmt_src,
+                    *mgmt_key_default,
+                )?)
+            } else {
+                None
+            };
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
             keyroost_transport::PivSession::with_transaction_traced(
-                &name,
+                &gate.name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    if !keygen.generate_key && load_pubkey.is_none() {
-                        if let Some(alg) = s.slot_key_algorithm(slot.to_slot()) {
-                            guard_signable_alg(alg)?;
-                        }
-                    }
-                    let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-                    if keygen.generate_key {
-                        // The key-generation step needs management-key auth; the CSR
-                        // signature that follows still only needs the PIN.
-                        let mgmt = resolve_mgmt_key(
-                            "management key",
-                            mgmt_key_env.as_deref(),
-                            *mgmt_key_stdin,
-                            *mgmt_key_default,
-                            s,
-                        )?;
+                    if let Some(mgmt) = &mgmt {
+                        let mgmt = mgmt_key_bytes(mgmt, &PIV_MGMT_KEY, s)?;
                         authenticate_piv(s, &mgmt)?;
                         inline_generate_key(s, slot.to_slot(), keygen)?;
                     } else if let Some(path) = load_pubkey {
@@ -8292,23 +8383,26 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         } => {
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
-            check_key_usage_args(
-                &key_usage.key_usage,
-                slot.to_slot(),
-                early_key_alg(keygen, load_pubkey.as_deref())?,
-            )?;
-            // Know whether the target key can sign before spending the PIN
-            // or the management key on a certificate that's doomed anyway.
-            if keygen.generate_key {
-                guard_signable_alg(keygen.algorithm.to_alg())?;
-            } else if let Some(path) = load_pubkey {
-                guard_signable_alg(load_pubkey_material(path)?.0)?;
+            let mut sec = Secrets::real();
+            let pin_src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            sec.check(&PIV_PIN, pin_src)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            // Judge `--key-usage` and whether the target key can sign before
+            // the PIN or the management key is asked for (see request-cert).
+            let known_alg = early_key_alg(keygen, load_pubkey.as_deref())?;
+            check_signing_key(&key_usage.key_usage, slot.to_slot(), known_alg)?;
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            if known_alg.is_none() {
+                let probed =
+                    piv_probe_slot_alg(&crate::target::reader_of(&dev)?, debug, slot.to_slot())?;
+                check_signing_key(&key_usage.key_usage, slot.to_slot(), probed)?;
             }
             // The new certificate always replaces the slot's; `--generate-key`
             // replaces its key as well.
-            let name = if keygen.generate_key {
+            let gate = if keygen.generate_key {
                 piv_confirm_replace(
-                    reader.as_deref(),
+                    dev,
                     debug,
                     *yes,
                     &format!(
@@ -8319,32 +8413,23 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 )?
             } else {
                 piv_confirm_replace(
-                    reader.as_deref(),
+                    dev,
                     debug,
                     *yes,
                     &format!("replace the certificate in PIV slot {}", slot_name(*slot)),
                     |s| piv_cert_known_absent(s, slot.to_slot()),
                 )?
             };
+            // The PIN covers the signature (stdin line 1); management-key
+            // auth covers the certificate import (line 2).
+            let pin = sec.read(&PIV_PIN, pin_src)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            crate::prompt::reverify_if_asked(&gate.dev, gate.asked)?;
             keyroost_transport::PivSession::with_transaction_traced(
-                &name,
+                &gate.name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    if !keygen.generate_key && load_pubkey.is_none() {
-                        if let Some(alg) = s.slot_key_algorithm(slot.to_slot()) {
-                            guard_signable_alg(alg)?;
-                        }
-                    }
-                    let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
-                    // Management-key auth covers the certificate import; the PIN
-                    // covers the signature itself.
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     if keygen.generate_key {
                         inline_generate_key(s, slot.to_slot(), keygen)?;
@@ -8401,13 +8486,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // policy — it's the caller's call whether to test with or
             // without one. When given, verify it once up front so a wrong
             // PIN fails before any op and costs just one retry.
-            let pin = if pin_env.is_some() || *pin_stdin {
-                Some(read_secret("PIN", pin_env.as_deref(), *pin_stdin)?)
-            } else {
-                None
-            };
-
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let pin = Secrets::real()
+                .read_given(&PIV_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -8504,6 +8585,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             years,
             guid,
         } => {
+            let mut sec = Secrets::real();
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
             let guid = match guid {
@@ -8515,17 +8599,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             };
             let expiration = valid_for.chuid_expiration(u64::from(unix_now()));
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     s.new_chuid(&guid, &expiration)?;
                     println!("Wrote a new CHUID (GUID {}).", hex_encode(&guid));
@@ -8654,24 +8733,23 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_default,
             yes,
         } => {
+            let mut sec = Secrets::real();
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
-            crate::prompt::confirm_on(
+            let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete the certificate in PIV slot {}", slot_name(*slot)),
             )?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     s.clear_certificate(slot.to_slot())?;
                     println!(
@@ -8692,12 +8770,17 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             yes,
             force,
         } => {
+            let mut sec = Secrets::real();
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
-            crate::prompt::confirm_on(
+            let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete the key in PIV slot {}", slot_name(*slot)),
             )?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            crate::prompt::reverify_if_asked(&dev, asked)?;
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
             let name = crate::target::reader_of(&dev)?;
@@ -8705,13 +8788,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     guard_piv_feature(s, keyroost_piv::compat::PivExtension::DeleteKey, *force)?;
                     authenticate_piv(s, &mgmt)?;
                     s.delete_key(slot.to_slot())?;
@@ -8733,18 +8810,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             mgmt_key_default,
             force,
         } => {
+            let mut sec = Secrets::real();
+            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    let mgmt = resolve_mgmt_key(
-                        "management key",
-                        mgmt_key_env.as_deref(),
-                        *mgmt_key_stdin,
-                        *mgmt_key_default,
-                        s,
-                    )?;
+                    let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     guard_piv_feature(s, keyroost_piv::compat::PivExtension::MoveKey, *force)?;
                     authenticate_piv(s, &mgmt)?;
                     s.move_key(from.to_slot(), to.to_slot())?;
@@ -8788,7 +8863,7 @@ fn open_openpgp_at(
 ///
 /// Every call site opens the plain session via
 /// [`keyroost_transport::PivSession::with_transaction_traced`] first, since
-/// resolving `--mgmt-key-default` (via [`resolve_mgmt_key`]) and feature
+/// resolving `--mgmt-key-default` (via [`mgmt_key_bytes`]) and feature
 /// gates like [`guard_piv_feature`] both need one already open — the latter's
 /// fingerprint probe re-SELECTs PIV and clears the auth state, so it must run
 /// before this, not after.
@@ -9037,22 +9112,30 @@ fn piv_cert_known_absent(
     Ok(piv_cert_absent_from(&s.read_certificate(slot)))
 }
 
-/// Select the PIV key and, unless `known_empty` shows there is nothing in
-/// the slot to lose, ask before `action`. The check runs in its own short,
-/// read-only transaction (skipped under `--yes`), so no PC/SC transaction
-/// is held while waiting for an answer. Returns the reader to act on.
+/// The outcome of [`piv_confirm_replace`]: the reader to act on, the key
+/// the user confirmed, and whether a question was actually shown (pass it
+/// to [`crate::prompt::reverify_if_asked`] after reading the secrets).
+struct ReplaceGate {
+    name: String,
+    dev: keyroost_resolve::Device,
+    asked: bool,
+}
+
+/// Unless `known_empty` shows there is nothing in the slot to lose, ask
+/// before `action` on the already-selected PIV key `dev`. The check runs in
+/// its own short, read-only transaction (skipped under `--yes`), so no PC/SC
+/// transaction is held while waiting for an answer. Callers read their
+/// secrets next, then call `reverify_if_asked(&gate.dev, gate.asked)`
+/// right before opening the session.
 fn piv_confirm_replace(
-    reader: Option<&str>,
+    dev: keyroost_resolve::Device,
     debug: bool,
     yes: bool,
     action: &str,
     known_empty: impl FnOnce(&mut keyroost_transport::PivSession<'_>) -> Result<bool, TransportError>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let dev = crate::target::select(Need::Piv, reader, None)?;
-    let name = dev
-        .reader
-        .clone()
-        .ok_or("internal error: PIV row without a reader")?;
+) -> Result<ReplaceGate, Box<dyn std::error::Error>> {
+    let name = crate::target::reader_of(&dev)?;
+    let mut asked = false;
     if !yes {
         let empty = keyroost_transport::PivSession::with_transaction_traced(
             &name,
@@ -9060,10 +9143,43 @@ fn piv_confirm_replace(
             |s| -> Result<bool, Box<dyn std::error::Error>> { Ok(known_empty(s)?) },
         )?;
         if !empty {
-            crate::prompt::confirm_on(&dev, yes, action)?;
+            asked = crate::prompt::confirm_then_read(&dev, yes, action)?;
         }
     }
-    Ok(name)
+    Ok(ReplaceGate { name, dev, asked })
+}
+
+/// The algorithm of the key already in `slot`, if the card says (GET
+/// METADATA, or the slot certificate), read in its own short read-only
+/// transaction — so `--key-usage` and an unsignable key are judged before
+/// any PIN or management key is asked for.
+fn piv_probe_slot_alg(
+    name: &str,
+    debug: bool,
+    slot: keyroost_piv::Slot,
+) -> Result<Option<keyroost_piv::KeyAlg>, Box<dyn std::error::Error>> {
+    keyroost_transport::PivSession::with_transaction_traced(
+        name,
+        debug,
+        |s| -> Result<Option<keyroost_piv::KeyAlg>, Box<dyn std::error::Error>> {
+            Ok(s.slot_key_algorithm(slot))
+        },
+    )
+}
+
+/// The `--key-usage` and signable-key checks of `request-cert` /
+/// `self-sign`, once the slot key's algorithm is known (`None`: the card
+/// can't say, and the in-session resolution judges it).
+fn check_signing_key(
+    key_usage: &[CliKeyUsage],
+    slot: keyroost_piv::Slot,
+    alg: Option<keyroost_piv::KeyAlg>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    check_key_usage_args(key_usage, slot, alg)?;
+    if let Some(alg) = alg {
+        guard_signable_alg(alg)?;
+    }
+    Ok(())
 }
 
 /// Refuse early when `alg` can't produce a signature — currently just
@@ -9137,53 +9253,91 @@ fn read_mgmt_key(
     Ok(zeroize::Zeroizing::new(hex_decode(hex.trim())?))
 }
 
-/// Resolve a management-key credential from the three `--{prefix}env`/
-/// `--{prefix}stdin`/`--{prefix}default` flags a PIV command offers for it
-/// (`{prefix}` is [`env_prefix_for`]'s mapping for `label`, e.g. "management
-/// key" \u{2192} "mgmt-key-"). The first two are [`read_mgmt_key`], unchanged;
-/// `--{prefix}default` instead reaches for `session`'s well-known
-/// factory-default management key
-/// ([`keyroost_transport::PivSession::default_management_key`], which reads
-/// [`keyroost_piv::compat::PivQuirk::Default9bManagementKey`] off the
-/// session's already-resolved fingerprint) and fails with a clear message
-/// when keyroost has none on record for this device \u{2014} the same
-/// "no known default" signal that disables the GUI's "use default"
-/// convenience. `session` must already be open (and PIV selected) since
-/// resolving the default needs this device's fingerprint.
-fn resolve_mgmt_key(
-    label: &str,
-    env: Option<&str>,
-    from_stdin: bool,
+/// A PIV management key as given: read before any card session (env /
+/// stdin / prompt), or `--…-default`, resolved inside the session because
+/// it depends on the applet's fingerprint.
+enum MgmtKeyInput {
+    Key(zeroize::Zeroizing<Vec<u8>>),
+    Default,
+}
+
+/// [`Secrets::check`] for a management key, which `--…-default` also
+/// satisfies.
+fn check_mgmt_key<I: crate::secrets::SecretIo>(
+    sec: &Secrets<I>,
+    spec: &Spec,
+    src: Source<'_>,
     use_default: bool,
+) -> Result<(), String> {
+    if use_default {
+        Ok(())
+    } else {
+        sec.check(spec, src)
+    }
+}
+
+/// Read a management key (hex) before any card session, or defer
+/// `--…-default` to [`mgmt_key_bytes`].
+fn read_mgmt_key_input<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    spec: &Spec,
+    src: Source<'_>,
+    use_default: bool,
+) -> Result<MgmtKeyInput, Box<dyn std::error::Error>> {
+    if use_default {
+        return Ok(MgmtKeyInput::Default);
+    }
+    Ok(MgmtKeyInput::Key(read_mgmt_key_hex(sec, spec, src)?))
+}
+
+/// Read a management key given as hex and decode it.
+fn read_mgmt_key_hex<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    spec: &Spec,
+    src: Source<'_>,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let hex = sec.read(spec, src)?;
+    // hex_decode's errors describe the problem, never the input.
+    let key = hex_decode(&hex).map_err(|e| format!("the {} is not valid hex: {e}", spec.label))?;
+    Ok(zeroize::Zeroizing::new(key))
+}
+
+/// The key bytes for `input`; `--…-default` looks up this device's known
+/// factory default on the open session's fingerprint
+/// ([`keyroost_transport::PivSession::default_management_key`]).
+fn mgmt_key_bytes(
+    input: &MgmtKeyInput,
+    spec: &Spec,
     session: &mut keyroost_transport::PivSession<'_>,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-    let prefix = env_prefix_for(label);
-    if use_default {
-        return session
+    match input {
+        MgmtKeyInput::Key(k) => Ok(k.clone()),
+        MgmtKeyInput::Default => session
             .default_management_key()
-            .map(|key| zeroize::Zeroizing::new(key.to_vec()))
+            .map(|k| zeroize::Zeroizing::new(k.to_vec()))
             .ok_or_else(|| {
                 format!(
-                    "--{prefix}default: keyroost has no known factory-default {label} on \
-                     record for this device; pass --{prefix}env/--{prefix}stdin instead"
+                    "{}: keyroost has no known factory-default {} on record for this device; \
+                     pass --{f}-env VAR or --{f}-stdin instead",
+                    spec.also.unwrap_or("--mgmt-key-default"),
+                    spec.label,
+                    f = spec.flag
                 )
                 .into()
-            });
+            }),
     }
-    // read_secret's generic "no source" message only knows about --*-env/
-    // --*-stdin. When neither was supplied, add the --*-default hint too —
-    // but only if this device actually has a known factory-default on
-    // record (`session` is already open, so this is the same
-    // `default_management_key` check `--{prefix}default` itself would use);
-    // otherwise the hint would send the caller toward a flag that just fails
-    // with "no known factory-default" right after.
-    if env.is_none() && !from_stdin && session.default_management_key().is_some() {
-        return Err(format!(
-            "no source for {label}: pass --{prefix}env VAR or --{prefix}stdin or --{prefix}default"
-        )
-        .into());
-    }
-    read_mgmt_key(label, env, from_stdin)
+}
+
+/// Read a current secret and then a new one, in that order (stdin lines 1
+/// and 2 when both come from stdin).
+fn read_piv_pair<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    first: (&Spec, Source<'_>),
+    second: (&Spec, Source<'_>),
+) -> Result<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>), String> {
+    let a = sec.read(first.0, first.1)?;
+    let b = sec.read(second.0, second.1)?;
+    Ok((a, b))
 }
 
 /// Write `data` to `path` with owner-only permissions (0600) on Unix, failing
@@ -14229,6 +14383,127 @@ mod cli_tests {
         }
         let err = guard_signable_alg(KeyAlg::X25519).unwrap_err();
         assert!(err.to_string().contains("X25519"));
+    }
+
+    #[test]
+    fn piv_change_pin_reads_both_before_opening() {
+        use crate::secrets::fake::FakeIo;
+        let mut sec = crate::secrets::Secrets::new(FakeIo::piped(&["123456\n"]));
+        let e = read_piv_pair(
+            &mut sec,
+            (&PIV_OLD_PIN, Source::new(None, true)),
+            (&PIV_NEW_PIN, Source::new(None, true)),
+        )
+        .unwrap_err();
+        assert_eq!(e, "expected the new PIN on stdin line 2, but stdin ended");
+    }
+
+    #[test]
+    fn piv_pair_reads_current_first_then_new() {
+        use crate::secrets::fake::FakeIo;
+        let mut sec = crate::secrets::Secrets::new(FakeIo::piped(&["123456\n", "654321\n"]));
+        let (old, new) = read_piv_pair(
+            &mut sec,
+            (&PIV_OLD_PIN, Source::new(None, true)),
+            (&PIV_NEW_PIN, Source::new(None, true)),
+        )
+        .unwrap();
+        assert_eq!((old.as_str(), new.as_str()), ("123456", "654321"));
+    }
+
+    #[test]
+    fn mgmt_key_default_is_deferred_and_hex_is_decoded() {
+        use crate::secrets::fake::FakeIo;
+        let mut sec = crate::secrets::Secrets::new(FakeIo::piped(&[
+            " 010203040506070801020304050607080102030405060708 \n",
+        ]));
+        assert!(matches!(
+            read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, Source::NONE, true).unwrap(),
+            MgmtKeyInput::Default
+        ));
+        assert_eq!(sec.io.lines_read, 0, "--mgmt-key-default reads nothing");
+        match read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, Source::new(None, true), false).unwrap()
+        {
+            MgmtKeyInput::Key(k) => assert_eq!(k.len(), 24),
+            MgmtKeyInput::Default => panic!(),
+        }
+        let sec = crate::secrets::Secrets::new(FakeIo::default());
+        assert_eq!(
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, Source::NONE, false).unwrap_err(),
+            "no management key given: pass --mgmt-key-env VAR, --mgmt-key-stdin or --mgmt-key-default"
+        );
+        assert!(check_mgmt_key(&sec, &PIV_MGMT_KEY, Source::NONE, true).is_ok());
+    }
+
+    #[test]
+    fn mgmt_key_bad_hex_names_the_key_but_never_the_value() {
+        use crate::secrets::fake::FakeIo;
+        let mut sec =
+            crate::secrets::Secrets::new(FakeIo::default().var("KR_MK", "zz0102secretish"));
+        let e = read_mgmt_key_input(&mut sec, &PIV_OLD_MGMT_KEY, Source::env("KR_MK"), false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.starts_with("the old management key is not valid hex"),
+            "{e}"
+        );
+        assert!(!e.contains("secretish") && !e.contains("zz01"), "{e}");
+    }
+
+    #[test]
+    fn piv_two_line_flags_state_their_line() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let piv = cmd.find_subcommand("piv").unwrap();
+        for (sub, flag, line) in [
+            ("change-pin", "old-pin-stdin", "first line"),
+            ("change-pin", "new-pin-stdin", "second line"),
+            ("change-puk", "old-puk-stdin", "first line"),
+            ("change-puk", "new-puk-stdin", "second line"),
+            ("unblock-pin", "puk-stdin", "first line"),
+            ("unblock-pin", "new-pin-stdin", "second line"),
+            ("set-retries", "pin-stdin", "first line"),
+            ("set-retries", "mgmt-key-stdin", "second line"),
+            ("change-management-key", "old-mgmt-key-stdin", "first line"),
+            ("change-management-key", "new-mgmt-key-stdin", "second line"),
+            ("self-sign", "pin-stdin", "first line"),
+            ("self-sign", "mgmt-key-stdin", "second line"),
+            ("request-cert", "pin-stdin", "first line"),
+            ("request-cert", "mgmt-key-stdin", "second line"),
+        ] {
+            let arg = piv
+                .find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .find(|a| a.get_long() == Some(flag))
+                .unwrap_or_else(|| panic!("{sub} --{flag}"));
+            let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(help.contains(line), "piv {sub} --{flag}: {help:?}");
+        }
+    }
+
+    #[test]
+    fn piv_secret_flags_all_have_help() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let piv = cmd.find_subcommand("piv").unwrap();
+        for sub in piv.get_subcommands() {
+            if sub.get_name() == "reset" {
+                continue; // Task 9
+            }
+            for arg in sub.get_arguments() {
+                let long = arg.get_long().unwrap_or_default();
+                if long.ends_with("-env") || long.ends_with("-stdin") || long.ends_with("-default")
+                {
+                    assert!(
+                        arg.get_help().is_some(),
+                        "piv {} --{long} has no help",
+                        sub.get_name()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
