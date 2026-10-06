@@ -39,4 +39,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_piv::fingerprint::parse_ascii_text(data)
         .and_then(|s| keyroost_piv::fingerprint::parse_dotted_version(&s));
     let _ = keyroost_piv::fingerprint::format_yubikey_name(data);
+    // Swissbit iShield replies (#163): the Management Application's GET
+    // DEVICE INFO (nested TLV) and the Card Manager's text replies.
+    let _ = keyroost_piv::fingerprint::parse_swissbit_device_name(data);
+    let _ = keyroost_piv::fingerprint::parse_swissbit_text(data);
 });
