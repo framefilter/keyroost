@@ -85,18 +85,21 @@
           <code>self-sign</code> / <code>--generate-key</code> on
           <code>self-sign</code> and <code>request-cert</code> (on a slot in
           use)</td>
-        <td>A y/N question in a terminal. A script must add
+        <td>A y/N question in a terminal. A script, or a command whose PIN,
+          seed or management key is piped in on stdin, must add
           <code>--yes</code>, or the command refuses and changes
           nothing.</td></tr>
       <tr><td>Commands that already took <code>--yes</code> refused without
           it, even in a terminal</td>
-        <td>In a terminal they ask y/N instead. Scripts still need
+        <td>In a terminal they ask y/N instead (the hidden <code>molto
+          probe</code> still needs <code>--yes</code>). Scripts still need
           <code>--yes</code>.</td></tr>
       <tr><td><code>factory-reset</code> needed <code>--yes</code></td>
         <td>In a terminal, type <code>reset</code> to confirm.
           <code>--yes</code> skips the question; scripts still need it.</td></tr>
       <tr><td><code>factory-reset</code> printed <code>N wiped, K
-          failed</code>, counted a skipped step as wiped, and exited 0</td>
+          failed</code>, counted a skipped step as wiped, and exited 0 when
+          steps were only skipped</td>
         <td>Prints <code>N wiped, M skipped, K failed</code> and exits with
           an error if any step was skipped or failed (the key was not fully
           reset).</td></tr>
@@ -148,10 +151,11 @@
           <code>--device</code> completes saved names. Regenerate an installed
           completion file to get this.</td></tr>
       <tr><td><code>list</code> had no numbers and no JSON</td>
-        <td>Each key has a stable number (usable as <code>--device
-          N</code>). <code>list --json</code> prints one row per key with
-          the exact <code>--device</code> value; <code>list --device
-          X</code> shows just that key.</td></tr>
+        <td>Each key has a number (usable as <code>--device N</code>; it
+          can change when keys are added or removed, so scripts should use
+          a name or serial). <code>list --json</code> prints one row per
+          key with the exact <code>--device</code> value; <code>list
+          --device X</code> shows just that key.</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>

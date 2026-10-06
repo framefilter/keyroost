@@ -126,8 +126,9 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   checks while allowing a relaxed, readable character set.
   On Windows and macOS the OS reports no USB position, so keyroost asks each
   side of a key for the identity it reports (a YubiKey's serial, a Solo 2's
-  ID, a Token2 key's serial) and joins them into one entry when they match. A
-  key that doesn't answer is shown as two entries rather than guessed at.
+  ID, a Token2 key's serial) and joins them into one entry when they match. If
+  two keys of the same make are connected and one doesn't answer, it is shown
+  as two entries rather than guessed at.
 
 ## Supported devices
 
@@ -595,18 +596,22 @@ installing them.
 
 ### Shell completions
 
-The Homebrew and AUR packages install `keyroostctl`'s completions (bash, zsh,
-fish) and man pages. Otherwise, set completions up once for your shell:
+The Homebrew package installs `keyroostctl`'s completions for bash, zsh and
+fish, plus man pages; the AUR package installs bash and fish the same way,
+plus man pages, but add the zsh line below to `~/.zshrc` either way.
+Otherwise, set completions up once for your shell:
 
 ```bash
 # bash: this session only, or for every session
 source <(keyroostctl completions bash)
+mkdir -p ~/.local/share/bash-completion/completions
 keyroostctl completions bash > ~/.local/share/bash-completion/completions/keyroostctl
 
-# zsh: into a directory on your $fpath
-keyroostctl completions zsh > ~/.zfunc/_keyroostctl
+# zsh: add this line to ~/.zshrc (after compinit)
+source <(keyroostctl completions zsh)
 
 # fish
+mkdir -p ~/.config/fish/completions
 keyroostctl completions fish > ~/.config/fish/completions/keyroostctl.fish
 
 # PowerShell: add this line to your $PROFILE
@@ -708,14 +713,16 @@ a terminal shows a numbered list to pick from; a script is refused with the
 exact `--device` value for each key. `--device` takes a saved name, a serial,
 or the number `keyroostctl list` shows (prefix `name:`, `serial:` or `list:`
 to say which you mean); `keyroostctl --json list` gives scripts the same
-values. `--reader` and `--path` are expert overrides, used exactly as typed;
-neither can be combined with `--device`.
+values. `--reader` (a reader name, or a unique part of one) and `--path` are
+expert overrides: they skip the capability check, and a value that matches
+no detected key is used as typed. Neither can be combined with `--device`.
 
-Commands that erase or replace something keyroost can't restore name the key
-and ask y/N first (`factory-reset` and `otp interface` ask you to type a
-phrase). A script has no terminal to ask on, so it adds `--yes`; so does a
-command whose PIN or seed is piped in on stdin. If you answered a question,
-keyroost checks it is still the same key before acting.
+Commands that erase or replace something on the key (resets, deletes,
+overwriting a used slot or seed) name the key and ask y/N first
+(`factory-reset` and `otp interface` ask you to type a phrase). A script has
+no terminal to ask on, so it adds `--yes`; so does a command whose PIN or
+seed is piped in on stdin. If you answered a question, keyroost checks it is
+still the same key before acting.
 
 ## Breaking changes & migration
 

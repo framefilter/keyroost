@@ -116,7 +116,7 @@ keyroostctl fido set-min-pin --length 8 --force-change --yes --pin-env KR_PIN
 keyroostctl fido force-pin-change                            --pin-env KR_PIN
 keyroostctl fido enterprise-attestation --yes                --pin-env KR_PIN</code></pre>
     <p class="kr-muted">Each command takes the PIN via <code>--pin-env</code> (an environment
-      variable name), <code>--pin-stdin</code>; with several keys connected, pick one with
+      variable name) or <code>--pin-stdin</code>; with several keys connected, pick one with
       <code>--device</code> (or <code>--path</code>). The two one-way commands,
       <code>set-min-pin</code> and <code>enterprise-attestation</code>, ask first in a
       terminal; in a script they need <code>--yes</code>, and without it they refuse and

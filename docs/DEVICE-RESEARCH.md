@@ -125,8 +125,8 @@ Two constraints the implementation had to add that this plan did not anticipate:
   ([#51](https://github.com/framefilter/keyroost/issues/51) follow-up below.)
 
 The HID-only resolver (`read_effective_serial`, `connected_keys`) was removed in
-v0.13.0; every front end now uses the device model (`keyroost_resolve::enumerate`
-plus `select::resolve_target`).
+v0.13.0; the GUI and CLI now share the device model (`keyroost_resolve::enumerate`),
+and the CLI picks a row with `select::resolve_target`.
 
 ## Identity matching across interfaces (#51, v0.13.0)
 
@@ -156,10 +156,11 @@ identity read.
 
 **Privacy.** Identities are read only to join the two halves of a key, held in
 memory for that scan, and written to disk only when the user names the key
-(`keys.json`, as before). Every read is read-only, has a short timeout, and is
-traced under `--debug`. Reads are planned only for what USB position leaves
-unmatched, so where USB position settles every key (Linux) no identity read is
-sent. A key that doesn't answer is shown as two entries, not guessed at.
+(`keys.json`, as before). Every read is read-only and traced under `--debug`;
+the HID reads give up after 1.5 seconds. Reads are planned only for what USB
+position leaves unmatched, so where USB position settles every key (Linux) no
+identity read is sent. Where several keys of one make are connected, a key
+that doesn't answer is shown as two entries, not guessed at.
 
 ---
 

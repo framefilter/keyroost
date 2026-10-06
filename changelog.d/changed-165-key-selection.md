@@ -5,5 +5,5 @@
   any more. `--device` takes a name, a serial or a `list` number
   (`name:`, `serial:` or `list:` forces which). `--device` with `--reader`
   or `--path` is refused, and so is `--device` on commands that touch no
-  key. `--reader` and `--path` are used exactly as typed, even when
-  keyroost didn't detect a key there. ([#165])
+  key. `--reader` and `--path` skip the capability check, and a value that
+  matches no detected key is used as typed. ([#165])
