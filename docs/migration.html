@@ -68,6 +68,11 @@
       connected and no selector, a script is refused instead of acting on
       the first key found: pick one with <code>--device</code> (the refusal
       lists the exact values, and <code>list --json</code> gives them too).
+      No secret is taken on the command line any more: the flags that took
+      one as a plain argument are gone, a few secret flags are renamed, and
+      with no <code>-env</code> / <code>-stdin</code> flag a terminal asks
+      for the secret at a hidden prompt (see
+      <a href="#v0-13-0-secrets">secrets</a> below).
       Library consumers: <code>keyroost-resolve</code> drops its HID-only
       name resolver for the shared device model.</p>
     <h3>CLI</h3>
@@ -163,6 +168,77 @@
           undefined</code> for the old output.</td></tr>
     </table>
     </div>
+    <h3 id="v0-13-0-secrets">CLI: secrets</h3>
+    <p>Every PIN, password, key, seed and <code>otpauth://</code> URI now
+      comes from <code>--X-env VAR</code>, from <code>--X-stdin</code> (one
+      line), or, with neither and a terminal present, from a hidden prompt.
+      New PINs, passwords and keys typed at the prompt are asked twice. A
+      script with no source is refused with an error naming the flags. A
+      removed or renamed flag is refused with an error naming its
+      replacement; the value given with it is never printed.</p>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Old (≤ 0.12.x)</th><th>New (0.13.0+)</th></tr>
+      <tr><td><code>keyroostctl molto --key HEX …</code></td>
+        <td><code>keyroostctl molto --key-env VAR …</code> (with no key
+          flag, the factory-default key is used, as before)</td></tr>
+      <tr><td><code>keyroostctl molto --key-ascii TEXT …</code></td>
+        <td><code>keyroostctl molto --key-ascii-env VAR …</code></td></tr>
+      <tr><td><code>keyroostctl molto seed -p 5 --hex HEX</code><br><code>keyroostctl molto seed -p 5 --base32 B32</code></td>
+        <td><code>keyroostctl molto seed -p 5 --hex-env VAR</code> or
+          <code>--hex-stdin</code>;<br><code>keyroostctl molto seed -p 5
+          --base32-env VAR</code> or <code>--base32-stdin</code></td></tr>
+      <tr><td><code>keyroostctl prog seed --hex HEX</code><br><code>keyroostctl prog seed --base32 B32</code></td>
+        <td><code>keyroostctl prog seed --hex-env VAR</code> or
+          <code>--hex-stdin</code>;<br><code>keyroostctl prog seed
+          --base32-env VAR</code> or <code>--base32-stdin</code></td></tr>
+      <tr><td><code>keyroostctl prog seed --base32-stdin</code> read all of stdin</td>
+        <td>Reads one line, like every other <code>-stdin</code>
+          flag.</td></tr>
+      <tr><td><code>keyroostctl molto customer-key --hex HEX</code><br><code>keyroostctl molto customer-key --ascii TEXT</code></td>
+        <td><code>keyroostctl molto customer-key --hex-env VAR</code> or
+          <code>--hex-stdin</code>;<br><code>keyroostctl molto customer-key
+          --ascii-env VAR</code> or <code>--ascii-stdin</code> (typed at a
+          terminal, the new key is asked twice)</td></tr>
+      <tr><td><code>keyroostctl molto import -p 0 'otpauth://…'</code></td>
+        <td><code>keyroostctl molto import -p 0 -</code> with the URI piped
+          on stdin, <code>keyroostctl molto import -p 0 --uri-env
+          VAR</code>, or <code>--qr IMAGE</code>; with none of them, a
+          terminal asks for the URI (hidden)</td></tr>
+      <tr><td><code>keyroostctl oath add NAME --secret-env VAR</code><br><code>keyroostctl oath add NAME --secret-stdin</code></td>
+        <td><code>keyroostctl oath add NAME --seed-env VAR</code> or
+          <code>--seed-stdin</code> (the names <code>otp add</code>
+          uses)</td></tr>
+      <tr><td><code>keyroostctl openpgp verify --pin admin</code></td>
+        <td><code>keyroostctl openpgp verify --which admin</code> (the PIN
+          itself comes from <code>--pin-env</code>, <code>--pin-stdin</code>
+          or the prompt)</td></tr>
+      <tr><td><code>keyroostctl otp change-pin --current-env OLD --new-env NEW</code></td>
+        <td><code>keyroostctl otp change-pin --old-pin-env OLD --new-pin-env
+          NEW</code></td></tr>
+      <tr><td><code>keyroostctl otp change-pin --pin-stdin</code> (current PIN on line 1, new PIN on line 2)</td>
+        <td><code>keyroostctl otp change-pin --old-pin-stdin
+          --new-pin-stdin</code> (same two lines, same order)</td></tr>
+      <tr><td><code>keyroostctl oath set-password --password-stdin --new-password-stdin</code> read the new password on line 1 and the current one on line 2</td>
+        <td>The current password is line 1 and the new one line 2. Swap
+          the lines in a script that pipes both.</td></tr>
+      <tr><td><code>keyroostctl piv change-management-key --old-mgmt-key-stdin --new-mgmt-key-stdin</code> read the new key on line 1 and the current one on line 2</td>
+        <td>The current key is line 1 and the new one line 2. Swap the
+          lines in a script that pipes both.</td></tr>
+      <tr><td>No <code>-env</code> / <code>-stdin</code> flag: refused, even in a terminal. A <code>-stdin</code> flag typed at a terminal showed the secret, with a warning</td>
+        <td>In a terminal: a hidden prompt (<code>--X-stdin</code> typed
+          at a terminal is hidden too). In a script: refused, naming the
+          flags. After a secret is typed at the prompt, keyroost checks it
+          is still the same key before acting.</td></tr>
+      <tr><td><code>keyroostctl piv reset</code> / <code>factory-reset</code> ignored an unset <code>--mgmt-key-env</code> or <code>--pin-env</code> variable when the card didn't need it</td>
+        <td>The credential is read before anything is reset, so an unset
+          variable is an error up front. Drop the flag if the card doesn't
+          need it.</td></tr>
+    </table>
+    </div>
+    <p>In Git Bash (mintty) on Windows the hidden prompt needs a real
+      console: run <code>winpty keyroostctl …</code>, or pass the secret
+      with an <code>-env</code> flag.</p>
     <h3>Library (crates.io) API changes</h3>
     <div class="kr-table-wrap">
     <table class="kr-table">

@@ -182,9 +182,10 @@ blocks something, that's intended.
 - **Never print or read secrets.** Don't `printenv`, don't `echo` a
   PIN/password/token variable, don't read `.env`, `*.pem`, SSH keys, or
   NetworkManager / `wpa_supplicant` WiFi configs. (Hook-blocked.)
-- **PIN entry is the user's job.** PINs come from `--pin-env` / `--pin-stdin`
-  the user sets in their own shell. Don't ask for the PIN, don't place it in
-  argv, don't read it back.
+- **PIN entry is the user's job.** keyroostctl takes no secret in argv; with
+  no `--pin-env` / `--pin-stdin` it asks at a hidden terminal prompt. The user
+  types it there, or sets `--pin-env` / `--pin-stdin` up in their own shell.
+  Don't ask for the PIN, don't place it in argv, don't read it back.
 - **Credential listings are private.** `fido creds-list` reveals which services
   the user has accounts with. Don't run it speculatively; if the user shares
   output, don't echo usernames / RP names beyond what the task needs.

@@ -140,7 +140,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 | **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
 | **Nitrokey 3** | FIDO2, OATH, PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. The OpenPGP applet is detected but not yet exercised by this project. |
-| **Swissbit iShield Key 2 Pro** | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own card. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)). Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. Other applets not yet exercised by this project. |
+| **Swissbit iShield Key 2 Pro** (and iShield Key 1) | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own iShield Key 2 Pro. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)). Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. On the iShield Key 1 and 2, keyroost reads the serial and device name from Swissbit's own management applications (and, on the Key 1, the firmware version) for `piv status` and the GUI, contributed by [@episource](https://github.com/episource) ([#163](https://github.com/framefilter/keyroost/pull/163)). Other applets not yet exercised by this project. |
 | **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, large-blob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
 
 Each listed row notes what's actually been verified on that device; the final,
@@ -332,10 +332,9 @@ an open industry standard.
 - **Pure-Rust crypto** — no OpenSSL or other C crypto; the in-tree primitives are
   checked against standard test vectors, and standard algorithms come from the
   audited RustCrypto crates.
-- **Secrets stay yours.** PINs and passwords come from stdin or env vars, never
-  argv. Molto2 seeds and customer keys also accept argv for convenience (with a
-  warning), and each has an env/stdin variant. The tool never prints or persists
-  them.
+- **Secrets stay yours.** PINs, passwords, keys, seeds and `otpauth://` URIs
+  come from an environment variable, stdin or a hidden prompt, never argv. The
+  tool never prints or persists them.
 - **A single self-contained binary per OS** — it dynamically links only the system
   C library and the PC/SC client; no scripts, no Python, no Qt.
 - **Toward native installs everywhere.** The longer-term goal is first-class
@@ -677,7 +676,8 @@ done
 
 # --- Token2 Molto2 (TOTP programming) ---
 keyroostctl molto info
-keyroostctl molto import --profile 0 'otpauth://totp/GitHub:me@x.com?secret=JBSWY3DPEHPK3PXP'
+keyroostctl molto import --profile 0                # asks for the otpauth:// URI (hidden)
+keyroostctl molto import --profile 0 --uri-env URI # or from an environment variable
 keyroostctl molto import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate first
 
 # --- Token2 single-profile programmable token (OTPC / miniOTP / C30x) ---
@@ -728,13 +728,40 @@ no terminal to ask on, so it adds `--yes`; so does a command whose PIN or
 seed is piped in on stdin. If you answered a question, keyroost checks it is
 still the same key before acting.
 
+### Giving keyroost a PIN
+
+keyroostctl never takes a PIN, password, key, seed or `otpauth://` URI on the
+command line, where it would land in shell history and `ps`. Each secret flag
+comes in two forms, and with neither, a terminal asks for it:
+
+```bash
+keyroostctl fido creds-list                       # asks "PIN:" (nothing is shown as you type)
+keyroostctl fido creds-list --pin-env KR_PIN      # read from the KR_PIN environment variable
+pass show fido-pin | keyroostctl fido creds-list --pin-stdin   # one line from stdin
+```
+
+A new PIN, password or key typed at the prompt is asked twice and must match.
+When one command reads two secrets from stdin, the current one is the first
+line and the new one the second (each flag's `--help` says which line):
+
+```bash
+printf '%s\n%s\n' "$OLD_PIN" "$NEW_PIN" | keyroostctl piv change-pin --old-pin-stdin --new-pin-stdin
+```
+
+`otp add` and `oath add` read the seed first, then the PIN or password. In a
+script with no terminal, a command with no source for a secret it needs is
+refused, naming the flags to use. In Git Bash (mintty) on Windows the prompt
+needs a real console: run `winpty keyroostctl …`, or use the `-env` flags.
+
 ## Breaking changes & migration
 
 Breaking changes are tracked per release on the site's
 [migration notes](https://framefilter.github.io/keyroost/migration.html)
 page, with the exact before → after for scripts and library consumers.
 **v0.13.0** makes more commands ask before they erase or replace something
-(scripts pass `--yes`) and refuses, in a script, to pick among several keys.
+(scripts pass `--yes`), refuses, in a script, to pick among several keys, and
+takes no secret on the command line (a few secret flags are renamed, and two
+commands read their stdin lines in a new order).
 Two older ones to know about: **v0.7.5** renames the global device selector from
 `--name` to `--device`, and **v0.6.0** moved the Molto2 / FIDO commands under
 the `molto` and `fido` groups.
@@ -765,7 +792,7 @@ old script.
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` (Windows only) |
-| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize` |
+| `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize`, `rpassword` (hidden PIN/password prompt) |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `rfd`, `pollster`, `png`, `base64`, `serde`/`serde_json`, `zeroize`; `x11rb`/`ashpd` on Linux (`qr` feature); `winresource` build-dep on Windows |
 
 ## Protocol

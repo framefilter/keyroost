@@ -83,10 +83,11 @@ device UTC:    1699999284 (epoch)
 
 ## Step 3: Authenticate with the default customer key
 
-Factory-fresh devices use `TOKEN2MOLTO1-KEY`.
+Factory-fresh devices use `TOKEN2MOLTO1-KEY`. With no customer-key flag,
+keyroost uses that factory default, so nothing needs to be passed:
 
 ```bash
-keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY title --profile 99 "MOLTO_TEST"
+keyroostctl --debug molto title --profile 99 "MOLTO_TEST"
 ```
 
 This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, `answer challenge`, then `set title` — and end with "title set on profile #99".
@@ -96,7 +97,7 @@ This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, 
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, via `--key-ascii` (text) or `--key` (hex). **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset` does **not** require the customer key (it's a plain CLA `0x80` command; it names the token and asks y/N first, or takes `--yes` in a script): it wipes **every one of the 100 profiles** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
+**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, from an environment variable: `--key-ascii-env VAR` (text) or `--key-env VAR` (hex), e.g. `keyroostctl --debug molto --key-ascii-env MOLTO_KEY title --profile 99 "MOLTO_TEST"` after setting `MOLTO_KEY` in your own shell. The customer key is never taken on the command line. **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset` does **not** require the customer key (it's a plain CLA `0x80` command; it names the token and asks y/N first, or takes `--yes` in a script): it wipes **every one of the 100 profiles** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 
@@ -108,13 +109,19 @@ should see "MOLTO_TEST" as the title.
 ## Step 5: Write a known TOTP seed and verify the codes match
 
 ```bash
-keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY \
-  import --profile 99 \
-  --title MOLTO_TEST \
-  'otpauth://totp/MoltoTest?secret=JBSWY3DPEHPK3PXPJBSWY3DP&algorithm=SHA1&digits=6&period=30'
+keyroostctl --debug molto import --profile 99 --title MOLTO_TEST
 ```
 
-This writes seed + title + config in one authenticated session. If slot #99
+At the hidden `otpauth:// URI:` prompt, paste this throwaway test URI (it is
+not shown as you type):
+
+```
+otpauth://totp/MoltoTest?secret=JBSWY3DPEHPK3PXPJBSWY3DP&algorithm=SHA1&digits=6&period=30
+```
+
+The URI holds the seed, so keyroost never takes it on the command line; a
+script pipes it on stdin with `-` or names an environment variable with
+`--uri-env VAR`. This writes seed + title + config in one authenticated session. If slot #99
 already holds a seed, keyroost asks y/N before overwriting it (a script adds
 `--yes`).
 
@@ -132,7 +139,7 @@ compare. Within ±1 step (30 seconds) both should show the same 6 digits. If
 they don't, the device's clock is off — fix with:
 
 ```bash
-keyroostctl molto --key-ascii TOKEN2MOLTO1-KEY sync-time --profile 99
+keyroostctl molto sync-time --profile 99
 ```
 
 …and try again on the next 30-second boundary.
@@ -143,8 +150,7 @@ Drop a small plaintext Aegis or 2FAS export (1–3 entries) into `/tmp/test.json
 and:
 
 ```bash
-keyroostctl --debug molto --key-ascii TOKEN2MOLTO1-KEY \
-  import-file /tmp/test.json --start 95 --dry-run
+keyroostctl --debug molto import-file /tmp/test.json --start 95 --dry-run
 ```
 
 `--dry-run` parses and prints the plan without writing. If that looks right,

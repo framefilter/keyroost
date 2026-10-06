@@ -140,8 +140,10 @@ keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --days 365 \
 keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
     --pin-stdin --file request.csr</code></pre>
     <p class="kr-muted">When two <code>--*-stdin</code> flags appear on one command, keyroost
-      reads them as consecutive lines in the order the operation needs them — for
-      <code>self-sign</code> that is the management key first, then the PIN.</p>
+      reads them as consecutive lines, and each flag's <code>--help</code> says which line it
+      reads — for <code>self-sign</code> that is the PIN first, then the management key; for a
+      change, the current secret first, then the new one. With no flag at all, a terminal asks
+      at a hidden prompt.</p>
     <p>Both commands take <code>--generate-key</code> to generate the slot's key in the
       same step (with the same <code>--algorithm</code>, <code>--pin-policy</code> and
       <code>--touch-policy</code> options as <code>generate-key</code>), which spares

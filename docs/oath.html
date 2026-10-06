@@ -112,8 +112,8 @@ keyroostctl oath code &lt;name&gt; --device my-yubikey
 keyroostctl oath delete &lt;name&gt;      # asks y/N first; a script adds --yes</code></pre>
     <p class="kr-muted">In the desktop app, credentials can be added from an
       <code>otpauth://</code> URI (the same format behind setup QR codes); on the CLI the
-      secret is supplied to <code>oath add</code> via <code>--secret-stdin</code> /
-      <code>--secret-env</code>. This works on any card exposing the OATH applet —
+      seed is supplied to <code>oath add</code> via <code>--seed-stdin</code> /
+      <code>--seed-env</code>, or typed at a hidden prompt. This works on any card exposing the OATH applet —
       YubiKey, Nitrokey, SoloKeys, Feitian, Token2 (experimental) and others — over USB or an
       NFC / PC-SC reader. With one key connected keyroost uses it; with several, a terminal
       shows a numbered list and a script names one with <code>--device</code> (a saved name,
