@@ -748,7 +748,11 @@ line and the new one the second (each flag's `--help` says which line):
 printf '%s\n%s\n' "$OLD_PIN" "$NEW_PIN" | keyroostctl piv change-pin --old-pin-stdin --new-pin-stdin
 ```
 
-`otp add` and `oath add` read the seed first, then the PIN or password. In a
+`otp add` and `oath add` read the seed first, then the PIN or password. The
+Molto2 and programmable-token seed and key commands (`molto seed`, `prog seed`,
+`molto customer-key`) don't prompt: you pick the encoding by flag (`--hex-*` or
+`--base32-*`, `--hex-*` or `--ascii-*`), so one of those flags is required. A
+Molto2 customer key left out means the factory default. In a
 script with no terminal, a command with no source for a secret it needs is
 refused, naming the flags to use. In Git Bash (mintty) on Windows the prompt
 needs a real console: run `winpty keyroostctl …`, or use the `-env` flags.
