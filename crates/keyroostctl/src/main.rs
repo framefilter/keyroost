@@ -2672,26 +2672,33 @@ enum FidoCmd {
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
-    /// Set the initial PIN on an authenticator that doesn't have one yet.
+    /// Set the initial PIN on an authenticator that doesn't have one yet. The
+    /// PIN comes from an environment variable, stdin or, with neither, a
+    /// hidden prompt (asked twice) — never argv.
     PinSet {
         /// Read the new PIN from the given environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (one line, trailing newline stripped).
+        /// Read the new PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
-    /// Change the existing PIN. Old and new PINs are sourced from env vars
-    /// or stdin (stdin reads two consecutive lines: old then new).
+    /// Change the existing PIN. Each PIN comes from an environment variable,
+    /// stdin (the current PIN on the first line, the new one on the second)
+    /// or, with neither, a hidden prompt — never argv.
     PinChange {
+        /// Read the current PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
         old_pin_env: Option<String>,
+        /// Read the current PIN from stdin (first line; hidden when typed at a terminal).
         #[arg(long)]
         old_pin_stdin: bool,
+        /// Read the new PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
+        /// Read the new PIN from stdin (second line; hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2699,8 +2706,11 @@ enum FidoCmd {
     },
     /// Show resident-credential storage stats (uses pinUvAuthToken).
     CredsMetadata {
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2708,8 +2718,11 @@ enum FidoCmd {
     },
     /// List every resident credential on the authenticator, grouped by RP.
     CredsList {
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2720,8 +2733,11 @@ enum FidoCmd {
         /// Hex-encoded credentialId as printed by `fido creds-list`.
         #[arg(long, value_name = "HEX")]
         cred_id: String,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2732,8 +2748,11 @@ enum FidoCmd {
     },
     /// List enrolled fingerprints (template id + name).
     FingerprintList {
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2745,8 +2764,11 @@ enum FidoCmd {
         /// Optional friendly name to set on the new fingerprint once enrolled.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2760,8 +2782,11 @@ enum FidoCmd {
         /// New friendly name.
         #[arg(long, value_name = "NAME")]
         name: String,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2772,8 +2797,11 @@ enum FidoCmd {
         /// Hex-encoded template id as printed by `fido fingerprint-list`.
         #[arg(long, value_name = "HEX")]
         template_id: String,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2785,8 +2813,11 @@ enum FidoCmd {
     /// Turn "always require user verification" (alwaysUv) on or off. This is a
     /// toggle relative to the key's current state; run `info` to check it.
     AlwaysUv {
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2806,8 +2837,11 @@ enum FidoCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2815,8 +2849,11 @@ enum FidoCmd {
     },
     /// Force a PIN change on next use, without changing the minimum length.
     ForcePinChange {
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2828,8 +2865,11 @@ enum FidoCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2865,8 +2905,11 @@ enum SshCertCmd {
     /// List resident SSH credentials (ssh:* RP IDs) and whether each has a
     /// certificate stored in its largeBlob.
     List {
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2884,8 +2927,11 @@ enum SshCertCmd {
         /// Overwrite the output file if it exists.
         #[arg(long)]
         overwrite: bool,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2923,8 +2969,11 @@ enum LargeBlobCmd {
         /// The note text to store (plain UTF-8). Visible in argv to other
         /// local processes — never a secret.
         text: String,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2938,8 +2987,11 @@ enum LargeBlobCmd {
         index: usize,
         /// The new note text (plain UTF-8). Visible in argv to other processes.
         text: String,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2955,8 +3007,11 @@ enum LargeBlobCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -2983,8 +3038,11 @@ enum LargeBlobCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
+        /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
@@ -9842,6 +9900,25 @@ fn format_aaguid(aaguid: &[u8; 16]) -> String {
     s
 }
 
+const FIDO_PIN: Spec = Spec::current("PIN", "pin");
+const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "old-pin");
+const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
+
+/// The PIN for a FIDO command that always needs it: refused before any
+/// device I/O when it has no source, read after the key is announced and
+/// before the command opens it.
+fn fido_pin(
+    path: Option<&std::path::Path>,
+    env: &Option<String>,
+    stdin: bool,
+) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
+    let mut sec = Secrets::real();
+    let src = Source::new(env.as_deref(), stdin);
+    sec.check(&FIDO_PIN, src)?;
+    let _ = crate::target::select_fido(path)?;
+    Ok(sec.read(&FIDO_PIN, src)?)
+}
+
 fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     // FIDO handlers open their own hidraw transport and don't consult the
     // shared PC/SC debug flag; accept it for signature parity with the other
@@ -9886,7 +9963,11 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             new_pin_stdin,
             path,
         } => {
-            let new_pin = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut sec = Secrets::real();
+            let src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            sec.check(&FIDO_NEW_PIN, src)?;
+            let _ = crate::target::select_fido(path.as_deref())?;
+            let new_pin = sec.read(&FIDO_NEW_PIN, src)?;
             run_fido_pin_set(path.as_deref(), &new_pin)?;
             Ok(())
         }
@@ -9897,8 +9978,17 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             new_pin_stdin,
             path,
         } => {
-            let old_pin = read_secret("old PIN", old_pin_env.as_deref(), *old_pin_stdin)?;
-            let new_pin = read_secret("new PIN", new_pin_env.as_deref(), *new_pin_stdin)?;
+            let mut sec = Secrets::real();
+            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
+            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            sec.check(&FIDO_OLD_PIN, first_src)?;
+            sec.check(&FIDO_NEW_PIN, second_src)?;
+            let _ = crate::target::select_fido(path.as_deref())?;
+            let (old_pin, new_pin) = read_secret_pair(
+                &mut sec,
+                (&FIDO_OLD_PIN, first_src),
+                (&FIDO_NEW_PIN, second_src),
+            )?;
             run_fido_pin_change(path.as_deref(), &old_pin, &new_pin)?;
             Ok(())
         }
@@ -9907,7 +9997,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_creds_metadata(path.as_deref(), &pin)?;
             Ok(())
         }
@@ -9916,7 +10006,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_creds_list(path.as_deref(), &pin)?;
             Ok(())
         }
@@ -9929,14 +10019,16 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         } => {
             let cred_id_bytes =
                 hex_decode(cred_id).map_err(|e| format!("--cred-id is not valid hex: {}", e))?;
-            crate::target::fido_path(path.as_deref())?;
-            let dev = crate::target::select(Need::FidoHid, None, path.as_deref())?;
+            let mut sec = Secrets::real();
+            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            sec.check(&FIDO_PIN, src)?;
+            let dev = crate::target::select_fido(path.as_deref())?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete FIDO credential {}", hex_short(&cred_id_bytes)),
             )?;
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = sec.read(&FIDO_PIN, src)?;
             crate::prompt::reverify_if_asked(&dev, asked)?;
             run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
             Ok(())
@@ -9946,7 +10038,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_fingerprint_list(path.as_deref(), &pin)?;
             Ok(())
         }
@@ -9956,7 +10048,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_fingerprint_enroll(path.as_deref(), &pin, name.as_deref())?;
             Ok(())
         }
@@ -9967,9 +10059,9 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
             let id = hex_decode(template_id)
                 .map_err(|e| format!("--template-id is not valid hex: {}", e))?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_fingerprint_rename(path.as_deref(), &pin, &id, name)?;
             Ok(())
         }
@@ -9982,14 +10074,16 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         } => {
             let id = hex_decode(template_id)
                 .map_err(|e| format!("--template-id is not valid hex: {}", e))?;
-            crate::target::fido_path(path.as_deref())?;
-            let dev = crate::target::select(Need::FidoHid, None, path.as_deref())?;
+            let mut sec = Secrets::real();
+            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            sec.check(&FIDO_PIN, src)?;
+            let dev = crate::target::select_fido(path.as_deref())?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete fingerprint template {}", hex_short(&id)),
             )?;
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = sec.read(&FIDO_PIN, src)?;
             crate::prompt::reverify_if_asked(&dev, asked)?;
             run_fido_fingerprint_delete(path.as_deref(), &pin, &id)?;
             Ok(())
@@ -9999,7 +10093,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             with_configurator(path.as_deref(), &pin, |cfg| {
                 cfg.toggle_always_uv()?;
                 println!(
@@ -10018,15 +10112,18 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
+            let mut sec = Secrets::real();
+            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let pin = confirm_then_read_pin(
                 &mut crate::prompt::RealTerm,
+                &mut sec,
                 *yes,
                 &format!("raise the minimum PIN length to {length} (only a reset lowers it again)"),
                 &crate::prompt::key_label(&dev),
                 Some(&dev),
-                pin_env.as_deref(),
-                *pin_stdin,
+                src,
             )?;
             let length = *length;
             let force_change = *force_change;
@@ -10049,7 +10146,7 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             with_configurator(path.as_deref(), &pin, |cfg| {
                 cfg.force_pin_change()?;
                 println!("A PIN change is now required on next use of this key.");
@@ -10063,15 +10160,18 @@ fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             pin_stdin,
             path,
         } => {
+            let mut sec = Secrets::real();
+            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let pin = confirm_then_read_pin(
                 &mut crate::prompt::RealTerm,
+                &mut sec,
                 *yes,
                 "enable enterprise attestation (only a reset turns it off)",
                 &crate::prompt::key_label(&dev),
                 Some(&dev),
-                pin_env.as_deref(),
-                *pin_stdin,
+                src,
             )?;
             with_configurator(path.as_deref(), &pin, |cfg| {
                 cfg.enable_enterprise_attestation()?;
@@ -10095,7 +10195,7 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_large_blob_add(path.as_deref(), &pin, text)
         }
         LargeBlobCmd::Edit {
@@ -10105,7 +10205,7 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_large_blob_edit(path.as_deref(), &pin, *index, text)
         }
         LargeBlobCmd::Delete {
@@ -10116,8 +10216,7 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             path,
         } => run_fido_large_blob_delete(
             path.as_deref(),
-            pin_env.as_deref(),
-            *pin_stdin,
+            Source::new(pin_env.as_deref(), *pin_stdin),
             *index,
             *yes,
         ),
@@ -10132,7 +10231,11 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             pin_env,
             pin_stdin,
             path,
-        } => run_fido_large_blob_clear(path.as_deref(), pin_env.as_deref(), *pin_stdin, *yes),
+        } => run_fido_large_blob_clear(
+            path.as_deref(),
+            Source::new(pin_env.as_deref(), *pin_stdin),
+            *yes,
+        ),
     }
 }
 
@@ -10144,7 +10247,7 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_ssh_cert_list(path.as_deref(), &pin)
         }
         SshCertCmd::Extract {
@@ -10155,7 +10258,7 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
             pin_stdin,
             path,
         } => {
-            let pin = read_secret("PIN", pin_env.as_deref(), *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_ssh_cert_extract(
                 path.as_deref(),
                 &pin,
@@ -10663,12 +10766,13 @@ fn run_fido_large_blob_edit(
 
 fn run_fido_large_blob_delete(
     path: Option<&std::path::Path>,
-    pin_env: Option<&str>,
-    pin_stdin: bool,
+    src: Source<'_>,
     index: usize,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut dev, info, current) = open_and_read_large_blobs(path)?;
+    let mut sec = Secrets::real();
+    sec.check(&FIDO_PIN, src)?;
+    let (dev, _info, current) = open_and_read_large_blobs(path)?;
     let entry = current
         .entries
         .get(index)
@@ -10681,18 +10785,23 @@ fn run_fido_large_blob_delete(
             index
         );
     }
+    drop(dev); // not held across the question or while the PIN is typed
     let key = crate::target::select_fido(path)?;
     let pin = confirm_then_read_pin(
         &mut crate::prompt::RealTerm,
+        &mut sec,
         yes,
         &format!("delete large-blob entry {index}"),
         &crate::prompt::key_label(&key),
-        None,
-        pin_env,
-        pin_stdin,
+        Some(&key),
+        src,
     )?;
+    let (mut dev, info, again) = open_and_read_large_blobs(path)?;
+    if again.raw_array != current.raw_array {
+        return Err(LARGE_BLOB_CHANGED.into());
+    }
 
-    let mut entries = current.entries.clone();
+    let mut entries = again.entries;
     entries.remove(index);
     let updated = keyroost_ctap::large_blobs::LargeBlobArray {
         entries,
@@ -10712,12 +10821,13 @@ fn run_fido_large_blob_delete(
 
 fn run_fido_large_blob_clear(
     path: Option<&std::path::Path>,
-    pin_env: Option<&str>,
-    pin_stdin: bool,
+    src: Source<'_>,
     yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Re-read first so we can report exactly what will be wiped.
-    let (mut dev, info, current) = open_and_read_large_blobs(path)?;
+    let mut sec = Secrets::real();
+    sec.check(&FIDO_PIN, src)?;
+    // Read first so we can report exactly what will be wiped.
+    let (dev, _info, current) = open_and_read_large_blobs(path)?;
     let total = current.entries.len();
     let opaque = current.entries.iter().filter(|e| !e.is_kr_note()).count();
     if !yes {
@@ -10736,16 +10846,21 @@ fn run_fido_large_blob_clear(
             if opaque == 1 { "y" } else { "ies" }
         );
     }
+    drop(dev); // not held across the question or while the PIN is typed
     let key = crate::target::select_fido(path)?;
     let pin = confirm_then_read_pin(
         &mut crate::prompt::RealTerm,
+        &mut sec,
         yes,
         "clear the whole large-blob array",
         &crate::prompt::key_label(&key),
-        None,
-        pin_env,
-        pin_stdin,
+        Some(&key),
+        src,
     )?;
+    let (mut dev, info, again) = open_and_read_large_blobs(path)?;
+    if again.raw_array != current.raw_array {
+        return Err(LARGE_BLOB_CHANGED.into());
+    }
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
         &pin,
@@ -10757,6 +10872,11 @@ fn run_fido_large_blob_clear(
     println!("Large-blob array cleared ({} entries wiped).", total);
     Ok(())
 }
+
+/// The large-blob array is re-read after the question and the PIN; a
+/// delete or clear refuses when it no longer matches what was shown.
+const LARGE_BLOB_CHANGED: &str =
+    "the large-blob array changed while waiting for confirmation; nothing was changed";
 
 /// A consistent "index out of range" error for the large-blob commands.
 fn large_blob_bad_index(index: usize, len: usize) -> Box<dyn std::error::Error> {
@@ -11513,18 +11633,18 @@ fn gather_secret(
 /// is the key a command reopens after this returns; when the question was
 /// shown, it is re-found ([`crate::target::reverify`]) only after the PIN
 /// has been read — immediately before the reopen, not while the person is
-/// still typing the PIN. Callers that hold the key's handle open across the
-/// question pass `None`.
-fn confirm_then_read_pin(
+/// still typing the PIN. Nothing may hold the key's handle open across the
+/// question or the PIN entry.
+fn confirm_then_read_pin<I: crate::secrets::SecretIo>(
     term: &mut dyn crate::prompt::Term,
+    sec: &mut Secrets<I>,
     yes: bool,
     action: &str,
     key: &str,
     reopened: Option<&keyroost_resolve::Device>,
-    pin_env: Option<&str>,
-    pin_stdin: bool,
+    src: Source<'_>,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
-    confirm_then_read_pin_ordered(term, yes, action, key, pin_env, pin_stdin, |asked| {
+    confirm_then_read_pin_ordered(term, sec, yes, action, key, src, |asked| {
         if asked {
             if let Some(dev) = reopened {
                 crate::target::reverify(dev)?;
@@ -11536,19 +11656,19 @@ fn confirm_then_read_pin(
 
 /// The pure ask → read → re-verify ordering behind [`confirm_then_read_pin`],
 /// with the re-verify step injectable so the ordering can be asserted
-/// without talking to hardware: `reverify` must run after `read_secret`
-/// succeeds, never before.
-fn confirm_then_read_pin_ordered(
+/// without talking to hardware: `reverify` must run after the PIN is read,
+/// never before.
+fn confirm_then_read_pin_ordered<I: crate::secrets::SecretIo>(
     term: &mut dyn crate::prompt::Term,
+    sec: &mut Secrets<I>,
     yes: bool,
     action: &str,
     key: &str,
-    pin_env: Option<&str>,
-    pin_stdin: bool,
+    src: Source<'_>,
     reverify: impl FnOnce(bool) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     let asked = crate::prompt::confirm(term, yes, action, key)?;
-    let pin = read_secret("PIN", pin_env, pin_stdin)?;
+    let pin = sec.read(&FIDO_PIN, src)?;
     reverify(asked)?;
     Ok(pin)
 }
@@ -12402,6 +12522,8 @@ mod cli_tests {
         // Without a terminal and without --yes the refusal comes first: an
         // unset PIN variable would otherwise be the error. With --yes the PIN
         // is read next, so the same unset variable is what fails.
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
         struct NoTty;
         impl crate::prompt::Term for NoTty {
             fn present(&self) -> bool {
@@ -12412,17 +12534,39 @@ mod cli_tests {
                 unreachable!("never asks without a terminal")
             }
         }
-        let unset = Some("KEYROOST_TEST_UNSET_PIN_VAR");
+        let unset = Source::env("KR_UNSET");
         let action = "enable enterprise attestation (only a reset turns it off)";
-        let e = confirm_then_read_pin(&mut NoTty, false, action, "solo-test", None, unset, false)
-            .unwrap_err()
-            .to_string();
+        let mut sec = Secrets::new(FakeIo::default());
+        let e = confirm_then_read_pin(
+            &mut NoTty,
+            &mut sec,
+            false,
+            action,
+            "solo-test",
+            None,
+            unset,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.ends_with("add --yes"), "{e}");
-        assert!(!e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");
-        let e = confirm_then_read_pin(&mut NoTty, true, action, "solo-test", None, unset, false)
+        assert!(!e.contains("KR_UNSET"), "{e}");
+        let e = confirm_then_read_pin(&mut NoTty, &mut sec, true, action, "solo-test", None, unset)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("KEYROOST_TEST_UNSET_PIN_VAR"), "{e}");
+        assert!(e.contains("KR_UNSET"), "{e}");
+        assert!(e.contains("--pin-env"), "{e}");
+    }
+
+    /// A terminal that answers "y" to every question.
+    struct YesTerm;
+    impl crate::prompt::Term for YesTerm {
+        fn present(&self) -> bool {
+            true
+        }
+        fn say(&mut self, _: &str) {}
+        fn ask(&mut self, _: &str) -> std::io::Result<String> {
+            Ok("y\n".into())
+        }
     }
 
     #[test]
@@ -12432,25 +12576,17 @@ mod cli_tests {
         // re-check. This is what would regress if the re-check moved back
         // to right after the question, ahead of the (possibly slow, typed)
         // PIN entry.
-        struct YesTerm;
-        impl crate::prompt::Term for YesTerm {
-            fn present(&self) -> bool {
-                true
-            }
-            fn say(&mut self, _: &str) {}
-            fn ask(&mut self, _: &str) -> std::io::Result<String> {
-                Ok("y\n".into())
-            }
-        }
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
         let reverify_ran = std::cell::Cell::new(false);
-        let unset = Some("KEYROOST_TEST_ORDER_UNSET_PIN_VAR");
+        let mut sec = Secrets::new(FakeIo::default());
         let e = confirm_then_read_pin_ordered(
             &mut YesTerm,
+            &mut sec,
             false,
             "action",
             "k",
-            unset,
-            false,
+            Source::env("KR_T"),
             |_asked| {
                 reverify_ran.set(true);
                 Ok(())
@@ -12458,43 +12594,95 @@ mod cli_tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(e.contains("KEYROOST_TEST_ORDER_UNSET_PIN_VAR"), "{e}");
+        assert!(e.contains("KR_T"), "{e}");
         assert!(!reverify_ran.get(), "re-check ran before the PIN was read");
     }
 
     #[test]
     fn confirm_then_read_pin_reverifies_after_a_successful_read() {
-        struct YesTerm;
-        impl crate::prompt::Term for YesTerm {
-            fn present(&self) -> bool {
-                true
-            }
-            fn say(&mut self, _: &str) {}
-            fn ask(&mut self, _: &str) -> std::io::Result<String> {
-                Ok("y\n".into())
-            }
-        }
-        let var = "KEYROOST_TEST_ORDER_SET_PIN_VAR";
-        std::env::set_var(var, "1234");
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let mut sec = Secrets::new(FakeIo::default().var("KR_T", "1234"));
         let seen = std::cell::RefCell::new(Vec::new());
         let pin = confirm_then_read_pin_ordered(
             &mut YesTerm,
+            &mut sec,
             false,
             "action",
             "k",
-            Some(var),
-            false,
+            Source::env("KR_T"),
             |asked| {
                 seen.borrow_mut().push(asked);
                 Ok(())
             },
         )
         .unwrap();
-        std::env::remove_var(var);
         assert_eq!(&*pin, "1234");
         // The read already happened (the PIN above came from it); the
         // re-check runs once more, right after, with `asked` carried through.
         assert_eq!(*seen.borrow(), vec![true]);
+    }
+
+    #[test]
+    fn fido_secret_flags_all_have_help_and_name_their_stdin_line() {
+        use clap::CommandFactory;
+        fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
+            for a in cmd.get_arguments() {
+                let long = a.get_long().unwrap_or_default();
+                if long.ends_with("pin-env") || long.ends_with("pin-stdin") {
+                    let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+                    if help.is_empty() {
+                        out.push(format!("{path} --{long}"));
+                    }
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let cli = Cli::command();
+        let fido = cli.find_subcommand("fido").unwrap();
+        let mut missing = Vec::new();
+        walk(fido, "fido", &mut missing);
+        assert!(missing.is_empty(), "no help: {missing:?}");
+        let change = fido.find_subcommand("pin-change").unwrap();
+        for (flag, line) in [
+            ("old-pin-stdin", "first line"),
+            ("new-pin-stdin", "second line"),
+        ] {
+            let help = change
+                .get_arguments()
+                .find(|a| a.get_long() == Some(flag))
+                .and_then(|a| a.get_help().map(|h| h.to_string()))
+                .unwrap_or_default();
+            assert!(help.contains(line), "pin-change --{flag}: {help:?}");
+        }
+    }
+
+    #[test]
+    fn confirm_then_read_pin_prompts_then_reverifies() {
+        // --yes and no PIN flag at a terminal: the PIN comes from the hidden
+        // prompt, and the re-check runs only once it has been typed.
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["1234"]));
+        let order = std::cell::RefCell::new(Vec::new());
+        let pin = confirm_then_read_pin_ordered(
+            &mut YesTerm,
+            &mut sec,
+            true,
+            "action",
+            "k",
+            Source::NONE,
+            |asked| {
+                order.borrow_mut().push(format!("reverify asked={asked}"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*pin, "1234");
+        assert_eq!(sec.io.prompts, vec!["PIN: ".to_string()]);
+        assert_eq!(*order.borrow(), vec!["reverify asked=false".to_string()]);
     }
 
     #[test]
