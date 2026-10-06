@@ -203,10 +203,12 @@ impl SecretIo for RealIo {
     }
     fn read_line(&mut self) -> std::io::Result<Option<Zeroizing<String>>> {
         // std's Stdin buffer is shared, so a second call continues at line 2.
-        // Pre-sized so a long secret doesn't grow the buffer through an
-        // unwiped reallocation copy; std's own internal BufReader for stdin
-        // keeps its own copy of the bytes that we have no way to wipe.
-        let mut line = Zeroizing::new(String::with_capacity(256));
+        // Pre-sized (4 KiB, room for a long otpauth:// URI with issuer,
+        // label and image parameters) so a long secret doesn't grow the
+        // buffer through an unwiped reallocation copy; std's own internal
+        // BufReader for stdin keeps its own copy of the bytes that we have
+        // no way to wipe.
+        let mut line = Zeroizing::new(String::with_capacity(4096));
         let n = std::io::stdin().lock().read_line(&mut line)?;
         Ok((n > 0).then_some(line))
     }
@@ -363,9 +365,13 @@ impl<I: SecretIo> Secrets<I> {
                 // rpassword turns off ISIG, so Ctrl-C arrives as a plain byte
                 // and it raises SIGINT itself before returning — that kills
                 // the process outright (and the terminal's echo may stay
-                // off unless the shell restores it), so `Interrupted` here
-                // is never actually reached from a live Ctrl-C. Only Ctrl-D
-                // (UnexpectedEof) reaches this branch.
+                // off unless the shell restores it), so on Unix `Interrupted`
+                // here is never actually reached from a live Ctrl-C; only
+                // Ctrl-D (UnexpectedEof) reaches this branch. On Windows
+                // rpassword calls GenerateConsoleCtrlEvent, which is
+                // asynchronous: `Interrupted` can come back and this message
+                // may print before the Ctrl-C handler ends the process —
+                // the same outcome, nothing changed.
                 ErrorKind::Interrupted | ErrorKind::UnexpectedEof => {
                     "cancelled; nothing was changed".to_string()
                 }

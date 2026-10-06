@@ -3941,8 +3941,6 @@ impl ValidFor {
     }
 }
 
-/// Load a bulk-import file, transparently decrypting an Aegis encrypted
-/// vault if `--password-stdin` or `--password-env` was supplied.
 /// The slots a bulk import writes: consecutive from `start`, leaving out the
 /// entries it skips (no issuer or account to title them with).
 fn bulk_import_slots(start: u8, entries: &[keyroost_import::BulkEntry]) -> Vec<u8> {
@@ -3968,6 +3966,8 @@ fn molto_occupied(
     Ok(out)
 }
 
+/// Load a bulk-import file, transparently decrypting an Aegis encrypted
+/// vault if `--password-stdin` or `--password-env` was supplied.
 fn load_bulk_entries(
     sec: &mut Secrets,
     path: &std::path::Path,
