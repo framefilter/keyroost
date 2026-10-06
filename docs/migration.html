@@ -156,6 +156,11 @@
           a name or serial). <code>list --json</code> prints one row per
           key with the exact <code>--device</code> value; <code>list
           --device X</code> shows just that key.</td></tr>
+      <tr><td><code>piv self-sign</code> / <code>request-cert</code> without
+          <code>--key-usage</code> wrote no key usage</td>
+        <td>They write the slot's standard PIV key usage, marked critical
+          (same as <code>--key-usage default</code>). Use <code>--key-usage
+          undefined</code> for the old output.</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>

@@ -237,8 +237,12 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   the PIV-refresh APDU deduplication
   ([#119](https://github.com/framefilter/keyroost/pull/119)), and PIV applet
   fingerprinting with per-device feature gates, HID Crescendo management and
-  ECC P-521 ([#128](https://github.com/framefilter/keyroost/pull/128)) — most
-  of it hardware-verified on their own cards.
+  ECC P-521 ([#128](https://github.com/framefilter/keyroost/pull/128)),
+  Swissbit iShield serial, device name and firmware reads
+  ([#163](https://github.com/framefilter/keyroost/pull/163)), and X.509 key
+  usage for certificates and CSRs
+  ([#164](https://github.com/framefilter/keyroost/pull/164)) — most of it
+  hardware-verified on their own cards.
 
 (This credits their contributions to the codebase; it does not change keyroost's
 independent status described above.)
