@@ -699,7 +699,7 @@ keyroostctl key-name add my-yubikey
 keyroostctl key-name list
 
 # machine-readable output for scripts (status and query commands)
-keyroostctl --json list                     # one row per key, with its --device value
+keyroostctl --json list                     # {"keys": [...]}, each with its --device value
 keyroostctl --json piv status --device my-yubikey
 
 # man pages (completions: see "Shell completions" above)
@@ -757,6 +757,23 @@ script with no terminal, a command with no source for a secret it needs is
 refused, naming the flags to use. In Git Bash (mintty) on Windows the prompt
 needs a real console: run `winpty keyroostctl …`, or use the `-env` flags.
 
+### Reading the output
+
+A command prints its result on stdout and everything else (prompts,
+progress, notes, warnings) on stderr. You see both at a terminal, but
+redirecting saves only the result:
+
+```bash
+keyroostctl molto slots > slots.txt     # the file gets just the table
+keyroostctl piv export-cert --slot 9a   # prints the certificate as PEM
+```
+
+With `--json` (on the commands that support it), a command prints one
+object; a list sits under a named key such as `keys` or `accounts`, and
+every field is there, `null` when unknown. Don't rely on key order. The
+`--debug` output is for people reading along and may change between
+releases.
+
 ## Breaking changes & migration
 
 Breaking changes are tracked per release on the site's
@@ -765,7 +782,9 @@ page, with the exact before → after for scripts and library consumers.
 **v0.13.0** makes more commands ask before they erase or replace something
 (scripts pass `--yes`), refuses, in a script, to pick among several keys, and
 takes no secret on the command line (a few secret flags are renamed, and two
-commands read their stdin lines in a new order).
+commands read their stdin lines in a new order). It also reshapes `--json`
+output, moves everything but the result to stderr, and makes `piv
+export-cert` write PEM.
 Two older ones to know about: **v0.7.5** renames the global device selector from
 `--name` to `--device`, and **v0.6.0** moved the Molto2 / FIDO commands under
 the `molto` and `fido` groups.
