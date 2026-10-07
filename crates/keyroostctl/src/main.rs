@@ -773,7 +773,8 @@ fn print_cert_stored(line: &str, stored: &keyroost_transport::CertImport) {
 #[derive(clap::Args)]
 struct InlineKeyGen {
     /// Generate a fresh key pair in the slot on the card first, then sign
-    /// against it. Convenience only: it does exactly what running `piv
+    /// against it. This replaces any key already in the slot (asks first when
+    /// there is one). Convenience only: it does exactly what running `piv
     /// generate-key` beforehand would, but keeps the freshly generated public
     /// key in this same session so no temporary key-material file is needed.
     /// Omit it to keep the normal behavior — sign the key already in the slot,
