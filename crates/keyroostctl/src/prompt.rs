@@ -145,6 +145,46 @@ pub(crate) fn confirm_typed(
     }
 }
 
+/// Before writing `path`: a file already there is replaced only with
+/// `--overwrite` or a "yes" at a terminal; without a terminal it refuses,
+/// naming the flag. A path with nothing there passes. A dangling symlink
+/// counts as something there.
+pub(crate) fn check_overwrite(
+    term: &mut dyn Term,
+    path: &std::path::Path,
+    overwrite: bool,
+) -> Result<(), String> {
+    if overwrite || std::fs::symlink_metadata(path).is_err() {
+        return Ok(());
+    }
+    let shown = sanitize_terminal(&path.display().to_string());
+    if !term.present() {
+        return Err(format!(
+            "{shown} already exists; pass --overwrite to replace it"
+        ));
+    }
+    let answer = term
+        .ask(&format!("{shown} already exists; overwrite? [y/N] "))
+        .map_err(|e| e.to_string())?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err("cancelled; nothing was changed".into()),
+    }
+}
+
+/// [`check_overwrite`] at the real terminal for each output path a command
+/// was given. Call it first in the handler: before any secret is read and
+/// before any key is selected.
+pub(crate) fn check_overwrites(
+    paths: &[Option<&std::path::Path>],
+    overwrite: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for p in paths.iter().flatten() {
+        check_overwrite(&mut RealTerm, p, overwrite)?;
+    }
+    Ok(())
+}
+
 /// "yubi-test (serial 12345678)" / model when unnamed / the reader or path
 /// as typed for a key that was not detected.
 pub(crate) fn key_label(d: &Device) -> String {
@@ -368,5 +408,31 @@ mod tests {
         assert!(TermPicker::new(&mut t).pick("2 keys:", &choices).is_err());
         let mut t = FakeTerm::new(true, &["x\n"]);
         assert!(TermPicker::new(&mut t).pick("2 keys:", &choices).is_err());
+    }
+
+    #[test]
+    fn check_overwrite_rules() {
+        let dir = std::env::temp_dir().join(format!("kr-overwrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("fresh.pem");
+        let taken = dir.join("taken.pem");
+        std::fs::write(&taken, b"x").unwrap();
+
+        let mut t = FakeTerm::new(true, &[]);
+        assert_eq!(check_overwrite(&mut t, &fresh, false), Ok(()));
+        assert!(t.asked.is_empty(), "nothing to ask about a new file");
+        let mut t = FakeTerm::new(true, &[]);
+        assert_eq!(check_overwrite(&mut t, &taken, true), Ok(()));
+        assert!(t.asked.is_empty(), "--overwrite never asks");
+
+        let e = check_overwrite(&mut FakeTerm::new(false, &[]), &taken, false).unwrap_err();
+        assert!(e.contains("--overwrite"), "{e}");
+        assert_eq!(
+            check_overwrite(&mut FakeTerm::new(true, &["y\n"]), &taken, false),
+            Ok(())
+        );
+        let e = check_overwrite(&mut FakeTerm::new(true, &["\n"]), &taken, false).unwrap_err();
+        assert!(e.contains("cancelled"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -151,6 +151,48 @@ const CASES: &[(&[&str], &str)] = &[
         "--period",
     ),
     (&["prog", "config", "--time-step", "60"], "--period"),
+    (&["molto", "sync-time", "-p", "99", "S3CRETVALUE"], "--slot"),
+    (&["molto", "delete", "-p", "99", "S3CRETVALUE"], "--slot"),
+    (&["molto", "import", "-p", "99", "S3CRETVALUE"], "--slot"),
+    (
+        &[
+            "piv",
+            "import-cert",
+            "--slot",
+            "9a",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--in",
+    ),
+    (
+        &[
+            "piv",
+            "export-cert",
+            "--slot",
+            "9a",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--out",
+    ),
+    (
+        &[
+            "piv",
+            "self-sign",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--out",
+    ),
+    (
+        &["fido", "large-blob", "export", "0", "S3CRETVALUE"],
+        "--out FILE",
+    ),
 ];
 
 #[test]

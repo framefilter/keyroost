@@ -95,3 +95,62 @@ fn list_json_is_one_object_with_keys() {
         assert!(v["keys"].is_array(), "{out}");
     }
 }
+
+#[test]
+fn an_existing_output_file_is_refused_before_any_key() {
+    let dir = std::env::temp_dir().join(format!("kr-out-exists-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("exists.out");
+    std::fs::write(&f, b"keep me").unwrap();
+    let f = f.to_str().unwrap();
+    for args in [
+        &["piv", "export-cert", "--slot", "9a", "--out", f][..],
+        &[
+            "piv",
+            "generate-key",
+            "--slot",
+            "9a",
+            "--save-pubkey",
+            f,
+            "--mgmt-key-default",
+            "--yes",
+        ],
+        &[
+            "piv",
+            "self-sign",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--generate-key",
+            "--save-pubkey",
+            f,
+            "--mgmt-key-default",
+            "--yes",
+        ],
+        &[
+            "piv",
+            "request-cert",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--out",
+            f,
+        ],
+        &["openpgp", "sign", "--in", f, "--out", f],
+        &["openpgp", "decrypt", "--in", f, "--out", f],
+        &["fido", "large-blob", "export", "0", "--out", f],
+        &["fido", "ssh-cert", "extract", "--out", f],
+    ] {
+        let (code, _out, err) = run(args);
+        assert_eq!(code, 1, "{args:?}: {err}");
+        assert!(err.contains("--overwrite"), "{args:?}: {err}");
+        assert!(
+            !err.contains('\u{2192}'),
+            "{args:?}: a key was selected first: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(dir.join("exists.out")).unwrap(), b"keep me");
+    let _ = std::fs::remove_dir_all(&dir);
+}
