@@ -11,11 +11,11 @@ If anything in steps 1–3 doesn't look right, save the full `--debug` output
 and we'll diff it against the expected format in `docs/PROTOCOL.md`.
 
 > **Safe slots.** Step 3 onwards writes to the device. Steps 3 and 5 target
-> **profile #99**; step 6 bulk-imports starting at **#95** and fills consecutive
+> **slot #99** (Token2 calls slots profiles); step 6 bulk-imports starting at **#95** and fills consecutive
 > slots from there — one per entry in your export, so a 3-entry file writes
 > #95, #96 and #97. If you've already programmed anything in #95–#99 for real,
 > pick a range you're willing to overwrite and substitute it in every
-> `--profile 99` / `--start 95` below.
+> `--slot 99` / `--start 95` below.
 
 ## Prerequisites
 
@@ -39,10 +39,10 @@ onto your `$PATH` or invoke it from there.
 Plug the Molto2 in, then:
 
 ```bash
-keyroostctl --list-readers
+keyroostctl list
 ```
 
-**Expected:** one line containing "TOKEN2" (case may vary, e.g. `TOKEN2 Molto2 [CCID Interface] 00 00`).
+**Expected:** a row for the Molto2 that names its reader, containing "TOKEN2" (case may vary, e.g. `TOKEN2 Molto2 [CCID Interface] 00 00`).
 
 **If it fails:**
 - *"PC/SC service is unavailable"* — start the service (`sudo systemctl start pcscd` on Linux). On macOS this shouldn't happen.
@@ -87,7 +87,7 @@ Factory-fresh devices use `TOKEN2MOLTO1-KEY`. With no customer-key flag,
 keyroost uses that factory default, so nothing needs to be passed:
 
 ```bash
-keyroostctl --debug molto title --profile 99 "MOLTO_TEST"
+keyroostctl --debug molto title --slot 99 "MOLTO_TEST"
 ```
 
 This will print a `>` / `<` pair on stderr for each of `get info`, `get challenge`, `answer challenge`, then `set title`, along with the serial, the device clock and "Authenticated.", and end with "Title set on slot #99." on stdout.
@@ -97,19 +97,19 @@ This will print a `>` / `<` pair on stderr for each of `get info`, `get challeng
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, from an environment variable: `--key-ascii-env VAR` (text) or `--key-env VAR` (hex), e.g. `keyroostctl --debug molto --key-ascii-env MOLTO_KEY title --profile 99 "MOLTO_TEST"` after setting `MOLTO_KEY` in your own shell. The customer key is never taken on the command line. **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset` does **not** require the customer key (it's a plain CLA `0x80` command; it names the token and asks y/N first, or takes `--yes` in a script): it wipes **every one of the 100 profiles** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
+**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, from an environment variable: `--key-ascii-env VAR` (text) or `--key-env VAR` (hex), e.g. `keyroostctl --debug molto --key-ascii-env MOLTO_KEY title --slot 99 "MOLTO_TEST"` after setting `MOLTO_KEY` in your own shell. The customer key is never taken on the command line. **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset` does **not** require the customer key (it's a plain CLA `0x80` command; it names the token and asks y/N first, or takes `--yes` in a script): it wipes **every one of the 100 slots** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 
 ## Step 4: Verify the title on-device
 
-Press the button on the Molto2 to wake it up and cycle to profile #99. You
+Press the button on the Molto2 to wake it up and cycle to slot #99. You
 should see "MOLTO_TEST" as the title.
 
 ## Step 5: Write a known TOTP seed and verify the codes match
 
 ```bash
-keyroostctl --debug molto import --profile 99 --title MOLTO_TEST
+keyroostctl --debug molto import --slot 99 --title MOLTO_TEST
 ```
 
 At the hidden `otpauth:// URI:` prompt, paste this throwaway test URI (it is
@@ -139,7 +139,7 @@ compare. Within ±1 step (30 seconds) both should show the same 6 digits. If
 they don't, the device's clock is off — fix with:
 
 ```bash
-keyroostctl molto sync-time --profile 99
+keyroostctl molto sync-time --slot 99
 ```
 
 …and try again on the next 30-second boundary.
@@ -247,20 +247,20 @@ First state-changing step. Use a known throwaway PIN for testing — you'll
 factory-reset before putting the key into real service.
 
 ```bash
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido pin-set \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido pin set \
     --device N --new-pin-stdin
 ```
 
 **Expected:** `PIN set.` Re-run `fido info`: `clientPin` should now be
-`true`. `fido pin-retries` should still show the full attempt counter —
+`true`. `fido pin retries` should still show the full attempt counter —
 the initial set doesn't consume a retry.
 
 ### Step F4: PIN-protected read paths
 
 ```bash
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-metadata \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido credentials metadata \
     --device N --pin-stdin
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido credentials list \
     --device N --pin-stdin
 ```
 
@@ -268,12 +268,12 @@ printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
 more`, and `(no resident credentials)`. The point isn't the (empty)
 contents — it's that the `pinUvAuthToken` exchange (`clientPin` 0x09 with
 `cm` permission) succeeded. A correct PIN must **not** decrement the retry
-counter; verify with `fido pin-retries` afterwards.
+counter; verify with `fido pin retries` afterwards.
 
 ### Step F5: Resident-credential round-trip (create → list → delete)
 
 Plant a discoverable credential using `ssh-keygen` as the simplest external
-RP, then exercise `fido creds-list` and `fido creds-delete`:
+RP, then exercise `fido credentials list` and `fido credentials delete`:
 
 ```bash
 # Create — needs PIN entry + a physical touch when the key blinks.
@@ -281,16 +281,16 @@ ssh-keygen -t ecdsa-sk -O resident -O application=ssh:moltotest \
            -N '' -f /tmp/sk_moltotest
 
 # Read back — confirm it appears, copy the FULL id= value.
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido credentials list \
     --device N --pin-stdin
 
 # Destructive: delete by full credentialId. The PIN is piped, so there is
 # no terminal to ask y/N on: --yes confirms.
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-delete \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido credentials delete \
     --device N --cred-id <full hex from id=> --pin-stdin --yes
 
 # Confirm empty.
-printf 'YOUR_TEST_PIN\n' | keyroostctl fido creds-list \
+printf 'YOUR_TEST_PIN\n' | keyroostctl fido credentials list \
     --device N --pin-stdin
 ```
 

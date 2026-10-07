@@ -133,14 +133,14 @@
         certificate or key, tests that a slot's key still works, writes a fresh CHUID, and
         resets the applet. The same controls are in the desktop app's PIV pane.</p>
     </div>
-<pre><code>keyroostctl piv status
+<pre><code>keyroostctl piv info
 keyroostctl piv generate-key --slot 9a --algorithm eccp256 --mgmt-key-stdin
 keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --days 365 \
     --pin-stdin --mgmt-key-stdin
 keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
-    --pin-stdin --file request.csr
+    --pin-stdin --out request.csr
 keyroostctl piv export-cert --slot 9a                  # prints the certificate as PEM
-keyroostctl piv export-cert --slot 9a --format der --file cert.der</code></pre>
+keyroostctl piv export-cert --slot 9a --format der --out cert.der</code></pre>
     <p class="kr-muted">When two <code>--*-stdin</code> flags appear on one command, keyroost
       reads them as consecutive lines, and each flag's <code>--help</code> says which line it
       reads — for <code>self-sign</code> that is the PIN first, then the management key; for a
@@ -151,18 +151,30 @@ keyroostctl piv export-cert --slot 9a --format der --file cert.der</code></pre>
       <code>--touch-policy</code> options as <code>generate-key</code>), which spares
       cards without GET METADATA the save-pubkey / load-pubkey detour.</p>
     <span id="certificates"></span>
+    <span id="slot-states"></span>
+    <p><strong>Slot states.</strong> In <code>piv info</code> and the app, a slot without a
+      certificate reads <em>empty</em> when the card says it holds no key, <em>key present,
+      no certificate</em> when the card confirms a key, and <em>no certificate (a key may be
+      present)</em> when keyroost can't tell. keyroost can't tell on cards where it doesn't
+      use GET METADATA's key type, and on cards that answer GET METADATA without key details
+      for empty slots, such as Nitrokey and Token2 PivApplet-based cards.</p>
     <p><strong>Certificates.</strong> keyroost reads certificates stored gzip-compressed (the
       PIV standard's CertInfo <code>0x01</code> form) and verifies their checksum. A damaged
       one, or one that would decompress past 64&nbsp;KiB, shows as present but unreadable:
-      in <code>piv status</code>'s text, as <code>cert_unreadable</code> in
+      in <code>piv info</code>'s text, as <code>cert_unreadable</code> in
       <code>--json</code>, and as &ldquo;unreadable cert&rdquo; in the app. A certificate
       the card refuses as too large, even with the <a href="#compression">compression</a>
       choice below, fails with a clear &ldquo;too large&rdquo; message, or &ldquo;no room
       left&rdquo; when the card is full, and leaves the slot's existing certificate
       unchanged. keyroost also refuses a certificate whose public key doesn't match the key
       already in the slot, when it can read that key. <code>export-cert</code> writes the
-      certificate as PEM, to stdout or to <code>--file</code>; add <code>--format der</code>
-      for the raw DER bytes.</p>
+      certificate as PEM, to stdout or to <code>--out FILE</code>; add <code>--format der</code>
+      for the raw DER bytes. <code>import-cert</code> reads the certificate from <code>--in
+      FILE</code>. When an output file already exists (<code>--out</code> on
+      <code>export-cert</code>, <code>request-cert</code> or <code>self-sign</code>, or the
+      public-key copy <code>generate-key</code> saves), a terminal asks "overwrite? [y/N]";
+      a script must add <code>--overwrite</code>. A directory as the output is refused
+      before the card is touched.</p>
     <span id="delete"></span>
     <p><strong>Clearing a slot.</strong> <code>delete-cert</code> removes only the slot's
       X.509 certificate object and leaves the private key in place — standard PIV, so it
@@ -232,7 +244,7 @@ keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
     <p><strong>Compressed certificates.</strong> The PIV standard lets a slot's certificate
       be stored gzip-compressed: the certificate object's CertInfo byte says whether it is
       (NIST SP&nbsp;800-73-4, Part&nbsp;1, Appendix&nbsp;A). keyroost reads compressed
-      certificates, and <code>piv status</code> marks them <em>stored compressed</em>. When
+      certificates, and <code>piv info</code> marks them <em>stored compressed</em>. When
       writing one with <code>import-cert</code> or <code>self-sign</code>, keyroost stores the
       certificate uncompressed by default and compresses it only if the card refuses it as
       too large, then says it did and why. <code>--compress</code> always stores it
@@ -243,8 +255,8 @@ keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
       certificate</strong> and <strong>Self-signed certificate</strong> dialogs offer the same
       choice as a <strong>Compression</strong> dropdown: Automatic (only if too large),
       Always, or Never.</p>
-<pre><code>keyroostctl piv import-cert --slot 9d --file cert.pem --mgmt-key-stdin   # compress only if needed
-keyroostctl piv import-cert --slot 9d --file cert.pem --mgmt-key-stdin --compress
+<pre><code>keyroostctl piv import-cert --slot 9d --in cert.pem --mgmt-key-stdin   # compress only if needed
+keyroostctl piv import-cert --slot 9d --in cert.pem --mgmt-key-stdin --compress
 keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-stdin \
     --no-compress</code></pre>
     <div class="kr-callout note">
@@ -260,7 +272,7 @@ keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-
     <p><strong>What each key supports.</strong> Many management commands — extra key
       algorithms, PIN and touch policies, move and delete key, retry counts, changing the
       management key, reset — are vendor extensions rather than standard PIV. keyroost
-      identifies which PIV applet a card runs (shown in <code>piv status</code> and at the
+      identifies which PIV applet a card runs (shown in <code>piv info</code> and at the
       start of the app's PIV status line) and checks each of these against a per-applet
       list of what each supports. A feature listed as unsupported for a key is dimmed in the app, with
       the reason on hover; one with no entry yet stays usable, marked with a warning.</p>
@@ -311,9 +323,11 @@ unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
       — the CSR signature itself needs only the PIN; the management key is for the
       key-generation step:</p>
 <pre><code>  keyroostctl piv request-cert --slot "$slot" --subject "CN=$USER" \
-      --pin-env PIV_PIN --file "slot-$slot.csr" --device my-yubikey</code></pre>
+      --pin-env PIV_PIN --out "slot-$slot.csr" --device my-yubikey</code></pre>
     <p>Import each issued certificate later with
-      <code>import-cert --slot "$slot" --file … --mgmt-key-env PIV_MGMT</code>.
+      <code>import-cert --slot "$slot" --in … --mgmt-key-env PIV_MGMT</code>.
+      Rerunning the loop over CSR files from an earlier run needs
+      <code>--overwrite</code>, since a script isn't asked.
       <code>--device</code> keeps the loop on one key when several are plugged in: it takes a
       <a href="naming.html">friendly name</a>, a serial, or the number
       <code>keyroostctl list</code> shows (<code>--reader &lt;substr&gt;</code> works too).

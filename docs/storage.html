@@ -126,15 +126,17 @@
 keyroostctl fido large-blob get 0
 keyroostctl fido large-blob add "spare key in the desk drawer" --pin-stdin
 keyroostctl fido large-blob edit 2 "moved to the safe" --pin-stdin
-keyroostctl fido large-blob export 1 entry.bin              # raw bytes, no PIN
-keyroostctl fido large-blob export 1 id_ecdsa_sk-cert.pub --as-cert
+keyroostctl fido large-blob export 1 --out entry.bin        # raw bytes, no PIN
+keyroostctl fido large-blob export 1 --out id_ecdsa_sk-cert.pub --as-cert
 keyroostctl fido large-blob delete 1 --pin-stdin --yes      # piped PIN, so --yes; RP-owned entries also print a warning
 keyroostctl fido large-blob clear --pin-stdin --yes         # wipes the whole array</code></pre>
     <p class="kr-muted">Reading (<code>list</code>, <code>get</code>, <code>export</code>) needs
       no PIN — the array is world-readable. Note that <code>add</code> and <code>edit</code>
       take the note text as an argument, so it is visible to other local processes in the
       process list while the command runs; that is fine for a note and unacceptable for a
-      secret, which is another reason not to put one here.</p>
+      secret, which is another reason not to put one here. If the <code>--out</code> file
+      of <code>export</code> already exists, a terminal asks "overwrite? [y/N]"; a script
+      must add <code>--overwrite</code>.</p>
   </section>
 
   <section class="kr-section">
@@ -150,9 +152,9 @@ keyroostctl fido large-blob clear --pin-stdin --yes         # wipes the whole ar
 <pre><code>keyroostctl fido ssh-cert list --pin-stdin
 keyroostctl fido ssh-cert extract --credential ssh:demo --out id_ecdsa_sk-cert.pub --pin-stdin</code></pre>
     <p><code>--credential</code> is needed only to disambiguate when the key holds several SSH
-      credentials, and <code>--out</code> defaults to a sanitised
-      <code>&lt;rp-id&gt;-cert.pub</code>; pass <code>--overwrite</code> to replace an existing
-      file. In the desktop app the same thing is <strong>Save certificate…</strong> on the
+      credentials, and <code>--out</code> defaults to a sanitized
+      <code>&lt;rp-id&gt;-cert.pub</code>. If that file exists, a terminal asks before
+      replacing it; a script must pass <code>--overwrite</code>. In the desktop app the same thing is <strong>Save certificate…</strong> on the
       <strong>Passkeys</strong> tab, next to the SSH credential it belongs to.</p>
   </section>
 

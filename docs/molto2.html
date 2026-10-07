@@ -148,7 +148,7 @@
       contactless <em>or</em> contact (chip) reader.</p>
     <ul>
       <li>Write the <strong>TOTP seed</strong> for the single account the token carries.</li>
-      <li>Set the <strong>configuration</strong> — HMAC algorithm (SHA1 / SHA256), time-step
+      <li>Set the <strong>configuration</strong> — HMAC algorithm (SHA1 / SHA256), period
         (30 s / 60 s), and display timeout — and sync the device clock to the host.</li>
       <li>keyroost reads back the device <strong>serial and model</strong> and refuses to
         program a token whose serial doesn't match a known model.</li>
@@ -167,7 +167,7 @@
         <code>keyroostctl prog seed</code> (seed from stdin or an environment variable —
         <code>--base32-stdin</code> / <code>--base32-env</code>, so it stays out of
         <code>ps</code> and shell history), and
-        <code>keyroostctl prog config</code> (algorithm, time-step, display timeout).
+        <code>keyroostctl prog config</code> (algorithm, <code>--period</code>, display timeout).
         <code>seed</code> and <code>config</code> ask <strong>y/N</strong> before overwriting
         (a script adds <code>--yes</code>), and only programmable tokens are considered when
         keyroost picks the token. The GUI offers the same on a dedicated programmable-token

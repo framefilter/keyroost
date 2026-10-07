@@ -94,10 +94,10 @@
 
   <section class="kr-section">
     <h2>Command line</h2>
-<pre><code>keyroostctl fido fingerprint-list   --pin-env KR_PIN
-keyroostctl fido fingerprint-enroll --pin-env KR_PIN --name "Right index"
-keyroostctl fido fingerprint-rename --pin-env KR_PIN --template-id 0001 --name "Left index"
-keyroostctl fido fingerprint-delete --pin-env KR_PIN --template-id 0002</code></pre>
+<pre><code>keyroostctl fido fingerprints list   --pin-env KR_PIN
+keyroostctl fido fingerprints add    --pin-env KR_PIN --name "Right index"
+keyroostctl fido fingerprints rename --pin-env KR_PIN --template-id 0001 --name "Left index"
+keyroostctl fido fingerprints delete --pin-env KR_PIN --template-id 0002</code></pre>
   </section>
 
   <section class="kr-section">

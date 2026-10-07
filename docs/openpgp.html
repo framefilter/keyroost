@@ -116,7 +116,7 @@
         PKCS#1 for RSA, <code>r||s</code> (not DER) for ECDSA, <code>R||S</code> for
         Ed25519.</p>
     </div>
-<pre><code>keyroostctl openpgp status --device my-yubikey
+<pre><code>keyroostctl openpgp info --device my-yubikey
 keyroostctl openpgp generate-key --slot sign --algorithm ed25519 --yes --admin-pin-stdin --device my-yubikey
 keyroostctl openpgp sign --in msg.txt --pin-stdin --device my-yubikey
 keyroostctl openpgp authenticate --in chal.bin --pin-stdin --device my-yubikey

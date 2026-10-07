@@ -152,10 +152,10 @@
       <code>authnrCfg</code> (<a href="settings.html">see Settings</a>). Locking returns to
       the gate and clears the session for all of them.</p>
 <pre><code>keyroostctl fido info
-keyroostctl fido pin-retries
-keyroostctl fido creds-list --pin-stdin   # PIN read from stdin, never argv
-keyroostctl fido creds-delete --cred-id &lt;hex&gt; --pin-env KR_PIN   # asks y/N first
-keyroostctl fido reset                    # asks y/N, then waits for a replug and a touch</code></pre>
+keyroostctl fido pin retries
+keyroostctl fido credentials list --pin-stdin   # PIN read from stdin, never argv
+keyroostctl fido credentials delete --cred-id &lt;hex&gt; --pin-env KR_PIN   # asks y/N first
+keyroostctl fido reset                          # asks y/N, then waits for a replug and a touch</code></pre>
     <p>Deleting a credential or fingerprint and resetting name the key and ask
       <strong>y/N</strong> first. A script has no terminal to ask on, so it adds
       <code>--yes</code>; so does a command whose PIN is piped in with
