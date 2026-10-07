@@ -10282,19 +10282,31 @@ fn fido_pin(
     let mut sec = Secrets::real();
     let src = Source::new(env.as_deref(), stdin);
     sec.check(&FIDO_PIN, src)?;
-    let _ = crate::target::select_fido(path)?;
+    let dev = crate::target::select_fido(path)?;
     let pin = sec.read(&FIDO_PIN, src)?;
-    fido_reverify_if_prompted(&sec, path)?;
+    fido_reverify_if_prompted(&sec, &dev)?;
     Ok(pin)
 }
 
 /// [`reverify_if_prompted`] for the FIDO-over-USB key.
+/// `dev` is the key selected (and shown) before the PIN was read; it is
+/// re-checked as is, never selected afresh, so a key swapped in while the
+/// PIN was typed is caught.
 fn fido_reverify_if_prompted<I: crate::secrets::SecretIo>(
     sec: &Secrets<I>,
-    path: Option<&std::path::Path>,
+    dev: &keyroost_resolve::Device,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fido_reverify_with(sec, dev, crate::target::reverify)
+}
+
+/// [`fido_reverify_if_prompted`] with the re-check passed in (tests).
+fn fido_reverify_with<I: crate::secrets::SecretIo>(
+    sec: &Secrets<I>,
+    dev: &keyroost_resolve::Device,
+    reverify: impl FnOnce(&keyroost_resolve::Device) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if sec.prompted() {
-        crate::target::reverify(&crate::target::select_fido(path)?)?;
+        reverify(dev)?;
     }
     Ok(())
 }
@@ -10353,9 +10365,9 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             let mut sec = Secrets::real();
             let src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
             sec.check(&FIDO_NEW_PIN, src)?;
-            let _ = crate::target::select_fido(path.as_deref())?;
+            let dev = crate::target::select_fido(path.as_deref())?;
             let new_pin = sec.read(&FIDO_NEW_PIN, src)?;
-            fido_reverify_if_prompted(&sec, path.as_deref())?;
+            fido_reverify_if_prompted(&sec, &dev)?;
             run_fido_pin_set(path.as_deref(), &new_pin)?;
             Ok(())
         }
@@ -10371,13 +10383,13 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
             sec.check(&FIDO_OLD_PIN, first_src)?;
             sec.check(&FIDO_NEW_PIN, second_src)?;
-            let _ = crate::target::select_fido(path.as_deref())?;
+            let dev = crate::target::select_fido(path.as_deref())?;
             let (old_pin, new_pin) = read_secret_pair(
                 &mut sec,
                 (&FIDO_OLD_PIN, first_src),
                 (&FIDO_NEW_PIN, second_src),
             )?;
-            fido_reverify_if_prompted(&sec, path.as_deref())?;
+            fido_reverify_if_prompted(&sec, &dev)?;
             run_fido_pin_change(path.as_deref(), &old_pin, &new_pin)?;
             Ok(())
         }
@@ -10512,6 +10524,20 @@ fn always_uv_step(current: Option<bool>, want_on: bool) -> Result<AlwaysUvStep, 
     }
 }
 
+/// [`always_uv_step`] from the info read before the PIN. A change also
+/// needs authenticatorConfig, so a key without it is refused before the
+/// PIN is asked for; an already-set key is a no-op either way.
+fn always_uv_pre_pin_step(
+    info: &keyroost_ctap::AuthenticatorInfo,
+    want_on: bool,
+) -> Result<AlwaysUvStep, Box<dyn std::error::Error>> {
+    let step = always_uv_step(info.option("alwaysUv"), want_on)?;
+    if step == AlwaysUvStep::Change && info.option("authnrCfg") != Some(true) {
+        return Err("this authenticator does not advertise authenticatorConfig support".into());
+    }
+    Ok(step)
+}
+
 fn run_fido_always_uv(
     want_on: bool,
     path: Option<&std::path::Path>,
@@ -10531,20 +10557,26 @@ fn run_fido_always_uv(
         if !init.supports_cbor() {
             return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
         }
-        keyroost_ctap::get_info(&mut hid)?.option("alwaysUv")
+        keyroost_ctap::get_info(&mut hid)?
     };
-    if always_uv_step(current, want_on)? == AlwaysUvStep::AlreadySet {
+    let already = || {
         println!("\"Always require user verification\" is already {word}; nothing was changed.");
+    };
+    if always_uv_pre_pin_step(&current, want_on)? == AlwaysUvStep::AlreadySet {
+        already();
         return Ok(());
     }
     let pin = sec.read(&FIDO_PIN, src)?;
-    fido_reverify_if_prompted(&sec, path)?;
+    fido_reverify_if_prompted(&sec, &dev)?;
     with_configurator(path, &pin, |cfg, info| {
         // Checked again on this handle: the key may have changed since the first read.
-        if always_uv_step(info.option("alwaysUv"), want_on)? == AlwaysUvStep::Change {
-            cfg.toggle_always_uv()?;
+        match always_uv_step(info.option("alwaysUv"), want_on)? {
+            AlwaysUvStep::AlreadySet => already(),
+            AlwaysUvStep::Change => {
+                cfg.toggle_always_uv()?;
+                println!("\"Always require user verification\" is now {word}.");
+            }
         }
-        println!("\"Always require user verification\" is now {word}.");
         Ok(())
     })
 }
@@ -13913,7 +13945,85 @@ mod cli_tests {
         sec.read(&PIV_PIN, Source::env("V")).unwrap();
         sec.read(&PIV_PIN, Source::new(None, true)).unwrap();
         assert!(reverify_if_prompted(&sec, Need::Piv, None).is_ok());
-        assert!(fido_reverify_if_prompted(&sec, None).is_ok());
+        assert!(fido_reverify_if_prompted(&sec, &test_fido_row()).is_ok());
+    }
+
+    fn test_fido_row() -> keyroost_resolve::Device {
+        let mut caps = keyroost_resolve::Caps::default();
+        caps.insert(keyroost_resolve::Caps::FIDO2);
+        keyroost_resolve::Device {
+            id: "x".into(),
+            name: None,
+            vendor: "V".into(),
+            model: "M".into(),
+            serial: "1".into(),
+            transport: String::new(),
+            firmware: String::new(),
+            caps,
+            unverified: keyroost_resolve::Caps::default(),
+            kind: keyroost_resolve::DeviceKind::Key,
+            hid_path: Some("/dev/hidraw3".into()),
+            reader: None,
+        }
+    }
+
+    #[test]
+    fn fido_reverify_checks_the_key_shown_before_the_pin() {
+        // After a hidden prompt the re-check gets the very row the caller
+        // selected before the PIN, never a fresh selection; with no prompt
+        // it does nothing.
+        use crate::secrets::fake::FakeIo;
+        use crate::secrets::{Secrets, Source};
+        let dev = test_fido_row();
+        let mut seen = Vec::new();
+        let mut sec = Secrets::new(FakeIo::piped(&["1234\n"]));
+        sec.read(&FIDO_PIN, Source::new(None, true)).unwrap();
+        fido_reverify_with(&sec, &dev, |d| {
+            seen.push(std::ptr::eq(d, &dev));
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen.is_empty(), "piped stdin is not a prompt");
+
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["1234"]));
+        sec.read(&FIDO_PIN, Source::NONE).unwrap();
+        fido_reverify_with(&sec, &dev, |d| {
+            seen.push(std::ptr::eq(d, &dev));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![true]);
+        let e = fido_reverify_with(&sec, &dev, |_| Err("swapped".into())).unwrap_err();
+        assert_eq!(e.to_string(), "swapped");
+    }
+
+    #[test]
+    fn always_uv_pre_pin_needs_authnr_cfg_only_to_change() {
+        let info = |opts: &[(&str, bool)]| keyroost_ctap::AuthenticatorInfo {
+            options: opts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..Default::default()
+        };
+        // Already in the wanted state: a no-op whatever authnrCfg says.
+        let set = info(&[("alwaysUv", true)]);
+        assert_eq!(
+            always_uv_pre_pin_step(&set, true).unwrap(),
+            AlwaysUvStep::AlreadySet
+        );
+        // A change needs authenticatorConfig, refused before any PIN.
+        let e = always_uv_pre_pin_step(&set, false).unwrap_err().to_string();
+        assert!(e.contains("authenticatorConfig"), "{e}");
+        let off = info(&[("alwaysUv", true), ("authnrCfg", false)]);
+        assert!(always_uv_pre_pin_step(&off, false).is_err());
+        let ok = info(&[("alwaysUv", true), ("authnrCfg", true)]);
+        assert_eq!(
+            always_uv_pre_pin_step(&ok, false).unwrap(),
+            AlwaysUvStep::Change
+        );
+        // Unreported state: refused even when authenticatorConfig is there.
+        let e = always_uv_pre_pin_step(&info(&[("authnrCfg", true)]), true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("nothing was changed"), "{e}");
     }
 
     #[test]
