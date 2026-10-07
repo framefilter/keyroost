@@ -138,6 +138,19 @@ const CASES: &[(&[&str], &str)] = &[
         &["--device", "pin-set", "fido", "pin-set"],
         "keyroostctl fido pin set",
     ),
+    (
+        &["molto", "seed", "-p", "99", "--hex-env", "S3CRETVALUE"],
+        "--slot",
+    ),
+    (
+        &["molto", "title", "--profile", "99", "S3CRETVALUE"],
+        "--slot",
+    ),
+    (
+        &["molto", "config", "--slot", "99", "--time-step", "60"],
+        "--period",
+    ),
+    (&["prog", "config", "--time-step", "60"], "--period"),
 ];
 
 #[test]

@@ -53,7 +53,7 @@ fn oath_add_digits_9_is_2_like_molto_config() {
     let (code, out, err) = run(&["oath", "add", "x", "--digits", "9"]);
     assert_eq!(code, 2, "{err}");
     assert!(out.is_empty());
-    let (code, _, _) = run(&["molto", "config", "-p", "1", "--digits", "9"]);
+    let (code, _, _) = run(&["molto", "config", "--slot", "1", "--digits", "9"]);
     assert_eq!(code, 2);
 }
 
@@ -63,10 +63,13 @@ fn value_parser_errors_name_the_value_once() {
     // reason must not repeat it.
     for (args, v) in [
         (
-            &["molto", "config", "-p", "abc", "--digits", "6"][..],
+            &["molto", "config", "--slot", "abc", "--digits", "6"][..],
             "abc",
         ),
-        (&["molto", "config", "-p", "120", "--digits", "6"], "120"),
+        (
+            &["molto", "config", "--slot", "120", "--digits", "6"],
+            "120",
+        ),
         (&["otp", "set-button-hotp", "--digits", "7"], "7"),
         (&["piv", "self-sign", "--days", "zz"], "zz"),
         (&["piv", "self-sign", "--years", "zz"], "zz"),

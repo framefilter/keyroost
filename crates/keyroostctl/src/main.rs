@@ -2015,8 +2015,9 @@ enum ProgCmd {
         reader: Option<String>,
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
         algorithm: AlgoArg,
+        /// TOTP period in seconds.
         #[arg(long, value_enum, default_value_t = StepArg::S30)]
-        time_step: StepArg,
+        period: StepArg,
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
         /// Confirm without asking (required when not run from a terminal).
@@ -2031,7 +2032,7 @@ enum ProgCmd {
 enum MoltoCmd {
     /// Print device serial number and on-device UTC time.
     Info,
-    /// List the 100 profile slots: occupancy, title, TOTP config.
+    /// List the 100 slots: occupancy, title, TOTP config.
     /// Titles and occupancy are readable by anyone holding the token —
     /// no customer key is needed (or used).
     Slots {
@@ -2039,7 +2040,7 @@ enum MoltoCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Write a TOTP seed to a profile slot, from exactly one of --hex-env /
+    /// Write a TOTP seed to a slot, from exactly one of --hex-env /
     /// --hex-stdin / --base32-env / --base32-stdin (never the command line).
     /// Hex or base32: the flag says which encoding you give (the token
     /// stores raw bytes).
@@ -2047,9 +2048,9 @@ enum MoltoCmd {
         .args(["hex_env", "base32_env", "hex_stdin", "base32_stdin"])
         .multiple(false)))]
     Seed {
-        /// Profile index 0..=99.
-        #[arg(short, long, value_parser = parse_molto_slot)]
-        profile: u8,
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
         /// Read the hex seed from the named environment variable.
         #[arg(long, value_name = "VAR")]
         hex_env: Option<String>,
@@ -2066,44 +2067,48 @@ enum MoltoCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Write a profile title (1..=12 ASCII chars), or print the current
+    /// Write a slot title (1..=12 ASCII chars), or print the current
     /// one when TITLE is omitted (reading needs no customer key).
     Title {
-        #[arg(short, long, value_parser = parse_molto_slot)]
-        profile: u8,
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
         /// New title; omit to read the slot's stored title instead.
         #[arg(value_parser = parse_molto_title)]
         title: Option<String>,
     },
-    /// Delete one profile's seed. The title, if any, survives. Keyless:
+    /// Delete one slot's seed. The title, if any, survives. Keyless:
     /// the device accepts this from any card holder (hardware-verified),
     /// so the only gate is the confirmation.
     Delete {
-        #[arg(short, long, value_parser = parse_molto_slot)]
-        profile: u8,
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
-    /// Set profile TOTP configuration (and seed the clock with the host's UTC time).
+    /// Set a slot's TOTP configuration (and seed the clock with the host's UTC time).
     Config {
-        #[arg(short, long, value_parser = parse_molto_slot)]
-        profile: u8,
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
         algorithm: AlgoArg,
         #[arg(long, value_enum, default_value_t = DigitsArg::Six)]
         digits: DigitsArg,
+        /// TOTP period in seconds.
         #[arg(long, value_enum, default_value_t = StepArg::S30)]
-        time_step: StepArg,
+        period: StepArg,
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
     },
-    /// Push the host's current UTC time to one profile (or all profiles).
+    /// Push the host's current UTC time to one slot (or all slots).
     SyncTime {
-        /// Sync only this profile (omit `--all`).
-        #[arg(short, long, conflicts_with = "all", value_parser = parse_molto_slot)]
-        profile: Option<u8>,
-        /// Sync time on every profile 0..=99.
+        /// Slot number, 0-99 (Token2 calls these profiles). Omit with `--all`.
+        #[arg(long, value_name = "SLOT", conflicts_with = "all", value_parser = parse_molto_slot)]
+        slot: Option<u8>,
+        /// Sync time on every slot 0..=99.
         #[arg(long)]
         all: bool,
     },
@@ -2129,14 +2134,15 @@ enum MoltoCmd {
         #[arg(long)]
         ascii_stdin: bool,
     },
-    /// Import an otpauth:// URI to a profile: writes seed, title, and config
+    /// Import an otpauth:// URI to a slot: writes seed, title, and config
     /// in one go. The URI comes from stdin (`-`), --uri-env VAR or a QR
     /// screenshot (--qr), never the command line; with none of them, a
     /// terminal asks for it (hidden).
     Import {
-        #[arg(short, long, value_parser = parse_molto_slot)]
-        profile: u8,
-        /// Override the profile title (default: derived from URI issuer/account).
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
+        /// Override the slot title (default: derived from URI issuer/account).
         #[arg(long, value_parser = parse_molto_title)]
         title: Option<String>,
         /// Display timeout in seconds (otpauth:// has no equivalent field).
@@ -2164,7 +2170,7 @@ enum MoltoCmd {
     ImportFile {
         /// Path to the export file. Format is auto-detected.
         path: std::path::PathBuf,
-        /// Starting profile index. Entries fill consecutive slots from here.
+        /// Starting slot. Entries fill consecutive slots from here.
         #[arg(long, default_value_t = 0, value_parser = parse_molto_slot)]
         start: u8,
         /// Display timeout to use for every imported entry.
@@ -2200,13 +2206,13 @@ enum MoltoCmd {
         /// Only useful if you've already exhausted the safe sweep.
         #[arg(long)]
         include_destructive: bool,
-        /// Profile slot to use in P2 for `authed` scans (P2 is the profile index
+        /// Slot to use in P2 for `authed` scans (P2 is the slot number
         /// for the known secure commands). Defaults to a high, presumably-unused
         /// slot.
         #[arg(long, default_value_t = 99)]
         slot: u8,
     },
-    /// Factory-reset the device. Wipes profiles and restores default customer key.
+    /// Factory-reset the device. Wipes all slots and restores default customer key.
     /// Requires physical button confirmation on the device.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
@@ -3212,9 +3218,9 @@ enum MoltoInput {
 fn parse_molto_slot(s: &str) -> Result<u8, String> {
     let n: u8 = s
         .parse()
-        .map_err(|_| "profile must be a number 0..=99".to_string())?;
+        .map_err(|_| "slot must be a number 0..=99".to_string())?;
     if n > 99 {
-        return Err("profile must be 0..=99".into());
+        return Err("slot must be 0..=99".into());
     }
     Ok(n)
 }
@@ -3773,6 +3779,26 @@ fn list_json_rows(
 /// repeats the value the user passed — clap only hands us the flag name,
 /// never its value or the next token, so there is nothing to leak here.
 const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
+    (
+        "-p",
+        &["molto"],
+        "-p/--profile was renamed --slot (Token2 calls slots profiles)",
+    ),
+    (
+        "--profile",
+        &["molto"],
+        "-p/--profile was renamed --slot (Token2 calls slots profiles)",
+    ),
+    (
+        "--time-step",
+        &["molto"],
+        "--time-step was renamed --period (same values: 30 or 60)",
+    ),
+    (
+        "--time-step",
+        &["prog"],
+        "--time-step was renamed --period (same values: 30 or 60)",
+    ),
     (
         "--key",
         &["molto"],
@@ -4533,14 +4559,10 @@ fn run_molto(
     }
 
     // Title with TITLE omitted is a read — keyless, like Info/Slots.
-    if let MoltoCmd::Title {
-        profile,
-        title: None,
-    } = cmd
-    {
+    if let MoltoCmd::Title { slot, title: None } = cmd {
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
-        let block = session.read_public_data(*profile)?;
+        let block = session.read_public_data(*slot)?;
         let title = block
             .title
             .as_deref()
@@ -4556,16 +4578,16 @@ fn run_molto(
 
     // Delete needs no auth (hardware-verified) — show what's in the slot,
     // then confirm before touching it.
-    if let MoltoCmd::Delete { profile, yes } = cmd {
+    if let MoltoCmd::Delete { slot, yes } = cmd {
         let dev = crate::target::select(Need::Molto2, exact, None)?;
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let info = session.read_info()?;
         write_info(&mut std::io::stderr(), &info)?;
-        let block = session.read_public_data(*profile)?;
+        let block = session.read_public_data(*slot)?;
         output::status(&format!(
             "slot #{}: occupied: {}, title: {}",
-            profile,
+            slot,
             if block.seed_present { "yes" } else { "no" },
             block
                 .title
@@ -4573,15 +4595,15 @@ fn run_molto(
                 .map(sanitize_terminal)
                 .unwrap_or_else(|| "(none)".into()),
         ));
-        crate::prompt::confirm_on_held(&dev, *yes, &format!("delete slot #{profile}'s seed"))?;
-        match session.delete_seed(*profile)? {
+        crate::prompt::confirm_on_held(&dev, *yes, &format!("delete slot #{slot}'s seed"))?;
+        match session.delete_seed(*slot)? {
             SeedDeleteOutcome::Deleted => {
                 println!(
                     "Seed deleted from slot #{}; the title (if any) remains.",
-                    profile
+                    slot
                 )
             }
-            SeedDeleteOutcome::AlreadyEmpty => println!("Slot #{} was already empty.", profile),
+            SeedDeleteOutcome::AlreadyEmpty => println!("Slot #{} was already empty.", slot),
         }
         return Ok(());
     }
@@ -4693,8 +4715,8 @@ fn run_molto(
     };
     // The seed slots this command writes, and whether it may skip asking.
     let writes: Option<(Vec<u8>, bool)> = match cmd {
-        MoltoCmd::Seed { profile, yes, .. } | MoltoCmd::Import { profile, yes, .. } => {
-            Some((vec![*profile], *yes))
+        MoltoCmd::Seed { slot, yes, .. } | MoltoCmd::Import { slot, yes, .. } => {
+            Some((vec![*slot], *yes))
         }
         MoltoCmd::ImportFile { start, yes, .. } => {
             let entries = bulk.as_deref().unwrap_or_default();
@@ -4746,39 +4768,39 @@ fn run_molto(
         MoltoCmd::Info => unreachable!("handled above before auth"),
         MoltoCmd::Slots { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Delete { .. } => unreachable!("handled above before auth"),
-        MoltoCmd::Seed { profile, .. } => {
+        MoltoCmd::Seed { slot, .. } => {
             let MoltoInput::Seed(seed) = &input else {
                 unreachable!("read before authentication")
             };
-            session.set_seed(*profile, seed)?;
-            println!("Seed written to slot #{}.", profile);
+            session.set_seed(*slot, seed)?;
+            println!("Seed written to slot #{}.", slot);
         }
-        MoltoCmd::Title { profile, title } => {
+        MoltoCmd::Title { slot, title } => {
             // Checked by molto_validate before the token was touched.
             let title = title
                 .as_deref()
                 .expect("title read mode is handled before auth");
-            session.set_title(*profile, title)?;
-            println!("Title set on slot #{}.", profile);
+            session.set_title(*slot, title)?;
+            println!("Title set on slot #{}.", slot);
         }
         MoltoCmd::Config {
-            profile,
+            slot,
             algorithm,
             digits,
-            time_step,
+            period,
             display_timeout,
         } => {
             let cfg = ProfileConfig {
                 display_timeout: display_timeout.to_proto(),
                 algorithm: algorithm.to_proto(),
                 digits: digits.to_proto(),
-                time_step: time_step.to_proto(),
+                time_step: period.to_proto(),
                 utc_time: unix_now(),
             };
-            session.set_config(*profile, &cfg)?;
-            println!("Slot #{} configured.", profile);
+            session.set_config(*slot, &cfg)?;
+            println!("Slot #{} configured.", slot);
         }
-        MoltoCmd::SyncTime { profile, all } => {
+        MoltoCmd::SyncTime { slot, all } => {
             if *all {
                 for p in 0..=99u8 {
                     match session.sync_time(p, unix_now()) {
@@ -4786,11 +4808,11 @@ fn run_molto(
                         Err(e) => output::warn(&format!("time sync failed on slot #{p}: {e}")),
                     }
                 }
-            } else if let Some(p) = profile {
+            } else if let Some(p) = slot {
                 session.sync_time(*p, unix_now())?;
                 println!("Time synced on slot #{}.", p);
             } else {
-                return Err("sync-time requires --profile <N> or --all".into());
+                return Err("sync-time requires --slot <N> or --all".into());
             }
         }
         MoltoCmd::CustomerKey { .. } => {
@@ -4803,7 +4825,7 @@ fn run_molto(
             );
         }
         MoltoCmd::Import {
-            profile,
+            slot,
             display_timeout,
             qr,
             ..
@@ -4815,16 +4837,16 @@ fn run_molto(
             else {
                 unreachable!("read before authentication")
             };
-            session.set_seed(*profile, &entry.secret)?;
-            session.set_title(*profile, final_title)?;
+            session.set_seed(*slot, &entry.secret)?;
+            session.set_title(*slot, final_title)?;
             session.set_config(
-                *profile,
+                *slot,
                 &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
             )?;
             println!(
                 "Imported {:?} to slot #{} ({} bytes secret, {:?}, {} digits).",
                 final_title,
-                profile,
+                slot,
                 entry.secret.len(),
                 entry.algorithm,
                 entry.digits as u8
@@ -4973,7 +4995,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         ProgCmd::Config {
             reader,
             algorithm,
-            time_step,
+            period,
             display_timeout,
             yes,
         } => {
@@ -5005,7 +5027,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     AlgoArg::Sha1 => prog::HmacAlgo::Sha1,
                     AlgoArg::Sha256 => prog::HmacAlgo::Sha256,
                 },
-                time_step: match time_step {
+                time_step: match period {
                     StepArg::S30 => prog::TimeStep::Seconds30,
                     StepArg::S60 => prog::TimeStep::Seconds60,
                 },
@@ -12522,8 +12544,24 @@ mod cli_tests {
     #[test]
     fn token2_secrets_are_not_accepted_on_the_command_line() {
         for args in [
-            &["keyroostctl", "molto", "seed", "-p", "99", "--hex", "00"][..],
-            &["keyroostctl", "molto", "seed", "-p", "99", "--base32", "X"],
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "--slot",
+                "99",
+                "--hex",
+                "00",
+            ][..],
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "--slot",
+                "99",
+                "--base32",
+                "X",
+            ],
             &["keyroostctl", "prog", "seed", "--hex", "00"],
             &["keyroostctl", "prog", "seed", "--base32", "X"],
             &["keyroostctl", "molto", "customer-key", "--ascii", "x"],
@@ -12549,7 +12587,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
-                "-p",
+                "--slot",
                 "99",
                 "--hex-stdin",
                 "--base32-env",
@@ -12575,7 +12613,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "import",
-                "-p",
+                "--slot",
                 "1",
                 "--uri-env",
                 "V",
@@ -12585,7 +12623,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "import",
-                "-p",
+                "--slot",
                 "1",
                 "--uri-env",
                 "V",
@@ -12615,7 +12653,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "import",
-            "-p",
+            "--slot",
             "1",
             "--uri-env",
             "V",
@@ -12782,24 +12820,38 @@ mod cli_tests {
                 .to_string()
         };
         assert_eq!(
-            err(&["keyroostctl", "molto", "seed", "-p", "99"]),
+            err(&["keyroostctl", "molto", "seed", "--slot", "99"]),
             "no seed given: pass --hex-env VAR, --hex-stdin, --base32-env VAR or --base32-stdin"
         );
         // Range checks are clap value parsers now: they fail at parse time.
         let parse_err = |args: &[&str]| parse(args).err().expect("must refuse").to_string();
-        let e = parse_err(&["keyroostctl", "molto", "seed", "-p", "100", "--hex-stdin"]);
-        assert!(e.contains("profile must be 0..=99"), "{e}");
-        let e = parse_err(&["keyroostctl", "molto", "title", "-p", "1", "thirteen-chars"]);
+        let e = parse_err(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--slot",
+            "100",
+            "--hex-stdin",
+        ]);
+        assert!(e.contains("slot must be 0..=99"), "{e}");
+        let e = parse_err(&[
+            "keyroostctl",
+            "molto",
+            "title",
+            "--slot",
+            "1",
+            "thirteen-chars",
+        ]);
         assert!(e.contains("title must be 1..=12 bytes"), "{e}");
         assert_eq!(
-            err(&["keyroostctl", "molto", "import", "-p", "1"]),
+            err(&["keyroostctl", "molto", "import", "--slot", "1"]),
             "no otpauth:// URI given: pass `-` to read it from stdin, --uri-env VAR or --qr IMAGE"
         );
         let e = parse_err(&[
             "keyroostctl",
             "molto",
             "import",
-            "-p",
+            "--slot",
             "1",
             "--title",
             "thirteen-chars",
@@ -12812,7 +12864,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "import",
-                "-p",
+                "--slot",
                 "1",
                 "otpauth://totp/x?secret=JBSWY3DP"
             ]),
@@ -12831,21 +12883,36 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
-                "-p",
+                "--slot",
                 "99",
                 "--base32-env",
                 "V",
             ][..],
-            &["keyroostctl", "molto", "import", "-p", "1", "-"],
-            &["keyroostctl", "molto", "import", "-p", "1", "--qr", "f.png"],
-            &["keyroostctl", "molto", "title", "-p", "1", "twelve-chars"],
-            &["keyroostctl", "molto", "config", "-p", "99"],
+            &["keyroostctl", "molto", "import", "--slot", "1", "-"],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--slot",
+                "1",
+                "--qr",
+                "f.png",
+            ],
+            &[
+                "keyroostctl",
+                "molto",
+                "title",
+                "--slot",
+                "1",
+                "twelve-chars",
+            ],
+            &["keyroostctl", "molto", "config", "--slot", "99"],
         ] {
             molto_validate(&molto_cmd(args), &sec).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
         let term = Secrets::new(FakeIo::terminal());
         molto_validate(
-            &molto_cmd(&["keyroostctl", "molto", "import", "-p", "1"]),
+            &molto_cmd(&["keyroostctl", "molto", "import", "--slot", "1"]),
             &term,
         )
         .unwrap();
@@ -12857,7 +12924,7 @@ mod cli_tests {
         // A seed over 63 bytes is refused once read.
         let long = format!("{}\n", "00".repeat(64));
         let mut sec = Secrets::new(FakeIo::piped(&[&long]));
-        let cmd = molto_cmd(&["keyroostctl", "molto", "seed", "-p", "1", "--hex-stdin"]);
+        let cmd = molto_cmd(&["keyroostctl", "molto", "seed", "--slot", "1", "--hex-stdin"]);
         let e = read_molto_input(&mut sec, &cmd).err().expect("too long");
         assert_eq!(e.to_string(), "seed must be 1..=63 bytes, got 64");
         let mut sec = Secrets::new(FakeIo::piped(&["0102\n"]));
@@ -12866,7 +12933,7 @@ mod cli_tests {
             _ => panic!("expected a seed"),
         }
         // An import's title is settled before authentication.
-        let cmd = molto_cmd(&["keyroostctl", "molto", "import", "-p", "1", "-"]);
+        let cmd = molto_cmd(&["keyroostctl", "molto", "import", "--slot", "1", "-"]);
         let mut sec = Secrets::new(FakeIo::piped(&["otpauth://totp/?secret=JBSWY3DP\n"]));
         let e = read_molto_input(&mut sec, &cmd).err().expect("no title");
         assert!(e.to_string().contains("must be 1..=12 bytes"), "{e}");
@@ -12880,7 +12947,7 @@ mod cli_tests {
         }
         // Commands with no secret read nothing.
         let mut sec = Secrets::new(FakeIo::terminal());
-        let cmd = molto_cmd(&["keyroostctl", "molto", "config", "-p", "1"]);
+        let cmd = molto_cmd(&["keyroostctl", "molto", "config", "--slot", "1"]);
         assert!(matches!(
             read_molto_input(&mut sec, &cmd).unwrap(),
             MoltoInput::Nothing
@@ -12991,7 +13058,7 @@ mod cli_tests {
                     "keyroostctl",
                     "molto",
                     "import",
-                    "-p",
+                    "--slot",
                     "99",
                     "-",
                     "otpauth://totp/x?secret=S3CRET",
@@ -13003,7 +13070,7 @@ mod cli_tests {
                     "keyroostctl",
                     "molto",
                     "seed",
-                    "-p",
+                    "--slot",
                     "99",
                     "--hex-stdin",
                     "S3CRET",
@@ -13045,14 +13112,22 @@ mod cli_tests {
         }
         // A misspelled flag keeps clap's message (it names only the flag),
         // and a command without a secret flag keeps clap's message too.
-        assert!(redacted(&["keyroostctl", "molto", "seed", "-p", "99", "--hexx-stdin"]).is_none());
+        assert!(redacted(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--slot",
+            "99",
+            "--hexx-stdin"
+        ])
+        .is_none());
         assert!(redacted(&["keyroostctl", "list", "extra"]).is_none());
         // A retired flag still gets its replacement hint.
         assert!(redacted(&[
             "keyroostctl",
             "molto",
             "seed",
-            "-p",
+            "--slot",
             "99",
             "--hex",
             "S3CRET"
@@ -13078,7 +13153,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
-                "-p",
+                "--slot",
                 "99",
                 "--hex-stdin=S3CRET",
             ][..],
@@ -15296,17 +15371,34 @@ mod cli_tests {
     }
 
     #[test]
+    fn molto_help_says_slot() {
+        use clap::CommandFactory;
+        fn texts(c: &clap::Command, out: &mut Vec<String>) {
+            out.extend(c.get_about().map(|s| s.to_string()));
+            out.extend(c.get_long_about().map(|s| s.to_string()));
+            for a in c.get_arguments() {
+                out.extend(a.get_help().map(|s| s.to_string()));
+                out.extend(a.get_long_help().map(|s| s.to_string()));
+            }
+            for s in c.get_subcommands() {
+                texts(s, out);
+            }
+        }
+        let root = Cli::command();
+        let mut all = Vec::new();
+        texts(root.find_subcommand("molto").unwrap(), &mut all);
+        for t in all {
+            let t = t
+                .replace("Token2 calls these profiles", "")
+                .replace("Token2 calls slots profiles", "");
+            assert!(!t.to_lowercase().contains("profile"), "{t}");
+        }
+    }
+
+    #[test]
     fn molto_is_nested() {
         assert!(parse(&["keyroostctl", "molto", "info"]).is_ok());
-        assert!(parse(&[
-            "keyroostctl",
-            "molto",
-            "seed",
-            "--profile",
-            "0",
-            "--hex-stdin"
-        ])
-        .is_ok());
+        assert!(parse(&["keyroostctl", "molto", "seed", "--slot", "0", "--hex-stdin"]).is_ok());
         assert!(parse(&["keyroostctl", "molto", "reset", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "molto", "probe", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "set-seed", "--profile", "0", "--hex-stdin"]).is_err());
@@ -15442,8 +15534,15 @@ mod cli_tests {
                 "--puk-tries",
                 "3",
             ],
-            &["keyroostctl", "molto", "title", "-p", "100"],
-            &["keyroostctl", "molto", "title", "-p", "1", "THIRTEEN-LONG"],
+            &["keyroostctl", "molto", "title", "--slot", "100"],
+            &[
+                "keyroostctl",
+                "molto",
+                "title",
+                "--slot",
+                "1",
+                "THIRTEEN-LONG",
+            ],
             &["keyroostctl", "piv", "new-chuid", "--guid", "zz"],
             &[
                 "keyroostctl",
@@ -17608,8 +17707,15 @@ mod cli_tests {
                 "--template-id",
                 "00",
             ],
-            &["keyroostctl", "molto", "seed", "-p", "99", "--hex-stdin"],
-            &["keyroostctl", "molto", "import", "-p", "99", "-"],
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "--slot",
+                "99",
+                "--hex-stdin",
+            ],
+            &["keyroostctl", "molto", "import", "--slot", "99", "-"],
             &["keyroostctl", "molto", "import-file", "f.json"],
             &["keyroostctl", "prog", "seed", "--hex-stdin"],
             &["keyroostctl", "prog", "config"],

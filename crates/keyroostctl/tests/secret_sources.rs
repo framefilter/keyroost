@@ -28,11 +28,11 @@ fn retired_secret_flags_name_their_replacement() {
             "--key-ascii-env VAR",
         ),
         (
-            &["molto", "seed", "-p", "99", "--hex", "S3CRETVALUE"],
+            &["molto", "seed", "--slot", "99", "--hex", "S3CRETVALUE"],
             "--hex-env VAR or --hex-stdin",
         ),
         (
-            &["molto", "seed", "-p", "99", "--base32=S3CRETVALUE"],
+            &["molto", "seed", "--slot", "99", "--base32=S3CRETVALUE"],
             "--base32-env VAR or --base32-stdin",
         ),
         (
@@ -64,7 +64,7 @@ fn retired_secret_flags_name_their_replacement() {
     let (code, err) = run(&[
         "molto",
         "import",
-        "-p",
+        "--slot",
         "99",
         "otpauth://totp/x?secret=S3CRETVALUE",
         "--yes",
@@ -87,7 +87,7 @@ fn a_stray_value_on_a_secret_command_is_not_repeated() {
             &[
                 "molto",
                 "import",
-                "-p",
+                "--slot",
                 "99",
                 "-",
                 "otpauth://totp/x?secret=S3CRET",
@@ -95,7 +95,7 @@ fn a_stray_value_on_a_secret_command_is_not_repeated() {
             "see `keyroostctl molto import --help`",
         ),
         (
-            &["molto", "seed", "-p", "99", "--hex-stdin", "S3CRET"],
+            &["molto", "seed", "--slot", "99", "--hex-stdin", "S3CRET"],
             "see `keyroostctl molto seed --help`",
         ),
     ] {
@@ -117,7 +117,7 @@ fn a_stray_value_on_a_secret_command_is_not_repeated() {
 #[test]
 fn a_stdin_flag_given_a_value_is_not_repeated() {
     for args in [
-        &["molto", "seed", "-p", "99", "--hex-stdin=S3CRET"][..],
+        &["molto", "seed", "--slot", "99", "--hex-stdin=S3CRET"][..],
         &[
             "piv",
             "change-pin",
