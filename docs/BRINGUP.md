@@ -63,15 +63,15 @@ keyroostctl --debug molto info
 **Expected stderr** (something like — the actual hex is device-dependent):
 
 ```
-> get info (serial + time) >> 80 41 00 00 00
-< get info (serial + time) << XX XX XX 08 41 42 43 44 45 46 47 48 XX XX 65 4F 12 34 90 00
+> get info (serial + time)  80 41 00 00 00
+< get info (serial + time)  XX XX XX 08 41 42 43 44 45 46 47 48 XX XX 65 4F 12 34 90 00
 ```
 
 …followed by the parsed output on stdout:
 
 ```
-device serial: ABCDEFGH
-device UTC:    1699999284 (epoch)
+Serial:     ABCDEFGH
+Device UTC: 1699999284 (epoch)
 ```
 
 **Checks:**
@@ -90,7 +90,7 @@ keyroost uses that factory default, so nothing needs to be passed:
 keyroostctl --debug molto title --profile 99 "MOLTO_TEST"
 ```
 
-This will print four `>` / `<` lines on stderr — `get info`, `get challenge`, `answer challenge`, then `set title` — and end with "title set on profile #99".
+This will print a `>` / `<` pair on stderr for each of `get info`, `get challenge`, `answer challenge`, then `set title`, along with the serial, the device clock and "Authenticated.", and end with "Title set on slot #99." on stdout.
 
 **Checks:**
 1. `get challenge` response: 8 random bytes plus `90 00`.
