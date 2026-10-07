@@ -74,6 +74,10 @@
       for the secret at a hidden prompt, except for the Molto2 seed and
       key commands, which need a flag to choose the encoding (see
       <a href="#v0-13-0-secrets">secrets</a> below).
+      Output is more consistent too: stdout carries only the result,
+      <code>--json</code> always prints one object with every field present,
+      and <code>piv export-cert</code> prints PEM (see
+      <a href="#v0-13-0-output">output and JSON</a> below).
       Library consumers: <code>keyroost-resolve</code> drops its HID-only
       name resolver for the shared device model.</p>
     <h3>CLI</h3>
@@ -159,8 +163,9 @@
       <tr><td><code>list</code> had no numbers and no JSON</td>
         <td>Each key has a number (usable as <code>--device N</code>; it
           can change when keys are added or removed, so scripts should use
-          a name or serial). <code>list --json</code> prints one row per
-          key with the exact <code>--device</code> value; <code>list
+          a name or serial). <code>list --json</code> prints
+          <code>{"keys": [...]}</code>, one row per key with the exact
+          <code>--device</code> value; <code>list
           --device X</code> shows just that key.</td></tr>
       <tr><td><code>piv self-sign</code> / <code>request-cert</code> without
           <code>--key-usage</code> wrote no key usage</td>
@@ -244,6 +249,107 @@
     <p>In Git Bash (mintty) on Windows the hidden prompt needs a real
       console: run <code>winpty keyroostctl …</code>, or pass the secret
       with an <code>-env</code> flag.</p>
+    <h3 id="v0-13-0-output">CLI: output and JSON</h3>
+    <p>stdout now carries only a command's result; prompts, progress and
+      notes go to stderr, so <code>keyroostctl molto slots &gt;
+      slots.txt</code> saves just the table. With <code>--json</code>, a
+      command prints one object, lists sit under a named key, and every
+      field is present (<code>null</code> when unknown). Key order is not
+      part of the shape.</p>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>keyroostctl --json</code> (the overview) printed a bare
+          array</td>
+        <td><code>{"keys": [...]}</code> (<code>list --json</code>, new in
+          this release, has the same shape)</td></tr>
+      <tr><td><code>oath list --json</code> and <code>otp list --json</code>
+          printed a bare array</td>
+        <td><code>{"accounts": [...]}</code></td></tr>
+      <tr><td>Overview: <code>caps</code>, <code>caps_unverified</code></td>
+        <td><code>capabilities</code>,
+          <code>capabilities_unverified</code></td></tr>
+      <tr><td><code>molto info</code>: <code>utc</code></td>
+        <td><code>utc_time</code></td></tr>
+      <tr><td><code>molto slots</code>: <code>algorithm</code> as a code
+          (<code>1</code>, <code>2</code>), <code>time_step</code>,
+          <code>digits</code></td>
+        <td><code>algorithm</code> is <code>"sha1"</code> or
+          <code>"sha256"</code>; <code>time_step</code> is now
+          <code>period</code> (<code>null</code> when 0); <code>algorithm</code>
+          and <code>digits</code> are <code>null</code> for a code keyroost
+          doesn't know</td></tr>
+      <tr><td><code>piv status</code> <code>slots[].slot</code> and
+          <code>piv test</code> <code>slot</code>:
+          <code>"authentication (9A)"</code></td>
+        <td><code>slot</code> is the <code>--slot</code> value
+          (<code>"9a"</code>); the old text is in the new
+          <code>slot_name</code></td></tr>
+      <tr><td><code>openpgp status</code>: <code>serial</code> as a number;
+          <code>pin_retries_pw1</code>, <code>pin_retries_rc</code>,
+          <code>pin_retries_pw3</code></td>
+        <td><code>serial</code> is a decimal string;
+          <code>user_pin_retries</code>, <code>reset_code_retries</code>,
+          <code>admin_pin_retries</code></td></tr>
+      <tr><td><code>otp pin-status</code>: <code>retries_left</code>,
+          <code>max_retries</code></td>
+        <td><code>pin_retries</code>, <code>pin_retries_max</code></td></tr>
+      <tr><td><code>oath list</code>: <code>oath_type</code>;
+          <code>otp list</code>: <code>otp_type</code></td>
+        <td><code>type</code></td></tr>
+      <tr><td><code>fido large-blob list</code> / <code>get</code>:
+          <code>ssh_cert.serial</code> as a number</td>
+        <td>A decimal string (a 64-bit serial doesn't fit every JSON
+          reader's numbers)</td></tr>
+      <tr><td>Fields left out when unknown: <code>molto slots</code>
+          <code>title</code>; <code>prog info</code> <code>model</code>;
+          <code>fido info</code> <code>ctap2</code>,
+          <code>max_msg_size</code>, <code>min_pin_length</code>,
+          <code>force_pin_change</code>, <code>firmware_version</code>;
+          <code>piv status</code> <code>cert_unreadable</code> and
+          <code>cert_compressed</code> (left out when false);
+          <code>piv test</code> <code>detail</code>; <code>openpgp
+          status</code> <code>serial</code>, <code>fingerprint_sig</code>,
+          <code>fingerprint_dec</code>, <code>fingerprint_aut</code>;
+          <code>otp pin-status</code> <code>pin_set</code> and the retry
+          counts; <code>fido creds-list</code> <code>rp_name</code>,
+          <code>user_name</code>, <code>user_display_name</code>,
+          <code>algorithm</code>, <code>algorithm_name</code>; <code>fido
+          large-blob list</code> / <code>get</code> <code>text</code>,
+          <code>ssh_cert</code></td>
+        <td>Always present: <code>null</code> when unknown
+          (<code>cert_compressed</code> is always <code>true</code> or
+          <code>false</code>)</td></tr>
+      <tr><td>On stdout: the Molto2 serial and UTC lines (on every
+          <code>molto</code> command), "authenticated" and the button
+          prompts; <code>fido fingerprint-enroll</code> progress and the
+          reader power-cycle line; the "Wrote" lines of <code>fido ssh-cert
+          extract</code> and <code>fido large-blob export</code>;
+          <code>openpgp generate</code> / <code>import</code> progress; the
+          PIV compressed-certificate note</td>
+        <td>On stderr. <code>molto info</code> still prints the serial and
+          UTC on stdout, since they are its result.</td></tr>
+      <tr><td><code>piv export-cert</code> wrote DER, and refused to write
+          it to a terminal</td>
+        <td>Writes PEM, so <code>keyroostctl piv export-cert --slot
+          9a</code> at a terminal prints the certificate. Add <code>--format
+          der</code> for the old bytes.</td></tr>
+      <tr><td>Some out-of-range values (<code>oath add --digits 9</code>,
+          <code>piv set-retries --pin-tries 0</code>) exited 1</td>
+        <td>Exit 2, like any other usage error</td></tr>
+      <tr><td><code>--debug</code> showed nothing for FIDO over USB
+          (<code>KEYROOST_CTAP_DEBUG</code> did)</td>
+        <td><code>--debug</code> traces FIDO over USB, not FIDO through a
+          smart-card reader; the variable still works. FIDO PIN exchanges
+          (clientPIN, authenticatorConfig) are hidden except the retry count
+          and key agreement, like PIV and OpenPGP PIN checks. Every group
+          uses one line format; it is for people and may change.</td></tr>
+      <tr><td>Messages mixed styles: <code>WARNING:</code> /
+          <code>Note:</code>, "profile #N" in Molto2 messages</td>
+        <td><code>warning:</code> / <code>note:</code>, sentences, and
+          "slot #N" (<code>Seed written to slot #5.</code>)</td></tr>
+    </table>
+    </div>
     <h3>Library (crates.io) API changes</h3>
     <div class="kr-table-wrap">
     <table class="kr-table">
@@ -273,6 +379,12 @@
           <code>ctaphid_vendor_read</code>, <code>ccid_applet_read</code>,
           <code>token2_serial_reply_hid</code>) and
           <code>PivSession::metadata_status</code>.</td></tr>
+      <tr><td><code>keyroost-proto</code>, <code>keyroost-ctap</code></td>
+        <td>New, additive: the <code>keyroost_proto::trace</code> module (the
+          shared <code>--debug</code> line format) and
+          <code>keyroost_ctap::set_trace</code> (turns the CTAP trace on
+          without the environment variable). Nothing existing
+          changes.</td></tr>
     </table>
     </div>
   </section>
