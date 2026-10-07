@@ -48,9 +48,9 @@ struct Cli {
     /// List available PC/SC readers and exit.
     #[arg(long, global = true)]
     list_readers: bool,
-    /// Print every message sent to and received from the key (APDUs and FIDO
-    /// CTAP) to stderr. The format is for people and may change between
-    /// releases.
+    /// Print every message sent to and received from the key to stderr (APDUs,
+    /// and FIDO CTAP over USB; not FIDO through a smart-card reader). The
+    /// format is for people and may change between releases.
     #[arg(long, global = true)]
     debug: bool,
     /// Target a key by friendly name, serial, or `list` number (prefix name:,

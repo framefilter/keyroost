@@ -321,7 +321,8 @@ fn pcsc_note(debug: bool, body: &str) {
     crate::trace::line(debug, || format_line(Dir::Note, &otp_label("PCSC"), body));
 }
 
-/// Print one debug-trace line to stderr when `debug` is on. Every byte dump
+/// Record one debug-trace line: to stderr when `debug` is on, and to an
+/// active GUI capture (see `crate::trace`) either way. Every byte dump
 /// in this module — both transports, both directions — must go through here
 /// so the redaction policy in [`trace_line`] cannot drift per call site.
 fn trace_bytes(
@@ -332,12 +333,9 @@ fn trace_bytes(
     bytes: &[u8],
     sensitive: bool,
 ) {
-    if debug {
-        eprintln!(
-            "{}",
-            trace_line(dir, transport, qualifier, bytes, sensitive)
-        );
-    }
+    crate::trace::line(debug, || {
+        trace_line(dir, transport, qualifier, bytes, sensitive)
+    });
 }
 
 // The `6C xx` ("wrong Le") retry classifier lives in `keyroost_proto::apdu`
@@ -559,16 +557,14 @@ impl OtpTransport for HidOtpTransport {
         let (data, sw) = asm
             .into_response()
             .ok_or(OtpTransportError::EmptyResponse)?;
-        if self.debug {
-            trace_bytes(
-                true,
-                Dir::Received,
-                "HID",
-                &format!("parsed sw={sw:#06x}"),
-                &data,
-                self.resp_sensitive,
-            );
-        }
+        trace_bytes(
+            self.debug,
+            Dir::Received,
+            "HID",
+            &format!("parsed sw={sw:#06x}"),
+            &data,
+            self.resp_sensitive,
+        );
         trace_bytes(
             self.debug,
             Dir::Received,
@@ -1965,6 +1961,24 @@ mod trace_redaction_tests {
         // The PIN-flag read and the ECDH agreement are not PIN material.
         assert!(!request_is_sensitive(&cmd::READ_OTP_PIN_FLAG));
         assert!(!request_is_sensitive(&cmd::READ_AGREEMENT_PUBKEY));
+    }
+
+    #[test]
+    fn trace_bytes_reaches_the_gui_capture_still_redacted() {
+        use super::{trace_bytes, Dir};
+        let secret = [0xDE, 0xAD, 0xBE, 0xEF];
+        crate::trace::begin();
+        // debug off: nothing on stderr, but an active capture still records.
+        trace_bytes(false, Dir::Sent, "PCSC", "", &secret, true);
+        trace_bytes(false, Dir::Received, "HID", "raw-frame", &secret, false);
+        let lines = crate::trace::take().unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "> otp pcsc              <4 bytes redacted>".to_string(),
+                "< otp hid               raw-frame deadbeef".to_string(),
+            ]
+        );
     }
 
     #[test]

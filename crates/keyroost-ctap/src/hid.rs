@@ -714,9 +714,9 @@ fn ctap_line(dir: Dir, cmd: u8, len: usize, payload: &str) -> String {
     )
 }
 
-/// True when a CTAPHID CBOR exchange carries personal data that must be
-/// redacted from the opt-in trace — in **both** directions, because requests
-/// carry the same material the responses enumerate:
+/// True when a CTAPHID CBOR exchange carries personal data or PIN material
+/// that must be redacted from the opt-in trace — in **both** directions,
+/// because requests carry the same material the responses enumerate:
 /// - authenticatorCredentialManagement (`0x0A`, preview `0x41`): responses
 ///   enumerate RP IDs and user names; `updateUserInformation` requests carry
 ///   the replacement user entity;
@@ -726,17 +726,41 @@ fn ctap_line(dir: Dir, cmd: u8, len: usize, payload: &str) -> String {
 /// - authenticatorLargeBlobs (`0x0C`): reads return the serialized array,
 ///   which includes keyroost's own plaintext notes (see
 ///   `large_blobs::LargeBlobEntry::from_text` — explicitly NOT encryption),
-///   and writes carry the same bytes out.
+///   and writes carry the same bytes out;
+/// - authenticatorClientPIN (`0x06`): every subcommand except getRetries
+///   (`0x01`) and getKeyAgreement (`0x02`) carries PIN-derived ciphertext
+///   (pinHashEnc, newPinEnc) or returns the encrypted pinUvAuthToken. These
+///   are ciphertexts under an ephemeral ECDH secret the trace never shows,
+///   but they are withheld anyway, the way PIN VERIFY is on the APDU path;
+/// - authenticatorConfig (`0x0D`): every subcommand carries a
+///   pinUvAuthParam.
 ///
-/// (PIN material in other commands is ciphertext under the ECDH session key,
-/// not recoverable from the trace.) Add every future personal-data-bearing
-/// CTAP2 command here, not at the trace call sites.
+/// Add every future personal-data- or PIN-bearing CTAP2 command here, not at
+/// the trace call sites.
 fn exchange_is_sensitive(cmd: u8, payload: &[u8]) -> bool {
-    cmd == CTAPHID_CBOR
-        && matches!(
-            payload.first(),
-            Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40) | Some(0x0C)
-        )
+    if cmd != CTAPHID_CBOR {
+        return false;
+    }
+    match payload.first() {
+        Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40) | Some(0x0C) | Some(0x0D) => true,
+        Some(0x06) => !matches!(
+            client_pin_subcommand(&payload[1..]),
+            Some(0x01) | Some(0x02)
+        ),
+        _ => false,
+    }
+}
+
+/// The clientPIN subcommand (map key `0x02`) of a request body, or `None`
+/// when the body does not decode as a map carrying one — which the caller
+/// treats as sensitive (fail closed).
+fn client_pin_subcommand(body: &[u8]) -> Option<u64> {
+    let (value, _) = crate::cbor::decode(body).ok()?;
+    value
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_uint() == Some(0x02))
+        .and_then(|(_, v)| v.as_uint())
 }
 
 /// The payload portion of one trace line: full hex normally, a redaction
@@ -1182,12 +1206,64 @@ mod tests {
                 "CBOR cmd 0x{cbor_cmd:02x} must be redacted"
             );
         }
-        // getInfo / clientPIN traces stay visible (PIN material is ciphertext).
+        // getInfo stays visible.
         assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[0x04]));
-        assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[0x06]));
         // Non-CBOR frames (INIT, PING) are never redacted.
         assert!(!exchange_is_sensitive(CTAPHID_INIT, &[0x0A]));
         assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[]));
+    }
+
+    #[test]
+    fn trace_redacts_client_pin_except_retries_and_key_agreement() {
+        // clientPIN carries PIN-derived ciphertext (pinHashEnc, newPinEnc)
+        // and the encrypted pinUvAuthToken; like PIN VERIFY on the APDU
+        // path, those exchanges are withheld. getRetries and
+        // getKeyAgreement carry no PIN material and stay visible.
+        // {1: 2, 2: sub}
+        let req = |sub: u8| vec![0x06, 0xA2, 0x01, 0x02, 0x02, sub];
+        assert!(
+            !exchange_is_sensitive(CTAPHID_CBOR, &req(0x01)),
+            "getRetries"
+        );
+        assert!(
+            !exchange_is_sensitive(CTAPHID_CBOR, &req(0x02)),
+            "getKeyAgreement"
+        );
+        for sub in [0x03, 0x04, 0x05, 0x06, 0x07, 0x09] {
+            assert!(
+                exchange_is_sensitive(CTAPHID_CBOR, &req(sub)),
+                "clientPIN subcommand 0x{sub:02x} must be redacted"
+            );
+        }
+        // A changePIN with its encrypted fields still classifies by the
+        // subcommand: {1: 2, 2: 4, 6: h'deadbeef'}.
+        let change = [
+            0x06, 0xA3, 0x01, 0x02, 0x02, 0x04, 0x06, 0x44, 0xDE, 0xAD, 0xBE, 0xEF,
+        ];
+        assert!(exchange_is_sensitive(CTAPHID_CBOR, &change));
+        let line = ctap_line(
+            Dir::Sent,
+            CTAPHID_CBOR,
+            change.len(),
+            &trace_payload(&change, true),
+        );
+        assert!(!line.contains("deadbeef"), "{line}");
+        // Unparseable or subcommand-less clientPIN fails closed.
+        assert!(exchange_is_sensitive(CTAPHID_CBOR, &[0x06]));
+        assert!(exchange_is_sensitive(CTAPHID_CBOR, &[0x06, 0xFF]));
+        assert!(exchange_is_sensitive(
+            CTAPHID_CBOR,
+            &[0x06, 0xA1, 0x01, 0x02]
+        ));
+    }
+
+    #[test]
+    fn trace_redacts_authenticator_config() {
+        // authenticatorConfig carries a pinUvAuthParam on every subcommand.
+        assert!(exchange_is_sensitive(
+            CTAPHID_CBOR,
+            &[0x0D, 0xA1, 0x01, 0x03]
+        ));
     }
 
     #[test]
