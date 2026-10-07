@@ -1258,9 +1258,13 @@ enum PivCmd {
     SetRetries {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
-        #[arg(long, value_name = "N")]
+        /// PIN retry count, at least 1: a zero count would leave the PIN
+        /// permanently blocked.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
         pin_tries: u8,
-        #[arg(long, value_name = "N")]
+        /// PUK retry count, at least 1: a zero count would leave the PUK
+        /// permanently blocked.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
         puk_tries: u8,
         /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
@@ -1529,18 +1533,18 @@ enum PivCmd {
         /// `--months`/`--days` — the same month and day as today, that many
         /// years later (a Feb 29 clamps to Feb 28 in a target year that
         /// isn't a leap year).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_valid_years)]
         years: Option<u32>,
         /// Validity period in whole calendar months, added on top of
         /// `--years` (if given) before `--days` — the same day of month as
         /// that point, that many months later (e.g. Jan 31 + 1 month clamps
         /// to Feb 28/29, the month's last day).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_valid_months)]
         months: Option<u32>,
         /// Validity period in days, starting now. Combines with `--years`/
         /// `--months` (e.g. `--years 1 --days 5` is 1 year and 5 additional
         /// days from now); defaults to 1 year if none of the three is given.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_valid_days)]
         days: Option<u32>,
         /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -1623,22 +1627,22 @@ enum PivCmd {
         /// before `--months`/`--days` — the same month and day as today,
         /// that many years later (a Feb 29 clamps to Feb 28 in a target
         /// year that isn't a leap year). Informational only.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_valid_years)]
         years: Option<u32>,
         /// CHUID expiration, in whole calendar months, added on top of
         /// `--years` (if given) before `--days` — the same day of month as
         /// that point, that many months later (e.g. Jan 31 + 1 month clamps
         /// to Feb 28/29, the month's last day). Informational only.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_valid_months)]
         months: Option<u32>,
         /// CHUID expiration, in days from now. Informational only — it has no
         /// technical implications. Combines with `--years`/`--months` (e.g.
         /// `--years 1 --days 5` is 1 year and 5 additional days from now);
         /// same default as self-sign's certificate validity.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_valid_days)]
         days: Option<u32>,
         /// GUID, hex (dashes optional). Omit to use random GUID.
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", value_parser = parse_guid_arg)]
         guid: Option<String>,
     },
     /// Reset the PIV application to factory defaults: Wipes all keys, certs,
@@ -2311,7 +2315,7 @@ enum OathCmd {
         #[arg(long, value_enum, default_value_t = OathAlgoArg::Sha1)]
         algorithm: OathAlgoArg,
         /// OTP digit count (6, 7, or 8).
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(6..=8))]
         digits: u8,
         /// Initial counter (moving factor) for HOTP credentials. Ignored for TOTP.
         #[arg(long, default_value_t = 0)]
@@ -2456,7 +2460,7 @@ enum MoltoCmd {
         .multiple(false)))]
     Seed {
         /// Profile index 0..=99.
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_molto_slot)]
         profile: u8,
         /// Read the hex seed from the named environment variable.
         #[arg(long, value_name = "VAR")]
@@ -2477,16 +2481,17 @@ enum MoltoCmd {
     /// Write a profile title (1..=12 ASCII chars), or print the current
     /// one when TITLE is omitted (reading needs no customer key).
     Title {
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_molto_slot)]
         profile: u8,
         /// New title; omit to read the slot's stored title instead.
+        #[arg(value_parser = parse_molto_title)]
         title: Option<String>,
     },
     /// Delete one profile's seed. The title, if any, survives. Keyless:
     /// the device accepts this from any card holder (hardware-verified),
     /// so the only gate is the confirmation.
     Delete {
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_molto_slot)]
         profile: u8,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -2494,7 +2499,7 @@ enum MoltoCmd {
     },
     /// Set profile TOTP configuration (and seed the clock with the host's UTC time).
     Config {
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_molto_slot)]
         profile: u8,
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
         algorithm: AlgoArg,
@@ -2508,7 +2513,7 @@ enum MoltoCmd {
     /// Push the host's current UTC time to one profile (or all profiles).
     SyncTime {
         /// Sync only this profile (omit `--all`).
-        #[arg(short, long, conflicts_with = "all")]
+        #[arg(short, long, conflicts_with = "all", value_parser = parse_molto_slot)]
         profile: Option<u8>,
         /// Sync time on every profile 0..=99.
         #[arg(long)]
@@ -2541,10 +2546,10 @@ enum MoltoCmd {
     /// screenshot (--qr), never the command line; with none of them, a
     /// terminal asks for it (hidden).
     Import {
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_molto_slot)]
         profile: u8,
         /// Override the profile title (default: derived from URI issuer/account).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_molto_title)]
         title: Option<String>,
         /// Display timeout in seconds (otpauth:// has no equivalent field).
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
@@ -2572,7 +2577,7 @@ enum MoltoCmd {
         /// Path to the export file. Format is auto-detected.
         path: std::path::PathBuf,
         /// Starting profile index. Entries fill consecutive slots from here.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, value_parser = parse_molto_slot)]
         start: u8,
         /// Display timeout to use for every imported entry.
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
@@ -2722,7 +2727,7 @@ enum FidoCmd {
     /// Delete a single resident credential by its hex-encoded credentialId.
     CredsDelete {
         /// Hex-encoded credentialId as printed by `fido creds-list`.
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         cred_id: String,
         /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2768,7 +2773,7 @@ enum FidoCmd {
     /// Rename an enrolled fingerprint by its hex template id (from `list`).
     FingerprintRename {
         /// Hex-encoded template id as printed by `fido fingerprint-list`.
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         template_id: String,
         /// New friendly name.
         #[arg(long, value_name = "NAME")]
@@ -2786,7 +2791,7 @@ enum FidoCmd {
     /// Delete an enrolled fingerprint by its hex template id (from `list`).
     FingerprintDelete {
         /// Hex-encoded template id as printed by `fido fingerprint-list`.
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         template_id: String,
         /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -3086,7 +3091,7 @@ enum OtpCmd {
         #[arg(long, value_enum, default_value_t = OtpAlgoArg::Sha1)]
         algorithm: OtpAlgoArg,
         /// Code length in digits (4..=10).
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(4..=10))]
         digits: u8,
         /// TOTP time step in seconds (ignored for HOTP).
         #[arg(long, default_value_t = 30)]
@@ -3144,7 +3149,7 @@ enum OtpCmd {
     /// argv.
     ButtonHotp {
         /// Code length — must be 6 or 8.
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 6, value_parser = parse_button_digits)]
         digits: u8,
         /// Suppress the trailing Enter keystroke after typing the code.
         #[arg(long)]
@@ -3572,18 +3577,49 @@ enum MoltoInput {
     },
 }
 
-fn check_profile(profile: u8) -> Result<(), String> {
-    if profile > 99 {
-        return Err(format!("profile must be 0..=99, got {profile}"));
+/// Clap value parser for a Molto2 profile slot: 0..=99.
+fn parse_molto_slot(s: &str) -> Result<u8, String> {
+    let n: u8 = s
+        .parse()
+        .map_err(|_| format!("profile must be a number 0..=99, got {s:?}"))?;
+    if n > 99 {
+        return Err(format!("profile must be 0..=99, got {n}"));
     }
-    Ok(())
+    Ok(n)
 }
 
-fn check_title(title: &str) -> Result<(), &'static str> {
-    if title.is_empty() || title.len() > 12 {
-        return Err("title must be 1..=12 bytes");
+/// Clap value parser for a Molto2 profile title: 1..=12 bytes.
+fn parse_molto_title(s: &str) -> Result<String, String> {
+    if s.is_empty() || s.len() > 12 {
+        return Err("title must be 1..=12 bytes".into());
     }
-    Ok(())
+    Ok(s.to_string())
+}
+
+/// Clap value parser for `button-hotp --digits`: 6 or 8.
+fn parse_button_digits(s: &str) -> Result<u8, String> {
+    match s.parse::<u8>() {
+        Ok(n @ (6 | 8)) => Ok(n),
+        _ => Err(format!("button HOTP --digits must be 6 or 8, got {s:?}")),
+    }
+}
+
+/// Clap value parser for a hex argument: valid, non-empty hex. Returns the
+/// input unchanged; the handler decodes it.
+fn parse_hex_arg(s: &str) -> Result<String, String> {
+    match hex_decode(s) {
+        Ok(b) if !b.is_empty() => Ok(s.to_string()),
+        Ok(_) => Err("must not be empty".into()),
+        Err(e) => Err(format!("not valid hex: {e}")),
+    }
+}
+
+/// Clap value parser for `piv new-chuid --guid`: 16 bytes of hex, dashes
+/// optional. Returns the input unchanged.
+fn parse_guid_arg(s: &str) -> Result<String, String> {
+    keyroost_piv::parse_guid_hex(s)
+        .map(|_| s.to_string())
+        .ok_or_else(|| "must be 16 bytes of hex, dashes optional".to_string())
 }
 
 /// Everything that can fail without the token: source counts, a literal URI,
@@ -3592,18 +3628,6 @@ fn molto_validate<I: crate::secrets::SecretIo>(
     cmd: &MoltoCmd,
     sec: &Secrets<I>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match cmd {
-        MoltoCmd::Seed { profile, .. }
-        | MoltoCmd::Title { profile, .. }
-        | MoltoCmd::Delete { profile, .. }
-        | MoltoCmd::Config { profile, .. }
-        | MoltoCmd::Import { profile, .. }
-        | MoltoCmd::SyncTime {
-            profile: Some(profile),
-            ..
-        } => check_profile(*profile)?,
-        _ => {}
-    }
     match cmd {
         MoltoCmd::Seed {
             hex_env,
@@ -3635,11 +3659,7 @@ fn molto_validate<I: crate::secrets::SecretIo>(
             ),
         )?,
         MoltoCmd::Import {
-            uri,
-            uri_env,
-            qr,
-            title,
-            ..
+            uri, uri_env, qr, ..
         } => {
             check_import_source(uri.as_deref())?;
             if qr.is_none() {
@@ -3648,11 +3668,7 @@ fn molto_validate<I: crate::secrets::SecretIo>(
                     Source::new(uri_env.as_deref(), uri.as_deref() == Some("-")),
                 )?;
             }
-            if let Some(t) = title {
-                check_title(t)?;
-            }
         }
-        MoltoCmd::Title { title: Some(t), .. } => check_title(t)?,
         _ => {}
     }
     Ok(())
@@ -3797,56 +3813,62 @@ fn unix_now() -> u32 {
     }
 }
 
-/// Reject a `piv self-sign`/`piv new-chuid` `--days` value beyond what a
+/// Clap value parser: reject a `piv self-sign`/`piv new-chuid` `--days` value beyond what a
 /// certificate's validity period or a CHUID's expiration date can actually
 /// represent ([`keyroost_piv::max_valid_days`]), instead of letting it
 /// silently saturate deep in the encoder (`der_time`/`chuid_expiration_in_days`
 /// both clamp to the same `9999-12-31` ceiling on their own, but a caller
 /// asking for more than that deserves a clear error, not a silently
 /// shorter validity period than what they typed).
-fn check_valid_days(days: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn parse_valid_days(s: &str) -> Result<u32, String> {
+    let days: u32 = s
+        .parse()
+        .map_err(|_| format!("--days must be a whole number, got {s:?}"))?;
     let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
     if days > max {
         return Err(format!(
             "--days {days} exceeds the largest representable value ({max} days \
              from now) — a CHUID/certificate date is a 4-digit year, capped at \
              9999-12-31"
-        )
-        .into());
+        ));
     }
-    Ok(())
+    Ok(days)
 }
 
-/// The years counterpart of [`check_valid_days`] — same rationale, same
+/// The years counterpart of [`parse_valid_days`] — same rationale, same
 /// 9999-12-31 ceiling, just checked against [`keyroost_piv::max_valid_years`]
 /// instead.
-fn check_valid_years(years: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn parse_valid_years(s: &str) -> Result<u32, String> {
+    let years: u32 = s
+        .parse()
+        .map_err(|_| format!("--years must be a whole number, got {s:?}"))?;
     let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
     if years > max {
         return Err(format!(
             "--years {years} exceeds the largest representable value ({max} years \
              from now) — a CHUID/certificate date is a 4-digit year, capped at \
              9999-12-31"
-        )
-        .into());
+        ));
     }
-    Ok(())
+    Ok(years)
 }
 
-/// The months counterpart of [`check_valid_days`]/[`check_valid_years`] —
+/// The months counterpart of [`parse_valid_days`]/[`parse_valid_years`] —
 /// same rationale, same 9999-12-31 ceiling, checked against
 /// [`keyroost_piv::max_valid_months`].
-fn check_valid_months(months: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn parse_valid_months(s: &str) -> Result<u32, String> {
+    let months: u32 = s
+        .parse()
+        .map_err(|_| format!("--months must be a whole number, got {s:?}"))?;
     let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
     if months > max {
         return Err(format!(
             "--months {months} exceeds the largest representable value ({max} months \
              from now) — a CHUID/certificate date is a 4-digit year, capped at \
              9999-12-31"
-        )
-        .into());
+        ));
     }
-    Ok(())
+    Ok(months)
 }
 
 /// `piv self-sign` and `piv new-chuid` both take a `--days`/`--months`/
@@ -3878,28 +3900,19 @@ impl ValidFor {
         }
     }
 
-    /// Reject an all-zero period, then check each given unit against its own
-    /// ceiling ([`keyroost_piv::max_valid_days`]/`_months`/`_years`, each
+    /// Reject an all-zero period. Each unit's own ceiling is already enforced
+    /// by its clap value parser (`parse_valid_days`/`_months`/`_years`, each
     /// independently computed from "now") — a conservative check when units
     /// combine (adding years first only ever shrinks the days/months budget
     /// left before 9999-12-31, so a component that already fits its own
     /// from-now ceiling always fits the summed one too); the actual encoder
     /// clamps the summed result as a backstop regardless (see
-    /// `check_valid_days`'s doc comment for why a clear error is still
+    /// `parse_valid_days`'s doc comment for why a clear error is still
     /// preferred over that silent saturation for the common single-unit
     /// case).
     fn check(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.years == 0 && self.months == 0 && self.days == 0 {
             return Err("validity must be at least 1 day".into());
-        }
-        if self.years > 0 {
-            check_valid_years(self.years)?;
-        }
-        if self.months > 0 {
-            check_valid_months(self.months)?;
-        }
-        if self.days > 0 {
-            check_valid_days(self.days)?;
         }
         Ok(())
     }
@@ -6688,9 +6701,6 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             touch,
             access,
         } => {
-            if !(6..=8).contains(digits) {
-                return Err("--digits must be 6, 7, or 8".into());
-            }
             if *counter != 0 && !matches!(oath_type, OathTypeArg::Hotp) {
                 return Err("--counter only applies to --type hotp".into());
             }
@@ -7183,9 +7193,6 @@ fn run_otp(
             pin_env,
             pin_stdin,
         } => {
-            if !(4..=10).contains(digits) {
-                return Err("--digits must be between 4 and 10".into());
-            }
             let mut sec = Secrets::real();
             let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
             sec.check(&OTP_SEED, seed_src)?;
@@ -7287,9 +7294,6 @@ fn run_otp(
             seed_stdin,
             yes,
         } => {
-            if *digits != 6 && *digits != 8 {
-                return Err("button HOTP --digits must be 6 or 8".into());
-            }
             let mut sec = Secrets::real();
             let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
             sec.check(&OTP_SEED, seed_src)?;
@@ -8412,13 +8416,6 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             pin_stdin,
             yes,
         } => {
-            if *pin_tries == 0 || *puk_tries == 0 {
-                return Err(
-                    "retry counts must be at least 1 — a zero count would leave the \
-                            PIN or PUK permanently blocked"
-                        .into(),
-                );
-            }
             let mut sec = Secrets::real();
             let pin_src = Source::new(pin_env.as_deref(), *pin_stdin);
             let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
@@ -12687,15 +12684,17 @@ mod cli_tests {
             err(&["keyroostctl", "molto", "seed", "-p", "99"]),
             "no seed given: pass --hex-env VAR, --hex-stdin, --base32-env VAR or --base32-stdin"
         );
-        let e = err(&["keyroostctl", "molto", "seed", "-p", "100", "--hex-stdin"]);
+        // Range checks are clap value parsers now: they fail at parse time.
+        let parse_err = |args: &[&str]| parse(args).err().expect("must refuse").to_string();
+        let e = parse_err(&["keyroostctl", "molto", "seed", "-p", "100", "--hex-stdin"]);
         assert!(e.contains("profile must be 0..=99"), "{e}");
-        let e = err(&["keyroostctl", "molto", "title", "-p", "1", "thirteen-chars"]);
+        let e = parse_err(&["keyroostctl", "molto", "title", "-p", "1", "thirteen-chars"]);
         assert!(e.contains("title must be 1..=12 bytes"), "{e}");
         assert_eq!(
             err(&["keyroostctl", "molto", "import", "-p", "1"]),
             "no otpauth:// URI given: pass `-` to read it from stdin, --uri-env VAR or --qr IMAGE"
         );
-        let e = err(&[
+        let e = parse_err(&[
             "keyroostctl",
             "molto",
             "import",
@@ -15134,6 +15133,45 @@ mod cli_tests {
     }
 
     #[test]
+    fn range_checks_are_usage_errors_from_clap() {
+        use clap::error::ErrorKind;
+        for argv in [
+            &["keyroostctl", "oath", "add", "x", "--digits", "9"][..],
+            &[
+                "keyroostctl",
+                "otp",
+                "add",
+                "--app",
+                "a",
+                "--account",
+                "b",
+                "--digits",
+                "11",
+            ],
+            &["keyroostctl", "otp", "button-hotp", "--digits", "7"],
+            &[
+                "keyroostctl",
+                "piv",
+                "set-retries",
+                "--pin-tries",
+                "0",
+                "--puk-tries",
+                "3",
+            ],
+            &["keyroostctl", "molto", "title", "-p", "100"],
+            &["keyroostctl", "molto", "title", "-p", "1", "THIRTEEN-LONG"],
+            &["keyroostctl", "piv", "new-chuid", "--guid", "zz"],
+            &["keyroostctl", "fido", "creds-delete", "--cred-id", "xyz"],
+        ] {
+            let e = Cli::try_parse_from(argv)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} parsed"));
+            assert_eq!(e.kind(), ErrorKind::ValueValidation, "{argv:?}: {e}");
+            assert_eq!(e.exit_code(), 2);
+        }
+    }
+
+    #[test]
     fn json_flag_parses_globally() {
         assert!(parse(&["keyroostctl", "--json", "piv", "status"]).is_ok());
         assert!(parse(&["keyroostctl", "--json", "fido", "info"]).is_ok());
@@ -15647,41 +15685,50 @@ mod cli_tests {
 
     #[test]
     fn check_valid_days_accepts_the_default_and_the_actual_ceiling() {
-        assert!(check_valid_days(365).is_ok());
-        assert!(check_valid_days(keyroost_piv::max_valid_days(u64::from(unix_now()))).is_ok());
+        assert!(parse_valid_days("365").is_ok());
+        assert!(
+            parse_valid_days(&keyroost_piv::max_valid_days(u64::from(unix_now())).to_string())
+                .is_ok()
+        );
     }
 
     #[test]
     fn check_valid_days_rejects_one_past_the_ceiling() {
         let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
-        let err = check_valid_days(max + 1).unwrap_err();
-        assert!(err.to_string().contains("exceeds"));
+        let err = parse_valid_days(&(max + 1).to_string()).unwrap_err();
+        assert!(err.contains("exceeds"));
     }
 
     #[test]
     fn check_valid_months_accepts_the_default_and_the_actual_ceiling() {
-        assert!(check_valid_months(12).is_ok());
-        assert!(check_valid_months(keyroost_piv::max_valid_months(u64::from(unix_now()))).is_ok());
+        assert!(parse_valid_months("12").is_ok());
+        assert!(parse_valid_months(
+            &keyroost_piv::max_valid_months(u64::from(unix_now())).to_string()
+        )
+        .is_ok());
     }
 
     #[test]
     fn check_valid_months_rejects_one_past_the_ceiling() {
         let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
-        let err = check_valid_months(max + 1).unwrap_err();
-        assert!(err.to_string().contains("exceeds"));
+        let err = parse_valid_months(&(max + 1).to_string()).unwrap_err();
+        assert!(err.contains("exceeds"));
     }
 
     #[test]
     fn check_valid_years_accepts_the_default_and_the_actual_ceiling() {
-        assert!(check_valid_years(1).is_ok());
-        assert!(check_valid_years(keyroost_piv::max_valid_years(u64::from(unix_now()))).is_ok());
+        assert!(parse_valid_years("1").is_ok());
+        assert!(parse_valid_years(
+            &keyroost_piv::max_valid_years(u64::from(unix_now())).to_string()
+        )
+        .is_ok());
     }
 
     #[test]
     fn check_valid_years_rejects_one_past_the_ceiling() {
         let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
-        let err = check_valid_years(max + 1).unwrap_err();
-        assert!(err.to_string().contains("exceeds"));
+        let err = parse_valid_years(&(max + 1).to_string()).unwrap_err();
+        assert!(err.contains("exceeds"));
     }
 
     #[test]
