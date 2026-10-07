@@ -48,6 +48,10 @@ pub struct OpenPgpStatus {
     /// Digital-signature counter (number of signatures made), if the card
     /// reported a Security Support Template.
     pub signature_count: Option<u32>,
+    /// A Token2 key's full serial, read from its OTP applet by [`OpenPgpSession::status`]
+    /// (a cross-applet read, the same one PIV status makes). `None` on other
+    /// cards, or when the OTP applet didn't answer.
+    pub otp_applet_serial: Option<u128>,
 }
 
 impl OpenPgpStatus {
@@ -61,6 +65,8 @@ impl OpenPgpStatus {
     /// value is run through `crate::decode_bcd_serial` to recover the real
     /// serial; every other vendor's serial is a plain integer and passes
     /// through untouched.
+    ///
+    /// See [`Self::full_serial`] for the serial to show.
     #[must_use]
     pub fn serial(&self) -> Option<u32> {
         let raw = self
@@ -75,6 +81,13 @@ impl OpenPgpStatus {
         } else {
             Some(raw)
         }
+    }
+
+    /// The serial to show: [`Self::otp_applet_serial`] when present, else [`Self::serial`].
+    #[must_use]
+    pub fn full_serial(&self) -> Option<u128> {
+        self.otp_applet_serial
+            .or_else(|| self.serial().map(u128::from))
     }
 
     /// Human label of the algorithm in `crt`'s slot (`RSA-2048`, `EdDSA
@@ -164,6 +177,19 @@ impl OpenPgpSession {
             _ => None,
         };
 
+        // Cross-applet read: on a Token2 card, the OpenPGP AID carries only a
+        // 4-byte BCD serial, while the key's OTP applet reports the full serial
+        // printed on the device. Read it on this same card handle, as PIV status
+        // does, then re-SELECT OpenPGP whatever the read returned: the next command
+        // on this session expects the OpenPGP applet.
+        let otp_applet_serial = if wants_otp_applet_serial(&ard.aid) {
+            let serial = crate::token2otp::read_otp_applet_serial(|apdu| self.transmit_full(apdu));
+            self.select()?;
+            serial
+        } else {
+            None
+        };
+
         Ok(OpenPgpStatus {
             sig_algo_id: ard.sig_algo_id(),
             dec_algo_id: ard.dec_algo_id(),
@@ -179,6 +205,7 @@ impl OpenPgpSession {
             tries_rc: ard.pw_status.tries_rc,
             tries_pw3: ard.pw_status.tries_pw3,
             signature_count,
+            otp_applet_serial,
         })
     }
 
@@ -757,6 +784,13 @@ impl OpenPgpSession {
     }
 }
 
+/// Whether `status` also reads the full serial through the OTP applet: only
+/// for a card whose AID names Token2 as the manufacturer, so no other card
+/// ever sees the extra SELECT.
+fn wants_otp_applet_serial(aid: &[u8]) -> bool {
+    pgp::aid_manufacturer_id(aid) == Some(pgp::MANUFACTURER_ID_TOKEN2)
+}
+
 /// The `--slot` value the CLI accepts for `crt`, for use in a "run this
 /// command" hint in an error message.
 fn crt_flag_name(crt: pgp::KeyCrt) -> &'static str {
@@ -833,6 +867,7 @@ mod tests {
             tries_rc: 0,
             tries_pw3: 3,
             signature_count: None,
+            otp_applet_serial: None,
         };
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Sign), "EdDSA Ed25519");
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Decrypt), "ECDH X25519");
@@ -850,9 +885,9 @@ mod tests {
         aid
     }
 
-    #[test]
-    fn serial_bcd_decodes_only_for_token2_cards() {
-        let status = |aid: Vec<u8>| OpenPgpStatus {
+    /// A status with every field fixed except the AID.
+    fn status_with(aid: Vec<u8>) -> OpenPgpStatus {
+        OpenPgpStatus {
             aid,
             sig_algo_id: None,
             dec_algo_id: None,
@@ -867,7 +902,13 @@ mod tests {
             tries_rc: 0,
             tries_pw3: 3,
             signature_count: None,
-        };
+            otp_applet_serial: None,
+        }
+    }
+
+    #[test]
+    fn serial_bcd_decodes_only_for_token2_cards() {
+        let status = status_with;
 
         // Token2: the raw AID serial is BCD — its nibbles are the printed digits.
         assert_eq!(
@@ -886,5 +927,23 @@ mod tests {
         );
         // Too-short AID still yields no serial rather than panicking.
         assert_eq!(status(vec![]).serial(), None);
+    }
+
+    #[test]
+    fn only_token2_aids_read_the_otp_applet_serial() {
+        assert!(wants_otp_applet_serial(&aid_with(
+            pgp::MANUFACTURER_ID_TOKEN2,
+            1
+        )));
+        assert!(!wants_otp_applet_serial(&aid_with(0x0006, 1))); // Yubico
+        assert!(!wants_otp_applet_serial(&[]));
+    }
+
+    #[test]
+    fn full_serial_prefers_the_otp_applet() {
+        let mut st = status_with(aid_with(pgp::MANUFACTURER_ID_TOKEN2, 0x1234_5678));
+        assert_eq!(st.full_serial(), Some(12_345_678));
+        st.otp_applet_serial = Some(1_000_000_123_456);
+        assert_eq!(st.full_serial(), Some(1_000_000_123_456));
     }
 }

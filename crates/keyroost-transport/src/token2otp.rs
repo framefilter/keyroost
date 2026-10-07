@@ -1880,6 +1880,79 @@ pub fn otp_type_str(t: OtpType) -> &'static str {
     }
 }
 
+/// Cross-applet read: a Token2 (or Thetis) unit's full serial, read from
+/// its on-device OTP applet's GET_INFO through another applet's session.
+///
+/// `tx` sends one APDU on the caller's card handle. This SELECTs the OTP
+/// applet ([`keyroost_token2otp::OTP_APPLET_AID`]) and sends
+/// [`keyroost_token2otp::read_serial_request`]; the OTP applet answers in
+/// plain ASCII decimal ([`keyroost_token2otp::parse_otp_serial`]). It
+/// leaves the OTP applet selected: the caller must re-SELECT its own applet
+/// afterwards, whatever this returns. `None` when the OTP applet doesn't
+/// SELECT, the request is refused, or the reply doesn't parse.
+pub(crate) fn read_otp_applet_serial(
+    mut tx: impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), crate::TransportError>,
+) -> Option<u128> {
+    let (_, sw) = tx(&keyroost_piv::select_by_aid(
+        &keyroost_token2otp::OTP_APPLET_AID,
+    ))
+    .ok()?;
+    if sw != 0x9000 {
+        return None;
+    }
+    let (data, sw) = tx(&keyroost_token2otp::read_serial_request()).ok()?;
+    if sw != 0x9000 {
+        return None;
+    }
+    keyroost_token2otp::parse_otp_serial(&data).ok()
+}
+
+#[cfg(test)]
+mod otp_applet_serial_tests {
+    use super::read_otp_applet_serial;
+
+    /// A scripted card: each APDU must be the next expected one and gets its reply.
+    struct Script(Vec<(Vec<u8>, Vec<u8>, u16)>);
+    impl Script {
+        fn tx(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), crate::TransportError> {
+            assert!(!self.0.is_empty(), "unexpected APDU {apdu:02x?}");
+            let (want, data, sw) = self.0.remove(0);
+            assert_eq!(apdu, want.as_slice());
+            Ok((data, sw))
+        }
+    }
+
+    #[test]
+    fn otp_applet_serial_read_sends_select_then_get_info() {
+        let select = keyroost_piv::select_by_aid(&keyroost_token2otp::OTP_APPLET_AID);
+        let get = keyroost_token2otp::read_serial_request();
+        let mut reply = vec![0xD1, 13];
+        reply.extend_from_slice(b"1000000123456");
+
+        let mut s = Script(vec![
+            (select.clone(), vec![], 0x9000),
+            (get.clone(), reply, 0x9000),
+        ]);
+        assert_eq!(read_otp_applet_serial(|a| s.tx(a)), Some(1_000_000_123_456));
+        assert!(s.0.is_empty());
+
+        // No OTP applet: one SELECT and nothing else.
+        let mut s = Script(vec![(select.clone(), vec![], 0x6A82)]);
+        assert_eq!(read_otp_applet_serial(|a| s.tx(a)), None);
+        assert!(s.0.is_empty());
+
+        // Refused, or a reply that isn't a decimal serial.
+        for (data, sw) in [(vec![], 0x6D00), (vec![0xD1, 0x02, b'x', b'y'], 0x9000)] {
+            let mut s = Script(vec![
+                (select.clone(), vec![], 0x9000),
+                (get.clone(), data, sw),
+            ]);
+            assert_eq!(read_otp_applet_serial(|a| s.tx(a)), None);
+            assert!(s.0.is_empty());
+        }
+    }
+}
+
 #[cfg(test)]
 mod trace_redaction_tests {
     use super::response_is_sensitive;

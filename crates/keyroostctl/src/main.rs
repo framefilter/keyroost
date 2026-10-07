@@ -7846,7 +7846,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 };
                 emit_json(&json_out::OpenpgpStatusJson {
                     aid: hex_encode(&status.aid),
-                    serial: status.serial().map(|s| s.to_string()),
+                    serial: status.full_serial().map(|s| s.to_string()),
                     sig_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Sign),
                     dec_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
                     aut_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
@@ -7862,10 +7862,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             }
 
             println!("AID:            {}", hex_encode(&status.aid));
-            if let Some(serial) = status.serial() {
-                // Yubico prints this serial in hex; show both (it equals the
-                // YubiKey's CCID/mgmt serial used for friendly names).
-                println!("Serial:         {0} (0x{0:08X})", serial);
+            // From the AID, Yubico prints this serial in hex, so
+            // `openpgp_serial_text` shows both (it equals the YubiKey's
+            // CCID/mgmt serial used for friendly names); a Token2 key's full
+            // serial from its OTP applet is shown as printed on the key.
+            if let Some(serial) = openpgp_serial_text(status.otp_applet_serial, status.serial()) {
+                println!("Serial:         {serial}");
             }
             println!(
                 "Key algorithms: sig={} dec={} aut={}",
@@ -10250,6 +10252,16 @@ fn load_pubkey_material(
             )
         })?;
     Ok((alg, key))
+}
+
+/// The serial `openpgp info` shows: Token2's full serial as printed on the
+/// key when its OTP applet supplied it, else the AID serial in decimal and hex.
+fn openpgp_serial_text(otp_applet_serial: Option<u128>, aid_serial: Option<u32>) -> Option<String> {
+    match (otp_applet_serial, aid_serial) {
+        (Some(s), _) => Some(s.to_string()),
+        (None, Some(s)) => Some(format!("{s} (0x{s:08X})")),
+        (None, None) => None,
+    }
 }
 
 /// Print a key fingerprint, rendering an all-zero (no key) slot as "(none)".
@@ -17687,6 +17699,19 @@ mod cli_tests {
         let v = serde_json::to_value(slot(None)).expect("serialize");
         assert!(v["cert_unreadable"].is_null(), "{v}");
         assert!(v.as_object().unwrap().contains_key("cert_unreadable"));
+    }
+
+    #[test]
+    fn openpgp_serial_text_forms() {
+        assert_eq!(
+            openpgp_serial_text(Some(1_000_000_123_456), Some(1)).as_deref(),
+            Some("1000000123456")
+        );
+        assert_eq!(
+            openpgp_serial_text(None, Some(0x0123_4567)).as_deref(),
+            Some("19088743 (0x01234567)")
+        );
+        assert_eq!(openpgp_serial_text(None, None), None);
     }
 
     #[test]

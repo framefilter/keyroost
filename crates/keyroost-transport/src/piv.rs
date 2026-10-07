@@ -1664,21 +1664,12 @@ impl<'tx> PivSession<'tx> {
     /// `GET_INFO` is refused, or when the reply doesn't parse as
     /// `D1 len ascii-decimal...` — callers fall back to the BCD-decoded
     /// `GET SERIAL` reply ([`decode_serial_if_bcd`]) in that case.
+    ///
+    /// The read itself is [`crate::token2otp::read_otp_applet_serial`], shared with OpenPGP status.
     fn probe_token2_otp_serial(&mut self) -> Option<u128> {
-        let selected = matches!(
-            self.transmit_full_raw(&piv::select_by_aid(&keyroost_token2otp::OTP_APPLET_AID)),
-            Ok((_, sw)) if sw == piv::SW_OK
-        );
-        let serial = if selected {
-            self.transmit_full_raw(&keyroost_token2otp::read_serial_request())
-                .ok()
-                .filter(|(_, sw)| *sw == piv::SW_OK)
-                .and_then(|(data, _)| keyroost_token2otp::parse_otp_serial(&data).ok())
-        } else {
-            None
-        };
-        // Restore PIV as the selected applet before returning — mirrors
-        // `probe_hid_crescendo_cplc_serial`.
+        let serial = crate::token2otp::read_otp_applet_serial(|apdu| self.transmit_full_raw(apdu));
+        // Restore PIV as the selected applet before returning, whatever the
+        // read returned — mirrors `probe_hid_crescendo_cplc_serial`.
         let _ = self.select();
         serial
     }
