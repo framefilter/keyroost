@@ -142,7 +142,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OtpCmd,
     },
-    /// Manage the OpenPGP card applet: status, keys, sign, decrypt, PINs,
+    /// Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs,
     /// cardholder details, and reset.
     ///
     /// Talks to the key over the smart-card interface (PC/SC).
@@ -150,7 +150,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: OpenpgpCmd,
     },
-    /// Manage the PIV (smart card) applet: status, PIN/PUK, management key,
+    /// Manage the PIV (smart card) applet: info, PIN/PUK, management key,
     /// keys, and certificates.
     ///
     /// Talks to the key over the smart-card interface (PC/SC).
@@ -872,9 +872,9 @@ enum PivCmd {
         #[arg(long)]
         new_pin_stdin: bool,
     },
-    /// Set the PIN and PUK retry counts; this also resets the PIN and PUK
-    /// themselves to their factory defaults. Needs the management key and the
-    /// current PIN.
+    /// Set the PIN and PUK retry counts (Yubico extension); this also resets
+    /// the PIN and PUK themselves to their factory defaults. Needs the
+    /// management key and the current PIN.
     SetRetries {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -979,8 +979,11 @@ enum PivCmd {
         #[arg(long, display_order = 19)]
         force: bool,
     },
-    /// Generate a new key pair in a slot and print its public key (PEM). Needs
-    /// the management key. Overwrites any existing key in the slot.
+    /// Generate a new key pair in a slot, replacing any key already there, and
+    /// print its public key (PEM). Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Needs the management key. Asks only when the slot isn't known to be
+    /// empty.
     GenerateKey {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -988,8 +991,7 @@ enum PivCmd {
         /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        /// Key type to generate (the names ykman uses; OpenPGP's `nistp256` is
-        /// `eccp256` here).
+        /// Key type to generate (OpenPGP's `nistp256` is `eccp256` here).
         #[arg(long, value_enum, default_value = "eccp256")]
         algorithm: CliPivKeyAlg,
         /// When the new key's private key may be used. `default` sends the
@@ -1034,7 +1036,11 @@ enum PivCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Import a DER or PEM X.509 certificate into a slot. Needs the management key.
+    /// Import a DER or PEM X.509 certificate into a slot, replacing any
+    /// certificate already there. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Needs the management key. Asks only when the slot isn't known to be
+    /// empty.
     ///
     /// No `--load-pubkey` here, unlike `request-cert`/`self-sign`: those
     /// commands need the key material to build their actual output (a CSR, a
@@ -1156,9 +1162,14 @@ enum PivCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Create a self-signed certificate for the key in a slot, signed on the
-    /// card, and store it in that slot (the slot then works in PIV-aware
-    /// software without an external CA).
+    /// Create a self-signed certificate for the key in a slot and store it
+    /// there, replacing any certificate already there. Irreversible: asks first
+    /// (`--yes` to skip).
+    ///
+    /// The certificate is signed on the card, so the slot then works in
+    /// PIV-aware software without an external CA. With `--generate-key` the
+    /// slot's key is replaced too. Asks only when the slot isn't known to be
+    /// empty.
     SelfSign {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -1557,8 +1568,8 @@ enum OpenpgpCmd {
         /// Key algorithm to generate. Omit to keep the slot's current algorithm
         /// (RSA-2048 on a factory card). Ed25519 fits the sign/auth slots,
         /// X25519 the decrypt slot; the NIST/brainpool/secp256k1 curves fit any.
-        /// See `openpgp algorithms` for what this card accepts. (GnuPG's names;
-        /// PIV's `eccp256` is `nistp256` here.)
+        /// See `openpgp algorithms` for what this card accepts. (PIV's `eccp256`
+        /// is `nistp256` here.)
         #[arg(long, value_enum)]
         algorithm: Option<CliOpenpgpKeyAlg>,
         /// Confirm without asking (required when not run from a terminal).
@@ -2072,7 +2083,8 @@ enum ProgCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Write the TOTP seed.
+    /// Write the TOTP seed, replacing the one on the token. Irreversible: asks
+    /// first (`--yes` to skip).
     ///
     /// The seed comes from exactly one of --hex-env / --hex-stdin /
     /// --base32-env / --base32-stdin (never the command line). Hex or
@@ -2133,9 +2145,10 @@ enum MoltoCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Write a TOTP seed to a slot.
+    /// Write a TOTP seed to a slot, replacing any seed already there.
+    /// Irreversible: asks first (`--yes` to skip).
     ///
-    /// The seed comes from exactly one of --hex-env / --hex-stdin /
+    /// Asks only when the slot is occupied. The seed comes from exactly one of --hex-env / --hex-stdin /
     /// --base32-env / --base32-stdin (never the command line). Hex or base32:
     /// the flag says which encoding you give (the token stores raw bytes).
     #[command(group(clap::ArgGroup::new("seed_source")
@@ -2234,10 +2247,11 @@ enum MoltoCmd {
         #[arg(long)]
         ascii_stdin: bool,
     },
-    /// Import an otpauth:// URI to a slot: writes seed, title, and config
-    /// in one go.
+    /// Import an otpauth:// URI to a slot: writes seed, title, and config in
+    /// one go, replacing what the slot held. Irreversible: asks first (`--yes`
+    /// to skip).
     ///
-    /// The URI comes from stdin (`-`), --uri-env VAR or a QR
+    /// Asks only when the slot is occupied. The URI comes from stdin (`-`), --uri-env VAR or a QR
     /// screenshot (--qr), never the command line; with none of them, a
     /// terminal asks for it (hidden).
     Import {
@@ -2266,9 +2280,10 @@ enum MoltoCmd {
         yes: bool,
     },
     /// Bulk-import a plaintext or encrypted export from Aegis, 2FAS, or a list
-    /// of otpauth:// URIs.
+    /// of otpauth:// URIs, replacing what the target slots held. Irreversible:
+    /// asks first (`--yes` to skip).
     ///
-    /// For encrypted Aegis vaults, pass the password via
+    /// Asks only when a target slot is occupied. For encrypted Aegis vaults, pass the password via
     /// `--password-stdin` (suitable for piping from a file or password manager)
     /// or `--password-env VAR`; with neither, a terminal asks for it (hidden).
     ImportFile {
@@ -2340,8 +2355,8 @@ enum FidoCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Factory-reset FIDO2: delete every passkey and the PIN. Irreversible:
-    /// asks first (`--yes` to skip).
+    /// Factory-reset FIDO2: wipe every credential (passkeys and security-key
+    /// sign-ins) and the PIN. Irreversible: asks first (`--yes` to skip).
     ///
     /// Runs authenticatorReset. Most authenticators only accept it within
     /// ~10s of plug-in and require a physical touch, so over USB keyroost
@@ -2676,7 +2691,7 @@ enum SshCertCmd {
         /// disambiguate when several SSH credentials are present.
         #[arg(long)]
         credential: Option<String>,
-        /// Output file (default: <rp-id-sanitised>-cert.pub).
+        /// Output file (default: <rp-id-sanitized>-cert.pub).
         #[arg(long, value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
@@ -2921,10 +2936,11 @@ enum OtpCmd {
     },
     /// Read the device serial number (over USB, or NFC where the model allows).
     Serial,
-    /// Configure the single HOTP-on-button keystroke slot: the key types this
-    /// code when touched outside a session.
+    /// Configure the single HOTP-on-button keystroke slot, replacing any seed
+    /// already there. Irreversible: asks first (`--yes` to skip).
     ///
-    /// The base32 seed comes from an
+    /// The key types this code when touched outside a session. Asks only when
+    /// the slot may already be configured. The base32 seed comes from an
     /// environment variable, stdin or, with neither, a hidden prompt — never
     /// argv.
     SetButtonHotp {
@@ -2987,10 +3003,10 @@ enum OtpCmd {
     PinStatus,
     /// Set an OTP PIN on a currently-unprotected key.
     ///
-    /// After this, codes are readable only after `otp verify` (or with
-    /// `otp list --pin-*`). The PIN comes from an environment
-    /// variable, stdin or, with neither, a hidden prompt (asked twice) — never
-    /// argv.
+    /// After this, reading codes needs the PIN (`otp list` asks for it, or
+    /// takes `--pin-env`/`--pin-stdin`). The new PIN comes from an
+    /// environment variable, stdin or, with neither, a hidden prompt (asked
+    /// twice) — never argv.
     ///
     /// There is no PIN reset: wrong attempts count down a retry counter, and a
     /// blocked PIN is recoverable only by erasing every OTP entry on the key
@@ -6069,7 +6085,7 @@ fn hid_ids_at(path: Option<&Path>, hids: &[keyroost_hid::HidDevice]) -> Option<(
 /// and for any vendor whose reader name we don't normalize to the same string
 /// those two differ — turning "the same key came back" into a refusal. A
 /// differing name is no more a mismatch here than it is on the serial path,
-/// which already accepts a relabelled key. The name stays only as the fallback
+/// which already accepts a relabeled key. The name stays only as the fallback
 /// for a key whose ids are unknown on one side or the other.
 fn same_product(
     expected_model: &str,
@@ -11027,7 +11043,7 @@ fn run_fido_ssh_cert_extract(
     let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
         .ok_or("stored blob is not a valid OpenSSH certificate")?;
 
-    // Resolve the output path (default: <sanitised rp-id>-cert.pub). The RP id
+    // Resolve the output path (default: <sanitized rp-id>-cert.pub). The RP id
     // is device-derived and must be treated as hostile: use the path-safe
     // filename sanitizer here, not sanitize_terminal (which only neutralizes
     // control/bidi/zero-width chars for display, not `/`, `\`, or `..`).
@@ -12871,26 +12887,33 @@ mod cli_tests {
             ("piv reset", IRREVERSIBLE),
             ("piv delete-cert", IRREVERSIBLE),
             ("piv delete-key", IRREVERSIBLE),
+            // These replace a key, seed or certificate already on the device.
+            ("piv generate-key", IRREVERSIBLE),
+            ("piv import-cert", IRREVERSIBLE),
+            ("piv self-sign", IRREVERSIBLE),
+            ("molto seed", IRREVERSIBLE),
+            ("molto import", IRREVERSIBLE),
+            ("molto import-file", IRREVERSIBLE),
+            ("prog seed", IRREVERSIBLE),
+            ("otp set-button-hotp", IRREVERSIBLE),
             ("factory-reset", IRREVERSIBLE_TYPED),
             ("fido config set-min-pin-length", ONE_WAY),
             ("fido config enable-enterprise-attestation", ONE_WAY),
         ];
-        // Commands that ask before a change but don't wipe anything on their own.
+        // Commands that ask before a change that destroys no key, seed or
+        // certificate: settings and retry counts, plus `piv request-cert`,
+        // which replaces a key only with the optional `--generate-key`.
         let confirms_only = [
-            "molto seed",
-            "molto import",
-            "molto import-file",
-            "prog seed",
             "prog config",
-            "otp set-button-hotp",
             "otp interface",
             "piv set-retries",
-            "piv generate-key",
-            "piv import-cert",
             "piv request-cert",
-            "piv self-sign",
         ];
-        for (path, cmd) in all_commands() {
+        let tree = all_commands();
+        for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
+            assert!(tree.iter().any(|(t, _)| t == p), "{p:?} is not a command");
+        }
+        for (path, cmd) in tree {
             // Hidden commands (`molto probe`) take `--yes` as a gate, not an answer.
             if cmd.is_hide_set() {
                 continue;
@@ -15939,7 +15962,7 @@ mod cli_tests {
     #[test]
     fn openpgp_generate_key_algorithm_is_optional_and_named_like_gpg() {
         // No --algorithm: None — generate whatever the slot's attributes say
-        // (the pre-#106 behaviour, unchanged for scripts).
+        // (the pre-#106 behavior, unchanged for scripts).
         match parse(&["keyroostctl", "openpgp", "generate-key", "--yes"])
             .unwrap()
             .command
@@ -16636,7 +16659,7 @@ mod cli_tests {
             _ => panic!("expected piv self-sign"),
         }
 
-        // Passed: the flag flips on and its options are honoured.
+        // Passed: the flag flips on and its options are honored.
         match parse(&[
             "keyroostctl",
             "piv",

@@ -113,7 +113,7 @@ pub(crate) fn confirm(
         .map_err(|e| e.to_string())?;
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Ok(true),
-        _ => Err("cancelled; nothing was changed".into()),
+        _ => Err("canceled; nothing was changed".into()),
     }
 }
 
@@ -234,7 +234,7 @@ pub(crate) fn check_overwrite(
         .map_err(|e| e.to_string())?;
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Ok(OutMode::Replace),
-        _ => Err("cancelled; nothing was changed".into()),
+        _ => Err("canceled; nothing was changed".into()),
     }
 }
 
@@ -529,7 +529,7 @@ mod tests {
             Ok(OutMode::Replace)
         );
         let e = check_overwrite(&mut FakeTerm::new(true, &["\n"]), &taken, false).unwrap_err();
-        assert!(e.contains("cancelled"), "{e}");
+        assert!(e.contains("canceled"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

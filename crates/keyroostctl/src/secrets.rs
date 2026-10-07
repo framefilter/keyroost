@@ -382,7 +382,7 @@ impl<I: SecretIo> Secrets<I> {
                 // may print before the Ctrl-C handler ends the process —
                 // the same outcome, nothing changed.
                 ErrorKind::Interrupted | ErrorKind::UnexpectedEof => {
-                    "cancelled; nothing was changed".to_string()
+                    "canceled; nothing was changed".to_string()
                 }
                 _ => format!(
                     "could not read the {} at a hidden prompt ({e}); pass {} instead",
@@ -757,13 +757,13 @@ mod tests {
         io.typed.push_back(Err(std::io::ErrorKind::Interrupted));
         assert_eq!(
             sec(io).read(&PIN, Source::NONE).unwrap_err(),
-            "cancelled; nothing was changed"
+            "canceled; nothing was changed"
         );
         let mut io = FakeIo::terminal();
         io.typed.push_back(Err(std::io::ErrorKind::UnexpectedEof));
         assert_eq!(
             sec(io).read(&PIN, Source::NONE).unwrap_err(),
-            "cancelled; nothing was changed"
+            "canceled; nothing was changed"
         );
         assert_eq!(
             sec(FakeIo::terminal().typing(&[""]))
@@ -920,7 +920,7 @@ mod tests {
         s.read(&PIN, Source::new(None, true)).unwrap();
         assert!(s.prompted(), "--pin-stdin typed at a terminal");
 
-        // A cancelled prompt still counts: the person was at the keyboard.
+        // A canceled prompt still counts: the person was at the keyboard.
         let mut s = sec(FakeIo::terminal());
         assert!(s.read(&PIN, Source::NONE).is_err());
         assert!(s.prompted());
