@@ -8946,6 +8946,23 @@ impl App {
         )
     }
 
+    /// [`piv_slot_occupancy`] for `slot`, reading the loaded caches and the
+    /// last status read's per-slot key presence.
+    fn piv_occupancy(&self, slot: keyroost_piv::Slot) -> PivOccupancy {
+        let standard: Vec<_> = self
+            .piv
+            .status
+            .as_ref()
+            .map(|s| s.slots.iter().map(|sl| (sl.slot, sl.key)).collect())
+            .unwrap_or_default();
+        piv_slot_occupancy(
+            slot,
+            &self.piv.slot_keys,
+            &standard,
+            self.piv.retired_occupancy.as_deref(),
+        )
+    }
+
     /// The selected slot's `(PIN policy, touch policy)` from the last
     /// `status_detailed` read, or `None` when the card didn't report one.
     fn piv_selected_slot_policy(
@@ -9917,6 +9934,69 @@ fn piv_slot_occupied(
                 .map(|(_, a, _)| a.is_some())
                 .unwrap_or(false)
         }
+    }
+}
+
+/// What the pane can say about whether a slot holds a private key, for the
+/// Generate / Move "replace?" warning. Unlike [`piv_slot_occupied`] (which
+/// gates actions that need a key, so only a known key counts), this fails
+/// closed: anything keyroost can't vouch for as empty is [`Self::MaybeKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PivOccupancy {
+    /// A key is known to be there.
+    Key,
+    /// keyroost can't tell, or hasn't read the slot yet.
+    MaybeKey,
+    /// The card said there is no key.
+    Empty,
+}
+
+/// [`PivOccupancy`] for `slot`. Standard slots: a carried algorithm in
+/// `slot_keys` is a key, otherwise `standard` (the status read's per-slot
+/// [`keyroost_transport::SlotKeyPresence`]) decides. Retired slots read the
+/// lazily-populated `retired_occupancy` cache. Only a confirmed "no key" is
+/// [`PivOccupancy::Empty`]; an unlisted slot or a missing cache is
+/// [`PivOccupancy::MaybeKey`]. Pure so it can be unit-tested.
+fn piv_slot_occupancy(
+    slot: keyroost_piv::Slot,
+    slot_keys: &[(
+        keyroost_piv::Slot,
+        Option<keyroost_piv::KeyAlg>,
+        Option<String>,
+    )],
+    standard: &[(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)],
+    retired_occupancy: Option<&[(keyroost_piv::Slot, keyroost_transport::SlotKeyPresence)]>,
+) -> PivOccupancy {
+    use keyroost_transport::SlotKeyPresence as K;
+    let presence = if matches!(slot, keyroost_piv::Slot::Retired(_)) {
+        retired_occupancy.and_then(|v| v.iter().find(|(s, _)| *s == slot).map(|(_, k)| *k))
+    } else {
+        if slot_keys
+            .iter()
+            .any(|(s, alg, _)| *s == slot && alg.is_some())
+        {
+            return PivOccupancy::Key;
+        }
+        standard.iter().find(|(s, _)| *s == slot).map(|(_, k)| *k)
+    };
+    match presence {
+        Some(K::Present) => PivOccupancy::Key,
+        Some(K::NoKey) => PivOccupancy::Empty,
+        _ => PivOccupancy::MaybeKey,
+    }
+}
+
+/// The red "replace?" warning for writing a key into `slot` (Generate, or
+/// the Move destination), or `None` when the slot is known to be empty.
+fn piv_replace_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
+    match occupancy {
+        PivOccupancy::Key => Some(format!(
+            "This OVERWRITES and destroys the existing key in {slot}. This cannot be undone."
+        )),
+        PivOccupancy::MaybeKey => Some(format!(
+            "{slot} may already hold a key, which would be replaced. This cannot be undone."
+        )),
+        PivOccupancy::Empty => None,
     }
 }
 
@@ -15441,6 +15521,10 @@ impl App {
         // overwrite warning + relabel and the Import-cert replace note.
         // Precomputed before the closure borrows `self` mutably.
         let selected_occupied = self.piv_selected_occupied();
+        // The Generate warning fails closed (a slot keyroost can't vouch for
+        // as empty may hold a key); the "Overwrite key" relabel stays for a
+        // known key only.
+        let selected_occupancy = self.piv_occupancy(self.piv.selected_slot.to_slot());
 
         // Move-key flow: precompute the source slot and the eligible destination
         // slots (empty, non-source) before the modal borrows `self` mutably. A
@@ -15471,6 +15555,13 @@ impl App {
         } else {
             Vec::new()
         };
+        // Destinations offered above that keyroost can't vouch for as empty:
+        // choosing one shows the "may already hold a key" warning.
+        let move_maybe_dests: Vec<keyroost_piv::Slot> = move_dests
+            .iter()
+            .copied()
+            .filter(|&s| self.piv_occupancy(s) == PivOccupancy::MaybeKey)
+            .collect();
 
         // New CHUID's GUID field needs to stay on one line at its full
         // canonical `8-4-4-4-12` width (36 characters); every other flow
@@ -15645,15 +15736,13 @@ impl App {
                             // the existing private key (irreversible). Warn in
                             // red before the auth field, mirroring the delete
                             // cards; the submit button is relabelled below.
-                            if selected_occupied {
-                                let slot = self.piv.selected_slot.to_slot().label();
+                            if let Some(warning) = piv_replace_warning(
+                                selected_occupancy,
+                                &self.piv.selected_slot.to_slot().label(),
+                            ) {
                                 ui.colored_label(
                                     p.err,
-                                    egui::RichText::new(format!(
-                                        "This OVERWRITES and destroys the existing key in \
-                                         {slot}. This cannot be undone."
-                                    ))
-                                    .font(theme::f_sb(12.5)),
+                                    egui::RichText::new(warning).font(theme::f_sb(12.5)),
                                 );
                                 ui.add_space(6.0);
                             }
@@ -16252,6 +16341,19 @@ impl App {
                                     });
                             });
                             ui.add_space(6.0);
+                            if let Some(dest) =
+                                self.piv.move_dest.filter(|d| move_maybe_dests.contains(d))
+                            {
+                                if let Some(warning) =
+                                    piv_replace_warning(PivOccupancy::MaybeKey, &dest.label())
+                                {
+                                    ui.colored_label(
+                                        p.err,
+                                        egui::RichText::new(warning).font(theme::f_sb(12.5)),
+                                    );
+                                    ui.add_space(6.0);
+                                }
+                            }
                             self.piv_modal_mgmt_field(ui, p, kind);
                             card_note(
                                 ui,
@@ -22828,6 +22930,79 @@ mod tests {
         ));
         // cache absent entirely -> false (unknown treated as empty)
         assert!(!piv_slot_occupied(PivSlotSel::Retired(1), &slot_keys, None));
+    }
+
+    /// The Generate / Move "replace?" warning fails closed: a slot keyroost
+    /// can't vouch for as empty counts as possibly holding a key, the same
+    /// rule the CLI applies before it writes.
+    #[test]
+    fn piv_slot_occupancy_treats_unknown_as_possibly_occupied() {
+        use keyroost_piv::{KeyAlg, Slot};
+        use keyroost_transport::SlotKeyPresence as K;
+
+        let slot_keys = vec![
+            (Slot::Authentication, Some(KeyAlg::EccP256), None),
+            (Slot::Signature, None, None),
+            (Slot::KeyManagement, None, None),
+            (Slot::CardAuthentication, None, None),
+        ];
+        let standard = vec![
+            (Slot::Authentication, K::Unknown),
+            (Slot::Signature, K::NoKey),
+            (Slot::KeyManagement, K::Unknown),
+            (Slot::CardAuthentication, K::Present),
+        ];
+        let retired = vec![
+            (Slot::retired(1).unwrap(), K::Present),
+            (Slot::retired(2).unwrap(), K::NoKey),
+            (Slot::retired(4).unwrap(), K::Unknown),
+        ];
+        let occ =
+            |s: Slot, r: Option<&[(Slot, K)]>| piv_slot_occupancy(s, &slot_keys, &standard, r);
+
+        // A carried algorithm is a key, whatever the status says.
+        assert_eq!(occ(Slot::Authentication, None), PivOccupancy::Key);
+        assert_eq!(occ(Slot::CardAuthentication, None), PivOccupancy::Key);
+        // Only a confirmed "no key" is empty.
+        assert_eq!(occ(Slot::Signature, None), PivOccupancy::Empty);
+        // Can't tell -> may hold a key.
+        assert_eq!(occ(Slot::KeyManagement, None), PivOccupancy::MaybeKey);
+        assert_eq!(
+            piv_slot_occupancy(Slot::KeyManagement, &slot_keys, &[], None),
+            PivOccupancy::MaybeKey
+        );
+
+        assert_eq!(
+            occ(Slot::retired(1).unwrap(), Some(&retired)),
+            PivOccupancy::Key
+        );
+        assert_eq!(
+            occ(Slot::retired(2).unwrap(), Some(&retired)),
+            PivOccupancy::Empty
+        );
+        assert_eq!(
+            occ(Slot::retired(4).unwrap(), Some(&retired)),
+            PivOccupancy::MaybeKey
+        );
+        // Not read yet (slot not listed, or no cache at all) -> may hold a key.
+        assert_eq!(
+            occ(Slot::retired(3).unwrap(), Some(&retired)),
+            PivOccupancy::MaybeKey
+        );
+        assert_eq!(occ(Slot::retired(1).unwrap(), None), PivOccupancy::MaybeKey);
+
+        // The warning text names the slot and what would happen.
+        assert_eq!(
+            piv_replace_warning(PivOccupancy::MaybeKey, "9d (Key Management)").as_deref(),
+            Some(
+                "9d (Key Management) may already hold a key, which would be replaced. \
+                 This cannot be undone."
+            )
+        );
+        assert!(
+            piv_replace_warning(PivOccupancy::Key, "9a").is_some_and(|w| w.contains("OVERWRITES"))
+        );
+        assert_eq!(piv_replace_warning(PivOccupancy::Empty, "9a"), None);
     }
 
     #[test]
