@@ -152,7 +152,7 @@ pub(crate) struct FidoPinRetriesJson {
     pub pin_retries: u32,
 }
 
-/// `keyroostctl piv --json status`.
+/// `keyroostctl piv --json info`.
 #[derive(Serialize)]
 pub(crate) struct PivStatusJson {
     /// Yubico GET VERSION's raw reply, dotted (or hex past 4 bytes),
@@ -253,7 +253,7 @@ pub(crate) struct PivTestOpJson {
     pub detail: Option<String>,
 }
 
-/// `keyroostctl openpgp --json status`.
+/// `keyroostctl openpgp --json info`.
 #[derive(Serialize)]
 pub(crate) struct OpenpgpStatusJson {
     pub aid: String,
@@ -327,9 +327,9 @@ pub(crate) struct OtpPinStatusJson {
     pub pin_retries_max: Option<u8>,
 }
 
-/// `keyroostctl otp --json get` — a single read OTP code.
+/// `keyroostctl otp --json code` — a single read OTP code.
 #[derive(Serialize)]
-pub(crate) struct OtpGetJson {
+pub(crate) struct OtpCodeJson {
     pub app: String,
     pub account: String,
     pub code: String,

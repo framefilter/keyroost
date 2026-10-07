@@ -7308,7 +7308,7 @@ fn run_otp(
             match entry.code {
                 Some(code) => {
                     if json_output() {
-                        emit_json(&json_out::OtpGetJson {
+                        emit_json(&json_out::OtpCodeJson {
                             app: app.clone(),
                             account: account.clone(),
                             code,
@@ -17883,8 +17883,8 @@ mod cli_tests {
     }
 
     #[test]
-    fn otp_get_json_serializes() {
-        let g = json_out::OtpGetJson {
+    fn otp_code_json_serializes() {
+        let g = json_out::OtpCodeJson {
             app: "Example".into(),
             account: "alice".into(),
             code: "123456".into(),
