@@ -138,7 +138,9 @@ keyroostctl piv generate-key --slot 9a --algorithm eccp256 --mgmt-key-stdin
 keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --days 365 \
     --pin-stdin --mgmt-key-stdin
 keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
-    --pin-stdin --file request.csr</code></pre>
+    --pin-stdin --file request.csr
+keyroostctl piv export-cert --slot 9a                  # prints the certificate as PEM
+keyroostctl piv export-cert --slot 9a --format der --file cert.der</code></pre>
     <p class="kr-muted">When two <code>--*-stdin</code> flags appear on one command, keyroost
       reads them as consecutive lines, and each flag's <code>--help</code> says which line it
       reads — for <code>self-sign</code> that is the PIN first, then the management key; for a
@@ -158,7 +160,9 @@ keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
       choice below, fails with a clear &ldquo;too large&rdquo; message, or &ldquo;no room
       left&rdquo; when the card is full, and leaves the slot's existing certificate
       unchanged. keyroost also refuses a certificate whose public key doesn't match the key
-      already in the slot, when it can read that key.</p>
+      already in the slot, when it can read that key. <code>export-cert</code> writes the
+      certificate as PEM, to stdout or to <code>--file</code>; add <code>--format der</code>
+      for the raw DER bytes.</p>
     <span id="delete"></span>
     <p><strong>Clearing a slot.</strong> <code>delete-cert</code> removes only the slot's
       X.509 certificate object and leaves the private key in place — standard PIV, so it
@@ -209,8 +213,10 @@ keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
       <code>Decrypt: passed</code>, <code>Sign: FAILED — …</code>,
       <code>Key Agree: skipped — not supported for …</code> — and exits non-zero if any
       operation failed. With <code>--json</code> it emits
-      <code>{ slot, algorithm, ok, operations: [ { operation, result, detail? } … ] }</code>
-      instead, with <code>detail</code> present only when the result is <code>failed</code>.
+      <code>{ slot, slot_name, algorithm, ok, operations: [ { operation, result, detail } … ] }</code>
+      instead: <code>slot</code> is the <code>--slot</code> value (<code>"9a"</code>),
+      <code>slot_name</code> its label, and <code>detail</code> is the reason when the
+      result is <code>failed</code>, otherwise <code>null</code>.
       A slot with no certificate, or a key type keyroost can't verify, is an error — nothing
       is tested.</p>
     <span id="new-chuid"></span>
