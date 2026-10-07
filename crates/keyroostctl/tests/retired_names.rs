@@ -82,6 +82,54 @@ const CASES: &[(&[&str], &str)] = &[
         &["fido", "enterprise-attestation", "S3CRETVALUE"],
         "keyroostctl fido config enable-enterprise-attestation",
     ),
+    (&["piv", "status", "S3CRETVALUE"], "keyroostctl piv info"),
+    (
+        &["openpgp", "status", "S3CRETVALUE"],
+        "keyroostctl openpgp info",
+    ),
+    (&["otp", "config", "S3CRETVALUE"], "keyroostctl otp info"),
+    (&["otp", "get", "S3CRETVALUE"], "keyroostctl otp code"),
+    (
+        &["otp", "button-hotp", "--seed-env", "S3CRETVALUE"],
+        "keyroostctl otp set-button-hotp",
+    ),
+    (
+        &["otp", "erase-all", "S3CRETVALUE"],
+        "keyroostctl otp reset",
+    ),
+    (
+        &["otp", "remove-pin", "S3CRETVALUE"],
+        "keyroostctl otp clear-pin",
+    ),
+    (
+        &["otp", "fp-status", "S3CRETVALUE"],
+        "keyroostctl otp fingerprint-status",
+    ),
+    (
+        &["otp", "fp-enable", "S3CRETVALUE"],
+        "keyroostctl otp fingerprint-enable",
+    ),
+    (
+        &["otp", "fp-disable", "S3CRETVALUE"],
+        "keyroostctl otp fingerprint-disable",
+    ),
+    (
+        &["otp", "fp-list", "S3CRETVALUE"],
+        "keyroostctl otp list --unlock fingerprint",
+    ),
+    (
+        &["otp", "unlock-list", "--pin-only", "S3CRETVALUE"],
+        "keyroostctl otp list --unlock auto",
+    ),
+    (
+        &["otp", "unlock-list", "--pin-only", "S3CRETVALUE"],
+        "--unlock pin",
+    ),
+    (
+        &["otp", "set-pin", "--pin-env", "S3CRETVALUE"],
+        "--new-pin-env",
+    ),
+    (&["otp", "set-pin", "--pin-stdin"], "--new-pin-stdin"),
     (
         &["--device", "pin-set", "fido", "pin-set"],
         "keyroostctl fido pin set",

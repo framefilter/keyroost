@@ -167,7 +167,7 @@ pub(crate) struct PivStatusJson {
     /// A string, not a number: a serial can be up to 128 bits (a
     /// Nitrokey's admin serial), and a bare JSON number past 2^53 loses
     /// precision in most consumers. Decimal within `u64`, `0x`-hex
-    /// beyond — the same rendering `piv status`'s text output uses.
+    /// beyond — the same rendering `piv info`'s text output uses.
     pub serial: Option<String>,
     pub pin_retries: Option<u8>,
     pub chuid: Option<PivChuidJson>,
@@ -182,7 +182,7 @@ pub(crate) struct PivStatusJson {
     /// Empty when none was — not backfilled with a generic name for
     /// `applet_fingerprint`, so an empty string here means specifically
     /// "the token didn't tell us its name," not "fingerprinting failed."
-    /// (The plain-text `piv status` output does apply that fallback —
+    /// (The plain-text `piv info` output does apply that fallback —
     /// see `run_piv`.)
     pub applet_name: String,
     /// The applet's own firmware version, dotted (same formatting as

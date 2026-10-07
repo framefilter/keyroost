@@ -1252,7 +1252,7 @@ impl core::fmt::Display for AppletFingerprint {
     /// matching Rust's own path syntax for a nested enum variant. Not derived
     /// `Debug`'s parentheses, so this reads unambiguously next to the
     /// friendly name from [`AppletFingerprint::applet_name`] wherever both
-    /// appear (`keyroostctl piv status`'s `--json` output).
+    /// appear (`keyroostctl piv info`'s `--json` output).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             AppletFingerprint::Generic => write!(f, "Generic"),

@@ -2,6 +2,11 @@
 //! dynamic engine, end to end, without touching hardware.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Gives every `complete` call its own config directory, so tests running
+/// in parallel never share or delete each other's keys.json.
+static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 /// Runs the dynamic completer (fish flavor) for `words` against a keys.json
 /// holding two saved names, and returns its stdout.
@@ -9,7 +14,7 @@ fn complete(words: &[&str]) -> String {
     let dir = std::env::temp_dir().join(format!(
         "keyroost-completion-{}-{}",
         std::process::id(),
-        words.join("_").replace(['-', ' '], "")
+        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(dir.join("keyroost")).unwrap();
     std::fs::write(

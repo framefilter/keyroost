@@ -148,7 +148,7 @@ enum Cmd {
         cmd: PivCmd,
     },
     /// Manage on-device OTP entries on a Token2 T2F2 / PIN+ FIDO key over USB-HID
-    /// or CCID/NFC: list, get a code, add/delete entries, the button-press HOTP
+    /// or CCID/NFC: list, print a code, add/delete entries, the button-press HOTP
     /// keystroke slot, and the serial number. This is the Token2 OTP applet,
     /// distinct from the Yubico/Trussed `oath` applet above.
     Otp {
@@ -776,7 +776,7 @@ struct InlineKeyGen {
 enum PivCmd {
     /// Show PIV status: version, serial, PIN retries, and which key slots hold a
     /// certificate. No PIN or touch required.
-    Status {
+    Info {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
@@ -1395,7 +1395,7 @@ enum PivCmd {
 enum OpenpgpCmd {
     /// Show card status: AID/serial, key algorithms and fingerprints, PIN retry
     /// counters, and the signature counter. No PIN or touch required.
-    Status {
+    Info {
         /// Select a reader whose name contains this substring (case-insensitive).
         /// Omit to use the only OpenPGP card, or to list choices when several exist.
         #[arg(long, value_name = "SUBSTR")]
@@ -2681,9 +2681,15 @@ enum LargeBlobCmd {
 enum OtpCmd {
     /// List the OTP entries stored on the key, with their live codes where the
     /// device returns them (TOTP without button-press). On a PIN-protected
-    /// (R3.4+) key the PIN comes from `--pin-env`/`--pin-stdin` or, with
-    /// neither, a hidden prompt; a key without a PIN is never asked.
+    /// (R3.4+) key, `--unlock pin` (the default) takes the PIN from
+    /// `--pin-env`/`--pin-stdin` or, with neither, a hidden prompt; a key
+    /// without a PIN is never asked. `--unlock fingerprint` unlocks by a
+    /// fingerprint touch instead, and `--unlock auto` tries the fingerprint
+    /// and falls back to a PIN given by flag (never asked for).
     List {
+        /// How to unlock the codes on a PIN-protected key.
+        #[arg(long, value_enum, default_value_t = OtpUnlock::Pin)]
+        unlock: OtpUnlock,
         /// Read the OTP PIN from the named environment variable (protected keys).
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
@@ -2694,7 +2700,7 @@ enum OtpCmd {
     },
     /// Print the current code for one entry, identified by app and account.
     /// A button-required entry will prompt for a touch.
-    Get {
+    Code {
         /// Application/issuer name as stored (may be empty).
         #[arg(long, default_value = "")]
         app: String,
@@ -2765,7 +2771,7 @@ enum OtpCmd {
     },
     /// Erase every OTP entry on the key. Asks first, then needs a confirming
     /// button press.
-    EraseAll {
+    Reset {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -2776,7 +2782,7 @@ enum OtpCmd {
     /// code when touched outside a session. The base32 seed comes from an
     /// environment variable, stdin or, with neither, a hidden prompt — never
     /// argv.
-    ButtonHotp {
+    SetButtonHotp {
         /// Code length — must be 6 or 8.
         #[arg(long, default_value_t = 6, value_parser = parse_button_digits)]
         digits: u8,
@@ -2809,7 +2815,7 @@ enum OtpCmd {
     ///
     /// Useful for diagnosing why the GUI's keyboard toggle or Touch HOTP gating
     /// behaves as it does.
-    Config,
+    Info,
     /// Enable or disable the key's USB interfaces (FIDO / keyboard-HID / CCID)
     /// via SET_DEVICE_TYPE.
     ///
@@ -2840,14 +2846,14 @@ enum OtpCmd {
     ///
     /// There is no PIN reset: wrong attempts count down a retry counter, and a
     /// blocked PIN is recoverable only by erasing every OTP entry on the key
-    /// (`otp erase-all`). Keep a record of the PIN somewhere you trust.
+    /// (`otp reset`). Keep a record of the PIN somewhere you trust.
     SetPin {
         /// Read the new OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
+        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
+        new_pin_env: Option<String>,
         /// Read the new OTP PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
-        pin_stdin: bool,
+        new_pin_stdin: bool,
     },
     /// Verify the OTP PIN, opening the read window for this connection (mostly
     /// for testing; `list` takes `--pin-*` directly). PIN via env, stdin or,
@@ -2879,7 +2885,7 @@ enum OtpCmd {
     },
     /// Remove the OTP PIN (requires the current PIN). PIN via env, stdin or,
     /// with neither, a hidden prompt.
-    RemovePin {
+    ClearPin {
         /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
@@ -2887,11 +2893,12 @@ enum OtpCmd {
         #[arg(long)]
         pin_stdin: bool,
     },
-    /// Report whether the key supports fingerprint-protected OTP (FpEnable).
-    FpStatus,
+    /// Report whether the key supports fingerprint-protected OTP and whether
+    /// it is on.
+    FingerprintStatus,
     /// Enable fingerprint protection for OTP (needs the current PIN). After this,
     /// codes can be unlocked by a fingerprint touch as well as the PIN.
-    FpEnable {
+    FingerprintEnable {
         /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
@@ -2900,7 +2907,7 @@ enum OtpCmd {
         pin_stdin: bool,
     },
     /// Disable fingerprint protection for OTP (needs the current PIN).
-    FpDisable {
+    FingerprintDisable {
         /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
@@ -2908,24 +2915,18 @@ enum OtpCmd {
         #[arg(long)]
         pin_stdin: bool,
     },
-    /// Unlock the codes by a FINGERPRINT touch (no PIN), then list them. Requires
-    /// fingerprint protection to be enabled on the key.
-    FpList,
-    /// List codes, unlocking with a fingerprint if enabled and falling back to
-    /// the PIN if the touch fails (or if fingerprint protection is off). Supply
-    /// the PIN via `--pin-stdin`/`--pin-env` to enable the fallback (never
-    /// prompted for: without a flag there is no PIN fallback).
-    UnlockList {
-        /// Read the OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
-        /// Skip the fingerprint attempt and go straight to the PIN.
-        #[arg(long)]
-        pin_only: bool,
-    },
+}
+
+/// How `otp list` unlocks the codes on a PIN-protected key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OtpUnlock {
+    /// The OTP PIN: from --pin-env/--pin-stdin, or asked for when the key needs one.
+    Pin,
+    /// A fingerprint touch, no PIN (fingerprint protection must be on).
+    Fingerprint,
+    /// A fingerprint touch when fingerprint protection is on, falling back to
+    /// the PIN given by --pin-env/--pin-stdin (never asked for).
+    Auto,
 }
 
 /// Transport selector for the `otp` command group.
@@ -3225,7 +3226,7 @@ fn parse_molto_title(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-/// Clap value parser for `button-hotp --digits`: 6 or 8.
+/// Clap value parser for `set-button-hotp --digits`: 6 or 8.
 fn parse_button_digits(s: &str) -> Result<u8, String> {
     match s.parse::<u8>() {
         Ok(n @ (6 | 8)) => Ok(n),
@@ -3811,6 +3812,16 @@ const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
         "--pin-stdin was split: use --old-pin-stdin (first line) and --new-pin-stdin (second line)",
     ),
     (
+        "--pin-env",
+        &["otp", "set-pin"],
+        "--pin-env was renamed --new-pin-env (the PIN being set; the same name `fido pin set` uses)",
+    ),
+    (
+        "--pin-stdin",
+        &["otp", "set-pin"],
+        "--pin-stdin was renamed --new-pin-stdin (the PIN being set; the same name `fido pin set` uses)",
+    ),
+    (
         "--list-readers",
         &[],
         "--list-readers was removed; `keyroostctl list` shows the smart-card readers",
@@ -3912,6 +3923,78 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         old: "enterprise-attestation",
         new: "fido config enable-enterprise-attestation",
         note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "status",
+        new: "piv info",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "status",
+        new: "openpgp info",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "config",
+        new: "otp info",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "get",
+        new: "otp code",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "button-hotp",
+        new: "otp set-button-hotp",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "erase-all",
+        new: "otp reset",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "remove-pin",
+        new: "otp clear-pin",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "fp-status",
+        new: "otp fingerprint-status",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "fp-enable",
+        new: "otp fingerprint-enable",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "fp-disable",
+        new: "otp fingerprint-disable",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "fp-list",
+        new: "otp list --unlock fingerprint",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "unlock-list",
+        new: "otp list --unlock auto",
+        note: "`--pin-only` is `--unlock pin`",
     },
 ];
 
@@ -6716,9 +6799,9 @@ fn open_otp(
 /// that plainly rather than surface the protocol error its first APDU produces.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OtpFeature {
-    /// The on-device OTP store (`otp list` / `get` / `add` / `delete` / `erase-all`).
+    /// The on-device OTP store (`otp list` / `code` / `add` / `delete` / `reset`).
     OnDevice,
-    /// The single HOTP-on-touch keystroke slot (`otp button-hotp`).
+    /// The single HOTP-on-touch keystroke slot (`otp set-button-hotp`).
     ButtonHotp,
 }
 
@@ -6729,14 +6812,14 @@ impl OtpFeature {
                 "this key does not have the on-device OTP function: it reports that it was \
                  supplied without it, so it cannot store TOTP or HOTP entries. Token2 keys \
                  aren't upgradable after purchase — OTP is a separate product configuration, \
-                 not something that can be switched on later. Run `keyroostctl otp config` to \
+                 not something that can be switched on later. Run `keyroostctl otp info` to \
                  see the capabilities the key reports."
             }
             OtpFeature::ButtonHotp => {
                 "this key does not have the HOTP-on-touch function: it reports that it was \
                  supplied without it. Token2 keys aren't upgradable after purchase — the \
                  keystroke slot is a separate product configuration, not something that can \
-                 be switched on later. Run `keyroostctl otp config` to see the capabilities \
+                 be switched on later. Run `keyroostctl otp info` to see the capabilities \
                  the key reports."
             }
         }
@@ -6811,7 +6894,6 @@ fn ensure_otp_feature(
 }
 
 const OTP_PIN: Spec = Spec::current("OTP PIN", "pin");
-const OTP_NEW_PIN_SET: Spec = Spec::new_secret("new OTP PIN", "pin");
 const OTP_OLD_PIN: Spec = Spec::current("current OTP PIN", "old-pin");
 const OTP_NEW_PIN: Spec = Spec::new_secret("new OTP PIN", "new-pin");
 const OTP_SEED: Spec = Spec::value("seed", "seed").base32();
@@ -6904,7 +6986,11 @@ fn run_otp(
     debug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        OtpCmd::List { pin_env, pin_stdin } => {
+        OtpCmd::List {
+            unlock: OtpUnlock::Pin,
+            pin_env,
+            pin_stdin,
+        } => {
             let dev = select_otp(&sel)?;
             let pin = otp_pin_if_needed(
                 &mut Secrets::real(),
@@ -6920,44 +7006,53 @@ fn run_otp(
             // A key whose PIN was set since the probe still surfaces a clear
             // "PIN required" error from enumerate_pinned.
             let entries = session.enumerate_pinned(now, pin.as_deref().map(|p| p.as_str()))?;
-            if json_output() {
-                let accounts: Vec<json_out::OtpEntryJson> = entries
-                    .iter()
-                    .map(|e| json_out::OtpEntryJson {
-                        app: e.app_name.clone(),
-                        account: e.account_name.clone(),
-                        otp_type: keyroost_transport::otp_type_str(e.otp_type),
-                        algorithm: otp_algo_json_t2(e.algorithm),
-                        code: e.code.clone(),
-                        touch_required: e.button_required,
-                    })
-                    .collect();
-                emit_json(&json_out::AccountsJson { accounts })?;
-                return Ok(());
-            }
-            if entries.is_empty() {
-                println!("(no OTP entries)");
-            } else {
-                for e in entries {
-                    let label = if e.app_name.is_empty() {
-                        e.account_name.clone()
-                    } else {
-                        format!("{}:{}", e.app_name, e.account_name)
-                    };
-                    // app/account names come from the device; strip escapes.
-                    let label = sanitize_terminal(&label);
-                    let code = e.code.as_deref().unwrap_or("\u{2014}"); // em dash when withheld
-                    println!(
-                        "{label}  [{}/{}]  {}{}",
-                        keyroost_transport::otp_type_str(e.otp_type),
-                        otp_algo_str_t2(e.algorithm),
-                        code,
-                        if e.button_required { "  (touch)" } else { "" },
-                    );
-                }
-            }
+            print_otp_entries(&entries)?;
         }
-        OtpCmd::Get { app, account } => {
+        OtpCmd::List {
+            unlock: OtpUnlock::Fingerprint,
+            pin_env,
+            pin_stdin,
+        } => {
+            if pin_env.is_some() || *pin_stdin {
+                return Err("`--unlock fingerprint` takes no PIN; drop --pin-env/--pin-stdin, or use --unlock auto for a PIN fallback".into());
+            }
+            let mut session = open_otp(&sel, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            let now = unix_now() as u64;
+            eprintln!("Touch the fingerprint sensor to unlock OTP codes\u{2026}");
+            session.verify_fingerprint()?;
+            let entries = session.enumerate(now)?;
+            print_otp_entries(&entries)?;
+        }
+        OtpCmd::List {
+            unlock: OtpUnlock::Auto,
+            pin_env,
+            pin_stdin,
+        } => {
+            // The PIN is only the fingerprint's fallback: read when a flag
+            // names it, never prompted for.
+            let mut sec = Secrets::real();
+            let dev = select_otp(&sel)?;
+            let pin = sec.read_given(&OTP_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
+            crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
+            let mut session = open_otp_on(&dev, sel.transport, debug)?;
+            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
+            let now = unix_now() as u64;
+            if session.fp_is_enabled().unwrap_or(false) {
+                eprintln!("Touch the fingerprint sensor (or wait to fall back to PIN)\u{2026}");
+            }
+            let method = session.unlock_fp_or_pin(pin.as_deref().map(|p| p.as_str()), true)?;
+            eprintln!(
+                "Unlocked with {}.",
+                match method {
+                    keyroost_transport::UnlockMethod::Fingerprint => "fingerprint",
+                    keyroost_transport::UnlockMethod::Pin => "PIN",
+                }
+            );
+            let entries = session.enumerate(now)?;
+            print_otp_entries(&entries)?;
+        }
+        OtpCmd::Code { app, account } => {
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
@@ -7061,7 +7156,7 @@ fn run_otp(
             session.delete_entry_pinned(app, account, pin.as_deref().map(|p| p.as_str()))?;
             println!("Deleted OTP entry {label:?}.");
         }
-        OtpCmd::EraseAll { yes } => {
+        OtpCmd::Reset { yes } => {
             let dev = select_otp(&sel)?;
             // Checked before the question and the touch prompt: no point
             // asking on a key that has nothing to erase.
@@ -7082,7 +7177,7 @@ fn run_otp(
             }
             println!("{hex}");
         }
-        OtpCmd::ButtonHotp {
+        OtpCmd::SetButtonHotp {
             digits,
             no_enter,
             long_touch,
@@ -7119,7 +7214,7 @@ fn run_otp(
             session.delete_button_hotp()?;
             println!("Deleted the HOTP-on-button keystroke slot.");
         }
-        OtpCmd::Config => {
+        OtpCmd::Info => {
             let mut session = open_otp(&sel, debug)?;
             // Show the raw READ_CONFIG bytes first (diagnostic), then the parse.
             // A failure is returned for `main` to print once.
@@ -7276,8 +7371,11 @@ fn run_otp(
                 ),
             }
         }
-        OtpCmd::SetPin { pin_env, pin_stdin } => {
-            let pin = otp_required_secret(&sel, &OTP_NEW_PIN_SET, pin_env, *pin_stdin)?;
+        OtpCmd::SetPin {
+            new_pin_env,
+            new_pin_stdin,
+        } => {
+            let pin = otp_required_secret(&sel, &OTP_NEW_PIN, new_pin_env, *new_pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_pin(pin.as_str())?;
@@ -7313,14 +7411,14 @@ fn run_otp(
             session.change_pin(current.as_str(), new.as_str())?;
             println!("OTP PIN changed.");
         }
-        OtpCmd::RemovePin { pin_env, pin_stdin } => {
+        OtpCmd::ClearPin { pin_env, pin_stdin } => {
             let current = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.remove_pin(current.as_str())?;
             println!("OTP PIN removed. Codes are readable without a PIN again.");
         }
-        OtpCmd::FpStatus => {
+        OtpCmd::FingerprintStatus => {
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             match session.fp_supported()? {
@@ -7329,96 +7427,62 @@ fn run_otp(
                 None => println!("Fingerprint-protected OTP: not available on this firmware"),
             }
         }
-        OtpCmd::FpEnable { pin_env, pin_stdin } => {
+        OtpCmd::FingerprintEnable { pin_env, pin_stdin } => {
             let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), true)?;
             println!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
         }
-        OtpCmd::FpDisable { pin_env, pin_stdin } => {
+        OtpCmd::FingerprintDisable { pin_env, pin_stdin } => {
             let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), false)?;
             println!("Fingerprint protection disabled.");
         }
-        OtpCmd::FpList => {
-            let mut session = open_otp(&sel, debug)?;
-            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
-            let now = unix_now() as u64;
-            eprintln!("Touch the fingerprint sensor to unlock OTP codes\u{2026}");
-            session.verify_fingerprint()?;
-            let entries = session.enumerate(now)?;
-            if entries.is_empty() {
-                println!("(no OTP entries)");
-            } else {
-                for e in entries {
-                    let label = if e.app_name.is_empty() {
-                        e.account_name.clone()
-                    } else {
-                        format!("{}:{}", e.app_name, e.account_name)
-                    };
-                    let label = sanitize_terminal(&label);
-                    let code = e.code.as_deref().unwrap_or("\u{2014}");
-                    println!(
-                        "{label}  [{}/{}]  {}{}",
-                        keyroost_transport::otp_type_str(e.otp_type),
-                        otp_algo_str_t2(e.algorithm),
-                        code,
-                        if e.button_required { "  (touch)" } else { "" },
-                    );
-                }
-            }
-        }
-        OtpCmd::UnlockList {
-            pin_env,
-            pin_stdin,
-            pin_only,
-        } => {
-            // The PIN is only the fingerprint's fallback: read when a flag
-            // names it, never prompted for.
-            let mut sec = Secrets::real();
-            let dev = select_otp(&sel)?;
-            let pin = sec.read_given(&OTP_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
-            crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
-            let mut session = open_otp_on(&dev, sel.transport, debug)?;
-            ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
-            let now = unix_now() as u64;
-            if !*pin_only && session.fp_is_enabled().unwrap_or(false) {
-                eprintln!("Touch the fingerprint sensor (or wait to fall back to PIN)\u{2026}");
-            }
-            let method =
-                session.unlock_fp_or_pin(pin.as_deref().map(|p| p.as_str()), !*pin_only)?;
-            eprintln!(
-                "Unlocked with {}.",
-                match method {
-                    keyroost_transport::UnlockMethod::Fingerprint => "fingerprint",
-                    keyroost_transport::UnlockMethod::Pin => "PIN",
-                }
-            );
-            let entries = session.enumerate(now)?;
-            if entries.is_empty() {
-                println!("(no OTP entries)");
-            } else {
-                for e in entries {
-                    let label = if e.app_name.is_empty() {
-                        e.account_name.clone()
-                    } else {
-                        format!("{}:{}", e.app_name, e.account_name)
-                    };
-                    let label = sanitize_terminal(&label);
-                    let code = e.code.as_deref().unwrap_or("\u{2014}");
-                    println!(
-                        "{label}  [{}/{}]  {}{}",
-                        keyroost_transport::otp_type_str(e.otp_type),
-                        otp_algo_str_t2(e.algorithm),
-                        code,
-                        if e.button_required { "  (touch)" } else { "" },
-                    );
-                }
-            }
-        }
+    }
+    Ok(())
+}
+
+/// `otp list` output for every --unlock mode: JSON `{"accounts": [...]}`
+/// or one line per entry ("(no OTP entries)" when there are none).
+fn print_otp_entries(
+    entries: &[keyroost_token2otp::Entry],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json_output() {
+        let accounts: Vec<json_out::OtpEntryJson> = entries
+            .iter()
+            .map(|e| json_out::OtpEntryJson {
+                app: e.app_name.clone(),
+                account: e.account_name.clone(),
+                otp_type: keyroost_transport::otp_type_str(e.otp_type),
+                algorithm: otp_algo_json_t2(e.algorithm),
+                code: e.code.clone(),
+                touch_required: e.button_required,
+            })
+            .collect();
+        return emit_json(&json_out::AccountsJson { accounts });
+    }
+    if entries.is_empty() {
+        println!("(no OTP entries)");
+    }
+    for e in entries {
+        let label = if e.app_name.is_empty() {
+            e.account_name.clone()
+        } else {
+            format!("{}:{}", e.app_name, e.account_name)
+        };
+        // app/account names come from the device; strip escapes.
+        let label = sanitize_terminal(&label);
+        let code = e.code.as_deref().unwrap_or("\u{2014}"); // em dash when withheld
+        println!(
+            "{label}  [{}/{}]  {}{}",
+            keyroost_transport::otp_type_str(e.otp_type),
+            otp_algo_str_t2(e.algorithm),
+            code,
+            if e.button_required { "  (touch)" } else { "" },
+        );
     }
     Ok(())
 }
@@ -7518,7 +7582,7 @@ const PGP_NEW_ADMIN_PIN: Spec = Spec::new_secret("new admin PIN (PW3)", "new-pin
 
 fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        OpenpgpCmd::Status { reader } => {
+        OpenpgpCmd::Info { reader } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             let status = session.status()?;
 
@@ -7996,7 +8060,7 @@ const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-
 
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        PivCmd::Status { reader } => {
+        PivCmd::Info { reader } => {
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -13199,7 +13263,7 @@ mod cli_tests {
         }
 
         // Global flags decode as themselves.
-        let g = parse(&["keyroostctl", "--json", "--debug", "piv", "status"]).unwrap();
+        let g = parse(&["keyroostctl", "--json", "--debug", "piv", "info"]).unwrap();
         assert!(g.json && g.debug && g.device.is_none());
     }
 
@@ -15220,11 +15284,46 @@ mod cli_tests {
     }
 
     #[test]
+    fn info_and_otp_names_parse() {
+        for a in [
+            &["keyroostctl", "piv", "info"][..],
+            &["keyroostctl", "openpgp", "info"],
+            &["keyroostctl", "otp", "info"],
+            &["keyroostctl", "otp", "code", "--account", "a"],
+            &["keyroostctl", "otp", "set-button-hotp"],
+            &["keyroostctl", "otp", "reset"],
+            &["keyroostctl", "otp", "clear-pin"],
+            &["keyroostctl", "otp", "fingerprint-status"],
+            &["keyroostctl", "otp", "fingerprint-enable"],
+            &["keyroostctl", "otp", "fingerprint-disable"],
+            &["keyroostctl", "otp", "set-pin", "--new-pin-env", "V"],
+        ] {
+            assert!(parse(a).is_ok(), "{a:?}");
+        }
+        let unlock_of = |a: &[&str]| match parse(a).unwrap().command {
+            Some(Cmd::Otp {
+                cmd: OtpCmd::List { unlock, .. },
+                ..
+            }) => unlock,
+            _ => panic!("not otp list"),
+        };
+        assert_eq!(unlock_of(&["keyroostctl", "otp", "list"]), OtpUnlock::Pin);
+        assert_eq!(
+            unlock_of(&["keyroostctl", "otp", "list", "--unlock", "fingerprint"]),
+            OtpUnlock::Fingerprint
+        );
+        assert_eq!(
+            unlock_of(&["keyroostctl", "otp", "list", "--unlock", "auto"]),
+            OtpUnlock::Auto
+        );
+    }
+
+    #[test]
     fn name_is_accepted_on_every_group() {
         for g in [
-            &["keyroostctl", "--device", "k", "piv", "status"][..],
+            &["keyroostctl", "--device", "k", "piv", "info"][..],
             &["keyroostctl", "--device", "k", "oath", "list"][..],
-            &["keyroostctl", "--device", "k", "openpgp", "status"][..],
+            &["keyroostctl", "--device", "k", "openpgp", "info"][..],
             &["keyroostctl", "--device", "k", "otp", "list"][..],
             &["keyroostctl", "--device", "k", "molto", "info"][..],
             &["keyroostctl", "--device", "k", "fido", "info"][..],
@@ -15249,7 +15348,7 @@ mod cli_tests {
                 "--digits",
                 "11",
             ],
-            &["keyroostctl", "otp", "button-hotp", "--digits", "7"],
+            &["keyroostctl", "otp", "set-button-hotp", "--digits", "7"],
             &[
                 "keyroostctl",
                 "piv",
@@ -15281,11 +15380,11 @@ mod cli_tests {
 
     #[test]
     fn json_flag_parses_globally() {
-        assert!(parse(&["keyroostctl", "--json", "piv", "status"]).is_ok());
+        assert!(parse(&["keyroostctl", "--json", "piv", "info"]).is_ok());
         assert!(parse(&["keyroostctl", "--json", "fido", "info"]).is_ok());
         assert!(parse(&["keyroostctl", "--json", "molto", "info"]).is_ok());
         // Position-insensitive: --json after the subcommand also works (global).
-        assert!(parse(&["keyroostctl", "piv", "status", "--json"]).is_ok());
+        assert!(parse(&["keyroostctl", "piv", "info", "--json"]).is_ok());
     }
 
     fn argv(a: &[&str]) -> Vec<String> {
@@ -17254,7 +17353,7 @@ mod cli_tests {
             Cmd::Otp {
                 cmd:
                     OtpCmd::Delete { yes, .. }
-                    | OtpCmd::ButtonHotp { yes, .. }
+                    | OtpCmd::SetButtonHotp { yes, .. }
                     | OtpCmd::DeleteButtonHotp { yes },
                 ..
             } => yes,
@@ -17402,7 +17501,7 @@ mod cli_tests {
             ],
             &["keyroostctl", "oath", "delete", "x"],
             &["keyroostctl", "otp", "delete", "--account", "a"],
-            &["keyroostctl", "otp", "button-hotp", "--seed-stdin"],
+            &["keyroostctl", "otp", "set-button-hotp", "--seed-stdin"],
             &["keyroostctl", "otp", "delete-button-hotp"],
             &[
                 "keyroostctl",
@@ -17452,7 +17551,7 @@ mod cli_tests {
             (&["keyroostctl", "molto", "import-file", "x.json"], None),
             (&["keyroostctl", "list"], None),
             (&["keyroostctl", "key-name", "add", "x"], None),
-            (&["keyroostctl", "piv", "status"], None),
+            (&["keyroostctl", "piv", "info"], None),
         ] {
             let cli = parse(args).unwrap();
             assert_eq!(inert_device_flag(cli.command.as_ref()), what, "{args:?}");

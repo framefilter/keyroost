@@ -51,7 +51,7 @@ fn value_parser_errors_name_the_value_once() {
             "abc",
         ),
         (&["molto", "config", "-p", "120", "--digits", "6"], "120"),
-        (&["otp", "button-hotp", "--digits", "7"], "7"),
+        (&["otp", "set-button-hotp", "--digits", "7"], "7"),
         (&["piv", "self-sign", "--days", "zz"], "zz"),
         (&["piv", "self-sign", "--years", "zz"], "zz"),
         (&["piv", "self-sign", "--months", "zz"], "zz"),

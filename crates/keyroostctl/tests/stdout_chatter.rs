@@ -39,7 +39,7 @@ const CHATTER: &[&str] = &[
 
 /// Results that legitimately contain one of the words above.
 const ALLOWED: &[&str] = &[
-    "Fingerprint protection enabled", // fp-enable ack: tells the user what changed
+    "Fingerprint protection enabled", // fingerprint-enable ack: tells the user what changed
     "wiped (warning:",                // factory-reset step line: the step's result
     "Wrote a new CHUID",              // piv set-chuid ack: the card write is the result
     // `doctor` / `list` report a bootloader-mode device inline, under the

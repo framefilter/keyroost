@@ -17429,7 +17429,7 @@ impl App {
                     // The token's own reported name when it has one (e.g. a
                     // Nitrokey's admin application); otherwise the generic name
                     // for its fingerprinted applet family — same fallback as
-                    // `keyroostctl piv status`'s plain-text output.
+                    // `keyroostctl piv info`'s plain-text output.
                     let applet_name = if st.applet_name.is_empty() {
                         st.applet_fingerprint.applet_name().to_string()
                     } else {
@@ -17445,7 +17445,7 @@ impl App {
                     // CHUID — GUID and expiration only. FASC-N carries no
                     // information worth showing here (it's a fixed filler, not
                     // real card data — see keyroost_piv::encode_chuid) and stays
-                    // out of the UI; `keyroostctl piv status` still prints it.
+                    // out of the UI; `keyroostctl piv info` still prints it.
                     // The signature and LRC fields are omitted everywhere.
                     if let Some(chuid) = &st.chuid {
                         ui.label(
