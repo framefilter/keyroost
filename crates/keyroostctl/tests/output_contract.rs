@@ -62,3 +62,14 @@ fn value_parser_errors_name_the_value_once() {
         assert_eq!(first.matches(v).count(), 1, "{args:?}: {first}");
     }
 }
+
+#[test]
+fn list_json_is_one_object_with_keys() {
+    for args in [&["--json", "list"][..], &["--json"]] {
+        let (code, out, err) = run(args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        let v: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("{args:?}: stdout is not one JSON document ({e}): {out:?}"));
+        assert!(v["keys"].is_array(), "{out}");
+    }
+}

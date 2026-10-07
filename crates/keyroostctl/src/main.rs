@@ -3907,7 +3907,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let rows = filter_rows(&devices, cli.device.as_deref())?;
         if json_output() {
             use keyroost_resolve::DeviceKind;
-            let out: Vec<json_out::DeviceJson> = rows
+            let keys: Vec<json_out::DeviceJson> = rows
                 .iter()
                 .map(|(_, d)| json_out::DeviceJson {
                     vendor: d.vendor.clone(),
@@ -3920,8 +3920,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         DeviceKind::Token => "token",
                         DeviceKind::ProgToken => "prog-token",
                     },
-                    caps: d.cap_badges(),
-                    caps_unverified: d
+                    capabilities: d.cap_badges(),
+                    capabilities_unverified: d
                         .cap_badge_states()
                         .into_iter()
                         .filter(|(_, s)| *s == keyroost_resolve::CapState::Unverified)
@@ -3929,7 +3929,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .collect(),
                 })
                 .collect();
-            emit_json(&out)?;
+            emit_json(&json_out::KeysJson { keys })?;
             return Ok(());
         }
         overview::print_overview(&rows);
@@ -4122,7 +4122,7 @@ fn run_molto(
         if json_output() {
             emit_json(&json_out::MoltoInfoJson {
                 serial: info.serial.clone(),
-                utc: info.utc_time,
+                utc_time: info.utc_time,
                 drift_seconds: i64::from(info.utc_time) - i64::from(unix_now()),
             })?;
             return Ok(());
@@ -4152,17 +4152,7 @@ fn run_molto(
             let out: Vec<json_out::MoltoSlotJson> = slots
                 .iter()
                 .enumerate()
-                .map(|(i, b)| json_out::MoltoSlotJson {
-                    slot: i as u8,
-                    occupied: b.seed_present,
-                    title: b.title.clone(),
-                    flag: b.flag,
-                    algorithm: b.algorithm,
-                    time_step: b.time_step,
-                    digits: b.digits,
-                    time_a: b.time_a,
-                    time_b: b.time_b,
-                })
+                .map(|(i, b)| json_out::MoltoSlotJson::from_block(i as u8, b))
                 .collect();
             let out = json_out::MoltoSlotsJson {
                 serial: info.serial.clone(),
@@ -4851,7 +4841,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     if json_output() {
         let devices = target::enumerate()?;
         let rows = filter_rows(&devices, device)?;
-        emit_json(&list_json_rows(&devices, &rows))?;
+        emit_json(&json_out::KeysJson {
+            keys: list_json_rows(&devices, &rows),
+        })?;
         return Ok(());
     }
 
@@ -6205,7 +6197,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             }
             let creds = listing.credentials;
             if json_output() {
-                let out: Vec<json_out::OathCredentialJson> = creds
+                let accounts: Vec<json_out::OathCredentialJson> = creds
                     .iter()
                     .map(|c| json_out::OathCredentialJson {
                         name: c.name.clone(),
@@ -6213,7 +6205,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                         algorithm: oath_algo_str(c.algorithm),
                     })
                     .collect();
-                emit_json(&out)?;
+                emit_json(&json_out::AccountsJson { accounts })?;
                 return Ok(());
             }
             if creds.is_empty() {
@@ -6696,7 +6688,7 @@ fn run_otp(
             // "PIN required" error from enumerate_pinned.
             let entries = session.enumerate_pinned(now, pin.as_deref().map(|p| p.as_str()))?;
             if json_output() {
-                let out: Vec<json_out::OtpEntryJson> = entries
+                let accounts: Vec<json_out::OtpEntryJson> = entries
                     .iter()
                     .map(|e| json_out::OtpEntryJson {
                         app: e.app_name.clone(),
@@ -6707,7 +6699,7 @@ fn run_otp(
                         touch_required: e.button_required,
                     })
                     .collect();
-                emit_json(&out)?;
+                emit_json(&json_out::AccountsJson { accounts })?;
                 return Ok(());
             }
             if entries.is_empty() {
@@ -7041,8 +7033,8 @@ fn run_otp(
                 emit_json(&json_out::OtpPinStatusJson {
                     supported: flag.is_some(),
                     pin_set: flag.as_ref().map(|f| f.is_set()),
-                    retries_left: flag.as_ref().map(|f| f.retries_left),
-                    max_retries: flag.as_ref().map(|f| f.max_retries),
+                    pin_retries: flag.as_ref().map(|f| f.retries_left),
+                    pin_retries_max: flag.as_ref().map(|f| f.max_retries),
                 })?;
                 return Ok(());
             }
@@ -7298,16 +7290,16 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 };
                 emit_json(&json_out::OpenpgpStatusJson {
                     aid: hex_encode(&status.aid),
-                    serial: status.serial(),
+                    serial: status.serial().map(|s| s.to_string()),
                     sig_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Sign),
                     dec_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
                     aut_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
                     fingerprint_sig: fpr(&status.fingerprint_sig),
                     fingerprint_dec: fpr(&status.fingerprint_dec),
                     fingerprint_aut: fpr(&status.fingerprint_aut),
-                    pin_retries_pw1: status.tries_pw1,
-                    pin_retries_rc: status.tries_rc,
-                    pin_retries_pw3: status.tries_pw3,
+                    user_pin_retries: status.tries_pw1,
+                    reset_code_retries: status.tries_rc,
+                    admin_pin_retries: status.tries_pw3,
                     signature_count: status.signature_count,
                 })?;
                 return Ok(());
@@ -7782,7 +7774,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 .slots
                                 .iter()
                                 .map(|s| json_out::PivSlotJson {
-                                    slot: s.slot.label(),
+                                    slot: json_out::piv_slot_token(s.slot),
+                                    slot_name: s.slot.label(),
                                     cert_present: s.cert_present,
                                     cert_len: if s.cert_present { s.cert_len } else { 0 },
                                     cert_unreadable: s.cert_unreadable.map(|r| r.code()),
@@ -8674,7 +8667,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let all_ok = !results.iter().any(|(_, r)| r.is_failure());
                     if json_output() {
                         emit_json(&json_out::PivTestJson {
-                            slot: piv_slot.label().to_string(),
+                            slot: json_out::piv_slot_token(piv_slot),
+                            slot_name: piv_slot.label(),
                             algorithm: alg.label().to_string(),
                             ok: all_ok,
                             operations: results
@@ -10393,7 +10387,7 @@ fn large_blob_kind(
         EntryKind::SshCert { info, .. } => {
             let cert = json_out::FidoLargeBlobSshCertJson {
                 key_type: info.key_type.clone(),
-                serial: info.serial,
+                serial: info.serial.to_string(),
                 cert_type: if info.cert_type == keyroost_ctap::ssh_cert::CERT_TYPE_USER {
                     "user"
                 } else {
@@ -11974,6 +11968,19 @@ mod otp_capability_tests {
 
 #[cfg(test)]
 mod cli_tests {
+    #[test]
+    fn piv_slot_token_matches_clap_for_every_slot() {
+        use clap::ValueEnum;
+        for v in CliPivSlot::value_variants() {
+            let clap_name = v.to_possible_value().unwrap().get_name().to_string();
+            assert_eq!(json_out::piv_slot_token(v.to_slot()), clap_name);
+        }
+        assert_eq!(
+            json_out::piv_slot_token(keyroost_piv::Slot::retired(20).unwrap()),
+            "95"
+        );
+    }
+
     use super::*;
     use clap::Parser;
 
@@ -15836,8 +15843,8 @@ mod cli_tests {
             serial: "12345678".into(),
             transport: "USB · PC/SC + FIDO HID".into(),
             kind: "key",
-            caps: vec!["FIDO2", "OATH", "PIV"],
-            caps_unverified: vec![],
+            capabilities: vec!["FIDO2", "OATH", "PIV"],
+            capabilities_unverified: vec![],
         };
         assert_json_has_keys(
             &d,
@@ -15847,24 +15854,24 @@ mod cli_tests {
                 "serial",
                 "transport",
                 "kind",
-                "caps",
-                "caps_unverified",
+                "capabilities",
+                "capabilities_unverified",
             ],
         );
-        // The whole overview is a JSON array of these.
-        let arr = serde_json::to_string(&vec![d]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
-        assert!(parsed.is_array());
+        // The whole overview is one object whose `keys` array holds these.
+        let doc = serde_json::to_string(&json_out::KeysJson { keys: vec![d] }).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert!(parsed["keys"].is_array());
     }
 
     #[test]
     fn molto_info_json_serializes() {
         let m = json_out::MoltoInfoJson {
             serial: "ABC123".into(),
-            utc: 1_700_000_000,
+            utc_time: 1_700_000_000,
             drift_seconds: -3,
         };
-        assert_json_has_keys(&m, &["serial", "utc", "drift_seconds"]);
+        assert_json_has_keys(&m, &["serial", "utc_time", "drift_seconds"]);
     }
 
     #[test]
@@ -15897,7 +15904,7 @@ mod cli_tests {
             &f,
             &["device", "channel_id", "firmware", "hid_caps", "ctap2"],
         );
-        // U2F-only device: ctap2 omitted entirely (skip_serializing_if).
+        // U2F-only device: ctap2 present as null.
         let u = json_out::FidoInfoJson {
             device: "/dev/hidraw1".into(),
             channel_id: 1,
@@ -15907,8 +15914,9 @@ mod cli_tests {
             hid_caps_raw: 0x08,
             ctap2: None,
         };
-        let s = serde_json::to_string(&u).unwrap();
-        assert!(!s.contains("ctap2"), "ctap2 should be omitted: {s}");
+        let v = serde_json::to_value(&u).unwrap();
+        assert!(v["ctap2"].is_null(), "ctap2 should be null: {v}");
+        assert!(v.as_object().unwrap().contains_key("ctap2"));
     }
 
     #[test]
@@ -15950,7 +15958,8 @@ mod cli_tests {
                 lrc: "".into(),
             }),
             slots: vec![json_out::PivSlotJson {
-                slot: "9a (Authentication)".into(),
+                slot: "9a".into(),
+                slot_name: "authentication (9A)".into(),
                 cert_present: true,
                 cert_len: 800,
                 cert_unreadable: None,
@@ -16068,9 +16077,10 @@ mod cli_tests {
     }
 
     #[test]
-    fn piv_slot_json_reports_compression_only_when_compressed() {
+    fn piv_slot_json_reports_compression_as_a_bool() {
         let slot = |cert_compressed| json_out::PivSlotJson {
-            slot: "key management (9D)".into(),
+            slot: "9d".into(),
+            slot_name: "key management (9D)".into(),
             cert_present: true,
             cert_len: 6164,
             cert_unreadable: None,
@@ -16079,13 +16089,14 @@ mod cli_tests {
         let v = serde_json::to_value(slot(true)).expect("serialize");
         assert_eq!(v["cert_compressed"], true);
         let v = serde_json::to_value(slot(false)).expect("serialize");
-        assert!(v.get("cert_compressed").is_none(), "{v}");
+        assert_eq!(v["cert_compressed"], false, "{v}");
     }
 
     #[test]
-    fn piv_slot_json_reports_an_unreadable_cert_only_when_there_is_one() {
+    fn piv_slot_json_reports_an_unreadable_cert_or_null() {
         let slot = |cert_unreadable| json_out::PivSlotJson {
-            slot: "key management (9D)".into(),
+            slot: "9d".into(),
+            slot_name: "key management (9D)".into(),
             cert_present: true,
             cert_len: 0,
             cert_unreadable,
@@ -16094,32 +16105,36 @@ mod cli_tests {
         let v = serde_json::to_value(slot(Some("damaged"))).expect("serialize");
         assert_eq!(v["cert_unreadable"], "damaged");
         let v = serde_json::to_value(slot(None)).expect("serialize");
-        assert!(v.get("cert_unreadable").is_none(), "{v}");
+        assert!(v["cert_unreadable"].is_null(), "{v}");
+        assert!(v.as_object().unwrap().contains_key("cert_unreadable"));
     }
 
     #[test]
     fn openpgp_status_json_serializes() {
         let o = json_out::OpenpgpStatusJson {
             aid: "d2760001240103040006...".into(),
-            serial: Some(12345678),
+            serial: Some("12345678".into()),
             sig_algo: "RSA-2048".into(),
             dec_algo: "RSA-2048".into(),
             aut_algo: "RSA-2048".into(),
             fingerprint_sig: Some("aabb...".into()),
             fingerprint_dec: None,
             fingerprint_aut: None,
-            pin_retries_pw1: 3,
-            pin_retries_rc: 0,
-            pin_retries_pw3: 3,
+            user_pin_retries: 3,
+            reset_code_retries: 0,
+            admin_pin_retries: 3,
             signature_count: Some(7),
         };
         assert_json_has_keys(
             &o,
             &[
                 "aid",
+                "serial",
                 "sig_algo",
-                "pin_retries_pw1",
-                "pin_retries_pw3",
+                "fingerprint_dec",
+                "user_pin_retries",
+                "reset_code_retries",
+                "admin_pin_retries",
                 "signature_count",
             ],
         );
@@ -16141,11 +16156,11 @@ mod cli_tests {
             oath_type: "TOTP",
             algorithm: "SHA1",
         };
-        assert_json_has_keys(&c, &["name", "oath_type", "algorithm"]);
-        // `oath list` emits a JSON array of these.
-        let arr = serde_json::to_string(&vec![c]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
-        assert!(parsed.is_array());
+        assert_json_has_keys(&c, &["name", "type", "algorithm"]);
+        // `oath list` emits one object whose `accounts` array holds these.
+        let doc = serde_json::to_string(&json_out::AccountsJson { accounts: vec![c] }).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert!(parsed["accounts"].is_array());
     }
 
     #[test]
@@ -16173,7 +16188,7 @@ mod cli_tests {
             &[
                 "app",
                 "account",
-                "otp_type",
+                "type",
                 "algorithm",
                 "code",
                 "touch_required",
@@ -16195,10 +16210,10 @@ mod cli_tests {
             v.get("touch_required").unwrap(),
             &serde_json::Value::Bool(true)
         );
-        // `otp list` emits a JSON array.
-        let arr = serde_json::to_string(&vec![e]).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&arr).unwrap();
-        assert!(parsed.is_array());
+        // `otp list` emits one object whose `accounts` array holds these.
+        let doc = serde_json::to_string(&json_out::AccountsJson { accounts: vec![e] }).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert!(parsed["accounts"].is_array());
     }
 
     #[test]
@@ -16249,14 +16264,15 @@ mod cli_tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
         assert!(v.get("relying_parties").unwrap().is_array());
-        // Empty rp_name is omitted (skip_serializing_if).
+        // An unknown rp_name is present as null.
         let no_name = json_out::FidoRelyingPartyJson {
             rp_id: "example.org".into(),
             rp_name: None,
             credentials: vec![],
         };
-        let s = serde_json::to_string(&no_name).unwrap();
-        assert!(!s.contains("rp_name"), "rp_name should be omitted: {s}");
+        let v = serde_json::to_value(&no_name).unwrap();
+        assert!(v["rp_name"].is_null(), "rp_name should be null: {v}");
+        assert!(v.as_object().unwrap().contains_key("rp_name"));
     }
 
     // ---- large-blob shaping (pure logic; no hardware) ----
@@ -16290,7 +16306,7 @@ mod cli_tests {
         assert_eq!(shaped.entries[0].kind, "note");
         assert!(shaped.entries[0].ssh_cert.is_none());
 
-        // [1] is opaque: is_note false, text omitted.
+        // [1] is opaque: is_note false, no text.
         assert_eq!(shaped.entries[1].index, 1);
         assert!(!shaped.entries[1].is_note);
         assert!(shaped.entries[1].text.is_none());
@@ -16307,13 +16323,14 @@ mod cli_tests {
             shaped.capacity.max_bytes - shaped.capacity.used_bytes
         );
 
-        // The opaque entry's text is omitted from the JSON (skip_serializing_if).
+        // The opaque entry's text is null in the JSON, and so is a note's
+        // ssh_cert; both keys are present.
         let s = serde_json::to_string(&shaped).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let arr = v.get("entries").unwrap().as_array().unwrap();
-        assert!(arr[0].get("text").is_some());
-        assert!(arr[1].get("text").is_none());
-        assert!(arr[0].get("ssh_cert").is_none());
+        assert_eq!(arr[0]["text"], "hello");
+        assert!(arr[1].get("text").is_some_and(|t| t.is_null()));
+        assert!(arr[0].get("ssh_cert").is_some_and(|c| c.is_null()));
     }
 
     #[test]
@@ -16334,9 +16351,9 @@ mod cli_tests {
         assert_eq!(g.kind, "opaque");
         assert_eq!(g.hex, "deadbeef0099");
         assert_json_has_keys(&g, &["index", "size", "is_note", "kind", "hex"]);
-        // text omitted for an opaque entry.
+        // text is null for an opaque entry.
         let s = serde_json::to_string(&g).unwrap();
-        assert!(!s.contains("\"text\""), "text should be omitted: {s}");
+        assert!(s.contains("\"text\":null"), "text should be null: {s}");
     }
 
     #[test]
