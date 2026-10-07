@@ -150,6 +150,26 @@ pub(crate) const APPEARED: &str =
     "a file appeared there while this command ran and was not replaced; \
      pass --overwrite to replace it";
 
+/// `write PATH: ERROR` for an output written after the card was changed.
+/// When the failure is a file that appeared mid-command ([`APPEARED`]),
+/// `card_note` follows it to say what is already on the card, so a rerun
+/// with `--overwrite` isn't the only way out.
+pub(crate) fn write_error(
+    path: &std::path::Path,
+    e: &std::io::Error,
+    card_note: Option<&str>,
+) -> String {
+    let shown = sanitize_terminal(&path.display().to_string());
+    match card_note {
+        Some(note)
+            if e.kind() == std::io::ErrorKind::AlreadyExists && e.to_string() == APPEARED =>
+        {
+            format!("write {shown}: {e}; {note}")
+        }
+        _ => format!("write {shown}: {e}"),
+    }
+}
+
 /// How an output file that passed [`check_overwrite`] is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutMode {
@@ -377,6 +397,33 @@ pub(crate) fn confirm_typed_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_error_says_what_the_card_already_holds() {
+        let dir = std::env::temp_dir().join(format!("keyroost-we-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cert.pem");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"x").unwrap();
+        let e = OutMode::New.write(&path, b"y").unwrap_err();
+        let note = "the certificate is stored in slot 9a";
+        let msg = write_error(&path, &e, Some(note));
+        assert!(
+            msg.starts_with(&format!("write {}: ", path.display())),
+            "{msg}"
+        );
+        assert!(msg.contains(APPEARED), "{msg}");
+        assert!(msg.ends_with(&format!("; {note}")), "{msg}");
+        // Without a note, or for any other write failure, no card note.
+        assert!(!write_error(&path, &e, None).contains("slot"));
+        let other = std::io::Error::other("disk full");
+        assert_eq!(
+            write_error(&path, &other, Some(note)),
+            format!("write {}: disk full", path.display())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     struct FakeTerm {
         present: bool,

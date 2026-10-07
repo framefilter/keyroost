@@ -9046,9 +9046,18 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes(), ku)?;
                     match out {
                         Some(path) => {
-                            out_mode
-                                .write(path, pem.as_bytes())
-                                .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                            // Only `--generate-key` changed the card; the
+                            // request itself is stored nowhere.
+                            let note = keygen.generate_key.then(|| {
+                                format!(
+                                    "the new key is in slot {}; rerun without \
+                                     --generate-key to sign a request for it",
+                                    slot_name(*slot)
+                                )
+                            });
+                            out_mode.write(path, pem.as_bytes()).map_err(|e| {
+                                crate::prompt::write_error(path, &e, note.as_deref())
+                            })?;
                             eprintln!(
                                 "Wrote certificate request for {} to {}.",
                                 slot.to_slot().label(),
@@ -9171,9 +9180,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         &stored,
                     );
                     if let Some(path) = out {
+                        let note = format!(
+                            "the certificate is stored on the card; `piv export-cert \
+                             --slot {} --out FILE` writes it",
+                            slot_name(*slot)
+                        );
                         out_mode
                             .write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
-                            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                            .map_err(|e| crate::prompt::write_error(path, &e, Some(&note)))?;
                         eprintln!("PEM copy written to {}.", path.display());
                     }
                     Ok(())
@@ -9999,9 +10013,15 @@ fn inline_generate_key(
         let der = keyroost_piv::spki::subject_public_key_info(&pubkey, alg)
             .map_err(|e| format!("key generated, but encoding its public key failed: {}", e))?;
         let pem = keyroost_piv::spki::to_pem(&der);
+        // The key is already replaced; a rerun with --generate-key would
+        // replace it again.
+        let note = format!(
+            "the new key is in slot {:02x}; rerun without --generate-key to use it",
+            slot.key_ref()
+        );
         pub_mode
             .write(path, pem.as_bytes())
-            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+            .map_err(|e| crate::prompt::write_error(path, &e, Some(&note)))?;
         eprintln!(
             "Wrote a copy of {}'s generated public key to {}.",
             slot.label(),
