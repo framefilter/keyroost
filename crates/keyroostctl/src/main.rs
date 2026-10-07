@@ -38,17 +38,23 @@ use crate::secrets::{Secrets, Source, Spec};
 /// resolver can honor it without threading it through every subcommand handler.
 static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
 
+/// `--reader` help shared by every command that takes it.
+const READER_HELP: &str =
+    "Smart-card reader whose name contains this text (case-insensitive), instead of --device";
+/// `--path` help shared by every FIDO and OTP command that takes it.
+const PATH_HELP: &str = "USB HID device path of the key, instead of --device";
+
 #[derive(Parser)]
 #[command(
     name = "keyroostctl",
     version,
-    about = "Program Token2 Molto2 / Molto2v2 TOTP tokens"
+    about = "Manage hardware security keys: FIDO2, OATH, OpenPGP, PIV and Token2 OTP, plus Token2 programmable TOTP tokens (Molto2 and the 2nd-generation single-profile token)"
 )]
 struct Cli {
     /// Print every message sent to and received from the key to stderr (APDUs,
     /// and FIDO CTAP over USB; not FIDO through a smart-card reader). The
     /// format is for people and may change between releases.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     debug: bool,
     /// Target a key by friendly name, serial, or `list` number (prefix name:,
     /// serial: or list: to force which). Can't be combined with --reader/--path.
@@ -61,13 +67,14 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        help_heading = "Global options",
         value_name = "KEY",
         add = clap_complete::ArgValueCandidates::new(device_candidates)
     )]
     device: Option<String>,
     /// Emit machine-readable JSON instead of human text (where supported: status
     /// and query commands). Side-effect commands ignore it.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     json: bool,
 
     #[command(subcommand)]
@@ -76,33 +83,91 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Print shell completions to stdout; they call back into keyroostctl so
-    /// `--device` completes saved key names (e.g. `keyroostctl completions bash
-    /// > ~/.local/share/bash-completion/completions/keyroostctl`).
-    Completions {
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
-    },
-    /// Write a set of man pages (keyroostctl.1 + keyroostctl-<group>.1) into a
-    /// directory, e.g. `keyroostctl manpage ./man && man -l ./man/keyroostctl-piv.1`.
-    Manpage {
-        /// Directory to write the .1 files into (created if missing).
-        #[arg(value_name = "DIR")]
-        dir: std::path::PathBuf,
+    /// List connected keys: smart-card (PC/SC) readers and FIDO USB (HID)
+    /// devices.
+    List {
+        /// Show every HID device, not just those advertising the FIDO usage page.
+        #[arg(long)]
+        all_hid: bool,
     },
     /// Diagnose the local environment: PC/SC service, readers, FIDO HID
     /// access, udev rules, registry permissions. Read-only, touches no key.
     Doctor,
+    /// Manage friendly names for security keys (opt-in; stored in keys.json).
+    KeyName {
+        #[command(subcommand)]
+        cmd: KeyNameCmd,
+    },
+    /// Manage FIDO2: passkeys, PIN, fingerprints, settings, the large-blob
+    /// store, SSH certificates, and reset.
+    Fido {
+        #[command(subcommand)]
+        cmd: FidoCmd,
+    },
+    /// Show codes and manage OATH (TOTP/HOTP) accounts on a security key.
+    ///
+    /// Talks to the key over the smart-card interface (PC/SC).
+    Oath {
+        #[command(subcommand)]
+        cmd: OathCmd,
+    },
+    /// Manage the OTP entries stored on a Token2 T2F2 / PIN+ FIDO key.
+    ///
+    /// Talks to the key over USB (HID) or the smart-card interface (CCID/NFC).
+    /// List entries, print a code, add or delete entries, set the button-press
+    /// HOTP keystroke slot, and read the serial number. This is the Token2 OTP
+    /// applet, distinct from the Yubico/Trussed applet the `oath` group
+    /// manages.
+    Otp {
+        /// Which transport to reach the OTP applet on. `auto` (default) tries
+        /// USB-HID and falls back to CCID/NFC when HID is disabled on the key.
+        #[arg(long, value_enum, default_value_t = OtpTransportArg::Auto, global = true)]
+        transport: OtpTransportArg,
+        #[arg(
+            id = "otp_reader",
+            long = "reader",
+            value_name = "SUBSTR",
+            global = true,
+            help = READER_HELP
+        )]
+        reader: Option<String>,
+        #[arg(
+            id = "otp_path",
+            long = "path",
+            value_name = "PATH",
+            global = true,
+            help = PATH_HELP
+        )]
+        path: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        cmd: OtpCmd,
+    },
+    /// Manage the OpenPGP card applet: status, keys, sign, decrypt, PINs,
+    /// cardholder details, and reset.
+    ///
+    /// Talks to the key over the smart-card interface (PC/SC).
+    Openpgp {
+        #[command(subcommand)]
+        cmd: OpenpgpCmd,
+    },
+    /// Manage the PIV (smart card) applet: status, PIN/PUK, management key,
+    /// keys, and certificates.
+    ///
+    /// Talks to the key over the smart-card interface (PC/SC).
+    Piv {
+        #[command(subcommand)]
+        cmd: PivCmd,
+    },
     /// Token2 Molto2 / Molto2v2 programmable TOTP token.
     Molto {
         #[command(flatten)]
         key: KeyArgs,
-        /// Smart-card reader name (substring) of the Molto2 to use, instead of --device.
         #[arg(
             id = "molto_reader",
             long = "reader",
             value_name = "SUBSTR",
-            global = true
+            global = true,
+            help = READER_HELP
         )]
         reader: Option<String>,
         #[command(subcommand)]
@@ -114,72 +179,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProgCmd,
     },
-    /// List connected devices: PC/SC readers and FIDO HID authenticators.
-    List {
-        /// Show every HID device, not just those advertising the FIDO usage page.
-        #[arg(long)]
-        all_hid: bool,
-    },
-    /// FIDO2 / CTAP2: device info, reset, PIN management, resident credentials.
-    Fido {
-        #[command(subcommand)]
-        cmd: FidoCmd,
-    },
-    /// Manage friendly names for security keys (opt-in; stored in keys.json).
-    KeyName {
-        #[command(subcommand)]
-        cmd: KeyNameCmd,
-    },
-    /// Read or manage OATH (TOTP/HOTP) credentials on a security key over PC/SC.
-    Oath {
-        #[command(subcommand)]
-        cmd: OathCmd,
-    },
-    /// Manage the OpenPGP card applet on a security key over PC/SC: status,
-    /// key generate/import, sign, decrypt, reset, and cardholder metadata.
-    Openpgp {
-        #[command(subcommand)]
-        cmd: OpenpgpCmd,
-    },
-    /// Manage the PIV (smartcard) applet on a security key over PC/SC: status,
-    /// PIN/PUK, management key, key generation, and certificate import/export.
-    Piv {
-        #[command(subcommand)]
-        cmd: PivCmd,
-    },
-    /// Manage on-device OTP entries on a Token2 T2F2 / PIN+ FIDO key over USB-HID
-    /// or CCID/NFC: list, print a code, add/delete entries, the button-press HOTP
-    /// keystroke slot, and the serial number. This is the Token2 OTP applet,
-    /// distinct from the Yubico/Trussed `oath` applet above.
-    Otp {
-        /// Which transport to reach the OTP applet on. `auto` (default) tries
-        /// USB-HID and falls back to CCID/NFC when HID is disabled on the key.
-        #[arg(long, value_enum, default_value_t = OtpTransportArg::Auto, global = true)]
-        transport: OtpTransportArg,
-        /// Smart-card reader name (substring) of the key, instead of --device.
-        #[arg(
-            id = "otp_reader",
-            long = "reader",
-            value_name = "SUBSTR",
-            global = true
-        )]
-        reader: Option<String>,
-        /// HID device path of the key, instead of --device.
-        #[arg(id = "otp_path", long = "path", value_name = "PATH", global = true)]
-        path: Option<std::path::PathBuf>,
-        #[command(subcommand)]
-        cmd: OtpCmd,
-    },
     /// Factory-reset EVERY resettable applet on the selected key: OATH,
-    /// OpenPGP, Token2 OTP, PIV, then FIDO2. On a USB key the FIDO2 step ends
-    /// with an unplug/replug + touch; a card in a smart-card reader is reset
-    /// in place instead (no replug, no touch). Wipes all credentials, codes,
-    /// keys, and PINs; each applet that completes comes back in factory
-    /// condition, and every step reports its own outcome. Irreversible.
+    /// OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed
+    /// confirmation (`--yes` to skip).
+    ///
+    /// Wipes all credentials, codes, keys, and PINs; each applet that
+    /// completes comes back in factory condition, and every step reports its
+    /// own outcome. On a USB key the FIDO2 step ends with an unplug/replug +
+    /// touch; a card in a smart-card reader is reset in place instead (no
+    /// replug, no touch).
     FactoryReset {
-        /// Substring of the PC/SC reader name (skips auto-detection for the
-        /// smart-card applets).
-        #[arg(long)]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Skip the typed confirmation (required when not run from a terminal).
         #[arg(long)]
@@ -231,6 +241,26 @@ enum Cmd {
             conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
         )]
         pin_stdin: bool,
+    },
+    /// Print shell completions to stdout.
+    ///
+    /// They call back into keyroostctl so `--device` completes saved key names
+    /// (e.g. `keyroostctl completions bash >
+    /// ~/.local/share/bash-completion/completions/keyroostctl`).
+    Completions {
+        /// Shell to print completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Write man pages (keyroostctl.1 + keyroostctl-<group>.1) into a
+    /// directory.
+    ///
+    /// For example: `keyroostctl manpage ./man && man -l
+    /// ./man/keyroostctl-piv.1`.
+    Manpage {
+        /// Directory to write the .1 files into (created if missing).
+        #[arg(value_name = "DIR")]
+        dir: std::path::PathBuf,
     },
 }
 
@@ -749,7 +779,7 @@ struct InlineKeyGen {
     /// Omit it to keep the normal behavior — sign the key already in the slot,
     /// named via GET METADATA or `--load-pubkey`. With it, `--load-pubkey`
     /// (and any prior `generate-key --save-pubkey`) is unnecessary, which is
-    /// the whole point on cards that don't support GET METADATA. Requires the
+    /// the whole point on cards that don't support GET METADATA. Needs the
     /// management key.
     #[arg(long, conflicts_with = "load_pubkey")]
     generate_key: bool,
@@ -781,14 +811,14 @@ enum PivCmd {
     /// Show PIV status: version, serial, PIN retries, and which key slots hold a
     /// certificate. No PIN or touch required.
     Info {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// Change the PIV PIN. Each PIN comes from an environment variable,
     /// stdin (the current PIN on the first line, the new one on the second)
     /// or, with neither, a hidden prompt.
     ChangePin {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Read the current PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
@@ -808,7 +838,7 @@ enum PivCmd {
     /// environment variable, stdin (the current PUK on the first line, the
     /// new one on the second) or, with neither, a hidden prompt.
     ChangePuk {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Read the current PUK from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "old_puk_stdin")]
@@ -826,7 +856,7 @@ enum PivCmd {
     },
     /// Unblock a blocked PIN using the PUK, setting a new PIN.
     UnblockPin {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Read the PUK from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "puk_stdin")]
@@ -842,10 +872,11 @@ enum PivCmd {
         #[arg(long)]
         new_pin_stdin: bool,
     },
-    /// Set the PIN and PUK retry counts (resets both to factory defaults).
-    /// Needs the management key and the current PIN.
+    /// Set the PIN and PUK retry counts; this also resets the PIN and PUK
+    /// themselves to their factory defaults. Needs the management key and the
+    /// current PIN.
     SetRetries {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// PIN retry count, at least 1: a zero count would leave the PIN
         /// permanently blocked.
@@ -903,7 +934,7 @@ enum PivCmd {
         // fields also start at 0, so `--help` interleaved the two structs'
         // args by tied order number instead of keeping this command's own
         // args — the `--old-mgmt-key-*` trio in particular — together.
-        #[arg(long, value_name = "SUBSTR", display_order = 10)]
+        #[arg(long, value_name = "SUBSTR", display_order = 10, help = READER_HELP)]
         reader: Option<String>,
         /// Read the current management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["old_mgmt_key_stdin", "old_mgmt_key_default"], display_order = 11)]
@@ -951,10 +982,14 @@ enum PivCmd {
     /// Generate a new key pair in a slot and print its public key (PEM). Needs
     /// the management key. Overwrites any existing key in the slot.
     GenerateKey {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
+        /// Key type to generate (the names ykman uses; OpenPGP's `nistp256` is
+        /// `eccp256` here).
         #[arg(long, value_enum, default_value = "eccp256")]
         algorithm: CliPivKeyAlg,
         /// When the new key's private key may be used. `default` sends the
@@ -1011,8 +1046,10 @@ enum PivCmd {
     /// as it did before that check existed. A `--load-pubkey` flag here would
     /// only feed that same unverifiable trust back into the comparison.
     ImportCert {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
         /// Certificate file to import (`.der` or `.pem`).
@@ -1036,8 +1073,10 @@ enum PivCmd {
     },
     /// Export a slot's certificate as PEM (default) or DER, to a file or stdout. No PIN required.
     ExportCert {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
         /// Write the certificate to this file instead of stdout.
@@ -1053,8 +1092,10 @@ enum PivCmd {
     /// signed on the card (PEM to stdout or --out). Hand the result to a CA;
     /// import the certificate it issues with `import-cert`.
     RequestCert {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
@@ -1119,8 +1160,10 @@ enum PivCmd {
     /// card, and store it in that slot (the slot then works in PIV-aware
     /// software without an external CA).
     SelfSign {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
@@ -1183,17 +1226,21 @@ enum PivCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Exercise a slot's private key end to end: for every operation the key's
-    /// algorithm supports (decrypt for RSA, key-agree for ECDH curves, sign
-    /// for RSA / ECDSA / Ed25519), run a fixed challenge on the card and
-    /// verify the result against the slot certificate's public key. Reports
-    /// each operation's pass / fail / skipped. Read-only — nothing on the card
-    /// changes. `--pin-env` / `--pin-stdin` are always optional: it's your
+    /// Test a slot's private key end to end against the slot certificate's
+    /// public key. Read-only — nothing on the card changes.
+    ///
+    /// For every operation the key's algorithm supports (decrypt for RSA,
+    /// key-agree for ECDH curves, sign for RSA / ECDSA / Ed25519), run a fixed
+    /// challenge on the card and verify the result against the slot
+    /// certificate's public key. Reports each operation's pass / fail /
+    /// skipped. `--pin-env` / `--pin-stdin` are always optional: it's your
     /// call whether to test with or without a PIN. Depending on device state
     /// and PIN policy, omitting it may fail.
     Test {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
         /// Read the PIN from the named environment variable.
@@ -1206,12 +1253,14 @@ enum PivCmd {
         pin_stdin: bool,
     },
     /// Write a fresh, randomly-generated CHUID (Card Holder Unique
-    /// Identifier). Needs the management key. Windows' PIV minidriver caches
+    /// Identifier). Needs the management key.
+    ///
+    /// Windows' PIV minidriver caches
     /// a card's contents by its CHUID's GUID, so after writing a new
     /// certificate or key it may keep showing stale data until the GUID
     /// changes — this forces that.
     NewChuid {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
@@ -1245,8 +1294,10 @@ enum PivCmd {
         #[arg(long, value_name = "HEX", value_parser = parse_guid_arg)]
         guid: Option<String>,
     },
-    /// Reset the PIV application to factory defaults: Wipes all keys, certs,
-    /// and PINs. This typically requires both the PIN and PUK to already be
+    /// Reset the PIV application to factory defaults: wipe all keys,
+    /// certificates and PINs. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// This typically requires both the PIN and PUK to already be
     /// blocked; keyroost arranges that itself where its list says the key
     /// supports RESET. A key with no entry gets a warning and a single bare
     /// RESET with nothing blocked; if it needs the PIN and PUK blocked first,
@@ -1265,8 +1316,9 @@ enum PivCmd {
     /// --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default or
     /// --pin-env/--pin-stdin supplied.
     Reset {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
         /// Run even on a device listed as incompatible. There it sends one bare
@@ -1316,12 +1368,16 @@ enum PivCmd {
         )]
         pin_stdin: bool,
     },
-    /// Clear a slot's certificate object (standard PIV; works on every card).
-    /// Removes ONLY the X.509 certificate — the slot's private key is left in
-    /// place. Needs the management key. DESTRUCTIVE: asks first.
+    /// Delete a slot's certificate; the slot's private key is left in place.
+    /// Needs the management key. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Clears ONLY the X.509 certificate object (standard PIV; works on every
+    /// card).
     DeleteCert {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
         /// Read the management key (hex) from the named environment variable.
@@ -1338,17 +1394,18 @@ enum PivCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Delete a slot's private key (Yubico extension). Permanently erases the
-    /// key material — the certificate object is left in place. Needs the
-    /// management key. DESTRUCTIVE: asks first.
+    /// Delete a slot's private key; the slot's certificate is left in place.
+    /// Needs the management key. Irreversible: asks first (`--yes` to skip).
     ///
-    /// Deleting a key is an extension to standard PIV (YubiKey 5.7+ and other
-    /// keys that implement it).
-    /// If keyroost's list marks this key as not supporting it, the command
+    /// Permanently erases the key material. Deleting a key is an extension to
+    /// standard PIV (YubiKey 5.7+ and other keys that implement it). If
+    /// keyroost's list marks this key as not supporting it, the command
     /// stops unless `--force`; a key with no entry gets a warning.
     DeleteKey {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
         /// Read the management key (hex) from the named environment variable.
@@ -1383,8 +1440,7 @@ enum PivCmd {
         /// Destination slot (must be empty).
         #[arg(long)]
         to: CliPivSlot,
-        /// PC/SC reader substring (skips auto-detection).
-        #[arg(long)]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Read the management key (hex) from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
@@ -1408,9 +1464,7 @@ enum OpenpgpCmd {
     /// Show card status: AID/serial, key algorithms and fingerprints, PIN retry
     /// counters, and the signature counter. No PIN or touch required.
     Info {
-        /// Select a reader whose name contains this substring (case-insensitive).
-        /// Omit to use the only OpenPGP card, or to list choices when several exist.
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// Verify a PIN against the card (checks it's correct; changes nothing). The
@@ -1427,7 +1481,7 @@ enum OpenpgpCmd {
         /// Read the PIN from stdin (one line; hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// Read the public key from a slot (read-only; no PIN). RSA keys print
@@ -1436,27 +1490,31 @@ enum OpenpgpCmd {
         /// Which key slot: `sign`, `decrypt`, or `auth`.
         #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// List the key algorithms this card reports accepting per slot (read-only;
     /// no PIN). Cards that don't publish the list accept any attempt and answer
     /// with an error if they can't.
     Algorithms {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// Factory-reset the OpenPGP applet: wipe ALL key slots and restore default
-    /// PINs (PW1 123456, PW3 12345678). DESTRUCTIVE; asks first. Also works
-    /// to recover a card whose PINs are blocked.
+    /// PINs (PW1 123456, PW3 12345678). Irreversible: asks first (`--yes` to
+    /// skip).
+    ///
+    /// Also works to recover a card whose PINs are blocked.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Set the cardholder name (PUT DATA 005B). Requires the admin PIN (PW3).
+    /// Set the cardholder name. Needs the admin PIN (PW3).
+    ///
+    /// Writes PUT DATA 005B.
     SetName {
         /// Cardholder name to write (UTF-8). The OpenPGP convention is
         /// `Surname<<Given`, but it is stored verbatim.
@@ -1467,10 +1525,12 @@ enum OpenpgpCmd {
         /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
         #[arg(long)]
         admin_pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Set the public-key URL (PUT DATA 5F50). Requires the admin PIN (PW3).
+    /// Set the public-key URL. Needs the admin PIN (PW3).
+    ///
+    /// Writes PUT DATA 5F50.
     SetUrl {
         /// URL to write.
         url: String,
@@ -1480,14 +1540,16 @@ enum OpenpgpCmd {
         /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
         #[arg(long)]
         admin_pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Generate a fresh key pair in a slot, optionally switching the slot's
-    /// algorithm first. DESTRUCTIVE — overwrites any existing key in that slot.
-    /// Requires the admin PIN (PW3) and `--yes`; on a YubiKey a touch is also
-    /// required. Also writes the key's v4 fingerprint and a generation
-    /// timestamp so an OpenPGP tool (e.g. gpg) recognizes the key.
+    /// Generate a fresh key pair in a slot, replacing any key already there.
+    /// Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Can switch the slot's algorithm first. Needs the admin PIN (PW3); on a
+    /// YubiKey a touch is also required. Also writes the key's v4 fingerprint
+    /// and a generation timestamp so an OpenPGP tool (e.g. gpg) recognizes the
+    /// key.
     GenerateKey {
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
         #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
@@ -1495,7 +1557,8 @@ enum OpenpgpCmd {
         /// Key algorithm to generate. Omit to keep the slot's current algorithm
         /// (RSA-2048 on a factory card). Ed25519 fits the sign/auth slots,
         /// X25519 the decrypt slot; the NIST/brainpool/secp256k1 curves fit any.
-        /// See `openpgp algorithms` for what this card accepts.
+        /// See `openpgp algorithms` for what this card accepts. (GnuPG's names;
+        /// PIV's `eccp256` is `nistp256` here.)
         #[arg(long, value_enum)]
         algorithm: Option<CliOpenpgpKeyAlg>,
         /// Confirm without asking (required when not run from a terminal).
@@ -1507,14 +1570,16 @@ enum OpenpgpCmd {
         /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
         #[arg(long)]
         admin_pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Import an RSA-2048 key into a slot. DESTRUCTIVE — overwrites any existing
-    /// key. The key comes from either `--generate` (fresh host keygen) or `--in
+    /// Import an RSA-2048 key into a slot, replacing any key already there.
+    /// Irreversible: asks first (`--yes` to skip).
+    ///
+    /// The key comes from either `--generate` (fresh host keygen) or `--in
     /// <FILE>` (an existing PKCS#1/PKCS#8 PEM or DER key); exactly one is
-    /// required. Requires admin PIN (PW3) and `--yes`. The key is registered
-    /// (fingerprint + timestamp) like generate-key.
+    /// required. Needs the admin PIN (PW3). The key is registered (fingerprint
+    /// + timestamp) like `openpgp generate-key`.
     ImportKey {
         /// Generate a fresh RSA-2048 key on the host and import it.
         /// Mutually exclusive with `--in`.
@@ -1538,15 +1603,16 @@ enum OpenpgpCmd {
         /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
         #[arg(long)]
         admin_pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Sign a file with the on-card signature key (PSO:CDS). Hashes the input
-    /// (SHA-256 by default, or SHA-1 via `--hash`). RSA slots sign a PKCS#1
-    /// DigestInfo; ECC slots sign the bare digest. Requires the signing PIN
-    /// (PW1) and, on a YubiKey, a touch. The output is the card's raw
-    /// signature: PKCS#1 for RSA, `r||s` (not DER) for ECDSA, `R||S` for
-    /// Ed25519.
+    /// Sign a file with the key in the signature slot.
+    ///
+    /// Runs PSO:CDS. Hashes the input (SHA-256 by default, or SHA-1 via
+    /// `--hash`). RSA slots sign a PKCS#1 DigestInfo; ECC slots sign the bare
+    /// digest. Needs the signing PIN (PW1) and, on a YubiKey, a touch. The
+    /// output is the card's raw signature: PKCS#1 for RSA, `r||s` (not DER)
+    /// for ECDSA, `R||S` for Ed25519.
     Sign {
         /// File whose contents to sign.
         #[arg(long, value_name = "FILE")]
@@ -1567,11 +1633,13 @@ enum OpenpgpCmd {
         /// modern default; SHA-1 is offered for interop with old verifiers.
         #[arg(long, value_enum, default_value_t = SignHash::Sha256)]
         hash: SignHash,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Decrypt a file with the on-card decryption key (PSO:DECIPHER). Requires
-    /// the user PIN (PW1) and, on a YubiKey, a touch.
+    /// Decrypt a file with the key in the decryption slot.
+    ///
+    /// Runs PSO:DECIPHER. Needs the user PIN (PW1) and, on a YubiKey, a
+    /// touch.
     Decrypt {
         /// For an RSA slot `--in` is the raw cryptogram; for an ECDH slot it is
         /// the sender's ephemeral public point (`04||X||Y`, or 32 raw bytes for
@@ -1590,15 +1658,17 @@ enum OpenpgpCmd {
         /// Read the user PIN (PW1) from stdin (one line; hidden when typed at a terminal).
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Produce a client/SSH authentication signature with the on-card
-    /// Authentication key (INTERNAL AUTHENTICATE). Hashes the input (SHA-256 by
-    /// default, or SHA-1 via `--hash`). RSA slots sign a PKCS#1 DigestInfo; ECC
-    /// slots sign the bare digest. Requires the user PIN (PW1) and, on a
-    /// YubiKey, a touch. The output is the card's raw signature: PKCS#1 for
-    /// RSA, `r||s` (not DER) for ECDSA, `R||S` for Ed25519.
+    /// Sign a challenge with the key in the authentication slot (client or SSH
+    /// login).
+    ///
+    /// Runs INTERNAL AUTHENTICATE. Hashes the input (SHA-256 by default, or
+    /// SHA-1 via `--hash`). RSA slots sign a PKCS#1 DigestInfo; ECC slots sign
+    /// the bare digest. Needs the user PIN (PW1) and, on a YubiKey, a touch.
+    /// The output is the card's raw signature: PKCS#1 for RSA, `r||s` (not
+    /// DER) for ECDSA, `R||S` for Ed25519.
     Authenticate {
         /// File whose contents to authenticate-sign.
         #[arg(long, value_name = "FILE")]
@@ -1619,7 +1689,7 @@ enum OpenpgpCmd {
         /// modern default; SHA-1 is offered for interop with old verifiers.
         #[arg(long, value_enum, default_value_t = SignHash::Sha256)]
         hash: SignHash,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// Change the user PIN (PW1). Each PIN comes from an environment
@@ -1640,7 +1710,7 @@ enum OpenpgpCmd {
         /// hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// Change the admin PIN (PW3). Each PIN comes from an environment
@@ -1661,11 +1731,13 @@ enum OpenpgpCmd {
         /// hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
     /// Unblock the user PIN (PW1) using the admin PIN (PW3), setting a new user
-    /// PIN. Recovers a card whose user PIN is blocked without a factory reset.
+    /// PIN.
+    ///
+    /// Recovers a card whose user PIN is blocked without a factory reset.
     /// Each PIN comes from an environment variable, stdin (the admin PIN on
     /// the first line, the new user PIN on the second) or, with neither, a
     /// hidden prompt — never argv.
@@ -1683,7 +1755,7 @@ enum OpenpgpCmd {
         /// given; hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
 }
@@ -1860,9 +1932,7 @@ enum KeyNameCmd {
 /// Flattened into each OATH subcommand so they share one access surface.
 #[derive(clap::Args)]
 struct OathAccess {
-    /// Select a reader whose name contains this substring (case-insensitive).
-    /// Omit to use the only OATH key, or to list choices when several exist.
-    #[arg(long, value_name = "SUBSTR")]
+    #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
     reader: Option<String>,
     /// Read the applet password from the named environment variable. Needed for
     /// password-protected applets (e.g. a YubiKey with an OATH password set).
@@ -1901,10 +1971,11 @@ enum OathCmd {
         #[command(flatten)]
         access: OathAccess,
     },
-    /// Add (provision) a TOTP or HOTP credential. The base32 seed comes from an
-    /// environment variable, stdin or, with neither, a hidden prompt — never
-    /// argv. Piped together with the applet password, the seed is the first
-    /// line and the password the second.
+    /// Add (provision) a TOTP or HOTP credential.
+    ///
+    /// The base32 seed comes from an environment variable, stdin or, with
+    /// neither, a hidden prompt — never argv. Piped together with the applet
+    /// password, the seed is the first line and the password the second.
     Add {
         /// Credential name to store (e.g. "issuer:account").
         name: String,
@@ -1932,7 +2003,8 @@ enum OathCmd {
         #[command(flatten)]
         access: OathAccess,
     },
-    /// Delete a credential by name.
+    /// Delete a credential by name. Irreversible: asks first (`--yes` to
+    /// skip).
     Delete {
         /// Credential name to remove.
         name: String,
@@ -1942,10 +2014,11 @@ enum OathCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Set (or replace) the applet password — never from argv. The current
-    /// password, if one is set, is read first (env, stdin line 1, or the
-    /// prompt), then the new one. To remove the password, use
-    /// `clear-password`.
+    /// Set (or replace) the applet password — never from argv.
+    ///
+    /// The current password, if one is set, is read first (env, stdin line 1,
+    /// or the prompt), then the new one. To remove the password, use `oath
+    /// clear-password`.
     SetPassword {
         /// Read the new password from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_password_stdin")]
@@ -1964,11 +2037,11 @@ enum OathCmd {
         access: OathAccess,
     },
     /// Factory-reset the OATH applet: wipe ALL authenticator credentials and
-    /// clear the access password. Needs no password — this is the recovery
-    /// path for a forgotten one. Irreversible.
+    /// clear the access password. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Needs no password — this is the recovery path for a forgotten one.
     Reset {
-        /// Substring of the PC/SC reader name to use (skips auto-detection).
-        #[arg(long)]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -1996,12 +2069,12 @@ struct KeyArgs {
 enum ProgCmd {
     /// Print device serial number and on-device UTC time. No auth needed.
     Info {
-        /// Match the reader whose name contains this substring (when more than
-        /// one reader is connected).
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Write the TOTP seed, from exactly one of --hex-env / --hex-stdin /
+    /// Write the TOTP seed.
+    ///
+    /// The seed comes from exactly one of --hex-env / --hex-stdin /
     /// --base32-env / --base32-stdin (never the command line). Hex or
     /// base32: the flag says which encoding you give (the token stores raw
     /// bytes).
@@ -2009,7 +2082,7 @@ enum ProgCmd {
         .args(["hex_env", "base32_env", "hex_stdin", "base32_stdin"])
         .multiple(false)))]
     Seed {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Read the hex seed from the named environment variable.
         #[arg(long, value_name = "VAR")]
@@ -2029,13 +2102,15 @@ enum ProgCmd {
     },
     /// Set the device configuration and seed the clock with the host's UTC time.
     Config {
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
+        /// HMAC algorithm for the codes.
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
         algorithm: AlgoArg,
         /// TOTP period in seconds.
         #[arg(long, value_enum, default_value_t = StepArg::S30)]
         period: StepArg,
+        /// How long the code stays on the display, in seconds.
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
         /// Confirm without asking (required when not run from a terminal).
@@ -2058,10 +2133,11 @@ enum MoltoCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Write a TOTP seed to a slot, from exactly one of --hex-env /
-    /// --hex-stdin / --base32-env / --base32-stdin (never the command line).
-    /// Hex or base32: the flag says which encoding you give (the token
-    /// stores raw bytes).
+    /// Write a TOTP seed to a slot.
+    ///
+    /// The seed comes from exactly one of --hex-env / --hex-stdin /
+    /// --base32-env / --base32-stdin (never the command line). Hex or base32:
+    /// the flag says which encoding you give (the token stores raw bytes).
     #[command(group(clap::ArgGroup::new("seed_source")
         .args(["hex_env", "base32_env", "hex_stdin", "base32_stdin"])
         .multiple(false)))]
@@ -2095,9 +2171,10 @@ enum MoltoCmd {
         #[arg(value_parser = parse_molto_title)]
         title: Option<String>,
     },
-    /// Delete one slot's seed. The title, if any, survives. Keyless:
-    /// the device accepts this from any card holder (hardware-verified),
-    /// so the only gate is the confirmation.
+    /// Delete one slot's seed. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// The title, if any, survives. Keyless: the device accepts this from any
+    /// card holder (hardware-verified), so the only gate is the confirmation.
     Delete {
         /// Slot number, 0-99 (Token2 calls these profiles).
         #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
@@ -2111,13 +2188,16 @@ enum MoltoCmd {
         /// Slot number, 0-99 (Token2 calls these profiles).
         #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: u8,
+        /// HMAC algorithm for the codes.
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
         algorithm: AlgoArg,
+        /// Code length in digits.
         #[arg(long, value_enum, default_value_t = DigitsArg::Six)]
         digits: DigitsArg,
         /// TOTP period in seconds.
         #[arg(long, value_enum, default_value_t = StepArg::S30)]
         period: StepArg,
+        /// How long the code stays on the display, in seconds.
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
     },
@@ -2131,7 +2211,9 @@ enum MoltoCmd {
         all: bool,
     },
     /// Rotate the device's customer key (requires physical button
-    /// confirmation). The new key comes from exactly one of --hex-env /
+    /// confirmation).
+    ///
+    /// The new key comes from exactly one of --hex-env /
     /// --hex-stdin / --ascii-env / --ascii-stdin (never the command line);
     /// typed at a terminal it is asked twice. The current key comes from
     /// --key-env / --key-ascii-env (factory default with neither).
@@ -2153,7 +2235,9 @@ enum MoltoCmd {
         ascii_stdin: bool,
     },
     /// Import an otpauth:// URI to a slot: writes seed, title, and config
-    /// in one go. The URI comes from stdin (`-`), --uri-env VAR or a QR
+    /// in one go.
+    ///
+    /// The URI comes from stdin (`-`), --uri-env VAR or a QR
     /// screenshot (--qr), never the command line; with none of them, a
     /// terminal asks for it (hidden).
     Import {
@@ -2182,7 +2266,9 @@ enum MoltoCmd {
         yes: bool,
     },
     /// Bulk-import a plaintext or encrypted export from Aegis, 2FAS, or a list
-    /// of otpauth:// URIs. For encrypted Aegis vaults, pass the password via
+    /// of otpauth:// URIs.
+    ///
+    /// For encrypted Aegis vaults, pass the password via
     /// `--password-stdin` (suitable for piping from a file or password manager)
     /// or `--password-env VAR`; with neither, a terminal asks for it (hidden).
     ImportFile {
@@ -2208,7 +2294,9 @@ enum MoltoCmd {
         yes: bool,
     },
     /// Sweep plausible read APDUs against the device and report what the firmware
-    /// recognizes. Read-only by intent — sends short read-style requests with
+    /// recognizes.
+    ///
+    /// Read-only by intent — sends short read-style requests with
     /// destructive INS bytes (set seed/title/config, factory reset, set customer
     /// key) excluded by default.
     #[command(hide = true)]
@@ -2230,7 +2318,9 @@ enum MoltoCmd {
         #[arg(long, default_value_t = 99)]
         slot: u8,
     },
-    /// Factory-reset the device. Wipes all slots and restores default customer key.
+    /// Factory-reset the device: wipe all slots and restore the default
+    /// customer key. Irreversible: asks first (`--yes` to skip).
+    ///
     /// Requires physical button confirmation on the device.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
@@ -2239,23 +2329,24 @@ enum MoltoCmd {
     },
 }
 
-/// FIDO2 / CTAP2 subcommands. These talk to a hidraw device, not the Molto2
-/// PC/SC reader.
+/// FIDO2 / CTAP2 subcommands. These talk to the key over USB HID (`fido reset
+/// --reader` can use a smart-card reader instead).
 #[derive(Subcommand)]
 enum FidoCmd {
-    /// Run `authenticatorGetInfo` against a connected FIDO authenticator.
+    /// Show the key's FIDO2 capabilities and settings.
+    ///
+    /// Runs authenticatorGetInfo.
     Info {
-        /// hidraw path to use — an expert override that targets that path as
-        /// typed. If omitted, auto-pick the only connected FIDO device.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Run `authenticatorReset`, wiping all credentials on the key.
+    /// Factory-reset FIDO2: delete every passkey and the PIN. Irreversible:
+    /// asks first (`--yes` to skip).
     ///
-    /// Most authenticators only accept Reset within ~10s of plug-in and
-    /// require a physical touch. Asks first unless `--yes` is given, then
-    /// (over USB-HID) waits up to 60 seconds for the key to be unplugged and
-    /// plugged back in before sending the reset.
+    /// Runs authenticatorReset. Most authenticators only accept it within
+    /// ~10s of plug-in and require a physical touch, so over USB keyroost
+    /// waits up to 60 seconds for the key to be unplugged and plugged back in
+    /// before sending the reset.
     ///
     /// For a card in a smart-card reader (no USB interface), use `--reader`:
     /// the card is power-cycled in place — which starts the same
@@ -2265,12 +2356,10 @@ enum FidoCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// hidraw path to use — an expert override that targets that path as
-        /// typed. If omitted, auto-pick the only connected FIDO device.
-        #[arg(long, value_name = "PATH", conflicts_with = "reader")]
+        #[arg(long, value_name = "PATH", conflicts_with = "reader", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
-        /// Substring of the PC/SC reader holding the card to reset. Routes the
-        /// reset over the smart-card interface instead of USB-HID.
+        /// Smart-card reader holding the card to reset (name contains this
+        /// text); sends the reset over the smart-card interface instead of USB.
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
@@ -2318,7 +2407,7 @@ enum FidoCmd {
 enum FidoPinCmd {
     /// Print the current PIN retry counter.
     Retries {
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Set the initial PIN on an authenticator that doesn't have one yet. The
@@ -2331,7 +2420,7 @@ enum FidoPinCmd {
         /// Read the new PIN from stdin (hidden when typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Change the existing PIN. Each PIN comes from an environment variable,
@@ -2351,7 +2440,7 @@ enum FidoPinCmd {
         /// typed at a terminal).
         #[arg(long)]
         new_pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
 }
@@ -2369,10 +2458,11 @@ enum FidoCredentialsCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Delete a single resident credential by its hex-encoded credentialId.
+    /// Delete one passkey (resident credential) by its hex credential ID.
+    /// Irreversible: asks first (`--yes` to skip).
     Delete {
         /// Hex-encoded credentialId as printed by `fido credentials list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
@@ -2384,13 +2474,14 @@ enum FidoCredentialsCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
     },
-    /// Show resident-credential storage stats (uses pinUvAuthToken).
+    /// Show how many passkeys the key holds and how many more fit. Needs the
+    /// PIN.
     Metadata {
         /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2399,7 +2490,7 @@ enum FidoCredentialsCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
 }
@@ -2416,7 +2507,7 @@ enum FidoFingerprintsCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Enroll a new fingerprint. Touch the sensor repeatedly when prompted until
@@ -2432,10 +2523,11 @@ enum FidoFingerprintsCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Rename an enrolled fingerprint by its hex template id (from `list`).
+    /// Rename an enrolled fingerprint by its hex template id (from `fido
+    /// fingerprints list`).
     Rename {
         /// Hex-encoded template id as printed by `fido fingerprints list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
@@ -2450,10 +2542,11 @@ enum FidoFingerprintsCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Delete an enrolled fingerprint by its hex template id (from `list`).
+    /// Delete an enrolled fingerprint by its hex template id (from `fido
+    /// fingerprints list`). Irreversible: asks first (`--yes` to skip).
     Delete {
         /// Hex-encoded template id as printed by `fido fingerprints list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
@@ -2465,7 +2558,7 @@ enum FidoFingerprintsCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -2485,7 +2578,7 @@ enum FidoConfigCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Turn off "always require user verification" (alwaysUv). Does nothing if it is already off.
@@ -2497,13 +2590,14 @@ enum FidoConfigCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Raise the minimum PIN length. The value can only be increased, never
-    /// lowered (a reset is required to lower it), and may force a PIN change.
-    /// ONE-WAY: asks first. To only force a PIN change, use
-    /// `fido config force-pin-change` instead.
+    /// Raise the minimum PIN length. One-way: asks first (`--yes` to skip).
+    ///
+    /// The value can only be increased, never lowered (a FIDO2 reset is
+    /// required to lower it), and may force a PIN change. To only force a PIN
+    /// change, use `fido config force-pin-change` instead.
     SetMinPinLength {
         /// New minimum PIN length (in code points). Must be >= the current one.
         #[arg(long, value_name = "N")]
@@ -2521,7 +2615,7 @@ enum FidoConfigCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Force a PIN change on next use, without changing the minimum length.
@@ -2533,11 +2627,12 @@ enum FidoConfigCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Enable enterprise attestation. This is typically one-way: disabling it
-    /// again requires a device reset. Asks first.
+    /// Enable enterprise attestation. One-way: asks first (`--yes` to skip).
+    ///
+    /// Turning it off again typically requires a FIDO2 reset.
     EnableEnterpriseAttestation {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -2549,7 +2644,7 @@ enum FidoConfigCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
 }
@@ -2572,7 +2667,7 @@ enum SshCertCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Extract an SSH certificate from its largeBlob to a -cert.pub file.
@@ -2593,7 +2688,7 @@ enum SshCertCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
 }
@@ -2609,14 +2704,14 @@ enum SshCertCmd {
 enum LargeBlobCmd {
     /// List every entry: index, size, type (note vs opaque), and a short preview.
     List {
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Show one entry in full by its index (from `list`).
+    /// Show one entry in full by its index (from `fido large-blob list`).
     Get {
         /// Zero-based entry index as printed by `large-blob list`.
         index: usize,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Append a keyroost text note.
@@ -2635,7 +2730,7 @@ enum LargeBlobCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Replace the text of an existing keyroost note by its index.
@@ -2653,10 +2748,11 @@ enum LargeBlobCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Delete a single entry by its index.
+    /// Delete a single entry by its index. Irreversible: asks first (`--yes`
+    /// to skip).
     ///
     /// Deleting an opaque (RP-owned) entry may break a service that stored it;
     /// the command warns before asking.
@@ -2673,7 +2769,7 @@ enum LargeBlobCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Save one entry's bytes to a file (read-only; no PIN needed).
@@ -2692,10 +2788,11 @@ enum LargeBlobCmd {
         /// Write a recognized SSH certificate in `-cert.pub` text form.
         #[arg(long)]
         as_cert: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Erase the ENTIRE large-blob array, including any RP-owned entries.
+    /// Irreversible: asks first (`--yes` to skip).
     Clear {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -2707,7 +2804,7 @@ enum LargeBlobCmd {
         /// neither flag, a hidden prompt asks for it.
         #[arg(long)]
         pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
 }
@@ -2717,7 +2814,9 @@ enum LargeBlobCmd {
 #[derive(Subcommand)]
 enum OtpCmd {
     /// List the OTP entries stored on the key, with their live codes where the
-    /// device returns them (TOTP without button-press). On a PIN-protected
+    /// device returns them (TOTP without button-press).
+    ///
+    /// On a PIN-protected
     /// (R3.4+) key, `--unlock pin` (the default) takes the PIN from
     /// `--pin-env`/`--pin-stdin` or, with neither, a hidden prompt; a key
     /// without a PIN is never asked. `--unlock fingerprint` unlocks by a
@@ -2746,10 +2845,12 @@ enum OtpCmd {
         #[arg(long)]
         account: String,
     },
-    /// Add (or overwrite) an OTP entry. The base32 seed comes from an
-    /// environment variable, stdin or, with neither, a hidden prompt — never
-    /// argv. A PIN-protected (R3.4+) key also needs its PIN: piped together
-    /// with the seed, the seed is the first line and the PIN the second.
+    /// Add (or overwrite) an OTP entry.
+    ///
+    /// The base32 seed comes from an environment variable, stdin or, with
+    /// neither, a hidden prompt — never argv. A PIN-protected (R3.4+) key also
+    /// needs its PIN: piped together with the seed, the seed is the first line
+    /// and the PIN the second.
     Add {
         /// Application/issuer name (0..=64 ASCII chars; may be empty).
         #[arg(long, default_value = "")]
@@ -2786,9 +2887,11 @@ enum OtpCmd {
         #[arg(long)]
         pin_stdin: bool,
     },
-    /// Delete one OTP entry by app and account. A PIN-protected (R3.4+) key's
-    /// PIN comes from `--pin-env`/`--pin-stdin` or, with neither, a hidden
-    /// prompt after the question.
+    /// Delete one OTP entry by app and account. Irreversible: asks first
+    /// (`--yes` to skip).
+    ///
+    /// A PIN-protected (R3.4+) key's PIN comes from `--pin-env`/`--pin-stdin`
+    /// or, with neither, a hidden prompt after the question.
     Delete {
         /// Application/issuer name as stored (may be empty).
         #[arg(long, default_value = "")]
@@ -2807,8 +2910,10 @@ enum OtpCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Erase every OTP entry on the key. Asks first, then needs a confirming
-    /// button press.
+    /// Erase every OTP entry on the key. Irreversible: asks first (`--yes` to
+    /// skip).
+    ///
+    /// The key then needs a confirming button press.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -2817,7 +2922,9 @@ enum OtpCmd {
     /// Read the device serial number (over USB, or NFC where the model allows).
     Serial,
     /// Configure the single HOTP-on-button keystroke slot: the key types this
-    /// code when touched outside a session. The base32 seed comes from an
+    /// code when touched outside a session.
+    ///
+    /// The base32 seed comes from an
     /// environment variable, stdin or, with neither, a hidden prompt — never
     /// argv.
     SetButtonHotp {
@@ -2843,7 +2950,8 @@ enum OtpCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Delete the HOTP-on-button keystroke slot.
+    /// Delete the HOTP-on-button keystroke slot. Irreversible: asks first
+    /// (`--yes` to skip).
     DeleteButtonHotp {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -2854,13 +2962,13 @@ enum OtpCmd {
     /// Useful for diagnosing why the GUI's keyboard toggle or Touch HOTP gating
     /// behaves as it does.
     Info,
-    /// Enable or disable the key's USB interfaces (FIDO / keyboard-HID / CCID)
-    /// via SET_DEVICE_TYPE.
+    /// Enable or disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
     ///
-    /// You name the interfaces to ENABLE; any not named are disabled. At least
-    /// TWO must remain enabled: disabling all of them bricks the key, and leaving
-    /// only one risks locking you out, so the tool refuses fewer than two. This
-    /// reconfigures the hardware and requires typing a confirmation phrase.
+    /// Sends SET_DEVICE_TYPE. You name the interfaces to ENABLE; any not named
+    /// are disabled. At least TWO must remain enabled: disabling all of them
+    /// bricks the key, and leaving only one risks locking you out, so the tool
+    /// refuses fewer than two. This reconfigures the hardware and requires
+    /// typing a confirmation phrase.
     Interface {
         /// Enable the FIDO2/U2F interface.
         #[arg(long)]
@@ -2877,8 +2985,10 @@ enum OtpCmd {
     },
     /// Report OTP-PIN status (R3.4+ keys): whether a PIN is set and retries left.
     PinStatus,
-    /// Set an OTP PIN on a currently-unprotected key. After this, codes are
-    /// readable only after `verify`. The PIN comes from an environment
+    /// Set an OTP PIN on a currently-unprotected key.
+    ///
+    /// After this, codes are readable only after `otp verify` (or with
+    /// `otp list --pin-*`). The PIN comes from an environment
     /// variable, stdin or, with neither, a hidden prompt (asked twice) — never
     /// argv.
     ///
@@ -2894,7 +3004,7 @@ enum OtpCmd {
         new_pin_stdin: bool,
     },
     /// Verify the OTP PIN, opening the read window for this connection (mostly
-    /// for testing; `list` takes `--pin-*` directly). PIN via env, stdin or,
+    /// for testing; `otp list` takes `--pin-*` directly). PIN via env, stdin or,
     /// with neither, a hidden prompt.
     Verify {
         /// Read the OTP PIN from the named environment variable.
@@ -2921,8 +3031,8 @@ enum OtpCmd {
         #[arg(long)]
         new_pin_stdin: bool,
     },
-    /// Remove the OTP PIN (requires the current PIN). PIN via env, stdin or,
-    /// with neither, a hidden prompt.
+    /// Remove the OTP PIN. Needs the current OTP PIN: via env, stdin or, with
+    /// neither, a hidden prompt.
     ClearPin {
         /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2934,8 +3044,8 @@ enum OtpCmd {
     /// Report whether the key supports fingerprint-protected OTP and whether
     /// it is on.
     FingerprintStatus,
-    /// Enable fingerprint protection for OTP (needs the current PIN). After this,
-    /// codes can be unlocked by a fingerprint touch as well as the PIN.
+    /// Enable fingerprint protection for OTP. Needs the current OTP PIN. After
+    /// this, codes can be unlocked by a fingerprint touch as well as the PIN.
     FingerprintEnable {
         /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -2944,7 +3054,7 @@ enum OtpCmd {
         #[arg(long)]
         pin_stdin: bool,
     },
-    /// Disable fingerprint protection for OTP (needs the current PIN).
+    /// Disable fingerprint protection for OTP. Needs the current OTP PIN.
     FingerprintDisable {
         /// Read the OTP PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
@@ -12695,6 +12805,225 @@ mod cli_tests {
     use super::*;
     use clap::Parser;
 
+    const IRREVERSIBLE: &str = "Irreversible: asks first (`--yes` to skip)";
+    const IRREVERSIBLE_TYPED: &str =
+        "Irreversible: asks for a typed confirmation (`--yes` to skip)";
+    const ONE_WAY: &str = "One-way: asks first (`--yes` to skip)";
+
+    /// Every command in the tree with its path ("fido pin set"; "" for the root).
+    fn all_commands() -> Vec<(String, clap::Command)> {
+        use clap::CommandFactory;
+        fn walk(c: &clap::Command, path: String, out: &mut Vec<(String, clap::Command)>) {
+            out.push((path.clone(), c.clone()));
+            for s in c.get_subcommands().filter(|s| s.get_name() != "help") {
+                let p = if path.is_empty() {
+                    s.get_name().to_string()
+                } else {
+                    format!("{path} {}", s.get_name())
+                };
+                walk(s, p, out);
+            }
+        }
+        let mut root = Cli::command();
+        root.build();
+        let mut out = Vec::new();
+        walk(&root, String::new(), &mut out);
+        out
+    }
+
+    #[test]
+    fn every_flag_and_argument_has_help() {
+        let mut bad = Vec::new();
+        for (path, cmd) in all_commands() {
+            for a in cmd.get_arguments() {
+                if matches!(a.get_id().as_str(), "help" | "version") || a.is_hide_set() {
+                    continue;
+                }
+                if a.get_help().is_none_or(|h| h.to_string().trim().is_empty()) {
+                    let name = a
+                        .get_long()
+                        .map_or_else(|| a.get_id().to_string(), |l| format!("--{l}"));
+                    bad.push(format!("{path}: {name}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "no help:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn one_destructive_marker_style() {
+        let marked: &[(&str, &str)] = &[
+            ("fido reset", IRREVERSIBLE),
+            ("fido credentials delete", IRREVERSIBLE),
+            ("fido fingerprints delete", IRREVERSIBLE),
+            ("fido large-blob delete", IRREVERSIBLE),
+            ("fido large-blob clear", IRREVERSIBLE),
+            ("molto delete", IRREVERSIBLE),
+            ("molto reset", IRREVERSIBLE),
+            ("oath delete", IRREVERSIBLE),
+            ("oath reset", IRREVERSIBLE),
+            ("otp delete", IRREVERSIBLE),
+            ("otp reset", IRREVERSIBLE),
+            ("otp delete-button-hotp", IRREVERSIBLE),
+            ("openpgp reset", IRREVERSIBLE),
+            ("openpgp generate-key", IRREVERSIBLE),
+            ("openpgp import-key", IRREVERSIBLE),
+            ("piv reset", IRREVERSIBLE),
+            ("piv delete-cert", IRREVERSIBLE),
+            ("piv delete-key", IRREVERSIBLE),
+            ("factory-reset", IRREVERSIBLE_TYPED),
+            ("fido config set-min-pin-length", ONE_WAY),
+            ("fido config enable-enterprise-attestation", ONE_WAY),
+        ];
+        // Commands that ask before a change but don't wipe anything on their own.
+        let confirms_only = [
+            "molto seed",
+            "molto import",
+            "molto import-file",
+            "prog seed",
+            "prog config",
+            "otp set-button-hotp",
+            "otp interface",
+            "piv set-retries",
+            "piv generate-key",
+            "piv import-cert",
+            "piv request-cert",
+            "piv self-sign",
+        ];
+        for (path, cmd) in all_commands() {
+            // Hidden commands (`molto probe`) take `--yes` as a gate, not an answer.
+            if cmd.is_hide_set() {
+                continue;
+            }
+            let about = cmd.get_about().map(|s| s.to_string()).unwrap_or_default();
+            let long = cmd
+                .get_long_about()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            for old in [
+                "DESTRUCTIVE",
+                "ONE-WAY",
+                "Irreversible.",
+                "Irreversible\n",
+                "Asks first.",
+            ] {
+                assert!(
+                    !about.contains(old) && !long.contains(old),
+                    "{path}: old marker {old:?}"
+                );
+            }
+            match marked.iter().find(|(p, _)| *p == path) {
+                Some((_, m)) => assert!(
+                    about.ends_with(m),
+                    "{path}: first line must end with {m:?}: {about:?}"
+                ),
+                None => {
+                    assert!(
+                        !about.contains("Irreversible") && !about.contains("One-way"),
+                        "{path}: {about:?}"
+                    );
+                    let asks = cmd.get_arguments().any(|a| a.get_long() == Some("yes"));
+                    assert!(
+                        !asks || confirms_only.contains(&path.as_str()),
+                        "{path} has --yes: mark it or list it in confirms_only"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_lines_are_plain_and_short() {
+        let jargon = [
+            "authenticatorGetInfo",
+            "authenticatorReset",
+            "PUT DATA",
+            "PSO:",
+            "INTERNAL AUTHENTICATE",
+            "SET_DEVICE_TYPE",
+            "FpEnable",
+            "pinUvAuthToken",
+            "hidraw",
+        ];
+        let old_credential = [
+            "Requires the admin PIN",
+            "Requires admin PIN",
+            "(needs the current PIN)",
+            "(uses pinUvAuthToken)",
+        ];
+        for (path, cmd) in all_commands() {
+            let about = cmd.get_about().map(|s| s.to_string()).unwrap_or_default();
+            for j in jargon {
+                assert!(!about.contains(j), "{path}: {j:?} in the first line");
+            }
+            let plain = [IRREVERSIBLE, IRREVERSIBLE_TYPED, ONE_WAY]
+                .iter()
+                .fold(about.clone(), |s, m| s.replace(m, ""));
+            assert!(
+                plain.chars().count() <= 200,
+                "{path}: first line is {} chars",
+                plain.chars().count()
+            );
+            let long = cmd
+                .get_long_about()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            for c in old_credential {
+                assert!(!about.contains(c) && !long.contains(c), "{path}: {c:?}");
+            }
+        }
+        for (path, cmd) in all_commands() {
+            for a in cmd.get_arguments() {
+                let h = a.get_help().map(|s| s.to_string()).unwrap_or_default();
+                assert!(!h.contains("hidraw"), "{path}: --{:?}", a.get_long());
+            }
+        }
+    }
+
+    #[test]
+    fn top_level_help_covers_every_group_and_globals_come_last() {
+        use clap::CommandFactory;
+        let about = Cli::command().get_about().unwrap().to_string();
+        for g in ["FIDO2", "OATH", "OpenPGP", "PIV", "OTP", "Molto2"] {
+            assert!(about.contains(g), "{g}: {about}");
+        }
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "list",
+                "doctor",
+                "key-name",
+                "fido",
+                "oath",
+                "otp",
+                "openpgp",
+                "piv",
+                "molto",
+                "prog",
+                "factory-reset",
+                "completions",
+                "manpage"
+            ]
+        );
+        // `Cli` isn't Debug, so `.err().unwrap()` rather than `unwrap_err()`.
+        let help = Cli::try_parse_from(["keyroostctl", "molto", "config", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        let own = help.find("--algorithm").unwrap();
+        let global = help
+            .find("Global options:")
+            .expect("no Global options heading");
+        assert!(
+            own < global && global < help.find("--debug").unwrap(),
+            "{help}"
+        );
+    }
+
     #[test]
     fn always_uv_step_table() {
         assert_eq!(always_uv_step(Some(false), true), Ok(AlwaysUvStep::Change));
@@ -13523,10 +13852,10 @@ mod cli_tests {
     }
 
     // `--force` was renamed to `--overwrite` with no alias, so that "force" has
-    // one meaning across the CLI (piv/oath/otp/fido/molto/prog resets use it for
-    // "proceed without the usual confirmation" — a different question from
-    // "overwrite this file"). The old spelling must be rejected, not silently
-    // accepted.
+    // one meaning across the CLI: it exists only on piv commands, where it
+    // means "ignore keyroost's compatibility list" — a different question from
+    // "overwrite this file" (and from `--yes`, which skips the confirmation).
+    // The old spelling must be rejected, not silently accepted.
     #[test]
     fn ssh_cert_extract_overwrite_flag() {
         match parse(&["keyroostctl", "fido", "ssh-cert", "extract", "--overwrite"])
