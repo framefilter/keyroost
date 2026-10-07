@@ -48,7 +48,9 @@ struct Cli {
     /// List available PC/SC readers and exit.
     #[arg(long, global = true)]
     list_readers: bool,
-    /// Print every outgoing APDU and incoming response to stderr.
+    /// Print every message sent to and received from the key (APDUs and FIDO
+    /// CTAP) to stderr. The format is for people and may change between
+    /// releases.
     #[arg(long, global = true)]
     debug: bool,
     /// Target a key by friendly name, serial, or `list` number (prefix name:,
@@ -3902,6 +3904,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = SELECTED_KEY_NAME.set(cli.device.clone());
     output::set_json(cli.json);
     let _ = target::DEBUG.set(cli.debug);
+    if cli.debug {
+        keyroost_ctap::set_trace(true);
+    }
 
     if cli.device.is_some() {
         if let Some(what) = inert_device_flag(cli.command.as_ref(), cli.list_readers) {
@@ -3996,7 +4001,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // FIDO commands talk to a hidraw device, not the Molto2 PC/SC reader.
     if let Cmd::Fido { cmd } = cmd {
-        return run_fido(cmd, cli.debug);
+        return run_fido(cmd);
     }
 
     // OATH talks to a security key's CCID applet over PC/SC, not the Molto2.
@@ -9850,11 +9855,7 @@ fn fido_reverify_if_prompted<I: crate::secrets::SecretIo>(
     Ok(())
 }
 
-fn run_fido(cmd: &FidoCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // FIDO handlers open their own hidraw transport and don't consult the
-    // shared PC/SC debug flag; accept it for signature parity with the other
-    // run_* group dispatchers.
-    let _ = debug;
+fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         FidoCmd::Info { path } => {
             run_fido_info(path.as_deref())?;

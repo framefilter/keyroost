@@ -23,7 +23,10 @@ use std::io;
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use keyroost_proto::trace::{format_line, Dir};
 
 /// Broadcast channel ID used for the initial `CTAPHID_INIT` request.
 pub const CTAPHID_BROADCAST_CID: u32 = 0xFFFF_FFFF;
@@ -426,9 +429,13 @@ impl CtapHidDevice {
         loop {
             if ctap_trace_enabled() {
                 eprintln!(
-                    "CTAP > cmd=0x{cmd:02x} len={} {}",
-                    payload.len(),
-                    trace_payload(payload, sensitive)
+                    "{}",
+                    ctap_line(
+                        Dir::Sent,
+                        cmd,
+                        payload.len(),
+                        &trace_payload(payload, sensitive)
+                    )
                 );
             }
             let outcome = self
@@ -438,9 +445,13 @@ impl CtapHidDevice {
                 Ok(resp) => {
                     if ctap_trace_enabled() {
                         eprintln!(
-                            "CTAP < len={} {}",
-                            resp.len(),
-                            trace_payload(&resp, sensitive)
+                            "{}",
+                            ctap_line(
+                                Dir::Received,
+                                cmd,
+                                resp.len(),
+                                &trace_payload(&resp, sensitive)
+                            )
                         );
                     }
                     return Ok(resp);
@@ -453,8 +464,15 @@ impl CtapHidDevice {
                         // Framing metadata only — no payload, so this line
                         // can't leak what the redacted trace withheld.
                         eprintln!(
-                            "CTAP ! cmd=0x{cmd:02x} error=0x{code:02x} busy, retry {attempt} in {}ms",
-                            delay.as_millis()
+                            "{}",
+                            format_line(
+                                Dir::Note,
+                                &format!("ctaphid {}", ctap_cmd_name(cmd)),
+                                &format!(
+                                    "busy (error 0x{code:02x}), retry {attempt} in {}ms",
+                                    delay.as_millis()
+                                ),
+                            )
                         );
                     }
                     self.sleep_between_attempts(delay)?;
@@ -489,8 +507,19 @@ impl CtapHidDevice {
 
     fn do_init(&mut self) -> Result<InitResponse, HidTransportError> {
         let nonce = generate_nonce();
+        if ctap_trace_enabled() {
+            let body = hexline(&nonce);
+            eprintln!("{}", ctap_line(Dir::Sent, CTAPHID_INIT, nonce.len(), &body));
+        }
         self.send(CTAPHID_BROADCAST_CID, CTAPHID_INIT, &nonce)?;
         let resp = self.recv(CTAPHID_BROADCAST_CID, CTAPHID_INIT)?;
+        if ctap_trace_enabled() {
+            let body = hexline(&resp);
+            eprintln!(
+                "{}",
+                ctap_line(Dir::Received, CTAPHID_INIT, resp.len(), &body)
+            );
+        }
         if resp.len() < 17 {
             return Err(HidTransportError::InitResponseTooShort);
         }
@@ -644,10 +673,45 @@ impl CtapHidDevice {
     }
 }
 
-/// True when `KEYROOST_CTAP_DEBUG` is set, enabling a stderr hex trace of every
-/// CTAP-HID transaction. Diagnostics only — never on by default.
+static TRACE_ON: AtomicBool = AtomicBool::new(false);
+
+/// Turn the CTAP-HID stderr trace on or off for this process (the CLI's
+/// `--debug`). `KEYROOST_CTAP_DEBUG` set in the environment also enables it.
+pub fn set_trace(enabled: bool) {
+    TRACE_ON.store(enabled, Ordering::Relaxed);
+}
+
+/// True when [`set_trace`] turned the trace on or `KEYROOST_CTAP_DEBUG` is
+/// set, enabling a stderr hex trace of every CTAP-HID transaction.
+/// Diagnostics only — never on by default.
 fn ctap_trace_enabled() -> bool {
-    std::env::var_os("KEYROOST_CTAP_DEBUG").is_some()
+    TRACE_ON.load(Ordering::Relaxed) || std::env::var_os("KEYROOST_CTAP_DEBUG").is_some()
+}
+
+/// Short name of a CTAPHID command for the trace. Accepts the wire byte
+/// (init bit set, e.g. `0x90`) or the bare command number (`0x10`).
+fn ctap_cmd_name(cmd: u8) -> String {
+    match cmd & 0x7F {
+        0x01 => "ping".to_owned(),
+        0x03 => "msg".to_owned(),
+        0x06 => "init".to_owned(),
+        0x08 => "wink".to_owned(),
+        0x10 => "cbor".to_owned(),
+        0x11 => "cancel".to_owned(),
+        0x3B => "keepalive".to_owned(),
+        0x3F => "error".to_owned(),
+        _ => format!("0x{cmd:02x}"),
+    }
+}
+
+/// One CTAP-HID trace line in the shared `--debug` grammar. `payload` is
+/// already the (possibly redacted) body from [`trace_payload`].
+fn ctap_line(dir: Dir, cmd: u8, len: usize, payload: &str) -> String {
+    format_line(
+        dir,
+        &format!("ctaphid {}", ctap_cmd_name(cmd)),
+        &format!("len={len} {payload}"),
+    )
 }
 
 /// True when a CTAPHID CBOR exchange carries personal data that must be
@@ -1154,6 +1218,49 @@ mod tests {
         let body = trace_payload(resp, true);
         assert!(body.contains("redacted"));
         assert!(!body.contains(&hexline(b"note")));
+    }
+
+    #[test]
+    fn set_trace_enables_and_disables() {
+        set_trace(true);
+        assert!(ctap_trace_enabled());
+        set_trace(false);
+        if std::env::var_os("KEYROOST_CTAP_DEBUG").is_none() {
+            assert!(!ctap_trace_enabled());
+        }
+    }
+
+    #[test]
+    fn ctap_line_uses_shared_grammar() {
+        assert_eq!(
+            ctap_line(Dir::Sent, 0x10, 1, "04"),
+            "> ctaphid cbor          len=1 04"
+        );
+        // The wire command byte (init bit set) names the same command.
+        assert_eq!(
+            ctap_line(Dir::Received, CTAPHID_CBOR, 1, "00"),
+            "< ctaphid cbor          len=1 00"
+        );
+        assert_eq!(ctap_cmd_name(CTAPHID_INIT), "init");
+        assert_eq!(ctap_cmd_name(0x55), "0x55");
+    }
+
+    #[test]
+    fn ctap_line_keeps_sensitive_payloads_redacted() {
+        // The shared-grammar wrapper must not reintroduce what the
+        // redaction withheld: the line carries framing plus the marker only.
+        let mut payload = vec![0x09];
+        payload.extend_from_slice(b"\xa1\x02mAlice Example");
+        let sensitive = exchange_is_sensitive(CTAPHID_CBOR, &payload);
+        let line = ctap_line(
+            Dir::Sent,
+            CTAPHID_CBOR,
+            payload.len(),
+            &trace_payload(&payload, sensitive),
+        );
+        assert!(line.starts_with("> ctaphid cbor"));
+        assert!(line.contains("<redacted: personal-data payload>"));
+        assert!(!line.contains(&hexline(b"Alice")));
     }
 
     #[test]

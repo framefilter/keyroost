@@ -24,6 +24,7 @@ use keyroost_proto::commands::{
     self, derive_sm4_key, sw_auth_failed, sw_completed, sw_ok, Command, ProfileConfig,
     ProfilePublicData, PublicDataError,
 };
+use keyroost_proto::trace::{format_line, Dir};
 use pcsc::{
     Attribute, Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State,
     PNP_NOTIFICATION,
@@ -750,16 +751,16 @@ impl Session {
     /// Returns an error if the device responds with anything other than `9000`.
     fn transmit(&mut self, cmd: &Command) -> Result<Vec<u8>, TransportError> {
         trace::line(self.debug, || {
-            format!(
-                "> {:>20} >> {}",
+            format_line(
+                Dir::Sent,
                 cmd.label,
-                dump_cmd(&cmd.apdu, molto2_cmd_sensitive(&cmd.apdu))
+                &dump_cmd(&cmd.apdu, molto2_cmd_sensitive(&cmd.apdu)),
             )
         });
         let mut buf = [0u8; 2048];
         let response = self.card.transmit(&cmd.apdu, &mut buf)?;
         trace::line(self.debug, || {
-            format!("< {:>20} << {}", cmd.label, hex_dump(response))
+            format_line(Dir::Received, cmd.label, &hex_dump(response))
         });
         if response.len() < 2 {
             return Err(TransportError::ShortResponse {
@@ -789,16 +790,16 @@ impl Session {
     /// Used for the probing subcommand.
     pub fn transmit_raw(&mut self, cmd: &Command) -> Result<(Vec<u8>, u8, u8), TransportError> {
         trace::line(self.debug, || {
-            format!(
-                "> {:>20} >> {}",
+            format_line(
+                Dir::Sent,
                 cmd.label,
-                dump_cmd(&cmd.apdu, molto2_cmd_sensitive(&cmd.apdu))
+                &dump_cmd(&cmd.apdu, molto2_cmd_sensitive(&cmd.apdu)),
             )
         });
         let mut buf = [0u8; 2048];
         let response = self.card.transmit(&cmd.apdu, &mut buf)?;
         trace::line(self.debug, || {
-            format!("< {:>20} << {}", cmd.label, hex_dump(response))
+            format_line(Dir::Received, cmd.label, &hex_dump(response))
         });
         if response.len() < 2 {
             return Err(TransportError::ShortResponse {
@@ -1055,6 +1056,11 @@ pub struct ReaderProbe {
     pub usb_address: Option<u8>,
 }
 
+/// One `KEYROOST_PROBE_DEBUG` line on stderr, in the shared trace grammar.
+fn probe_note(body: &str) {
+    eprintln!("{}", format_line(Dir::Note, "probe", body));
+}
+
 /// Probe every connected PC/SC reader in a single pass: one context, the reader
 /// list once, and **at most one card connection per reader**, on which all
 /// applet SELECTs are issued in sequence.
@@ -1132,7 +1138,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         };
         let trace = std::env::var_os("KEYROOST_PROBE_DEBUG").is_some();
         if trace {
-            eprintln!("[probe] reader seen: {}", probe.reader_name);
+            probe_note(&format!("reader seen: {}", probe.reader_name));
         }
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
             (probe.usb_bus, probe.usb_address) = read_channel_id(&card);
@@ -1147,9 +1153,9 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 if trace {
                     match &r {
                         Ok((_, s1, s2)) => {
-                            eprintln!("[probe]   {label} select -> {s1:02X}{s2:02X}")
+                            probe_note(&format!("{label} select -> {s1:02X}{s2:02X}"))
                         }
-                        Err(e) => eprintln!("[probe]   {label} select -> error: {e}"),
+                        Err(e) => probe_note(&format!("{label} select -> error: {e}")),
                     }
                 }
                 matches!(r, Ok((_, s1, s2)) if sw_ok(s1, s2) || s1 == 0x61 || s1 == 0x6C)
@@ -1201,7 +1207,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                             probe.is_prog = true;
                             probe.prog_serial = Some(parsed.serial);
                             if trace {
-                                eprintln!("[probe]   prog token -> {:?}", probe.prog_serial);
+                                probe_note(&format!("prog token -> {:?}", probe.prog_serial));
                             }
                         }
                     }
@@ -1240,11 +1246,11 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                         if !hex.is_empty() {
                             probe.serial = Some(hex);
                             if trace {
-                                eprintln!("[probe]   token2 full serial -> {:?}", probe.serial);
+                                probe_note(&format!("token2 full serial -> {:?}", probe.serial));
                             }
                         }
                     } else if trace {
-                        eprintln!("[probe]   token2 serial parse failed (not a Token2 card)");
+                        probe_note("token2 serial parse failed (not a Token2 card)");
                     }
                 }
             }
@@ -1266,10 +1272,10 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                     };
                     probe.openpgp_manufacturer = keyroost_openpgp::aid_manufacturer_id(aid);
                     if trace {
-                        eprintln!(
-                            "[probe]   openpgp manufacturer -> {:?}",
+                        probe_note(&format!(
+                            "openpgp manufacturer -> {:?}",
                             probe.openpgp_manufacturer
-                        );
+                        ));
                     }
                     if probe.serial.is_none()
                         && aid.len() >= 14
@@ -1279,7 +1285,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                         probe.serial =
                             Some(sn.iter().map(|b| format!("{b:02x}")).collect::<String>());
                         if trace {
-                            eprintln!("[probe]   openpgp serial (aid) -> {:?}", probe.serial);
+                            probe_note(&format!("openpgp serial (aid) -> {:?}", probe.serial));
                         }
                     }
                 }
@@ -1291,7 +1297,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // alone.
             let _ = card.disconnect(pcsc::Disposition::LeaveCard);
         } else if trace {
-            eprintln!("[probe]   connect failed");
+            probe_note("connect failed");
         }
         out.push(probe);
     }
@@ -1582,7 +1588,7 @@ pub(crate) fn sw_tries_remaining(sw: u16) -> Option<u8> {
 }
 
 /// A short plain-language reading of an ISO 7816-4 status word, for the trace's
-/// `< … << SW = …` annotation line (emitted only for applets that opt into
+/// `< label  SW = …` annotation line (emitted only for applets that opt into
 /// command labelling via [`AppletIo::describe`]). Covers the status words the
 /// the applets keyroost drives actually return; anything else is reported as non-standard
 /// rather than guessed at.
@@ -1776,20 +1782,16 @@ pub(crate) fn transmit_applet(
     loop {
         if let Some(describe) = io.describe {
             trace::line(debug, || {
-                format!("> {:>14} >> {}", io.label, describe(&to_send))
+                format_line(Dir::Sent, io.label, &describe(&to_send))
             });
         }
         trace::line(debug, || {
-            format!(
-                "> {:>14} >> {}",
-                io.label,
-                dump_cmd(&to_send, cmd_sensitive)
-            )
+            format_line(Dir::Sent, io.label, &dump_cmd(&to_send, cmd_sensitive))
         });
         let mut buf = [0u8; 4096];
         let resp = card.transmit(&to_send, &mut buf)?;
         trace::line(debug, || {
-            format!("< {:>14} << {}", io.label, dump_resp(resp, resp_sensitive))
+            format_line(Dir::Received, io.label, &dump_resp(resp, resp_sensitive))
         });
         if resp.len() < 2 {
             return Err(TransportError::ShortResponse {
@@ -1802,10 +1804,10 @@ pub(crate) fn transmit_applet(
         if io.describe.is_some() {
             let (sw1, sw2) = (sw[0], sw[1]);
             trace::line(debug, || {
-                format!(
-                    "< {:>14} << SW = {sw1:02X} {sw2:02X} ({})",
+                format_line(
+                    Dir::Received,
                     io.label,
-                    iso_sw_summary(sw1, sw2)
+                    &format!("SW = {sw1:02X} {sw2:02X} ({})", iso_sw_summary(sw1, sw2)),
                 )
             });
         }

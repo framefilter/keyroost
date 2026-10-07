@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use keyroost_hid::HidDevice;
 use keyroost_keyring::Keyring;
+use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
 
 /// Capability bit-set. Hand-rolled (no `bitflags` dep). Each physical key
@@ -253,7 +254,7 @@ pub struct MatchOptions {
     /// Also turns off the single-reader CCID serial guess, so with this set
     /// nothing but topology and identity can join a node to a reader's row.
     pub skip_vendor_fallback: bool,
-    /// Print one `[match]` line per FIDO node to stderr (`--debug`).
+    /// Print one `! match` trace line per FIDO node to stderr (`--debug`).
     pub trace: bool,
 }
 
@@ -713,11 +714,21 @@ pub fn correlate_with(
         for (hid, b) in hids.iter().zip(&bound) {
             match b {
                 Some((r, step)) => eprintln!(
-                    "[match] {} -> '{r}' by {}",
-                    hid.path.display(),
-                    step.label()
+                    "{}",
+                    format_line(
+                        Dir::Note,
+                        "match",
+                        &format!("{} -> '{r}' by {}", hid.path.display(), step.label()),
+                    )
                 ),
-                None => eprintln!("[match] {} -> no reader", hid.path.display()),
+                None => eprintln!(
+                    "{}",
+                    format_line(
+                        Dir::Note,
+                        "match",
+                        &format!("{} -> no reader", hid.path.display()),
+                    )
+                ),
             }
         }
     }
@@ -864,7 +875,14 @@ fn apply_test_switch(opts: &mut MatchOptions) {
     if std::env::var("KEYROOST_MATCH_TEST").as_deref() == Ok("identity-only") {
         opts.skip_topology = true;
         opts.skip_vendor_fallback = true;
-        eprintln!("[match] test switch: topology and vendor steps disabled");
+        eprintln!(
+            "{}",
+            format_line(
+                Dir::Note,
+                "match",
+                "test switch: topology and vendor steps disabled",
+            )
+        );
     }
 }
 #[cfg(not(feature = "match-test-switch"))]

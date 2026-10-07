@@ -13,6 +13,7 @@ use crate::gzip::{gunzip_capped, gzip_member};
 use crate::{trace, TransportError};
 use keyroost_piv as piv;
 use keyroost_piv::{KeyAlg, Metadata, MgmtAlg, PinPolicy, PublicKey, Slot, TouchPolicy};
+use keyroost_proto::trace::{format_line, Dir};
 use pcsc::{
     Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State, Transaction,
 };
@@ -2651,7 +2652,11 @@ impl<'tx> PivSession<'tx> {
         if let Some(note) = note {
             let fingerprint = self.identity().fingerprint;
             trace::line(self.traced, || {
-                format!("! piv {what}: {note} ({fingerprint:?})")
+                format_line(
+                    Dir::Note,
+                    &format!("piv {what}"),
+                    &format!("{note} ({fingerprint:?})"),
+                )
             });
         }
         send
@@ -3039,9 +3044,12 @@ impl<'tx> PivSession<'tx> {
             MgmtAlg::Aes256,
         ];
         trace::line(self.traced, || {
-            "piv mgmt-key: GET METADATA unsupported; probing every GENERAL \
-             AUTHENTICATE P1 with a witness request"
-                .to_string()
+            format_line(
+                Dir::Note,
+                "piv mgmt-key",
+                "GET METADATA unsupported; probing every GENERAL \
+             AUTHENTICATE P1 with a witness request",
+            )
         });
         let mut accepted: Vec<MgmtAlg> = Vec::with_capacity(ALL.len());
         for alg in ALL {
@@ -3054,15 +3062,19 @@ impl<'tx> PivSession<'tx> {
             ))?;
             let ok = sw == piv::SW_OK;
             trace::line(self.traced, || {
-                format!(
-                    "piv mgmt-key: probe {} (P1={:#04x}) -> {}",
-                    alg.label(),
-                    alg.id(),
-                    if ok {
-                        "accepted".to_string()
-                    } else {
-                        format!("rejected (SW {sw:04X})")
-                    }
+                format_line(
+                    Dir::Note,
+                    "piv mgmt-key",
+                    &format!(
+                        "probe {} (P1={:#04x}) -> {}",
+                        alg.label(),
+                        alg.id(),
+                        if ok {
+                            "accepted".to_string()
+                        } else {
+                            format!("rejected (SW {sw:04X})")
+                        }
+                    ),
                 )
             });
             if ok {
@@ -3072,12 +3084,20 @@ impl<'tx> PivSession<'tx> {
 
         if accepted.is_empty() {
             trace::line(self.traced, || {
-                "piv mgmt-key: card accepted no probe; falling back to key length".to_string()
+                format_line(
+                    Dir::Note,
+                    "piv mgmt-key",
+                    "card accepted no probe; falling back to key length",
+                )
             });
         }
         let chosen = pick_mgmt_alg(&accepted, key_len).ok_or(TransportError::PivBadKeyLength)?;
         trace::line(self.traced, || {
-            format!("piv mgmt-key: selected {}", chosen.label())
+            format_line(
+                Dir::Note,
+                "piv mgmt-key",
+                &format!("selected {}", chosen.label()),
+            )
         });
         Ok(chosen)
     }
@@ -3183,10 +3203,13 @@ impl<'tx> PivSession<'tx> {
             // and a reviewer (or a user wondering why a swapped card was
             // accepted) should be able to see that the weaker path was taken.
             trace::line(self.traced, || {
-                "! piv authenticate: card returned no 0x82 challenge response; \
+                format_line(
+                    Dir::Note,
+                    "piv authenticate",
+                    "card returned no 0x82 challenge response; \
                  accepting host-only (client) authentication — this card cannot \
-                 prove it holds the management key"
-                    .to_string()
+                 prove it holds the management key",
+                )
             });
             return Ok(());
         }
@@ -3311,7 +3334,11 @@ impl<'tx> PivSession<'tx> {
             // word still reaches `--debug` output here, for whoever's
             // diagnosing a real device against this.
             trace::line(self.traced, || {
-                format!("piv aca external authenticate: rejected (SW {sw:04X})")
+                format_line(
+                    Dir::Note,
+                    "piv aca external authenticate",
+                    &format!("rejected (SW {sw:04X})"),
+                )
             });
             return Err(TransportError::PivManagementAuthFailed);
         }
@@ -3605,9 +3632,13 @@ impl<'tx> PivSession<'tx> {
         let (_, sw) = self.transmit_full(&apdu)?;
         if sw != piv::SW_OK {
             trace::line(self.traced, || {
-                format!(
-                    "piv put admin data: rejected (SW {sw:04X}) — treating as \
+                format_line(
+                    Dir::Note,
+                    "piv put admin data",
+                    &format!(
+                        "rejected (SW {sw:04X}) — treating as \
                      unsupported on this device, not an error"
+                    ),
                 )
             });
         }
@@ -3897,9 +3928,10 @@ impl<'tx> PivSession<'tx> {
                 self.verify_pin_hid_crescendo_aca(fingerprint::HID_CRESCENDO_ACA_PIN_AFTER_RESET)
             {
                 trace::line(self.traced, || {
-                    format!(
-                        "piv aca reauth after reset card (restore factory default): \
-                         failed ({e})"
+                    format_line(
+                        Dir::Note,
+                        "piv aca reauth after reset card (restore factory default)",
+                        &format!("failed ({e})"),
                     )
                 });
                 return Ok(FactoryResetOutcome::WipedKeyRestoreFailed);
@@ -3918,9 +3950,10 @@ impl<'tx> PivSession<'tx> {
                     Ok((_, sw)) if sw == piv::SW_OK => FactoryResetOutcome::WipedGlobal,
                     Ok((_, sw)) => {
                         trace::line(self.traced, || {
-                            format!(
-                                "piv aca put xauth key (restore factory default): \
-                                 rejected (SW {sw:04X})"
+                            format_line(
+                                Dir::Note,
+                                "piv aca put xauth key (restore factory default)",
+                                &format!("rejected (SW {sw:04X})"),
                             )
                         });
                         FactoryResetOutcome::WipedKeyRestoreFailed
@@ -4111,9 +4144,12 @@ impl<'tx> PivSession<'tx> {
         })?;
         if done.auto_compressed {
             trace::line(self.traced, || {
-                "! piv import certificate: refused uncompressed as too large; \
-                 stored gzip-compressed"
-                    .to_string()
+                format_line(
+                    Dir::Note,
+                    "piv import certificate",
+                    "refused uncompressed as too large; \
+                 stored gzip-compressed",
+                )
             });
         }
         if done.compressed {
@@ -4150,9 +4186,10 @@ impl<'tx> PivSession<'tx> {
         let apdu = piv::put_data(&tag, value);
         let sw = if self.chain_upfront() {
             trace::line(self.traced, || {
-                format!(
-                    "! piv import certificate: command chaining up front ({})",
-                    self.chain_reason()
+                format_line(
+                    Dir::Note,
+                    "piv import certificate",
+                    &format!("command chaining up front ({})", self.chain_reason()),
                 )
             });
             chained_cert_sw(self.transmit_chain(
@@ -4165,9 +4202,13 @@ impl<'tx> PivSession<'tx> {
             if retry_chained_after(&direct, extended) {
                 if let Err(e) = &direct {
                     trace::line(self.traced, || {
-                        format!(
-                            "! piv import certificate: extended length failed at the PC/SC \
+                        format_line(
+                            Dir::Note,
+                            "piv import certificate",
+                            &format!(
+                                "extended length failed at the PC/SC \
                              layer ({e}); retrying with command chaining"
+                            ),
                         )
                     });
                 }
@@ -4181,9 +4222,13 @@ impl<'tx> PivSession<'tx> {
                     sw
                 } else {
                     trace::line(self.traced, || {
-                        format!(
-                            "! piv import certificate: extended length rejected (SW={sw:04X}); \
+                        format_line(
+                            Dir::Note,
+                            "piv import certificate",
+                            &format!(
+                                "extended length rejected (SW={sw:04X}); \
                              retrying with command chaining"
+                            ),
                         )
                     });
                     chained_cert_sw(self.transmit_chain(
@@ -4717,9 +4762,10 @@ impl<'tx> PivSession<'tx> {
     ) -> Result<Vec<u8>, TransportError> {
         let (data, sw) = if self.chain_upfront() {
             trace::line(self.traced, || {
-                format!(
-                    "! {label}: command chaining up front ({})",
-                    self.chain_reason()
+                format_line(
+                    Dir::Note,
+                    label,
+                    &format!("command chaining up front ({})", self.chain_reason()),
                 )
             });
             self.transmit_chain(label, chained)?
@@ -4729,9 +4775,13 @@ impl<'tx> PivSession<'tx> {
                 (data, sw)
             } else {
                 trace::line(self.traced, || {
-                    format!(
-                        "! {label}: extended length rejected (SW={sw:04X}); retrying with \
+                    format_line(
+                        Dir::Note,
+                        label,
+                        &format!(
+                            "extended length rejected (SW={sw:04X}); retrying with \
                          command chaining"
+                        ),
                     )
                 });
                 self.transmit_chain(label, chained)?

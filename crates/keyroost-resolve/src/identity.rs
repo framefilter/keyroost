@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use keyroost_hid::HidDevice;
+use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::ReaderProbe;
 
 /// Which encoding an identity came from. Values are comparable only
@@ -367,9 +368,12 @@ pub fn read_identities(
                 .as_ref()
                 .map_or_else(|| "no answer".to_string(), ToString::to_string);
             eprintln!(
-                "[identity] {} {}: {shown}",
-                registry[*v].vendor(),
-                path.display()
+                "{}",
+                format_line(
+                    Dir::Note,
+                    "identity",
+                    &format!("{} {}: {shown}", registry[*v].vendor(), path.display()),
+                )
             );
         }
         if let Some(id) = id {
@@ -385,7 +389,14 @@ pub fn read_identities(
             let shown = id
                 .as_ref()
                 .map_or_else(|| "no answer".to_string(), ToString::to_string);
-            eprintln!("[identity] {} '{name}': {shown}", registry[*v].vendor());
+            eprintln!(
+                "{}",
+                format_line(
+                    Dir::Note,
+                    "identity",
+                    &format!("{} '{name}': {shown}", registry[*v].vendor()),
+                )
+            );
         }
         if let Some(id) = id {
             ids.reader.insert(name.clone(), id);

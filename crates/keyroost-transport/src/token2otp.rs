@@ -27,6 +27,7 @@ use keyroost_token2otp::entry::{serialize_enum_all, ParseError};
 use keyroost_token2otp::hidframe::{self, ResponseAssembler, Step};
 use keyroost_token2otp::{cmd, EncryptError, Entry, OtpError, OtpType, WriteEntry};
 
+use keyroost_proto::trace::{format_line, Dir};
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::fs::{File, OpenOptions};
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
@@ -292,21 +293,50 @@ fn request_is_sensitive(apdu: &[u8]) -> bool {
 /// redaction policy is *rendered* — the four former inline copies of this
 /// block had drifted apart in wording. Pure, so the "secrets never reach the
 /// trace" guarantee is unit-testable.
-fn trace_line(label: &str, bytes: &[u8], sensitive: bool) -> String {
-    if sensitive {
-        format!("[token2otp {label}] <{} bytes redacted>", bytes.len())
+///
+/// `transport` is `"HID"` or `"PCSC"` (the label becomes `otp hid` /
+/// `otp pcsc`); `qualifier`, when non-empty, precedes the payload in the body
+/// (e.g. `raw-frame`).
+fn trace_line(dir: Dir, transport: &str, qualifier: &str, bytes: &[u8], sensitive: bool) -> String {
+    let payload = if sensitive {
+        format!("<{} bytes redacted>", bytes.len())
     } else {
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        format!("[token2otp {label}] {hex}")
-    }
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    };
+    let body = if qualifier.is_empty() {
+        payload
+    } else {
+        format!("{qualifier} {payload}")
+    };
+    format_line(dir, &otp_label(transport), &body)
+}
+
+/// The trace label for one OTP transport: `otp hid` / `otp pcsc`.
+fn otp_label(transport: &str) -> String {
+    format!("otp {}", transport.to_lowercase())
+}
+
+/// One `otp pcsc` lifecycle note (reader connect, applet select, retry).
+fn pcsc_note(debug: bool, body: &str) {
+    crate::trace::line(debug, || format_line(Dir::Note, &otp_label("PCSC"), body));
 }
 
 /// Print one debug-trace line to stderr when `debug` is on. Every byte dump
 /// in this module — both transports, both directions — must go through here
 /// so the redaction policy in [`trace_line`] cannot drift per call site.
-fn trace_bytes(debug: bool, label: &str, bytes: &[u8], sensitive: bool) {
+fn trace_bytes(
+    debug: bool,
+    dir: Dir,
+    transport: &str,
+    qualifier: &str,
+    bytes: &[u8],
+    sensitive: bool,
+) {
     if debug {
-        eprintln!("{}", trace_line(label, bytes, sensitive));
+        eprintln!(
+            "{}",
+            trace_line(dir, transport, qualifier, bytes, sensitive)
+        );
     }
 }
 
@@ -438,7 +468,14 @@ impl HidOtpTransport {
             }
         };
         if n > 0 {
-            trace_bytes(self.debug, "HID raw-frame", &buf[..n], self.resp_sensitive);
+            trace_bytes(
+                self.debug,
+                Dir::Received,
+                "HID",
+                "raw-frame",
+                &buf[..n],
+                self.resp_sensitive,
+            );
         }
         Ok(n)
     }
@@ -462,7 +499,14 @@ impl OtpTransport for HidOtpTransport {
     ) -> Result<(Vec<u8>, u16), OtpTransportError> {
         // Seed-bearing commands (WRITE_SEED / WRITE_HOTP_SEED) carry the ECDH
         // blob; redact those from the trace (matches the OATH PUT redaction).
-        trace_bytes(self.debug, "HID send", apdu, request_is_sensitive(apdu));
+        trace_bytes(
+            self.debug,
+            Dir::Sent,
+            "HID",
+            "",
+            apdu,
+            request_is_sensitive(apdu),
+        );
 
         // Decide once whether the response frames carry secrets (ENUM_CODES
         // entries: account names + live OTP codes) so the per-frame and parsed
@@ -518,12 +562,21 @@ impl OtpTransport for HidOtpTransport {
         if self.debug {
             trace_bytes(
                 true,
-                &format!("HID parsed sw={sw:#06x}"),
+                Dir::Received,
+                "HID",
+                &format!("parsed sw={sw:#06x}"),
                 &data,
                 self.resp_sensitive,
             );
         }
-        trace_bytes(self.debug, "HID recv", &data, self.resp_sensitive);
+        trace_bytes(
+            self.debug,
+            Dir::Received,
+            "HID",
+            "",
+            &data,
+            self.resp_sensitive,
+        );
         Ok((data, sw))
     }
 
@@ -566,13 +619,11 @@ impl PcScOtpTransport {
         let mut buf = [0u8; 4096];
         let names: Vec<std::ffi::CString> =
             ctx.list_readers(&mut buf)?.map(|r| r.to_owned()).collect();
-        if debug && names.is_empty() {
-            eprintln!("[token2otp PCSC] no readers present");
+        if names.is_empty() {
+            pcsc_note(debug, "no readers present");
         }
         for name in names {
-            if debug {
-                eprintln!("[token2otp PCSC] trying reader: {}", name.to_string_lossy());
-            }
+            pcsc_note(debug, &format!("trying reader: {}", name.to_string_lossy()));
             // Try shared first, then exclusive; some CCID interfaces only grant
             // one or the other.
             let card = match ctx.connect(
@@ -582,9 +633,7 @@ impl PcScOtpTransport {
             ) {
                 Ok(c) => Some(c),
                 Err(e) => {
-                    if debug {
-                        eprintln!("[token2otp PCSC]   shared connect failed: {e}");
-                    }
+                    pcsc_note(debug, &format!("shared connect failed: {e}"));
                     match ctx.connect(
                         name.as_c_str(),
                         pcsc::ShareMode::Exclusive,
@@ -592,9 +641,7 @@ impl PcScOtpTransport {
                     ) {
                         Ok(c) => Some(c),
                         Err(e2) => {
-                            if debug {
-                                eprintln!("[token2otp PCSC]   exclusive connect failed: {e2}");
-                            }
+                            pcsc_note(debug, &format!("exclusive connect failed: {e2}"));
                             None
                         }
                     }
@@ -608,15 +655,11 @@ impl PcScOtpTransport {
             };
             match t.select(&t2::OTP_APPLET_AID) {
                 Ok(()) => {
-                    if debug {
-                        eprintln!("[token2otp PCSC]   OTP applet selected OK");
-                    }
+                    pcsc_note(debug, "OTP applet selected OK");
                     return Ok(t);
                 }
                 Err(e) => {
-                    if debug {
-                        eprintln!("[token2otp PCSC]   SELECT OTP applet failed: {e}");
-                    }
+                    pcsc_note(debug, &format!("SELECT OTP applet failed: {e}"));
                     let _ = t.card.disconnect(pcsc::Disposition::LeaveCard);
                 }
             }
@@ -655,7 +698,14 @@ impl PcScOtpTransport {
         // resends a different header into `to_send`, but the secret verdict must
         // follow the command the user actually issued.
         let resp_sensitive = response_is_sensitive(apdu);
-        trace_bytes(self.debug, "PCSC send", apdu, request_is_sensitive(apdu));
+        trace_bytes(
+            self.debug,
+            Dir::Sent,
+            "PCSC",
+            "",
+            apdu,
+            request_is_sensitive(apdu),
+        );
         // Remember which applet a SELECT switches us to (SELECT = `00 A4 04 00
         // Lc aid...`), so the reset-recovery path below can re-SELECT it. This
         // covers both the open-time SELECT and the FIDO/OTP applet switches the
@@ -685,11 +735,10 @@ impl PcScOtpTransport {
                     if retries_left > 0 =>
                 {
                     retries_left -= 1;
-                    if self.debug {
-                        eprintln!(
-                            "[token2otp PCSC] transient card error; reconnecting and retrying"
-                        );
-                    }
+                    pcsc_note(
+                        self.debug,
+                        "transient card error; reconnecting and retrying",
+                    );
                     // Re-establish the link to the same card.
                     self.card.reconnect(
                         pcsc::ShareMode::Shared,
@@ -725,7 +774,7 @@ impl PcScOtpTransport {
                 }
                 Err(e) => return Err(OtpTransportError::Pcsc(e)),
             };
-            trace_bytes(self.debug, "PCSC recv", resp, resp_sensitive);
+            trace_bytes(self.debug, Dir::Received, "PCSC", "", resp, resp_sensitive);
             if resp.len() < 2 {
                 return Err(OtpTransportError::EmptyResponse);
             }
@@ -1920,16 +1969,26 @@ mod trace_redaction_tests {
 
     #[test]
     fn trace_line_redacts_sensitive_payloads() {
-        use super::trace_line;
+        use super::{trace_line, Dir};
         let secret = [0xDE, 0xAD, 0xBE, 0xEF];
         // A sensitive payload must never reach the trace as hex — only its
         // length may appear.
-        let line = trace_line("PCSC send", &secret, true);
+        let line = trace_line(Dir::Sent, "PCSC", "", &secret, true);
         assert!(!line.contains("deadbeef"), "secret bytes leaked: {line}");
-        assert_eq!(line, "[token2otp PCSC send] <4 bytes redacted>");
+        assert_eq!(line, "> otp pcsc              <4 bytes redacted>");
+        // A qualifier never un-redacts the payload.
+        let parsed = trace_line(Dir::Received, "HID", "parsed sw=0x9000", &secret, true);
+        assert!(
+            !parsed.contains("deadbeef"),
+            "secret bytes leaked: {parsed}"
+        );
+        assert_eq!(
+            parsed,
+            "< otp hid               parsed sw=0x9000 <4 bytes redacted>"
+        );
         // A non-sensitive payload prints as lowercase hex.
-        let clear = trace_line("HID recv", &secret, false);
-        assert_eq!(clear, "[token2otp HID recv] deadbeef");
+        let clear = trace_line(Dir::Received, "HID", "", &secret, false);
+        assert_eq!(clear, "< otp hid               deadbeef");
     }
 }
 

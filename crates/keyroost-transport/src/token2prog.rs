@@ -14,6 +14,7 @@ use keyroost_token2prog::{self as prog, Command};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 
 use crate::{trace, TransportError};
+use keyroost_proto::trace::{format_line, Dir};
 
 /// A session against a single-profile programmable token over a reader.
 pub struct Token2ProgSession {
@@ -56,19 +57,22 @@ impl Token2ProgSession {
         let sensitive = matches!(cmd.apdu.get(1), Some(0xC5) | Some(0xCE));
         trace::line(self.debug, || {
             if sensitive && cmd.apdu.len() > 5 {
-                format!(
-                    "> {:>16} >> {}<{} bytes redacted>",
+                format_line(
+                    Dir::Sent,
                     cmd.label,
-                    hex(&cmd.apdu[..5]),
-                    cmd.apdu.len() - 5
+                    &format!(
+                        "{}<{} bytes redacted>",
+                        hex(&cmd.apdu[..5]),
+                        cmd.apdu.len() - 5
+                    ),
                 )
             } else {
-                format!("> {:>16} >> {}", cmd.label, hex(&cmd.apdu))
+                format_line(Dir::Sent, cmd.label, &hex(&cmd.apdu))
             }
         });
         let (data, sw1, sw2) = self.exchange_full(&cmd.apdu, cmd.label)?;
         trace::line(self.debug, || {
-            format!("< {:>16} << ...{:02X}{:02X}", cmd.label, sw1, sw2)
+            format_line(Dir::Received, cmd.label, &format!("...{sw1:02X}{sw2:02X}"))
         });
         // The challenge answer replies with a bare 9000 (no data) on success and
         // 6983 when the device key is locked; surface the latter clearly.

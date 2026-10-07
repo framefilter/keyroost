@@ -11,6 +11,7 @@ use std::time::Duration;
 use pcsc::{Context, Protocols, Scope, ShareMode};
 
 use crate::trace;
+use keyroost_proto::trace::{format_line, Dir};
 
 pub use crate::token2otp::token2_serial_reply_hid;
 
@@ -35,15 +36,18 @@ fn hex(b: &[u8]) -> String {
 pub fn ctaphid_vendor_read(path: &Path, cmd: u8, payload: &[u8], debug: bool) -> Option<Vec<u8>> {
     let shown = path.display().to_string();
     trace::line(debug, || {
-        format!(
-            "[identity] {shown} CTAPHID > cmd=0x{cmd:02x} {}",
-            hex(payload)
+        format_line(
+            Dir::Sent,
+            "identity",
+            &format!("{shown} ctaphid cmd=0x{cmd:02x} {}", hex(payload)),
         )
     });
     let (mut dev, _init) = match keyroost_ctap::CtapHidDevice::open(path) {
         Ok(d) => d,
         Err(e) => {
-            trace::line(debug, || format!("[identity] {shown} open failed: {e}"));
+            trace::line(debug, || {
+                format_line(Dir::Note, "identity", &format!("{shown} open failed: {e}"))
+            });
             return None;
         }
     };
@@ -51,12 +55,22 @@ pub fn ctaphid_vendor_read(path: &Path, cmd: u8, payload: &[u8], debug: bool) ->
     match dev.transact(cmd, payload) {
         Ok(resp) => {
             trace::line(debug, || {
-                format!("[identity] {shown} CTAPHID < {}", hex(&resp))
+                format_line(
+                    Dir::Received,
+                    "identity",
+                    &format!("{shown} ctaphid {}", hex(&resp)),
+                )
             });
             Some(resp)
         }
         Err(e) => {
-            trace::line(debug, || format!("[identity] {shown} CTAPHID failed: {e}"));
+            trace::line(debug, || {
+                format_line(
+                    Dir::Note,
+                    "identity",
+                    &format!("{shown} ctaphid failed: {e}"),
+                )
+            });
             None
         }
     }
@@ -81,23 +95,43 @@ pub fn ccid_applet_read(
     let card = match ctx.connect(&name, ShareMode::Shared, Protocols::ANY) {
         Ok(c) => c,
         Err(e) => {
-            trace::line(debug, || format!("[identity] {reader} connect failed: {e}"));
+            trace::line(debug, || {
+                format_line(
+                    Dir::Note,
+                    "identity",
+                    &format!("{reader} connect failed: {e}"),
+                )
+            });
             return None;
         }
     };
     let out = (|| -> Option<Vec<u8>> {
-        trace::line(debug, || format!("[identity] {reader} > {}", hex(select)));
+        trace::line(debug, || {
+            format_line(Dir::Sent, "identity", &format!("{reader} {}", hex(select)))
+        });
         let (_, s1, s2) = crate::transmit_apdu(&card, select).ok()?;
-        trace::line(debug, || format!("[identity] {reader} < {s1:02X}{s2:02X}"));
+        trace::line(debug, || {
+            format_line(
+                Dir::Received,
+                "identity",
+                &format!("{reader} {s1:02X}{s2:02X}"),
+            )
+        });
         if select_must_succeed && !((s1 == 0x90 && s2 == 0x00) || s1 == 0x61) {
             return None;
         }
-        trace::line(debug, || format!("[identity] {reader} > {}", hex(command)));
+        trace::line(debug, || {
+            format_line(Dir::Sent, "identity", &format!("{reader} {}", hex(command)))
+        });
         let (data, sw) =
             crate::exchange_apdu(&card, command, 0x61, || vec![0x00, 0xC0, 0x00, 0x00, 0x00])
                 .ok()?;
         trace::line(debug, || {
-            format!("[identity] {reader} < {} {sw:04X}", hex(&data))
+            format_line(
+                Dir::Received,
+                "identity",
+                &format!("{reader} {} {sw:04X}", hex(&data)),
+            )
         });
         (sw == 0x9000).then_some(data)
     })();
@@ -151,7 +185,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("[identity]") && l.contains("cmd=0xc2")),
+                .any(|l| l.starts_with("> identity ") && l.contains("cmd=0xc2")),
             "{lines:?}"
         );
         assert_eq!(token2_serial_reply_hid(p, false), None);

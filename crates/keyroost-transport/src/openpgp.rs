@@ -12,6 +12,7 @@
 
 use crate::{trace, TransportError};
 use keyroost_openpgp as pgp;
+use keyroost_proto::trace::{format_line, Dir};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use zeroize::Zeroizing;
 
@@ -312,8 +313,12 @@ impl OpenPgpSession {
             if needs_attribute_write(&current, alg) {
                 if self.debug {
                     eprintln!(
-                        "! openpgp generate: setting {crt:?} slot algorithm to {}",
-                        alg.label()
+                        "{}",
+                        format_line(
+                            Dir::Note,
+                            "openpgp generate",
+                            &format!("setting {crt:?} slot algorithm to {}", alg.label()),
+                        )
                     );
                 }
                 self.set_algorithm(crt, alg)?;
@@ -371,14 +376,22 @@ impl OpenPgpSession {
                 return ok_or_apdu("openpgp import key", sw);
             }
             trace::line(self.debug, || {
-                format!(
-                    "! openpgp import: extended length rejected (SW={sw:04X}); \
-                     retrying with command chaining"
+                format_line(
+                    Dir::Note,
+                    "openpgp import",
+                    &format!(
+                        "extended length rejected (SW={sw:04X}); \
+                         retrying with command chaining"
+                    ),
                 )
             });
         } else {
             trace::line(self.debug, || {
-                "! openpgp import: forcing command chaining (env override)".to_string()
+                format_line(
+                    Dir::Note,
+                    "openpgp import",
+                    "forcing command chaining (env override)",
+                )
             });
         }
 
@@ -466,8 +479,15 @@ impl OpenPgpSession {
         if sw != pgp::SW_OK {
             if self.debug {
                 eprintln!(
-                    "! openpgp: card has no Algorithm Information object (SW={sw:04X}); \
-                     offering every algorithm"
+                    "{}",
+                    format_line(
+                        Dir::Note,
+                        "openpgp",
+                        &format!(
+                            "card has no Algorithm Information object (SW={sw:04X}); \
+                             offering every algorithm"
+                        ),
+                    )
                 );
             }
             return Ok(None);
@@ -475,7 +495,12 @@ impl OpenPgpSession {
         let parsed = pgp::parse_algorithm_information(&bytes).ok();
         if parsed.is_none() && self.debug {
             eprintln!(
-                "! openpgp: Algorithm Information object did not parse; offering every algorithm"
+                "{}",
+                format_line(
+                    Dir::Note,
+                    "openpgp",
+                    "Algorithm Information object did not parse; offering every algorithm",
+                )
             );
         }
         Ok(parsed)
@@ -580,14 +605,22 @@ impl OpenPgpSession {
                 ok_or_apdu("openpgp decipher", sw)?;
             }
             trace::line(self.debug, || {
-                format!(
-                    "! openpgp decipher: extended length rejected (SW={sw:04X}); \
-                     retrying with command chaining"
+                format_line(
+                    Dir::Note,
+                    "openpgp decipher",
+                    &format!(
+                        "extended length rejected (SW={sw:04X}); \
+                         retrying with command chaining"
+                    ),
                 )
             });
         } else {
             trace::line(self.debug, || {
-                "! openpgp decipher: forcing command chaining (env override)".to_string()
+                format_line(
+                    Dir::Note,
+                    "openpgp decipher",
+                    "forcing command chaining (env override)",
+                )
             });
         }
 
