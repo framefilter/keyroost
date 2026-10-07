@@ -146,7 +146,7 @@ pub(crate) struct OptionJson {
     pub value: bool,
 }
 
-/// `keyroostctl fido --json pin-retries`.
+/// `keyroostctl fido --json pin retries`.
 #[derive(Serialize)]
 pub(crate) struct FidoPinRetriesJson {
     pub pin_retries: u32,
@@ -335,21 +335,21 @@ pub(crate) struct OtpGetJson {
     pub code: String,
 }
 
-/// `keyroostctl fido --json creds-metadata` — resident-credential counts.
+/// `keyroostctl fido --json credentials metadata` — resident-credential counts.
 #[derive(Serialize)]
 pub(crate) struct FidoCredsMetadataJson {
     pub existing_resident_credentials: u64,
     pub max_possible_remaining: u64,
 }
 
-/// `keyroostctl fido --json creds-list` — the resident credentials grouped
+/// `keyroostctl fido --json credentials list` — the resident credentials grouped
 /// by relying party.
 #[derive(Serialize)]
 pub(crate) struct FidoCredsListJson {
     pub relying_parties: Vec<FidoRelyingPartyJson>,
 }
 
-/// One relying party in the creds-list output.
+/// One relying party in the `credentials list` output.
 #[derive(Serialize)]
 pub(crate) struct FidoRelyingPartyJson {
     pub rp_id: String,
@@ -360,7 +360,7 @@ pub(crate) struct FidoRelyingPartyJson {
 /// One resident credential under a relying party.
 #[derive(Serialize)]
 pub(crate) struct FidoCredentialJson {
-    /// Full hex credentialId (the value `creds-delete --cred-id` expects).
+    /// Full hex credentialId (the value `credentials delete --cred-id` expects).
     pub credential_id: String,
     /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
     pub user_id: String,

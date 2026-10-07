@@ -2250,15 +2250,70 @@ enum FidoCmd {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
     },
+    /// Set, change or check the FIDO2 PIN.
+    Pin {
+        #[command(subcommand)]
+        cmd: FidoPinCmd,
+    },
+    /// List, inspect or delete the passkeys (resident credentials) on the key.
+    Credentials {
+        #[command(subcommand)]
+        cmd: FidoCredentialsCmd,
+    },
+    /// List, add, rename or delete enrolled fingerprints.
+    Fingerprints {
+        #[command(subcommand)]
+        cmd: FidoFingerprintsCmd,
+    },
+    /// Key-wide FIDO2 settings: user verification, minimum PIN length, attestation.
+    Config {
+        #[command(subcommand)]
+        cmd: FidoConfigCmd,
+    },
+    /// Turn "always require user verification" (alwaysUv) on or off. This is a
+    /// toggle relative to the key's current state; run `info` to check it.
+    AlwaysUv {
+        /// Read the PIN from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Read and manage the FIDO2 large-blob array (the key's small shared store).
+    ///
+    /// IMPORTANT: the large-blob store is WORLD-READABLE without a PIN — any
+    /// software with access to the key can read every entry. It is a convenience
+    /// scratchpad, NOT a place for secrets. Relying parties (e.g. an SSH cert
+    /// flow) may also keep their own encrypted entries here; keyroost never
+    /// rewrites or deletes those without an explicit `--yes`.
+    LargeBlob {
+        #[command(subcommand)]
+        cmd: LargeBlobCmd,
+    },
+    /// Enumerate resident SSH credentials and extract a stored OpenSSH
+    /// certificate from a credential's largeBlob to a `-cert.pub` file.
+    SshCert {
+        #[command(subcommand)]
+        cmd: SshCertCmd,
+    },
+}
+
+/// `fido pin` subcommands: the FIDO2 PIN itself.
+#[derive(Subcommand)]
+enum FidoPinCmd {
     /// Print the current PIN retry counter.
-    PinRetries {
+    Retries {
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
     /// Set the initial PIN on an authenticator that doesn't have one yet. The
     /// PIN comes from an environment variable, stdin or, with neither, a
     /// hidden prompt (asked twice) — never argv.
-    PinSet {
+    Set {
         /// Read the new PIN from the given environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
         new_pin_env: Option<String>,
@@ -2271,7 +2326,7 @@ enum FidoCmd {
     /// Change the existing PIN. Each PIN comes from an environment variable,
     /// stdin (the current PIN on the first line, the new one on the second)
     /// or, with neither, a hidden prompt — never argv.
-    PinChange {
+    Change {
         /// Read the current PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
         old_pin_env: Option<String>,
@@ -2288,20 +2343,14 @@ enum FidoCmd {
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
     },
-    /// Show resident-credential storage stats (uses pinUvAuthToken).
-    CredsMetadata {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
+}
+
+/// `fido credentials` subcommands: the passkeys (resident credentials) stored
+/// on the key.
+#[derive(Subcommand)]
+enum FidoCredentialsCmd {
     /// List every resident credential on the authenticator, grouped by RP.
-    CredsList {
+    List {
         /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
@@ -2313,8 +2362,8 @@ enum FidoCmd {
         path: Option<std::path::PathBuf>,
     },
     /// Delete a single resident credential by its hex-encoded credentialId.
-    CredsDelete {
-        /// Hex-encoded credentialId as printed by `fido creds-list`.
+    Delete {
+        /// Hex-encoded credentialId as printed by `fido credentials list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         cred_id: String,
         /// Read the PIN from the named environment variable.
@@ -2330,8 +2379,25 @@ enum FidoCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Show resident-credential storage stats (uses pinUvAuthToken).
+    Metadata {
+        /// Read the PIN from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
+/// `fido fingerprints` subcommands: bio enrollment on keys with a sensor.
+#[derive(Subcommand)]
+enum FidoFingerprintsCmd {
     /// List enrolled fingerprints (template id + name).
-    FingerprintList {
+    List {
         /// Read the PIN from the named environment variable.
         #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
         pin_env: Option<String>,
@@ -2344,7 +2410,7 @@ enum FidoCmd {
     },
     /// Enroll a new fingerprint. Touch the sensor repeatedly when prompted until
     /// capture completes.
-    FingerprintEnroll {
+    Add {
         /// Optional friendly name to set on the new fingerprint once enrolled.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
@@ -2359,8 +2425,8 @@ enum FidoCmd {
         path: Option<std::path::PathBuf>,
     },
     /// Rename an enrolled fingerprint by its hex template id (from `list`).
-    FingerprintRename {
-        /// Hex-encoded template id as printed by `fido fingerprint-list`.
+    Rename {
+        /// Hex-encoded template id as printed by `fido fingerprints list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         template_id: String,
         /// New friendly name.
@@ -2377,8 +2443,8 @@ enum FidoCmd {
         path: Option<std::path::PathBuf>,
     },
     /// Delete an enrolled fingerprint by its hex template id (from `list`).
-    FingerprintDelete {
-        /// Hex-encoded template id as printed by `fido fingerprint-list`.
+    Delete {
+        /// Hex-encoded template id as printed by `fido fingerprints list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         template_id: String,
         /// Read the PIN from the named environment variable.
@@ -2394,24 +2460,16 @@ enum FidoCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Turn "always require user verification" (alwaysUv) on or off. This is a
-    /// toggle relative to the key's current state; run `info` to check it.
-    AlwaysUv {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
+}
+
+/// `fido config` subcommands: key-wide authenticatorConfig settings.
+#[derive(Subcommand)]
+enum FidoConfigCmd {
     /// Raise the minimum PIN length. The value can only be increased, never
     /// lowered (a reset is required to lower it), and may force a PIN change.
     /// ONE-WAY: asks first. To only force a PIN change, use
-    /// `force-pin-change` instead.
-    SetMinPin {
+    /// `fido config force-pin-change` instead.
+    SetMinPinLength {
         /// New minimum PIN length (in code points). Must be >= the current one.
         #[arg(long, value_name = "N")]
         length: u32,
@@ -2445,7 +2503,7 @@ enum FidoCmd {
     },
     /// Enable enterprise attestation. This is typically one-way: disabling it
     /// again requires a device reset. Asks first.
-    EnterpriseAttestation {
+    EnableEnterpriseAttestation {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -2458,23 +2516,6 @@ enum FidoCmd {
         pin_stdin: bool,
         #[arg(long, value_name = "PATH")]
         path: Option<std::path::PathBuf>,
-    },
-    /// Read and manage the FIDO2 large-blob array (the key's small shared store).
-    ///
-    /// IMPORTANT: the large-blob store is WORLD-READABLE without a PIN — any
-    /// software with access to the key can read every entry. It is a convenience
-    /// scratchpad, NOT a place for secrets. Relying parties (e.g. an SSH cert
-    /// flow) may also keep their own encrypted entries here; keyroost never
-    /// rewrites or deletes those without an explicit `--yes`.
-    LargeBlob {
-        #[command(subcommand)]
-        cmd: LargeBlobCmd,
-    },
-    /// Enumerate resident SSH credentials and extract a stored OpenSSH
-    /// certificate from a credential's largeBlob to a `-cert.pub` file.
-    SshCert {
-        #[command(subcommand)]
-        cmd: SshCertCmd,
     },
 }
 
@@ -3703,8 +3744,9 @@ fn list_json_rows(
         .collect()
 }
 
-/// Removed or renamed flags, keyed by (the flag as clap reports it, words that must all appear in argv to disambiguate which
-/// subcommand's flag this is, the message to print). The message never
+/// Removed or renamed flags, keyed by (the flag as clap reports it, words
+/// that must all appear in argv to disambiguate which subcommand's flag this
+/// is, the message to print). The message never
 /// repeats the value the user passed — clap only hands us the flag name,
 /// never its value or the next token, so there is nothing to leak here.
 const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
@@ -3786,12 +3828,92 @@ struct RetiredCommand {
     note: &'static str,
 }
 
-const RETIRED_COMMANDS: &[RetiredCommand] = &[RetiredCommand {
-    parent: "key-name",
-    old: "remove",
-    new: "key-name delete",
-    note: "",
-}];
+const RETIRED_COMMANDS: &[RetiredCommand] = &[
+    RetiredCommand {
+        parent: "key-name",
+        old: "remove",
+        new: "key-name delete",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "pin-set",
+        new: "fido pin set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "pin-change",
+        new: "fido pin change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "pin-retries",
+        new: "fido pin retries",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "creds-list",
+        new: "fido credentials list",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "creds-delete",
+        new: "fido credentials delete",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "creds-metadata",
+        new: "fido credentials metadata",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "fingerprint-list",
+        new: "fido fingerprints list",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "fingerprint-enroll",
+        new: "fido fingerprints add",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "fingerprint-rename",
+        new: "fido fingerprints rename",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "fingerprint-delete",
+        new: "fido fingerprints delete",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "set-min-pin",
+        new: "fido config set-min-pin-length",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "force-pin-change",
+        new: "fido config force-pin-change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "enterprise-attestation",
+        new: "fido config enable-enterprise-attestation",
+        note: "",
+    },
+];
 
 /// The message for a retired subcommand, if clap's unknown subcommand
 /// `invalid` is one. Walks `argv` down the real command tree to find the
@@ -9980,11 +10102,38 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        FidoCmd::PinRetries { path } => {
+        FidoCmd::Pin { cmd } => run_fido_pin(cmd),
+        FidoCmd::Credentials { cmd } => run_fido_credentials(cmd),
+        FidoCmd::Fingerprints { cmd } => run_fido_fingerprints(cmd),
+        FidoCmd::Config { cmd } => run_fido_config(cmd),
+        FidoCmd::AlwaysUv {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+            with_configurator(path.as_deref(), &pin, |cfg| {
+                cfg.toggle_always_uv()?;
+                println!(
+                    "Toggled \"always require user verification\". Run `fido info` to \
+                     confirm the new state."
+                );
+                Ok(())
+            })?;
+            Ok(())
+        }
+        FidoCmd::LargeBlob { cmd } => run_fido_large_blob(cmd),
+        FidoCmd::SshCert { cmd } => run_fido_ssh_cert(cmd),
+    }
+}
+
+fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        FidoPinCmd::Retries { path } => {
             run_fido_pin_retries(path.as_deref())?;
             Ok(())
         }
-        FidoCmd::PinSet {
+        FidoPinCmd::Set {
             new_pin_env,
             new_pin_stdin,
             path,
@@ -9998,7 +10147,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_pin_set(path.as_deref(), &new_pin)?;
             Ok(())
         }
-        FidoCmd::PinChange {
+        FidoPinCmd::Change {
             old_pin_env,
             old_pin_stdin,
             new_pin_env,
@@ -10020,16 +10169,12 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_pin_change(path.as_deref(), &old_pin, &new_pin)?;
             Ok(())
         }
-        FidoCmd::CredsMetadata {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
-            run_fido_creds_metadata(path.as_deref(), &pin)?;
-            Ok(())
-        }
-        FidoCmd::CredsList {
+    }
+}
+
+fn run_fido_credentials(cmd: &FidoCredentialsCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        FidoCredentialsCmd::List {
             pin_env,
             pin_stdin,
             path,
@@ -10038,7 +10183,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_creds_list(path.as_deref(), &pin)?;
             Ok(())
         }
-        FidoCmd::CredsDelete {
+        FidoCredentialsCmd::Delete {
             cred_id,
             pin_env,
             pin_stdin,
@@ -10061,7 +10206,21 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
             Ok(())
         }
-        FidoCmd::FingerprintList {
+        FidoCredentialsCmd::Metadata {
+            pin_env,
+            pin_stdin,
+            path,
+        } => {
+            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+            run_fido_creds_metadata(path.as_deref(), &pin)?;
+            Ok(())
+        }
+    }
+}
+
+fn run_fido_fingerprints(cmd: &FidoFingerprintsCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        FidoFingerprintsCmd::List {
             pin_env,
             pin_stdin,
             path,
@@ -10070,7 +10229,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_fingerprint_list(path.as_deref(), &pin)?;
             Ok(())
         }
-        FidoCmd::FingerprintEnroll {
+        FidoFingerprintsCmd::Add {
             name,
             pin_env,
             pin_stdin,
@@ -10080,7 +10239,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_fingerprint_enroll(path.as_deref(), &pin, name.as_deref())?;
             Ok(())
         }
-        FidoCmd::FingerprintRename {
+        FidoFingerprintsCmd::Rename {
             template_id,
             name,
             pin_env,
@@ -10093,7 +10252,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_fingerprint_rename(path.as_deref(), &pin, &id, name)?;
             Ok(())
         }
-        FidoCmd::FingerprintDelete {
+        FidoFingerprintsCmd::Delete {
             template_id,
             pin_env,
             pin_stdin,
@@ -10116,23 +10275,12 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_fingerprint_delete(path.as_deref(), &pin, &id)?;
             Ok(())
         }
-        FidoCmd::AlwaysUv {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
-            with_configurator(path.as_deref(), &pin, |cfg| {
-                cfg.toggle_always_uv()?;
-                println!(
-                    "Toggled \"always require user verification\". Run `fido info` to \
-                     confirm the new state."
-                );
-                Ok(())
-            })?;
-            Ok(())
-        }
-        FidoCmd::SetMinPin {
+    }
+}
+
+fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        FidoConfigCmd::SetMinPinLength {
             length,
             force_change,
             yes,
@@ -10169,7 +10317,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             })?;
             Ok(())
         }
-        FidoCmd::ForcePinChange {
+        FidoConfigCmd::ForcePinChange {
             pin_env,
             pin_stdin,
             path,
@@ -10182,7 +10330,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             })?;
             Ok(())
         }
-        FidoCmd::EnterpriseAttestation {
+        FidoConfigCmd::EnableEnterpriseAttestation {
             yes,
             pin_env,
             pin_stdin,
@@ -10208,8 +10356,6 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             })?;
             Ok(())
         }
-        FidoCmd::LargeBlob { cmd } => run_fido_large_blob(cmd),
-        FidoCmd::SshCert { cmd } => run_fido_ssh_cert(cmd),
     }
 }
 
@@ -11407,7 +11553,7 @@ fn run_fido_creds_list(
                     display_field,
                 );
                 // Full credentialId on its own line: this is the exact value
-                // `fido-creds-delete --cred-id` expects (the `cred …` summary
+                // `fido credentials delete --cred-id` expects (the `cred …` summary
                 // above is truncated for readability and can't be copied).
                 println!("       id={}", hex_encode(&c.credential_id));
                 if let Some(alg) = c.algorithm {
@@ -13039,14 +13185,17 @@ mod cli_tests {
         }
 
         // A stdin secret source must route to its own field, not somewhere else.
-        match parse(&["keyroostctl", "fido", "pin-set", "--new-pin-stdin"])
+        match parse(&["keyroostctl", "fido", "pin", "set", "--new-pin-stdin"])
             .unwrap()
             .command
         {
             Some(Cmd::Fido {
-                cmd: FidoCmd::PinSet { new_pin_stdin, .. },
+                cmd:
+                    FidoCmd::Pin {
+                        cmd: FidoPinCmd::Set { new_pin_stdin, .. },
+                    },
             }) => assert!(new_pin_stdin),
-            _ => panic!("expected fido pin-set"),
+            _ => panic!("expected fido pin set"),
         }
 
         // Global flags decode as themselves.
@@ -13085,7 +13234,8 @@ mod cli_tests {
         match parse(&[
             "keyroostctl",
             "fido",
-            "set-min-pin",
+            "config",
+            "set-min-pin-length",
             "--length",
             "8",
             "--yes",
@@ -13094,36 +13244,66 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Fido {
-                cmd: FidoCmd::SetMinPin { yes, length, .. },
+                cmd:
+                    FidoCmd::Config {
+                        cmd: FidoConfigCmd::SetMinPinLength { yes, length, .. },
+                    },
             }) => assert!(yes && length == 8),
-            _ => panic!("expected fido set-min-pin"),
+            _ => panic!("expected fido config set-min-pin-length"),
         }
-        match parse(&["keyroostctl", "fido", "set-min-pin", "--length", "8"])
-            .unwrap()
-            .command
+        match parse(&[
+            "keyroostctl",
+            "fido",
+            "config",
+            "set-min-pin-length",
+            "--length",
+            "8",
+        ])
+        .unwrap()
+        .command
         {
             Some(Cmd::Fido {
-                cmd: FidoCmd::SetMinPin { yes, .. },
+                cmd:
+                    FidoCmd::Config {
+                        cmd: FidoConfigCmd::SetMinPinLength { yes, .. },
+                    },
             }) => assert!(!yes),
-            _ => panic!("expected fido set-min-pin"),
+            _ => panic!("expected fido config set-min-pin-length"),
         }
-        match parse(&["keyroostctl", "fido", "enterprise-attestation", "--yes"])
-            .unwrap()
-            .command
+        match parse(&[
+            "keyroostctl",
+            "fido",
+            "config",
+            "enable-enterprise-attestation",
+            "--yes",
+        ])
+        .unwrap()
+        .command
         {
             Some(Cmd::Fido {
-                cmd: FidoCmd::EnterpriseAttestation { yes, .. },
+                cmd:
+                    FidoCmd::Config {
+                        cmd: FidoConfigCmd::EnableEnterpriseAttestation { yes, .. },
+                    },
             }) => assert!(yes),
-            _ => panic!("expected fido enterprise-attestation"),
+            _ => panic!("expected fido config enable-enterprise-attestation"),
         }
-        match parse(&["keyroostctl", "fido", "enterprise-attestation"])
-            .unwrap()
-            .command
+        match parse(&[
+            "keyroostctl",
+            "fido",
+            "config",
+            "enable-enterprise-attestation",
+        ])
+        .unwrap()
+        .command
         {
             Some(Cmd::Fido {
-                cmd: FidoCmd::EnterpriseAttestation { yes, .. },
+                cmd:
+                    FidoCmd::Config {
+                        cmd: FidoConfigCmd::EnableEnterpriseAttestation { yes, .. },
+                    },
             }) => assert!(!yes),
-            _ => panic!("expected fido enterprise-attestation"),
+            _ => panic!("expected fido config enable-enterprise-attestation"),
         }
     }
 
@@ -13288,7 +13468,11 @@ mod cli_tests {
         let mut missing = Vec::new();
         walk(fido, "fido", &mut missing);
         assert!(missing.is_empty(), "no help: {missing:?}");
-        let change = fido.find_subcommand("pin-change").unwrap();
+        let change = fido
+            .find_subcommand("pin")
+            .unwrap()
+            .find_subcommand("change")
+            .unwrap();
         for (flag, line) in [
             ("old-pin-stdin", "first line"),
             (
@@ -13301,7 +13485,7 @@ mod cli_tests {
                 .find(|a| a.get_long() == Some(flag))
                 .and_then(|a| a.get_help().map(|h| h.to_string()))
                 .unwrap_or_default();
-            assert!(help.contains(line), "pin-change --{flag}: {help:?}");
+            assert!(help.contains(line), "pin change --{flag}: {help:?}");
         }
     }
 
@@ -14820,10 +15004,66 @@ mod cli_tests {
     }
 
     #[test]
+    fn fido_nests_by_topic() {
+        for a in [
+            &["keyroostctl", "fido", "pin", "retries"][..],
+            &["keyroostctl", "fido", "pin", "set"],
+            &["keyroostctl", "fido", "pin", "change"],
+            &["keyroostctl", "fido", "credentials", "list"],
+            &["keyroostctl", "fido", "credentials", "metadata"],
+            &[
+                "keyroostctl",
+                "fido",
+                "credentials",
+                "delete",
+                "--cred-id",
+                "00",
+            ],
+            &["keyroostctl", "fido", "fingerprints", "list"],
+            &["keyroostctl", "fido", "fingerprints", "add"],
+            &[
+                "keyroostctl",
+                "fido",
+                "fingerprints",
+                "rename",
+                "--template-id",
+                "00",
+                "--name",
+                "x",
+            ],
+            &[
+                "keyroostctl",
+                "fido",
+                "fingerprints",
+                "delete",
+                "--template-id",
+                "00",
+            ],
+            &[
+                "keyroostctl",
+                "fido",
+                "config",
+                "set-min-pin-length",
+                "--length",
+                "8",
+            ],
+            &["keyroostctl", "fido", "config", "force-pin-change"],
+            &[
+                "keyroostctl",
+                "fido",
+                "config",
+                "enable-enterprise-attestation",
+            ],
+        ] {
+            assert!(parse(a).is_ok(), "{a:?}");
+        }
+    }
+
+    #[test]
     fn fido_is_nested() {
         assert!(parse(&["keyroostctl", "fido", "info"]).is_ok());
-        assert!(parse(&["keyroostctl", "fido", "pin-set", "--new-pin-stdin"]).is_ok());
-        assert!(parse(&["keyroostctl", "fido", "creds-list"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "pin", "set", "--new-pin-stdin"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "credentials", "list"]).is_ok());
         assert!(parse(&["keyroostctl", "fido-info"]).is_err());
         assert!(parse(&["keyroostctl", "fido-creds-list"]).is_err());
     }
@@ -15022,7 +15262,14 @@ mod cli_tests {
             &["keyroostctl", "molto", "title", "-p", "100"],
             &["keyroostctl", "molto", "title", "-p", "1", "THIRTEEN-LONG"],
             &["keyroostctl", "piv", "new-chuid", "--guid", "zz"],
-            &["keyroostctl", "fido", "creds-delete", "--cred-id", "xyz"],
+            &[
+                "keyroostctl",
+                "fido",
+                "credentials",
+                "delete",
+                "--cred-id",
+                "xyz",
+            ],
         ] {
             let e = Cli::try_parse_from(argv)
                 .err()
@@ -17012,7 +17259,13 @@ mod cli_tests {
                 ..
             } => yes,
             Cmd::Fido {
-                cmd: FidoCmd::CredsDelete { yes, .. } | FidoCmd::FingerprintDelete { yes, .. },
+                cmd:
+                    FidoCmd::Credentials {
+                        cmd: FidoCredentialsCmd::Delete { yes, .. },
+                    }
+                    | FidoCmd::Fingerprints {
+                        cmd: FidoFingerprintsCmd::Delete { yes, .. },
+                    },
             } => yes,
             Cmd::Molto {
                 cmd:
@@ -17151,11 +17404,19 @@ mod cli_tests {
             &["keyroostctl", "otp", "delete", "--account", "a"],
             &["keyroostctl", "otp", "button-hotp", "--seed-stdin"],
             &["keyroostctl", "otp", "delete-button-hotp"],
-            &["keyroostctl", "fido", "creds-delete", "--cred-id", "00"],
             &[
                 "keyroostctl",
                 "fido",
-                "fingerprint-delete",
+                "credentials",
+                "delete",
+                "--cred-id",
+                "00",
+            ],
+            &[
+                "keyroostctl",
+                "fido",
+                "fingerprints",
+                "delete",
                 "--template-id",
                 "00",
             ],

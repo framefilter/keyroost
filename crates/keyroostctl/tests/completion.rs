@@ -3,9 +3,14 @@
 
 use std::process::Command;
 
-#[test]
-fn device_completes_saved_names() {
-    let dir = std::env::temp_dir().join(format!("keyroost-completion-{}", std::process::id()));
+/// Runs the dynamic completer (fish flavor) for `words` against a keys.json
+/// holding two saved names, and returns its stdout.
+fn complete(words: &[&str]) -> String {
+    let dir = std::env::temp_dir().join(format!(
+        "keyroost-completion-{}-{}",
+        std::process::id(),
+        words.join("_").replace(['-', ' '], "")
+    ));
     std::fs::create_dir_all(dir.join("keyroost")).unwrap();
     std::fs::write(
         dir.join("keyroost/keys.json"),
@@ -16,12 +21,18 @@ fn device_completes_saved_names() {
         .env("KEYROOSTCTL_COMPLETE", "fish")
         .env("XDG_CONFIG_HOME", &dir)
         .env("APPDATA", &dir)
-        .args(["--", "keyroostctl", "--device", ""])
+        .arg("--")
+        .args(words)
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn device_completes_saved_names() {
+    let stdout = complete(&["keyroostctl", "--device", ""]);
     assert!(
         stdout.lines().any(|l| l.starts_with("yubi-test")),
         "{stdout}"
@@ -29,6 +40,27 @@ fn device_completes_saved_names() {
     assert!(
         stdout.lines().any(|l| l.starts_with("solo-test")),
         "{stdout}"
+    );
+}
+
+#[test]
+fn device_completes_on_a_nested_path() {
+    let out = complete(&["keyroostctl", "fido", "pin", "retries", "--device", ""]);
+    assert!(out.lines().any(|l| l.starts_with("yubi-test")), "{out}");
+}
+
+#[test]
+fn fido_completes_the_new_groups() {
+    let out = complete(&["keyroostctl", "fido", ""]);
+    for g in ["pin", "credentials", "fingerprints", "config"] {
+        assert!(
+            out.lines().any(|l| l.split_whitespace().next() == Some(g)),
+            "{g}: {out}"
+        );
+    }
+    assert!(
+        !out.contains("pin-set") && !out.contains("creds-list"),
+        "{out}"
     );
 }
 

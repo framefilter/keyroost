@@ -30,6 +30,62 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (&["--list-readers", "S3CRETVALUE"], "keyroostctl list"),
     (&["piv", "--list-readers"], "keyroostctl list"),
+    (
+        &["fido", "pin-set", "--new-pin-env", "S3CRETVALUE"],
+        "keyroostctl fido pin set",
+    ),
+    (
+        &["fido", "pin-change", "S3CRETVALUE"],
+        "keyroostctl fido pin change",
+    ),
+    (
+        &["fido", "pin-retries", "S3CRETVALUE"],
+        "keyroostctl fido pin retries",
+    ),
+    (
+        &["fido", "creds-list", "--pin-env", "S3CRETVALUE"],
+        "keyroostctl fido credentials list",
+    ),
+    (
+        &["fido", "creds-delete", "S3CRETVALUE"],
+        "keyroostctl fido credentials delete",
+    ),
+    (
+        &["fido", "creds-metadata", "S3CRETVALUE"],
+        "keyroostctl fido credentials metadata",
+    ),
+    (
+        &["fido", "fingerprint-list", "S3CRETVALUE"],
+        "keyroostctl fido fingerprints list",
+    ),
+    (
+        &["fido", "fingerprint-enroll", "S3CRETVALUE"],
+        "keyroostctl fido fingerprints add",
+    ),
+    (
+        &["fido", "fingerprint-rename", "S3CRETVALUE"],
+        "keyroostctl fido fingerprints rename",
+    ),
+    (
+        &["fido", "fingerprint-delete", "S3CRETVALUE"],
+        "keyroostctl fido fingerprints delete",
+    ),
+    (
+        &["fido", "set-min-pin", "S3CRETVALUE"],
+        "keyroostctl fido config set-min-pin-length",
+    ),
+    (
+        &["fido", "force-pin-change", "S3CRETVALUE"],
+        "keyroostctl fido config force-pin-change",
+    ),
+    (
+        &["fido", "enterprise-attestation", "S3CRETVALUE"],
+        "keyroostctl fido config enable-enterprise-attestation",
+    ),
+    (
+        &["--device", "pin-set", "fido", "pin-set"],
+        "keyroostctl fido pin set",
+    ),
 ];
 
 #[test]
