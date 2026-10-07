@@ -28,6 +28,7 @@ const CHATTER: &[&str] = &[
     "device UTC",
     "Device UTC",
     "programming slots",
+    "READ_CONFIG returned",
     "warning:",
     "WARNING:",
     "note:",

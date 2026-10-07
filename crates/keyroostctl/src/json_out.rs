@@ -286,7 +286,7 @@ pub(crate) struct OathCredentialJson {
     /// "TOTP" or "HOTP".
     #[serde(rename = "type")]
     pub oath_type: &'static str,
-    /// "SHA1" / "SHA256" / "SHA512".
+    /// "sha1" / "sha256" / "sha512" (lowercase, like `molto slots`).
     pub algorithm: &'static str,
 }
 
@@ -307,7 +307,7 @@ pub(crate) struct OtpEntryJson {
     /// "TOTP" or "HOTP".
     #[serde(rename = "type")]
     pub otp_type: &'static str,
-    /// "SHA1" / "SHA256".
+    /// "sha1" / "sha256" (lowercase, like `molto slots`).
     pub algorithm: &'static str,
     /// `None` (JSON `null`) when the code is withheld pending a touch (the
     /// human shows an em-dash); present otherwise.
@@ -868,7 +868,7 @@ mod tests {
             accounts: vec![OathCredentialJson {
                 name: "a".into(),
                 oath_type: "TOTP",
-                algorithm: "SHA1",
+                algorithm: "sha1",
             }],
         });
         assert_shape(&v, &[("accounts", "array")]);
@@ -880,6 +880,7 @@ mod tests {
                 ("algorithm", "string"),
             ],
         );
+        assert_eq!(v["accounts"][0]["algorithm"], "sha1");
     }
 
     #[test]
@@ -890,7 +891,7 @@ mod tests {
                     app: "a".into(),
                     account: "b".into(),
                     otp_type: "TOTP",
-                    algorithm: "SHA1",
+                    algorithm: "sha1",
                     touch_required: code.is_none(),
                     code,
                 }],
@@ -907,6 +908,7 @@ mod tests {
                     ("touch_required", "bool"),
                 ],
             );
+            assert_eq!(v["accounts"][0]["algorithm"], "sha1");
         }
     }
 

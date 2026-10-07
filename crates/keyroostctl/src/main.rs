@@ -3595,7 +3595,7 @@ fn load_bulk_entries(
                 n
             ));
         }
-        eprintln!("remember to delete the screenshot after a successful import");
+        output::note("remember to delete the screenshot after a successful import");
         return Ok(import.entries);
     }
 
@@ -3979,7 +3979,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let name = format!("keyroostctl-{}.1", sub.get_name());
             render(sub, &dir.join(name))?;
         }
-        eprintln!("wrote man pages to {}", dir.display());
+        eprintln!("Wrote man pages to {}.", dir.display());
         return Ok(());
     }
     if let Cmd::Doctor = cmd {
@@ -4554,10 +4554,10 @@ fn run_molto(
                 let p = start + i as u8;
                 let title = entry.suggested_title();
                 if title.is_empty() {
-                    eprintln!(
+                    output::warn(&format!(
                         "  #{}: skipping — entry has no issuer or account to use as title",
                         p
-                    );
+                    ));
                     continue;
                 }
                 output::status(&format!(
@@ -4660,7 +4660,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             same_prog_token(&seen_serial, &session.read_info()?.serial)?;
             session.authenticate()?;
             session.set_seed(&seed)?;
-            println!("seed programmed ({} bytes).", seed.len());
+            println!("Seed programmed ({} bytes).", seed.len());
         }
         ProgCmd::Config {
             reader,
@@ -4705,7 +4705,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             };
             session.authenticate()?;
             session.set_config(&cfg)?;
-            println!("config programmed (clock set to {now}).");
+            println!("Config programmed (clock set to {now}).");
         }
     }
     Ok(())
@@ -6241,7 +6241,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     .map(|c| json_out::OathCredentialJson {
                         name: c.name.clone(),
                         oath_type: oath_type_str(c.oath_type),
-                        algorithm: oath_algo_str(c.algorithm),
+                        algorithm: oath_algo_json(c.algorithm),
                     })
                     .collect();
                 emit_json(&json_out::AccountsJson { accounts })?;
@@ -6733,7 +6733,7 @@ fn run_otp(
                         app: e.app_name.clone(),
                         account: e.account_name.clone(),
                         otp_type: keyroost_transport::otp_type_str(e.otp_type),
-                        algorithm: otp_algo_str_t2(e.algorithm),
+                        algorithm: otp_algo_json_t2(e.algorithm),
                         code: e.code.clone(),
                         touch_required: e.button_required,
                     })
@@ -6931,7 +6931,7 @@ fn run_otp(
             // A failure is returned for `main` to print once.
             let raw = session.read_config()?;
             let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-            println!("READ_CONFIG returned {} bytes: {hex}", raw.len());
+            output::status(&format!("READ_CONFIG returned {} bytes: {hex}", raw.len()));
             let info = session.read_device_info()?;
             println!("Device configuration:");
             println!(
@@ -7233,6 +7233,23 @@ fn otp_algo_str_t2(a: keyroost_token2otp::Algorithm) -> &'static str {
     match a {
         keyroost_token2otp::Algorithm::Sha1 => "SHA1",
         keyroost_token2otp::Algorithm::Sha256 => "SHA256",
+    }
+}
+
+/// JSON spelling: lowercase, the same as `molto slots`.
+fn otp_algo_json_t2(a: keyroost_token2otp::Algorithm) -> &'static str {
+    match a {
+        keyroost_token2otp::Algorithm::Sha1 => "sha1",
+        keyroost_token2otp::Algorithm::Sha256 => "sha256",
+    }
+}
+
+/// JSON spelling: lowercase, the same as `molto slots`.
+fn oath_algo_json(a: keyroost_oath::Algorithm) -> &'static str {
+    match a {
+        keyroost_oath::Algorithm::Sha1 => "sha1",
+        keyroost_oath::Algorithm::Sha256 => "sha256",
+        keyroost_oath::Algorithm::Sha512 => "sha512",
     }
 }
 
@@ -7595,7 +7612,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(path) => {
                     write_private_file(path, &sig)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!("Wrote {} signature bytes to {}", sig.len(), path.display());
+                    eprintln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
                 }
                 None => println!("{}", hex_encode(&sig)),
             }
@@ -7645,7 +7662,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(path) => {
                     write_private_file(path, &plain)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!("Wrote {} {} bytes to {}", plain.len(), noun, path.display());
+                    eprintln!(
+                        "Wrote {} {} bytes to {}.",
+                        plain.len(),
+                        noun,
+                        path.display()
+                    );
                 }
                 None => println!("{}", hex_encode(&plain)),
             }
@@ -7683,7 +7705,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 Some(path) => {
                     write_private_file(path, &sig)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                    eprintln!("Wrote {} signature bytes to {}", sig.len(), path.display());
+                    eprintln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
                 }
                 None => println!("{}", hex_encode(&sig)),
             }
@@ -9774,7 +9796,7 @@ fn key_name_add(
         name
     );
     let written = keyring.save_default()?;
-    println!("Saved to {}", written.display());
+    output::status(&format!("Saved to {}.", written.display()));
     Ok(())
 }
 
@@ -10373,7 +10395,7 @@ fn run_fido_ssh_cert_extract(
         .into());
     }
     std::fs::write(&out_path, cert_pub.as_bytes())?;
-    output::status(&format!("Wrote SSH certificate to {}", out_path.display()));
+    output::status(&format!("Wrote SSH certificate to {}.", out_path.display()));
     Ok(())
 }
 
@@ -10651,7 +10673,7 @@ fn run_fido_large_blob_export(
     };
     std::fs::write(output, &bytes)?;
     output::status(&format!(
-        "Wrote {} bytes to {}",
+        "Wrote {} bytes to {}.",
         bytes.len(),
         output.display()
     ));
@@ -16349,6 +16371,16 @@ mod cli_tests {
         let doc = serde_json::to_string(&json_out::AccountsJson { accounts: vec![c] }).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&doc).unwrap();
         assert!(parsed["accounts"].is_array());
+    }
+
+    #[test]
+    fn json_algorithm_names_are_lowercase() {
+        assert_eq!(oath_algo_json(keyroost_oath::Algorithm::Sha512), "sha512");
+        assert_eq!(oath_algo_json(keyroost_oath::Algorithm::Sha256), "sha256");
+        assert_eq!(
+            otp_algo_json_t2(keyroost_token2otp::Algorithm::Sha1),
+            "sha1"
+        );
     }
 
     #[test]
