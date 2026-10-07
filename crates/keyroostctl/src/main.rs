@@ -235,6 +235,20 @@ enum Cmd {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum CertFormat {
+    Pem,
+    Der,
+}
+
+/// Encode a certificate for `piv export-cert`.
+fn encode_cert(der: &[u8], format: CertFormat) -> Vec<u8> {
+    match format {
+        CertFormat::Pem => keyroost_piv::x509::pem_certificate(der).into_bytes(),
+        CertFormat::Der => der.to_vec(),
+    }
+}
+
 /// A PIV key slot, selected on the CLI by its hex key reference.
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum CliPivSlot {
@@ -1015,15 +1029,18 @@ enum PivCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Export a slot's certificate (DER) to a file or stdout. No PIN required.
+    /// Export a slot's certificate as PEM (default) or DER, to a file or stdout. No PIN required.
     ExportCert {
         #[arg(long, value_name = "SUBSTR")]
         reader: Option<String>,
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        /// Output path; omit to write DER to stdout.
+        /// Output path; omit to write to stdout.
         #[arg(long, value_name = "PATH")]
         file: Option<std::path::PathBuf>,
+        /// Output encoding: PEM text (default) or raw DER.
+        #[arg(long, value_enum, default_value_t = CertFormat::Pem)]
+        format: CertFormat,
     },
     /// Create a PKCS#10 certificate signing request for the key in a slot,
     /// signed on the card (PEM to stdout or --file). Hand the result to a CA;
@@ -8355,7 +8372,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ExportCert { reader, slot, file } => {
+        PivCmd::ExportCert {
+            reader,
+            slot,
+            file,
+            format,
+        } => {
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8367,27 +8389,28 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 format!("{} holds no certificate", slot.to_slot().label()).into()
                             )
                         }
-                        Some(der) => match file {
-                            Some(path) => {
-                                std::fs::write(path, &der)
-                                    .map_err(|e| format!("write {}: {}", path.display(), e))?;
-                                eprintln!(
-                                    "Wrote {}-byte DER certificate to {}.",
-                                    der.len(),
-                                    path.display()
-                                );
-                            }
-                            None => {
-                                use std::io::{IsTerminal, Write};
-                                // DER is binary — don't garble an interactive terminal.
-                                if std::io::stdout().is_terminal() {
-                                    return Err("stdout is a terminal; pass --file PATH or pipe \
-                                        (e.g. | openssl x509 -inform der -text)"
-                                        .into());
+                        Some(der) => {
+                            let bytes = encode_cert(&der, *format);
+                            match file {
+                                Some(path) => {
+                                    std::fs::write(path, &bytes)
+                                        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+                                    let kind = match format {
+                                        CertFormat::Pem => "PEM",
+                                        CertFormat::Der => "DER",
+                                    };
+                                    output::status(&format!(
+                                        "Wrote {}-byte {kind} certificate to {}.",
+                                        bytes.len(),
+                                        path.display()
+                                    ));
                                 }
-                                std::io::stdout().write_all(&der)?;
+                                None => {
+                                    use std::io::Write;
+                                    std::io::stdout().write_all(&bytes)?;
+                                }
                             }
-                        },
+                        }
                     }
                     Ok(())
                 },
@@ -12130,6 +12153,35 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn export_cert_encodings() {
+        // Minimal DER SEQUENCE; the encoders don't interpret the contents.
+        let der: Vec<u8> = vec![0x30, 0x05, 0x02, 0x01, 0x01, 0x05, 0x00];
+        assert_eq!(encode_cert(&der, CertFormat::Der), der);
+        let pem = String::from_utf8(encode_cert(&der, CertFormat::Pem)).unwrap();
+        assert!(
+            pem.starts_with("-----BEGIN CERTIFICATE-----\n")
+                && pem.ends_with("-----END CERTIFICATE-----\n")
+        );
+        assert_eq!(cert_to_der(pem.as_bytes()).unwrap(), der);
+    }
+
+    #[test]
+    fn export_cert_format_parses_and_defaults_to_pem() {
+        let format_of = |argv: &[&str]| match parse(argv).unwrap().command {
+            Some(Cmd::Piv {
+                cmd: PivCmd::ExportCert { format, .. },
+            }) => format,
+            _ => panic!("not export-cert"),
+        };
+        let base = ["keyroostctl", "piv", "export-cert", "--slot", "9a"];
+        assert_eq!(format_of(&base), CertFormat::Pem);
+        let der: Vec<&str> = base.iter().copied().chain(["--format", "der"]).collect();
+        assert_eq!(format_of(&der), CertFormat::Der);
+        let txt: Vec<&str> = base.iter().copied().chain(["--format", "txt"]).collect();
+        assert!(parse(&txt).is_err());
     }
 
     #[test]
