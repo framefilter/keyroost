@@ -77,7 +77,10 @@
       Output is more consistent too: stdout carries only the result,
       <code>--json</code> always prints one object with every field present,
       and <code>piv export-cert</code> prints PEM (see
-      <a href="#v0-13-0-output">output and JSON</a> below).
+      <a href="#v0-13-0-output">output and JSON</a> below). Many commands
+      and flags have new names, and an existing output file is no longer
+      replaced without asking (see
+      <a href="#v0-13-0-names">command and flag names</a> below).
       Library consumers: <code>keyroost-resolve</code> drops its HID-only
       name resolver for the shared device model.</p>
     <h3>CLI</h3>
@@ -147,9 +150,9 @@
       <tr><td><code>--device</code> was ignored by commands that touch no
           key</td>
         <td>Refused on <code>doctor</code>, <code>key-name list</code>,
-          <code>key-name remove</code>, <code>completions</code>,
-          <code>manpage</code>, <code>molto import-file --dry-run</code> and
-          <code>--list-readers</code>. Remove it.</td></tr>
+          <code>key-name delete</code>, <code>completions</code>,
+          <code>manpage</code> and <code>molto import-file
+          --dry-run</code>. Remove it.</td></tr>
       <tr><td><code>fido ssh-cert extract --force</code></td>
         <td><code>fido ssh-cert extract --overwrite</code>. The old flag is
           gone.</td></tr>
@@ -194,8 +197,8 @@
       <tr><td><code>keyroostctl molto --key-ascii TEXT …</code></td>
         <td><code>keyroostctl molto --key-ascii-env VAR …</code></td></tr>
       <tr><td><code>keyroostctl molto seed -p 5 --hex HEX</code><br><code>keyroostctl molto seed -p 5 --base32 B32</code></td>
-        <td><code>keyroostctl molto seed -p 5 --hex-env VAR</code> or
-          <code>--hex-stdin</code>;<br><code>keyroostctl molto seed -p 5
+        <td><code>keyroostctl molto seed --slot 5 --hex-env VAR</code> or
+          <code>--hex-stdin</code>;<br><code>keyroostctl molto seed --slot 5
           --base32-env VAR</code> or <code>--base32-stdin</code></td></tr>
       <tr><td><code>keyroostctl prog seed --hex HEX</code><br><code>keyroostctl prog seed --base32 B32</code></td>
         <td><code>keyroostctl prog seed --hex-env VAR</code> or
@@ -210,8 +213,8 @@
           --ascii-env VAR</code> or <code>--ascii-stdin</code> (typed at a
           terminal, the new key is asked twice)</td></tr>
       <tr><td><code>keyroostctl molto import -p 0 'otpauth://…'</code></td>
-        <td><code>keyroostctl molto import -p 0 -</code> with the URI piped
-          on stdin, <code>keyroostctl molto import -p 0 --uri-env
+        <td><code>keyroostctl molto import --slot 0 -</code> with the URI piped
+          on stdin, <code>keyroostctl molto import --slot 0 --uri-env
           VAR</code>, or <code>--qr IMAGE</code>; with none of them, a
           terminal asks for the URI (hidden)</td></tr>
       <tr><td><code>keyroostctl oath add NAME --secret-env VAR</code><br><code>keyroostctl oath add NAME --secret-stdin</code></td>
@@ -368,6 +371,119 @@
           <code>--json</code> where it exists.</td></tr>
     </table>
     </div>
+    <h3 id="v0-13-0-names">CLI: command and flag names</h3>
+    <p>Commands and flags are renamed so related ones read alike. An old
+      name is refused with an error naming the new one; there are no hidden
+      aliases, so update scripts as follows.</p>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Old</th><th>New</th></tr>
+      <tr><td><code>keyroostctl fido pin-set</code></td><td><code>keyroostctl fido pin set</code></td></tr>
+      <tr><td><code>keyroostctl fido pin-change</code></td><td><code>keyroostctl fido pin change</code></td></tr>
+      <tr><td><code>keyroostctl fido pin-retries</code></td><td><code>keyroostctl fido pin retries</code></td></tr>
+      <tr><td><code>keyroostctl fido creds-list</code></td><td><code>keyroostctl fido credentials list</code></td></tr>
+      <tr><td><code>keyroostctl fido creds-delete</code></td><td><code>keyroostctl fido credentials delete</code></td></tr>
+      <tr><td><code>keyroostctl fido creds-metadata</code></td><td><code>keyroostctl fido credentials metadata</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-list</code></td><td><code>keyroostctl fido fingerprints list</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-enroll</code></td><td><code>keyroostctl fido fingerprints add</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-rename</code></td><td><code>keyroostctl fido fingerprints rename</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-delete</code></td><td><code>keyroostctl fido fingerprints delete</code></td></tr>
+      <tr><td><code>keyroostctl fido always-uv</code></td>
+        <td><code>keyroostctl fido config enable-always-uv</code> or
+          <code>keyroostctl fido config disable-always-uv</code>; no longer
+          a toggle (see below)</td></tr>
+      <tr><td><code>keyroostctl fido set-min-pin</code></td><td><code>keyroostctl fido config set-min-pin-length</code></td></tr>
+      <tr><td><code>keyroostctl fido force-pin-change</code></td><td><code>keyroostctl fido config force-pin-change</code></td></tr>
+      <tr><td><code>keyroostctl fido enterprise-attestation</code></td><td><code>keyroostctl fido config enable-enterprise-attestation</code></td></tr>
+      <tr><td><code>keyroostctl piv status</code></td><td><code>keyroostctl piv info</code></td></tr>
+      <tr><td><code>keyroostctl openpgp status</code></td><td><code>keyroostctl openpgp info</code></td></tr>
+      <tr><td><code>keyroostctl otp config</code></td><td><code>keyroostctl otp info</code></td></tr>
+      <tr><td><code>keyroostctl otp get</code></td><td><code>keyroostctl otp code</code></td></tr>
+      <tr><td><code>keyroostctl otp button-hotp</code></td><td><code>keyroostctl otp set-button-hotp</code></td></tr>
+      <tr><td><code>keyroostctl otp erase-all</code></td><td><code>keyroostctl otp reset</code></td></tr>
+      <tr><td><code>keyroostctl otp remove-pin</code></td><td><code>keyroostctl otp clear-pin</code></td></tr>
+      <tr><td><code>keyroostctl otp fp-status</code></td><td><code>keyroostctl otp fingerprint-status</code></td></tr>
+      <tr><td><code>keyroostctl otp fp-enable</code></td><td><code>keyroostctl otp fingerprint-enable</code></td></tr>
+      <tr><td><code>keyroostctl otp fp-disable</code></td><td><code>keyroostctl otp fingerprint-disable</code></td></tr>
+      <tr><td><code>keyroostctl otp fp-list</code></td><td><code>keyroostctl otp list --unlock fingerprint</code></td></tr>
+      <tr><td><code>keyroostctl otp unlock-list</code></td>
+        <td><code>keyroostctl otp list --unlock auto</code>;
+          <code>unlock-list --pin-only</code> is <code>keyroostctl otp list
+          --unlock pin</code> (the default)</td></tr>
+      <tr><td><code>keyroostctl key-name remove NAME</code></td><td><code>keyroostctl key-name delete NAME</code></td></tr>
+      <tr><td><code>keyroostctl --list-readers</code></td>
+        <td><code>keyroostctl list</code>; the flag is removed</td></tr>
+      <tr><td><code>keyroostctl molto title -p 99 NAME</code> (also <code>--profile</code>, on <code>seed</code>, <code>title</code>, <code>delete</code>, <code>config</code>, <code>sync-time</code> and <code>import</code>)</td>
+        <td><code>keyroostctl molto title --slot 99 NAME</code> (Token2
+          calls slots profiles)</td></tr>
+      <tr><td><code>keyroostctl molto config -p 5 --time-step 60</code></td>
+        <td><code>keyroostctl molto config --slot 5 --period 60</code> (same
+          values)</td></tr>
+      <tr><td><code>keyroostctl prog config --time-step 60</code></td>
+        <td><code>keyroostctl prog config --period 60</code> (same
+          values)</td></tr>
+      <tr><td><code>keyroostctl otp set-pin --pin-env VAR</code> / <code>--pin-stdin</code></td>
+        <td><code>keyroostctl otp set-pin --new-pin-env VAR</code> /
+          <code>--new-pin-stdin</code></td></tr>
+      <tr><td><code>keyroostctl piv import-cert --slot 9a --file cert.pem</code></td>
+        <td><code>keyroostctl piv import-cert --slot 9a --in cert.pem</code></td></tr>
+      <tr><td><code>keyroostctl piv export-cert --slot 9a --file cert.pem</code> (also <code>request-cert</code> and <code>self-sign</code>)</td>
+        <td><code>keyroostctl piv export-cert --slot 9a --out cert.pem</code></td></tr>
+      <tr><td><code>keyroostctl fido large-blob export 1 entry.bin</code></td>
+        <td><code>keyroostctl fido large-blob export 1 --out entry.bin</code></td></tr>
+    </table>
+    </div>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td>An existing output file was replaced without asking
+          (<code>fido ssh-cert extract</code> refused it unless
+          <code>--force</code>)</td>
+        <td><code>piv export-cert</code>, <code>request-cert</code>,
+          <code>self-sign</code> and <code>generate-key
+          --save-pubkey</code>, <code>openpgp sign</code>,
+          <code>decrypt</code> and <code>authenticate</code>, and
+          <code>fido large-blob export</code> and <code>ssh-cert
+          extract</code> ask "overwrite? [y/N]" at a terminal and refuse in a
+          script. Add <code>--overwrite</code> to replace the file. A
+          directory as the output (and a symlink, for the
+          <code>openpgp</code> outputs) is refused before the key is
+          touched. <code>--overwrite</code> covers only the file;
+          <code>--yes</code> still confirms what happens on the
+          key.</td></tr>
+      <tr><td><code>fido always-uv</code> flipped the setting, whatever it
+          was</td>
+        <td><code>keyroostctl fido config enable-always-uv</code> turns it
+          on and <code>keyroostctl fido config disable-always-uv</code> turns
+          it off. Each does nothing, says so and exits 0 when the key is
+          already in that state.</td></tr>
+      <tr><td><code>otp unlock-list --pin-only</code> never asked for the
+          PIN</td>
+        <td><code>keyroostctl otp list --unlock pin</code> asks for it at a
+          terminal when the key needs one and no
+          <code>--pin-env</code> / <code>--pin-stdin</code> gives it. A
+          script still needs one of the flags. <code>--unlock
+          fingerprint</code> with a PIN flag is a usage error (exit
+          2).</td></tr>
+      <tr><td><code>piv status</code> and the GUI called every slot without
+          a certificate "empty"</td>
+        <td>"empty" when the card says the slot holds no key, "key present,
+          no certificate" when the card confirms a key, and "no certificate
+          (a key may be present)" when keyroost can't tell. keyroost can't
+          tell on cards where it doesn't use GET METADATA's key type, and on
+          cards that answer GET METADATA without key details for empty
+          slots, such as Nitrokey and Token2 PivApplet-based cards: their
+          slots that read "empty" before now read "no certificate (a key may
+          be present)". On a YubiKey, a slot with a key but no certificate
+          now reads "key present, no certificate" in the CLI. JSON is
+          unchanged.</td></tr>
+      <tr><td><code>openpgp status</code> showed a Token2 key's shortened
+          OpenPGP serial</td>
+        <td><code>keyroostctl openpgp info</code> (and its JSON
+          <code>serial</code>) shows the full serial, read from the key's
+          OTP applet like <code>piv info</code> does.</td></tr>
+    </table>
+    </div>
     <h3>Library (crates.io) API changes</h3>
     <div class="kr-table-wrap">
     <table class="kr-table">
@@ -397,6 +513,16 @@
           <code>ctaphid_vendor_read</code>, <code>ccid_applet_read</code>,
           <code>token2_serial_reply_hid</code>) and
           <code>PivSession::metadata_status</code>.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td>New, additive: <code>OpenPgpStatus::otp_applet_serial</code>
+          and <code>OpenPgpStatus::full_serial()</code> (a Token2 key's full
+          serial); <code>PivSlotStatus::key</code>, the
+          <code>SlotKeyPresence</code> enum (<code>Present</code>,
+          <code>NoKey</code>, <code>Unknown</code>) and
+          <code>PivSession::slot_key_presence</code> (what keyroost can tell
+          about a slot's key). Both structs and the enum are
+          <code>#[non_exhaustive]</code>, so nothing existing
+          breaks.</td></tr>
       <tr><td><code>keyroost-proto</code>, <code>keyroost-ctap</code></td>
         <td>New, additive: the <code>keyroost_proto::trace</code> module (the
           shared <code>--debug</code> line format) and
@@ -531,10 +657,13 @@
           <code>--reader</code> and <code>--device</code>: <code>--reader</code>
           silently won</td>
         <td>An error; pass one selector.</td></tr>
-      <tr><td><code>keyroostctl fido set-min-pin --length 8 --pin-env KR_PIN</code></td>
-        <td><code>keyroostctl fido set-min-pin --length 8 --yes --pin-env KR_PIN</code>
+      <tr><td><code>fido set-min-pin --length 8 --pin-env KR_PIN</code></td>
+        <td><code>fido set-min-pin --length 8 --yes --pin-env KR_PIN</code>
           &mdash; without <code>--yes</code> it refuses and leaves the key
-          unchanged. Same for <code>fido enterprise-attestation</code>.</td></tr>
+          unchanged. Same for <code>fido enterprise-attestation</code>.
+          (Since v0.13.0: <code>keyroostctl fido config set-min-pin-length</code>
+          and <code>keyroostctl fido config
+          enable-enterprise-attestation</code>.)</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>
@@ -770,15 +899,20 @@ keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
       <tr><td><code>keyroostctl factory-reset …</code></td><td><code>keyroostctl molto reset …</code> — <strong>see the warning below</strong></td></tr>
       <tr><td><code>keyroostctl fido-info</code></td><td><code>keyroostctl fido info</code></td></tr>
       <tr><td><code>keyroostctl fido-reset …</code></td><td><code>keyroostctl fido reset …</code></td></tr>
-      <tr><td><code>keyroostctl fido-pin-set …</code></td><td><code>keyroostctl fido pin-set …</code></td></tr>
-      <tr><td><code>keyroostctl fido-pin-change …</code></td><td><code>keyroostctl fido pin-change …</code></td></tr>
-      <tr><td><code>keyroostctl fido-pin-retries</code></td><td><code>keyroostctl fido pin-retries</code></td></tr>
-      <tr><td><code>keyroostctl fido-creds-list …</code></td><td><code>keyroostctl fido creds-list …</code></td></tr>
-      <tr><td><code>keyroostctl fido-creds-metadata …</code></td><td><code>keyroostctl fido creds-metadata …</code></td></tr>
-      <tr><td><code>keyroostctl fido-creds-delete …</code></td><td><code>keyroostctl fido creds-delete …</code></td></tr>
+      <tr><td><code>keyroostctl fido-pin-set …</code></td><td><code>keyroostctl fido pin set …</code></td></tr>
+      <tr><td><code>keyroostctl fido-pin-change …</code></td><td><code>keyroostctl fido pin change …</code></td></tr>
+      <tr><td><code>keyroostctl fido-pin-retries</code></td><td><code>keyroostctl fido pin retries</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-list …</code></td><td><code>keyroostctl fido credentials list …</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-metadata …</code></td><td><code>keyroostctl fido credentials metadata …</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-delete …</code></td><td><code>keyroostctl fido credentials delete …</code></td></tr>
       <tr><td><code>keyroostctl manpage &gt; x.1</code></td><td><code>keyroostctl manpage ./man</code></td></tr>
     </table>
     </div>
+    <p>The New column shows today's names: from v0.6.0 to v0.12.x the FIDO
+      PIN and credential commands were <code>fido pin-set</code>,
+      <code>pin-change</code>, <code>pin-retries</code>,
+      <code>creds-list</code>, <code>creds-metadata</code> and
+      <code>creds-delete</code> (see <a href="#v0-13-0-names">v0.13.0</a>).</p>
     <div class="kr-callout danger">
       <div class="kr-callout-title danger">Danger: <code>factory-reset</code> was reused</div>
       <p>Since v0.7.7 <code>keyroostctl factory-reset</code> exists again as a top-level
