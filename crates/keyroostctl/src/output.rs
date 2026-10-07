@@ -42,7 +42,6 @@ pub(crate) fn status(msg: &str) {
 
 /// One aligned `Key: value` column: every value starts one space after the
 /// longest `Key:`. No trailing newline.
-#[allow(dead_code)] // first callers arrive with the text-output pass
 pub(crate) fn kv_block(rows: &[(&str, String)]) -> String {
     let w = rows
         .iter()

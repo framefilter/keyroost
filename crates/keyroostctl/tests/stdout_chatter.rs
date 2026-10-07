@@ -92,3 +92,21 @@ fn no_chatter_on_stdout() {
     }
     assert!(bad.is_empty(), "stdout chatter:\n{}", bad.join("\n"));
 }
+
+#[test]
+fn one_warning_and_note_style() {
+    for (file, src) in SOURCES {
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        for (i, l) in code.lines().enumerate() {
+            for bad in [
+                "\"WARNING:",
+                "\"Note:",
+                "\"NOTE:",
+                "\"Warning:",
+                "profile #",
+            ] {
+                assert!(!l.contains(bad), "{file}:{}: {bad}: {}", i + 1, l.trim());
+            }
+        }
+    }
+}

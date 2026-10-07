@@ -608,13 +608,13 @@ fn resolve_key_usage(
             // The key type is known and can back none of the slot's default
             // usages (Ed25519 in 9D / retired): the default is "no extension".
             None if keyroost_piv::x509::piv_default_degrades_to_undefined(slot, alg) => {
-                eprintln!(
-                    "warning: the slot default key usage for {} is undefined: {} keys \
+                output::warn(&format!(
+                    "the slot default key usage for {} is undefined: {} keys \
                      can't back the usages the PIV standard defines there; no keyUsage \
                      extension will be added.",
                     slot.label(),
                     alg.map_or("these", |a| a.label())
-                );
+                ));
                 Ok(None)
             }
             None => Err(format!(
@@ -627,11 +627,11 @@ fn resolve_key_usage(
     let (usages, critical) = explicit_key_usage(args);
     if let Some(alg) = alg {
         if !keyroost_piv::x509::supported_key_usages(alg).contains(usages) {
-            eprintln!(
-                "warning: some requested key usages are incompatible with {} keys; \
+            output::warn(&format!(
+                "some requested key usages are incompatible with {} keys; \
                  a CA or verifier may reject the certificate.",
                 alg.label()
-            );
+            ));
         }
     }
     Ok(Some(keyroost_piv::x509::KeyUsageExt { usages, critical }))
@@ -670,7 +670,7 @@ impl CertCompressArgs {
 
 /// Printed after a certificate the default (automatic) choice had to store
 /// compressed. The GUI shows the same note.
-const AUTO_COMPRESSED_NOTE: &str = "Note: the certificate did not fit on the card \
+const AUTO_COMPRESSED_NOTE: &str = "the certificate did not fit on the card \
     uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
     software reads compressed certificates, including Windows' built-in smart-card \
     driver in a community test; macOS's built-in PIV support has not been verified.";
@@ -3327,16 +3327,16 @@ fn molto_entry_from_qr(
         std::fs::read(image_path).map_err(|e| format!("read {}: {}", image_path.display(), e))?;
     let import = keyroost_qr::entries_from_image(&bytes)?;
     for s in &import.skipped {
-        eprintln!("skipped {:?}: {}", s.label, s.reason);
+        output::note(&format!("skipped {:?}: {}", s.label, s.reason));
     }
     // A GA export can span several QR images; a clean single-slot import of
     // QR 1 must not read as "migration complete".
     if let Some((i, n)) = import.batch {
-        eprintln!(
-            "note: this is QR {} of {} in the export — import the other images too",
+        output::note(&format!(
+            "this is QR {} of {} in the export — import the other images too",
             i + 1,
             n
-        );
+        ));
     }
     match import.entries.len() {
         0 => Err("QR decoded, but no account could be imported (see skips above)".into()),
@@ -3567,14 +3567,14 @@ fn load_bulk_entries(
     if keyroost_qr::looks_like_image(&bytes) {
         let import = keyroost_qr::entries_from_image(&bytes)?;
         for s in &import.skipped {
-            eprintln!("skipped {:?}: {}", s.label, s.reason);
+            output::note(&format!("skipped {:?}: {}", s.label, s.reason));
         }
         if let Some((i, n)) = import.batch {
-            eprintln!(
-                "note: this is QR {} of {} in the export — import the other images too",
+            output::note(&format!(
+                "this is QR {} of {} in the export — import the other images too",
                 i + 1,
                 n
-            );
+            ));
         }
         eprintln!("remember to delete the screenshot after a successful import");
         return Ok(import.entries);
@@ -4094,7 +4094,7 @@ fn run_molto(
         let entries = load_bulk_entries(&mut sec, path, *password_stdin, password_env.as_deref())?;
         let last = (*start as usize).saturating_add(entries.len());
         println!(
-            "found {} entries; would fill slots #{}..#{} (dry-run)",
+            "Found {} entries; would fill slots #{}..#{} (dry run).",
             entries.len(),
             start,
             last.saturating_sub(1)
@@ -4168,7 +4168,7 @@ fn run_molto(
             .filter(|(_, b)| *all || b.seed_present || b.title.is_some())
             .collect();
         if shown.is_empty() && sweep_err.is_none() {
-            println!("no occupied or titled slots (use --all to list all 100)");
+            println!("No occupied or titled slots (use --all to list all 100).");
             return Ok(());
         }
         println!(
@@ -4211,13 +4211,15 @@ fn run_molto(
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let block = session.read_public_data(*profile)?;
-        match &block.title {
-            Some(t) => println!("slot #{} title: {}", profile, sanitize_terminal(t)),
-            None => println!("slot #{} has no title", profile),
-        }
+        let title = block
+            .title
+            .as_deref()
+            .map(sanitize_terminal)
+            .unwrap_or_else(|| "(none)".into());
+        let occupied = if block.seed_present { "yes" } else { "no" };
         println!(
-            "occupied: {}",
-            if block.seed_present { "yes" } else { "no" }
+            "{}",
+            output::kv_block(&[("Title", title), ("Occupied", occupied.into())])
         );
         return Ok(());
     }
@@ -4245,11 +4247,11 @@ fn run_molto(
         match session.delete_seed(*profile)? {
             SeedDeleteOutcome::Deleted => {
                 println!(
-                    "seed deleted from slot #{}; the title (if any) remains",
+                    "Seed deleted from slot #{}; the title (if any) remains.",
                     profile
                 )
             }
-            SeedDeleteOutcome::AlreadyEmpty => println!("slot #{} was already empty", profile),
+            SeedDeleteOutcome::AlreadyEmpty => println!("Slot #{} was already empty.", profile),
         }
         return Ok(());
     }
@@ -4268,7 +4270,9 @@ fn run_molto(
         let info = session.read_info()?;
         write_info(&mut std::io::stderr(), &info)?;
         crate::prompt::confirm_on_held(&dev, *yes, "factory-reset the Molto2 (all 100 slots)")?;
-        output::status("requesting factory reset; confirm with the up-arrow button on the device");
+        output::status(
+            "Requesting a factory reset: confirm with the up-arrow button on the device.",
+        );
         session.factory_reset()?;
         return Ok(());
     }
@@ -4295,7 +4299,7 @@ fn run_molto(
         if *authed {
             let key = customer_key(&mut sec, key)?;
             match session.authenticate(&key) {
-                Ok(()) => output::status("authenticated"),
+                Ok(()) => output::status("Authenticated."),
                 // The Display impl renders the tries-remaining count (or
                 // "unknown" when the card gave none).
                 Err(e @ TransportError::AuthFailed { .. }) => {
@@ -4319,10 +4323,10 @@ fn run_molto(
             MoltoCmd::Seed { .. } | MoltoCmd::Import { .. } | MoltoCmd::ImportFile { .. }
         )
     {
-        eprintln!(
-            "warning: using the factory-default customer key — seeds sent to the \
+        output::warn(
+            "using the factory-default customer key — seeds sent to the \
              device are decryptable by anyone who captures the USB traffic. \
-             Rotate it first: keyroostctl molto customer-key (see --help)."
+             Rotate it first: keyroostctl molto customer-key (see --help).",
         );
     }
     // Bulk import reads its file — and so any vault password, from the
@@ -4402,7 +4406,7 @@ fn run_molto(
         write_info(&mut std::io::stderr(), &info)?;
     }
     match session.authenticate(&key) {
-        Ok(()) => output::status("authenticated"),
+        Ok(()) => output::status("Authenticated."),
         // The Display impl renders the tries-remaining count (or "unknown").
         Err(e @ TransportError::AuthFailed { .. }) => return Err(e.to_string().into()),
         Err(e) => return Err(e.into()),
@@ -4417,7 +4421,7 @@ fn run_molto(
                 unreachable!("read before authentication")
             };
             session.set_seed(*profile, seed)?;
-            println!("seed written to profile #{}", profile);
+            println!("Seed written to slot #{}.", profile);
         }
         MoltoCmd::Title { profile, title } => {
             // Checked by molto_validate before the token was touched.
@@ -4425,7 +4429,7 @@ fn run_molto(
                 .as_deref()
                 .expect("title read mode is handled before auth");
             session.set_title(*profile, title)?;
-            println!("title set on profile #{}", profile);
+            println!("Title set on slot #{}.", profile);
         }
         MoltoCmd::Config {
             profile,
@@ -4442,19 +4446,19 @@ fn run_molto(
                 utc_time: unix_now(),
             };
             session.set_config(*profile, &cfg)?;
-            println!("profile #{} configured", profile);
+            println!("Slot #{} configured.", profile);
         }
         MoltoCmd::SyncTime { profile, all } => {
             if *all {
                 for p in 0..=99u8 {
                     match session.sync_time(p, unix_now()) {
-                        Ok(()) => println!("synced profile #{}", p),
-                        Err(e) => eprintln!("profile #{} failed: {}", p, e),
+                        Ok(()) => println!("Time synced on slot #{}.", p),
+                        Err(e) => output::warn(&format!("time sync failed on slot #{p}: {e}")),
                     }
                 }
             } else if let Some(p) = profile {
                 session.sync_time(*p, unix_now())?;
-                println!("time synced on profile #{}", p);
+                println!("Time synced on slot #{}.", p);
             } else {
                 return Err("sync-time requires --profile <N> or --all".into());
             }
@@ -4465,7 +4469,7 @@ fn run_molto(
             };
             session.set_customer_key(new_key)?;
             output::status(
-                "customer-key rotation requested. Press the up-arrow button on the device to confirm.",
+                "Customer-key rotation requested: press the up-arrow button on the device to confirm.",
             );
         }
         MoltoCmd::Import {
@@ -4488,7 +4492,7 @@ fn run_molto(
                 &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
             )?;
             println!(
-                "imported {:?} to profile #{} ({} bytes secret, {:?}, {} digits)",
+                "Imported {:?} to slot #{} ({} bytes secret, {:?}, {} digits).",
                 final_title,
                 profile,
                 entry.secret.len(),
@@ -4518,11 +4522,12 @@ fn run_molto(
             let n = entries.len();
             let last = *start as usize + n;
             output::status(&format!(
-                "found {} entries; programming slots #{}..#{}",
+                "Found {} entries; programming slots #{}..#{}.",
                 n,
                 start,
                 last - 1
             ));
+            let mut written = 0usize;
             for (i, entry) in entries.iter().enumerate() {
                 let p = start + i as u8;
                 let title = entry.suggested_title();
@@ -4547,8 +4552,9 @@ fn run_molto(
                     p,
                     &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
                 )?;
+                written += 1;
             }
-            println!("done");
+            println!("{}", import_file_ack(written, *start, last - 1));
         }
         MoltoCmd::Reset { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Probe { .. } => unreachable!("handled above before auth"),
@@ -4577,12 +4583,18 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     utc_time: info.utc_time,
                 })?;
             } else {
-                match model {
-                    Some(m) => println!("model:    {m}"),
-                    None => println!("model:    (unrecognized serial — not a known Token2 model)"),
-                }
-                println!("serial:   {}", sanitize_terminal(&info.serial));
-                println!("utc_time: {}", info.utc_time);
+                let model = model.map_or_else(
+                    || "(unrecognized serial — not a known Token2 model)".to_owned(),
+                    str::to_owned,
+                );
+                println!(
+                    "{}",
+                    output::kv_block(&[
+                        ("Model", model),
+                        ("Serial", sanitize_terminal(&info.serial)),
+                        ("Device UTC", format!("{} (epoch)", info.utc_time)),
+                    ])
+                );
             }
         }
         ProgCmd::Seed {
@@ -4686,7 +4698,10 @@ fn prog_guard_model(
     let info = session.read_info()?;
     match info.model() {
         Some(model) => {
-            eprintln!("[*] {model} (serial {})", sanitize_terminal(&info.serial));
+            output::status(&format!(
+                "\u{2192} {model} \u{b7} serial {}",
+                sanitize_terminal(&info.serial)
+            ));
             Ok(model)
         }
         None => Err(format!(
@@ -6189,13 +6204,13 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 // reaches --json users without breaking the output schema. An
                 // invisible entry would otherwise be silently destroyed by a
                 // reset the user believed they had fully audited.
-                eprintln!(
-                    "warning: {} credential entr{} on the key could not be decoded and {} not shown; \
+                output::warn(&format!(
+                    "{} credential entr{} on the key could not be decoded and {} not shown; \
                      the listing is incomplete",
                     listing.skipped,
                     if listing.skipped == 1 { "y" } else { "ies" },
                     if listing.skipped == 1 { "is" } else { "are" },
-                );
+                ));
             }
             let creds = listing.credentials;
             if json_output() {
@@ -8078,11 +8093,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let maintain_pin_unlock = match pin_unlock_gate {
                         keyroost_piv::compat::FeatureGate::Supported => true,
                         keyroost_piv::compat::FeatureGate::Unverified => {
-                            eprintln!(
-                                "warning: {} {}",
+                            output::warn(&format!(
+                                "{} {}",
                                 keyroost_piv::compat::PivExtension::PinManagementAuth.requirement(),
                                 keyroost_piv::compat::FeatureGate::UNVERIFIED_SUFFIX
-                            );
+                            ));
                             true
                         }
                         keyroost_piv::compat::FeatureGate::Unsupported if *allow_pin_unlock => {
@@ -8160,11 +8175,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 )
                                 .into());
                             }
-                            eprintln!(
-                                "warning: management key changed, but could not {action} \
+                            output::warn(&format!(
+                                "management key changed, but could not {action} \
                                  PIN-protected management-key storage ({e}). keyroost's list \
                                  has no entry for this on this key."
-                            );
+                            ));
                         }
                     }
                     Ok(())
@@ -8835,10 +8850,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     if s.quirks()
                         .contains(&keyroost_piv::compat::PivQuirk::ResetLongRunning)
                     {
-                        eprintln!(
-                            "warning: {}",
-                            keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT
-                        );
+                        output::warn(keyroost_piv::compat::PivQuirk::RESET_LONG_RUNNING_HINT);
                     }
                     // `current` is also handed to `force_reset_if_known_supported`
                     // below — dead today (`PivSession::reset`'s doc explains why),
@@ -8954,7 +8966,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     authenticate_piv(s, &mgmt)?;
                     s.move_key(from.to_slot(), to.to_slot())?;
                     println!(
-                        "moved the private key {} \u{2192} {}; the certificate remains in {}",
+                        "Moved the private key {} \u{2192} {}; the certificate remains in {}.",
                         from.to_slot().label(),
                         to.to_slot().label(),
                         from.to_slot().label()
@@ -9191,10 +9203,10 @@ fn guard_piv_policy_value(
         return Ok(());
     }
     if force {
-        eprintln!(
-            "warning: {value_label} is known to be unsupported on this device. Running anyway \
+        output::warn(&format!(
+            "{value_label} is known to be unsupported on this device. Running anyway \
              because --force was given."
-        );
+        ));
         return Ok(());
     }
     Err(format!(
@@ -10683,11 +10695,11 @@ fn run_fido_large_blob_delete(
         .ok_or_else(|| large_blob_bad_index(index, current.entries.len()))?;
     if !entry.is_kr_note() {
         // Opaque RP-owned entry: deleting it can break the owning service.
-        eprintln!(
-            "WARNING: entry {} was not created by keyroost (it is an opaque, \
+        output::warn(&format!(
+            "entry {} was not created by keyroost (it is an opaque, \
              RP-encrypted record); deleting it may break a service that stored it.",
             index
-        );
+        ));
     }
     drop(dev); // not held across the question or while the PIN is typed
     let key = crate::target::select_fido(path)?;
@@ -10735,20 +10747,20 @@ fn run_fido_large_blob_clear(
     let total = current.entries.len();
     let opaque = current.entries.iter().filter(|e| !e.is_kr_note()).count();
     if !yes {
-        eprintln!(
-            "WARNING: `clear` erases the ENTIRE large-blob array — ALL {total} \
+        output::warn(&format!(
+            "`clear` erases the ENTIRE large-blob array — ALL {total} \
              entr{plural} ({opaque} opaque/RP-owned, e.g. stored SSH certs). This \
              can break any service that stored data here.",
             total = total,
             plural = if total == 1 { "y" } else { "ies" },
             opaque = opaque,
-        );
+        ));
     } else if opaque > 0 {
-        eprintln!(
-            "WARNING: wiping {} opaque/RP-owned entr{} along with everything else.",
+        output::warn(&format!(
+            "wiping {} opaque/RP-owned entr{} along with everything else.",
             opaque,
             if opaque == 1 { "y" } else { "ies" }
-        );
+        ));
     }
     drop(dev); // not held across the question or while the PIN is typed
     let key = crate::target::select_fido(path)?;
@@ -10917,19 +10929,29 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
         caps.push("U2F");
     }
     if !json {
-        println!("Device:    {}", path.display());
         println!(
-            "Channel:   {:#010x} (CTAPHID protocol v{})",
-            init.channel_id, init.protocol_version
-        );
-        println!(
-            "Firmware:  {}.{}.{}",
-            init.device_major, init.device_minor, init.device_build
-        );
-        println!(
-            "Caps:      {} (raw 0x{:02X})",
-            caps.join("+"),
-            init.capabilities
+            "{}",
+            output::kv_block(&[
+                ("Device", path.display().to_string()),
+                (
+                    "Channel",
+                    format!(
+                        "{:#010x} (CTAPHID protocol v{})",
+                        init.channel_id, init.protocol_version
+                    ),
+                ),
+                (
+                    "Firmware",
+                    format!(
+                        "{}.{}.{}",
+                        init.device_major, init.device_minor, init.device_build
+                    ),
+                ),
+                (
+                    "Caps",
+                    format!("{} (raw 0x{:02X})", caps.join("+"), init.capabilities),
+                ),
+            ])
         );
     }
 
@@ -10991,29 +11013,30 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
     }
 
     println!();
+    println!("{}", output::kv_block(&fido_info_rows(&info)));
+    Ok(())
+}
+
+/// `fido info`'s CTAP2 block, one `(label, value)` row per field the
+/// authenticator reported; a field it left out has no row.
+fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str, String)> {
     // versions/extensions/option-keys come from the device's getInfo CBOR;
     // flatten any control bytes before they reach the terminal.
-    println!(
-        "Versions:  {}",
-        sanitize_terminal(&info.versions.join(", "))
-    );
+    let mut rows = vec![("Versions", sanitize_terminal(&info.versions.join(", ")))];
     if !info.extensions.is_empty() {
-        println!(
-            "Extensions: {}",
-            sanitize_terminal(&info.extensions.join(", "))
-        );
+        rows.push(("Extensions", sanitize_terminal(&info.extensions.join(", "))));
     }
-    println!("AAGUID:    {}", format_aaguid(&info.aaguid));
+    rows.push(("AAGUID", format_aaguid(&info.aaguid)));
     if !info.options.is_empty() {
         let opts: Vec<String> = info
             .options
             .iter()
             .map(|(k, v)| format!("{}={}", sanitize_terminal(k), v))
             .collect();
-        println!("Options:   {}", opts.join(", "));
+        rows.push(("Options", opts.join(", ")));
     }
     if let Some(n) = info.max_msg_size {
-        println!("MaxMsgSize: {}", n);
+        rows.push(("Max message size", n.to_string()));
     }
     if !info.pin_uv_auth_protocols.is_empty() {
         let v: Vec<String> = info
@@ -11021,24 +11044,21 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
             .iter()
             .map(|n| n.to_string())
             .collect();
-        println!("PIN/UV protocols: {}", v.join(", "));
+        rows.push(("PIN/UV protocols", v.join(", ")));
     }
     if !info.transports.is_empty() {
-        println!(
-            "Transports: {}",
-            sanitize_terminal(&info.transports.join(", "))
-        );
+        rows.push(("Transports", sanitize_terminal(&info.transports.join(", "))));
     }
     if let Some(n) = info.min_pin_length {
-        println!("Min PIN length: {}", n);
+        rows.push(("Min PIN length", n.to_string()));
     }
     if info.force_pin_change == Some(true) {
-        println!("Force PIN change: yes");
+        rows.push(("Force PIN change", "yes".to_owned()));
     }
     if let Some(v) = info.firmware_version {
-        println!("CTAP fwVer: {}", v);
+        rows.push(("CTAP firmware version", v.to_string()));
     }
-    Ok(())
+    rows
 }
 
 /// How `fido reset` reaches the selected key's FIDO2 applet.
@@ -11575,7 +11595,7 @@ const DESTRUCTIVE_INS: &[u8] = &[
     0xCE, // answer challenge (consumes an auth attempt)
     0x56, // factory reset
     0xD8, // lock / unlock screen
-    0xE6, // delete seed (keyless: P2=00 would wipe profile #0)
+    0xE6, // delete seed (keyless: P2=00 would wipe slot #0)
 ];
 
 fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slot: u8) {
@@ -11685,6 +11705,15 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
     println!("Any ✓ line is an instruction the firmware recognized and completed.");
 }
 
+/// `molto import-file`'s result line: how many entries were written (entries
+/// skipped for having no title are not counted) and the slot range covered.
+fn import_file_ack(written: usize, first: u8, last: usize) -> String {
+    format!(
+        "Imported {written} entr{} into slots #{first}..#{last}.",
+        if written == 1 { "y" } else { "ies" }
+    )
+}
+
 /// Write the Molto2's serial and clock to `w`: stdout for `molto info` (the
 /// result), stderr for every other command (context before the result).
 fn write_info(
@@ -11694,19 +11723,25 @@ fn write_info(
     // The serial is `from_utf8_lossy` over device bytes; flatten any control
     // characters before they reach the terminal (a hostile token could embed
     // escape sequences). Shared by every command that prints device info.
-    writeln!(w, "device serial: {}", sanitize_terminal(&info.serial))?;
-    writeln!(w, "device UTC:    {} (epoch)", info.utc_time)?;
+    writeln!(
+        w,
+        "{}",
+        output::kv_block(&[
+            ("Serial", sanitize_terminal(&info.serial)),
+            ("Device UTC", format!("{} (epoch)", info.utc_time)),
+        ])
+    )?;
     // TOTP tolerates small drift (one 30s step either way at most verifiers);
     // beyond that, codes get rejected in ways users misdiagnose as a bad
     // seed. Surface it here where it's cheap to see.
     let drift = i64::from(info.utc_time) - i64::from(unix_now());
     if drift.abs() > 30 {
-        eprintln!(
-            "warning: device clock is {} seconds {} the host clock — codes may be \
+        output::warn(&format!(
+            "device clock is {} seconds {} the host clock — codes may be \
              rejected. Run `keyroostctl molto sync-time --all` to fix.",
             drift.abs(),
             if drift > 0 { "ahead of" } else { "behind" }
-        );
+        ));
     }
     Ok(())
 }
@@ -11885,6 +11920,92 @@ fn main() -> ExitCode {
             eprintln!("error: worker thread panicked");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod human_style_tests {
+    use super::*;
+
+    /// The column each `Key: value` line's value starts at.
+    fn value_columns(block: &str) -> Vec<usize> {
+        block
+            .lines()
+            .map(|l| {
+                let colon = l.find(':').expect("every row has a label") + 1;
+                colon + l[colon..].len() - l[colon..].trim_start().len()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fido_info_block_is_one_column() {
+        let info = keyroost_ctap::AuthenticatorInfo {
+            versions: vec!["FIDO_2_0".into(), "FIDO_2_1".into()],
+            extensions: vec!["credProtect".into()],
+            options: vec![("rk".into(), true), ("clientPin".into(), false)],
+            max_msg_size: Some(1200),
+            pin_uv_auth_protocols: vec![2, 1],
+            transports: vec!["usb".into()],
+            min_pin_length: Some(4),
+            force_pin_change: Some(true),
+            firmware_version: Some(7),
+            ..Default::default()
+        };
+        let rows = fido_info_rows(&info);
+        let labels: Vec<&str> = rows.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            labels,
+            [
+                "Versions",
+                "Extensions",
+                "AAGUID",
+                "Options",
+                "Max message size",
+                "PIN/UV protocols",
+                "Transports",
+                "Min PIN length",
+                "Force PIN change",
+                "CTAP firmware version",
+            ]
+        );
+        let block = output::kv_block(&rows);
+        let cols = value_columns(&block);
+        assert!(cols.iter().all(|c| *c == cols[0]), "{block}");
+        // An absent field has no row, as before.
+        let bare = fido_info_rows(&keyroost_ctap::AuthenticatorInfo::default());
+        let labels: Vec<&str> = bare.iter().map(|(k, _)| *k).collect();
+        assert_eq!(labels, ["Versions", "AAGUID"]);
+    }
+
+    #[test]
+    fn molto_info_is_an_aligned_block() {
+        let info = keyroost_transport::DeviceInfo {
+            serial: "T2M-0001".into(),
+            utc_time: unix_now(),
+        };
+        let mut out = Vec::new();
+        write_info(&mut out, &info).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "Serial:     T2M-0001\nDevice UTC: {} (epoch)\n",
+                info.utc_time
+            )
+        );
+    }
+
+    #[test]
+    fn import_file_ack_counts_written_entries() {
+        assert_eq!(
+            import_file_ack(3, 95, 97),
+            "Imported 3 entries into slots #95..#97."
+        );
+        assert_eq!(
+            import_file_ack(1, 99, 99),
+            "Imported 1 entry into slots #99..#99."
+        );
     }
 }
 
