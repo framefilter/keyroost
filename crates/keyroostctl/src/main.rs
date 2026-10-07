@@ -712,7 +712,7 @@ fn print_cert_stored(line: &str, stored: &keyroost_transport::CertImport) {
         stored_compressed_suffix(stored.compressed, stored.stored_len)
     );
     if stored.auto_compressed {
-        println!("{AUTO_COMPRESSED_NOTE}");
+        output::note(AUTO_COMPRESSED_NOTE);
     }
 }
 
@@ -4127,7 +4127,7 @@ fn run_molto(
             })?;
             return Ok(());
         }
-        print_info(&info);
+        write_info(&mut std::io::stdout(), &info)?;
         return Ok(());
     }
 
@@ -4161,7 +4161,7 @@ fn run_molto(
             emit_json(&out)?;
             return Ok(());
         }
-        print_info(&info);
+        write_info(&mut std::io::stderr(), &info)?;
         let shown: Vec<_> = slots
             .iter()
             .enumerate()
@@ -4229,9 +4229,9 @@ fn run_molto(
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let info = session.read_info()?;
-        print_info(&info);
+        write_info(&mut std::io::stderr(), &info)?;
         let block = session.read_public_data(*profile)?;
-        println!(
+        output::status(&format!(
             "slot #{}: occupied: {}, title: {}",
             profile,
             if block.seed_present { "yes" } else { "no" },
@@ -4240,7 +4240,7 @@ fn run_molto(
                 .as_deref()
                 .map(sanitize_terminal)
                 .unwrap_or_else(|| "(none)".into()),
-        );
+        ));
         crate::prompt::confirm_on_held(&dev, *yes, &format!("delete slot #{profile}'s seed"))?;
         match session.delete_seed(*profile)? {
             SeedDeleteOutcome::Deleted => {
@@ -4266,9 +4266,9 @@ fn run_molto(
         let mut session = Session::open_named(&reader)?;
         session.set_debug(debug);
         let info = session.read_info()?;
-        print_info(&info);
+        write_info(&mut std::io::stderr(), &info)?;
         crate::prompt::confirm_on_held(&dev, *yes, "factory-reset the Molto2 (all 100 slots)")?;
-        println!("requesting factory reset; confirm with the up-arrow button on the device");
+        output::status("requesting factory reset; confirm with the up-arrow button on the device");
         session.factory_reset()?;
         return Ok(());
     }
@@ -4291,11 +4291,11 @@ fn run_molto(
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let info = session.read_info()?;
-        print_info(&info);
+        write_info(&mut std::io::stderr(), &info)?;
         if *authed {
             let key = customer_key(&mut sec, key)?;
             match session.authenticate(&key) {
-                Ok(()) => println!("authenticated"),
+                Ok(()) => output::status("authenticated"),
                 // The Display impl renders the tries-remaining count (or
                 // "unknown" when the card gave none).
                 Err(e @ TransportError::AuthFailed { .. }) => {
@@ -4378,7 +4378,7 @@ fn run_molto(
         let mut probe = open_molto_session(exact)?;
         probe.set_debug(debug);
         let info = probe.read_info()?;
-        print_info(&info);
+        write_info(&mut std::io::stderr(), &info)?;
         let busy = molto_occupied(&mut probe, slots.iter().copied())?;
         seen_serial = Some(info.serial.clone());
         drop(probe);
@@ -4399,10 +4399,10 @@ fn run_molto(
     let info = session.read_info()?;
     same_molto(seen_serial.as_deref(), &info.serial)?;
     if seen_serial.is_none() {
-        print_info(&info);
+        write_info(&mut std::io::stderr(), &info)?;
     }
     match session.authenticate(&key) {
-        Ok(()) => println!("authenticated"),
+        Ok(()) => output::status("authenticated"),
         // The Display impl renders the tries-remaining count (or "unknown").
         Err(e @ TransportError::AuthFailed { .. }) => return Err(e.to_string().into()),
         Err(e) => return Err(e.into()),
@@ -4464,7 +4464,9 @@ fn run_molto(
                 unreachable!("read before authentication")
             };
             session.set_customer_key(new_key)?;
-            println!("customer-key rotation requested. Press the up-arrow button on the device to confirm.");
+            output::status(
+                "customer-key rotation requested. Press the up-arrow button on the device to confirm.",
+            );
         }
         MoltoCmd::Import {
             profile,
@@ -4494,9 +4496,9 @@ fn run_molto(
                 entry.digits as u8
             );
             if qr.is_some() {
-                println!(
+                output::note(
                     "remember to delete the screenshot (and any phone/cloud copies) — it \
-                     contains the secret"
+                     contains the secret",
                 );
             }
         }
@@ -4515,12 +4517,12 @@ fn run_molto(
                 .ok_or("internal error: bulk entries not loaded")?;
             let n = entries.len();
             let last = *start as usize + n;
-            println!(
+            output::status(&format!(
                 "found {} entries; programming slots #{}..#{}",
                 n,
                 start,
                 last - 1
-            );
+            ));
             for (i, entry) in entries.iter().enumerate() {
                 let p = start + i as u8;
                 let title = entry.suggested_title();
@@ -4531,14 +4533,14 @@ fn run_molto(
                     );
                     continue;
                 }
-                println!(
+                output::status(&format!(
                     "  #{}: {:?} ({} bytes secret, {:?}, {} digits)",
                     p,
                     title,
                     entry.secret.len(),
                     entry.algorithm,
                     entry.digits as u8
-                );
+                ));
                 session.set_seed(p, &entry.secret)?;
                 session.set_title(p, &title)?;
                 session.set_config(
@@ -6889,16 +6891,10 @@ fn run_otp(
         OtpCmd::Config => {
             let mut session = open_otp(&sel, debug)?;
             // Show the raw READ_CONFIG bytes first (diagnostic), then the parse.
-            match session.read_config() {
-                Ok(raw) => {
-                    let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-                    println!("READ_CONFIG returned {} bytes: {hex}", raw.len());
-                }
-                Err(e) => {
-                    eprintln!("READ_CONFIG failed: {e}");
-                    return Err(e.into());
-                }
-            }
+            // A failure is returned for `main` to print once.
+            let raw = session.read_config()?;
+            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            println!("READ_CONFIG returned {} bytes: {hex}", raw.len());
             let info = session.read_device_info()?;
             println!("Device configuration:");
             println!(
@@ -7418,10 +7414,10 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
-            println!(
+            output::status(&format!(
                 "Generating {} key — touch the key if it blinks…",
                 slot.label()
-            );
+            ));
             let key = session.generate_key(slot.to_crt(), algorithm.map(|a| a.to_alg()))?;
             let attrs = session.algorithm_attributes(slot.to_crt())?;
             print_openpgp_public_key(&format!("Generated {}", slot.label()), &attrs, &key);
@@ -7459,7 +7455,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 let path = in_file
                     .as_deref()
                     .ok_or("provide --generate or --in <FILE>")?;
-                println!("Loading RSA key from {}…", path.display());
+                output::status(&format!("Loading RSA key from {}…", path.display()));
                 Some(keyroost_rsakey::load_from_file(path)?)
             };
             let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
@@ -7472,7 +7468,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let k = match loaded {
                 Some(k) => k,
                 None => {
-                    println!("Generating an RSA-2048 key on the host…");
+                    output::status("Generating an RSA-2048 key on the host…");
                     keyroost_rsakey::generate_2048()?
                 }
             };
@@ -7480,7 +7476,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
             session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
-            println!("Importing {} key…", slot.label());
+            output::status(&format!("Importing {} key…", slot.label()));
             let parts = keyroost_transport::RsaPrivateKeyParts {
                 e: &k.e,
                 p: &k.p,
@@ -10341,7 +10337,7 @@ fn run_fido_ssh_cert_extract(
         .into());
     }
     std::fs::write(&out_path, cert_pub.as_bytes())?;
-    println!("Wrote SSH certificate to {}", out_path.display());
+    output::status(&format!("Wrote SSH certificate to {}", out_path.display()));
     Ok(())
 }
 
@@ -10574,7 +10570,9 @@ fn run_fido_large_blob_get(
             for ext in &info.extensions {
                 println!("  Extension:   {}", sanitize_terminal(ext));
             }
-            println!("\nExport with: keyroostctl fido large-blob export {index} <FILE> --as-cert");
+            output::note(&format!(
+                "export with: keyroostctl fido large-blob export {index} <FILE> --as-cert"
+            ));
         }
         EntryKind::Opaque => {
             println!(
@@ -10616,7 +10614,11 @@ fn run_fido_large_blob_export(
         entry.ciphertext.clone()
     };
     std::fs::write(output, &bytes)?;
-    println!("Wrote {} bytes to {}", bytes.len(), output.display());
+    output::status(&format!(
+        "Wrote {} bytes to {}",
+        bytes.len(),
+        output.display()
+    ));
     Ok(())
 }
 
@@ -11114,7 +11116,7 @@ fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::E
         )
         .into());
     }
-    println!("Power-cycling the card and sending the reset\u{2026}");
+    output::status("Power-cycling the card and sending the reset\u{2026}");
     let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(exact_reader)?;
     keyroost_ctap::reset(&mut dev).map_err(|e| -> Box<dyn std::error::Error> {
         let s = e.to_string();
@@ -11312,7 +11314,7 @@ fn run_fido_fingerprint_list(
             // The hex template id is what --template-id takes for rename/delete.
             println!("  id {}   {}", hex_encode(&e.template_id), name);
         }
-        println!("(use the id with --template-id to rename or delete)");
+        output::note("use the id with --template-id to rename or delete");
         Ok(())
     })
 }
@@ -11326,23 +11328,29 @@ fn run_fido_fingerprint_enroll(
     with_bio_enrollment(path, pin, |bio| {
         if let Ok(info) = bio.sensor_info() {
             if info.max_capture_samples > 0 {
-                println!(
+                output::status(&format!(
                     "Enrolling a fingerprint ({} good samples needed).",
                     info.max_capture_samples
-                );
+                ));
             }
         }
-        println!("Touch the sensor now\u{2026}");
+        output::status("Touch the sensor now\u{2026}");
         let (template_id, mut status) = bio.enroll_begin(None)?;
-        println!("  {}", sample_status_message(status.last_sample_status));
+        output::status(&format!(
+            "  {}",
+            sample_status_message(status.last_sample_status)
+        ));
         // Capture until the device says no samples remain.
         while status.remaining_samples > 0 {
-            println!(
+            output::status(&format!(
                 "  {} more sample(s) needed \u{2014} touch the sensor again\u{2026}",
                 status.remaining_samples
-            );
+            ));
             status = bio.enroll_capture_next(&template_id, None)?;
-            println!("  {}", sample_status_message(status.last_sample_status));
+            output::status(&format!(
+                "  {}",
+                sample_status_message(status.last_sample_status)
+            ));
         }
         // Optionally name it once enrolled.
         if let Some(n) = name {
@@ -11677,12 +11685,17 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
     println!("Any ✓ line is an instruction the firmware recognized and completed.");
 }
 
-fn print_info(info: &keyroost_transport::DeviceInfo) {
+/// Write the Molto2's serial and clock to `w`: stdout for `molto info` (the
+/// result), stderr for every other command (context before the result).
+fn write_info(
+    w: &mut impl std::io::Write,
+    info: &keyroost_transport::DeviceInfo,
+) -> std::io::Result<()> {
     // The serial is `from_utf8_lossy` over device bytes; flatten any control
     // characters before they reach the terminal (a hostile token could embed
     // escape sequences). Shared by every command that prints device info.
-    println!("device serial: {}", sanitize_terminal(&info.serial));
-    println!("device UTC:    {} (epoch)", info.utc_time);
+    writeln!(w, "device serial: {}", sanitize_terminal(&info.serial))?;
+    writeln!(w, "device UTC:    {} (epoch)", info.utc_time)?;
     // TOTP tolerates small drift (one 30s step either way at most verifiers);
     // beyond that, codes get rejected in ways users misdiagnose as a bad
     // seed. Surface it here where it's cheap to see.
@@ -11695,6 +11708,7 @@ fn print_info(info: &keyroost_transport::DeviceInfo) {
             if drift > 0 { "ahead of" } else { "behind" }
         );
     }
+    Ok(())
 }
 
 /// Exit quietly on a broken output pipe instead of dumping a panic + backtrace.

@@ -36,7 +36,6 @@ pub(crate) fn note(msg: &str) {
 
 /// A status line on stderr, unprefixed: prompts, progress, "wrote", the
 /// target announcement.
-#[allow(dead_code)] // first callers arrive with the text-output pass
 pub(crate) fn status(msg: &str) {
     eprintln!("{msg}");
 }
