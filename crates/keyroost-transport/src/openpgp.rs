@@ -90,6 +90,19 @@ impl OpenPgpStatus {
             .or_else(|| self.serial().map(u128::from))
     }
 
+    /// The serial as front ends show it: [`Self::otp_applet_serial`] (a
+    /// Token2 key's full serial, as printed on the key) when present, else
+    /// [`Self::serial`] in decimal and hex (`19088743 (0x01234567)`). `None`
+    /// when the card reported neither.
+    #[must_use]
+    pub fn serial_text(&self) -> Option<String> {
+        match (self.otp_applet_serial, self.serial()) {
+            (Some(s), _) => Some(s.to_string()),
+            (None, Some(s)) => Some(format!("{s} (0x{s:08X})")),
+            (None, None) => None,
+        }
+    }
+
     /// Human label of the algorithm in `crt`'s slot (`RSA-2048`, `EdDSA
     /// Ed25519`, …), or `none` for an empty attributes object. Never fails.
     #[must_use]
@@ -927,6 +940,23 @@ mod tests {
         );
         // Too-short AID still yields no serial rather than panicking.
         assert_eq!(status(vec![]).serial(), None);
+    }
+
+    #[test]
+    fn serial_text_forms() {
+        // The OTP applet's full serial wins, shown as printed on the key.
+        let mut st = status_with(aid_with(0x0006, 1));
+        st.otp_applet_serial = Some(1_000_000_123_456);
+        assert_eq!(st.serial_text().as_deref(), Some("1000000123456"));
+        // Otherwise the AID serial, in decimal and hex.
+        assert_eq!(
+            status_with(aid_with(0x0006, 0x0123_4567))
+                .serial_text()
+                .as_deref(),
+            Some("19088743 (0x01234567)")
+        );
+        // Neither: nothing to show.
+        assert_eq!(status_with(vec![]).serial_text(), None);
     }
 
     #[test]

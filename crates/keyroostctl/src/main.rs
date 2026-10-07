@@ -7866,7 +7866,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             // it equals the YubiKey's CCID/mgmt serial used for friendly
             // names). A Token2 key's full serial from its OTP applet is shown
             // as printed on the key.
-            if let Some(serial) = openpgp_serial_text(status.otp_applet_serial, status.serial()) {
+            if let Some(serial) = status.serial_text() {
                 println!("Serial:         {serial}");
             }
             println!(
@@ -10277,16 +10277,6 @@ fn load_pubkey_material(
             )
         })?;
     Ok((alg, key))
-}
-
-/// The serial `openpgp info` shows: Token2's full serial as printed on the
-/// key when its OTP applet supplied it, else the AID serial in decimal and hex.
-fn openpgp_serial_text(otp_applet_serial: Option<u128>, aid_serial: Option<u32>) -> Option<String> {
-    match (otp_applet_serial, aid_serial) {
-        (Some(s), _) => Some(s.to_string()),
-        (None, Some(s)) => Some(format!("{s} (0x{s:08X})")),
-        (None, None) => None,
-    }
 }
 
 /// Print a key fingerprint, rendering an all-zero (no key) slot as "(none)".
@@ -17762,19 +17752,6 @@ mod cli_tests {
             piv_slot_state(Some(CertUnreadable::Damaged), true, 0, false, K::Unknown)
                 .starts_with("cert present but unreadable")
         );
-    }
-
-    #[test]
-    fn openpgp_serial_text_forms() {
-        assert_eq!(
-            openpgp_serial_text(Some(1_000_000_123_456), Some(1)).as_deref(),
-            Some("1000000123456")
-        );
-        assert_eq!(
-            openpgp_serial_text(None, Some(0x0123_4567)).as_deref(),
-            Some("19088743 (0x01234567)")
-        );
-        assert_eq!(openpgp_serial_text(None, None), None);
     }
 
     #[test]

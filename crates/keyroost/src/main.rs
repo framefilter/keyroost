@@ -2494,16 +2494,6 @@ fn piv_cert_error_hint(e: &TransportError, choice: PivCertCompressionSel) -> Opt
     }
 }
 
-/// The serial the OpenPGP pane shows: Token2's full serial as printed on the
-/// key when its OTP applet supplied it, else the AID serial in decimal and hex.
-fn openpgp_serial_text(otp_applet_serial: Option<u128>, aid_serial: Option<u32>) -> Option<String> {
-    match (otp_applet_serial, aid_serial) {
-        (Some(s), _) => Some(s.to_string()),
-        (None, Some(s)) => Some(format!("{s} (0x{s:08X})")),
-        (None, None) => None,
-    }
-}
-
 /// The selected slot's state words: whether it holds a certificate (and
 /// whether that is stored compressed or unreadable) or just a key, with the
 /// key algorithm parenthesized after the state word it describes. A slot with
@@ -17055,7 +17045,8 @@ impl App {
             // The three per-key algorithm+fingerprint rows live under the sub-tab
             // strip now, not here.
             if let Some(status) = &self.openpgp.status {
-                let serial = openpgp_serial_text(status.otp_applet_serial, status.serial())
+                let serial = status
+                    .serial_text()
                     .unwrap_or_else(|| "\u{2014}".to_string());
                 let sigs = status
                     .signature_count
@@ -22672,19 +22663,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn openpgp_serial_text_forms() {
-        assert_eq!(
-            openpgp_serial_text(Some(1_000_000_123_456), Some(1)).as_deref(),
-            Some("1000000123456")
-        );
-        assert_eq!(
-            openpgp_serial_text(None, Some(0x0123_4567)).as_deref(),
-            Some("19088743 (0x01234567)")
-        );
-        assert_eq!(openpgp_serial_text(None, None), None);
     }
 
     #[test]
