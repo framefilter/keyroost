@@ -12904,9 +12904,18 @@ mod cli_tests {
         assert!(bad.is_empty(), "no help:\n{}", bad.join("\n"));
     }
 
+    /// Two markers, on purpose. "Irreversible" ends the first line of every
+    /// command whose change loses something stored (a key, seed, certificate,
+    /// credential or blob). "One-way" is a deliberate second marker for a
+    /// setting that loses nothing but can't be turned back except by a FIDO
+    /// reset; only `ONE_WAY_SETTINGS` carry it.
     #[test]
-    fn one_destructive_marker_style() {
-        let marked: &[(&str, &str)] = &[
+    fn destructive_marker_styles() {
+        const ONE_WAY_SETTINGS: [&str; 2] = [
+            "fido config set-min-pin-length",
+            "fido config enable-enterprise-attestation",
+        ];
+        let irreversible: &[(&str, &str)] = &[
             ("fido reset", IRREVERSIBLE),
             ("fido credentials delete", IRREVERSIBLE),
             ("fido fingerprints delete", IRREVERSIBLE),
@@ -12935,9 +12944,12 @@ mod cli_tests {
             ("prog seed", IRREVERSIBLE),
             ("otp set-button-hotp", IRREVERSIBLE),
             ("factory-reset", IRREVERSIBLE_TYPED),
-            ("fido config set-min-pin-length", ONE_WAY),
-            ("fido config enable-enterprise-attestation", ONE_WAY),
         ];
+        let marked: Vec<(&str, &str)> = irreversible
+            .iter()
+            .copied()
+            .chain(ONE_WAY_SETTINGS.iter().map(|p| (*p, ONE_WAY)))
+            .collect();
         // Commands that ask before a change that destroys no key, seed or
         // certificate: settings and retry counts, plus `piv request-cert`,
         // which replaces a key only with the optional `--generate-key`.
