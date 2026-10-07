@@ -71,8 +71,9 @@ pub(crate) struct MoltoSlotsJson {
 /// One element of [`MoltoSlotsJson::slots`] (full parsed block).
 /// `time_a`/`time_b` are raw big-endian u32s with unconfirmed semantics.
 ///
-/// `algorithm`, `period` and `digits` are `null` when the stored byte is not
-/// a value the token defines (an empty slot stores zeros), never a guess.
+/// `algorithm` and `digits` are `null` for a code keyroost doesn't know;
+/// `period` is the stored seconds byte, `null` when 0. An empty slot may
+/// still report default values, so use `occupied`.
 #[derive(Serialize)]
 pub(crate) struct MoltoSlotJson {
     pub slot: u8,
@@ -735,6 +736,51 @@ mod tests {
             assert_shape(&v, &shape);
             assert_eq!(v["slot"], "9a");
             assert_eq!(v["slot_name"], "authentication (9A)");
+        }
+    }
+
+    #[test]
+    fn piv_status_shape() {
+        let shape = [
+            ("version", "string|null"),
+            ("serial", "string|null"),
+            ("pin_retries", "number|null"),
+            ("chuid", "object|null"),
+            ("slots", "array"),
+            ("applet_fingerprint", "string"),
+            ("applet_name", "string"),
+            ("version_firmware", "string|null"),
+        ];
+        for some in [true, false] {
+            let v = to_v(&PivStatusJson {
+                version: some.then(|| "5.7.1".to_string()),
+                serial: some.then(|| "12345678".to_string()),
+                pin_retries: some.then_some(3),
+                chuid: some.then(|| PivChuidJson {
+                    fasc_n: "d4".into(),
+                    guid: "00".into(),
+                    expiration: "2030-01-01".into(),
+                    signature: String::new(),
+                    lrc: String::new(),
+                }),
+                slots: vec![],
+                applet_fingerprint: "YubiKey".into(),
+                applet_name: String::new(),
+                version_firmware: some.then(|| "1.0.0".to_string()),
+            });
+            assert_shape(&v, &shape);
+            if some {
+                assert_shape(
+                    &v["chuid"],
+                    &[
+                        ("fasc_n", "string"),
+                        ("guid", "string"),
+                        ("expiration", "string"),
+                        ("signature", "string"),
+                        ("lrc", "string"),
+                    ],
+                );
+            }
         }
     }
 

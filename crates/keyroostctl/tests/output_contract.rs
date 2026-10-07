@@ -55,6 +55,9 @@ fn value_parser_errors_name_the_value_once() {
         (&["piv", "self-sign", "--days", "zz"], "zz"),
         (&["piv", "self-sign", "--years", "zz"], "zz"),
         (&["piv", "self-sign", "--months", "zz"], "zz"),
+        (&["piv", "self-sign", "--days", "99999999"], "99999999"),
+        (&["piv", "self-sign", "--years", "99999"], "99999"),
+        (&["piv", "self-sign", "--months", "9999999"], "9999999"),
     ] {
         let (code, _, err) = run(args);
         assert_eq!(code, 2, "{args:?}: {err}");

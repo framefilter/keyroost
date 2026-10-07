@@ -3399,7 +3399,7 @@ fn parse_valid_days(s: &str) -> Result<u32, String> {
     let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
     if days > max {
         return Err(format!(
-            "--days {days} exceeds the largest representable value ({max} days \
+            "--days exceeds the largest representable validity ({max} days \
              from now) — a CHUID/certificate date is a 4-digit year, capped at \
              9999-12-31"
         ));
@@ -3417,7 +3417,7 @@ fn parse_valid_years(s: &str) -> Result<u32, String> {
     let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
     if years > max {
         return Err(format!(
-            "--years {years} exceeds the largest representable value ({max} years \
+            "--years exceeds the largest representable validity ({max} years \
              from now) — a CHUID/certificate date is a 4-digit year, capped at \
              9999-12-31"
         ));
@@ -3435,7 +3435,7 @@ fn parse_valid_months(s: &str) -> Result<u32, String> {
     let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
     if months > max {
         return Err(format!(
-            "--months {months} exceeds the largest representable value ({max} months \
+            "--months exceeds the largest representable validity ({max} months \
              from now) — a CHUID/certificate date is a 4-digit year, capped at \
              9999-12-31"
         ));
@@ -11968,6 +11968,9 @@ mod otp_capability_tests {
 
 #[cfg(test)]
 mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
     #[test]
     fn piv_slot_token_matches_clap_for_every_slot() {
         use clap::ValueEnum;
@@ -11980,9 +11983,6 @@ mod cli_tests {
             "95"
         );
     }
-
-    use super::*;
-    use clap::Parser;
 
     #[test]
     fn piv_reset_refuses_a_card_swapped_during_the_question() {
