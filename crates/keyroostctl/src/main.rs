@@ -2294,19 +2294,6 @@ enum FidoCmd {
         #[command(subcommand)]
         cmd: FidoConfigCmd,
     },
-    /// Turn "always require user verification" (alwaysUv) on or off. This is a
-    /// toggle relative to the key's current state; run `info` to check it.
-    AlwaysUv {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
-        #[arg(long, value_name = "PATH")]
-        path: Option<std::path::PathBuf>,
-    },
     /// Read and manage the FIDO2 large-blob array (the key's small shared store).
     ///
     /// IMPORTANT: the large-blob store is WORLD-READABLE without a PIN — any
@@ -2489,6 +2476,30 @@ enum FidoFingerprintsCmd {
 /// `fido config` subcommands: key-wide authenticatorConfig settings.
 #[derive(Subcommand)]
 enum FidoConfigCmd {
+    /// Turn on "always require user verification" (alwaysUv). Does nothing if it is already on.
+    EnableAlwaysUv {
+        /// Read the PIN from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
+    /// Turn off "always require user verification" (alwaysUv). Does nothing if it is already off.
+    DisableAlwaysUv {
+        /// Read the PIN from the named environment variable.
+        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
+        pin_env: Option<String>,
+        /// Read the PIN from stdin (hidden when typed at a terminal); with
+        /// neither flag, a hidden prompt asks for it.
+        #[arg(long)]
+        pin_stdin: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+    },
     /// Raise the minimum PIN length. The value can only be increased, never
     /// lowered (a reset is required to lower it), and may force a PIN change.
     /// ONE-WAY: asks first. To only force a PIN change, use
@@ -4016,6 +4027,12 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         old: "enterprise-attestation",
         new: "fido config enable-enterprise-attestation",
         note: "",
+    },
+    RetiredCommand {
+        parent: "fido",
+        old: "always-uv",
+        new: "fido config enable-always-uv",
+        note: "or `keyroostctl fido config disable-always-uv`; say which state you want",
     },
     RetiredCommand {
         parent: "piv",
@@ -10317,22 +10334,6 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
         FidoCmd::Credentials { cmd } => run_fido_credentials(cmd),
         FidoCmd::Fingerprints { cmd } => run_fido_fingerprints(cmd),
         FidoCmd::Config { cmd } => run_fido_config(cmd),
-        FidoCmd::AlwaysUv {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
-            with_configurator(path.as_deref(), &pin, |cfg| {
-                cfg.toggle_always_uv()?;
-                println!(
-                    "Toggled \"always require user verification\". Run `fido info` to \
-                     confirm the new state."
-                );
-                Ok(())
-            })?;
-            Ok(())
-        }
         FidoCmd::LargeBlob { cmd } => run_fido_large_blob(cmd),
         FidoCmd::SshCert { cmd } => run_fido_ssh_cert(cmd),
     }
@@ -10489,8 +10490,77 @@ fn run_fido_fingerprints(cmd: &FidoFingerprintsCmd) -> Result<(), Box<dyn std::e
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AlwaysUvStep {
+    AlreadySet,
+    Change,
+}
+
+/// What enable-/disable-always-uv must do, from the `alwaysUv` option the
+/// key reports. A key that doesn't report it can't be brought to a known
+/// state, so nothing is sent.
+fn always_uv_step(current: Option<bool>, want_on: bool) -> Result<AlwaysUvStep, String> {
+    match current {
+        None => Err(
+            "this key doesn't report its \"always require user verification\" \
+                     setting (alwaysUv), so keyroost can't set it to a known state; \
+                     nothing was changed"
+                .into(),
+        ),
+        Some(on) if on == want_on => Ok(AlwaysUvStep::AlreadySet),
+        Some(_) => Ok(AlwaysUvStep::Change),
+    }
+}
+
+fn run_fido_always_uv(
+    want_on: bool,
+    path: Option<&std::path::Path>,
+    pin_env: &Option<String>,
+    pin_stdin: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut sec = Secrets::real();
+    let src = Source::new(pin_env.as_deref(), pin_stdin);
+    sec.check(&FIDO_PIN, src)?;
+    let dev = crate::target::select_fido(path)?;
+    let word = if want_on { "on" } else { "off" };
+    // Read the state first (no PIN needed), so a key already in the
+    // wanted state is never asked for its PIN.
+    let current = {
+        let (mut hid, init) =
+            keyroost_ctap::CtapHidDevice::open(&crate::target::hid_path_of(&dev)?)?;
+        if !init.supports_cbor() {
+            return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
+        }
+        keyroost_ctap::get_info(&mut hid)?.option("alwaysUv")
+    };
+    if always_uv_step(current, want_on)? == AlwaysUvStep::AlreadySet {
+        println!("\"Always require user verification\" is already {word}; nothing was changed.");
+        return Ok(());
+    }
+    let pin = sec.read(&FIDO_PIN, src)?;
+    fido_reverify_if_prompted(&sec, path)?;
+    with_configurator(path, &pin, |cfg, info| {
+        // Checked again on this handle: the key may have changed since the first read.
+        if always_uv_step(info.option("alwaysUv"), want_on)? == AlwaysUvStep::Change {
+            cfg.toggle_always_uv()?;
+        }
+        println!("\"Always require user verification\" is now {word}.");
+        Ok(())
+    })
+}
+
 fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
+        FidoConfigCmd::EnableAlwaysUv {
+            pin_env,
+            pin_stdin,
+            path,
+        } => run_fido_always_uv(true, path.as_deref(), pin_env, *pin_stdin),
+        FidoConfigCmd::DisableAlwaysUv {
+            pin_env,
+            pin_stdin,
+            path,
+        } => run_fido_always_uv(false, path.as_deref(), pin_env, *pin_stdin),
         FidoConfigCmd::SetMinPinLength {
             length,
             force_change,
@@ -10514,7 +10584,7 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
             )?;
             let length = *length;
             let force_change = *force_change;
-            with_configurator(path.as_deref(), &pin, move |cfg| {
+            with_configurator(path.as_deref(), &pin, move |cfg, _info| {
                 cfg.set_min_pin_length(Some(length), &[], force_change)?;
                 println!(
                     "Minimum PIN length set to {length}.{}",
@@ -10534,7 +10604,7 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
             path,
         } => {
             let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
-            with_configurator(path.as_deref(), &pin, |cfg| {
+            with_configurator(path.as_deref(), &pin, |cfg, _info| {
                 cfg.force_pin_change()?;
                 println!("A PIN change is now required on next use of this key.");
                 Ok(())
@@ -10560,7 +10630,7 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
                 Some(&dev),
                 src,
             )?;
-            with_configurator(path.as_deref(), &pin, |cfg| {
+            with_configurator(path.as_deref(), &pin, |cfg, _info| {
                 cfg.enable_enterprise_attestation()?;
                 println!("Enterprise attestation enabled. Disabling it again requires a reset.");
                 Ok(())
@@ -11979,6 +12049,7 @@ fn with_configurator<F>(
 where
     F: for<'a> FnOnce(
         &mut keyroost_ctap::config::Configurator<'a, keyroost_ctap::CtapHidDevice>,
+        &keyroost_ctap::AuthenticatorInfo,
     ) -> Result<(), Box<dyn std::error::Error>>,
 {
     let path = crate::target::fido_path(path)?;
@@ -11997,7 +12068,7 @@ where
         keyroost_ctap::client_pin::permissions::AUTHENTICATOR_CONFIGURATION,
     )?;
     let mut cfg = keyroost_ctap::config::Configurator::new(&mut dev, token, &info)?;
-    f(&mut cfg)
+    f(&mut cfg, &info)
 }
 
 /// Ask first, then read the PIN: a refusal or a "no" never consumes a PIN
@@ -12591,6 +12662,24 @@ mod otp_capability_tests {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn always_uv_step_table() {
+        assert_eq!(always_uv_step(Some(false), true), Ok(AlwaysUvStep::Change));
+        assert_eq!(always_uv_step(Some(true), false), Ok(AlwaysUvStep::Change));
+        assert_eq!(
+            always_uv_step(Some(true), true),
+            Ok(AlwaysUvStep::AlreadySet)
+        );
+        assert_eq!(
+            always_uv_step(Some(false), false),
+            Ok(AlwaysUvStep::AlreadySet)
+        );
+        for want in [true, false] {
+            let e = always_uv_step(None, want).unwrap_err();
+            assert!(e.contains("nothing was changed"), "{e}");
+        }
+    }
 
     #[test]
     fn piv_slot_token_matches_clap_for_every_slot() {

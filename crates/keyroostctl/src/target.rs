@@ -186,7 +186,7 @@ pub(crate) fn add_bootloader_hint(e: Box<dyn Error>, bootloader: Option<&str>) -
 /// return for `Need::FidoHid` has one: a detected row admitted by that need
 /// requires `hid_path`, and an unmatched `--path` passes through as a typed
 /// row carrying the path it was given.
-fn hid_path_of(dev: &Device) -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn hid_path_of(dev: &Device) -> Result<PathBuf, Box<dyn Error>> {
     dev.hid_path.clone().ok_or_else(|| {
         Box::<dyn Error>::from("internal error: a FIDO-over-USB row without a HID path")
     })

@@ -82,6 +82,10 @@ const CASES: &[(&[&str], &str)] = &[
         &["fido", "enterprise-attestation", "S3CRETVALUE"],
         "keyroostctl fido config enable-enterprise-attestation",
     ),
+    (
+        &["fido", "always-uv", "--pin-env", "S3CRETVALUE"],
+        "fido config disable-always-uv",
+    ),
     (&["piv", "status", "S3CRETVALUE"], "keyroostctl piv info"),
     (
         &["openpgp", "status", "S3CRETVALUE"],
