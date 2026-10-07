@@ -1860,7 +1860,7 @@ mod tests {
         // Yubico. The second node reports its own bus/address and matches no
         // reader — it must NOT adopt the YubiKey's reader "because there is only
         // one". Merging them put the Security Key's hid_path on the YubiKey's
-        // row, so every FIDO operation (PIN entry, creds-list, creds-delete)
+        // row, so every FIDO operation (PIN entry, credentials list, credentials delete)
         // landed on a key the user never selected.
         let probes = [probe(
             "Yubico YubiKey OTP+FIDO+CCID 00 00",
