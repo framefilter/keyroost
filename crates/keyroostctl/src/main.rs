@@ -45,9 +45,6 @@ static SELECTED_KEY_NAME: OnceLock<Option<String>> = OnceLock::new();
     about = "Program Token2 Molto2 / Molto2v2 TOTP tokens"
 )]
 struct Cli {
-    /// List available PC/SC readers and exit.
-    #[arg(long, global = true)]
-    list_readers: bool,
     /// Print every message sent to and received from the key to stderr (APDUs,
     /// and FIDO CTAP over USB; not FIDO through a smart-card reader). The
     /// format is for people and may change between releases.
@@ -897,8 +894,8 @@ enum PivCmd {
         // field, matching declaration order): clap-derive's implicit order
         // is an auto-incrementing counter that starts fresh at 0 in *each*
         // derive invocation, including the top-level `Cli` struct's own
-        // `global = true` args (`--list-readers`/`--debug`/`--device`/
-        // `--json`, implicitly 0..3). Left implicit, this variant's own
+        // `global = true` args (`--debug`/`--device`/`--json`, implicitly
+        // 0..2). Left implicit, this variant's own
         // fields also start at 0, so `--help` interleaved the two structs'
         // args by tied order number instead of keeping this command's own
         // args — the `--old-mgmt-key-*` trio in particular — together.
@@ -1834,9 +1831,9 @@ enum KeyNameCmd {
     },
     /// List configured key names and whether each is currently connected.
     List,
-    /// Remove a configured key name.
-    Remove {
-        /// The friendly label to remove.
+    /// Delete a friendly name from keys.json (the key itself is not touched).
+    Delete {
+        /// The friendly label to delete.
         name: String,
     },
 }
@@ -3624,10 +3621,7 @@ fn load_bulk_entries(
 
 /// `--device` on a command that never touches a key is a mistake (it used
 /// to be silently ignored). `list` and the bare overview filter by it.
-fn inert_device_flag(cmd: Option<&Cmd>, list_readers: bool) -> Option<&'static str> {
-    if list_readers {
-        return Some("--list-readers");
-    }
+fn inert_device_flag(cmd: Option<&Cmd>) -> Option<&'static str> {
     match cmd? {
         Cmd::Doctor => Some("doctor"),
         Cmd::Completions { .. } => Some("completions"),
@@ -3636,8 +3630,8 @@ fn inert_device_flag(cmd: Option<&Cmd>, list_readers: bool) -> Option<&'static s
             cmd: KeyNameCmd::List,
         } => Some("key-name list"),
         Cmd::KeyName {
-            cmd: KeyNameCmd::Remove { .. },
-        } => Some("key-name remove"),
+            cmd: KeyNameCmd::Delete { .. },
+        } => Some("key-name delete"),
         Cmd::Molto {
             cmd: MoltoCmd::ImportFile { dry_run: true, .. },
             ..
@@ -3709,8 +3703,7 @@ fn list_json_rows(
         .collect()
 }
 
-/// Removed or renamed secret-bearing flags, keyed by (the flag as clap
-/// reports it, words that must all appear in argv to disambiguate which
+/// Removed or renamed flags, keyed by (the flag as clap reports it, words that must all appear in argv to disambiguate which
 /// subcommand's flag this is, the message to print). The message never
 /// repeats the value the user passed — clap only hands us the flag name,
 /// never its value or the next token, so there is nothing to leak here.
@@ -3775,7 +3768,85 @@ const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
         &["otp", "change-pin"],
         "--pin-stdin was split: use --old-pin-stdin (first line) and --new-pin-stdin (second line)",
     ),
+    (
+        "--list-readers",
+        &[],
+        "--list-readers was removed; `keyroostctl list` shows the smart-card readers",
+    ),
 ];
+
+/// A renamed or removed subcommand. `parent` is the command path above it
+/// ("" for top level, "fido", "fido large-blob"), `old` the retired word,
+/// `new` the full command to use now (it may end in flags), `note` an
+/// optional extra clause.
+struct RetiredCommand {
+    parent: &'static str,
+    old: &'static str,
+    new: &'static str,
+    note: &'static str,
+}
+
+const RETIRED_COMMANDS: &[RetiredCommand] = &[RetiredCommand {
+    parent: "key-name",
+    old: "remove",
+    new: "key-name delete",
+    note: "",
+}];
+
+/// The message for a retired subcommand, if clap's unknown subcommand
+/// `invalid` is one. Walks `argv` down the real command tree to find the
+/// path it was typed under, skipping the value of every flag that takes
+/// one (`--device remove key-name remove` resolves to `key-name`). The
+/// message is static table text: nothing from argv is repeated.
+fn retired_command_hint(invalid: &str, argv: &[String]) -> Option<String> {
+    use clap::CommandFactory;
+    let mut root = Cli::command();
+    root.build();
+    let mut cmd = &root;
+    let mut path: Vec<&str> = Vec::new();
+    let mut words = argv.iter().skip(1);
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let takes_value = cmd
+                .get_arguments()
+                .any(|a| a.get_long() == Some(long) && a.get_action().takes_values());
+            if takes_value {
+                words.next();
+            }
+            continue;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        match cmd.find_subcommand(word) {
+            Some(sub) => {
+                path.push(sub.get_name());
+                cmd = sub;
+            }
+            None => break,
+        }
+    }
+    let parent = path.join(" ");
+    RETIRED_COMMANDS
+        .iter()
+        .find(|r| r.parent == parent && r.old == invalid)
+        .map(|r| {
+            let old = if r.parent.is_empty() {
+                r.old.to_string()
+            } else {
+                format!("{} {}", r.parent, r.old)
+            };
+            let note = if r.note.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", r.note)
+            };
+            format!("`keyroostctl {old}` is now `keyroostctl {}`{note}", r.new)
+        })
+}
 
 /// A friendly hint for a removed or renamed secret-bearing flag, or `None` if
 /// `invalid` isn't one of ours (or the surrounding argv doesn't match, so an
@@ -3813,8 +3884,9 @@ fn stdin_flag_precedes(argv: &[String], prefix: &str) -> bool {
 /// The message to print instead of clap's for a parse error that could
 /// repeat a secret, or `None` to let clap print its own.
 ///
-/// A retired secret flag gets its replacement hint. An unexpected
-/// non-flag argument on a command that takes a secret is not repeated:
+/// A retired subcommand gets its replacement hint, and so does a retired
+/// flag. An unexpected non-flag argument on a command that takes a secret
+/// is not repeated:
 /// clap's "unexpected argument 'X' found" would echo X, which may be the
 /// secret itself (`molto seed --hex-stdin DEADBEEF`, or an otpauth:// URI
 /// after `molto import -`). A `--X-stdin` flag given a value (`--hex-stdin
@@ -3827,6 +3899,13 @@ fn stdin_flag_precedes(argv: &[String], prefix: &str) -> bool {
 fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     use clap::CommandFactory;
+
+    if e.kind() == ErrorKind::InvalidSubcommand {
+        let Some(ContextValue::String(word)) = e.get(ContextKind::InvalidSubcommand) else {
+            return None;
+        };
+        return retired_command_hint(word, argv);
+    }
 
     // A bare flag given a value it doesn't take. For a `--X-stdin` flag the
     // value may be the secret itself, typed where the variable name or
@@ -3909,16 +3988,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cli.device.is_some() {
-        if let Some(what) = inert_device_flag(cli.command.as_ref(), cli.list_readers) {
+        if let Some(what) = inert_device_flag(cli.command.as_ref()) {
             return Err(format!("--device has no effect on `{what}`; remove it").into());
         }
-    }
-
-    if cli.list_readers {
-        for r in Session::list_readers()? {
-            println!("{}", r);
-        }
-        return Ok(());
     }
 
     let Some(cmd) = cli.command.as_ref() else {
@@ -9718,7 +9790,7 @@ fn run_key_name(cmd: &KeyNameCmd) -> Result<(), Box<dyn std::error::Error>> {
             key_name_add(name, path.as_deref(), reader.as_deref())
         }
         KeyNameCmd::List => key_name_list(),
-        KeyNameCmd::Remove { name } => key_name_remove(name),
+        KeyNameCmd::Delete { name } => key_name_delete(name),
     }
 }
 
@@ -9791,8 +9863,8 @@ fn key_name_add(
     );
     eprintln!(
         "This saves the key's serial number to keys.json on this computer so the \
-         key can be recognized by name later — remove it any time with \
-         `keyroostctl key-name remove {}`.",
+         key can be recognized by name later — delete it any time with \
+         `keyroostctl key-name delete {}`.",
         name
     );
     let written = keyring.save_default()?;
@@ -9822,7 +9894,7 @@ fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn key_name_remove(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn key_name_delete(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut keyring = Keyring::load_default()?;
     if keyring.remove(name) {
         keyring.save_default()?;
@@ -14969,6 +15041,84 @@ mod cli_tests {
         assert!(parse(&["keyroostctl", "piv", "status", "--json"]).is_ok());
     }
 
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn retired_command_hint_skips_flag_values() {
+        let want = "`keyroostctl key-name remove` is now `keyroostctl key-name delete`";
+        for a in [
+            &["keyroostctl", "key-name", "remove", "x"][..],
+            &["keyroostctl", "--json", "key-name", "remove", "x"],
+            // The value of --device is the same word, and must be skipped.
+            &[
+                "keyroostctl",
+                "--device",
+                "remove",
+                "key-name",
+                "remove",
+                "x",
+            ],
+            &["keyroostctl", "--device=remove", "key-name", "remove"],
+        ] {
+            assert_eq!(
+                retired_command_hint("remove", &argv(a)).as_deref(),
+                Some(want),
+                "{a:?}"
+            );
+        }
+        // Same word under another parent is not this row.
+        assert_eq!(
+            retired_command_hint("remove", &argv(&["keyroostctl", "remove"])),
+            None
+        );
+        assert_eq!(
+            retired_command_hint("remove", &argv(&["keyroostctl", "oath", "remove"])),
+            None
+        );
+    }
+
+    #[test]
+    fn retired_rows_point_at_real_commands() {
+        use clap::CommandFactory;
+        let mut root = Cli::command();
+        root.build();
+        let descend = |path: &str| -> Option<&clap::Command> {
+            let mut c = &root;
+            for w in path.split(' ').filter(|w| !w.is_empty()) {
+                c = c.find_subcommand(w)?;
+            }
+            Some(c)
+        };
+        for r in RETIRED_COMMANDS {
+            let parent =
+                descend(r.parent).unwrap_or_else(|| panic!("parent `{}` is gone", r.parent));
+            assert!(
+                parent.find_subcommand(r.old).is_none(),
+                "`{} {}` still parses",
+                r.parent,
+                r.old
+            );
+            let mut c = &root;
+            let mut in_flags = false;
+            for w in r.new.split(' ') {
+                if let Some(flag) = w.strip_prefix("--") {
+                    in_flags = true;
+                    assert!(
+                        c.get_arguments().any(|a| a.get_long() == Some(flag)),
+                        "`{}`: no --{flag}",
+                        r.new
+                    );
+                } else if !in_flags {
+                    c = c
+                        .find_subcommand(w)
+                        .unwrap_or_else(|| panic!("`{}`: no `{w}`", r.new));
+                }
+            }
+        }
+    }
+
     #[test]
     fn piv_move_key_parses_standard_and_retired_slots() {
         match parse(&[
@@ -17031,8 +17181,8 @@ mod cli_tests {
             (&["keyroostctl", "manpage", "d"], Some("manpage")),
             (&["keyroostctl", "key-name", "list"], Some("key-name list")),
             (
-                &["keyroostctl", "key-name", "remove", "x"],
-                Some("key-name remove"),
+                &["keyroostctl", "key-name", "delete", "x"],
+                Some("key-name delete"),
             ),
             (
                 &["keyroostctl", "molto", "import-file", "--dry-run", "x.json"],
@@ -17044,17 +17194,8 @@ mod cli_tests {
             (&["keyroostctl", "piv", "status"], None),
         ] {
             let cli = parse(args).unwrap();
-            assert_eq!(
-                inert_device_flag(cli.command.as_ref(), cli.list_readers),
-                what,
-                "{args:?}"
-            );
+            assert_eq!(inert_device_flag(cli.command.as_ref()), what, "{args:?}");
         }
-        let cli = parse(&["keyroostctl", "--list-readers"]).unwrap();
-        assert_eq!(
-            inert_device_flag(cli.command.as_ref(), cli.list_readers),
-            Some("--list-readers")
-        );
     }
 
     #[test]
