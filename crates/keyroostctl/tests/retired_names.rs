@@ -131,6 +131,10 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (&["otp", "set-pin", "--pin-stdin"], "--new-pin-stdin"),
     (
+        &["otp", "list", "--pin-only", "S3CRETVALUE"],
+        "--unlock pin",
+    ),
+    (
         &["--device", "pin-set", "fido", "pin-set"],
         "keyroostctl fido pin set",
     ),

@@ -7224,7 +7224,7 @@ mod tests {
     // `slot_status` / `status_detailed`) uses to decide whether a slot holds
     // a certificate. The regression this guards: a deleted slot answering
     // SW_OK with an empty `53 00` template (Nitrokey's piv-authenticator,
-    // observed with `piv status` after `piv delete-cert`) must read as empty,
+    // observed with `piv info` after `piv delete-cert`) must read as empty,
     // not "cert present (0 bytes)".
 
     #[test]
@@ -7302,7 +7302,7 @@ mod tests {
 
     // A slot whose certificate is flagged compressed but will not inflate
     // holds *something* — it must read as unreadable, never as empty, so
-    // `piv status` doesn't invite overwriting it and `export-cert` doesn't
+    // `piv info` doesn't invite overwriting it and `export-cert` doesn't
     // report "no certificate" (#147 follow-up; seen on a YubiKey 5.7).
 
     #[test]

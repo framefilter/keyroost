@@ -2687,7 +2687,8 @@ enum OtpCmd {
     /// fingerprint touch instead, and `--unlock auto` tries the fingerprint
     /// and falls back to a PIN given by flag (never asked for).
     List {
-        /// How to unlock the codes on a PIN-protected key.
+        /// How to unlock the codes on a PIN-protected key; `pin` asks for the
+        /// PIN when the key needs one and no flag gives it.
         #[arg(long, value_enum, default_value_t = OtpUnlock::Pin)]
         unlock: OtpUnlock,
         /// Read the OTP PIN from the named environment variable (protected keys).
@@ -3663,6 +3664,27 @@ fn load_bulk_entries(
 
 /// `--device` on a command that never touches a key is a mistake (it used
 /// to be silently ignored). `list` and the bare overview filter by it.
+/// The usage mistake in `otp list --unlock fingerprint --pin-env/--pin-stdin`:
+/// a fingerprint unlock takes no PIN. clap can't tie a conflict to one value
+/// of `--unlock`, so `run` checks this straight after parsing and exits 2,
+/// like any other usage error, before a key is looked at.
+fn otp_unlock_conflict(cmd: Option<&Cmd>) -> Option<&'static str> {
+    match cmd {
+        Some(Cmd::Otp {
+            cmd:
+                OtpCmd::List {
+                    unlock: OtpUnlock::Fingerprint,
+                    pin_env,
+                    pin_stdin,
+                },
+            ..
+        }) if pin_env.is_some() || *pin_stdin => Some(
+            "`--unlock fingerprint` takes no PIN; drop --pin-env/--pin-stdin, or use --unlock auto for a PIN fallback",
+        ),
+        _ => None,
+    }
+}
+
 fn inert_device_flag(cmd: Option<&Cmd>) -> Option<&'static str> {
     match cmd? {
         Cmd::Doctor => Some("doctor"),
@@ -3820,6 +3842,11 @@ const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
         "--pin-stdin",
         &["otp", "set-pin"],
         "--pin-stdin was renamed --new-pin-stdin (the PIN being set; the same name `fido pin set` uses)",
+    ),
+    (
+        "--pin-only",
+        &["otp", "list"],
+        "--pin-only was replaced by --unlock pin (the old `otp unlock-list` is now `otp list --unlock auto`)",
     ),
     (
         "--list-readers",
@@ -4183,6 +4210,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             e.exit()
         }
     };
+    if let Some(msg) = otp_unlock_conflict(cli.command.as_ref()) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
     // Capture --device once so target::select() can honor it without threading
     // it through every command handler.
     let _ = SELECTED_KEY_NAME.set(cli.device.clone());
@@ -7013,9 +7044,8 @@ fn run_otp(
             pin_env,
             pin_stdin,
         } => {
-            if pin_env.is_some() || *pin_stdin {
-                return Err("`--unlock fingerprint` takes no PIN; drop --pin-env/--pin-stdin, or use --unlock auto for a PIN fallback".into());
-            }
+            // A PIN flag here was refused at parse time (otp_unlock_conflict).
+            debug_assert!(pin_env.is_none() && !*pin_stdin);
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
@@ -15284,6 +15314,60 @@ mod cli_tests {
     }
 
     #[test]
+    fn otp_unlock_conflict_only_flags_a_pin_with_fingerprint() {
+        for (args, conflict) in [
+            (&["keyroostctl", "otp", "list"][..], false),
+            (&["keyroostctl", "otp", "list", "--pin-env", "V"], false),
+            (
+                &[
+                    "keyroostctl",
+                    "otp",
+                    "list",
+                    "--unlock",
+                    "auto",
+                    "--pin-stdin",
+                ],
+                false,
+            ),
+            (
+                &["keyroostctl", "otp", "list", "--unlock", "fingerprint"],
+                false,
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "otp",
+                    "list",
+                    "--unlock",
+                    "fingerprint",
+                    "--pin-env",
+                    "V",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "otp",
+                    "list",
+                    "--unlock",
+                    "fingerprint",
+                    "--pin-stdin",
+                ],
+                true,
+            ),
+            (&["keyroostctl", "piv", "info"], false),
+        ] {
+            let cli = parse(args).unwrap();
+            assert_eq!(
+                otp_unlock_conflict(cli.command.as_ref()).is_some(),
+                conflict,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn info_and_otp_names_parse() {
         for a in [
             &["keyroostctl", "piv", "info"][..],
@@ -16446,18 +16530,23 @@ mod cli_tests {
         use clap::CommandFactory;
         let tree = secret_pairs();
         let mut table = std::collections::BTreeMap::new();
+        // A path may have several rows (one per mode, e.g. `otp list
+        // --unlock auto`) as long as their extra args differ and they all
+        // list the same secrets.
+        let mut seen = std::collections::BTreeSet::new();
         for line in SECRET_TABLE
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         {
             let cols: Vec<&str> = line.split('\t').filter(|c| !c.is_empty()).collect();
             assert!(cols.len() == 3 || cols.len() == 4, "bad row: {line:?}");
+            let extra = if cols.len() == 4 { cols[1] } else { "" };
+            assert!(seen.insert((cols[0], extra)), "duplicate row: {line:?}");
             let mut all: Vec<String> = cols[cols.len() - 2].split(' ').map(str::to_owned).collect();
             all.sort();
-            assert!(
-                table.insert(cols[0].to_owned(), all).is_none(),
-                "duplicate row: {line:?}"
-            );
+            if let Some(prev) = table.insert(cols[0].to_owned(), all.clone()) {
+                assert_eq!(prev, all, "rows for one path disagree: {line:?}");
+            }
         }
         assert_eq!(tree, table, "tests/secret_flags.txt is out of date");
         let mut root = Cli::command();

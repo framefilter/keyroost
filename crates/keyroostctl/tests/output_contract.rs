@@ -32,6 +32,22 @@ pub fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// `--unlock fingerprint` takes no PIN: giving one is a usage mistake,
+/// refused with exit 2 before any key is looked at.
+#[test]
+fn otp_list_fingerprint_unlock_with_a_pin_flag_is_2() {
+    for args in [
+        &["otp", "list", "--unlock", "fingerprint", "--pin-env", "V"][..],
+        &["otp", "list", "--unlock", "fingerprint", "--pin-stdin"],
+    ] {
+        let (code, out, err) = run(args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+        assert!(out.is_empty(), "{args:?}: {out}");
+        assert!(err.contains("--unlock auto"), "{args:?}: {err}");
+        assert!(!err.contains('\u{2192}'), "{args:?}: {err}");
+    }
+}
+
 #[test]
 fn oath_add_digits_9_is_2_like_molto_config() {
     let (code, out, err) = run(&["oath", "add", "x", "--digits", "9"]);
