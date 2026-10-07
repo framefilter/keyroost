@@ -156,8 +156,8 @@ keyroostctl piv export-cert --slot 9a --format der --out cert.der</code></pre>
       certificate reads <em>empty</em> when the card says it holds no key, <em>key present,
       no certificate</em> when the card confirms a key, and <em>no certificate (a key may be
       present)</em> when keyroost can't tell. keyroost can't tell on cards where it doesn't
-      use GET METADATA's key type, and on cards that answer GET METADATA without key details
-      for empty slots, such as Nitrokey and Token2 PivApplet-based cards.</p>
+      use GET METADATA's key type, and on cards whose GET METADATA answer neither names a key
+      nor says there is none.</p>
     <p><strong>Certificates.</strong> keyroost reads certificates stored gzip-compressed (the
       PIV standard's CertInfo <code>0x01</code> form) and verifies their checksum. A damaged
       one, or one that would decompress past 64&nbsp;KiB, shows as present but unreadable:
@@ -326,8 +326,8 @@ unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
       --pin-env PIV_PIN --out "slot-$slot.csr" --device my-yubikey</code></pre>
     <p>Import each issued certificate later with
       <code>import-cert --slot "$slot" --in … --mgmt-key-env PIV_MGMT</code>.
-      Rerunning the loop over CSR files from an earlier run needs
-      <code>--overwrite</code>, since a script isn't asked.
+      Rerunning the loop over CSR files from an earlier run asks before replacing each
+      one; add <code>--overwrite</code> to run it unattended.
       <code>--device</code> keeps the loop on one key when several are plugged in: it takes a
       <a href="naming.html">friendly name</a>, a serial, or the number
       <code>keyroostctl list</code> shows (<code>--reader &lt;substr&gt;</code> works too).
