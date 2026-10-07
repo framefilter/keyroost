@@ -7862,10 +7862,10 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             }
 
             println!("AID:            {}", hex_encode(&status.aid));
-            // From the AID, Yubico prints this serial in hex, so
-            // `openpgp_serial_text` shows both (it equals the YubiKey's
-            // CCID/mgmt serial used for friendly names); a Token2 key's full
-            // serial from its OTP applet is shown as printed on the key.
+            // AID serial: shown in decimal and hex (Yubico prints it in hex;
+            // it equals the YubiKey's CCID/mgmt serial used for friendly
+            // names). A Token2 key's full serial from its OTP applet is shown
+            // as printed on the key.
             if let Some(serial) = openpgp_serial_text(status.otp_applet_serial, status.serial()) {
                 println!("Serial:         {serial}");
             }
@@ -7942,7 +7942,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let name = crate::target::reader_of(&dev)?;
             let mut session = open_openpgp_at(&name, debug)?;
             let status = session.status()?;
-            let ident = match status.serial() {
+            let ident = match status.full_serial() {
                 Some(serial) => format!("serial {}", serial),
                 None => format!("AID {}", hex_encode(&status.aid)),
             };
@@ -8434,7 +8434,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 s.cert_present,
                                 s.cert_len,
                                 s.cert_compressed,
-                                s.key_presence_unknown,
+                                s.key,
                             )
                         );
                     }
@@ -9797,6 +9797,11 @@ fn slot_name(s: CliPivSlot) -> String {
 
 /// Whether `quirks` include one that makes this card's GET METADATA answer
 /// untrustworthy, so its "no key here" can't be taken at its word either.
+///
+/// Stricter than the display rule `piv info` uses (keyroost-transport's
+/// `metadata_says_no_key`, which distrusts only the key-type quirk): a
+/// replace prompt decides whether anything can be lost, so it also distrusts
+/// a card with the PIN/touch-policy quirk. Change the two together.
 fn piv_metadata_quirky(
     quirks: &std::collections::BTreeSet<keyroost_piv::compat::PivQuirk>,
 ) -> bool {
@@ -9806,15 +9811,16 @@ fn piv_metadata_quirky(
 }
 
 /// The `piv info` words for one slot. A slot without a certificate reads
-/// "empty" only when the card said it holds no key; otherwise keyroost can't
-/// rule a key out, and says so.
+/// "empty" only when the card said it holds no key (`key` from
+/// `PivSession::slot_key_presence`); when keyroost can't tell, it says so.
 fn piv_slot_state(
     cert_unreadable: Option<keyroost_transport::CertUnreadable>,
     cert_present: bool,
     cert_len: usize,
     cert_compressed: bool,
-    key_presence_unknown: bool,
+    key: keyroost_transport::SlotKeyPresence,
 ) -> String {
+    use keyroost_transport::SlotKeyPresence;
     match (cert_unreadable, cert_present) {
         (Some(reason), _) => format!("cert present but unreadable ({reason})"),
         (None, true) => format!(
@@ -9825,10 +9831,11 @@ fn piv_slot_state(
                 ""
             }
         ),
-        (None, false) if key_presence_unknown => {
-            "no certificate (a key may be present)".to_string()
-        }
-        (None, false) => "empty".to_string(),
+        (None, false) => match key {
+            SlotKeyPresence::Present => "key present, no certificate".to_string(),
+            SlotKeyPresence::NoKey => "empty".to_string(),
+            _ => "no certificate (a key may be present)".to_string(),
+        },
     }
 }
 
@@ -17721,22 +17728,26 @@ mod cli_tests {
 
     #[test]
     fn piv_slot_state_words() {
-        use keyroost_transport::CertUnreadable;
-        assert_eq!(piv_slot_state(None, false, 0, false, false), "empty");
+        use keyroost_transport::{CertUnreadable, SlotKeyPresence as K};
+        assert_eq!(piv_slot_state(None, false, 0, false, K::NoKey), "empty");
         assert_eq!(
-            piv_slot_state(None, false, 0, false, true),
+            piv_slot_state(None, false, 0, false, K::Unknown),
             "no certificate (a key may be present)"
         );
         assert_eq!(
-            piv_slot_state(None, true, 812, true, true),
+            piv_slot_state(None, false, 0, false, K::Present),
+            "key present, no certificate"
+        );
+        assert_eq!(
+            piv_slot_state(None, true, 812, true, K::Unknown),
             "cert present (812 bytes, stored compressed)"
         );
         assert_eq!(
-            piv_slot_state(None, true, 812, false, false),
+            piv_slot_state(None, true, 812, false, K::NoKey),
             "cert present (812 bytes)"
         );
         assert!(
-            piv_slot_state(Some(CertUnreadable::Damaged), true, 0, false, true)
+            piv_slot_state(Some(CertUnreadable::Damaged), true, 0, false, K::Unknown)
                 .starts_with("cert present but unreadable")
         );
     }

@@ -17,7 +17,7 @@ use keyroost_proto::trace::{format_line, Dir};
 use pcsc::{
     Card, Context, Error as PcscError, Protocols, ReaderState, Scope, ShareMode, State, Transaction,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use zeroize::Zeroizing;
 
 /// How many wrong-credential attempts to make when intentionally blocking a
@@ -209,16 +209,6 @@ pub struct PivStatus {
     /// wanting something to show either way falls back to `applet_fingerprint`
     /// itself (its `Display` impl, or `applet_fingerprint.applet_name()`).
     pub applet_name: String,
-    /// True when keyroost can't use this card's GET METADATA to tell whether
-    /// a slot without a certificate holds a key: it ignores the card's key
-    /// type there ([`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`],
-    /// see `clear_metadata_if_quirky`), or it doesn't send GET METADATA to
-    /// this card at all (the compatibility table lists it unsupported). A
-    /// card-wide answer, for slots [`Self::slots`] doesn't cover (the retired
-    /// slots); each standard slot has its own
-    /// [`PivSlotStatus::key_presence_unknown`], which also covers a card
-    /// that gets GET METADATA but doesn't answer that the slot has no key.
-    pub key_presence_unknown: bool,
 }
 
 /// Whether a given PIV key slot holds a certificate (and its size).
@@ -240,15 +230,35 @@ pub struct PivSlotStatus {
     /// True when the certificate is stored gzip-compressed (CertInfo `0x01`)
     /// and inflated cleanly. `cert_len` is still the inflated DER length.
     pub cert_compressed: bool,
-    /// True when the slot has no certificate and keyroost can't confirm it
-    /// holds no key: the card didn't answer the slot's GET METADATA with
-    /// "reference data not found" (its way of saying there is no key), or
-    /// [`PivStatus::key_presence_unknown`] holds for the card. Also true when
-    /// a key is known to be there ([`PivSession::status_detailed`] then names
-    /// its algorithm). False when the card said the slot has no key, and when
-    /// a certificate is there (readable or not); then the certificate is
+    /// Whether the slot holds a key, for a slot without a certificate (see
+    /// [`SlotKeyPresence`]). Not read for a slot with a certificate, readable
+    /// or not: [`SlotKeyPresence::Unknown`] there, and the certificate is
     /// what a caller shows.
-    pub key_presence_unknown: bool,
+    pub key: SlotKeyPresence,
+}
+
+/// What keyroost can tell about a PIV slot's private key. The same answer
+/// backs [`PivStatus::slots`], [`PivStatusDetailed`] and
+/// [`PivSession::slot_key_presence`], so every front end words a slot alike.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlotKeyPresence {
+    /// A key is there: GET METADATA named it, this session generated or was
+    /// given it ([`PivSession::remember_pubkey`]), or the card's own
+    /// properties list an algorithm for the slot (HID Crescendo).
+    Present,
+    /// The card answered the slot's GET METADATA with "reference data not
+    /// found", its way of saying there is no key, and keyroost uses this
+    /// card's GET METADATA key type.
+    NoKey,
+    /// keyroost can't tell: it ignores this card's GET METADATA key type
+    /// ([`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`]),
+    /// doesn't send GET METADATA to it (the compatibility table lists it
+    /// unsupported), or the card's answer neither named a key nor said there
+    /// is none (some cards answer every slot the same way), or the read
+    /// failed.
+    #[default]
+    Unknown,
 }
 
 /// Whether [`PivSession::import_certificate`] stores a certificate
@@ -918,8 +928,13 @@ pub struct PivSession<'tx> {
 /// * `reset` wipes every slot — via `PivSessionState::default`, which drops
 ///   this whole cache along with everything else `refresh` rebuilds, not a
 ///   dedicated method here.
+///
+/// The second field holds the key references whose `None` entry is the
+/// card saying there is no key ([`metadata_says_no_key`]), as opposed to an
+/// answer that names no key but doesn't rule one out; `Self::presence`
+/// reads the two together. Every write below keeps it in step.
 #[derive(Clone, Default)]
-struct PubkeyCache(HashMap<u8, Option<(KeyAlg, PublicKey)>>);
+struct PubkeyCache(HashMap<u8, Option<(KeyAlg, PublicKey)>>, HashSet<u8>);
 
 impl PubkeyCache {
     /// The slot's key material is now known to be exactly `value` — a
@@ -930,6 +945,23 @@ impl PubkeyCache {
     /// describe the new private key.
     fn remember(&mut self, key_ref: u8, value: Option<(KeyAlg, PublicKey)>) {
         self.0.insert(key_ref, value);
+        self.1.remove(&key_ref);
+    }
+
+    /// The card said the slot holds no key ([`metadata_says_no_key`]).
+    fn remember_no_key(&mut self, key_ref: u8) {
+        self.0.insert(key_ref, None);
+        self.1.insert(key_ref);
+    }
+
+    /// What the cached answer says about the slot's key; `None` when the
+    /// slot hasn't been resolved this lineage.
+    fn presence(&self, key_ref: u8) -> Option<SlotKeyPresence> {
+        Some(match self.0.get(&key_ref)? {
+            Some(_) => SlotKeyPresence::Present,
+            None if self.1.contains(&key_ref) => SlotKeyPresence::NoKey,
+            None => SlotKeyPresence::Unknown,
+        })
     }
 
     /// The slot's key material is gone (`delete_key` succeeded): a stale
@@ -940,6 +972,7 @@ impl PubkeyCache {
     /// asked, and confirmed there's nothing here."
     fn evict(&mut self, key_ref: u8) {
         self.0.remove(&key_ref);
+        self.1.remove(&key_ref);
     }
 
     /// The key itself relocated (`move_key` succeeded), not just its
@@ -950,6 +983,10 @@ impl PubkeyCache {
     fn migrate(&mut self, src: u8, dest: u8) {
         if let Some(cached) = self.0.remove(&src) {
             self.0.insert(dest, cached);
+            self.1.remove(&dest);
+            if self.1.remove(&src) {
+                self.1.insert(dest);
+            }
         }
     }
 
@@ -1233,33 +1270,22 @@ fn clear_metadata_if_quirky(
     md
 }
 
-/// See [`PivStatus::key_presence_unknown`].
+/// Whether keyroost ignores this card's GET METADATA key type (see
+/// `clear_metadata_if_quirky`), so the card can't say a slot has no key.
 fn metadata_key_type_ignored(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> bool {
     quirks.contains(&keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid)
 }
 
-/// [`PivStatus::key_presence_unknown`], pure for testing: keyroost ignores
-/// the card's GET METADATA key type, or doesn't send GET METADATA to it
-/// (the same decision [`PivSession::metadata_status`] makes, without its
-/// trace line).
-fn card_key_presence_unknown(
+/// Whether a GET METADATA status word says the slot holds no key: "reference
+/// data not found" from a card whose GET METADATA key type keyroost uses.
+/// keyroostctl's replace prompts (`piv_metadata_quirky` there) also distrust
+/// a card with only the PIN/touch-policy quirk, since they decide whether
+/// anything can be lost; this display rule needs only the key type.
+fn metadata_says_no_key(
+    sw: Option<u16>,
     quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>,
-    metadata_gate: keyroost_piv::compat::FeatureGate,
-    send_unsupported: bool,
 ) -> bool {
-    metadata_key_type_ignored(quirks) || !internal_read_decision(metadata_gate, send_unsupported).0
-}
-
-/// [`PivSlotStatus::key_presence_unknown`], pure for testing. `metadata_sw`
-/// sends the slot's GET METADATA ([`PivSession::metadata_status`]); it runs
-/// only for a slot without a certificate on a card where `card_unknown` is
-/// false, so no other slot or card sees the extra read.
-fn slot_key_presence_unknown(
-    cert_absent: bool,
-    card_unknown: bool,
-    metadata_sw: impl FnOnce() -> Option<u16>,
-) -> bool {
-    cert_absent && (card_unknown || metadata_sw() != Some(piv::SW_REFERENCE_NOT_FOUND))
+    !metadata_key_type_ignored(quirks) && sw == Some(piv::SW_REFERENCE_NOT_FOUND)
 }
 
 /// Whether a fresh PC/SC reading, `event_count` and all, is even usable —
@@ -2381,14 +2407,14 @@ impl<'tx> PivSession<'tx> {
         // the whole status snapshot, any more than an unsupported GET
         // VERSION/SERIAL does above.
         let chuid = self.read_chuid().unwrap_or_default();
-        let key_presence_unknown = self.card_key_presence_unknown();
         let mut slots = Vec::with_capacity(4);
         for slot in piv::Slot::all() {
             let mut st = self.slot_status(slot)?;
-            st.key_presence_unknown =
-                slot_key_presence_unknown(!st.cert_present, key_presence_unknown, || {
-                    self.metadata_status(slot.key_ref())
-                });
+            // Only a slot without a certificate needs the key answer, so only
+            // it costs a GET METADATA (once per session: it's cached).
+            if !st.cert_present {
+                st.key = self.slot_key_presence(slot);
+            }
             slots.push(st);
         }
         Ok(PivStatus {
@@ -2400,7 +2426,6 @@ impl<'tx> PivSession<'tx> {
             chuid,
             applet_fingerprint,
             applet_name,
-            key_presence_unknown,
         })
     }
 
@@ -2474,7 +2499,6 @@ impl<'tx> PivSession<'tx> {
         } = self.applet_fingerprint();
         let pin_retries = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
-        let key_presence_unknown = self.card_key_presence_unknown();
 
         let mut slots = Vec::with_capacity(4);
         let mut detail = Vec::with_capacity(4);
@@ -2505,14 +2529,11 @@ impl<'tx> PivSession<'tx> {
             let policy = self.slot_policy(slot);
 
             let mut st = slot_status_of(slot, &cert);
-            // A key named by the algorithm reads above is already known, so
-            // only a slot with neither a certificate nor a known key asks
-            // whether the card says there is no key.
-            st.key_presence_unknown = slot_key_presence_unknown(
-                !st.cert_present,
-                key_presence_unknown || algorithm.is_some(),
-                || self.metadata_status(slot.key_ref()),
-            );
+            // Same answer as `status` gives; the algorithm reads above have
+            // already cached everything it needs, so no APDU here.
+            if !st.cert_present {
+                st.key = self.slot_key_presence(slot);
+            }
             slots.push(st);
             detail.push(PivSlotDetail {
                 slot,
@@ -2531,7 +2552,6 @@ impl<'tx> PivSession<'tx> {
                 chuid,
                 applet_fingerprint,
                 applet_name,
-                key_presence_unknown,
             },
             slots: detail,
         })
@@ -2784,18 +2804,29 @@ impl<'tx> PivSession<'tx> {
     /// algorithm/key/policy) rather than the reply itself; see that
     /// method's doc for why.
     pub fn metadata(&mut self, key_ref: u8) -> Option<Metadata> {
+        self.metadata_reply(key_ref).1
+    }
+
+    /// [`Self::metadata`] plus the reply's status word (`None` when nothing
+    /// was sent or the transmit failed), for a caller that also needs to
+    /// know whether the card said "reference data not found".
+    fn metadata_reply(&mut self, key_ref: u8) -> (Option<u16>, Option<Metadata>) {
         if !self.internal_read_allowed(
             keyroost_piv::compat::PivExtension::GetMetadata,
             "GET METADATA",
         ) {
-            return None;
+            return (None, None);
         }
-        let (data, sw) = self.transmit_full(&piv::get_metadata(key_ref)).ok()?;
+        let Ok((data, sw)) = self.transmit_full(&piv::get_metadata(key_ref)) else {
+            return (None, None);
+        };
         if sw != piv::SW_OK {
-            return None;
+            return (Some(sw), None);
         }
-        let md = piv::parse_metadata(&data).ok()?;
-        Some(clear_metadata_if_quirky(&self.quirks(), md))
+        let md = piv::parse_metadata(&data)
+            .ok()
+            .map(|md| clear_metadata_if_quirky(&self.quirks(), md));
+        (Some(sw), md)
     }
 
     /// The bare status word of a GET METADATA for `key_ref`, reply body
@@ -2816,12 +2847,22 @@ impl<'tx> PivSession<'tx> {
             .map(|(_, sw)| sw)
     }
 
-    /// [`PivStatus::key_presence_unknown`] for this session's card. No APDU:
-    /// the quirks and the compatibility gate both come from the cached
-    /// identity.
-    fn card_key_presence_unknown(&mut self) -> bool {
-        let gate = self.extension_gate(keyroost_piv::compat::PivExtension::GetMetadata);
-        card_key_presence_unknown(&self.quirks(), gate, self.state.send_unsupported_reads)
+    /// What keyroost can tell about `slot`'s private key ([`SlotKeyPresence`]).
+    /// Works for retired slots too. Cache-preferring like
+    /// [`Self::slot_has_key`]: at most one GET METADATA per slot per session
+    /// lineage, and none when [`Self::status_detailed`] or this already
+    /// resolved the slot. [`SlotKeyPresence::Present`] also covers a key this
+    /// session knows ([`Self::remember_pubkey`]) and, on HID Crescendo, an
+    /// algorithm the card's own properties list for the slot.
+    pub fn slot_key_presence(&mut self, slot: Slot) -> SlotKeyPresence {
+        if self.cached_slot_key(slot).is_some() || self.hid_crescendo_slot_algorithm(slot).is_some()
+        {
+            return SlotKeyPresence::Present;
+        }
+        self.state
+            .pubkey_cache
+            .presence(slot.key_ref())
+            .unwrap_or_default()
     }
 
     /// One live [`Self::metadata`]`(slot.key_ref())` read, decoded straight
@@ -2846,9 +2887,13 @@ impl<'tx> PivSession<'tx> {
     /// so `Self::slot_key_status_algorithm` can use this same decode path
     /// for its algorithm-only reply without going anywhere near
     /// `pubkey_cache` at all (see that method's doc for why it must not).
-    fn resolve_slot_from_device(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
+    ///
+    /// The `bool` is [`metadata_says_no_key`] for the same reply: the card
+    /// said there is no key.
+    fn resolve_slot_from_device(&mut self, slot: Slot) -> (Option<(KeyAlg, PublicKey)>, bool) {
         let key_ref = slot.key_ref();
-        let md = self.metadata(key_ref);
+        let (sw, md) = self.metadata_reply(key_ref);
+        let no_key = metadata_says_no_key(sw, &self.quirks());
         if let Some((pin, touch)) = md.as_ref().and_then(|m| m.policy) {
             if let (Some(pin), Some(touch)) = (PinPolicy::from_id(pin), TouchPolicy::from_id(touch))
             {
@@ -2857,9 +2902,11 @@ impl<'tx> PivSession<'tx> {
                     .remember(key_ref, Some((pin, touch)));
             }
         }
-        md.as_ref()
+        let kv = md
+            .as_ref()
             .and_then(|m| metadata_key_material(m, |id| self.key_alg_from_apdu_id(id)))
-            .and_then(|(alg, raw)| public_key_from_metadata(raw).ok().map(|key| (alg, key)))
+            .and_then(|(alg, raw)| public_key_from_metadata(raw).ok().map(|key| (alg, key)));
+        (kv, no_key)
     }
 
     /// `slot`'s algorithm + public key from `PubkeyCache` if this lineage
@@ -2877,8 +2924,12 @@ impl<'tx> PivSession<'tx> {
         if let Some(resolved) = self.state.pubkey_cache.get(key_ref) {
             return resolved.cloned();
         }
-        let resolved = self.resolve_slot_from_device(slot);
-        self.state.pubkey_cache.remember(key_ref, resolved.clone());
+        let (resolved, no_key) = self.resolve_slot_from_device(slot);
+        if no_key && resolved.is_none() {
+            self.state.pubkey_cache.remember_no_key(key_ref);
+        } else {
+            self.state.pubkey_cache.remember(key_ref, resolved.clone());
+        }
         resolved
     }
 
@@ -2900,7 +2951,7 @@ impl<'tx> PivSession<'tx> {
     /// card's silence is *expected*, not a "this key is gone" signal.
     fn confirmed_slot_key(&mut self, slot: Slot) -> Option<(KeyAlg, PublicKey)> {
         let key_ref = slot.key_ref();
-        match self.resolve_slot_from_device(slot) {
+        match self.resolve_slot_from_device(slot).0 {
             Some(kv) => {
                 self.state.pubkey_cache.remember(key_ref, Some(kv.clone()));
                 Some(kv)
@@ -6294,7 +6345,7 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
             cert_len: 0,
             cert_unreadable: Some(reason),
             cert_compressed: false,
-            key_presence_unknown: false,
+            key: SlotKeyPresence::Unknown,
         },
         Ok(der) => {
             let len = der.map_or(0, <[u8]>::len);
@@ -6305,7 +6356,7 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
                 cert_unreadable: None,
                 cert_compressed: false,
                 // The status reads fill this in; it needs the card.
-                key_presence_unknown: false,
+                key: SlotKeyPresence::Unknown,
             }
         }
     }
@@ -6554,49 +6605,51 @@ mod tests {
     }
 
     #[test]
-    fn slot_key_presence_is_known_only_from_a_no_key_metadata_answer() {
-        let never = || -> Option<u16> { panic!("no GET METADATA expected") };
-        // A certificate (readable or not) decides the slot's words: no read.
-        assert!(!slot_key_presence_unknown(false, false, never));
-        assert!(!slot_key_presence_unknown(false, true, never));
-        // A card where keyroost can't use GET METADATA: unknown, no read.
-        assert!(slot_key_presence_unknown(true, true, never));
-        // "Reference data not found" is the card saying there is no key.
-        assert!(!slot_key_presence_unknown(true, false, || Some(
-            piv::SW_REFERENCE_NOT_FOUND
-        )));
-        // Any other answer, or none, can't rule a key out.
+    fn metadata_says_no_key_only_on_reference_not_found_from_a_trusted_card() {
+        use keyroost_piv::compat::PivQuirk;
+        let none = BTreeSet::new();
+        let quirky = BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid]);
+        assert!(metadata_says_no_key(
+            Some(piv::SW_REFERENCE_NOT_FOUND),
+            &none
+        ));
+        // A card whose key type keyroost ignores can't say there is no key.
+        assert!(!metadata_says_no_key(
+            Some(piv::SW_REFERENCE_NOT_FOUND),
+            &quirky
+        ));
+        // Any other answer, or none (not sent, transmit error), isn't "no key".
         for sw in [Some(piv::SW_OK), Some(0x6D00), Some(0x6A81), None] {
-            assert!(slot_key_presence_unknown(true, false, || sw), "{sw:04X?}");
+            assert!(!metadata_says_no_key(sw, &none), "{sw:04X?}");
         }
     }
 
     #[test]
-    fn card_key_presence_is_unknown_where_get_metadata_is_ignored_or_not_sent() {
-        use keyroost_piv::compat::{FeatureGate, PivQuirk};
-        let quirky = BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid]);
-        let none = BTreeSet::new();
-        assert!(card_key_presence_unknown(
-            &quirky,
-            FeatureGate::Supported,
-            false
-        ));
-        assert!(card_key_presence_unknown(
-            &none,
-            FeatureGate::Unsupported,
-            false
-        ));
-        // `--force` / Enable Anyway sends it, so its answer counts per slot.
-        assert!(!card_key_presence_unknown(
-            &none,
-            FeatureGate::Unsupported,
-            true
-        ));
-        assert!(!card_key_presence_unknown(
-            &none,
-            FeatureGate::Supported,
-            false
-        ));
+    fn pubkey_cache_keeps_the_key_presence_it_resolved() {
+        let mut cache = PubkeyCache::default();
+        // Never asked: no answer to give, the caller reads the card.
+        assert_eq!(cache.presence(0x9A), None);
+        // The card said there is no key.
+        cache.remember_no_key(0x9A);
+        assert_eq!(cache.get(0x9A), Some(None));
+        assert_eq!(cache.presence(0x9A), Some(SlotKeyPresence::NoKey));
+        // Asked, but the answer named no key and didn't rule one out.
+        cache.remember(0x9C, None);
+        assert_eq!(cache.presence(0x9C), Some(SlotKeyPresence::Unknown));
+        // A key (from the card or this session) replaces "no key".
+        cache.remember(0x9A, Some((KeyAlg::EccP256, ecc(1))));
+        assert_eq!(cache.presence(0x9A), Some(SlotKeyPresence::Present));
+        // Evicting forgets presence too.
+        cache.remember_no_key(0x9D);
+        cache.evict(0x9D);
+        assert_eq!(cache.presence(0x9D), None);
+        // Migrating carries it along and leaves nothing behind.
+        cache.remember_no_key(0x9E);
+        cache.migrate(0x9E, 0x82);
+        assert_eq!(cache.presence(0x9E), None);
+        assert_eq!(cache.presence(0x82), Some(SlotKeyPresence::NoKey));
+        cache.migrate(0x9A, 0x83);
+        assert_eq!(cache.presence(0x83), Some(SlotKeyPresence::Present));
     }
 
     #[test]
