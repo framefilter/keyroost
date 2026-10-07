@@ -103,12 +103,14 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   or CCID; configure the single HOTP-on-touch keystroke slot; read the serial;
   and enable / disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
   On R3.4+ keys the codes can be put behind an OTP PIN (`otp set-pin`,
-  `otp verify`, `otp change-pin`, `otp remove-pin`, `otp pin-status`); note
+  `otp verify`, `otp change-pin`, `otp clear-pin`, `otp pin-status`); note
   there is no PIN reset — a blocked PIN is recoverable only by erasing every
   OTP entry. On Bio3 keys with a fingerprint enrolled, a fingerprint touch can
-  release protected codes as an alternative to the PIN (`otp fp-status`,
-  `otp fp-enable`, `otp fp-disable`, `otp fp-list`, and `otp unlock-list`,
-  which tries the fingerprint and falls back to the PIN); fingerprint
+  release protected codes as an alternative to the PIN
+  (`otp fingerprint-status`, `otp fingerprint-enable`,
+  `otp fingerprint-disable`, `otp list --unlock fingerprint`, and
+  `otp list --unlock auto`, which tries the fingerprint and falls back to
+  the PIN); fingerprint
   enrollment itself is done through the key's FIDO2 fingerprint setup.
 - **One-shot factory reset** — `keyroostctl factory-reset` (and a card on
   the GUI device Overview tab) resets every resettable applet on a key in turn:
@@ -136,11 +138,11 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 |---|---|---|
 | **Token2 Molto2 / Molto2v2** | TOTP slot programming, bulk import | Hardware-verified. Programmed over the vendor-specific SM4-MAC protocol ([docs/PROTOCOL.md](docs/PROTOCOL.md)); supports bulk import from Aegis / 2FAS / otpauth-list, clock sync, and customer-key rotation. |
 | **Token2 single-profile tokens** (OTPC-P1-i / P2-i, miniOTP-2-i / 3-i, C301-i, C302-i) | Single-account TOTP seed + config programming | Programmed over the vendor-specific SM4-MAC protocol with a fixed device key ([docs/PROTOCOL-token2prog.md](docs/PROTOCOL-token2prog.md)); writes the seed and the TOTP algorithm / time-step / display-timeout over a contact or contactless PC/SC reader. The model is recognized from the device serial. |
-| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys without it answer the capability probe with "no such command" and are unaffected. Contributed by [@token2](https://github.com/token2). PIV management was exercised on Token2 hardware by [@episource](https://github.com/episource) ([#128](https://github.com/framefilter/keyroost/pull/128)), and keyroost decodes the BCD-coded serial Token2's PIV and OpenPGP applets report. The OATH / OpenPGP smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
+| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys without it answer the capability probe with "no such command" and are unaffected. Contributed by [@token2](https://github.com/token2). PIV management was exercised on Token2 hardware by [@episource](https://github.com/episource) ([#128](https://github.com/framefilter/keyroost/pull/128)), and keyroost decodes the BCD-coded serial Token2's PIV and OpenPGP applets report; `piv info` and `openpgp info` show the key's full serial, read from its OTP applet. The OATH / OpenPGP smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
 | **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
 | **Nitrokey 3** | FIDO2, OATH, PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. The OpenPGP applet is detected but not yet exercised by this project. |
-| **Swissbit iShield Key 2 Pro** (and iShield Key 1) | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own iShield Key 2 Pro. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)). Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. On the iShield Key 1 and 2, keyroost reads the serial and device name from Swissbit's own management applications (and, on the Key 1, the firmware version) for `piv status` and the GUI, contributed by [@episource](https://github.com/episource) ([#163](https://github.com/framefilter/keyroost/pull/163)). Other applets not yet exercised by this project. |
+| **Swissbit iShield Key 2 Pro** (and iShield Key 1) | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own iShield Key 2 Pro. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)), so a slot without a certificate reads "no certificate (a key may be present)". Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. On the iShield Key 1 and 2, keyroost reads the serial and device name from Swissbit's own management applications (and, on the Key 1, the firmware version) for `piv info` and the GUI, contributed by [@episource](https://github.com/episource) ([#163](https://github.com/framefilter/keyroost/pull/163)). Other applets not yet exercised by this project. |
 | **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, large-blob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
 
 Each listed row notes what's actually been verified on that device; the final,
@@ -638,8 +640,8 @@ keyroostctl doctor
 
 # --- FIDO2 (YubiKey / Solo 2 / Nitrokey 3), over USB-HID or an NFC reader ---
 keyroostctl fido info
-keyroostctl fido pin-retries
-keyroostctl fido creds-list --pin-stdin        # PIN read from stdin, never argv
+keyroostctl fido pin retries
+keyroostctl fido credentials list --pin-stdin  # PIN read from stdin, never argv
 keyroostctl fido ssh-cert list --pin-stdin     # list SSH certs stored in resident credentials
 keyroostctl fido ssh-cert extract --credential ssh:demo --out demo-cert.pub --pin-stdin
 
@@ -648,12 +650,12 @@ keyroostctl oath list
 keyroostctl oath code 'GitHub:me@x.com' --device my-yubikey
 
 # --- OpenPGP card ---
-keyroostctl openpgp status --device my-yubikey
+keyroostctl openpgp info --device my-yubikey
 keyroostctl openpgp sign --in msg.txt --pin-stdin --device my-yubikey
 keyroostctl openpgp authenticate --in chal.bin --pin-stdin --device my-yubikey  # client/SSH auth (Auth key)
 
 # --- PIV (read-only status) ---
-keyroostctl piv status --device my-yubikey
+keyroostctl piv info --device my-yubikey
 
 # bulk-provision several slots: management key + PIN from env once, loop the rest.
 # (the GUI asks per operation; the CLI is the path for many slots/keys)
@@ -676,19 +678,19 @@ done
 
 # --- Token2 Molto2 (TOTP programming) ---
 keyroostctl molto info
-keyroostctl molto import --profile 0                # asks for the otpauth:// URI (hidden)
-keyroostctl molto import --profile 0 --uri-env URI # or from an environment variable
+keyroostctl molto import --slot 0                # asks for the otpauth:// URI (hidden)
+keyroostctl molto import --slot 0 --uri-env URI # or from an environment variable
 keyroostctl molto import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate first
 
 # --- Token2 single-profile programmable token (OTPC / miniOTP / C30x) ---
 keyroostctl prog info                          # serial, model, and on-device clock
 keyroostctl prog seed --base32-stdin           # base32 seed from stdin, never argv
-keyroostctl prog config --algorithm sha1 --time-step 30 --display-timeout 30
+keyroostctl prog config --algorithm sha1 --period 30 --display-timeout 30
 
 # --- Token2 on-device OTP (PIN+ Series FIDO keys) ---
 keyroostctl otp list
 keyroostctl otp add --app GitHub --account me@x.com --seed-stdin   # seed from stdin, never argv
-keyroostctl otp get --app GitHub --account me@x.com
+keyroostctl otp code --app GitHub --account me@x.com
 
 # --- Destructive operations (ask y/N, or type "reset", in a terminal) ---
 keyroostctl factory-reset --device my-yubikey          # asks you to type "reset"
@@ -700,7 +702,7 @@ keyroostctl key-name list
 
 # machine-readable output for scripts (status and query commands)
 keyroostctl --json list                     # {"keys": [...]}, each with its --device value
-keyroostctl --json piv status --device my-yubikey
+keyroostctl --json piv info --device my-yubikey
 
 # man pages (completions: see "Shell completions" above)
 keyroostctl manpage ./man && man -l ./man/keyroostctl-piv.1
@@ -735,9 +737,9 @@ command line, where it would land in shell history and `ps`. Each secret flag
 comes in two forms, and with neither, a terminal asks for it:
 
 ```bash
-keyroostctl fido creds-list                       # asks "PIN:" (nothing is shown as you type)
-keyroostctl fido creds-list --pin-env KR_PIN      # read from the KR_PIN environment variable
-pass show fido-pin | keyroostctl fido creds-list --pin-stdin   # one line from stdin
+keyroostctl fido credentials list                   # asks "PIN:" (nothing is shown as you type)
+keyroostctl fido credentials list --pin-env KR_PIN  # read from the KR_PIN environment variable
+pass show fido-pin | keyroostctl fido credentials list --pin-stdin   # one line from stdin
 ```
 
 A new PIN, password or key typed at the prompt is asked twice and must match.
