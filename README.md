@@ -772,7 +772,8 @@ With `--json` (on the commands that support it), a command prints one
 object; a list sits under a named key such as `keys` or `accounts`, and
 every field is there, `null` when unknown. Don't rely on key order. The
 `--debug` output is for people reading along and may change between
-releases.
+releases. So may the human-readable text of any command; to read values in
+a script, use `--json` where a command has it.
 
 ## Breaking changes & migration
 

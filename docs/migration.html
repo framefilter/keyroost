@@ -279,6 +279,12 @@
           <code>period</code> (<code>null</code> when 0); <code>algorithm</code>
           and <code>digits</code> are <code>null</code> for a code keyroost
           doesn't know</td></tr>
+      <tr><td><code>oath list</code> and <code>otp list</code>:
+          <code>algorithm</code> as <code>"SHA1"</code>,
+          <code>"SHA256"</code>, <code>"SHA512"</code></td>
+        <td>Lowercase (<code>"sha1"</code>, <code>"sha256"</code>,
+          <code>"sha512"</code>), the same as <code>molto slots</code>. The
+          human <code>[TOTP/SHA1]</code> text is unchanged.</td></tr>
       <tr><td><code>piv status</code> <code>slots[].slot</code> and
           <code>piv test</code> <code>slot</code>:
           <code>"authentication (9A)"</code></td>
@@ -348,6 +354,18 @@
           <code>Note:</code>, "profile #N" in Molto2 messages</td>
         <td><code>warning:</code> / <code>note:</code>, sentences, and
           "slot #N" (<code>Seed written to slot #5.</code>)</td></tr>
+      <tr><td>Human labels: <code>device serial:</code>,
+          <code>device UTC:</code>, <code>slot #N title:</code>,
+          <code>occupied:</code>, <code>prog info</code>
+          <code>model:</code> / <code>serial:</code> /
+          <code>utc_time:</code>, <code>fido info</code>
+          <code>MaxMsgSize:</code>, <code>CTAP fwVer:</code></td>
+        <td><code>Serial:</code>, <code>Device UTC:</code>,
+          <code>Title:</code>, <code>Occupied:</code>, <code>Model:</code> /
+          <code>Serial:</code> / <code>Device UTC:</code>,
+          <code>Max message size:</code>,
+          <code>CTAP firmware version:</code>. Read values in a script with
+          <code>--json</code> where it exists.</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>
