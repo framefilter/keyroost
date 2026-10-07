@@ -8426,26 +8426,17 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     }
                     println!("Slots:");
                     for s in &status.slots {
-                        if let Some(reason) = s.cert_unreadable {
-                            println!(
-                                "  {:<26} cert present but unreadable ({})",
-                                s.slot.label(),
-                                reason
-                            );
-                        } else if s.cert_present {
-                            println!(
-                                "  {:<26} cert present ({} bytes{})",
-                                s.slot.label(),
+                        println!(
+                            "  {:<26} {}",
+                            s.slot.label(),
+                            piv_slot_state(
+                                s.cert_unreadable,
+                                s.cert_present,
                                 s.cert_len,
-                                if s.cert_compressed {
-                                    ", stored compressed"
-                                } else {
-                                    ""
-                                }
-                            );
-                        } else {
-                            println!("  {:<26} empty", s.slot.label());
-                        }
+                                s.cert_compressed,
+                                s.key_presence_unknown,
+                            )
+                        );
                     }
                     Ok(())
                 },
@@ -9812,6 +9803,33 @@ fn piv_metadata_quirky(
     use keyroost_piv::compat::PivQuirk;
     quirks.contains(&PivQuirk::InsF7MetadataAlgorithmInvalid)
         || quirks.contains(&PivQuirk::InsF7MetadataPinTouchPolicyInvalid)
+}
+
+/// The `piv info` words for one slot. A slot without a certificate reads
+/// "empty" only when the card said it holds no key; otherwise keyroost can't
+/// rule a key out, and says so.
+fn piv_slot_state(
+    cert_unreadable: Option<keyroost_transport::CertUnreadable>,
+    cert_present: bool,
+    cert_len: usize,
+    cert_compressed: bool,
+    key_presence_unknown: bool,
+) -> String {
+    match (cert_unreadable, cert_present) {
+        (Some(reason), _) => format!("cert present but unreadable ({reason})"),
+        (None, true) => format!(
+            "cert present ({cert_len} bytes{})",
+            if cert_compressed {
+                ", stored compressed"
+            } else {
+                ""
+            }
+        ),
+        (None, false) if key_presence_unknown => {
+            "no certificate (a key may be present)".to_string()
+        }
+        (None, false) => "empty".to_string(),
+    }
 }
 
 /// The fail-closed "nothing to lose in this slot" decision. Only a card
@@ -17699,6 +17717,28 @@ mod cli_tests {
         let v = serde_json::to_value(slot(None)).expect("serialize");
         assert!(v["cert_unreadable"].is_null(), "{v}");
         assert!(v.as_object().unwrap().contains_key("cert_unreadable"));
+    }
+
+    #[test]
+    fn piv_slot_state_words() {
+        use keyroost_transport::CertUnreadable;
+        assert_eq!(piv_slot_state(None, false, 0, false, false), "empty");
+        assert_eq!(
+            piv_slot_state(None, false, 0, false, true),
+            "no certificate (a key may be present)"
+        );
+        assert_eq!(
+            piv_slot_state(None, true, 812, true, true),
+            "cert present (812 bytes, stored compressed)"
+        );
+        assert_eq!(
+            piv_slot_state(None, true, 812, false, false),
+            "cert present (812 bytes)"
+        );
+        assert!(
+            piv_slot_state(Some(CertUnreadable::Damaged), true, 0, false, true)
+                .starts_with("cert present but unreadable")
+        );
     }
 
     #[test]

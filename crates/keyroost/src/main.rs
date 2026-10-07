@@ -2506,12 +2506,15 @@ fn openpgp_serial_text(otp_applet_serial: Option<u128>, aid_serial: Option<u32>)
 
 /// The selected slot's state words: whether it holds a certificate (and
 /// whether that is stored compressed or unreadable) or just a key, with the
-/// key algorithm parenthesized after the state word it describes.
+/// key algorithm parenthesized after the state word it describes. A slot with
+/// neither reads "empty" only when the card said it holds no key
+/// (`key_presence_unknown` false); otherwise keyroost can't rule a key out.
 fn piv_slot_state_text(
     cert_unreadable: Option<keyroost_transport::CertUnreadable>,
     cert_present: bool,
     cert_compressed: bool,
     alg: Option<keyroost_piv::KeyAlg>,
+    key_presence_unknown: bool,
 ) -> String {
     // "key present" and "certificate present" both get the algorithm
     // parenthesized right after the state word they describe — for the
@@ -2535,6 +2538,9 @@ fn piv_slot_state_text(
             }
         }
         (None, false, Some(a)) => format!("key present ({}), no certificate", a.label()),
+        (None, false, None) if key_presence_unknown => {
+            "no certificate (a key may be present)".to_string()
+        }
         (None, false, None) => "empty".to_string(),
     }
 }
@@ -12726,6 +12732,10 @@ impl App {
                                         "unreadable cert"
                                     } else if slot.cert_present {
                                         "cert"
+                                    } else if slot.key_presence_unknown {
+                                        // Can't rule a key out: see
+                                        // `PivSlotStatus::key_presence_unknown`.
+                                        "no cert"
                                     } else {
                                         "empty"
                                     }
@@ -17708,10 +17718,17 @@ impl App {
                 .as_ref()
                 .and_then(|v| v.iter().find(|(s, _)| *s == keyroost_piv::Slot::Retired(n)))
                 .map(|(_, has)| *has);
+            let key_presence_unknown = self
+                .piv
+                .status
+                .as_ref()
+                .is_some_and(|s| s.key_presence_unknown);
             match has_key {
                 Some(true) => "key present".to_string(),
-                // Cache reports empty, or hasn't loaded yet for this slot:
-                // fall back to the same "empty" wording used elsewhere.
+                // Cache reports no key, or hasn't loaded yet for this slot:
+                // the same wording the standard slots use. A card whose GET
+                // METADATA keyroost can't use can't say there is no key.
+                _ if key_presence_unknown => "no certificate (a key may be present)".to_string(),
                 _ => "empty".to_string(),
             }
         } else {
@@ -17724,10 +17741,17 @@ impl App {
             let cert_present = sel_status.is_some_and(|sl| sl.cert_present);
             let cert_unreadable = sel_status.and_then(|sl| sl.cert_unreadable);
             let cert_compressed = sel_status.is_some_and(|sl| sl.cert_compressed);
+            let key_presence_unknown = sel_status.is_some_and(|sl| sl.key_presence_unknown);
             let entry = self.piv.slot_keys.iter().find(|(s, _, _)| *s == sel_slot);
             let alg = entry.and_then(|(_, a, _)| *a);
             let dn = entry.and_then(|(_, _, d)| d.as_deref());
-            let mut s = piv_slot_state_text(cert_unreadable, cert_present, cert_compressed, alg);
+            let mut s = piv_slot_state_text(
+                cert_unreadable,
+                cert_present,
+                cert_compressed,
+                alg,
+                key_presence_unknown,
+            );
             // PIN/touch policy, only alongside an actual key — an empty slot
             // has no policy to report, and showing "not available" there
             // would read as a hardware problem rather than just "no key yet".
@@ -18045,6 +18069,13 @@ impl App {
         // on every status refresh.
         if matches!(selected, PivSlotSel::Retired(_)) {
             ui.add_space(14.0);
+            // See `PivStatus::key_presence_unknown`: on such a card a slot
+            // without a found key isn't called empty.
+            let key_presence_unknown = self
+                .piv
+                .status
+                .as_ref()
+                .is_some_and(|s| s.key_presence_unknown);
             match self.piv.retired_occupancy.clone() {
                 Some(occ) => {
                     // Show as many rows as the pane can spare before the action
@@ -18105,6 +18136,11 @@ impl App {
                                 }
                                 let resp = resp.on_hover_text(if has_key {
                                     format!("{} \u{00B7} holds a key", slot.label())
+                                } else if key_presence_unknown {
+                                    format!(
+                                        "{} \u{00B7} no certificate (a key may be present)",
+                                        slot.label()
+                                    )
                                 } else {
                                     format!("{} \u{00B7} empty", slot.label())
                                 });
@@ -22561,32 +22597,45 @@ mod tests {
     fn piv_slot_state_text_marks_compression() {
         let p256 = Some(keyroost_piv::KeyAlg::EccP256);
         assert_eq!(
-            piv_slot_state_text(None, true, true, p256),
+            piv_slot_state_text(None, true, true, p256, false),
             "certificate present (ECC P-256, compressed)"
         );
         assert_eq!(
-            piv_slot_state_text(None, true, false, p256),
+            piv_slot_state_text(None, true, false, p256, false),
             "certificate present (ECC P-256)"
         );
         assert_eq!(
-            piv_slot_state_text(None, true, true, None),
+            piv_slot_state_text(None, true, true, None, false),
             "certificate present (compressed)"
         );
         assert_eq!(
-            piv_slot_state_text(None, true, false, None),
+            piv_slot_state_text(None, true, false, None, false),
             "certificate present"
         );
         assert_eq!(
-            piv_slot_state_text(None, false, false, p256),
+            piv_slot_state_text(None, false, false, p256, false),
             "key present (ECC P-256), no certificate"
         );
-        assert_eq!(piv_slot_state_text(None, false, false, None), "empty");
+        assert_eq!(
+            piv_slot_state_text(None, false, false, None, false),
+            "empty"
+        );
+        assert_eq!(
+            piv_slot_state_text(None, false, false, None, true),
+            "no certificate (a key may be present)"
+        );
+        // A known key is named whatever the flag says.
+        assert_eq!(
+            piv_slot_state_text(None, false, false, p256, true),
+            "key present (ECC P-256), no certificate"
+        );
         assert_eq!(
             piv_slot_state_text(
                 Some(keyroost_transport::CertUnreadable::Damaged),
                 true,
                 false,
-                p256
+                p256,
+                false
             ),
             format!(
                 "certificate present but unreadable ({})",

@@ -209,6 +209,16 @@ pub struct PivStatus {
     /// wanting something to show either way falls back to `applet_fingerprint`
     /// itself (its `Display` impl, or `applet_fingerprint.applet_name()`).
     pub applet_name: String,
+    /// True when keyroost can't use this card's GET METADATA to tell whether
+    /// a slot without a certificate holds a key: it ignores the card's key
+    /// type there ([`keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid`],
+    /// see `clear_metadata_if_quirky`), or it doesn't send GET METADATA to
+    /// this card at all (the compatibility table lists it unsupported). A
+    /// card-wide answer, for slots [`Self::slots`] doesn't cover (the retired
+    /// slots); each standard slot has its own
+    /// [`PivSlotStatus::key_presence_unknown`], which also covers a card
+    /// that gets GET METADATA but doesn't answer that the slot has no key.
+    pub key_presence_unknown: bool,
 }
 
 /// Whether a given PIV key slot holds a certificate (and its size).
@@ -230,6 +240,15 @@ pub struct PivSlotStatus {
     /// True when the certificate is stored gzip-compressed (CertInfo `0x01`)
     /// and inflated cleanly. `cert_len` is still the inflated DER length.
     pub cert_compressed: bool,
+    /// True when the slot has no certificate and keyroost can't confirm it
+    /// holds no key: the card didn't answer the slot's GET METADATA with
+    /// "reference data not found" (its way of saying there is no key), or
+    /// [`PivStatus::key_presence_unknown`] holds for the card. Also true when
+    /// a key is known to be there ([`PivSession::status_detailed`] then names
+    /// its algorithm). False when the card said the slot has no key, and when
+    /// a certificate is there (readable or not); then the certificate is
+    /// what a caller shows.
+    pub key_presence_unknown: bool,
 }
 
 /// Whether [`PivSession::import_certificate`] stores a certificate
@@ -1212,6 +1231,35 @@ fn clear_metadata_if_quirky(
         md.policy = None;
     }
     md
+}
+
+/// See [`PivStatus::key_presence_unknown`].
+fn metadata_key_type_ignored(quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>) -> bool {
+    quirks.contains(&keyroost_piv::compat::PivQuirk::InsF7MetadataAlgorithmInvalid)
+}
+
+/// [`PivStatus::key_presence_unknown`], pure for testing: keyroost ignores
+/// the card's GET METADATA key type, or doesn't send GET METADATA to it
+/// (the same decision [`PivSession::metadata_status`] makes, without its
+/// trace line).
+fn card_key_presence_unknown(
+    quirks: &BTreeSet<keyroost_piv::compat::PivQuirk>,
+    metadata_gate: keyroost_piv::compat::FeatureGate,
+    send_unsupported: bool,
+) -> bool {
+    metadata_key_type_ignored(quirks) || !internal_read_decision(metadata_gate, send_unsupported).0
+}
+
+/// [`PivSlotStatus::key_presence_unknown`], pure for testing. `metadata_sw`
+/// sends the slot's GET METADATA ([`PivSession::metadata_status`]); it runs
+/// only for a slot without a certificate on a card where `card_unknown` is
+/// false, so no other slot or card sees the extra read.
+fn slot_key_presence_unknown(
+    cert_absent: bool,
+    card_unknown: bool,
+    metadata_sw: impl FnOnce() -> Option<u16>,
+) -> bool {
+    cert_absent && (card_unknown || metadata_sw() != Some(piv::SW_REFERENCE_NOT_FOUND))
 }
 
 /// Whether a fresh PC/SC reading, `event_count` and all, is even usable —
@@ -2333,9 +2381,15 @@ impl<'tx> PivSession<'tx> {
         // the whole status snapshot, any more than an unsupported GET
         // VERSION/SERIAL does above.
         let chuid = self.read_chuid().unwrap_or_default();
+        let key_presence_unknown = self.card_key_presence_unknown();
         let mut slots = Vec::with_capacity(4);
         for slot in piv::Slot::all() {
-            slots.push(self.slot_status(slot)?);
+            let mut st = self.slot_status(slot)?;
+            st.key_presence_unknown =
+                slot_key_presence_unknown(!st.cert_present, key_presence_unknown, || {
+                    self.metadata_status(slot.key_ref())
+                });
+            slots.push(st);
         }
         Ok(PivStatus {
             version,
@@ -2346,6 +2400,7 @@ impl<'tx> PivSession<'tx> {
             chuid,
             applet_fingerprint,
             applet_name,
+            key_presence_unknown,
         })
     }
 
@@ -2419,6 +2474,7 @@ impl<'tx> PivSession<'tx> {
         } = self.applet_fingerprint();
         let pin_retries = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
+        let key_presence_unknown = self.card_key_presence_unknown();
 
         let mut slots = Vec::with_capacity(4);
         let mut detail = Vec::with_capacity(4);
@@ -2448,7 +2504,16 @@ impl<'tx> PivSession<'tx> {
                 .map(|dn| dn.to_string());
             let policy = self.slot_policy(slot);
 
-            slots.push(slot_status_of(slot, &cert));
+            let mut st = slot_status_of(slot, &cert);
+            // A key named by the algorithm reads above is already known, so
+            // only a slot with neither a certificate nor a known key asks
+            // whether the card says there is no key.
+            st.key_presence_unknown = slot_key_presence_unknown(
+                !st.cert_present,
+                key_presence_unknown || algorithm.is_some(),
+                || self.metadata_status(slot.key_ref()),
+            );
+            slots.push(st);
             detail.push(PivSlotDetail {
                 slot,
                 algorithm,
@@ -2466,6 +2531,7 @@ impl<'tx> PivSession<'tx> {
                 chuid,
                 applet_fingerprint,
                 applet_name,
+                key_presence_unknown,
             },
             slots: detail,
         })
@@ -2748,6 +2814,14 @@ impl<'tx> PivSession<'tx> {
         self.transmit_full(&piv::get_metadata(key_ref))
             .ok()
             .map(|(_, sw)| sw)
+    }
+
+    /// [`PivStatus::key_presence_unknown`] for this session's card. No APDU:
+    /// the quirks and the compatibility gate both come from the cached
+    /// identity.
+    fn card_key_presence_unknown(&mut self) -> bool {
+        let gate = self.extension_gate(keyroost_piv::compat::PivExtension::GetMetadata);
+        card_key_presence_unknown(&self.quirks(), gate, self.state.send_unsupported_reads)
     }
 
     /// One live [`Self::metadata`]`(slot.key_ref())` read, decoded straight
@@ -6220,6 +6294,7 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
             cert_len: 0,
             cert_unreadable: Some(reason),
             cert_compressed: false,
+            key_presence_unknown: false,
         },
         Ok(der) => {
             let len = der.map_or(0, <[u8]>::len);
@@ -6229,6 +6304,8 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
                 cert_len: len,
                 cert_unreadable: None,
                 cert_compressed: false,
+                // The status reads fill this in; it needs the card.
+                key_presence_unknown: false,
             }
         }
     }
@@ -6462,6 +6539,64 @@ mod tests {
             decode_serial_if_bcd(AppletFingerprint::Token2, Some(&[1, 0]), None, None),
             None
         );
+    }
+
+    #[test]
+    fn key_presence_is_unknown_only_where_the_metadata_key_type_is_ignored() {
+        use keyroost_piv::compat::PivQuirk;
+        assert!(metadata_key_type_ignored(&BTreeSet::from([
+            PivQuirk::InsF7MetadataAlgorithmInvalid
+        ])));
+        assert!(!metadata_key_type_ignored(&BTreeSet::from([
+            PivQuirk::InsF7MetadataPinTouchPolicyInvalid
+        ])));
+        assert!(!metadata_key_type_ignored(&BTreeSet::new()));
+    }
+
+    #[test]
+    fn slot_key_presence_is_known_only_from_a_no_key_metadata_answer() {
+        let never = || -> Option<u16> { panic!("no GET METADATA expected") };
+        // A certificate (readable or not) decides the slot's words: no read.
+        assert!(!slot_key_presence_unknown(false, false, never));
+        assert!(!slot_key_presence_unknown(false, true, never));
+        // A card where keyroost can't use GET METADATA: unknown, no read.
+        assert!(slot_key_presence_unknown(true, true, never));
+        // "Reference data not found" is the card saying there is no key.
+        assert!(!slot_key_presence_unknown(true, false, || Some(
+            piv::SW_REFERENCE_NOT_FOUND
+        )));
+        // Any other answer, or none, can't rule a key out.
+        for sw in [Some(piv::SW_OK), Some(0x6D00), Some(0x6A81), None] {
+            assert!(slot_key_presence_unknown(true, false, || sw), "{sw:04X?}");
+        }
+    }
+
+    #[test]
+    fn card_key_presence_is_unknown_where_get_metadata_is_ignored_or_not_sent() {
+        use keyroost_piv::compat::{FeatureGate, PivQuirk};
+        let quirky = BTreeSet::from([PivQuirk::InsF7MetadataAlgorithmInvalid]);
+        let none = BTreeSet::new();
+        assert!(card_key_presence_unknown(
+            &quirky,
+            FeatureGate::Supported,
+            false
+        ));
+        assert!(card_key_presence_unknown(
+            &none,
+            FeatureGate::Unsupported,
+            false
+        ));
+        // `--force` / Enable Anyway sends it, so its answer counts per slot.
+        assert!(!card_key_presence_unknown(
+            &none,
+            FeatureGate::Unsupported,
+            true
+        ));
+        assert!(!card_key_presence_unknown(
+            &none,
+            FeatureGate::Supported,
+            false
+        ));
     }
 
     #[test]
