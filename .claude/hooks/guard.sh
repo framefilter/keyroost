@@ -8,7 +8,7 @@
 # It blocks commands or file reads that would surface a secret (PINs, env
 # dumps, private keys, .env files, SSH keys, WiFi/NetworkManager configs).
 #
-# Destructive FIDO operations (fido-reset, fido-creds-delete) are intentionally
+# Destructive FIDO operations (fido reset, fido credentials delete) are intentionally
 # NOT guarded here: this checkout is used only with disposable test keys.
 #
 # This is intentionally conservative: when something looks like it would expose
