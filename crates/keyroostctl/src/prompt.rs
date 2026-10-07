@@ -145,19 +145,85 @@ pub(crate) fn confirm_typed(
     }
 }
 
+/// A file that appeared at an output path after the overwrite check.
+pub(crate) const APPEARED: &str =
+    "a file appeared there while this command ran and was not replaced; \
+     pass --overwrite to replace it";
+
+/// How an output file that passed [`check_overwrite`] is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutMode {
+    /// Nothing was there at check time: create it, and fail rather than
+    /// replace a file that appeared while the command waited on the key.
+    New,
+    /// Something was there and replacing it was agreed (`--overwrite` or a
+    /// "yes" at the terminal).
+    Replace,
+}
+
+impl OutMode {
+    /// Open `path` for writing in this mode. `New` reports a file that
+    /// appeared since the check as an error naming --overwrite.
+    pub(crate) fn open(self, path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        match self {
+            OutMode::New => opts.create_new(true),
+            OutMode::Replace => opts.create(true).truncate(true),
+        };
+        opts.open(path).map_err(|e| {
+            if self == OutMode::New && e.kind() == std::io::ErrorKind::AlreadyExists {
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, APPEARED)
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Write `data` to `path` in this mode.
+    pub(crate) fn write(self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.open(path)?.write_all(data)
+    }
+}
+
 /// Before writing `path`: a file already there is replaced only with
 /// `--overwrite` or a "yes" at a terminal; without a terminal it refuses,
-/// naming the flag. A path with nothing there passes. A dangling symlink
-/// counts as something there.
+/// naming the flag. A path with nothing there passes as [`OutMode::New`]. A
+/// dangling symlink counts as something there. A directory, or anything else
+/// that isn't a regular file, is refused whatever the flag says: writing to
+/// it would fail, and only after the key was used.
 pub(crate) fn check_overwrite(
     term: &mut dyn Term,
     path: &std::path::Path,
     overwrite: bool,
-) -> Result<(), String> {
-    if overwrite || std::fs::symlink_metadata(path).is_err() {
-        return Ok(());
-    }
+) -> Result<OutMode, String> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(OutMode::New);
+    };
     let shown = sanitize_terminal(&path.display().to_string());
+    // Through a link, judge what it points at; a dangling link is treated as
+    // a file there to replace.
+    let target = if meta.file_type().is_symlink() {
+        std::fs::metadata(path).ok()
+    } else {
+        Some(meta)
+    };
+    if let Some(t) = target {
+        if t.is_dir() {
+            return Err(format!(
+                "{shown} is a directory; give a file name for the output"
+            ));
+        }
+        if !t.is_file() {
+            return Err(format!(
+                "{shown} is not a regular file; give a file name for the output"
+            ));
+        }
+    }
+    if overwrite {
+        return Ok(OutMode::Replace);
+    }
     if !term.present() {
         return Err(format!(
             "{shown} already exists; pass --overwrite to replace it"
@@ -167,22 +233,51 @@ pub(crate) fn check_overwrite(
         .ask(&format!("{shown} already exists; overwrite? [y/N] "))
         .map_err(|e| e.to_string())?;
     match answer.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(()),
+        "y" | "yes" => Ok(OutMode::Replace),
         _ => Err("cancelled; nothing was changed".into()),
     }
 }
 
 /// [`check_overwrite`] at the real terminal for each output path a command
-/// was given. Call it first in the handler: before any secret is read and
-/// before any key is selected.
-pub(crate) fn check_overwrites(
-    paths: &[Option<&std::path::Path>],
+/// was given, returning each one's [`OutMode`] in the same order (`New` for
+/// a path not given). Call it first in the handler: before any secret is
+/// read and before any key is selected.
+pub(crate) fn check_overwrites<const N: usize>(
+    paths: [Option<&std::path::Path>; N],
     overwrite: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for p in paths.iter().flatten() {
-        check_overwrite(&mut RealTerm, p, overwrite)?;
+) -> Result<[OutMode; N], Box<dyn std::error::Error>> {
+    let mut modes = [OutMode::New; N];
+    for (mode, p) in modes.iter_mut().zip(paths) {
+        if let Some(p) = p {
+            *mode = check_overwrite(&mut RealTerm, p, overwrite)?;
+        }
     }
-    Ok(())
+    Ok(modes)
+}
+
+/// A secret output is never written through a symbolic link (the writer
+/// refuses one), so say so before the PIN or the card is used.
+pub(crate) fn refuse_link(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "{} is a symbolic link; this output is secret and is only written to a plain file",
+            sanitize_terminal(&path.display().to_string())
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// [`check_overwrites`] for one secret output: a symbolic link is refused
+/// first, then the overwrite question.
+pub(crate) fn check_secret_overwrite(
+    path: Option<&std::path::Path>,
+    overwrite: bool,
+) -> Result<OutMode, Box<dyn std::error::Error>> {
+    if let Some(p) = path {
+        refuse_link(p)?;
+    }
+    let [mode] = check_overwrites([path], overwrite)?;
+    Ok(mode)
 }
 
 /// "yubi-test (serial 12345678)" / model when unnamed / the reader or path
@@ -419,20 +514,94 @@ mod tests {
         std::fs::write(&taken, b"x").unwrap();
 
         let mut t = FakeTerm::new(true, &[]);
-        assert_eq!(check_overwrite(&mut t, &fresh, false), Ok(()));
+        assert_eq!(check_overwrite(&mut t, &fresh, false), Ok(OutMode::New));
         assert!(t.asked.is_empty(), "nothing to ask about a new file");
         let mut t = FakeTerm::new(true, &[]);
-        assert_eq!(check_overwrite(&mut t, &taken, true), Ok(()));
+        assert_eq!(check_overwrite(&mut t, &fresh, true), Ok(OutMode::New));
+        let mut t = FakeTerm::new(true, &[]);
+        assert_eq!(check_overwrite(&mut t, &taken, true), Ok(OutMode::Replace));
         assert!(t.asked.is_empty(), "--overwrite never asks");
 
         let e = check_overwrite(&mut FakeTerm::new(false, &[]), &taken, false).unwrap_err();
         assert!(e.contains("--overwrite"), "{e}");
         assert_eq!(
             check_overwrite(&mut FakeTerm::new(true, &["y\n"]), &taken, false),
-            Ok(())
+            Ok(OutMode::Replace)
         );
         let e = check_overwrite(&mut FakeTerm::new(true, &["\n"]), &taken, false).unwrap_err();
         assert!(e.contains("cancelled"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory (or anything else that isn't a plain file) can't be
+    /// replaced by writing to it: refused outright, --overwrite or not, and
+    /// never asked about.
+    #[test]
+    fn check_overwrite_refuses_what_is_not_a_file() {
+        let dir = std::env::temp_dir().join(format!("kr-overwrite-dir-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for overwrite in [false, true] {
+            for present in [false, true] {
+                let mut t = FakeTerm::new(present, &["y\n"]);
+                let e = check_overwrite(&mut t, &sub, overwrite).unwrap_err();
+                assert!(e.contains("is a directory"), "{e}");
+                assert!(e.contains("sub"), "names the path: {e}");
+                assert!(t.asked.is_empty(), "a directory is never offered: {e}");
+            }
+        }
+        #[cfg(unix)]
+        {
+            let link = dir.join("to-dir");
+            std::os::unix::fs::symlink(&sub, &link).unwrap();
+            let e = check_overwrite(&mut FakeTerm::new(true, &["y\n"]), &link, true).unwrap_err();
+            assert!(e.contains("is a directory"), "{e}");
+            let e = check_overwrite(
+                &mut FakeTerm::new(true, &["y\n"]),
+                std::path::Path::new("/dev/null"),
+                true,
+            )
+            .unwrap_err();
+            assert!(e.contains("not a regular file"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that appears between the check and the write is not replaced
+    /// when nothing was there at check time; an agreed replace still is.
+    #[test]
+    fn out_mode_new_never_replaces() {
+        let dir = std::env::temp_dir().join(format!("kr-outmode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("out.bin");
+        OutMode::New.write(&p, b"first").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+        let e = OutMode::New.write(&p, b"second").unwrap_err();
+        assert!(e.to_string().contains("--overwrite"), "{e}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"first");
+        OutMode::Replace.write(&p, b"third").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"third");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Secret outputs refuse a symbolic link before anything is read.
+    #[cfg(unix)]
+    #[test]
+    fn secret_output_refuses_a_link() {
+        let dir = std::env::temp_dir().join(format!("kr-secret-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.bin");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let dangling = dir.join("dangling.bin");
+        std::os::unix::fs::symlink(dir.join("missing"), &dangling).unwrap();
+        for p in [&link, &dangling] {
+            let e = refuse_link(p).unwrap_err();
+            assert!(e.contains("symbolic link"), "{e}");
+        }
+        assert_eq!(refuse_link(&target), Ok(()));
+        assert_eq!(refuse_link(&dir.join("fresh.bin")), Ok(()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

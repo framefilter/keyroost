@@ -179,6 +179,19 @@ const CASES: &[(&[&str], &str)] = &[
     (
         &[
             "piv",
+            "request-cert",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--out",
+    ),
+    (
+        &[
+            "piv",
             "self-sign",
             "--slot",
             "9a",

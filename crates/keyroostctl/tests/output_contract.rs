@@ -103,8 +103,41 @@ fn an_existing_output_file_is_refused_before_any_key() {
     let f = dir.join("exists.out");
     std::fs::write(&f, b"keep me").unwrap();
     let f = f.to_str().unwrap();
+    let fresh = dir.join("fresh.out");
+    let fresh = fresh.to_str().unwrap();
     for args in [
         &["piv", "export-cert", "--slot", "9a", "--out", f][..],
+        &["openpgp", "authenticate", "--in", f, "--out", f],
+        &[
+            "piv",
+            "request-cert",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--out",
+            fresh,
+            "--generate-key",
+            "--save-pubkey",
+            f,
+            "--mgmt-key-default",
+            "--yes",
+        ],
+        &[
+            "piv",
+            "self-sign",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--out",
+            fresh,
+            "--generate-key",
+            "--save-pubkey",
+            f,
+            "--mgmt-key-default",
+            "--yes",
+        ],
         &[
             "piv",
             "generate-key",
@@ -152,5 +185,83 @@ fn an_existing_output_file_is_refused_before_any_key() {
         );
     }
     assert_eq!(std::fs::read(dir.join("exists.out")).unwrap(), b"keep me");
+    assert!(!dir.join("fresh.out").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory can't be written as an output file: refused before any key
+/// is selected, and --overwrite doesn't change that. Secret outputs also
+/// refuse a symbolic link up front, before the PIN or the card is used.
+#[test]
+fn an_output_that_cannot_be_replaced_is_refused_before_any_key() {
+    let dir = std::env::temp_dir().join(format!("kr-out-dir-{}", std::process::id()));
+    let sub = dir.join("a-dir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let d = sub.to_str().unwrap();
+    let input = dir.join("in.bin");
+    std::fs::write(&input, b"data").unwrap();
+    let i = input.to_str().unwrap();
+    for args in [
+        &[
+            "piv",
+            "export-cert",
+            "--slot",
+            "9a",
+            "--out",
+            d,
+            "--overwrite",
+        ][..],
+        &[
+            "piv",
+            "self-sign",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--generate-key",
+            "--save-pubkey",
+            d,
+            "--mgmt-key-default",
+            "--yes",
+            "--overwrite",
+        ],
+        &["openpgp", "sign", "--in", i, "--out", d, "--overwrite"],
+        &[
+            "fido",
+            "large-blob",
+            "export",
+            "0",
+            "--out",
+            d,
+            "--overwrite",
+        ],
+        &["fido", "ssh-cert", "extract", "--out", d, "--overwrite"],
+    ] {
+        let (code, _out, err) = run(args);
+        assert_eq!(code, 1, "{args:?}: {err}");
+        assert!(err.contains("is a directory"), "{args:?}: {err}");
+        assert!(err.contains("a-dir"), "{args:?}: names the path: {err}");
+        assert!(
+            !err.contains('\u{2192}'),
+            "{args:?}: a key was selected first: {err}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        let link = dir.join("link.bin");
+        std::os::unix::fs::symlink(&input, &link).unwrap();
+        let l = link.to_str().unwrap();
+        for cmd in ["sign", "decrypt", "authenticate"] {
+            let args = ["openpgp", cmd, "--in", i, "--out", l, "--overwrite"];
+            let (code, _out, err) = run(&args);
+            assert_eq!(code, 1, "{args:?}: {err}");
+            assert!(err.contains("symbolic link"), "{args:?}: {err}");
+            assert!(
+                !err.contains('\u{2192}'),
+                "{args:?}: a key was selected first: {err}"
+            );
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), b"data");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3901,7 +3901,17 @@ const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
     ),
     (
         "--file",
-        &["piv"],
+        &["piv", "export-cert"],
+        "--file was renamed --out (the file to write)",
+    ),
+    (
+        "--file",
+        &["piv", "request-cert"],
+        "--file was renamed --out (the file to write)",
+    ),
+    (
+        "--file",
+        &["piv", "self-sign"],
         "--file was renamed --out (the file to write)",
     ),
     (
@@ -7945,7 +7955,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             hash,
             reader,
         } => {
-            crate::prompt::check_overwrites(&[out.as_deref()], *overwrite)?;
+            let out_mode = crate::prompt::check_secret_overwrite(out.as_deref(), *overwrite)?;
             let mut sec = Secrets::real();
             let src = Source::new(pin_env.as_deref(), *pin_stdin);
             sec.check(&PGP_SIGN_PIN, src)?;
@@ -7964,7 +7974,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let sig = session.sign(&input)?;
             match out {
                 Some(path) => {
-                    write_private_file(path, &sig)
+                    write_private_file(path, &sig, out_mode)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
                     eprintln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
                 }
@@ -7979,7 +7989,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             pin_stdin,
             reader,
         } => {
-            crate::prompt::check_overwrites(&[out.as_deref()], *overwrite)?;
+            let out_mode = crate::prompt::check_secret_overwrite(out.as_deref(), *overwrite)?;
             let mut sec = Secrets::real();
             let src = Source::new(pin_env.as_deref(), *pin_stdin);
             sec.check(&PGP_USER_PIN, src)?;
@@ -8016,7 +8026,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             };
             match out {
                 Some(path) => {
-                    write_private_file(path, &plain)
+                    write_private_file(path, &plain, out_mode)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
                     eprintln!(
                         "Wrote {} {} bytes to {}.",
@@ -8037,7 +8047,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             hash,
             reader,
         } => {
-            crate::prompt::check_overwrites(&[out.as_deref()], *overwrite)?;
+            let out_mode = crate::prompt::check_secret_overwrite(out.as_deref(), *overwrite)?;
             let mut sec = Secrets::real();
             let src = Source::new(pin_env.as_deref(), *pin_stdin);
             sec.check(&PGP_USER_PIN, src)?;
@@ -8061,7 +8071,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let sig = session.internal_authenticate(&input)?;
             match out {
                 Some(path) => {
-                    write_private_file(path, &sig)
+                    write_private_file(path, &sig, out_mode)
                         .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
                     eprintln!("Wrote {} signature bytes to {}.", sig.len(), path.display());
                 }
@@ -8603,7 +8613,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             force,
             yes,
         } => {
-            crate::prompt::check_overwrites(&[save_pubkey.as_deref()], *overwrite)?;
+            let [pub_mode] = crate::prompt::check_overwrites([save_pubkey.as_deref()], *overwrite)?;
             let alg = algorithm.to_alg();
             // Gate the PIN/touch policy — Yubico extensions to GENERATE
             // ASYMMETRIC KEYPAIR, not SP 800-73-4 — on the applet's
@@ -8695,7 +8705,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     };
                     let pem = keyroost_piv::spki::to_pem(&der);
                     if let Some(path) = save_pubkey {
-                        std::fs::write(path, pem.as_bytes())
+                        pub_mode
+                            .write(path, pem.as_bytes())
                             .map_err(|e| format!("write {}: {}", path.display(), e))?;
                         eprintln!(
                     "Wrote key material for {} to {} — pass it to request-cert/self-sign's \
@@ -8766,7 +8777,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             overwrite,
             format,
         } => {
-            crate::prompt::check_overwrites(&[out.as_deref()], *overwrite)?;
+            let [out_mode] = crate::prompt::check_overwrites([out.as_deref()], *overwrite)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8782,7 +8793,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             let bytes = encode_cert(&der, *format);
                             match out {
                                 Some(path) => {
-                                    std::fs::write(path, &bytes)
+                                    out_mode
+                                        .write(path, &bytes)
                                         .map_err(|e| format!("write {}: {}", path.display(), e))?;
                                     let kind = match format {
                                         CertFormat::Pem => "PEM",
@@ -8822,8 +8834,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             key_usage,
             yes,
         } => {
-            crate::prompt::check_overwrites(
-                &[out.as_deref(), keygen.save_pubkey.as_deref()],
+            let [out_mode, pub_mode] = crate::prompt::check_overwrites(
+                [out.as_deref(), keygen.save_pubkey.as_deref()],
                 *overwrite,
             )?;
             let mut sec = Secrets::real();
@@ -8883,7 +8895,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     if let Some(mgmt) = &mgmt {
                         let mgmt = mgmt_key_bytes(mgmt, &PIV_MGMT_KEY, s)?;
                         authenticate_piv(s, &mgmt)?;
-                        inline_generate_key(s, slot.to_slot(), keygen)?;
+                        inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
                     } else if let Some(path) = load_pubkey {
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
@@ -8897,7 +8909,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let pem = s.generate_csr(slot.to_slot(), subject, pin.as_bytes(), ku)?;
                     match out {
                         Some(path) => {
-                            std::fs::write(path, pem.as_bytes())
+                            out_mode
+                                .write(path, pem.as_bytes())
                                 .map_err(|e| format!("write {}: {}", path.display(), e))?;
                             eprintln!(
                                 "Wrote certificate request for {} to {}.",
@@ -8932,8 +8945,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             key_usage,
             yes,
         } => {
-            crate::prompt::check_overwrites(
-                &[out.as_deref(), keygen.save_pubkey.as_deref()],
+            let [out_mode, pub_mode] = crate::prompt::check_overwrites(
+                [out.as_deref(), keygen.save_pubkey.as_deref()],
                 *overwrite,
             )?;
             let valid_for = ValidFor::resolve(*days, *months, *years);
@@ -8987,7 +9000,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
                     if keygen.generate_key {
-                        inline_generate_key(s, slot.to_slot(), keygen)?;
+                        inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
                     } else if let Some(path) = load_pubkey {
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
@@ -9021,7 +9034,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         &stored,
                     );
                     if let Some(path) = out {
-                        std::fs::write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
+                        out_mode
+                            .write(path, keyroost_piv::x509::pem_certificate(&der).as_bytes())
                             .map_err(|e| format!("write {}: {}", path.display(), e))?;
                         eprintln!("PEM copy written to {}.", path.display());
                     }
@@ -9796,6 +9810,7 @@ fn inline_generate_key(
     s: &mut keyroost_transport::PivSession<'_>,
     slot: keyroost_piv::Slot,
     keygen: &InlineKeyGen,
+    pub_mode: crate::prompt::OutMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let alg = keygen.algorithm.to_alg();
     eprintln!(
@@ -9813,7 +9828,8 @@ fn inline_generate_key(
         let der = keyroost_piv::spki::subject_public_key_info(&pubkey, alg)
             .map_err(|e| format!("key generated, but encoding its public key failed: {}", e))?;
         let pem = keyroost_piv::spki::to_pem(&der);
-        std::fs::write(path, pem.as_bytes())
+        pub_mode
+            .write(path, pem.as_bytes())
             .map_err(|e| format!("write {}: {}", path.display(), e))?;
         eprintln!(
             "Wrote a copy of {}'s generated public key to {}.",
@@ -9922,9 +9938,29 @@ fn read_secret_pair<I: crate::secrets::SecretIo>(
 /// it over the destination. Because bytes never touch the caller-supplied path
 /// directly, no write can be redirected through an attacker's link.
 #[cfg(unix)]
-fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+fn write_private_file(
+    path: &std::path::Path,
+    data: &[u8],
+    mode: crate::prompt::OutMode,
+) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    // Nothing was there at check time: create it exclusively (O_CREAT|O_EXCL
+    // never follows a link and fails if anything appeared since), owner-only
+    // from the start.
+    if mode == crate::prompt::OutMode::New {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        let mut f = opts.open(path).map_err(|e| {
+            if e.kind() == ErrorKind::AlreadyExists {
+                Error::new(ErrorKind::AlreadyExists, crate::prompt::APPEARED)
+            } else {
+                e
+            }
+        })?;
+        return f.write_all(data).and_then(|_| f.sync_all());
+    }
 
     let parent = path
         .parent()
@@ -10003,15 +10039,12 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()
 /// Non-Unix fallback: create/overwrite with owner-intent semantics. Windows ACL
 /// hardening is out of scope for this helper.
 #[cfg(not(unix))]
-fn write_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    f.write_all(data)?;
-    Ok(())
+fn write_private_file(
+    path: &std::path::Path,
+    data: &[u8],
+    mode: crate::prompt::OutMode,
+) -> std::io::Result<()> {
+    mode.write(path, data)
 }
 
 /// Accept a certificate as DER or PEM, returning DER bytes.
@@ -10579,8 +10612,8 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             as_cert,
             path,
         } => {
-            crate::prompt::check_overwrites(&[Some(out.as_path())], *overwrite)?;
-            run_fido_large_blob_export(path.as_deref(), *index, out, *as_cert)
+            let [out_mode] = crate::prompt::check_overwrites([Some(out.as_path())], *overwrite)?;
+            run_fido_large_blob_export(path.as_deref(), *index, out, out_mode, *as_cert)
         }
         LargeBlobCmd::Clear {
             yes,
@@ -10614,13 +10647,14 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
             pin_stdin,
             path,
         } => {
-            crate::prompt::check_overwrites(&[out.as_deref()], *overwrite)?;
+            let [out_mode] = crate::prompt::check_overwrites([out.as_deref()], *overwrite)?;
             let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
             run_fido_ssh_cert_extract(
                 path.as_deref(),
                 &pin,
                 credential.as_deref(),
                 out.as_deref(),
+                out_mode,
                 *overwrite,
             )
         }
@@ -10714,6 +10748,7 @@ fn run_fido_ssh_cert_extract(
     pin: &str,
     credential: Option<&str>,
     out: Option<&std::path::Path>,
+    out_mode: crate::prompt::OutMode,
     overwrite: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (creds, array) = enumerate_ssh_credentials(path, pin)?;
@@ -10790,10 +10825,13 @@ fn run_fido_ssh_cert_extract(
     };
     // A given --out was checked before the key was touched; the default name
     // is only known now.
-    if out.is_none() {
-        crate::prompt::check_overwrite(&mut crate::prompt::RealTerm, &out_path, overwrite)?;
-    }
-    std::fs::write(&out_path, cert_pub.as_bytes())?;
+    let out_mode = match out {
+        Some(_) => out_mode,
+        None => crate::prompt::check_overwrite(&mut crate::prompt::RealTerm, &out_path, overwrite)?,
+    };
+    out_mode
+        .write(&out_path, cert_pub.as_bytes())
+        .map_err(|e| format!("write {}: {}", out_path.display(), e))?;
     output::status(&format!("Wrote SSH certificate to {}.", out_path.display()));
     Ok(())
 }
@@ -11047,6 +11085,7 @@ fn run_fido_large_blob_export(
     path: Option<&std::path::Path>,
     index: usize,
     output: &std::path::Path,
+    out_mode: crate::prompt::OutMode,
     as_cert: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_ctap::large_blobs::EntryKind;
@@ -11070,7 +11109,9 @@ fn run_fido_large_blob_export(
     } else {
         entry.ciphertext.clone()
     };
-    std::fs::write(output, &bytes)?;
+    out_mode
+        .write(output, &bytes)
+        .map_err(|e| format!("write {}: {}", output.display(), e))?;
     output::status(&format!(
         "Wrote {} bytes to {}.",
         bytes.len(),
@@ -15068,14 +15109,21 @@ mod cli_tests {
         let mut path = std::env::temp_dir();
         path.push(format!("keyroost_priv_{}", std::process::id()));
 
+        use crate::prompt::OutMode;
         // Fresh file is created 0600.
-        write_private_file(&path, b"secret plaintext").unwrap();
+        write_private_file(&path, b"secret plaintext", OutMode::New).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "fresh file should be 0600");
 
+        // A file that appeared after the check is not replaced in New mode.
+        let err = write_private_file(&path, b"other", OutMode::New).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(err.to_string().contains("--overwrite"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret plaintext");
+
         // Loosen perms, then re-write: the helper must tighten back to 0600.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_private_file(&path, b"new secret").unwrap();
+        write_private_file(&path, b"new secret", OutMode::Replace).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "re-write should tighten to 0600");
 
@@ -15095,8 +15143,10 @@ mod cli_tests {
         // Attacker pre-plants a symlink where keyroost will write secret output.
         symlink(&victim, &link).unwrap();
 
-        let err = write_private_file(&link, b"top secret plaintext").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        for mode in [crate::prompt::OutMode::New, crate::prompt::OutMode::Replace] {
+            let err = write_private_file(&link, b"top secret plaintext", mode).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        }
 
         // No bytes may have been written through the link to the victim target.
         assert!(!victim.exists(), "secret bytes leaked through the symlink");
@@ -15637,6 +15687,25 @@ mod cli_tests {
 
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--file` is only hinted on the piv commands that had it; other piv
+    /// commands never took it and have no --out to point at.
+    #[test]
+    fn piv_file_hint_only_where_file_was() {
+        let hint = |cmd: &str| {
+            retired_flag_hint(
+                "--file",
+                &argv(&["keyroostctl", "piv", cmd, "--slot", "9a", "--file", "x"]),
+            )
+        };
+        assert!(hint("import-cert").unwrap().contains("--in"));
+        for cmd in ["export-cert", "request-cert", "self-sign"] {
+            assert!(hint(cmd).unwrap().contains("--out"), "{cmd}");
+        }
+        for cmd in ["generate-key", "test", "info"] {
+            assert_eq!(hint(cmd), None, "{cmd}");
+        }
     }
 
     #[test]
