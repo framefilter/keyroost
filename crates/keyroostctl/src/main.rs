@@ -3581,9 +3581,9 @@ enum MoltoInput {
 fn parse_molto_slot(s: &str) -> Result<u8, String> {
     let n: u8 = s
         .parse()
-        .map_err(|_| format!("profile must be a number 0..=99, got {s:?}"))?;
+        .map_err(|_| "profile must be a number 0..=99".to_string())?;
     if n > 99 {
-        return Err(format!("profile must be 0..=99, got {n}"));
+        return Err("profile must be 0..=99".into());
     }
     Ok(n)
 }
@@ -3600,7 +3600,7 @@ fn parse_molto_title(s: &str) -> Result<String, String> {
 fn parse_button_digits(s: &str) -> Result<u8, String> {
     match s.parse::<u8>() {
         Ok(n @ (6 | 8)) => Ok(n),
-        _ => Err(format!("button HOTP --digits must be 6 or 8, got {s:?}")),
+        _ => Err("button HOTP --digits must be 6 or 8".into()),
     }
 }
 
@@ -3823,7 +3823,7 @@ fn unix_now() -> u32 {
 fn parse_valid_days(s: &str) -> Result<u32, String> {
     let days: u32 = s
         .parse()
-        .map_err(|_| format!("--days must be a whole number, got {s:?}"))?;
+        .map_err(|_| "--days must be a whole number".to_string())?;
     let max = keyroost_piv::max_valid_days(u64::from(unix_now()));
     if days > max {
         return Err(format!(
@@ -3841,7 +3841,7 @@ fn parse_valid_days(s: &str) -> Result<u32, String> {
 fn parse_valid_years(s: &str) -> Result<u32, String> {
     let years: u32 = s
         .parse()
-        .map_err(|_| format!("--years must be a whole number, got {s:?}"))?;
+        .map_err(|_| "--years must be a whole number".to_string())?;
     let max = keyroost_piv::max_valid_years(u64::from(unix_now()));
     if years > max {
         return Err(format!(
@@ -3859,7 +3859,7 @@ fn parse_valid_years(s: &str) -> Result<u32, String> {
 fn parse_valid_months(s: &str) -> Result<u32, String> {
     let months: u32 = s
         .parse()
-        .map_err(|_| format!("--months must be a whole number, got {s:?}"))?;
+        .map_err(|_| "--months must be a whole number".to_string())?;
     let max = keyroost_piv::max_valid_months(u64::from(unix_now()));
     if months > max {
         return Err(format!(
