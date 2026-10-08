@@ -437,9 +437,10 @@ pub(crate) struct FidoLargeBlobEntryJson {
     /// Whether this entry is a keyroost-authored plaintext note (true) or an
     /// opaque RP-encrypted record (false).
     pub is_note: bool,
-    /// The note text when `is_note`; `null` for opaque entries.
+    /// The note text when `is_note`, the name for a "key-name" entry; `null`
+    /// for other entries.
     pub text: Option<String>,
-    /// Entry classification: "note", "ssh-cert", or "opaque".
+    /// Entry classification: "note", "key-name", "ssh-cert", or "opaque".
     pub kind: &'static str,
     pub ssh_cert: Option<FidoLargeBlobSshCertJson>,
 }
@@ -451,7 +452,7 @@ pub(crate) struct FidoLargeBlobGetJson {
     pub size: u64,
     pub is_note: bool,
     pub text: Option<String>,
-    /// Entry classification: "note", "ssh-cert", or "opaque".
+    /// Entry classification: "note", "key-name", "ssh-cert", or "opaque".
     pub kind: &'static str,
     pub ssh_cert: Option<FidoLargeBlobSshCertJson>,
     /// Hex of the raw ciphertext bytes (the note magic + UTF-8 for a note, or

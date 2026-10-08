@@ -185,7 +185,8 @@ enum Cmd {
     /// OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed
     /// confirmation (`--yes` to skip).
     ///
-    /// Wipes all credentials, codes, keys, and PINs; each applet that
+    /// Wipes all credentials, codes, keys, and PINs (including a name stored
+    /// on the key); each applet that
     /// completes comes back in factory condition, and every step reports its
     /// own outcome. On a USB key the FIDO2 step ends with an unplug/replug +
     /// touch; a card in a smart-card reader is reset in place instead (no
@@ -2372,6 +2373,9 @@ enum FidoCmd {
     /// Factory-reset FIDO2: wipe every credential (passkeys and security-key
     /// sign-ins) and the PIN. Irreversible: asks first (`--yes` to skip).
     ///
+    /// The large-blob storage is wiped too (including a name stored on the
+    /// key).
+    ///
     /// Runs authenticatorReset. Most authenticators only accept it within
     /// ~10s of plug-in and require a physical touch, so over USB keyroost
     /// waits up to 60 seconds for the key to be unplugged and plugged back in
@@ -2716,12 +2720,15 @@ enum SshCertCmd {
 ///
 /// keyroost stores its own entries as plaintext "notes" (a small magic prefix
 /// marks them); relying parties store opaque AEAD-encrypted records keyroost
-/// cannot read. Reads need no PIN (the store is world-readable); writes pull a
+/// cannot read. The key's own name (`keyroostctl name set NAME --store key`)
+/// is an entry of kind `key name`; change it with `name set`, not here.
+/// Reads need no PIN (the store is world-readable); writes pull a
 /// `largeBlobWrite` token from your PIN. Every write re-reads the live array
 /// first so existing RP entries are never clobbered by stale state.
 #[derive(Subcommand)]
 enum LargeBlobCmd {
-    /// List every entry: index, size, type (note vs opaque), and a short preview.
+    /// List every entry: index, size, type (note, key name, SSH certificate or
+    /// opaque), and a short preview.
     List {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -2806,10 +2813,17 @@ enum LargeBlobCmd {
     },
     /// Erase the ENTIRE large-blob array, including any RP-owned entries.
     /// Irreversible: asks first (`--yes` to skip).
+    ///
+    /// The key's name, if one is stored on the key, goes too unless
+    /// --keep-name.
     Clear {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Keep the key's name entry (`name set --store key`), unchanged, and
+        /// clear everything else.
+        #[arg(long)]
+        keep_name: bool,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
         /// asks.
@@ -12420,7 +12434,19 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             pin,
             path,
         } => {
-            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
+            // The PIN's source is checked before the key is looked at, and
+            // the name entry refused before the PIN is read.
+            let mut sec = Secrets::real();
+            let src = Source::from_flag(pin.as_ref());
+            sec.check(&FIDO_PIN, src)?;
+            let (dev, _, current) = open_and_read_large_blobs(path.as_deref())?;
+            if let Some(refusal) = large_blob_edit_refusal(&current, *index) {
+                return Err(refusal.into());
+            }
+            drop(dev); // not held while the PIN is typed
+            let key = crate::target::select_fido(path.as_deref())?;
+            let pin = sec.read(&FIDO_PIN, src)?;
+            fido_reverify_if_prompted(&sec, &key)?;
             run_fido_large_blob_edit(path.as_deref(), &pin, *index, text)
         }
         LargeBlobCmd::Delete {
@@ -12444,9 +12470,17 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             let [out_mode] = crate::prompt::check_overwrites([Some(out.as_path())], *overwrite)?;
             run_fido_large_blob_export(path.as_deref(), *index, out, out_mode, *as_cert)
         }
-        LargeBlobCmd::Clear { yes, pin, path } => {
-            run_fido_large_blob_clear(path.as_deref(), Source::from_flag(pin.as_ref()), *yes)
-        }
+        LargeBlobCmd::Clear {
+            yes,
+            keep_name,
+            pin,
+            path,
+        } => run_fido_large_blob_clear(
+            path.as_deref(),
+            Source::from_flag(pin.as_ref()),
+            *yes,
+            *keep_name,
+        ),
     }
 }
 
@@ -12728,6 +12762,45 @@ fn large_blob_kind(
     }
 }
 
+/// An entry's text for JSON: a note's text, or the key's name.
+fn large_blob_text(e: &keyroost_ctap::large_blobs::LargeBlobEntry) -> Option<String> {
+    match e.classify() {
+        keyroost_ctap::large_blobs::EntryKind::KeyName(l) => Some(l.label),
+        _ => e.as_text(),
+    }
+}
+
+/// Why `fido blob edit INDEX` refuses: the entry is the key's name, which
+/// only `name set` changes. `None` for any other index.
+fn large_blob_edit_refusal(
+    array: &keyroost_ctap::large_blobs::LargeBlobArray,
+    index: usize,
+) -> Option<String> {
+    use keyroost_ctap::large_blobs::EntryKind;
+    match array.entry(index)?.classify() {
+        EntryKind::KeyName(_) => Some(format!(
+            "entry {index} is the key's name; change it with: keyroostctl name set NAME"
+        )),
+        _ => None,
+    }
+}
+
+/// What `fido blob clear` writes: the empty array, or with `keep_name` and a
+/// name on the key, the name entries exactly as read. Returns the bytes and
+/// the name kept.
+fn large_blob_clear_bytes(
+    current: &keyroost_ctap::large_blobs::LargeBlobArray,
+    keep_name: bool,
+) -> Result<(Vec<u8>, Option<String>), keyroost_ctap::CtapError> {
+    match current.label().filter(|_| keep_name) {
+        Some((_, l)) => Ok((
+            current.only_label().serialize_with_checksum()?,
+            Some(l.label),
+        )),
+        None => Ok((keyroost_ctap::large_blobs::empty_array_serialized(), None)),
+    }
+}
+
 /// Shape a parsed large-blob array into the JSON `list` view.
 fn large_blob_list_json(
     array: &keyroost_ctap::large_blobs::LargeBlobArray,
@@ -12743,7 +12816,7 @@ fn large_blob_list_json(
                 index,
                 size: e.orig_size,
                 is_note: e.is_kr_note(),
-                text: e.as_text(),
+                text: large_blob_text(e),
                 kind,
                 ssh_cert,
             }
@@ -12831,7 +12904,7 @@ fn run_fido_large_blob_get(
             index,
             size: entry.orig_size,
             is_note: entry.is_kr_note(),
-            text: entry.as_text(),
+            text: large_blob_text(entry),
             kind,
             ssh_cert,
             hex: hex_encode(&entry.ciphertext),
@@ -13008,7 +13081,12 @@ fn run_fido_large_blob_delete(
     let entry = current
         .entry(index)
         .ok_or_else(|| large_blob_bad_index(index, current.len()))?;
-    if !entry.is_kr_note() {
+    if let keyroost_ctap::large_blobs::EntryKind::KeyName(l) = entry.classify() {
+        output::warn(&format!(
+            "this removes the key's name '{}'",
+            sanitize_terminal(&l.label)
+        ));
+    } else if !entry.is_kr_note() {
         // Opaque RP-owned entry: deleting it can break the owning service.
         output::warn(&format!(
             "entry {} was not created by keyroost (it is an opaque, \
@@ -13054,35 +13132,56 @@ fn run_fido_large_blob_clear(
     path: Option<&std::path::Path>,
     src: Source<'_>,
     yes: bool,
+    keep_name: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_ctap::large_blobs::EntryKind;
     let mut sec = Secrets::real();
     sec.check(&FIDO_PIN, src)?;
     // Read first so we can report exactly what will be wiped.
     let (dev, _info, current) = open_and_read_large_blobs(path)?;
+    let name = current.label().map(|(_, l)| sanitize_terminal(&l.label));
+    let keep = keep_name && name.is_some();
+    if keep_name && !keep {
+        output::status("no name on the key; clearing everything");
+    }
     // Skipped (non-standard) elements are wiped too, so they count as opaque.
     let skipped = current.skipped_count();
-    let total = current.len() + skipped;
+    let names = current
+        .entries()
+        .into_iter()
+        .filter(|e| matches!(e.classify(), EntryKind::KeyName(_)))
+        .count();
+    let total = current.len() + skipped - if keep { names } else { 0 };
     let opaque = current
         .entries()
         .into_iter()
-        .filter(|e| !e.is_kr_note())
+        .filter(|e| !e.is_kr_note() && !matches!(e.classify(), EntryKind::KeyName(_)))
         .count()
         + skipped;
+    let name_clause = match (&name, keep) {
+        (Some(n), false) => {
+            format!(" This also removes the key's name '{n}' (keep it with --keep-name).")
+        }
+        _ => String::new(),
+    };
     if !yes {
         output::warn(&format!(
             "`clear` erases the ENTIRE large-blob array — ALL {total} \
              entr{plural} ({opaque} opaque/RP-owned, e.g. stored SSH certs). This \
-             can break any service that stored data here.",
-            total = total,
+             can break any service that stored data here.{name_clause}",
             plural = if total == 1 { "y" } else { "ies" },
-            opaque = opaque,
         ));
-    } else if opaque > 0 {
-        output::warn(&format!(
-            "wiping {} opaque/RP-owned entr{} along with everything else.",
-            opaque,
-            if opaque == 1 { "y" } else { "ies" }
-        ));
+    } else {
+        if opaque > 0 {
+            output::warn(&format!(
+                "wiping {} opaque/RP-owned entr{} along with everything else.",
+                opaque,
+                if opaque == 1 { "y" } else { "ies" }
+            ));
+        }
+        if !name_clause.is_empty() {
+            output::warn(name_clause.trim_start());
+        }
     }
     drop(dev); // not held across the question or while the PIN is typed
     let key = crate::target::select_fido(path)?;
@@ -13090,7 +13189,11 @@ fn run_fido_large_blob_clear(
         &mut crate::prompt::RealTerm,
         &mut sec,
         yes,
-        "clear the whole large-blob array",
+        if keep {
+            "clear the large-blob array except the key's name"
+        } else {
+            "clear the whole large-blob array"
+        },
         &crate::prompt::key_label(&key),
         Some(&key),
         src,
@@ -13099,18 +13202,22 @@ fn run_fido_large_blob_clear(
     if !large_blob_unchanged(&current, &again) {
         return Err(LARGE_BLOB_CHANGED.into());
     }
+    let (serialized, kept) = large_blob_clear_bytes(&again, keep)?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
         &pin,
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
-    let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
     // Names read from keys before or during the write are stale.
     keyroost_resolve::with_key_names_forgotten(|| {
         keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
     })?;
-    println!("Large-blob array cleared ({} entries wiped).", total);
+    if kept.is_some() {
+        println!("Large-blob array cleared except the key's name ({total} entries wiped).");
+    } else {
+        println!("Large-blob array cleared ({total} entries wiped).");
+    }
     Ok(())
 }
 
@@ -21507,6 +21614,75 @@ mod cli_tests {
             .entry(0)
             .unwrap()
             .clone()
+    }
+
+    /// `base` with a name entry for `label` appended.
+    fn with_key_name(base: &LargeBlobArray, label: &str) -> LargeBlobArray {
+        let l = keyroost_ctap::device_label::DeviceLabel {
+            label: label.into(),
+            writer: Some("keyroost".into()),
+        };
+        base.with_label(Some(&l), [7; 12]).unwrap()
+    }
+
+    #[test]
+    fn large_blob_json_shows_the_key_name_entry() {
+        let array = with_key_name(&large_blob_array_of(&[&opaque_entry_map()]), "Work YubiKey");
+        let shaped = large_blob_list_json(&array, &keyroost_ctap::AuthenticatorInfo::default());
+        let e = &shaped.entries[1];
+        assert_eq!(e.kind, "key-name");
+        assert!(!e.is_note);
+        assert_eq!(e.text.as_deref(), Some("Work YubiKey"));
+        let v = serde_json::to_value(&shaped).unwrap();
+        assert_eq!(v["entries"][1]["kind"], "key-name");
+        assert_eq!(v["entries"][1]["text"], "Work YubiKey");
+        assert!(v["entries"][0]["text"].is_null());
+    }
+
+    #[test]
+    fn editing_the_key_name_entry_is_refused() {
+        let array = with_key_name(&large_blob_array_of(&[]).with_text_note("hi"), "Work");
+        assert_eq!(
+            large_blob_edit_refusal(&array, 1).as_deref(),
+            Some("entry 1 is the key's name; change it with: keyroostctl name set NAME")
+        );
+        assert_eq!(large_blob_edit_refusal(&array, 0), None);
+        assert_eq!(large_blob_edit_refusal(&array, 5), None);
+    }
+
+    #[test]
+    fn clear_keep_name_writes_only_the_label() {
+        let named = with_key_name(
+            &large_blob_array_of(&[&opaque_entry_map()]).with_text_note("hi"),
+            "Work",
+        );
+        // Read back as from the key, so the label bytes are the stored ones.
+        let read = LargeBlobArray::parse(&{
+            let mut b = named.serialize_with_checksum().unwrap();
+            b.truncate(b.len() - 16);
+            b
+        })
+        .unwrap();
+        let (bytes, kept) = large_blob_clear_bytes(&read, true).unwrap();
+        assert_eq!(kept.as_deref(), Some("Work"));
+        let after = LargeBlobArray::parse(&bytes[..bytes.len() - 16]).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after.entry(0).unwrap().ciphertext,
+            read.entry(2).unwrap().ciphertext,
+            "the label is written back unchanged"
+        );
+        // Without --keep-name, or with no name to keep: everything goes.
+        let empty = keyroost_ctap::large_blobs::empty_array_serialized();
+        assert_eq!(
+            large_blob_clear_bytes(&read, false).unwrap(),
+            (empty.clone(), None)
+        );
+        let unnamed = large_blob_array_of(&[&opaque_entry_map()]);
+        assert_eq!(
+            large_blob_clear_bytes(&unnamed, true).unwrap(),
+            (empty, None)
+        );
     }
 
     #[test]
