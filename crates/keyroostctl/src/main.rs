@@ -12061,6 +12061,7 @@ fn large_blob_kind(
     let kind = entry.classify();
     match &kind {
         EntryKind::Note(_) => ("note", None, kind),
+        EntryKind::KeyName(_) => ("key-name", None, kind),
         EntryKind::Opaque => ("opaque", None, kind),
         EntryKind::SshCert { info, .. } => {
             let cert = json_out::FidoLargeBlobSshCertJson {
@@ -12160,6 +12161,12 @@ fn run_fido_large_blob_list(
                 sanitize_terminal(&info.key_id),
                 sanitize_terminal(&info.principals.join(","))
             ),
+            EntryKind::KeyName(l) => println!(
+                "[{}] {} bytes  key name  \"{}\"",
+                i,
+                e.orig_size,
+                sanitize_terminal(&l.label)
+            ),
             EntryKind::Opaque => println!(
                 "[{}] {} bytes  opaque    {}",
                 i,
@@ -12208,6 +12215,10 @@ fn run_fido_large_blob_get(
             // A note is arbitrary text written by any app with the PIN; keep its
             // line structure but strip escapes so it can't hijack the terminal.
             println!("{}", sanitize_multiline(&text));
+        }
+        EntryKind::KeyName(l) => {
+            println!("Entry {}: key name, {} bytes", index, entry.orig_size);
+            println!("{}", sanitize_terminal(&l.label));
         }
         EntryKind::SshCert { info, .. } => {
             println!(

@@ -50,6 +50,7 @@
 use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::{AuthenticatorInfo, CtapError};
+use crate::device_label::{self, DeviceLabel, LabelError};
 use crate::hid::CTAPHID_CBOR;
 use crate::pin::left16_sha256;
 use crate::ssh_cert;
@@ -149,6 +150,16 @@ impl LargeBlobEntry {
         }
     }
 
+    /// An entry built here from its fields (no bytes read from a key).
+    pub(crate) fn built(ciphertext: Vec<u8>, nonce: Vec<u8>, orig_size: u64) -> Self {
+        LargeBlobEntry {
+            ciphertext,
+            nonce,
+            orig_size,
+            original: None,
+        }
+    }
+
     /// If this entry is a keyroost note (its ciphertext starts with
     /// [`KR_NOTE_MAGIC`] and the remainder is valid UTF-8), return the stored
     /// text. Returns `None` for genuine RP entries, which must be shown only as
@@ -163,10 +174,14 @@ impl LargeBlobEntry {
         self.ciphertext.starts_with(KR_NOTE_MAGIC)
     }
 
-    /// Classify this entry. Conservative by construction: the keyroost note
-    /// magic wins outright, certificate recognition requires a complete,
-    /// well-formed parse, and everything else is opaque.
+    /// Classify this entry. Conservative by construction: a name entry must
+    /// pass its AEAD tag under the published name key, the keyroost note
+    /// magic wins over everything else, certificate recognition requires a
+    /// complete, well-formed parse, and everything else is opaque.
     pub fn classify(&self) -> EntryKind {
+        if let Some(label) = device_label::decode_entry(self) {
+            return EntryKind::KeyName(label);
+        }
         if let Some(text) = self.as_text() {
             return EntryKind::Note(text);
         }
@@ -190,6 +205,8 @@ impl LargeBlobEntry {
 pub enum EntryKind {
     /// keyroost plaintext note (magic-prefixed).
     Note(String),
+    /// The key's own name ([`device_label`]).
+    KeyName(DeviceLabel),
     /// A recognized OpenSSH certificate. `wire` holds the canonical binary
     /// certificate (decoded from base64 when the entry stored the text form),
     /// ready for export as a `-cert.pub`.
@@ -375,6 +392,53 @@ impl LargeBlobArray {
         Some(self.changed(items))
     }
 
+    /// The last name entry (its entry index and the name), if any.
+    pub fn label(&self) -> Option<(usize, DeviceLabel)> {
+        self.entry_iter()
+            .enumerate()
+            .filter_map(|(i, e)| Some((i, device_label::decode_entry(e)?)))
+            .last()
+    }
+
+    /// A copy with every name entry removed and, when `label` is given, one
+    /// new name entry (encrypted with `nonce`) appended. Nothing else moves
+    /// or changes.
+    pub fn with_label(
+        &self,
+        label: Option<&DeviceLabel>,
+        nonce: [u8; 12],
+    ) -> Result<LargeBlobArray, LabelError> {
+        let mut items: Vec<Item> = self
+            .items
+            .iter()
+            .filter(|i| !is_label_item(i))
+            .cloned()
+            .collect();
+        if let Some(l) = label {
+            items.push(Item::Entry(device_label::encode_entry(l, nonce)?));
+        }
+        Ok(self.changed(items))
+    }
+
+    /// A copy holding only the name entries, as read (`fido blob clear
+    /// --keep-name`).
+    pub fn only_label(&self) -> LargeBlobArray {
+        let items = self
+            .items
+            .iter()
+            .filter(|i| is_label_item(i))
+            .cloned()
+            .collect();
+        self.changed(items)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_entry_for_test(&self, e: LargeBlobEntry) -> LargeBlobArray {
+        let mut items = self.items.clone();
+        items.push(Item::Entry(e));
+        self.changed(items)
+    }
+
     /// Compute capacity from the elements as currently held (re-serialized,
     /// so it stays correct after local adds/edits that haven't been written).
     pub fn capacity(&self, info: &AuthenticatorInfo) -> BlobCapacity {
@@ -389,6 +453,11 @@ impl LargeBlobArray {
             entry_count: self.len(),
         }
     }
+}
+
+/// Whether `item` is a name entry ([`device_label`]).
+fn is_label_item(item: &Item) -> bool {
+    matches!(item, Item::Entry(e) if device_label::decode_entry(e).is_some())
 }
 
 /// The canonical `{1: ciphertext, 2: nonce, 3: origSize}` map for `e`.
@@ -649,6 +718,32 @@ pub(crate) fn gcm_decrypt(
             },
         )
         .ok()
+}
+
+/// AES-256-GCM encrypt for a largeBlob entry, the inverse of
+/// [`gcm_decrypt`]: AAD `b"blob" || u64le(orig_size)`; the result carries
+/// the 16-byte tag.
+pub(crate) fn gcm_encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    plain: &[u8],
+    orig_size: u64,
+) -> Vec<u8> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+
+    let mut aad = Vec::with_capacity(12);
+    aad.extend_from_slice(b"blob");
+    aad.extend_from_slice(&orig_size.to_le_bytes());
+    Aes256Gcm::new(key.into())
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plain,
+                aad: &aad,
+            },
+        )
+        .expect("AES-GCM encryption of a small buffer cannot fail")
 }
 
 /// Host-side ceiling on the inflated plaintext of a single largeBlob entry.

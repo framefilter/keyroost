@@ -14484,6 +14484,7 @@ impl App {
                     ui.add_space(8.0);
                     let meta = match &classification {
                         EntryKind::Note(_) => "keyroost text note".to_string(),
+                        EntryKind::KeyName(l) => format!("key name: \"{}\"", l.label),
                         EntryKind::SshCert { .. } => format!(
                             "ssh-cert \u{00b7} {} bytes \u{00b7} relying-party data",
                             entry.ciphertext.len(),
