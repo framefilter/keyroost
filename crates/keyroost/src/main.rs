@@ -316,6 +316,9 @@ struct SecurityKeysState {
     /// Pending "clear all storage" confirmation. Set by the first click on the
     /// destructive clear control; the confirmed click wipes every entry.
     lb_confirm_clear: bool,
+    /// "Keep the key's name" in the clear confirmation; set when it opens
+    /// ([`device::keep_name_default`]).
+    lb_keep_name: bool,
     /// Status / result line for the last large-blob load or write.
     lb_status: Option<String>,
     /// Text buffer for the "add a note" field.
@@ -548,6 +551,14 @@ struct RenameTarget {
     /// Display hints for the log line and the keys.json record.
     vendor: String,
     model: String,
+}
+
+/// The answer to the hero's offer to write a lost name back onto the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteBack {
+    Write,
+    Forget,
+    Dismiss,
 }
 
 struct UnlockedSession {
@@ -3174,6 +3185,8 @@ struct App {
     /// The FIDO PIN typed into the naming dialog for an on-key save (masked;
     /// wiped when the dialog closes and after every attempt).
     rename_pin: String,
+    /// Rows whose "write the name back" offer was dismissed this session.
+    write_back_dismissed: std::collections::HashSet<DeviceId>,
     /// Background worker for blocking device I/O. `None` only in tests.
     worker: Option<Worker>,
     /// Number of in-flight background jobs. While >0 the UI shows a spinner and
@@ -9948,6 +9961,11 @@ impl App {
                         if open_here {
                             app.close_rename();
                         }
+                        // The storage view's copy of the array is stale now.
+                        if app.selected_device.as_ref() == Some(&device_id) {
+                            app.security_keys.large_blobs = None;
+                            app.security_keys.lb_autoloaded = false;
+                        }
                         app.refresh_devices();
                     }
                     Err(e) => {
@@ -12745,6 +12763,41 @@ impl App {
     }
 
     /// Device hero strip at the top of a key's pane.
+    /// Act on the hero's offer to write the lost name `name` back onto `dev`.
+    /// Writing opens the naming field on the key with the name filled in
+    /// (and saves at once when the key's FIDO session is unlocked; otherwise
+    /// the field asks for the PIN). Forgetting removes this computer's record
+    /// of the name; "Not now" hides the offer for this session.
+    fn apply_write_back(&mut self, dev: &Device, action: WriteBack, name: &str) {
+        match action {
+            WriteBack::Write => {
+                self.open_rename(dev, Some(name));
+                if !self.rename_needs_pin() {
+                    self.save_device_name();
+                }
+            }
+            WriteBack::Forget => {
+                let saved = keyroost_keyring::Keyring::load_default().and_then(|mut k| {
+                    k.remove(name);
+                    k.save_default()
+                });
+                match saved {
+                    Ok(_) => {
+                        self.log(
+                            Severity::Ok,
+                            format!("forgot the name \"{name}\" on this computer"),
+                        );
+                        self.refresh_devices();
+                    }
+                    Err(e) => self.log(Severity::Err, format!("names not saved: {e}")),
+                }
+            }
+            WriteBack::Dismiss => {
+                self.write_back_dismissed.insert(dev.id.clone());
+            }
+        }
+    }
+
     /// Whether the open naming field asks for a rename on this computer of
     /// a key that carries its name on the key (Save stays disabled).
     fn rename_blocked(&self) -> bool {
@@ -12915,6 +12968,10 @@ impl App {
         let mut do_save = false;
         let mut do_cancel = false;
         let (mut do_confirm, mut do_unconfirm) = (false, false);
+        let mut write_back: Option<WriteBack> = None;
+        let offer = device::write_back_offer(dev, self.write_back_dismissed.contains(&dev.id))
+            .filter(|_| self.rename_target.is_none())
+            .map(str::to_owned);
         ui.horizontal(|ui| {
             glyph_tile(
                 ui,
@@ -12987,6 +13044,31 @@ impl App {
                         .font(theme::f_reg(12.5))
                         .color(p.txt2),
                 );
+                if let Some(n) = &offer {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "This key no longer carries its name \"{n}\"."
+                            ))
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        if theme::button(ui, p, BtnKind::Primary, "Write it back").clicked() {
+                            write_back = Some(WriteBack::Write);
+                        }
+                        if theme::button(ui, p, BtnKind::Ghost, "Forget")
+                            .on_hover_text("Remove this name from this computer.")
+                            .clicked()
+                        {
+                            write_back = Some(WriteBack::Forget);
+                        }
+                        if theme::button(ui, p, BtnKind::Ghost, "Not now").clicked() {
+                            write_back = Some(WriteBack::Dismiss);
+                        }
+                    });
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
@@ -13000,6 +13082,9 @@ impl App {
         });
         self.apply_rename_question(do_confirm, do_unconfirm);
         self.apply_rename_actions(dev, open_rename, do_cancel, do_save);
+        if let (Some(action), Some(n)) = (write_back, offer) {
+            self.apply_write_back(dev, action, &n);
+        }
         ui.add_space(14.0);
         let y = ui.cursor().top();
         ui.painter()
@@ -14712,6 +14797,12 @@ impl App {
             return;
         };
         let pin = session.pin.clone();
+        // Deleting the key's name entry: the hero then offers to write it
+        // back, which needs a fresh scan.
+        let removes_name = matches!(
+            target_entry.classify(),
+            keyroost_ctap::large_blobs::EntryKind::KeyName(_)
+        );
 
         // Capture the *target entry* (not its cached index). The actual removal
         // happens against a fresh read of the live array inside the worker, so an
@@ -14777,6 +14868,9 @@ impl App {
                         app.security_keys.lb_status =
                             Some(format!("Entry deleted. {n} remaining."));
                         app.security_keys.error = None;
+                        if removes_name {
+                            app.refresh_devices();
+                        }
                     }
                     Err(e) => {
                         app.security_keys.lb_status = Some(format!("Update failed: {e}"));
@@ -14788,23 +14882,29 @@ impl App {
 
     /// Wipe the entire large-blob array: serialize an empty array with a fresh
     /// checksum and write it back. This is what a FIDO reset does NOT do, so it
-    /// is the only way to erase plaintext notes that survive a reset. Mirrors
-    /// `delete_large_blob_entry` but clears every entry. Needs a Large-Blob-Write
-    /// token derived from the unlocked session's PIN. Runs on the worker thread.
-    fn clear_large_blob_storage(&mut self) {
+    /// is the only way to erase plaintext notes that survive a reset. With
+    /// `keep_name` and a name on the key, the key's name entry is written back
+    /// exactly as read (`fido blob clear --keep-name`). Refuses, before the PIN
+    /// is used, when the array on the key is no longer the one shown. Needs a
+    /// Large-Blob-Write token derived from the unlocked session's PIN. Runs on
+    /// the worker thread.
+    fn clear_large_blob_storage(&mut self, keep_name: bool) {
         let Some(target) = self.selected_fido_target() else {
             self.security_keys.lb_status = Some("No FIDO key selected.".into());
             return;
         };
-        if self.security_keys.large_blobs.is_none() {
+        let Some(shown) = self.security_keys.large_blobs.clone() else {
             return;
-        }
+        };
         let Some(session) = self.fido_session() else {
             self.security_keys.lb_status =
                 Some("Unlock the key with your PIN first to modify large blobs.".into());
             return;
         };
         let pin = session.pin.clone();
+        // The name goes when it isn't kept: the hero then offers to write it
+        // back, which needs a fresh scan.
+        let removes_name = shown.label().is_some() && !keep_name;
 
         let for_device = self.selected_device.clone();
         self.spawn_job("Clearing large blobs\u{2026}", move || {
@@ -14820,21 +14920,32 @@ impl App {
                     return Err("device is U2F-only".into());
                 }
                 let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
-                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-                    &mut dev,
-                    &pin,
-                    &info,
-                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
-                )
-                .map_err(|e| e.to_string())?;
-
-                // Wipe every element, including any skipped (non-standard) ones.
-                let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
+                // Plan before unlocking, so a certain refusal costs no PIN try:
+                // clear only the array the person was shown.
+                let current =
+                    keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
+                if current.raw_array() != shown.raw_array() {
+                    return Err(
+                        "the key's large-blob storage changed since it was loaded \
+                         \u{2014} nothing was cleared; reload and try again."
+                            .into(),
+                    );
+                }
+                // Wipe every element, including any skipped (non-standard)
+                // ones; keep the name entry exactly as read when asked.
+                let serialized = match current.label().filter(|_| keep_name) {
+                    Some(_) => current
+                        .only_label()
+                        .serialize_with_checksum()
+                        .map_err(|e| e.to_string())?,
+                    None => keyroost_ctap::large_blobs::empty_array_serialized(),
+                };
+                let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
                 // Names read from keys before or during the write are stale.
                 keyroost_resolve::with_key_names_forgotten(|| {
                     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                 })
-                    .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?;
 
                 // Read back so the view reflects the authenticator's actual state.
                 let array =
@@ -14853,9 +14964,14 @@ impl App {
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
                         app.security_keys.lb_selected = None;
-                        app.security_keys.lb_status =
-                            Some(format!("Storage cleared. {n} entries remaining."));
+                        app.security_keys.lb_status = Some(format!(
+                            "Storage cleared. {n} entr{} remaining.",
+                            if n == 1 { "y" } else { "ies" }
+                        ));
                         app.security_keys.error = None;
+                        if removes_name {
+                            app.refresh_devices();
+                        }
                     }
                     Err(e) => {
                         app.security_keys.lb_status = Some(format!("Clear failed: {e}"));
@@ -14927,6 +15043,11 @@ impl App {
                     ui.add_space(8.0);
                     if theme::button(ui, p, BtnKind::Danger, "Clear all storage").clicked() {
                         self.security_keys.lb_confirm_clear = true;
+                        self.security_keys.lb_keep_name = self
+                            .security_keys
+                            .large_blobs
+                            .as_ref()
+                            .is_some_and(device::keep_name_default);
                     }
                 }
             });
@@ -15078,7 +15199,7 @@ impl App {
                     ui.add_space(8.0);
                     let meta = match &classification {
                         EntryKind::Note(_) => "keyroost text note".to_string(),
-                        EntryKind::KeyName(l) => format!("key name: \"{}\"", l.label),
+                        EntryKind::KeyName(l) => device::key_name_row_text(&l.label),
                         EntryKind::SshCert { .. } => format!(
                             "ssh-cert \u{00b7} {} bytes \u{00b7} relying-party data",
                             entry.ciphertext.len(),
@@ -15104,6 +15225,11 @@ impl App {
                         if theme::button(ui, p, BtnKind::Ghost, toggle).clicked() {
                             self.security_keys.lb_selected =
                                 if is_open { None } else { Some(idx) };
+                        }
+                        // The key's name is changed with Rename, never here.
+                        if matches!(classification, EntryKind::KeyName(_)) {
+                            theme::button_disabled(ui, p, "Edit")
+                                .on_hover_text("Change it with Rename");
                         }
                         // Edit only applies to keyroost's own notes.
                         if note_text.is_some()
@@ -15240,7 +15366,7 @@ impl App {
         if skipped > 0 {
             ui.label(
                 egui::RichText::new(format!(
-                    "{skipped} element(s) not in the standard format were skipped (kept unchanged)"
+                    "{skipped} element(s) not in the standard format (kept unchanged)"
                 ))
                 .font(theme::f_reg(11.5))
                 .color(p.txt3),
@@ -15266,14 +15392,25 @@ impl App {
             self.security_keys.lb_confirm_delete = Some(idx);
         }
         if let Some(idx) = self.security_keys.lb_confirm_delete {
+            let is_name = array.entry(idx).is_some_and(|e| {
+                matches!(
+                    e.classify(),
+                    keyroost_ctap::large_blobs::EntryKind::KeyName(_)
+                )
+            });
             ui.add_space(6.0);
             theme::card_frame(p)
                 .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Delete entry {} and rewrite the array? Requires your PIN.",
-                            idx + 1
+                            "Delete entry {} and rewrite the array? Requires your PIN.{}",
+                            idx + 1,
+                            if is_name {
+                                " This removes the key's name."
+                            } else {
+                                ""
+                            }
                         ))
                         .font(theme::f_reg(12.5))
                         .color(p.txt),
@@ -15294,36 +15431,68 @@ impl App {
         // Clearing all storage is irreversible and wipes every note, so the
         // first click only arms this confirm; the user must confirm explicitly.
         if self.security_keys.lb_confirm_clear {
-            let n = array.len() + skipped;
+            let label = array.label().map(|(_, l)| l.label);
+            let names = array
+                .entries()
+                .into_iter()
+                .filter(|e| {
+                    matches!(
+                        e.classify(),
+                        keyroost_ctap::large_blobs::EntryKind::KeyName(_)
+                    )
+                })
+                .count();
+            let keep = self.security_keys.lb_keep_name && label.is_some();
+            let n = array.len() + skipped - if keep { names } else { 0 };
+            let plural = if n == 1 { "y" } else { "ies" };
             ui.add_space(6.0);
             theme::card_frame(p)
                 .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
                 .show(ui, |ui| {
+                    let name_clause = match (&label, keep) {
+                        (Some(_), true) => " The key's name stays.".to_string(),
+                        (Some(l), false) if keyroost_keyring::validate_name(l).is_ok() => {
+                            format!(" This also removes the key's name \"{l}\".")
+                        }
+                        (Some(_), false) => " This also removes the key's name.".to_string(),
+                        (None, _) => String::new(),
+                    };
+                    let every = if keep {
+                        "every other entry"
+                    } else {
+                        "every entry"
+                    };
+                    let what = if keep {
+                        format!("Wipe {n} entr{plural} from this key?")
+                    } else {
+                        format!("Wipe all {n} entr{plural} from this key?")
+                    };
                     ui.label(
                         egui::RichText::new(format!(
-                            "Wipe all {n} entr{} from this key? This erases every entry \u{2014} \
+                            "{what} This erases {every} \u{2014} \
                              including any relying-party data (e.g. SSH certificates, sign-in \
-                             records), not just keyroost notes. Cannot be undone; requires your PIN.",
-                            if n == 1 { "y" } else { "ies" },
+                             records), not just keyroost notes. Cannot be undone; requires your \
+                             PIN.{name_clause}",
                         ))
                         .font(theme::f_reg(12.5))
                         .color(p.txt),
                     );
+                    if label.is_some() {
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut self.security_keys.lb_keep_name, "Keep the key's name");
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if theme::button(
-                            ui,
-                            p,
-                            BtnKind::Danger,
-                            &format!(
-                                "Confirm \u{2014} wipe all {n} entr{}",
-                                if n == 1 { "y" } else { "ies" }
-                            ),
-                        )
-                        .clicked()
-                        {
+                        let confirm = if keep {
+                            format!("Confirm \u{2014} wipe {n} entr{plural}")
+                        } else {
+                            format!("Confirm \u{2014} wipe all {n} entr{plural}")
+                        };
+                        if n == 0 {
+                            theme::button_disabled(ui, p, &confirm);
+                        } else if theme::button(ui, p, BtnKind::Danger, &confirm).clicked() {
                             self.security_keys.lb_confirm_clear = false;
-                            self.clear_large_blob_storage();
+                            self.clear_large_blob_storage(keep);
                         }
                         if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
                             self.security_keys.lb_confirm_clear = false;
@@ -24322,6 +24491,31 @@ mod tests {
         app.rename_input = "Lab".into();
         assert!(app.rename_goes_on_key());
         assert!(app.rename_needs_pin());
+    }
+
+    #[test]
+    fn write_back_offer_opens_the_key_field_or_hides_for_the_session() {
+        let mut app = App::default();
+        let mut d = key_with_storage(None);
+        d.naming.missing_on_key = Some("Desk".into());
+        assert_eq!(device::write_back_offer(&d, false), Some("Desk"));
+        // No unlocked session: the field opens on the key with the name,
+        // asking for the PIN; nothing is written yet.
+        app.apply_write_back(&d, WriteBack::Write, "Desk");
+        let t = app.rename_target.clone().expect("field open");
+        assert_eq!(t.store, device::NameStoreChoice::Key);
+        assert_eq!(app.rename_input, "Desk");
+        assert!(app.rename_goes_on_key());
+        assert!(app.rename_needs_pin());
+        assert!(!t.saving);
+        app.close_rename();
+        // "Not now" hides the offer for this row only.
+        app.apply_write_back(&d, WriteBack::Dismiss, "Desk");
+        assert!(app.write_back_dismissed.contains(&d.id));
+        assert_eq!(
+            device::write_back_offer(&d, app.write_back_dismissed.contains(&d.id)),
+            None
+        );
     }
 
     #[test]

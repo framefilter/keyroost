@@ -185,6 +185,16 @@ pub fn plan_name_save(
     }
 }
 
+/// The name to offer writing back onto `d`: one this computer recorded as
+/// stored on the key, which the key no longer carries. `None` once the
+/// person dismissed the offer, or when the key can't hold a name now.
+pub fn write_back_offer(d: &Device, dismissed: bool) -> Option<&str> {
+    if dismissed || !store_choices(d).contains(&NameStoreChoice::Key) {
+        return None;
+    }
+    d.naming.missing_on_key.as_deref()
+}
+
 /// Every serial `d` may be recorded under: its own, then its FIDO HID
 /// node's when that differs (the serials the naming pass looks names up by).
 pub fn row_serials(d: &Device) -> Vec<String> {
@@ -242,6 +252,22 @@ pub fn set_key_name(
 /// Remove every record of the key with `serials`; returns how many.
 pub fn clear_key_names(keyring: &mut keyroost_keyring::Keyring, serials: &[String]) -> usize {
     serials.iter().map(|s| keyring.clear_key(s).len()).sum()
+}
+
+/// The large-blob row text for the key's name entry. A name that fails the
+/// name rules is never shown.
+pub fn key_name_row_text(label: &str) -> String {
+    if keyroost_keyring::validate_name(label).is_ok() {
+        format!("key name: \"{label}\"")
+    } else {
+        "key name (not shown)".to_string()
+    }
+}
+
+/// Whether "Keep the key's name" starts checked in the clear confirmation:
+/// when the array carries a name.
+pub fn keep_name_default(array: &keyroost_ctap::large_blobs::LargeBlobArray) -> bool {
+    array.label().is_some()
 }
 
 #[cfg(test)]
@@ -409,6 +435,20 @@ mod tests {
     }
 
     #[test]
+    fn write_back_offer_needs_a_missing_name_and_storage() {
+        let mut d = dev(true, true, KeyLabel::Absent);
+        assert_eq!(write_back_offer(&d, false), None);
+        d.naming.missing_on_key = Some("Desk".into());
+        assert_eq!(write_back_offer(&d, false), Some("Desk"));
+        assert_eq!(write_back_offer(&d, true), None, "dismissed");
+        d.naming.on_key = KeyLabel::ReadFailed;
+        assert_eq!(write_back_offer(&d, false), None, "storage not known");
+        let mut card = dev(true, false, KeyLabel::Absent);
+        card.naming.missing_on_key = Some("Desk".into());
+        assert_eq!(write_back_offer(&card, false), None, "no HID path");
+    }
+
+    #[test]
     fn row_serials_include_a_distinct_hid_serial() {
         let mut d = dev(true, true, KeyLabel::Absent);
         assert_eq!(row_serials(&d), vec!["12345678".to_string()]);
@@ -463,5 +503,28 @@ mod tests {
         assert_eq!(k.keys[0].stored, NameStore::Key);
         assert_eq!(clear_key_names(&mut k, &serials), 1);
         assert!(k.keys.is_empty());
+    }
+    #[test]
+    fn key_name_row_text_hides_names_that_fail_the_rules() {
+        assert_eq!(key_name_row_text("Desk"), "key name: \"Desk\"");
+        assert_eq!(key_name_row_text("a\u{202E}b"), "key name (not shown)");
+    }
+
+    #[test]
+    fn keep_name_defaults_on_only_with_a_name() {
+        use keyroost_ctap::device_label::DeviceLabel;
+        use keyroost_ctap::large_blobs::LargeBlobArray;
+        let empty = LargeBlobArray::parse(&[0x80]).unwrap();
+        assert!(!keep_name_default(&empty));
+        let named = empty
+            .with_label(
+                Some(&DeviceLabel {
+                    label: "Desk".into(),
+                    writer: None,
+                }),
+                [0; 12],
+            )
+            .unwrap();
+        assert!(keep_name_default(&named));
     }
 }
