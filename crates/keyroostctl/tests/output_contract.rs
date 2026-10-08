@@ -70,7 +70,7 @@ fn value_parser_errors_name_the_value_once() {
             &["molto", "config", "--slot", "120", "--digits", "6"],
             "120",
         ),
-        (&["otp", "set-button-hotp", "--digits", "7"], "7"),
+        (&["otp", "button", "set", "--digits", "7"], "7"),
         (&["piv", "cert", "generate", "--days", "zz"], "zz"),
         (&["piv", "cert", "generate", "--years", "zz"], "zz"),
         (&["piv", "cert", "generate", "--months", "zz"], "zz"),

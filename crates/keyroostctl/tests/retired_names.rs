@@ -86,28 +86,68 @@ const CASES: &[(&[&str], &str)] = &[
     (&["otp", "config", "S3CRETVALUE"], "keyroostctl otp info"),
     (&["otp", "get", "S3CRETVALUE"], "keyroostctl otp code"),
     (
-        &["otp", "button-hotp", "--seed-env", "S3CRETVALUE"],
-        "keyroostctl otp set-button-hotp",
-    ),
-    (
         &["otp", "erase-all", "S3CRETVALUE"],
         "keyroostctl otp reset",
     ),
     (
+        &["otp", "button-hotp", "--seed-env", "S3CRETVALUE"],
+        "keyroostctl otp button set",
+    ),
+    (
+        &["otp", "set-button-hotp", "--seed-env", "S3CRETVALUE"],
+        "keyroostctl otp button set",
+    ),
+    (
+        &["otp", "delete-button-hotp", "S3CRETVALUE"],
+        "keyroostctl otp button delete",
+    ),
+    (
+        &["otp", "pin-status", "S3CRETVALUE"],
+        "keyroostctl otp pin status",
+    ),
+    (
+        &["otp", "set-pin", "--pin-env", "S3CRETVALUE"],
+        "keyroostctl otp pin set",
+    ),
+    (
+        &["otp", "verify", "--pin-env", "S3CRETVALUE"],
+        "keyroostctl otp pin verify",
+    ),
+    (
+        &["otp", "change-pin", "--current-env", "S3CRETVALUE"],
+        "keyroostctl otp pin change",
+    ),
+    (
         &["otp", "remove-pin", "S3CRETVALUE"],
-        "keyroostctl otp clear-pin",
+        "keyroostctl otp pin clear",
+    ),
+    (
+        &["otp", "clear-pin", "S3CRETVALUE"],
+        "keyroostctl otp pin clear",
     ),
     (
         &["otp", "fp-status", "S3CRETVALUE"],
-        "keyroostctl otp fingerprint-status",
+        "keyroostctl otp fingerprint status",
     ),
     (
         &["otp", "fp-enable", "S3CRETVALUE"],
-        "keyroostctl otp fingerprint-enable",
+        "keyroostctl otp fingerprint enable",
     ),
     (
         &["otp", "fp-disable", "S3CRETVALUE"],
-        "keyroostctl otp fingerprint-disable",
+        "keyroostctl otp fingerprint disable",
+    ),
+    (
+        &["otp", "fingerprint-status", "S3CRETVALUE"],
+        "keyroostctl otp fingerprint status",
+    ),
+    (
+        &["otp", "fingerprint-enable", "S3CRETVALUE"],
+        "keyroostctl otp fingerprint enable",
+    ),
+    (
+        &["otp", "fingerprint-disable", "S3CRETVALUE"],
+        "keyroostctl otp fingerprint disable",
     ),
     (
         &["otp", "fp-list", "S3CRETVALUE"],
@@ -122,13 +162,56 @@ const CASES: &[(&[&str], &str)] = &[
         "--unlock pin",
     ),
     (
-        &["otp", "set-pin", "--pin-env", "S3CRETVALUE"],
+        &["otp", "pin", "set", "--pin-env", "S3CRETVALUE"],
         "--new-pin env:VAR",
     ),
-    (&["otp", "set-pin", "--pin-stdin"], "--new-pin stdin"),
+    (&["otp", "pin", "set", "--pin-stdin"], "--new-pin stdin"),
+    (
+        &["otp", "pin", "change", "--pin-stdin"],
+        "--pin stdin --new-pin stdin",
+    ),
+    (
+        &["otp", "pin", "change", "--current-env", "S3CRETVALUE"],
+        "--pin env:VAR",
+    ),
+    (
+        &["otp", "pin", "change", "--new-env", "S3CRETVALUE"],
+        "--new-pin env:VAR",
+    ),
     (
         &["otp", "list", "--pin-only", "S3CRETVALUE"],
         "--unlock pin",
+    ),
+    (
+        &["oath", "set-password", "--new-password-env", "S3CRETVALUE"],
+        "keyroostctl oath password set",
+    ),
+    (
+        &["oath", "clear-password", "S3CRETVALUE"],
+        "keyroostctl oath password clear",
+    ),
+    (
+        &["molto", "sync-time", "-p", "99", "S3CRETVALUE"],
+        "keyroostctl molto sync",
+    ),
+    (
+        &["molto", "import-file", "S3CRETVALUE"],
+        "keyroostctl molto import --file",
+    ),
+    (
+        &["molto", "import-file", "S3CRETVALUE"],
+        "`--start` is `--slot`",
+    ),
+    (
+        &[
+            "molto",
+            "import",
+            "--file",
+            "v.json",
+            "--start",
+            "S3CRETVALUE",
+        ],
+        "--slot",
     ),
     (
         &["molto", "seed", "-p", "99", "--hex-env", "S3CRETVALUE"],
@@ -143,7 +226,7 @@ const CASES: &[(&[&str], &str)] = &[
         "--period",
     ),
     (&["prog", "config", "--time-step", "60"], "--period"),
-    (&["molto", "sync-time", "-p", "99", "S3CRETVALUE"], "--slot"),
+    (&["molto", "sync", "-p", "99", "S3CRETVALUE"], "--slot"),
     (&["molto", "delete", "-p", "99", "S3CRETVALUE"], "--slot"),
     (&["molto", "import", "-p", "99", "S3CRETVALUE"], "--slot"),
     (

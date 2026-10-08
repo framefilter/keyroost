@@ -315,7 +315,7 @@ pub(crate) struct OtpEntryJson {
     pub touch_required: bool,
 }
 
-/// `keyroostctl otp --json pin-status` — the R3.4 OTP-PIN state.
+/// `keyroostctl otp --json pin status` — the R3.4 OTP-PIN state.
 ///
 /// `supported: false` means the key never answered the flag read, so the
 /// three PIN fields are `null`: the feature is not there to report on.

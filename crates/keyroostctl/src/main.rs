@@ -1907,7 +1907,7 @@ struct OathAccess {
     /// reads one line (hidden when typed at a terminal). With neither, a
     /// terminal asks when the applet has a password. Needed for
     /// password-protected applets (e.g. a YubiKey
-    /// with an OATH password set). `set-password` reads it on the first line,
+    /// with an OATH password set). `oath password set` reads it on the first line,
     /// before the new password; `add` reads it after the seed (second line when
     /// --seed stdin is also given).
     #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
@@ -1985,26 +1985,10 @@ enum OathCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Set (or replace) the applet password — never from argv.
-    ///
-    /// The current password, if one is set, is read first (env, stdin line 1,
-    /// or the prompt), then the new one. To remove the password, use `oath
-    /// clear-password`.
-    SetPassword {
-        /// The new password: env:NAME reads that environment variable, stdin
-        /// reads one line (second line when --password stdin is also given;
-        /// hidden when typed at a terminal). With neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        new_password: Option<SecretSource>,
-        #[command(flatten)]
-        access: OathAccess,
-    },
-    /// Remove the applet password. The current password comes from
-    /// `--password env:NAME` / `--password stdin` or, with neither, a hidden
-    /// prompt.
-    ClearPassword {
-        #[command(flatten)]
-        access: OathAccess,
+    /// Set or clear the OATH applet's access password.
+    Password {
+        #[command(subcommand)]
+        cmd: OathPasswordCmd,
     },
     /// Factory-reset the OATH applet: wipe ALL authenticator credentials and
     /// clear the access password. Irreversible: asks first (`--yes` to skip).
@@ -2016,6 +2000,32 @@ enum OathCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// `oath password`: the applet's access password.
+#[derive(Subcommand)]
+enum OathPasswordCmd {
+    /// Set (or replace) the applet password — never from argv.
+    ///
+    /// The current password, if one is set, is read first (env, stdin line 1,
+    /// or the prompt), then the new one. To remove the password, use `oath
+    /// password clear`.
+    Set {
+        /// The new password: env:NAME reads that environment variable, stdin
+        /// reads one line (second line when --password stdin is also given;
+        /// hidden when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_password: Option<SecretSource>,
+        #[command(flatten)]
+        access: OathAccess,
+    },
+    /// Remove the applet password. The current password comes from
+    /// `--password env:NAME` / `--password stdin` or, with neither, a hidden
+    /// prompt.
+    Clear {
+        #[command(flatten)]
+        access: OathAccess,
     },
 }
 
@@ -2176,7 +2186,7 @@ enum MoltoCmd {
         display_timeout: TimeoutArg,
     },
     /// Push the host's current UTC time to one slot (or all slots).
-    SyncTime {
+    Sync {
         /// Slot number, 0-99 (Token2 calls these profiles). Omit with `--all`.
         #[arg(long, value_name = "SLOT", conflicts_with = "all", value_parser = parse_molto_slot)]
         slot: Option<u8>,
@@ -2203,62 +2213,50 @@ enum MoltoCmd {
         #[arg(long, value_enum, default_value_t = KeyEncoding::Hex)]
         encoding: KeyEncoding,
     },
-    /// Import an otpauth:// URI to a slot: writes seed, title, and config in
-    /// one go, replacing what the slot held. Irreversible: asks first (`--yes`
-    /// to skip).
+    /// Import an otpauth:// URI to a slot, or every entry of an export file
+    /// to consecutive slots: writes seed, title, and config, replacing what
+    /// the slots held. Irreversible: asks first (`--yes` to skip).
     ///
-    /// Asks only when the slot is occupied. The URI comes from --uri
+    /// Asks only when a target slot is occupied. The URI comes from --uri
     /// env:NAME, --uri stdin or a QR screenshot (--qr IMAGE), never the
-    /// command line; with none of them, a terminal asks for it (hidden).
+    /// command line; with none of them and no --file, a terminal asks for it
+    /// (hidden). For an encrypted Aegis vault given with --file, the password
+    /// comes from --password env:NAME or --password stdin; with neither, a
+    /// terminal asks for it (hidden).
+    #[command(group(clap::ArgGroup::new("import_source").args(["uri", "qr", "file"]).multiple(false)))]
     Import {
-        /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
-        slot: u8,
-        /// Override the slot title (default: derived from URI issuer/account).
-        #[arg(long, value_parser = parse_molto_title)]
+        /// Slot number, 0-99 (Token2 calls these profiles). With --file, the
+        /// first slot to fill (default 0); entries fill consecutive slots.
+        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot, required_unless_present = "file")]
+        slot: Option<u8>,
+        /// Override the slot title (default: derived from the URI issuer/account).
+        #[arg(long, value_parser = parse_molto_title, conflicts_with = "file")]
         title: Option<String>,
         /// Display timeout in seconds (otpauth:// has no equivalent field).
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
-        /// Decode the otpauth:// URI from a QR code in a PNG/JPEG screenshot
-        /// instead of passing it as text. For Google Authenticator export
-        /// QRs (multiple accounts), use `import-file` with the image path.
-        #[arg(long, value_name = "IMAGE", conflicts_with = "uri")]
-        qr: Option<std::path::PathBuf>,
-        /// The otpauth:// URI: env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --customer-key stdin is
-        /// also given; hidden when typed at a terminal). With none of these
-        /// and no --qr, a terminal asks.
+        /// The otpauth:// URI: env:NAME reads that environment variable, stdin
+        /// reads one line (second line when --customer-key stdin is also given;
+        /// hidden when typed at a terminal). With none of --uri, --qr and
+        /// --file, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         uri: Option<SecretSource>,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Bulk-import a plaintext or encrypted export from Aegis, 2FAS, or a list
-    /// of otpauth:// URIs, replacing what the target slots held. Irreversible:
-    /// asks first (`--yes` to skip).
-    ///
-    /// Asks only when a target slot is occupied. For encrypted Aegis vaults, pass the password via
-    /// `--password stdin` (suitable for piping from a file or password manager)
-    /// or `--password env:NAME`; with neither, a terminal asks for it (hidden).
-    ImportFile {
-        /// Path to the export file. Format is auto-detected.
-        path: std::path::PathBuf,
-        /// Starting slot. Entries fill consecutive slots from here.
-        #[arg(long, default_value_t = 0, value_parser = parse_molto_slot)]
-        start: u8,
-        /// Display timeout to use for every imported entry.
-        #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
-        display_timeout: TimeoutArg,
+        /// Decode the otpauth:// URI from a QR code in a PNG/JPEG screenshot.
+        /// For a Google Authenticator export QR (several accounts), use --file.
+        #[arg(long, value_name = "IMAGE")]
+        qr: Option<std::path::PathBuf>,
+        /// Import every entry of an export file instead: Aegis (plain or
+        /// encrypted), 2FAS, a list of otpauth:// URIs, or a Google
+        /// Authenticator export QR image. The format is detected.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
         /// Print what would be written, but don't touch the device.
-        #[arg(long)]
+        #[arg(long, requires = "file")]
         dry_run: bool,
-        /// The vault password: env:NAME reads that environment variable, stdin
-        /// reads one line (second line when --customer-key stdin is also
-        /// given; hidden when typed at a terminal). With neither, a terminal
-        /// asks when the file is an encrypted vault.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        /// The password of an encrypted Aegis vault: env:NAME or stdin (second
+        /// line when --customer-key stdin is also given; hidden when typed at a
+        /// terminal). With neither, a terminal asks when the vault needs one.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, requires = "file")]
         password: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
@@ -2873,45 +2871,10 @@ enum OtpCmd {
     },
     /// Read the device serial number (over USB, or NFC where the model allows).
     Serial,
-    /// Configure the single HOTP-on-button keystroke slot, replacing any seed
-    /// already there. Irreversible: asks first (`--yes` to skip).
-    ///
-    /// The key types this code when touched outside a session. Asks only when
-    /// the slot may already be configured. The seed comes from an
-    /// environment variable, stdin or, with neither, a hidden prompt — never
-    /// argv; --encoding says how it is written (base32 unless --encoding
-    /// hex).
-    SetButtonHotp {
-        /// Code length — must be 6 or 8.
-        #[arg(long, default_value_t = 6, value_parser = parse_button_digits)]
-        digits: u8,
-        /// Suppress the trailing Enter keystroke after typing the code.
-        #[arg(long)]
-        no_enter: bool,
-        /// Require a 2-second long touch (else a short tap triggers it).
-        #[arg(long)]
-        long_touch: bool,
-        /// Type the digits using the numeric-keypad scancodes.
-        #[arg(long)]
-        numpad: bool,
-        /// The seed: env:NAME reads that environment variable, stdin reads
-        /// one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        seed: Option<SecretSource>,
-        /// How --seed is written.
-        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
-        encoding: SeedEncoding,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Delete the HOTP-on-button keystroke slot. Irreversible: asks first
-    /// (`--yes` to skip).
-    DeleteButtonHotp {
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
+    /// Set or delete the HOTP code the key types when its button is pressed.
+    Button {
+        #[command(subcommand)]
+        cmd: OtpButtonCmd,
     },
     /// Read and print the device configuration (interface states, capabilities).
     ///
@@ -2939,8 +2902,21 @@ enum OtpCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Report OTP-PIN status (R3.4+ keys): whether a PIN is set and retries left.
-    PinStatus,
+    /// Set, change, clear, check or verify the OTP PIN.
+    Pin {
+        #[command(subcommand)]
+        cmd: OtpPinCmd,
+    },
+    /// Check, enable or disable fingerprint unlock for the OTP entries.
+    Fingerprint {
+        #[command(subcommand)]
+        cmd: OtpFingerprintCmd,
+    },
+}
+
+/// `otp pin`: the OTP PIN (R3.4+ keys).
+#[derive(Subcommand)]
+enum OtpPinCmd {
     /// Set an OTP PIN on a currently-unprotected key.
     ///
     /// After this, reading codes needs the PIN (`otp list` asks for it, or
@@ -2951,26 +2927,16 @@ enum OtpCmd {
     /// There is no PIN reset: wrong attempts count down a retry counter, and a
     /// blocked PIN is recoverable only by erasing every OTP entry on the key
     /// (`otp reset`). Keep a record of the PIN somewhere you trust.
-    SetPin {
+    Set {
         /// The new OTP PIN: env:NAME reads that environment variable, stdin
         /// reads one line (hidden when typed at a terminal). With neither, a
         /// terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         new_pin: Option<SecretSource>,
     },
-    /// Verify the OTP PIN, opening the read window for this connection (mostly
-    /// for testing; `otp list` takes `--pin` directly). The PIN comes from
-    /// --pin env:NAME or stdin or, with neither, a hidden prompt.
-    Verify {
-        /// The OTP PIN: env:NAME reads that environment variable, stdin reads
-        /// one line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-    },
     /// Change the OTP PIN: current first, then new (stdin lines 1 and 2, env
     /// vars, or the prompt).
-    ChangePin {
+    Change {
         /// The current OTP PIN: env:NAME reads that environment variable, stdin
         /// reads one line (first line; hidden when typed at a terminal). With
         /// neither, a terminal asks.
@@ -2984,19 +2950,36 @@ enum OtpCmd {
     },
     /// Remove the OTP PIN. Needs the current OTP PIN: via env, stdin or, with
     /// neither, a hidden prompt.
-    ClearPin {
+    Clear {
         /// The OTP PIN: env:NAME reads that environment variable, stdin reads
         /// one line (hidden when typed at a terminal). With neither, a terminal
         /// asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
     },
+    /// Report OTP-PIN status (R3.4+ keys): whether a PIN is set and retries left.
+    Status,
+    /// Verify the OTP PIN, opening the read window for this connection (mostly
+    /// for testing; `otp list` takes `--pin` directly). The PIN comes from
+    /// --pin env:NAME or stdin or, with neither, a hidden prompt.
+    Verify {
+        /// The OTP PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+    },
+}
+
+/// `otp fingerprint`: fingerprint unlock for the OTP entries.
+#[derive(Subcommand)]
+enum OtpFingerprintCmd {
     /// Report whether the key supports fingerprint-protected OTP and whether
     /// it is on.
-    FingerprintStatus,
+    Status,
     /// Enable fingerprint protection for OTP. Needs the current OTP PIN. After
     /// this, codes can be unlocked by a fingerprint touch as well as the PIN.
-    FingerprintEnable {
+    Enable {
         /// The OTP PIN: env:NAME reads that environment variable, stdin reads
         /// one line (hidden when typed at a terminal). With neither, a terminal
         /// asks.
@@ -3004,12 +2987,57 @@ enum OtpCmd {
         pin: Option<SecretSource>,
     },
     /// Disable fingerprint protection for OTP. Needs the current OTP PIN.
-    FingerprintDisable {
+    Disable {
         /// The OTP PIN: env:NAME reads that environment variable, stdin reads
         /// one line (hidden when typed at a terminal). With neither, a terminal
         /// asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
+    },
+}
+
+/// `otp button`: the HOTP code typed on a button press.
+#[derive(Subcommand)]
+enum OtpButtonCmd {
+    /// Configure the single HOTP-on-button keystroke slot, replacing any seed
+    /// already there. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// The key types this code when touched outside a session. Asks only when
+    /// the slot may already be configured. The seed comes from an
+    /// environment variable, stdin or, with neither, a hidden prompt — never
+    /// argv; --encoding says how it is written (base32 unless --encoding
+    /// hex).
+    Set {
+        /// Code length — must be 6 or 8.
+        #[arg(long, default_value_t = 6, value_parser = parse_button_digits)]
+        digits: u8,
+        /// Suppress the trailing Enter keystroke after typing the code.
+        #[arg(long)]
+        no_enter: bool,
+        /// Require a 2-second long touch (else a short tap triggers it).
+        #[arg(long)]
+        long_touch: bool,
+        /// Type the digits using the numeric-keypad scancodes.
+        #[arg(long)]
+        numpad: bool,
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete the HOTP-on-button keystroke slot. Irreversible: asks first
+    /// (`--yes` to skip).
+    Delete {
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -3212,7 +3240,7 @@ const fn customer_key_spec(e: KeyEncoding, new: bool) -> &'static Spec {
 
 const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
     .prompt_as("otpauth:// URI")
-    .hint("--uri env:NAME, --uri stdin or --qr IMAGE");
+    .hint("--uri env:NAME, --uri stdin, --qr IMAGE or --file PATH");
 const VAULT_PASSWORD: Spec = Spec::current("vault password", "password");
 
 /// Decode a seed; the error names the flag and the encoding, never the input.
@@ -3285,7 +3313,7 @@ fn parse_molto_title(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-/// Clap value parser for `set-button-hotp --digits`: 6 or 8.
+/// Clap value parser for `otp button set --digits`: 6 or 8.
 fn parse_button_digits(s: &str) -> Result<u8, String> {
     match s.parse::<u8>() {
         Ok(n @ (6 | 8)) => Ok(n),
@@ -3336,9 +3364,12 @@ fn molto_validate<I: crate::secrets::SecretIo>(
             customer_key_spec(*encoding, true),
             Source::from_flag(new_customer_key.as_ref()),
         )?,
-        MoltoCmd::Import { uri, qr: None, .. } => {
-            sec.check(&IMPORT_URI, Source::from_flag(uri.as_ref()))?
-        }
+        MoltoCmd::Import {
+            uri,
+            qr: None,
+            file: None,
+            ..
+        } => sec.check(&IMPORT_URI, Source::from_flag(uri.as_ref()))?,
         _ => {}
     }
     Ok(())
@@ -3369,7 +3400,13 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
             )?;
             MoltoInput::NewKey(decode_customer_key(&text, *encoding, "--new-customer-key")?)
         }
-        MoltoCmd::Import { title, qr, uri, .. } => {
+        MoltoCmd::Import {
+            title,
+            qr,
+            uri,
+            file: None,
+            ..
+        } => {
             let entry = match qr {
                 Some(image_path) => molto_entry_from_qr(image_path)?,
                 None => {
@@ -3406,12 +3443,12 @@ fn molto_early_key<I: crate::secrets::SecretIo>(
     cmd: &MoltoCmd,
 ) -> Result<Option<CustomerKey>, String> {
     match cmd {
-        MoltoCmd::ImportFile { .. } => customer_key(sec, key).map(Some),
+        MoltoCmd::Import { file: Some(_), .. } => customer_key(sec, key).map(Some),
         _ => Ok(None),
     }
 }
 
-/// `molto import-file --dry-run` never uses the customer key. It reads and
+/// `molto import --file --dry-run` never uses the customer key. It reads and
 /// drops it only when both it and the password are piped on stdin, so the
 /// password stays on line 2 as in a real import; at a terminal each is its
 /// own prompt, so the key is not asked for.
@@ -3447,10 +3484,7 @@ fn molto_key_and_input<I: crate::secrets::SecretIo>(
     // source). Programming real seeds under it means anyone holding a USB
     // capture can decrypt them — nudge, don't block.
     if key.as_slice() == DEFAULT_CUSTOMER_KEY
-        && matches!(
-            cmd,
-            MoltoCmd::Seed { .. } | MoltoCmd::Import { .. } | MoltoCmd::ImportFile { .. }
-        )
+        && matches!(cmd, MoltoCmd::Seed { .. } | MoltoCmd::Import { .. })
     {
         output::warn(
             "using the factory-default customer key — seeds sent to the \
@@ -3485,7 +3519,7 @@ fn molto_entry_from_qr(
         0 => Err("QR decoded, but no account could be imported (see skips above)".into()),
         1 => Ok(import.entries.into_iter().next().unwrap()),
         n => Err(format!(
-            "QR contains {} accounts — use `import-file {}` to program them \
+            "QR contains {} accounts — use `molto import --file {}` to program them \
              into consecutive slots",
             n,
             image_path.display()
@@ -3521,7 +3555,7 @@ fn unix_now() -> u32 {
         Ok(d) => d.as_secs() as u32,
         Err(_) => {
             // A pre-1970 clock would otherwise silently program time 0 into
-            // the device (configure / sync-time / key registration).
+            // the device (configure / sync / key registration).
             output::warn("system clock reads before 1970; using time 0");
             0
         }
@@ -3777,9 +3811,9 @@ fn inert_device_flag(cmd: Option<&Cmd>) -> Option<&'static str> {
             cmd: NameCmd::Delete { .. },
         } => Some("name delete"),
         Cmd::Molto {
-            cmd: MoltoCmd::ImportFile { dry_run: true, .. },
+            cmd: MoltoCmd::Import { dry_run: true, .. },
             ..
-        } => Some("molto import-file --dry-run"),
+        } => Some("molto import --dry-run"),
         _ => None,
     }
 }
@@ -4012,19 +4046,19 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
     },
     RetiredFlag {
         flag: "--pin-stdin",
-        words: &["otp", "change-pin"],
+        words: &["otp", "pin", "change"],
         msg: "--pin-stdin is now --pin stdin --new-pin stdin: the current PIN on the first line, the new one on the second",
         now: &["--pin", "--new-pin"],
     },
     RetiredFlag {
         flag: "--pin-env",
-        words: &["otp", "set-pin"],
+        words: &["otp", "pin", "set"],
         msg: "--pin-env VAR is now --new-pin env:VAR (the PIN being set)",
         now: &["--new-pin"],
     },
     RetiredFlag {
         flag: "--pin-stdin",
-        words: &["otp", "set-pin"],
+        words: &["otp", "pin", "set"],
         msg: "--pin-stdin is now --new-pin stdin (the PIN being set)",
         now: &["--new-pin"],
     },
@@ -4033,6 +4067,12 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
         words: &["otp", "list"],
         msg: "--pin-only was replaced by --unlock pin, the default",
         now: &["--unlock"],
+    },
+    RetiredFlag {
+        flag: "--start",
+        words: &["molto", "import"],
+        msg: "--start is now -s/--slot (with --file, the first slot to fill)",
+        now: &["--slot"],
     },
     RetiredFlag {
         flag: "--which",
@@ -4608,9 +4648,15 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         note: "",
     },
     RetiredCommand {
-        parent: "otp",
-        old: "config",
-        new: "otp info",
+        parent: "oath",
+        old: "set-password",
+        new: "oath password set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "oath",
+        old: "clear-password",
+        new: "oath password clear",
         note: "",
     },
     RetiredCommand {
@@ -4621,8 +4667,8 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
     },
     RetiredCommand {
         parent: "otp",
-        old: "button-hotp",
-        new: "otp set-button-hotp",
+        old: "config",
+        new: "otp info",
         note: "",
     },
     RetiredCommand {
@@ -4633,26 +4679,92 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
     },
     RetiredCommand {
         parent: "otp",
+        old: "button-hotp",
+        new: "otp button set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "set-button-hotp",
+        new: "otp button set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "delete-button-hotp",
+        new: "otp button delete",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "pin-status",
+        new: "otp pin status",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "set-pin",
+        new: "otp pin set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "verify",
+        new: "otp pin verify",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "change-pin",
+        new: "otp pin change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
         old: "remove-pin",
-        new: "otp clear-pin",
+        new: "otp pin clear",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "clear-pin",
+        new: "otp pin clear",
         note: "",
     },
     RetiredCommand {
         parent: "otp",
         old: "fp-status",
-        new: "otp fingerprint-status",
+        new: "otp fingerprint status",
         note: "",
     },
     RetiredCommand {
         parent: "otp",
         old: "fp-enable",
-        new: "otp fingerprint-enable",
+        new: "otp fingerprint enable",
         note: "",
     },
     RetiredCommand {
         parent: "otp",
         old: "fp-disable",
-        new: "otp fingerprint-disable",
+        new: "otp fingerprint disable",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "fingerprint-status",
+        new: "otp fingerprint status",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "fingerprint-enable",
+        new: "otp fingerprint enable",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "otp",
+        old: "fingerprint-disable",
+        new: "otp fingerprint disable",
         note: "",
     },
     RetiredCommand {
@@ -4665,7 +4777,19 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         parent: "otp",
         old: "unlock-list",
         new: "otp list --unlock auto",
-        note: "`--pin-only` is `--unlock pin`",
+        note: "`--pin-only` is `--unlock pin`, the default",
+    },
+    RetiredCommand {
+        parent: "molto",
+        old: "sync-time",
+        new: "molto sync",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "molto",
+        old: "import-file",
+        new: "molto import --file",
+        note: "the path is the value of `--file`; `--start` is `--slot`",
     },
 ];
 
@@ -5167,15 +5291,15 @@ fn run_molto(
     molto_validate(cmd, key, &sec)?;
 
     // --dry-run on bulk import doesn't need the device at all.
-    if let MoltoCmd::ImportFile {
-        path,
-        start,
-        display_timeout: _,
+    if let MoltoCmd::Import {
+        file: Some(path),
+        slot,
         dry_run: true,
         password,
-        yes: _,
+        ..
     } = cmd
     {
+        let start = &slot.unwrap_or(0);
         molto_dry_run_key(&mut sec, key, password.as_ref())?;
         let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
         let last = (*start as usize).saturating_add(entries.len());
@@ -5409,15 +5533,16 @@ fn run_molto(
     // be mistaken for the answer (there is no question then; an occupied
     // slot needs --yes).
     let bulk = match cmd {
-        MoltoCmd::ImportFile {
-            path,
-            start,
+        MoltoCmd::Import {
+            file: Some(path),
+            slot,
             password,
             ..
         } => {
+            let start = slot.unwrap_or(0);
             let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
             let n = entries.len();
-            let last = (*start as usize).saturating_add(n);
+            let last = (start as usize).saturating_add(n);
             if last > 100 {
                 return Err(format!(
                     "{} entries starting at #{} would exceed slot 99 (last slot needed: #{})",
@@ -5433,12 +5558,26 @@ fn run_molto(
     };
     // The seed slots this command writes, and whether it may skip asking.
     let writes: Option<(Vec<u8>, bool)> = match cmd {
-        MoltoCmd::Seed { slot, yes, .. } | MoltoCmd::Import { slot, yes, .. } => {
+        MoltoCmd::Seed { slot, yes, .. } => Some((vec![*slot], *yes)),
+        MoltoCmd::Import {
+            file: None,
+            slot,
+            yes,
+            ..
+        } => {
+            let Some(slot) = slot else {
+                unreachable!("clap requires --slot without --file")
+            };
             Some((vec![*slot], *yes))
         }
-        MoltoCmd::ImportFile { start, yes, .. } => {
+        MoltoCmd::Import {
+            file: Some(_),
+            slot,
+            yes,
+            ..
+        } => {
             let entries = bulk.as_deref().unwrap_or_default();
-            Some((bulk_import_slots(*start, entries), *yes))
+            Some((bulk_import_slots(slot.unwrap_or(0), entries), *yes))
         }
         _ => None,
     };
@@ -5517,7 +5656,7 @@ fn run_molto(
             session.set_config(*slot, &cfg)?;
             println!("Slot #{} configured.", slot);
         }
-        MoltoCmd::SyncTime { slot, all } => {
+        MoltoCmd::Sync { slot, all } => {
             if *all {
                 for p in 0..=99u8 {
                     match session.sync_time(p, unix_now()) {
@@ -5529,7 +5668,7 @@ fn run_molto(
                 session.sync_time(*p, unix_now())?;
                 println!("Time synced on slot #{}.", p);
             } else {
-                return Err("sync-time requires --slot <N> or --all".into());
+                return Err("sync requires --slot <N> or --all".into());
             }
         }
         MoltoCmd::CustomerKey { .. } => {
@@ -5542,11 +5681,15 @@ fn run_molto(
             );
         }
         MoltoCmd::Import {
+            file: None,
             slot,
             display_timeout,
             qr,
             ..
         } => {
+            let Some(slot) = slot else {
+                unreachable!("clap requires --slot without --file")
+            };
             let MoltoInput::Entry {
                 entry,
                 title: final_title,
@@ -5575,12 +5718,14 @@ fn run_molto(
                 );
             }
         }
-        MoltoCmd::ImportFile {
-            start,
+        MoltoCmd::Import {
+            file: Some(_),
+            slot,
             display_timeout,
             dry_run,
             ..
         } => {
+            let start = &slot.unwrap_or(0);
             // dry-run prints the plan and returns *before* authentication
             // (see the pre-auth handling above) — it is always false here.
             debug_assert!(!*dry_run);
@@ -6110,7 +6255,7 @@ fn open_oath_from(
 /// the new password still to read.
 type OathCurrentThen<'a> = (String, Option<zeroize::Zeroizing<String>>, SecondSecret<'a>);
 
-/// `oath set-password`'s current password (the first secret of its pair),
+/// `oath password set`'s current password (the first secret of its pair),
 /// then the new one's [`SecondSecret`] to read next.
 fn oath_current_then<'a>(
     sec: &mut Secrets,
@@ -7412,13 +7557,15 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             session.delete(name)?;
             println!("Deleted OATH credential {:?}.", name);
         }
-        OathCmd::SetPassword { access, .. } => {
+        OathCmd::Password {
+            cmd: OathPasswordCmd::Set { access, .. },
+        } => {
             let mut sec = Secrets::real();
             let pair = pair_of(oath_secret_pair(cmd))?;
             pair.second.check(&sec)?;
             // The current password first (stdin line 1, when the applet has
             // one), then the new one. The helper refuses an empty new
-            // password; `clear-password` removes it.
+            // password; `oath password clear` removes it.
             let (name, current, new_pw) = oath_current_then(&mut sec, access, pair, debug)?;
             let new_pw = new_pw.read(&mut sec)?.text()?;
             reverify_if_prompted(&sec, Need::Oath, access.reader.as_deref())?;
@@ -7427,7 +7574,9 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             session.set_password(&new_pw)?;
             println!("OATH password set.");
         }
-        OathCmd::ClearPassword { access } => {
+        OathCmd::Password {
+            cmd: OathPasswordCmd::Clear { access },
+        } => {
             let mut session = open_oath(&mut Secrets::real(), access, debug)?;
             session.clear_password()?;
             println!("OATH password cleared.");
@@ -7583,7 +7732,7 @@ fn open_otp(
 enum OtpFeature {
     /// The on-device OTP store (`otp list` / `code` / `add` / `delete` / `reset`).
     OnDevice,
-    /// The single HOTP-on-touch keystroke slot (`otp set-button-hotp`).
+    /// The single HOTP-on-touch keystroke slot (`otp button set`).
     ButtonHotp,
 }
 
@@ -7959,14 +8108,17 @@ fn run_otp(
             }
             println!("{hex}");
         }
-        OtpCmd::SetButtonHotp {
-            digits,
-            no_enter,
-            long_touch,
-            numpad,
-            seed,
-            encoding,
-            yes,
+        OtpCmd::Button {
+            cmd:
+                OtpButtonCmd::Set {
+                    digits,
+                    no_enter,
+                    long_touch,
+                    numpad,
+                    seed,
+                    encoding,
+                    yes,
+                },
         } => {
             let mut sec = Secrets::real();
             let seed_src = Source::from_flag(seed.as_ref());
@@ -7986,7 +8138,9 @@ fn run_otp(
             session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
             println!("Configured the HOTP-on-button keystroke slot.");
         }
-        OtpCmd::DeleteButtonHotp { yes } => {
+        OtpCmd::Button {
+            cmd: OtpButtonCmd::Delete { yes },
+        } => {
             let dev = select_otp(&sel)?;
             otp_precheck(&dev, sel.transport, debug, OtpFeature::ButtonHotp)?;
             crate::prompt::confirm_on(&dev, *yes, "delete the HOTP-on-button seed")?;
@@ -8125,7 +8279,9 @@ fn run_otp(
             session.set_device_type(disable)?;
             println!("Interface configuration updated. Re-plug the key for it to take effect.");
         }
-        OtpCmd::PinStatus => {
+        OtpCmd::Pin {
+            cmd: OtpPinCmd::Status,
+        } => {
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             // `None` = the key never answered the flag read, i.e. it has no
@@ -8151,21 +8307,27 @@ fn run_otp(
                 ),
             }
         }
-        OtpCmd::SetPin { new_pin } => {
+        OtpCmd::Pin {
+            cmd: OtpPinCmd::Set { new_pin },
+        } => {
             let pin = otp_required_secret(&sel, &OTP_NEW_PIN, new_pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_pin(pin.as_str())?;
             println!("OTP PIN set. Codes now require the PIN to read.");
         }
-        OtpCmd::Verify { pin } => {
+        OtpCmd::Pin {
+            cmd: OtpPinCmd::Verify { pin },
+        } => {
             let pin = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.verify_pin(pin.as_str())?;
             println!("OTP PIN verified; read window open for this connection.");
         }
-        OtpCmd::ChangePin { .. } => {
+        OtpCmd::Pin {
+            cmd: OtpPinCmd::Change { .. },
+        } => {
             let mut sec = Secrets::real();
             let pair = pair_of(otp_secret_pair(cmd))?;
             pair.check(&sec)?;
@@ -8177,14 +8339,18 @@ fn run_otp(
             session.change_pin(current.as_str(), new.as_str())?;
             println!("OTP PIN changed.");
         }
-        OtpCmd::ClearPin { pin } => {
+        OtpCmd::Pin {
+            cmd: OtpPinCmd::Clear { pin },
+        } => {
             let current = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.remove_pin(current.as_str())?;
             println!("OTP PIN removed. Codes are readable without a PIN again.");
         }
-        OtpCmd::FingerprintStatus => {
+        OtpCmd::Fingerprint {
+            cmd: OtpFingerprintCmd::Status,
+        } => {
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             match session.fp_supported()? {
@@ -8193,14 +8359,18 @@ fn run_otp(
                 None => println!("Fingerprint-protected OTP: not available on this firmware"),
             }
         }
-        OtpCmd::FingerprintEnable { pin } => {
+        OtpCmd::Fingerprint {
+            cmd: OtpFingerprintCmd::Enable { pin },
+        } => {
             let pin = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), true)?;
             println!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
         }
-        OtpCmd::FingerprintDisable { pin } => {
+        OtpCmd::Fingerprint {
+            cmd: OtpFingerprintCmd::Disable { pin },
+        } => {
             let pin = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
@@ -10753,9 +10923,9 @@ fn pgp_secret_pair(cmd: &OpenpgpCmd) -> Option<SecretPair<'_>> {
 
 fn otp_secret_pair(cmd: &OtpCmd) -> Option<SecretPair<'_>> {
     Some(match cmd {
-        OtpCmd::ChangePin { pin, new_pin } => {
-            secret_pair((&OTP_OLD_PIN, pin), (&OTP_NEW_PIN, new_pin))
-        }
+        OtpCmd::Pin {
+            cmd: OtpPinCmd::Change { pin, new_pin },
+        } => secret_pair((&OTP_OLD_PIN, pin), (&OTP_NEW_PIN, new_pin)),
         OtpCmd::Add {
             seed,
             pin,
@@ -10777,9 +10947,12 @@ fn oath_secret_pair(cmd: &OathCmd) -> Option<SecretPair<'_>> {
             (seed_spec(*encoding), seed),
             (&OATH_PASSWORD, &access.password),
         ),
-        OathCmd::SetPassword {
-            new_password,
-            access,
+        OathCmd::Password {
+            cmd:
+                OathPasswordCmd::Set {
+                    new_password,
+                    access,
+                },
         } => secret_pair(
             (&OATH_PASSWORD, &access.password),
             (&OATH_NEW_PASSWORD, new_password),
@@ -13071,7 +13244,7 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
     println!("Any ✓ line is an instruction the firmware recognized and completed.");
 }
 
-/// `molto import-file`'s result line: how many entries were written (entries
+/// `molto import --file`'s result line: how many entries were written (entries
 /// skipped for having no title are not counted) and the slot range covered.
 fn import_file_ack(written: usize, first: u8, last: usize) -> String {
     format!(
@@ -13104,7 +13277,7 @@ fn write_info(
     if drift.abs() > 30 {
         output::warn(&format!(
             "device clock is {} seconds {} the host clock — codes may be \
-             rejected. Run `keyroostctl molto sync-time --all` to fix.",
+             rejected. Run `keyroostctl molto sync --all` to fix.",
             drift.abs(),
             if drift > 0 { "ahead of" } else { "behind" }
         ));
@@ -13801,7 +13974,7 @@ mod cli_tests {
             ("oath reset", IRREVERSIBLE),
             ("otp delete", IRREVERSIBLE),
             ("otp reset", IRREVERSIBLE),
-            ("otp delete-button-hotp", IRREVERSIBLE),
+            ("otp button delete", IRREVERSIBLE),
             ("openpgp reset", IRREVERSIBLE),
             ("openpgp key generate", IRREVERSIBLE),
             ("openpgp key import", IRREVERSIBLE),
@@ -13814,9 +13987,8 @@ mod cli_tests {
             ("piv cert generate", IRREVERSIBLE),
             ("molto seed", IRREVERSIBLE),
             ("molto import", IRREVERSIBLE),
-            ("molto import-file", IRREVERSIBLE),
             ("prog seed", IRREVERSIBLE),
-            ("otp set-button-hotp", IRREVERSIBLE),
+            ("otp button set", IRREVERSIBLE),
             ("factory-reset", IRREVERSIBLE_TYPED),
         ];
         let marked: Vec<(&str, &str)> = irreversible
@@ -14156,7 +14328,7 @@ mod cli_tests {
         let e = read(&mut sec, None).unwrap_err();
         assert_eq!(
             e,
-            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin or --qr IMAGE"
+            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin, --qr IMAGE or --file PATH"
         );
     }
 
@@ -14493,7 +14665,7 @@ mod cli_tests {
                 "--encoding",
                 "hex",
             ],
-            &["keyroostctl", "otp", "set-button-hotp", "--encoding", "hex"],
+            &["keyroostctl", "otp", "button", "set", "--encoding", "hex"],
             &["keyroostctl", "prog", "seed", "--encoding", "hex"],
         ] {
             parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
@@ -14563,7 +14735,7 @@ mod cli_tests {
         assert!(e.contains("title must be 1..=12 bytes"), "{e}");
         assert_eq!(
             err(&["keyroostctl", "molto", "import", "--slot", "1"]),
-            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin or --qr IMAGE"
+            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin, --qr IMAGE or --file PATH"
         );
         let e = parse_err(&[
             "keyroostctl",
@@ -14803,17 +14975,17 @@ mod cli_tests {
             ),
             (
                 "--current-env",
-                "keyroostctl otp change-pin --current-env V",
+                "keyroostctl otp pin change --current-env V",
                 "--pin env:VAR",
             ),
             (
                 "--new-env",
-                "keyroostctl otp change-pin --new-env V",
+                "keyroostctl otp pin change --new-env V",
                 "--new-pin env:VAR",
             ),
             (
                 "--pin-stdin",
-                "keyroostctl otp change-pin --pin-stdin",
+                "keyroostctl otp pin change --pin-stdin",
                 "--pin stdin --new-pin stdin",
             ),
             // Generic rows apply on any command.
@@ -16590,9 +16762,9 @@ mod cli_tests {
         let cmd = Cli::command();
         let oath = cmd.find_subcommand("oath").unwrap();
         for (sub, flag, line) in [
-            ("set-password", "password", "first line"),
+            ("password set", "password", "first line"),
             (
-                "set-password",
+                "password set",
                 "new-password",
                 "second line when --password stdin is also given",
             ),
@@ -16603,9 +16775,9 @@ mod cli_tests {
                 "second line when --seed stdin is also given",
             ),
         ] {
-            let arg = oath
-                .find_subcommand(sub)
-                .unwrap()
+            let arg = sub
+                .split(' ')
+                .fold(oath, |c, name| c.find_subcommand(name).unwrap())
                 .get_arguments()
                 .find(|a| a.get_long() == Some(flag))
                 .unwrap_or_else(|| panic!("{sub} --{flag}"));
@@ -16619,7 +16791,8 @@ mod cli_tests {
         match parse(&[
             "keyroostctl",
             "otp",
-            "change-pin",
+            "pin",
+            "change",
             "--pin",
             "env:A",
             "--new-pin",
@@ -16629,13 +16802,16 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Otp {
-                cmd: OtpCmd::ChangePin { pin, new_pin },
+                cmd:
+                    OtpCmd::Pin {
+                        cmd: OtpPinCmd::Change { pin, new_pin },
+                    },
                 ..
             }) => {
                 assert_eq!(pin, Some(SecretSource::Env("A".into())));
                 assert_eq!(new_pin, Some(SecretSource::Stdin));
             }
-            _ => panic!("expected otp change-pin"),
+            _ => panic!("expected otp pin change"),
         }
         for old in [
             &["--current-env", "V"][..],
@@ -16643,7 +16819,7 @@ mod cli_tests {
             &["--pin-stdin"][..],
             &["--old-pin-env", "V"][..],
         ] {
-            let mut argv = vec!["keyroostctl", "otp", "change-pin"];
+            let mut argv = vec!["keyroostctl", "otp", "pin", "change"];
             argv.extend_from_slice(old);
             let e = parse(&argv).err().unwrap();
             assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "{old:?}");
@@ -16652,7 +16828,8 @@ mod cli_tests {
         assert!(parse(&[
             "keyroostctl",
             "otp",
-            "change-pin",
+            "pin",
+            "change",
             "--pin",
             "env:A",
             "--pin",
@@ -16700,18 +16877,18 @@ mod cli_tests {
         let cmd = Cli::command();
         let otp = cmd.find_subcommand("otp").unwrap();
         for (sub, flag, line) in [
-            ("change-pin", "pin", "first line"),
+            ("pin change", "pin", "first line"),
             (
-                "change-pin",
+                "pin change",
                 "new-pin",
                 "second line when --pin stdin is also given",
             ),
             ("add", "seed", "first line"),
             ("add", "pin", "second line when --seed stdin is also given"),
         ] {
-            let arg = otp
-                .find_subcommand(sub)
-                .unwrap()
+            let arg = sub
+                .split(' ')
+                .fold(otp, |c, name| c.find_subcommand(name).unwrap())
                 .get_arguments()
                 .find(|a| a.get_long() == Some(flag))
                 .unwrap_or_else(|| panic!("{sub} --{flag}"));
@@ -17169,6 +17346,77 @@ mod cli_tests {
     }
 
     #[test]
+    fn oath_otp_molto_nest_by_topic() {
+        for a in [
+            &["keyroostctl", "oath", "password", "set"][..],
+            &["keyroostctl", "oath", "password", "clear"],
+            &["keyroostctl", "otp", "pin", "set"],
+            &["keyroostctl", "otp", "pin", "change"],
+            &["keyroostctl", "otp", "pin", "clear"],
+            &["keyroostctl", "otp", "pin", "status"],
+            &["keyroostctl", "otp", "pin", "verify"],
+            &["keyroostctl", "otp", "fingerprint", "status"],
+            &["keyroostctl", "otp", "fingerprint", "enable"],
+            &["keyroostctl", "otp", "fingerprint", "disable"],
+            &["keyroostctl", "otp", "button", "set"],
+            &["keyroostctl", "otp", "button", "delete"],
+            &["keyroostctl", "molto", "sync", "--slot", "1"],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--slot",
+                "1",
+                "--uri",
+                "stdin",
+            ],
+            &["keyroostctl", "molto", "import", "--file", "v.json"],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--file",
+                "v.json",
+                "--slot",
+                "5",
+                "--dry-run",
+                "--password",
+                "stdin",
+            ],
+        ] {
+            assert!(parse(a).is_ok(), "{a:?}");
+        }
+        for bad in [
+            // --slot is required without --file
+            &["keyroostctl", "molto", "import", "--uri", "stdin"][..],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--slot",
+                "1",
+                "--uri",
+                "stdin",
+                "--file",
+                "v.json",
+            ],
+            // --dry-run needs --file
+            &["keyroostctl", "molto", "import", "--slot", "1", "--dry-run"],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--file",
+                "v.json",
+                "--title",
+                "x",
+            ],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn piv_nests_by_topic() {
         for a in [
             &["keyroostctl", "piv", "pin", "change"][..],
@@ -17559,13 +17807,13 @@ mod cli_tests {
             &["keyroostctl", "openpgp", "info"],
             &["keyroostctl", "otp", "info"],
             &["keyroostctl", "otp", "code", "--account", "a"],
-            &["keyroostctl", "otp", "set-button-hotp"],
+            &["keyroostctl", "otp", "button", "set"],
             &["keyroostctl", "otp", "reset"],
-            &["keyroostctl", "otp", "clear-pin"],
-            &["keyroostctl", "otp", "fingerprint-status"],
-            &["keyroostctl", "otp", "fingerprint-enable"],
-            &["keyroostctl", "otp", "fingerprint-disable"],
-            &["keyroostctl", "otp", "set-pin", "--new-pin", "env:V"],
+            &["keyroostctl", "otp", "pin", "clear"],
+            &["keyroostctl", "otp", "fingerprint", "status"],
+            &["keyroostctl", "otp", "fingerprint", "enable"],
+            &["keyroostctl", "otp", "fingerprint", "disable"],
+            &["keyroostctl", "otp", "pin", "set", "--new-pin", "env:V"],
         ] {
             assert!(parse(a).is_ok(), "{a:?}");
         }
@@ -17617,7 +17865,7 @@ mod cli_tests {
                 "--digits",
                 "11",
             ],
-            &["keyroostctl", "otp", "set-button-hotp", "--digits", "7"],
+            &["keyroostctl", "otp", "button", "set", "--digits", "7"],
             &[
                 "keyroostctl",
                 "piv",
@@ -19105,11 +19353,27 @@ mod cli_tests {
             .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
         {
             let cols: Vec<&str> = line.split('\t').filter(|c| !c.is_empty()).collect();
-            let flags: Vec<&str> = cols[cols.len() - 2].split(' ').collect();
+            let mut flags: Vec<&str> = cols[cols.len() - 2].split(' ').collect();
+            let path: Vec<&str> = cols[0].split(' ').collect();
+            if flags.len() > 2 {
+                // One command, several modes (`molto import --file` takes
+                // --password, `--slot` takes --uri): a row's pair is the
+                // flags its own extra args leave usable.
+                let mut base = vec!["keyroostctl"];
+                base.extend(&path);
+                if cols.len() == 4 {
+                    base.extend(cols[1].split(' '));
+                }
+                flags.retain(|f| {
+                    let flag = format!("--{f}");
+                    let mut argv = base.clone();
+                    argv.extend([flag.as_str(), "stdin"]);
+                    parse(&argv).is_ok()
+                });
+            }
             if flags.len() != 2 {
                 continue;
             }
-            let path: Vec<&str> = cols[0].split(' ').collect();
             let mut cmd = &root;
             for name in &path {
                 cmd = cmd.find_subcommand(name).unwrap();
@@ -19168,10 +19432,9 @@ mod cli_tests {
                 "molto seed",
                 "molto customer-key",
                 "molto import",
-                "molto import-file",
                 "fido pin change",
                 "oath add",
-                "oath set-password",
+                "oath password set",
                 "openpgp pin change",
                 "openpgp pin unblock",
                 "piv pin change",
@@ -19182,7 +19445,7 @@ mod cli_tests {
                 "piv cert request",
                 "piv cert generate",
                 "otp add",
-                "otp change-pin",
+                "otp pin change",
             ]
         );
     }
@@ -19224,7 +19487,14 @@ mod cli_tests {
         let mut sec = Secrets::new(FakeIo::piped(&["11\n", line2]));
         let early = molto_early_key(&mut sec, &key, &cmd).unwrap();
         match (second, &cmd) {
-            ("password", MoltoCmd::ImportFile { path, password, .. }) => {
+            (
+                "password",
+                MoltoCmd::Import {
+                    file: Some(path),
+                    password,
+                    ..
+                },
+            ) => {
                 assert_eq!(&early.unwrap()[..], [0x11], "{line}");
                 assert!(load_bulk_entries(&mut sec, path, password.as_ref()).is_err());
                 assert_eq!(sec.io.lines_read, 2, "{line}");
@@ -19246,19 +19516,26 @@ mod cli_tests {
         }
     }
 
-    /// `molto import-file --dry-run` never uses the customer key: it reads
+    /// `molto import --file --dry-run` never uses the customer key: it reads
     /// (and drops) it only to keep a piped password on stdin line 2, and
     /// never asks for it at a terminal.
     #[test]
     fn dry_run_reads_the_customer_key_only_for_stdin_order() {
         use crate::secrets::fake::FakeIo;
         let parts = |argv: &[&str]| {
-            let mut full = vec!["keyroostctl", "molto", "import-file", "v.json", "--dry-run"];
+            let mut full = vec![
+                "keyroostctl",
+                "molto",
+                "import",
+                "--file",
+                "v.json",
+                "--dry-run",
+            ];
             full.extend(argv);
             match parse(&full).unwrap().command {
                 Some(Cmd::Molto {
                     key,
-                    cmd: MoltoCmd::ImportFile { password, .. },
+                    cmd: MoltoCmd::Import { password, .. },
                     ..
                 }) => (key, password),
                 _ => unreachable!(),
@@ -20167,8 +20444,9 @@ mod cli_tests {
             Cmd::Otp {
                 cmd:
                     OtpCmd::Delete { yes, .. }
-                    | OtpCmd::SetButtonHotp { yes, .. }
-                    | OtpCmd::DeleteButtonHotp { yes },
+                    | OtpCmd::Button {
+                        cmd: OtpButtonCmd::Set { yes, .. } | OtpButtonCmd::Delete { yes },
+                    },
                 ..
             } => yes,
             Cmd::Fido {
@@ -20181,10 +20459,7 @@ mod cli_tests {
                     },
             } => yes,
             Cmd::Molto {
-                cmd:
-                    MoltoCmd::Seed { yes, .. }
-                    | MoltoCmd::Import { yes, .. }
-                    | MoltoCmd::ImportFile { yes, .. },
+                cmd: MoltoCmd::Seed { yes, .. } | MoltoCmd::Import { yes, .. },
                 ..
             } => yes,
             Cmd::Prog {
@@ -20319,8 +20594,8 @@ mod cli_tests {
             ],
             &["keyroostctl", "oath", "delete", "x"],
             &["keyroostctl", "otp", "delete", "--account", "a"],
-            &["keyroostctl", "otp", "set-button-hotp", "--seed", "stdin"],
-            &["keyroostctl", "otp", "delete-button-hotp"],
+            &["keyroostctl", "otp", "button", "set", "--seed", "stdin"],
+            &["keyroostctl", "otp", "button", "delete"],
             &["keyroostctl", "fido", "credential", "delete", "--id", "00"],
             &["keyroostctl", "fido", "fingerprint", "delete", "--id", "00"],
             &[
@@ -20341,7 +20616,7 @@ mod cli_tests {
                 "--uri",
                 "stdin",
             ],
-            &["keyroostctl", "molto", "import-file", "f.json"],
+            &["keyroostctl", "molto", "import", "--file", "f.json"],
             &["keyroostctl", "prog", "seed", "--seed", "stdin"],
             &["keyroostctl", "prog", "config"],
         ] {
@@ -20362,10 +20637,20 @@ mod cli_tests {
             (&["keyroostctl", "name", "list"], Some("name list")),
             (&["keyroostctl", "name", "delete", "x"], Some("name delete")),
             (
-                &["keyroostctl", "molto", "import-file", "--dry-run", "x.json"],
-                Some("molto import-file --dry-run"),
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "import",
+                    "--dry-run",
+                    "--file",
+                    "x.json",
+                ],
+                Some("molto import --dry-run"),
             ),
-            (&["keyroostctl", "molto", "import-file", "x.json"], None),
+            (
+                &["keyroostctl", "molto", "import", "--file", "x.json"],
+                None,
+            ),
             (&["keyroostctl", "list"], None),
             (&["keyroostctl", "name", "add", "x"], None),
             (&["keyroostctl", "piv", "info"], None),

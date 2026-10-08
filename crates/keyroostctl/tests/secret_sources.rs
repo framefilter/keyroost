@@ -59,15 +59,15 @@ fn retired_secret_flags_name_their_replacement() {
         (&["oath", "add", "n", "--secret-env", "V"], "--seed env:VAR"),
         (&["oath", "add", "n", "--secret-stdin"], "--seed stdin"),
         (
-            &["otp", "change-pin", "--current-env", "V"],
+            &["otp", "pin", "change", "--current-env", "V"],
             "--pin env:VAR",
         ),
         (
-            &["otp", "change-pin", "--new-env", "V"],
+            &["otp", "pin", "change", "--new-env", "V"],
             "--new-pin env:VAR",
         ),
         (
-            &["otp", "change-pin", "--pin-stdin"],
+            &["otp", "pin", "change", "--pin-stdin"],
             "--pin stdin --new-pin stdin",
         ),
         (
@@ -349,7 +349,7 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
         &["piv", "mgmt-key", "change", "--new-mgmt-key", "default"],
         &["openpgp", "name", "set", "x", "--admin-pin", "S3CRETVALUE"],
         &["oath", "list", "--password", "S3CRETVALUE"],
-        &["oath", "set-password", "--new-password", "S3CRETVALUE"],
+        &["oath", "password", "set", "--new-password", "S3CRETVALUE"],
         &["oath", "add", "n", "--seed", "S3CRETVALUE"],
         &["fido", "pin", "change", "--pin", "default"],
         &["molto", "--customer-key", "S3CRETVALUE", "info"],
