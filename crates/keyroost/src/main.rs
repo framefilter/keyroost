@@ -82,6 +82,120 @@ fn large_blob_write_token(
     Ok(token)
 }
 
+/// The naming dialog's message for a key with no storage for its own name.
+const KEY_NAME_NO_STORAGE: &str =
+    "This key can't store a name on itself; save the name on this computer.";
+
+/// The naming dialog's message for a name change the key refused or can't
+/// hold. `used` is how many bytes the array uses now.
+fn key_name_refusal(e: keyroost_ctap::device_label::LabelError, used: u64) -> String {
+    use keyroost_ctap::device_label::LabelError;
+    match e {
+        LabelError::Unsupported => KEY_NAME_NO_STORAGE.into(),
+        LabelError::NoPin => "This key has no FIDO PIN yet. Set one with \"Set a PIN\" in the \
+                              FIDO2 tab, then save the name on the key."
+            .into(),
+        LabelError::TooLarge { size, max } => format!(
+            "Not enough large-blob space for the name: it needs {} bytes, {} are free.",
+            size.saturating_sub(used),
+            max.saturating_sub(used)
+        ),
+        LabelError::Changed => "The key's storage changed while saving; nothing was \
+                                changed. Try again."
+            .into(),
+        other => format!("Couldn't save the name on the key: {other}"),
+    }
+}
+
+/// Set (`Some`) or clear (`None`) the name stored on the key at `path`, the
+/// way `keyroostctl name set --store key` does: open, getInfo, read, plan
+/// (refusing what can't work before the PIN is used), PIN token, write only
+/// over the array planned from, then read the name back. `expected` is the
+/// name the dialog showed: a different name found now refuses, since the
+/// question asked was about that one. Names read from keys are forgotten
+/// around the write.
+fn write_key_name(
+    path: &std::path::Path,
+    name: Option<&str>,
+    expected: Option<&str>,
+    pin: &str,
+) -> Result<(), String> {
+    use keyroost_ctap::device_label::{
+        apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelState,
+        WRITER_KEYROOST,
+    };
+    let (mut dev, init) = CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+    if !init.supports_cbor() {
+        return Err(KEY_NAME_NO_STORAGE.into());
+    }
+    let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+    if info.option("largeBlobs") != Some(true) {
+        return Err(KEY_NAME_NO_STORAGE.into());
+    }
+    let current = keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
+    let used = current.capacity(&info).used_bytes;
+    let new = name.map(|l| DeviceLabel {
+        label: l.to_string(),
+        writer: Some(WRITER_KEYROOST.to_string()),
+    });
+    let plan = plan_label_change(&current, &info, new.as_ref(), random_nonce())
+        .map_err(|e| key_name_refusal(e, used))?;
+    // An unreadable name on the key counts as none: only a readable one
+    // other than the name the dialog showed is a change to refuse.
+    let previous = plan
+        .previous
+        .as_ref()
+        .map(|l| l.label.as_str())
+        .filter(|l| keyroost_keyring::validate_name(l).is_ok());
+    if previous != expected {
+        return Err(key_name_refusal(
+            keyroost_ctap::device_label::LabelError::Changed,
+            used,
+        ));
+    }
+    if previous == name {
+        return Ok(()); // already so; nothing to write
+    }
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut dev,
+        pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+    )
+    .map_err(|e| format!("Couldn't unlock the key: {e}"))?;
+    keyroost_resolve::with_key_names_forgotten(|| apply_label_plan(&mut dev, &info, &token, &plan))
+        .map_err(|e| key_name_refusal(e, used))?;
+    let now = read_label(&mut dev, &info).map_err(|e| e.to_string())?;
+    let kept = match (&now, name) {
+        (LabelState::Present(l), Some(n)) => l.label == n,
+        (LabelState::Absent, None) => true,
+        _ => false,
+    };
+    if kept {
+        Ok(())
+    } else {
+        Err("The key didn't keep the change; try again.".into())
+    }
+}
+
+/// Record on this computer that the key with `serials` carries `name` (or,
+/// for `None`, drop every record of it), after an on-key save.
+fn record_key_name(
+    serials: &[String],
+    name: Option<&str>,
+    meta: keyroost_keyring::RecordMeta,
+) -> Result<(), String> {
+    let mut k = keyroost_keyring::Keyring::load_default().map_err(|e| e.to_string())?;
+    match name {
+        Some(n) => device::set_key_name(&mut k, serials, n, keyroost_keyring::NameStore::Key, meta)
+            .map_err(|e| e.to_string())?,
+        None => {
+            device::clear_key_names(&mut k, serials);
+        }
+    }
+    k.save_default().map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// Open a CTAP transport for `target`, returning the boxed transport, whether
 /// it speaks CTAP2 (CBOR), and the HID `InitResponse` when available (HID only;
 /// `None` over PC/SC, which has no INIT phase). The InitResponse carries the
@@ -404,12 +518,36 @@ fn same_hid_connection(a: &HidIdentity, b: &HidIdentity) -> bool {
 /// a background rescan can't retarget the save. See [`App::rename_target`].
 #[derive(Clone)]
 struct RenameTarget {
-    /// Serial the new name will be written against (device serial, not the
-    /// reader-name serial). A device with no serial can't be named.
-    serial: String,
     /// The device's friendly name at open time, so the save removes the right
     /// old entry even if the live device's name has since changed.
     name_at_open: Option<String>,
+    /// The row the field was opened on; completions of an on-key save act on
+    /// the dialog only while it is still open for this row.
+    device_id: DeviceId,
+    /// Every serial the key may be recorded under ([`device::row_serials`]),
+    /// its own first (the device serial, not the reader-name serial). A
+    /// device with no serial can't be named.
+    serials: Vec<String>,
+    /// The key's FIDO HID path at open time (an on-key save writes there).
+    hid_path: Option<std::path::PathBuf>,
+    /// How the key was named at open time.
+    naming: keyroost_resolve::Naming,
+    /// The places offered ([`device::store_choices`]).
+    choices: Vec<device::NameStoreChoice>,
+    /// The key has no large-blob storage (the dialog says so).
+    lacks_storage: bool,
+    /// The place picked in the dialog.
+    store: device::NameStoreChoice,
+    /// Why the last save didn't happen; the field stays open.
+    error: Option<String>,
+    /// A question awaiting an answer before an on-key save (replacing or
+    /// removing the name the key carries), with the planned save.
+    confirm: Option<(String, Option<String>)>,
+    /// An on-key save is running.
+    saving: bool,
+    /// Display hints for the log line and the keys.json record.
+    vendor: String,
+    model: String,
 }
 
 struct UnlockedSession {
@@ -3033,6 +3171,9 @@ struct App {
     /// selection between open and save, and without this pin the new name would
     /// land on the wrong key.
     rename_target: Option<RenameTarget>,
+    /// The FIDO PIN typed into the naming dialog for an on-key save (masked;
+    /// wiped when the dialog closes and after every attempt).
+    rename_pin: String,
     /// Background worker for blocking device I/O. `None` only in tests.
     worker: Option<Worker>,
     /// Number of in-flight background jobs. While >0 the UI shows a spinner and
@@ -9565,20 +9706,7 @@ impl App {
     /// borrowed) and applied here afterwards.
     fn apply_rename_actions(&mut self, dev: &Device, open: bool, cancel: bool, save: bool) {
         if open {
-            if dev.serial.is_empty() {
-                self.log(
-                    Severity::Warn,
-                    "this device exposes no serial, so it can't be named yet",
-                );
-            } else {
-                self.rename_input = dev.name.clone().unwrap_or_default();
-                // Pin the target now, so the eventual save writes against this
-                // device even if a background rescan moves the selection first.
-                self.rename_target = Some(RenameTarget {
-                    serial: dev.serial.clone(),
-                    name_at_open: dev.name.clone(),
-                });
-            }
+            self.open_rename(dev, None);
         }
         if cancel {
             self.close_rename();
@@ -9588,9 +9716,53 @@ impl App {
         }
     }
 
-    /// Reset the inline-rename state (field closed, draft and pin cleared).
+    /// Open the inline naming field on `dev`, prefilled with its name, or
+    /// with `write_back` and "On this key" picked (the offer to write a lost
+    /// name back).
+    fn open_rename(&mut self, dev: &Device, write_back: Option<&str>) {
+        if dev.serial.is_empty() {
+            self.log(
+                Severity::Warn,
+                "this device exposes no serial, so it can't be named yet",
+            );
+            return;
+        }
+        let choices = device::store_choices(dev);
+        let store = match write_back {
+            Some(_) if choices.contains(&device::NameStoreChoice::Key) => {
+                device::NameStoreChoice::Key
+            }
+            _ => device::default_store(dev),
+        };
+        self.rename_input = write_back
+            .map(str::to_owned)
+            .or_else(|| dev.naming.plain.clone())
+            .or_else(|| dev.name.clone())
+            .unwrap_or_default();
+        wipe(&mut self.rename_pin);
+        // Pin the target now, so the eventual save writes against this
+        // device even if a background rescan moves the selection first.
+        self.rename_target = Some(RenameTarget {
+            name_at_open: dev.name.clone(),
+            device_id: dev.id.clone(),
+            serials: device::row_serials(dev),
+            hid_path: dev.hid_path.clone(),
+            naming: dev.naming.clone(),
+            lacks_storage: device::lacks_key_storage(dev),
+            choices,
+            store,
+            error: None,
+            confirm: None,
+            saving: false,
+            vendor: dev.vendor.clone(),
+            model: dev.model.clone(),
+        });
+    }
+
+    /// Reset the inline-rename state (field closed, draft, PIN and pin cleared).
     fn close_rename(&mut self) {
         self.rename_input.clear();
+        wipe(&mut self.rename_pin);
         self.rename_target = None;
         // The scan-burst loop stops scheduling repaints while a rename field
         // is open (see `update`); wake the loop once so a paused burst
@@ -9600,12 +9772,29 @@ impl App {
         }
     }
 
+    /// Show `msg` in the open naming field, which stays open.
+    fn rename_failed(&mut self, msg: impl Into<String>) {
+        if let Some(t) = self.rename_target.as_mut() {
+            t.error = Some(msg.into());
+            t.saving = false;
+        }
+    }
+
+    /// Whether an on-key save of the open naming field needs a typed PIN:
+    /// it does unless the key's FIDO session is unlocked.
+    fn rename_needs_pin(&self) -> bool {
+        let Some(t) = &self.rename_target else {
+            return false;
+        };
+        !(self.selected_device.as_ref() == Some(&t.device_id) && self.fido_session().is_some())
+    }
+
     /// Persist (or clear) the friendly name for the device the rename field was
-    /// opened against, keyed by the serial pinned at open time. Empty input
-    /// removes the existing name. Writing against the *pinned* serial (not the
-    /// live selection) is what keeps a mid-edit rescan from landing the name on
-    /// the wrong key. The vendor is looked up from the live device list if that
-    /// device is still present, else omitted — it's a display hint only.
+    /// opened against, keyed by the serial pinned at open time, where the
+    /// dialog says ([`device::plan_name_save`]). Empty input removes the name
+    /// wherever it lives. Writing against the *pinned* serial (not the live
+    /// selection) is what keeps a mid-edit rescan from landing the name on the
+    /// wrong key. Certain refusals come before any question or PIN use.
     fn save_device_name(&mut self) {
         let Some(target) = self.rename_target.clone() else {
             // No pinned target (e.g. the device had no serial at open); nothing
@@ -9613,52 +9802,227 @@ impl App {
             self.close_rename();
             return;
         };
+        if target.saving {
+            return;
+        }
         let name = self.rename_input.trim().to_owned();
         if !name.is_empty() {
             if let Err(e) = keyroost_keyring::validate_name(&name) {
-                self.log(Severity::Err, format!("invalid name: {e}"));
+                self.rename_failed(format!("Invalid name: {e}"));
                 return; // keep the field open so the user can correct it
             }
         }
-        let live = self.devices.iter().find(|d| d.serial == target.serial);
-        let vendor = live.map(|d| d.vendor.to_ascii_lowercase());
-        // A key without an explicit friendly name still shows one — its model
-        // (see `DeviceView::title`). Resolving both sides of the change to a
-        // concrete display name means one message covers rename, first naming
-        // and clearing alike, with no special cases.
-        let implicit = live
-            .map(|d| d.model.clone())
-            .unwrap_or_else(|| "this key".to_string());
+        let plan = match device::plan_name_save(&target.naming, target.store, &name) {
+            Ok(p) => p,
+            Err(why) => {
+                self.rename_failed(why);
+                return;
+            }
+        };
+        match plan {
+            device::NameSave::Unchanged => self.close_rename(),
+            device::NameSave::Local(name) => self.save_name_locally(&target, name),
+            device::NameSave::OnKey { name, question } => {
+                if self.rename_needs_pin() && self.rename_pin.is_empty() {
+                    self.rename_failed("Enter the key's FIDO PIN to save the name on the key.");
+                    return;
+                }
+                if let Some(n) = &name {
+                    match keyroost_keyring::Keyring::load_default() {
+                        Ok(k) if device::name_held_elsewhere(&k, n, &target.serials) => {
+                            self.rename_failed(format!(
+                                "Another key on this computer already has the name \"{n}\". \
+                                 Pick another name, or clear that key's name first."
+                            ));
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            self.rename_failed(format!("Names not saved: {e}"));
+                            return;
+                        }
+                    }
+                }
+                match question {
+                    Some(q) => {
+                        if let Some(t) = self.rename_target.as_mut() {
+                            t.error = None;
+                            t.confirm = Some((q, name));
+                        }
+                    }
+                    None => self.start_key_name_write(name),
+                }
+            }
+        }
+    }
+
+    /// The person answered the replace/remove question: save on the key.
+    fn confirm_key_name_write(&mut self) {
+        let Some(name) = self
+            .rename_target
+            .as_mut()
+            .and_then(|t| t.confirm.take())
+            .map(|(_, n)| n)
+        else {
+            return;
+        };
+        self.start_key_name_write(name);
+    }
+
+    /// Set (`Some`) or clear (`None`) the name on the key the open naming
+    /// field is pinned to, in the background, then record it on this
+    /// computer. The worker plans first and refuses what can't work before
+    /// the PIN is used.
+    fn start_key_name_write(&mut self, name: Option<String>) {
+        let Some(target) = self.rename_target.clone() else {
+            return;
+        };
+        let pin = if self.rename_needs_pin() {
+            zeroize::Zeroizing::new(self.rename_pin.clone())
+        } else {
+            match self.fido_session() {
+                Some(s) => s.pin.clone(),
+                None => zeroize::Zeroizing::new(String::new()),
+            }
+        };
+        wipe(&mut self.rename_pin);
+        if pin.is_empty() {
+            self.rename_failed("Enter the key's FIDO PIN to save the name on the key.");
+            return;
+        }
+        let Some(path) = target.hid_path.clone() else {
+            self.rename_failed(KEY_NAME_NO_STORAGE);
+            return;
+        };
+        let expected = match &target.naming.on_key {
+            keyroost_resolve::KeyLabel::Present(l) => Some(l.clone()),
+            _ => None,
+        };
+        let serials = target.serials.clone();
+        let meta = keyroost_keyring::RecordMeta {
+            source: keyroost_keyring::IdSource::default(),
+            vendor: Some(target.vendor.to_ascii_lowercase()),
+        };
+        let device_id = target.device_id.clone();
         let old_display = target
             .name_at_open
             .clone()
-            .unwrap_or_else(|| implicit.clone());
-        let cleared = name.is_empty();
-        let new_display = if cleared { implicit } else { name.clone() };
+            .unwrap_or_else(|| target.model.clone());
+        let new_display = name.clone().unwrap_or_else(|| target.model.clone());
+        let label = if name.is_some() {
+            "Saving the name on the key\u{2026}"
+        } else {
+            "Removing the name from the key\u{2026}"
+        };
+        let queued = self.spawn_job(label, move || {
+            let result = write_key_name(&path, name.as_deref(), expected.as_deref(), &pin)
+                .map(|()| record_key_name(&serials, name.as_deref(), meta).err());
+            drop(pin);
+            Box::new(move |app: &mut App| {
+                let open_here = completion_still_valid(
+                    Some(&device_id),
+                    app.rename_target.as_ref().map(|t| &t.device_id),
+                );
+                match result {
+                    Ok(record_error) => {
+                        let what = if name.is_some() {
+                            "name saved on the key"
+                        } else {
+                            "name removed from the key"
+                        };
+                        app.log_global(
+                            Severity::Ok,
+                            LogKind::User,
+                            format!("{new_display}: {what}, was {old_display}"),
+                        );
+                        if let Some(e) = record_error {
+                            app.log_global(
+                                Severity::Warn,
+                                LogKind::User,
+                                format!(
+                                    "{new_display}: this computer's record of the name \
+                                     couldn't be saved: {e}"
+                                ),
+                            );
+                        }
+                        if open_here {
+                            app.close_rename();
+                        }
+                        app.refresh_devices();
+                    }
+                    Err(e) => {
+                        if open_here {
+                            app.rename_failed(e);
+                        } else {
+                            app.log_global(
+                                Severity::Err,
+                                LogKind::User,
+                                format!("{old_display}: name not saved: {e}"),
+                            );
+                        }
+                    }
+                }
+            })
+        });
+        if let Some(t) = self.rename_target.as_mut() {
+            if queued {
+                t.saving = true;
+                t.error = None;
+            } else {
+                t.error = Some("Another operation is running; try again in a moment.".into());
+            }
+        }
+    }
+
+    /// Save (or clear) the name on this computer only.
+    fn save_name_locally(&mut self, target: &RenameTarget, name: Option<String>) {
         // Never fall back to an empty registry here: saving it would replace
         // every name in a keys.json that merely failed to load.
         let mut keyring = match keyroost_keyring::Keyring::load_default() {
             Ok(k) => k,
             Err(e) => {
-                self.log(Severity::Err, format!("names not saved: {e}"));
+                self.rename_failed(format!("Names not saved: {e}"));
                 return; // keep the field open; nothing was saved
             }
         };
-        // A rename replaces this key's computer name in place; clearing drops
-        // every record of the key.
-        if cleared {
-            keyring.clear_key(&target.serial);
-        } else if let Err(e) = keyring.set_name(
-            &target.serial,
-            &name,
-            keyroost_keyring::NameStore::Computer,
-            keyroost_keyring::RecordMeta {
-                source: keyroost_keyring::IdSource::default(),
-                vendor,
-            },
-        ) {
-            self.log(Severity::Err, format!("name: {e}"));
-            return; // keep the field open; nothing was saved
+        // A key without an explicit friendly name still shows one — its model
+        // (see `DeviceView::title`). Resolving both sides of the change to a
+        // concrete display name means one message covers rename, first naming
+        // and clearing alike, with no special cases.
+        let old_display = target
+            .name_at_open
+            .clone()
+            .unwrap_or_else(|| target.model.clone());
+        let cleared = name.is_none();
+        let new_display = name.clone().unwrap_or_else(|| target.model.clone());
+        match &name {
+            // Clearing drops every record of the key.
+            None => {
+                device::clear_key_names(&mut keyring, &target.serials);
+            }
+            Some(n) => {
+                if device::name_held_elsewhere(&keyring, n, &target.serials) {
+                    self.rename_failed(format!(
+                        "Another key on this computer already has the name \"{n}\". \
+                         Pick another name, or clear that key's name first."
+                    ));
+                    return;
+                }
+                let meta = keyroost_keyring::RecordMeta {
+                    source: keyroost_keyring::IdSource::default(),
+                    vendor: Some(target.vendor.to_ascii_lowercase()),
+                };
+                if let Err(e) = device::set_key_name(
+                    &mut keyring,
+                    &target.serials,
+                    n,
+                    keyroost_keyring::NameStore::Computer,
+                    meta,
+                ) {
+                    self.rename_failed(format!("Name not saved: {e}"));
+                    return; // keep the field open; nothing was saved
+                }
+            }
         }
         match keyring.save_default() {
             // Name the before and after explicitly rather than leaning on the
@@ -9673,7 +10037,10 @@ impl App {
                     if cleared { "cleared" } else { "saved" }
                 ),
             ),
-            Err(e) => self.log(Severity::Err, format!("save names: {e}")),
+            Err(e) => {
+                self.rename_failed(format!("Names not saved: {e}"));
+                return;
+            }
         }
         self.close_rename();
         self.refresh_devices();
@@ -12378,40 +12745,217 @@ impl App {
     }
 
     /// Device hero strip at the top of a key's pane.
+    /// Whether the open naming field asks for a rename on this computer of
+    /// a key that carries its name on the key (Save stays disabled).
+    fn rename_blocked(&self) -> bool {
+        self.rename_target.as_ref().is_some_and(|t| {
+            device::plan_name_save(&t.naming, t.store, self.rename_input.trim())
+                == Err(device::NAME_IS_ON_THE_KEY)
+        })
+    }
+
+    /// Whether saving the open naming field writes to the key.
+    fn rename_goes_on_key(&self) -> bool {
+        self.rename_target.as_ref().is_some_and(|t| {
+            matches!(
+                device::plan_name_save(&t.naming, t.store, self.rename_input.trim()),
+                Ok(device::NameSave::OnKey { .. })
+            )
+        })
+    }
+
+    /// The inline naming field's text box with Save and Cancel, shared by
+    /// the security-key and Molto2 heroes. Returns (save, cancel).
+    fn rename_field_row(&mut self, ui: &mut egui::Ui, p: &Palette) -> (bool, bool) {
+        let held = self
+            .rename_target
+            .as_ref()
+            .is_some_and(|t| t.saving || t.confirm.is_some());
+        let resp = ui
+            .add_enabled_ui(!held, |ui| {
+                ui.add_sized(
+                    [200.0, 32.0],
+                    egui::TextEdit::singleline(&mut self.rename_input)
+                        .vertical_align(egui::Align::Center)
+                        .hint_text("friendly-name"),
+                )
+            })
+            .inner;
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let save = if held || self.rename_blocked() {
+            theme::button_disabled(ui, p, "Save");
+            false
+        } else {
+            theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter
+        };
+        ui.add_space(4.0);
+        let cancel = theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked();
+        (save, cancel)
+    }
+
+    /// What the naming field explains under the text box: where the name
+    /// goes (and the choice, when the key can hold its own name), the PIN
+    /// field for an on-key save, the last error, and the replace/remove
+    /// question. `what` is "key" or "token". Returns (confirm, cancel the
+    /// question).
+    fn rename_details(&mut self, ui: &mut egui::Ui, p: &Palette, what: &str) -> (bool, bool) {
+        let note = |ui: &mut egui::Ui, text: &str| {
+            ui.label(
+                egui::RichText::new(text)
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+            );
+        };
+        let computer_note = format!(
+            "Saves a fingerprint of this {what} (not its serial) with the name in keys.json \
+             on this computer. Up to 64 characters."
+        );
+        let needs_pin = self.rename_needs_pin();
+        let on_key = self.rename_goes_on_key();
+        let blocked = self.rename_blocked();
+        let Some(t) = self.rename_target.as_mut() else {
+            return (false, false);
+        };
+        ui.add_space(3.0);
+        if t.choices.contains(&device::NameStoreChoice::Key) {
+            ui.add_enabled_ui(!t.saving && t.confirm.is_none(), |ui| {
+                ui.radio_value(
+                    &mut t.store,
+                    device::NameStoreChoice::Computer,
+                    egui::RichText::new("On this computer").font(theme::f_reg(12.5)),
+                );
+                note(ui, &computer_note);
+                ui.add_space(2.0);
+                ui.radio_value(
+                    &mut t.store,
+                    device::NameStoreChoice::Key,
+                    egui::RichText::new("On this key").font(theme::f_reg(12.5)),
+                );
+                note(
+                    ui,
+                    "Visible to anyone who has the key. Saving asks for the key's PIN.",
+                );
+            });
+        } else {
+            if t.lacks_storage {
+                note(
+                    ui,
+                    "This key can't store a name on itself; it is saved on this computer.",
+                );
+            }
+            note(ui, &computer_note);
+        }
+        if blocked {
+            ui.add_space(3.0);
+            ui.colored_label(p.err, device::NAME_IS_ON_THE_KEY);
+        }
+        if on_key && needs_pin && !t.saving {
+            ui.add_space(4.0);
+            let pin = &mut self.rename_pin;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Key PIN")
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(pin)
+                        .password(true)
+                        .desired_width(160.0),
+                );
+                guard_secret_field(ui.ctx(), &resp);
+            });
+        }
+        let Some(t) = self.rename_target.as_mut() else {
+            return (false, false);
+        };
+        if let Some(e) = &t.error {
+            ui.add_space(3.0);
+            ui.colored_label(p.err, e);
+        }
+        let (mut confirm, mut cancel) = (false, false);
+        if let Some((question, name)) = &t.confirm {
+            ui.add_space(6.0);
+            theme::card_frame(p)
+                .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(question)
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let (kind, label) = if name.is_some() {
+                            (BtnKind::Primary, "Replace")
+                        } else {
+                            (BtnKind::Danger, "Remove")
+                        };
+                        confirm = theme::button(ui, p, kind, label).clicked();
+                        cancel = theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked();
+                    });
+                });
+        }
+        (confirm, cancel)
+    }
+
+    /// Apply what [`Self::rename_details`] returned.
+    fn apply_rename_question(&mut self, confirm: bool, cancel: bool) {
+        if confirm {
+            self.confirm_key_name_write();
+        } else if cancel {
+            if let Some(t) = self.rename_target.as_mut() {
+                t.confirm = None;
+            }
+        }
+    }
+
     fn device_hero(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
         let mut open_rename = false;
         let mut do_save = false;
         let mut do_cancel = false;
+        let (mut do_confirm, mut do_unconfirm) = (false, false);
         ui.horizontal(|ui| {
-            glyph_tile(ui, 46.0, p.raised2, p.txt2, Some(dev.vendor.chars().next().unwrap_or('?').to_ascii_uppercase()));
+            glyph_tile(
+                ui,
+                46.0,
+                p.raised2,
+                p.txt2,
+                Some(
+                    dev.vendor
+                        .chars()
+                        .next()
+                        .unwrap_or('?')
+                        .to_ascii_uppercase(),
+                ),
+            );
             ui.add_space(12.0);
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     if self.rename_target.is_some() {
-                        let resp = ui.add_sized(
-                            [200.0, 32.0],
-                            egui::TextEdit::singleline(&mut self.rename_input)
-                                .vertical_align(egui::Align::Center)
-                                .hint_text("friendly-name"),
-                        );
-                        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter {
-                            do_save = true;
-                        }
-                        ui.add_space(4.0);
-                        if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
-                            do_cancel = true;
-                        }
+                        (do_save, do_cancel) = self.rename_field_row(ui, p);
                     } else {
-                        ui.label(egui::RichText::new(dev.title()).font(theme::f_bold(21.0)).color(p.txt));
+                        ui.label(
+                            egui::RichText::new(dev.title())
+                                .font(theme::f_bold(21.0))
+                                .color(p.txt),
+                        );
                         ui.add_space(5.0);
                         self.help_dot(ui, p, "device");
                         ui.add_space(8.0);
-                        let label = if dev.name.is_some() { "Rename" } else { "Name this key" };
+                        let label = if dev.name.is_some() {
+                            "Rename"
+                        } else {
+                            "Name this key"
+                        };
                         if ui
                             .add(
-                                egui::Label::new(egui::RichText::new(label).font(theme::f_sb(12.0)).color(p.accent))
-                                    .sense(egui::Sense::click()),
+                                egui::Label::new(
+                                    egui::RichText::new(label)
+                                        .font(theme::f_sb(12.0))
+                                        .color(p.accent),
+                                )
+                                .sense(egui::Sense::click()),
                             )
                             .clicked()
                         {
@@ -12420,29 +12964,41 @@ impl App {
                     }
                 });
                 if self.rename_target.is_some() {
-                    ui.add_space(3.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Saves this key's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine. Up to 64 characters.",
-                        )
-                        .font(theme::f_reg(11.5))
-                        .color(p.txt3),
-                    );
+                    (do_confirm, do_unconfirm) = self.rename_details(ui, p, "key");
                 }
                 ui.add_space(2.0);
-                let serial = if dev.serial.is_empty() { "\u{2014}".to_string() } else { dev.serial.clone() };
-                let mut meta = format!("{} \u{00B7} #{} \u{00B7} {}", dev.vendor, serial, dev.transport);
+                let serial = if dev.serial.is_empty() {
+                    "\u{2014}".to_string()
+                } else {
+                    dev.serial.clone()
+                };
+                let mut meta = format!(
+                    "{} \u{00B7} #{} \u{00B7} {}",
+                    dev.vendor, serial, dev.transport
+                );
                 if !dev.firmware.is_empty() {
                     meta.push_str(&format!(" \u{00B7} fw {}", dev.firmware));
                 }
-                ui.label(egui::RichText::new(meta).font(theme::f_reg(12.5)).color(p.txt2));
+                if dev.naming.source == Some(keyroost_resolve::NameSource::Key) {
+                    meta.push_str(" \u{00B7} name on key");
+                }
+                ui.label(
+                    egui::RichText::new(meta)
+                        .font(theme::f_reg(12.5))
+                        .color(p.txt2),
+                );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new("Connected").font(theme::f_sb(12.5)).color(p.txt2));
+                ui.label(
+                    egui::RichText::new("Connected")
+                        .font(theme::f_sb(12.5))
+                        .color(p.txt2),
+                );
                 ui.add_space(5.0);
                 theme::status_dot(ui, p.ok, 8.0);
             });
         });
+        self.apply_rename_question(do_confirm, do_unconfirm);
         self.apply_rename_actions(dev, open_rename, do_cancel, do_save);
         ui.add_space(14.0);
         let y = ui.cursor().top();
@@ -19247,32 +19803,31 @@ impl App {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             if self.rename_target.is_some() {
-                                let resp = ui.add_sized(
-                                    [200.0, 32.0],
-                                    egui::TextEdit::singleline(&mut self.rename_input)
-                                        .vertical_align(egui::Align::Center)
-                                        .hint_text("friendly-name"),
-                                );
-                                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                if theme::button(ui, p, BtnKind::Primary, "Save").clicked() || enter {
-                                    do_save = true;
-                                }
-                                ui.add_space(4.0);
-                                if theme::button(ui, p, BtnKind::Ghost, "Cancel").clicked() {
-                                    do_cancel = true;
-                                }
+                                (do_save, do_cancel) = self.rename_field_row(ui, p);
                             } else {
-                                ui.label(egui::RichText::new(dev.title()).font(theme::f_bold(21.0)).color(p.txt));
+                                ui.label(
+                                    egui::RichText::new(dev.title())
+                                        .font(theme::f_bold(21.0))
+                                        .color(p.txt),
+                                );
                                 ui.add_space(6.0);
                                 theme::pill(ui, "Programmable TOTP token", p.brand, p.brand_soft());
                                 ui.add_space(4.0);
                                 self.help_dot(ui, p, "molto");
                                 ui.add_space(6.0);
-                                let label = if dev.name.is_some() { "Rename" } else { "Name this token" };
+                                let label = if dev.name.is_some() {
+                                    "Rename"
+                                } else {
+                                    "Name this token"
+                                };
                                 if ui
                                     .add(
-                                        egui::Label::new(egui::RichText::new(label).font(theme::f_sb(12.0)).color(p.accent))
-                                            .sense(egui::Sense::click()),
+                                        egui::Label::new(
+                                            egui::RichText::new(label)
+                                                .font(theme::f_sb(12.0))
+                                                .color(p.accent),
+                                        )
+                                        .sense(egui::Sense::click()),
                                     )
                                     .clicked()
                                 {
@@ -19281,25 +19836,30 @@ impl App {
                             }
                         });
                         if self.rename_target.is_some() {
-                            ui.add_space(3.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Saves this token's serial with the name to keys.json on this computer \u{2014} nothing leaves your machine.",
-                                )
-                                .font(theme::f_reg(11.5))
-                                .color(p.txt3),
-                            );
+                            // A token can't hold its own name: this computer only.
+                            self.rename_details(ui, p, "token");
                         }
                         ui.add_space(2.0);
-                        let serial = if dev.serial.is_empty() { "\u{2014}".to_string() } else { dev.serial.clone() };
+                        let serial = if dev.serial.is_empty() {
+                            "\u{2014}".to_string()
+                        } else {
+                            dev.serial.clone()
+                        };
                         ui.label(
-                            egui::RichText::new(format!("{} \u{00B7} #{} \u{00B7} {} slots", dev.vendor, serial, PROFILES))
-                                .font(theme::f_reg(12.5))
-                                .color(p.txt2),
+                            egui::RichText::new(format!(
+                                "{} \u{00B7} #{} \u{00B7} {} slots",
+                                dev.vendor, serial, PROFILES
+                            ))
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("Connected").font(theme::f_sb(12.5)).color(p.txt2));
+                        ui.label(
+                            egui::RichText::new("Connected")
+                                .font(theme::f_sb(12.5))
+                                .color(p.txt2),
+                        );
                         ui.add_space(5.0);
                         theme::status_dot(ui, p.ok, 8.0);
                     });
@@ -23692,14 +24252,14 @@ mod tests {
         app.apply_rename_actions(&a, /*open*/ true, false, false);
         assert!(app.rename_target.is_some());
         let t = app.rename_target.clone().expect("target pinned on open");
-        assert_eq!(t.serial, "AAA");
+        assert_eq!(t.serials, vec!["AAA".to_string()]);
         assert_eq!(t.name_at_open.as_deref(), Some("old-a"));
 
         // Selection moves to another key mid-edit — the pin is unchanged.
         app.devices = vec![test_key("serial:B", "BBB", Some("old-b"))];
         app.selected_device = Some("serial:B".into());
         let still = app.rename_target.clone().unwrap();
-        assert_eq!(still.serial, "AAA", "pin must not follow the selection");
+        assert_eq!(still.serials[0], "AAA", "pin must not follow the selection");
 
         // Cancel clears the pin and the field.
         app.apply_rename_actions(&a, false, /*cancel*/ true, false);
@@ -23714,6 +24274,122 @@ mod tests {
         let no_serial = test_key("winfido:x", "", None);
         app.apply_rename_actions(&no_serial, true, false, false);
         assert!(app.rename_target.is_none());
+    }
+
+    /// A FIDO2 key on USB with large-blob storage, named on the key as `on_key`
+    /// says (`None`: storage, no name).
+    fn key_with_storage(on_key: Option<&str>) -> Device {
+        let mut d = test_key("serial:A", "AAA", on_key);
+        d.caps.insert(Caps::FIDO2);
+        d.hid_path = Some(std::path::PathBuf::from("/dev/hidraw9"));
+        d.naming = match on_key {
+            Some(n) => keyroost_resolve::Naming {
+                plain: Some(n.into()),
+                source: Some(keyroost_resolve::NameSource::Key),
+                selectable: true,
+                on_key: keyroost_resolve::KeyLabel::Present(n.into()),
+                missing_on_key: None,
+            },
+            None => keyroost_resolve::Naming {
+                on_key: keyroost_resolve::KeyLabel::Absent,
+                ..Default::default()
+            },
+        };
+        d
+    }
+
+    #[test]
+    fn naming_dialog_offers_the_key_and_preselects_where_the_name_lives() {
+        let mut app = App::default();
+        app.apply_rename_actions(&key_with_storage(None), true, false, false);
+        let t = app.rename_target.clone().unwrap();
+        assert_eq!(
+            t.choices,
+            vec![
+                device::NameStoreChoice::Computer,
+                device::NameStoreChoice::Key
+            ]
+        );
+        assert_eq!(t.store, device::NameStoreChoice::Computer);
+        app.close_rename();
+        app.apply_rename_actions(&key_with_storage(Some("Desk")), true, false, false);
+        let t = app.rename_target.clone().unwrap();
+        assert_eq!(t.store, device::NameStoreChoice::Key);
+        assert_eq!(app.rename_input, "Desk");
+        // Unchanged: nothing goes to the key, so no PIN field.
+        assert!(!app.rename_goes_on_key());
+        // A rename does; without an unlocked session it needs a typed PIN.
+        app.rename_input = "Lab".into();
+        assert!(app.rename_goes_on_key());
+        assert!(app.rename_needs_pin());
+    }
+
+    #[test]
+    fn naming_dialog_blocks_a_local_rename_of_a_name_on_the_key() {
+        let mut app = App::default();
+        app.apply_rename_actions(&key_with_storage(Some("Desk")), true, false, false);
+        app.rename_target.as_mut().unwrap().store = device::NameStoreChoice::Computer;
+        app.rename_input = "Lab".into();
+        assert!(app.rename_blocked());
+        app.save_device_name();
+        let t = app.rename_target.clone().expect("field stays open");
+        assert_eq!(t.error.as_deref(), Some(device::NAME_IS_ON_THE_KEY));
+        // Clearing is allowed from either choice: it goes to the key.
+        app.rename_input.clear();
+        assert!(!app.rename_blocked());
+        assert!(app.rename_goes_on_key());
+    }
+
+    #[test]
+    fn naming_dialog_asks_for_the_pin_before_anything_else() {
+        let mut app = App::default();
+        app.apply_rename_actions(&key_with_storage(None), true, false, false);
+        app.rename_target.as_mut().unwrap().store = device::NameStoreChoice::Key;
+        app.rename_input = "Lab".into();
+        app.save_device_name();
+        let t = app.rename_target.clone().expect("field stays open");
+        assert!(t.error.unwrap().contains("PIN"));
+        assert!(!t.saving);
+        assert!(t.confirm.is_none());
+    }
+
+    #[test]
+    fn naming_dialog_asks_before_removing_the_name_on_the_key_and_wipes_the_pin() {
+        let mut app = App::default();
+        let mut d = key_with_storage(Some("Desk"));
+        // No HID path at save time: the write is refused without any I/O.
+        app.apply_rename_actions(&d, true, false, false);
+        app.rename_target.as_mut().unwrap().hid_path = None;
+        app.rename_input.clear();
+        app.rename_pin = "1234".into();
+        app.save_device_name();
+        let t = app.rename_target.clone().unwrap();
+        assert_eq!(
+            t.confirm,
+            Some((
+                "Remove the name \"Desk\" stored on the key?".to_string(),
+                None
+            ))
+        );
+        assert_eq!(app.rename_pin, "1234", "kept until the answer");
+        // Cancel the question: nothing happens, the field stays open.
+        app.apply_rename_question(false, true);
+        assert!(app.rename_target.as_ref().unwrap().confirm.is_none());
+        // Ask again and confirm: the PIN is taken (and wiped) at once.
+        app.save_device_name();
+        app.apply_rename_question(true, false);
+        assert!(app.rename_pin.is_empty());
+        let t = app.rename_target.clone().unwrap();
+        assert_eq!(t.error.as_deref(), Some(KEY_NAME_NO_STORAGE));
+        // Closing wipes a typed PIN too.
+        app.rename_pin = "1234".into();
+        app.close_rename();
+        assert!(app.rename_pin.is_empty());
+        d.naming.on_key = keyroost_resolve::KeyLabel::Unsupported;
+        app.apply_rename_actions(&d, true, false, false);
+        let t = app.rename_target.clone().unwrap();
+        assert!(t.lacks_storage);
+        assert_eq!(t.choices, vec![device::NameStoreChoice::Computer]);
     }
 
     /// The OpenPGP mismatch guard is inert (the PIN forms have no confirm field),
