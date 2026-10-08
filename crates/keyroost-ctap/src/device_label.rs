@@ -23,10 +23,22 @@
 //! SHOULD use Unicode NFC. Callers validate the label's text (keyroost uses
 //! `keyroost_keyring::validate_name`); this module checks only its type and
 //! length.
+//!
+//! # Reading and writing
+//!
+//! [`read_label`] needs no PIN. A change is planned from an array already
+//! read ([`plan_label_change`], pure, which refuses rather than evicting
+//! anything to make room) and then written with [`apply_label_plan`], which
+//! re-reads the array first and sends nothing if it changed meanwhile, so
+//! another tool's entry written in between is never lost.
 
 use crate::cbor::{self, Value};
-use crate::cmd::CtapError;
-use crate::large_blobs::{gcm_decrypt, gcm_encrypt, inflate_raw, LargeBlobEntry};
+use crate::client_pin::PinUvAuthToken;
+use crate::cmd::{AuthenticatorInfo, CtapError};
+use crate::large_blobs::{
+    self, gcm_decrypt, gcm_encrypt, inflate_raw, LargeBlobArray, LargeBlobEntry,
+};
+use crate::transport::CtapTransport;
 
 /// The string hashed to the fixed key every name entry is encrypted under.
 pub const LABEL_KEY_INFO: &[u8] = b"FIDO2 large-blob device label v1";
@@ -161,7 +173,7 @@ pub fn stored_deflate(data: &[u8]) -> Vec<u8> {
 }
 
 /// The large-blob entry holding `l`, encrypted under [`label_key`] with
-/// `nonce`, which must be fresh and random outside tests.
+/// `nonce` (use [`random_nonce`] outside tests).
 pub fn encode_entry(l: &DeviceLabel, nonce: [u8; 12]) -> Result<LargeBlobEntry, LabelError> {
     let p = plaintext(l)?;
     let orig_size = p.len() as u64;
@@ -193,6 +205,106 @@ pub fn decode_entry(e: &LargeBlobEntry) -> Option<DeviceLabel> {
         label: label.to_owned(),
         writer: writer.map(str::to_owned),
     })
+}
+
+/// What a key says about its own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelState {
+    /// The key has no large-blob storage.
+    Unsupported,
+    /// The key has storage but no name entry.
+    Absent,
+    Present(DeviceLabel),
+}
+
+/// Read the key's name. Needs no PIN: the large-blob array is readable by
+/// anyone. `Unsupported` when getInfo lacks `largeBlobs: true`.
+pub fn read_label(
+    dev: &mut impl CtapTransport,
+    info: &AuthenticatorInfo,
+) -> Result<LabelState, CtapError> {
+    if info.option("largeBlobs") != Some(true) {
+        return Ok(LabelState::Unsupported);
+    }
+    Ok(match large_blobs::read(dev, info)?.label() {
+        Some((_, label)) => LabelState::Present(label),
+        None => LabelState::Absent,
+    })
+}
+
+/// A checked change to the key's name, ready to write with
+/// [`apply_label_plan`].
+#[derive(Debug, Clone)]
+pub struct LabelPlan {
+    /// The array the plan was made from, as read (without the checksum).
+    before_raw: Vec<u8>,
+    /// What will be written (with the checksum).
+    serialized: Vec<u8>,
+    /// The name the key had when the plan was made.
+    pub previous: Option<DeviceLabel>,
+    /// The array as it will be after the write.
+    pub after: LargeBlobArray,
+}
+
+/// Plan setting (`Some`) or clearing (`None`) the name on an array read
+/// from the key. Pure: nothing is sent. Refuses with `Unsupported` when the
+/// key has no large-blob storage, `NoPin` when it has no FIDO PIN set (the
+/// write needs a PIN token), `InvalidLabel`, and `TooLarge` when the result
+/// would not fit `maxSerializedLargeBlobArray` (the spec floor of 1024 bytes
+/// when the key doesn't say). Never evicts other entries to make room.
+pub fn plan_label_change(
+    current: &LargeBlobArray,
+    info: &AuthenticatorInfo,
+    label: Option<&DeviceLabel>,
+    nonce: [u8; 12],
+) -> Result<LabelPlan, LabelError> {
+    if info.option("largeBlobs") != Some(true) {
+        return Err(LabelError::Unsupported);
+    }
+    if info.option("clientPin") != Some(true) {
+        return Err(LabelError::NoPin);
+    }
+    let after = current.with_label(label, nonce)?;
+    let serialized = after.serialize_with_checksum()?;
+    let capacity = current.capacity(info);
+    let size = serialized.len() as u64;
+    if size > capacity.max_bytes {
+        return Err(LabelError::TooLarge {
+            need: size.saturating_sub(capacity.used_bytes),
+            free: capacity.free_bytes,
+        });
+    }
+    Ok(LabelPlan {
+        before_raw: current.raw_array().to_vec(),
+        serialized,
+        previous: current.label().map(|(_, l)| l),
+        after,
+    })
+}
+
+/// Write `plan`, but only over the array it was made from: re-read the
+/// array and refuse with `Changed`, sending nothing, unless its bytes equal
+/// the ones planned from. `token` needs the large-blob-write permission.
+pub fn apply_label_plan(
+    dev: &mut impl CtapTransport,
+    info: &AuthenticatorInfo,
+    token: &PinUvAuthToken,
+    plan: &LabelPlan,
+) -> Result<(), LabelError> {
+    let now = large_blobs::read(dev, info)?;
+    if now.raw_array() != plan.before_raw.as_slice() {
+        return Err(LabelError::Changed);
+    }
+    large_blobs::write(dev, info, token, &plan.serialized)?;
+    Ok(())
+}
+
+/// A fresh random 12-byte nonce for [`encode_entry`].
+pub fn random_nonce() -> [u8; 12] {
+    use rand_core::{OsRng, RngCore};
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
 }
 
 #[cfg(test)]
@@ -574,5 +686,258 @@ mod tests {
             .unwrap()
             .only_label();
         assert_eq!(hex(&none.serialize_with_checksum().unwrap()[..1]), "80");
+    }
+
+    // ---- reading and writing through a scripted key ----
+
+    use crate::client_pin::PinUvAuthToken;
+    use crate::pin::PIN_PROTOCOL_V1;
+
+    /// A key that answers `get` from a stored array and records every
+    /// `set`. Each full read (a `get` at offset 0) takes the next array in
+    /// `reads`; once they run out the last one keeps answering.
+    struct FakeKey {
+        reads: Vec<Vec<u8>>,
+        current: Vec<u8>,
+        sets: Vec<(u64, Vec<u8>, Option<u64>)>,
+        calls: usize,
+    }
+
+    impl FakeKey {
+        fn new(reads: Vec<Vec<u8>>) -> Self {
+            FakeKey {
+                reads,
+                current: Vec::new(),
+                sets: Vec::new(),
+                calls: 0,
+            }
+        }
+
+        /// The recorded `set` fragments, reassembled.
+        fn written(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            for (offset, fragment, _) in &self.sets {
+                assert_eq!(*offset as usize, out.len(), "fragments are contiguous");
+                out.extend_from_slice(fragment);
+            }
+            out
+        }
+    }
+
+    impl CtapTransport for FakeKey {
+        fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            self.calls += 1;
+            assert_eq!(cmd, crate::hid::CTAPHID_CBOR);
+            assert_eq!(payload[0], 0x0c, "authenticatorLargeBlobs");
+            let (req, _) = cbor::decode(&payload[1..]).unwrap();
+            let offset = req.get_uint_key(3).and_then(Value::as_uint).unwrap();
+            if let Some(count) = req.get_uint_key(1).and_then(Value::as_uint) {
+                if offset == 0 && !self.reads.is_empty() {
+                    self.current = self.reads.remove(0);
+                }
+                let from = (offset as usize).min(self.current.len());
+                let to = (from + count as usize).min(self.current.len());
+                let mut resp = vec![0x00];
+                resp.extend_from_slice(&cbor::encode(&Value::Map(vec![(
+                    Value::UInt(1),
+                    Value::Bytes(self.current[from..to].to_vec()),
+                )])));
+                return Ok(resp);
+            }
+            let fragment = req.get_uint_key(2).and_then(Value::as_bytes).unwrap();
+            let length = req.get_uint_key(4).and_then(Value::as_uint);
+            self.sets.push((offset, fragment.to_vec(), length));
+            Ok(vec![0x00])
+        }
+    }
+
+    fn token() -> PinUvAuthToken {
+        PinUvAuthToken {
+            protocol: PIN_PROTOCOL_V1,
+            token: vec![0x42; 16],
+        }
+    }
+
+    fn info(large_blobs: bool, client_pin: Option<bool>) -> AuthenticatorInfo {
+        let mut info = AuthenticatorInfo::default();
+        if large_blobs {
+            info.options.push(("largeBlobs".into(), true));
+        }
+        if let Some(set) = client_pin {
+            info.options.push(("clientPin".into(), set));
+        }
+        info
+    }
+
+    /// The array (without checksum) and its stored form (with).
+    fn stored(arr: &LargeBlobArray) -> (LargeBlobArray, Vec<u8>) {
+        let bytes = arr.serialize_with_checksum().unwrap();
+        let parsed = LargeBlobArray::parse(&bytes[..bytes.len() - 16]).unwrap();
+        (parsed, bytes)
+    }
+
+    fn empty() -> LargeBlobArray {
+        LargeBlobArray::parse(&[0x80]).unwrap()
+    }
+
+    /// An array holding one keyroost note, `total` bytes stored.
+    fn array_of_size(total: usize) -> LargeBlobArray {
+        (0..total)
+            .map(|n| empty().with_text_note(&"x".repeat(n)))
+            .find(|a| a.serialize_with_checksum().unwrap().len() == total)
+            .expect("a note size that lands exactly on the total")
+    }
+
+    #[test]
+    fn read_label_unsupported_without_largeblobs_option() {
+        let mut key = FakeKey::new(vec![]);
+        assert_eq!(
+            read_label(&mut key, &info(false, Some(true))).unwrap(),
+            LabelState::Unsupported
+        );
+        assert_eq!(key.calls, 0, "nothing is sent to a key without storage");
+    }
+
+    #[test]
+    fn read_label_absent_and_present() {
+        let (_, none) = stored(&empty().with_text_note("note"));
+        let (_, some) = stored(
+            &empty()
+                .with_text_note("note")
+                .with_label(Some(&v2()), NONCE)
+                .unwrap(),
+        );
+        let mut key = FakeKey::new(vec![none, some]);
+        let i = info(true, None); // no PIN needed to read
+        assert_eq!(read_label(&mut key, &i).unwrap(), LabelState::Absent);
+        assert_eq!(read_label(&mut key, &i).unwrap(), LabelState::Present(v2()));
+        assert!(key.sets.is_empty());
+    }
+
+    #[test]
+    fn plan_refuses_when_full() {
+        let current = array_of_size(1000);
+        // The V1 entry is 58 bytes; the array header stays one byte.
+        for max in [Some(1024), None] {
+            let mut i = info(true, Some(true));
+            i.max_serialized_large_blob_array = max;
+            match plan_label_change(&current, &i, Some(&v1()), NONCE) {
+                Err(LabelError::TooLarge { need, free }) => assert_eq!((need, free), (58, 24)),
+                other => panic!("expected TooLarge, got {other:?}"),
+            }
+        }
+        // It fits exactly when the key has the room.
+        let mut i = info(true, Some(true));
+        i.max_serialized_large_blob_array = Some(1058);
+        let plan = plan_label_change(&current, &i, Some(&v1()), NONCE).unwrap();
+        assert_eq!(plan.serialized.len(), 1058);
+    }
+
+    #[test]
+    fn plan_refuses_without_pin() {
+        for pin in [None, Some(false)] {
+            assert!(matches!(
+                plan_label_change(&empty(), &info(true, pin), Some(&v1()), NONCE),
+                Err(LabelError::NoPin)
+            ));
+        }
+    }
+
+    #[test]
+    fn plan_refuses_unsupported() {
+        assert!(matches!(
+            plan_label_change(&empty(), &info(false, Some(true)), Some(&v1()), NONCE),
+            Err(LabelError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn plan_refuses_an_invalid_label_and_a_trailing_array() {
+        let i = info(true, Some(true));
+        let bad = DeviceLabel {
+            label: "x".repeat(65),
+            writer: None,
+        };
+        assert!(matches!(
+            plan_label_change(&empty(), &i, Some(&bad), NONCE),
+            Err(LabelError::InvalidLabel)
+        ));
+        // Bytes after the array would be dropped by the rewrite.
+        let trailing = LargeBlobArray::parse(&[0x80, 0x00]).unwrap();
+        assert!(matches!(
+            plan_label_change(&trailing, &i, Some(&v1()), NONCE),
+            Err(LabelError::Ctap(_))
+        ));
+    }
+
+    #[test]
+    fn plan_reports_previous_and_keeps_other_entries() {
+        let (current, _) = stored(
+            &empty()
+                .with_label(Some(&v2()), NONCE)
+                .unwrap()
+                .with_text_note("note"),
+        );
+        let plan =
+            plan_label_change(&current, &info(true, Some(true)), Some(&v1()), NONCE).unwrap();
+        assert_eq!(plan.previous, Some(v2()));
+        assert_eq!(plan.before_raw, current.raw_array());
+        assert_eq!(plan.after.label(), Some((1, v1())));
+        assert_eq!(
+            plan.after.entry(0).unwrap().as_text().as_deref(),
+            Some("note")
+        );
+        assert_eq!(
+            plan.serialized,
+            plan.after.serialize_with_checksum().unwrap()
+        );
+        let cleared = plan_label_change(&current, &info(true, Some(true)), None, NONCE).unwrap();
+        assert_eq!(cleared.after.label(), None);
+        assert_eq!(cleared.after.len(), 1);
+    }
+
+    #[test]
+    fn apply_refuses_when_the_array_changed_and_sends_no_set() {
+        let (current, before) = stored(&empty().with_text_note("note"));
+        let (_, changed) = stored(&empty().with_text_note("note 2"));
+        let i = info(true, Some(true));
+        let plan = plan_label_change(&current, &i, Some(&v1()), NONCE).unwrap();
+        let mut key = FakeKey::new(vec![changed]);
+        assert!(matches!(
+            apply_label_plan(&mut key, &i, &token(), &plan),
+            Err(LabelError::Changed)
+        ));
+        assert!(key.sets.is_empty());
+        // Unchanged, the same plan goes through.
+        let mut key = FakeKey::new(vec![before]);
+        apply_label_plan(&mut key, &i, &token(), &plan).unwrap();
+        assert_eq!(key.written(), plan.serialized);
+    }
+
+    #[test]
+    fn apply_writes_exactly_the_planned_bytes() {
+        // Single fragment (default maxMsgSize) and several (1536 → 1472-byte
+        // fragments over a ~2000-byte array).
+        let small = empty().with_text_note("note");
+        let big = empty().with_text_note(&"y".repeat(2000));
+        for (arr, max_msg, fragments) in [(small, None, 1), (big, Some(1536), 2)] {
+            let (current, before) = stored(&arr);
+            let mut i = info(true, Some(true));
+            i.max_msg_size = max_msg;
+            i.max_serialized_large_blob_array = Some(4096);
+            let plan = plan_label_change(&current, &i, Some(&v2()), NONCE).unwrap();
+            let mut key = FakeKey::new(vec![before]);
+            apply_label_plan(&mut key, &i, &token(), &plan).unwrap();
+            assert_eq!(key.sets.len(), fragments);
+            assert_eq!(key.written(), plan.serialized);
+            // Only the first fragment declares the total length.
+            assert_eq!(key.sets[0].2, Some(plan.serialized.len() as u64));
+            assert!(key.sets[1..].iter().all(|s| s.2.is_none()));
+        }
+    }
+
+    #[test]
+    fn random_nonces_differ() {
+        assert_ne!(random_nonce(), random_nonce());
     }
 }
