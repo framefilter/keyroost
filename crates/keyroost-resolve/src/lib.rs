@@ -23,10 +23,10 @@ pub mod identity;
 pub mod names;
 pub mod select;
 pub use device::{
-    correlate, correlate_live, correlate_with, enumerate, enumerate_with, exclude_unresettable_piv,
-    factory_reset_plan, forget_key_names, load_keyring_for_scan, name_from_keys,
-    take_scan_warnings, with_key_names_forgotten, CapState, Caps, Device, DeviceId, DeviceKind,
-    EnumerateOptions, MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport,
+    add_key_names, correlate, correlate_live, correlate_with, enumerate, enumerate_with,
+    exclude_unresettable_piv, factory_reset_plan, forget_key_names, load_keyring_for_scan,
+    name_from_keys, take_scan_warnings, with_key_names_forgotten, CapState, Caps, Device, DeviceId,
+    DeviceKind, EnumerateOptions, MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport,
     PIV_GLOBAL_RESET_LABEL,
 };
 pub use identity::{
@@ -39,8 +39,8 @@ pub use names::{
 };
 pub use select::{
     device_value, endpoint, list_number, list_order, parse_device_spec, resolve_target, row_label,
-    rows_matching, shell_quote, Candidate, Choice, DeviceSpec, Need, NoPicker, Picker, SelectError,
-    SelectedBy, Selector, Target,
+    rows_matching, selection_needs_key_names, shell_quote, Candidate, Choice, DeviceSpec, Need,
+    NoPicker, Picker, SelectError, SelectedBy, Selector, Target,
 };
 
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.

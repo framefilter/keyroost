@@ -189,6 +189,32 @@ pub fn rows_matching(devices: &[Device], spec: DeviceSpec<'_>) -> Vec<usize> {
     hits
 }
 
+/// Whether resolving `sel` for `need` over `devices` could depend on names
+/// stored on keys, so a scan must read them first (it costs a CTAP round
+/// trip per FIDO key). `devices` already carry this computer's own names.
+///
+/// Not needed when `--reader` / `--path` override the choice, when
+/// `--device` is a connected key's exact serial, a `serial:` / `list:` form
+/// or an existing list number, or when no `--device` is given and at most
+/// one key qualifies (nothing to tell apart; the announce line shows the
+/// local name only). Needed for anything that could be a name, and for the
+/// picker or refusal that lists several keys.
+pub fn selection_needs_key_names(devices: &[Device], sel: &Selector<'_>, need: Need) -> bool {
+    if sel.reader.is_some() || sel.path.is_some() {
+        return false;
+    }
+    match sel.device.map(parse_device_spec) {
+        Some(DeviceSpec::Serial(_) | DeviceSpec::Number(_) | DeviceSpec::BadNumber(_)) => false,
+        Some(DeviceSpec::Name(_)) => true,
+        Some(DeviceSpec::Any(v)) => {
+            let serial = !v.is_empty() && devices.iter().any(|d| d.serial.eq_ignore_ascii_case(v));
+            let number = parse_number(v).is_some_and(|k| (1..=devices.len()).contains(&k));
+            !(serial || number)
+        }
+        None => devices.iter().filter(|d| need.admits(d)).count() > 1,
+    }
+}
+
 /// The exact `--device` value that selects `devices[index]` and nothing
 /// else: its name, serial or list number when that alone is unique, else
 /// the prefixed form. Used by refusals and `list --json`.
@@ -1447,6 +1473,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, SelectError::NotFound { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn key_names_are_read_only_when_a_name_could_decide() {
+        let devs = [yubi(), solo()];
+        let needs = |device: Option<&str>, need: Need| {
+            selection_needs_key_names(&devs, &sel(device, None, None), need)
+        };
+        // Chosen by serial, serial:/list: form or list number: never.
+        assert!(!needs(Some("11111111"), Need::Any));
+        assert!(!needs(Some("07a9568fbe31ad5dad1f2298476cf0d4"), Need::Any));
+        assert!(!needs(Some("serial:nope"), Need::Any));
+        assert!(!needs(Some("list:2"), Need::Any));
+        assert!(!needs(Some("list:x"), Need::Any));
+        assert!(!needs(Some("2"), Need::Any));
+        // Anything that could be a name: yes.
+        assert!(needs(Some("Work"), Need::Any));
+        assert!(needs(Some("name:11111111"), Need::Any));
+        assert!(needs(Some("9"), Need::Any));
+        // Overrides never.
+        let p = std::path::Path::new("/dev/hidraw0");
+        assert!(!selection_needs_key_names(
+            &devs,
+            &sel(None, Some("Yubico"), None),
+            Need::Any
+        ));
+        assert!(!selection_needs_key_names(
+            &devs,
+            &sel(None, None, Some(p)),
+            Need::Any
+        ));
+        // No --device: only when several keys qualify (picker / refusal).
+        assert!(!needs(None, Need::Oath));
+        assert!(needs(None, Need::Piv));
+        assert!(!needs(None, Need::Molto2));
     }
 
     #[test]

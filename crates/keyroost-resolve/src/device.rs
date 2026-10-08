@@ -1268,6 +1268,14 @@ pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool,
     }
 }
 
+/// [`name_from_keys`] over rows from a scan that skipped name reads
+/// (`skip_key_names`), loading `keys.json` itself: for a caller that learns
+/// only after scanning that it needs names stored on keys.
+pub fn add_key_names(devices: &mut [Device], debug: bool) {
+    let (keyring, may_save) = load_keyring_for_scan();
+    name_from_keys(devices, &keyring, may_save, debug);
+}
+
 /// Build the unified device list (see [`enumerate`]) with options.
 pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
