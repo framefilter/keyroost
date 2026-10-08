@@ -303,10 +303,25 @@ jobs:
           # the commits stay unsigned and `flatpak install` fails with "GPG
           # verification enabled, but no signatures found" — even though
           # `remote-info` (which checks only the summary) passes. This bit v0.7.0
-          # (issue #46). Then export the public key next to the repo so the
-          # .flatpakrepo can trust-pin it.
+          # (issue #46). build-sign covers one ref, so the .Debug runtime is
+          # signed separately. The appstream/appstream2 commits are written
+          # UNSIGNED by flatpak-builder's export, and build-update-repo skips
+          # re-committing an unchanged appstream tree (so it never signs them):
+          # sign those explicitly too (issue #167). Then export the public key
+          # next to the repo so the .flatpakrepo can trust-pin it.
           flatpak build-sign repo "${APP_ID}" --gpg-sign="${GPG_ID}" --gpg-homedir="${GNUPGHOME}"
+          flatpak build-sign repo --runtime "${APP_ID}.Debug" --gpg-sign="${GPG_ID}" --gpg-homedir="${GNUPGHOME}"
+          for ref in $(ostree --repo=repo refs | grep -E '^appstream2?/'); do
+            ostree --repo=repo gpg-sign --gpg-homedir="${GNUPGHOME}" "${ref}" "${GPG_ID}"
+          done
           flatpak build-update-repo --gpg-sign="${GPG_ID}" --gpg-homedir="${GNUPGHOME}" repo
+          # Guard: every ref must carry a detached signature, or the publish
+          # fails here instead of on users' machines.
+          for ref in $(ostree --repo=repo refs); do
+            c=$(ostree --repo=repo rev-parse "${ref}")
+            test -s "repo/objects/${c:0:2}/${c:2}.commitmeta" \
+              || { echo "::error::unsigned ref in the Flatpak repo: ${ref}"; exit 1; }
+          done
           gpg --homedir "${GNUPGHOME}" --export "${GPG_ID}" > repo/keyroost.gpg
           echo "signed=true" >> "$GITHUB_OUTPUT"
 
