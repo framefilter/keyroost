@@ -333,7 +333,7 @@ const CASES: &[(&[&str], &str)] = &[
     (&["key-name", "remove", "S3CRETVALUE"], "keyroostctl name"),
     (
         &["key-name", "list", "S3CRETVALUE"],
-        "`key-name remove` is now `name delete`",
+        "`key-name remove` is now `name clear`",
     ),
     (
         &["--device", "pin-set", "fido", "pin-set"],

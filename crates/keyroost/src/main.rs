@@ -5463,9 +5463,9 @@ impl App {
                     }
                 }
                 let mut dev = dev.ok_or_else(|| "could not open key".to_string())?;
-                // A name read from this key may change; never reuse an older read.
-                keyroost_resolve::forget_key_names();
-                keyroost_ctap::reset(&mut dev).map_err(|e| e.to_string())
+                // Names read from keys before or during the write are stale.
+                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::reset(&mut dev))
+                    .map_err(|e| e.to_string())
             })();
             Box::new(move |app: &mut App| {
                 App::apply_reset_path_outcome(app, for_device.as_ref(), result)
@@ -5486,24 +5486,24 @@ impl App {
             let result = (|| -> Result<(), String> {
                 let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(&reader)
                     .map_err(|e| e.to_string())?;
-                // A name read from this key may change; never reuse an older read.
-                keyroost_resolve::forget_key_names();
-                keyroost_ctap::reset(&mut dev).map_err(|e| {
-                    let s = e.to_string();
-                    // Rewrite the refusal here, not in the shared handler: its
-                    // NOT_ALLOWED advice ("unplug the key, plug it back in")
-                    // is USB advice, and following it would eject the card
-                    // for nothing.
-                    if s.contains("NOT_ALLOWED") || s.contains("0x30") {
-                        "the card refused the reset even straight after a power \
+                // Names read from keys before or during the write are stale.
+                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::reset(&mut dev))
+                    .map_err(|e| {
+                        let s = e.to_string();
+                        // Rewrite the refusal here, not in the shared handler: its
+                        // NOT_ALLOWED advice ("unplug the key, plug it back in")
+                        // is USB advice, and following it would eject the card
+                        // for nothing.
+                        if s.contains("NOT_ALLOWED") || s.contains("0x30") {
+                            "the card refused the reset even straight after a power \
                          cycle. Some cards only accept a FIDO reset over NFC \
                          (contactless) rather than a contact reader \u{2014} \
                          try a contactless reader or the vendor's mobile app."
-                            .to_string()
-                    } else {
-                        s
-                    }
-                })
+                                .to_string()
+                        } else {
+                            s
+                        }
+                    })
             })();
             Box::new(move |app: &mut App| {
                 App::apply_reset_path_outcome(app, for_device.as_ref(), result)
@@ -13983,9 +13983,8 @@ impl App {
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
-                // A name read from this key may change; never reuse an older read.
-                keyroost_resolve::forget_key_names();
-                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                // Names read from keys before or during the write are stale.
+                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
                     .map_err(|e| e.to_string())?;
 
                 let array =
@@ -14061,9 +14060,8 @@ impl App {
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
-                // A name read from this key may change; never reuse an older read.
-                keyroost_resolve::forget_key_names();
-                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                // Names read from keys before or during the write are stale.
+                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
                     .map_err(|e| e.to_string())?;
 
                 let array =
@@ -14193,9 +14191,8 @@ impl App {
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &live)?;
-                // A name read from this key may change; never reuse an older read.
-                keyroost_resolve::forget_key_names();
-                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                // Names read from keys before or during the write are stale.
+                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
                     .map_err(|e| e.to_string())?;
 
                 // Read back so the view reflects the authenticator's actual state.
@@ -14271,9 +14268,8 @@ impl App {
 
                 // Wipe every element, including any skipped (non-standard) ones.
                 let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
-                // A name read from this key may change; never reuse an older read.
-                keyroost_resolve::forget_key_names();
-                keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                // Names read from keys before or during the write are stale.
+                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
                     .map_err(|e| e.to_string())?;
 
                 // Read back so the view reflects the authenticator's actual state.

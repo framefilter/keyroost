@@ -53,6 +53,27 @@ pub(crate) struct ListRowJson {
     pub hid_paths: Vec<String>,
 }
 
+/// `keyroostctl name --json list`.
+#[derive(Serialize)]
+pub(crate) struct NamesJson {
+    pub names: Vec<NameRowJson>,
+}
+
+/// One name this computer knows, or one a connected key carries.
+#[derive(Serialize)]
+pub(crate) struct NameRowJson {
+    /// The name as shown (a key carrying another key's name has its serial
+    /// tail appended).
+    pub name: String,
+    /// "computer" or "key".
+    pub stored: &'static str,
+    /// "connected", "not-connected", "hidden", "missing-on-key",
+    /// "unmatched", "other-key" or "unrecorded".
+    pub status: &'static str,
+    /// The connected key's `list` number, if any.
+    pub number: Option<usize>,
+}
+
 /// `keyroostctl molto --json info`.
 #[derive(Serialize)]
 pub(crate) struct MoltoInfoJson {

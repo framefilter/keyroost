@@ -1007,12 +1007,53 @@ const LABEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 type LabelCache = Vec<((PathBuf, String), std::time::Instant, KeyLabel)>;
 static LABEL_CACHE: std::sync::Mutex<LabelCache> = std::sync::Mutex::new(Vec::new());
 
-/// Forget every name read from a key. Call before anything that writes a
-/// key's large-blob storage or resets it, so no scan reuses a stale read.
+/// Bumped by every [`forget_key_names`]: a read that started before a
+/// forget is never cached after it.
+static LABEL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn label_generation() -> u64 {
+    LABEL_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Forget every name read from a key. Call before and after anything that
+/// writes a key's large-blob storage or resets it, so no scan reuses a
+/// stale read; a read still under way when this runs is not cached.
 pub fn forget_key_names() {
     if let Ok(mut c) = LABEL_CACHE.lock() {
+        LABEL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         c.clear();
     }
+}
+
+/// Run `write` — anything that writes a key's large-blob storage or resets
+/// it — with every name read from keys forgotten before and after, so no
+/// scan reuses a name read before the write: neither one that starts during
+/// it nor one that was already reading.
+pub fn with_key_names_forgotten<T>(write: impl FnOnce() -> T) -> T {
+    forget_key_names();
+    let r = write();
+    forget_key_names();
+    r
+}
+
+/// Cache `label`, read under generation `read_gen`, unless a forget ran
+/// since (`now_gen` differs): a read that started before a write must not
+/// outlive it. Replaces older reads of `key` and drops expired ones.
+/// Returns whether it was cached.
+fn cache_label(
+    cache: &mut LabelCache,
+    read_gen: u64,
+    now_gen: u64,
+    key: (PathBuf, String),
+    at: std::time::Instant,
+    label: KeyLabel,
+) -> bool {
+    if read_gen != now_gen {
+        return false;
+    }
+    cache.retain(|(k, t, _)| *k != key && at.duration_since(*t) < LABEL_CACHE_TTL);
+    cache.push((key, at, label));
+    true
 }
 
 /// For every row with FIDO2 and a HID path: open it, ask getInfo, and read
@@ -1037,6 +1078,7 @@ fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabe
             labels.insert(d.id.clone(), l);
             continue;
         }
+        let read_gen = label_generation();
         let read = || -> Result<KeyLabel, String> {
             let (mut dev, _) =
                 keyroost_ctap::CtapHidDevice::open(path).map_err(|e| e.to_string())?;
@@ -1063,8 +1105,16 @@ fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabe
             KeyLabel::ReadFailed
         });
         if let Ok(mut c) = LABEL_CACHE.lock() {
-            c.retain(|(k, at, _)| *k != key && now.duration_since(*at) < LABEL_CACHE_TTL);
-            c.push((key, now, label.clone()));
+            // Under the lock, so no forget can slip in between the check
+            // and the insert.
+            cache_label(
+                &mut c,
+                read_gen,
+                label_generation(),
+                key,
+                now,
+                label.clone(),
+            );
         }
         labels.insert(d.id.clone(), label);
     }
@@ -1082,6 +1132,8 @@ struct Learned {
     dropped: usize,
     /// Why what the pass learned couldn't be saved.
     save_error: Option<String>,
+    /// Changes learned but not saved because nothing may be saved.
+    unsaved: usize,
 }
 
 /// Record `updates` in the `keys.json` at `path`, re-read just before
@@ -1125,6 +1177,7 @@ fn learn_names(
         return learned;
     }
     let Some(path) = save else {
+        learned.unsaved = updates.len();
         return learned;
     };
     match record_updates_at(path, &updates) {
@@ -1136,6 +1189,21 @@ fn learn_names(
         Err(e) => learned.save_error = Some(e.to_string()),
     }
     learned
+}
+
+/// The warning for names read from keys that couldn't be recorded.
+fn unrecorded_names_warning(why: &str) -> String {
+    format!(
+        "names read from keys couldn't be recorded in keys.json ({why}); they are \
+         shown, but --device can't select a key by them yet"
+    )
+}
+
+/// The same warning when there is no config directory to record names in.
+/// (A keys.json that couldn't be loaded was already reported on its own.)
+fn unsaved_names_warning(learned: &Learned, has_config_dir: bool) -> Option<String> {
+    (learned.unsaved > 0 && !has_config_dir)
+        .then(|| unrecorded_names_warning(&keyroost_keyring::KeyringError::NoConfigDir.to_string()))
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -1157,10 +1225,10 @@ pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool,
     };
     let learned = learn_names(devices, keyring, &labels, path.as_deref());
     if let Some(e) = &learned.save_error {
-        warn_once(format!(
-            "names read from keys couldn't be recorded in keys.json ({e}); they are \
-             shown, but --device can't select a key by them yet"
-        ));
+        warn_once(unrecorded_names_warning(e));
+    }
+    if let Some(w) = unsaved_names_warning(&learned, keyroost_keyring::config_path().is_some()) {
+        warn_once(w);
     }
     if debug {
         let mut line = format!(
@@ -3090,6 +3158,7 @@ mod plan_tests {
                 recorded: 1,
                 dropped: 0,
                 save_error: None,
+                unsaved: 0,
             }
         );
         assert!(Keyring::load_from(&path).unwrap().holder("Work").is_some());
@@ -3107,8 +3176,70 @@ mod plan_tests {
         let labels = work_labels(&devs);
         let got = learn_names(&mut devs, &Keyring::default(), &labels, None);
         assert_eq!((got.recorded, got.dropped), (0, 0));
+        assert_eq!(got.unsaved, 1);
         let work = devs.iter().find(|d| d.name.as_deref() == Some("Work"));
         assert!(work.is_some_and(|d| !d.naming.selectable));
+    }
+
+    #[test]
+    fn no_config_dir_warns_like_a_failed_save() {
+        let pending = Learned {
+            unsaved: 1,
+            ..Learned::default()
+        };
+        let w = unsaved_names_warning(&pending, false).unwrap();
+        assert!(
+            w.starts_with("names read from keys couldn't be recorded in keys.json ("),
+            "{w}"
+        );
+        assert!(w.contains("could not determine config dir"), "{w}");
+        assert!(
+            w.ends_with("--device can't select a key by them yet"),
+            "{w}"
+        );
+        // With a config dir, a keys.json that couldn't be loaded was already
+        // reported; with nothing pending there is nothing to say.
+        assert_eq!(unsaved_names_warning(&pending, true), None);
+        assert_eq!(unsaved_names_warning(&Learned::default(), false), None);
+    }
+
+    #[test]
+    fn a_name_read_before_a_forget_is_never_cached() {
+        let mut cache = LabelCache::new();
+        let key = (PathBuf::from("/dev/hidraw-t"), "12345678".to_string());
+        let now = std::time::Instant::now();
+        let before = label_generation();
+        forget_key_names();
+        assert_ne!(label_generation(), before);
+        // A read that started before the forget lands after it: dropped.
+        assert!(!cache_label(
+            &mut cache,
+            before,
+            before + 1,
+            key.clone(),
+            now,
+            KeyLabel::Absent
+        ));
+        assert!(cache.is_empty());
+        // A read with no forget in between is kept, replacing older ones.
+        assert!(cache_label(
+            &mut cache,
+            7,
+            7,
+            key.clone(),
+            now,
+            KeyLabel::Absent
+        ));
+        assert!(cache_label(
+            &mut cache,
+            7,
+            7,
+            key,
+            now,
+            KeyLabel::Present("Work".into())
+        ));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].2, KeyLabel::Present("Work".into()));
     }
 
     #[test]

@@ -94,7 +94,8 @@ enum Cmd {
     /// Diagnose the local environment: PC/SC service, readers, FIDO HID
     /// access, udev rules, registry permissions. Read-only, touches no key.
     Doctor,
-    /// Manage friendly names for security keys (opt-in; stored in keys.json).
+    /// Name security keys: on this computer (keys.json) or on the key itself,
+    /// where the name is visible to anyone who has the key.
     Name {
         #[command(subcommand)]
         cmd: NameCmd,
@@ -1881,31 +1882,75 @@ fn pin_kind(admin: bool) -> OpenpgpPinKind {
     }
 }
 
-/// Subcommands for the `name` friendly-name registry.
+/// Name a key, rename it, or remove its name. A name lives on this computer
+/// (keys.json, the default) or on the key itself (its FIDO2 large-blob
+/// storage, visible to anyone who has the key). Select the key with -d.
 #[derive(Subcommand)]
 enum NameCmd {
-    /// Record a friendly name for a connected key. Writes the key's serial to
-    /// keys.json on this computer (opt-in) so it's recognizable by name later.
-    Add {
-        /// Friendly label to assign, e.g. "Signing YubiKey". Any text up to 64
-        /// characters — letters of any script, digits, spaces, punctuation;
-        /// only blank names and control / zero-width / bidi characters are
-        /// rejected.
+    /// Name the selected key, or rename it. Renaming keeps the name where it
+    /// is unless --store says otherwise.
+    ///
+    /// A name stored on the key travels with it and is visible to anyone who
+    /// has the key; changing or replacing it needs the FIDO PIN.
+    Set {
+        /// Any text up to 64 characters; control, zero-width and bidi
+        /// characters are rejected.
         name: String,
-        /// Which connected key to name. Omit to auto-pick / choose interactively.
-        #[arg(long, value_name = "PATH")]
+        /// Where to keep the name: `local` (this computer; the default for an
+        /// unnamed key) or `key` (on the key; needs the FIDO PIN; visible to
+        /// anyone who has the key).
+        #[arg(long, value_enum, value_name = "WHERE")]
+        store: Option<StoreArg>,
+        /// Replace a name stored on the key without asking (required when not
+        /// run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// The FIDO PIN, for a name stored on the key: env:NAME reads that
+        /// environment variable, stdin reads one line (hidden when typed at a
+        /// terminal). With neither, a terminal asks when the name goes on the
+        /// key.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
-        /// Name the key on this smart-card reader (substring).
-        #[arg(long, value_name = "SUBSTR")]
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// List configured key names and whether each is currently connected.
-    List,
-    /// Delete a friendly name from keys.json (the key itself is not touched).
-    Delete {
-        /// The friendly label to delete.
-        name: String,
+    /// Remove a name wherever it is stored: NAME, or the key selected with -d.
+    ///
+    /// Removing a name stored on the key needs the key connected and the FIDO
+    /// PIN; a name only on this computer is removed without either.
+    Clear {
+        /// The name to remove (omit it to clear the key selected with -d).
+        #[arg(conflicts_with_all = ["path", "reader"])]
+        name: Option<String>,
+        /// Remove a name stored on the key without asking (required when not
+        /// run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// The FIDO PIN, for a name stored on the key: env:NAME reads that
+        /// environment variable, stdin reads one line (hidden when typed at a
+        /// terminal). With neither, a terminal asks when the name is on the
+        /// key.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
     },
+    /// List the names this computer knows, where each lives, and which keys
+    /// are connected.
+    List,
+}
+
+/// `name set --store`: where a name lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum StoreArg {
+    /// This computer's keys.json.
+    Local,
+    /// The key's own large-blob storage.
+    Key,
 }
 
 /// Reader selection plus the (optional) password for a protected OATH applet.
@@ -3819,15 +3864,24 @@ fn otp_unlock_conflict(cmd: Option<&Cmd>) -> Option<&'static str> {
     }
 }
 
+/// The usage mistake in `-d KEY name clear NAME`: the name and the key
+/// would each pick what to clear. Checked straight after parsing, like
+/// [`otp_unlock_conflict`], and exits 2.
+fn name_clear_conflict(cmd: Option<&Cmd>, device: Option<&str>) -> Option<&'static str> {
+    match cmd {
+        Some(Cmd::Name {
+            cmd: NameCmd::Clear { name: Some(_), .. },
+        }) if device.is_some() => Some("pass a NAME or select the key with -d, not both"),
+        _ => None,
+    }
+}
+
 fn inert_device_flag(cmd: Option<&Cmd>) -> Option<&'static str> {
     match cmd? {
         Cmd::Doctor => Some("doctor"),
         Cmd::Completions { .. } => Some("completions"),
         Cmd::Manpage { .. } => Some("manpage"),
         Cmd::Name { cmd: NameCmd::List } => Some("name list"),
-        Cmd::Name {
-            cmd: NameCmd::Delete { .. },
-        } => Some("name delete"),
         Cmd::Molto {
             cmd: MoltoCmd::Import { dry_run: true, .. },
             ..
@@ -4521,7 +4575,7 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         parent: "",
         old: "key-name",
         new: "name",
-        note: "`key-name remove` is now `name delete`",
+        note: "`key-name add` is now `name set`, `key-name remove` is now `name clear`",
     },
     RetiredCommand {
         parent: "piv",
@@ -5211,7 +5265,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             e.exit()
         }
     };
-    if let Some(msg) = otp_unlock_conflict(cli.command.as_ref()) {
+    if let Some(msg) = otp_unlock_conflict(cli.command.as_ref())
+        .or_else(|| name_clear_conflict(cli.command.as_ref(), cli.device.as_deref()))
+    {
         eprintln!("error: {msg}");
         std::process::exit(2);
     }
@@ -6174,7 +6230,7 @@ fn run_doctor() {
             println!("✓ registry present at {}", path.display());
         }
         Some(path) => println!(
-            "– no registry yet ({}) — created on first `name add`",
+            "– no registry yet ({}) — created on first `name set`",
             path.display()
         ),
         None => println!("– no config dir resolvable (HOME/XDG unset?)"),
@@ -11306,19 +11362,658 @@ fn print_fingerprint(label: &str, fpr: &[u8; 20]) {
 
 fn run_name(cmd: &NameCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        NameCmd::Add { name, path, reader } => {
-            key_name_add(name, path.as_deref(), reader.as_deref())
-        }
-        NameCmd::List => key_name_list(),
-        NameCmd::Delete { name } => key_name_delete(name),
+        NameCmd::Set {
+            name,
+            store,
+            yes,
+            pin,
+            path,
+            reader,
+        } => name_set(
+            name,
+            *store,
+            *yes,
+            pin.as_ref(),
+            path.as_deref(),
+            reader.as_deref(),
+        ),
+        NameCmd::Clear {
+            name,
+            yes,
+            pin,
+            path,
+            reader,
+        } => name_clear(
+            name.as_deref(),
+            *yes,
+            pin.as_ref(),
+            path.as_deref(),
+            reader.as_deref(),
+        ),
+        NameCmd::List => name_list(),
     }
+}
+
+/// Where `name set` puts a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamePlace {
+    /// A `stored = computer` record in keys.json.
+    Computer,
+    /// The key's own large-blob storage, plus a `stored = key` record.
+    Key,
+}
+
+/// Why `name set` won't put a name where `--store` asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameSetRefusal {
+    /// `--store local` on a key that carries its name on the key: that name
+    /// would stay on the key and hide the local one.
+    NameIsOnTheKey,
+}
+
+impl NameSetRefusal {
+    /// The refusal, with `v` the `-d` value that selects the key.
+    fn message(self, v: &str) -> String {
+        match self {
+            NameSetRefusal::NameIsOnTheKey => format!(
+                "this key carries its name on the key; rename it there (omit --store) \
+                 or clear it first with: keyroostctl -d {v} name clear"
+            ),
+        }
+    }
+}
+
+/// Where `name set` puts the name, from where the key's name lives now
+/// (`current`) and `--store`. A rename stays where the name is unless
+/// `--store` says otherwise; a name on the key is never silently left there
+/// behind a new local one.
+fn plan_name_set(
+    current: Option<keyroost_resolve::NameSource>,
+    store: Option<StoreArg>,
+) -> Result<NamePlace, NameSetRefusal> {
+    use keyroost_resolve::NameSource;
+    match (current, store) {
+        (Some(NameSource::Key), Some(StoreArg::Local)) => Err(NameSetRefusal::NameIsOnTheKey),
+        (Some(NameSource::Key), _) | (_, Some(StoreArg::Key)) => Ok(NamePlace::Key),
+        _ => Ok(NamePlace::Computer),
+    }
+}
+
+/// Every serial `d` may be recorded under: its own, then its FIDO HID
+/// node's when that differs (the same set the naming pass looks names up by).
+fn row_serials(d: &keyroost_resolve::Device) -> Vec<&str> {
+    std::iter::once(d.serial.as_str())
+        .chain(d.hid_serial.as_deref())
+        .filter(|s| !keyroost_keyring::canonical_serial(s).is_empty())
+        .collect()
+}
+
+/// `'X'` for a copy-pasteable command, quoted even when plain so a hint
+/// reads the same for every name.
+fn quoted_name(name: &str) -> String {
+    format!("'{}'", sanitize_terminal(name).replace('\'', r"'\''"))
+}
+
+/// The `-d` value a hint for `d` uses: the `--device` given, else its serial.
+fn key_hint_value(d: &keyroost_resolve::Device) -> String {
+    let v = crate::target::device_flag().unwrap_or(&d.serial);
+    keyroost_resolve::shell_quote(&sanitize_terminal(v))
+}
+
+/// Refuse a name another key's record already holds (one that can't be
+/// matched to any key holds it too). `serials` are the selected key's.
+fn refuse_name_held_elsewhere(
+    keyring: &Keyring,
+    name: &str,
+    serials: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(h) = keyring.holder(name) else {
+        return Ok(());
+    };
+    let ours = h.fingerprint.is_some()
+        && serials
+            .iter()
+            .any(|s| keyring.fingerprint_of(s) == h.fingerprint);
+    if ours {
+        return Ok(());
+    }
+    let q = quoted_name(name);
+    Err(format!(
+        "the name {q} already belongs to another key on this computer; pick another \
+         name, or free it with: keyroostctl name clear {q}"
+    )
+    .into())
+}
+
+/// A key that has no storage for its own name.
+const NO_KEY_NAME_STORAGE: &str =
+    "this key has no storage for a name on the key (no FIDO2 large-blob support); use --store local";
+
+/// The message for a name change the key refused or can't hold. `v` is the
+/// `-d` value for hints; `used` is how many bytes the array uses now.
+fn label_refusal(e: keyroost_ctap::device_label::LabelError, v: &str, used: u64) -> String {
+    use keyroost_ctap::device_label::LabelError;
+    match e {
+        LabelError::Unsupported => NO_KEY_NAME_STORAGE.into(),
+        LabelError::NoPin => {
+            format!("this key has no FIDO PIN; set one first with: keyroostctl -d {v} fido pin set")
+        }
+        LabelError::TooLarge { size, max } => format!(
+            "not enough large-blob space for the name: need {} bytes, {} free",
+            size.saturating_sub(used),
+            max.saturating_sub(used)
+        ),
+        LabelError::Changed => {
+            "the large-blob array changed while waiting for the PIN; nothing was changed".into()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A planned change to the name stored on `dev`, made from the array read
+/// with no PIN; the handle is closed again before any question or PIN.
+fn plan_key_label(
+    dev: &keyroost_resolve::Device,
+    label: Option<&str>,
+    v: &str,
+) -> Result<keyroost_ctap::device_label::LabelPlan, Box<dyn std::error::Error>> {
+    use keyroost_ctap::device_label::{plan_label_change, random_nonce, DeviceLabel};
+    let path = dev
+        .hid_path
+        .as_deref()
+        .filter(|_| dev.caps.has(keyroost_resolve::Caps::FIDO2))
+        .ok_or(NO_KEY_NAME_STORAGE)?;
+    let (mut h, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    if !init.supports_cbor() {
+        return Err(NO_KEY_NAME_STORAGE.into());
+    }
+    let info = keyroost_ctap::get_info(&mut h)?;
+    if info.option("largeBlobs") != Some(true) {
+        return Err(NO_KEY_NAME_STORAGE.into());
+    }
+    let current = keyroost_ctap::large_blobs::read(&mut h, &info)?;
+    let new = label.map(|l| DeviceLabel {
+        label: l.to_string(),
+        writer: Some(keyroost_ctap::device_label::WRITER_KEYROOST.to_string()),
+    });
+    let used = current.capacity(&info).used_bytes;
+    plan_label_change(&current, &info, new.as_ref(), random_nonce())
+        .map_err(|e| label_refusal(e, v, used).into())
+}
+
+/// Write `plan` to `dev`: ask first when `question` is given (a name on the
+/// key is replaced or removed), read the FIDO PIN, re-find the key if the
+/// person was kept waiting, then write only over the array the plan was
+/// made from.
+fn apply_key_label(
+    sec: &mut Secrets,
+    src: Source<'_>,
+    yes: bool,
+    dev: &keyroost_resolve::Device,
+    plan: &keyroost_ctap::device_label::LabelPlan,
+    question: Option<&str>,
+    v: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sec.check(&FIDO_PIN, src)?;
+    let pin = confirm_then_read_pin(
+        &mut crate::prompt::RealTerm,
+        sec,
+        yes || question.is_none(),
+        question.unwrap_or_default(),
+        &crate::prompt::key_label(dev),
+        Some(dev),
+        src,
+    )?;
+    let path = crate::target::hid_path_of(dev)?;
+    let (mut h, _) = keyroost_ctap::CtapHidDevice::open(&path)?;
+    let info = keyroost_ctap::get_info(&mut h)?;
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        &mut h,
+        &pin,
+        &info,
+        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+    )?;
+    keyroost_resolve::with_key_names_forgotten(|| {
+        keyroost_ctap::device_label::apply_label_plan(&mut h, &info, &token, plan)
+    })
+    .map_err(|e| label_refusal(e, v, 0).into())
+}
+
+/// `name set`: name the selected key, or rename it, where
+/// [`plan_name_set`] says.
+fn name_set(
+    name: &str,
+    store: Option<StoreArg>,
+    yes: bool,
+    pin: Option<&SecretSource>,
+    path: Option<&Path>,
+    reader: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_resolve::{KeyLabel, NameSource};
+    keyroost_keyring::validate_name(name)?;
+    let mut sec = Secrets::real();
+    let src = Source::from_flag(pin);
+    if pin.is_some() {
+        sec.check(&FIDO_PIN, src)?;
+    }
+    let dev = crate::target::select(Need::Nameable, reader, path)?;
+    nameable(&dev)?;
+    let v = key_hint_value(&dev);
+    if dev.naming.on_key == KeyLabel::ReadFailed {
+        return Err(
+            "couldn't read whether this key carries a name of its own; nothing was \
+                    changed, try again"
+                .into(),
+        );
+    }
+    let place = plan_name_set(dev.naming.source, store).map_err(|r| r.message(&v))?;
+    let keyring = Keyring::load_default()?;
+    refuse_name_held_elsewhere(&keyring, name, &row_serials(&dev))?;
+    let shown = sanitize_terminal(name);
+    let unchanged = dev.naming.plain.as_deref() == Some(name)
+        && dev.naming.source
+            == Some(match place {
+                NamePlace::Computer => NameSource::Computer,
+                NamePlace::Key => NameSource::Key,
+            });
+    if unchanged && place == NamePlace::Computer {
+        println!("already named '{shown}'; nothing changed");
+        return Ok(());
+    }
+    let meta = record_meta_for(&dev, &keyroost_hid::enumerate().unwrap_or_default());
+    match place {
+        NamePlace::Computer => name_set_local(keyring, &dev, name, meta),
+        NamePlace::Key => {
+            let plan = plan_key_label(&dev, Some(name), &v)?;
+            let previous = plan.previous.as_ref().map(|l| l.label.as_str());
+            if previous == Some(name) {
+                println!("already named '{shown}'; nothing changed");
+                return Ok(());
+            }
+            let question = previous.map(|old| {
+                format!(
+                    "replace the name '{}' stored on the key with '{shown}'",
+                    sanitize_terminal(old)
+                )
+            });
+            apply_key_label(&mut sec, src, yes, &dev, &plan, question.as_deref(), &v)?;
+            // Re-read keys.json: the re-check after the PIN may have saved
+            // what a scan learned meanwhile.
+            let saved = Keyring::load_default().and_then(|mut k| {
+                k.set_name(&dev.serial, name, keyroost_keyring::NameStore::Key, meta)?;
+                k.save_default()
+            });
+            if let Err(e) = saved {
+                return Err(format!(
+                    "the name is on the key; this computer's record could not be saved: {e}"
+                )
+                .into());
+            }
+            println!("Name set on the key: {shown}");
+            eprintln!("The name is stored on the key and is visible to anyone who has the key.");
+            Ok(())
+        }
+    }
+}
+
+/// `name set` on this computer: record (or rename) the key's computer name.
+fn name_set_local(
+    mut keyring: Keyring,
+    dev: &keyroost_resolve::Device,
+    name: &str,
+    meta: keyroost_keyring::RecordMeta,
+) -> Result<(), Box<dyn std::error::Error>> {
+    keyring.set_name(
+        &dev.serial,
+        name,
+        keyroost_keyring::NameStore::Computer,
+        meta,
+    )?;
+    // Opt-in disclosure: state plainly what is stored, and how to undo it.
+    eprintln!(
+        "This saves a fingerprint of the key (a salted hash of its serial, not the \
+         serial itself) with the name in keys.json on this computer; remove it with: \
+         keyroostctl name clear {}",
+        quoted_name(name)
+    );
+    let written = keyring.save_default()?;
+    println!("Name set on this computer: {}", sanitize_terminal(name));
+    output::status(&format!("Saved to {}.", written.display()));
+    Ok(())
+}
+
+/// `name clear`: remove NAME wherever it lives, or every name of the key
+/// selected with `-d`.
+fn name_clear(
+    name: Option<&str>,
+    yes: bool,
+    pin: Option<&SecretSource>,
+    path: Option<&Path>,
+    reader: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut sec = Secrets::real();
+    let src = Source::from_flag(pin);
+    if pin.is_some() {
+        sec.check(&FIDO_PIN, src)?;
+    }
+    match name {
+        Some(n) => name_clear_by_name(&mut sec, src, yes, n),
+        None => name_clear_selected(&mut sec, src, yes, path, reader),
+    }
+}
+
+/// Clear the name stored on `dev` (asking first, then the PIN).
+fn clear_key_label(
+    sec: &mut Secrets,
+    src: Source<'_>,
+    yes: bool,
+    dev: &keyroost_resolve::Device,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let v = key_hint_value(dev);
+    let plan = plan_key_label(dev, None, &v)?;
+    if plan.previous.is_none() {
+        return Ok(());
+    }
+    let question = format!(
+        "remove the name '{}' stored on the key",
+        sanitize_terminal(label)
+    );
+    apply_key_label(sec, src, yes, dev, &plan, Some(&question), &v)
+}
+
+const NAME_READ_FAILED: &str =
+    "couldn't read the name stored on the key; nothing was changed, try again";
+
+fn name_clear_by_name(
+    sec: &mut Secrets,
+    src: Source<'_>,
+    yes: bool,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_resolve::KeyLabel;
+    let keyring = Keyring::load_default()?;
+    let shown = sanitize_terminal(name);
+    let Some(rec) = keyring.holder(name).cloned() else {
+        return Err(format!("no name '{shown}' on this computer").into());
+    };
+    let mut stays_on_key = false;
+    if rec.stored == keyroost_keyring::NameStore::Key {
+        let devices = crate::target::enumerate()?;
+        let keyring = Keyring::load_default()?;
+        let here = rec.fingerprint.as_ref().and_then(|fp| {
+            devices.iter().find(|d| {
+                row_serials(d)
+                    .iter()
+                    .any(|s| keyring.fingerprint_of(s).as_ref() == Some(fp))
+            })
+        });
+        match here {
+            Some(d) => match &d.naming.on_key {
+                KeyLabel::Present(l) if l == name => {
+                    eprintln!("{}", crate::target::announce_line(d, Need::FidoHid));
+                    clear_key_label(sec, src, yes, d, name)?;
+                }
+                KeyLabel::ReadFailed => return Err(NAME_READ_FAILED.into()),
+                _ => {}
+            },
+            None => stays_on_key = true,
+        }
+    }
+    let mut keyring = Keyring::load_default()?;
+    keyring.remove(name);
+    keyring.save_default()?;
+    println!("Removed the name '{shown}'.");
+    if stays_on_key {
+        eprintln!(
+            "the name stays on the key itself; plug the key in and run this again to remove it there"
+        );
+    }
+    Ok(())
+}
+
+fn name_clear_selected(
+    sec: &mut Secrets,
+    src: Source<'_>,
+    yes: bool,
+    path: Option<&Path>,
+    reader: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use keyroost_resolve::{KeyLabel, NameSource};
+    let dev = crate::target::select(Need::Nameable, reader, path)?;
+    nameable(&dev)?;
+    if dev.naming.on_key == KeyLabel::ReadFailed {
+        return Err(NAME_READ_FAILED.into());
+    }
+    let mut cleared_on_key = false;
+    if let (Some(NameSource::Key), Some(label)) = (dev.naming.source, &dev.naming.plain) {
+        clear_key_label(sec, src, yes, &dev, label)?;
+        cleared_on_key = true;
+    }
+    let mut keyring = Keyring::load_default()?;
+    let mut gone = 0;
+    for s in row_serials(&dev) {
+        gone += keyring.clear_key(s).len();
+    }
+    if gone == 0 && !cleared_on_key {
+        return Err("this key has no name on this computer or on the key".into());
+    }
+    if gone > 0 {
+        keyring.save_default()?;
+    }
+    println!("Removed this key's name.");
+    Ok(())
+}
+
+/// Where a name in `name list` stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NameStatus {
+    /// The key holding it is connected as `list` number N.
+    Connected(usize),
+    NotConnected,
+    /// A computer name of key N, which carries its own name on the key.
+    Hidden(usize),
+    /// A name recorded as stored on key N, which no longer carries it.
+    Missing(usize),
+    /// The record can't be matched to any key.
+    Unmatched,
+    /// Key N carries this name on the key, but another key holds it here.
+    OtherKey(usize),
+    /// Key N carries this name on the key; this computer hasn't recorded it.
+    Unrecorded(usize),
+}
+
+/// One `name list` row. `name` is what is shown (a newcomer's carries its
+/// serial tail).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NameRow {
+    name: String,
+    stored: keyroost_keyring::NameStore,
+    status: NameStatus,
+}
+
+/// Every name this computer knows, plus names connected keys carry that no
+/// record here stands for.
+fn name_list_rows(keyring: &Keyring, devices: &[keyroost_resolve::Device]) -> Vec<NameRow> {
+    use keyroost_keyring::NameStore;
+    use keyroost_resolve::{KeyLabel, NameSource};
+    let numbered = overview::numbered(devices);
+    let is_of = |d: &keyroost_resolve::Device, fp: &keyroost_keyring::Fingerprint| {
+        row_serials(d)
+            .iter()
+            .any(|s| keyring.fingerprint_of(s).as_ref() == Some(fp))
+    };
+    let mut rows: Vec<NameRow> = keyring
+        .keys
+        .iter()
+        .map(|r| {
+            let here = r
+                .fingerprint
+                .as_ref()
+                .and_then(|fp| numbered.iter().find(|(_, d)| is_of(d, fp)));
+            let status = match (here, r.stored) {
+                _ if r.fingerprint.is_none() => NameStatus::Unmatched,
+                (None, _) => NameStatus::NotConnected,
+                (Some((n, d)), NameStore::Computer) => {
+                    if d.naming.source == Some(NameSource::Key) {
+                        NameStatus::Hidden(*n)
+                    } else {
+                        NameStatus::Connected(*n)
+                    }
+                }
+                (Some((n, d)), NameStore::Key) => match &d.naming.on_key {
+                    KeyLabel::Present(l) if *l != r.name => NameStatus::Missing(*n),
+                    KeyLabel::Absent => NameStatus::Missing(*n),
+                    _ => NameStatus::Connected(*n),
+                },
+            };
+            NameRow {
+                name: r.name.clone(),
+                stored: r.stored,
+                status,
+            }
+        })
+        .collect();
+    for (n, d) in &numbered {
+        let (Some(NameSource::Key), Some(plain)) = (d.naming.source, &d.naming.plain) else {
+            continue;
+        };
+        let recorded = keyring.keys.iter().any(|r| {
+            r.name == *plain
+                && r.stored == NameStore::Key
+                && r.fingerprint.as_ref().is_some_and(|fp| is_of(d, fp))
+        });
+        if recorded {
+            continue;
+        }
+        rows.push(NameRow {
+            name: d.name.clone().unwrap_or_else(|| plain.clone()),
+            stored: NameStore::Key,
+            status: if keyring.holder(plain).is_some() {
+                NameStatus::OtherKey(*n)
+            } else {
+                NameStatus::Unrecorded(*n)
+            },
+        });
+    }
+    rows
+}
+
+fn stored_label(s: keyroost_keyring::NameStore) -> &'static str {
+    match s {
+        keyroost_keyring::NameStore::Computer => "this computer",
+        keyroost_keyring::NameStore::Key => "on the key",
+    }
+}
+
+/// The human `name list`: a header and one aligned line per row.
+fn name_list_lines(rows: &[NameRow]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["(no names; add one with: keyroostctl -d <key> name set NAME)".to_string()];
+    }
+    let cells: Vec<(String, &str, String)> = rows
+        .iter()
+        .map(|r| {
+            let q = quoted_name(&r.name);
+            let status = match r.status {
+                NameStatus::Connected(n) => format!("connected (#{n})"),
+                NameStatus::NotConnected => "not connected".into(),
+                NameStatus::Hidden(n) => format!(
+                    "hidden: key #{n} carries its own name; clear with: keyroostctl name clear {q}"
+                ),
+                NameStatus::Missing(n) => format!(
+                    "#{n} no longer carries it; restore with: keyroostctl -d {n} name set {q} \
+                     --store key"
+                ),
+                NameStatus::Unmatched => format!(
+                    "{q} can't be matched (keys.json salt missing); clear with: \
+                     keyroostctl name clear {q}"
+                ),
+                NameStatus::OtherKey(n) => {
+                    format!("connected (#{n}), a different key; select it with --device {n}")
+                }
+                NameStatus::Unrecorded(n) => {
+                    format!("connected (#{n}); not recorded on this computer yet")
+                }
+            };
+            let name = if r.status == NameStatus::Unmatched {
+                "(unmatched)".to_string()
+            } else {
+                sanitize_terminal(&r.name)
+            };
+            (name, stored_label(r.stored), status)
+        })
+        .collect();
+    let wn = cells
+        .iter()
+        .map(|c| c.0.chars().count())
+        .chain([4])
+        .max()
+        .unwrap_or(4);
+    let ws = cells
+        .iter()
+        .map(|c| c.1.chars().count())
+        .chain([6])
+        .max()
+        .unwrap_or(6);
+    std::iter::once(format!("  {:wn$}  {:ws$}  STATUS", "NAME", "STORED"))
+        .chain(
+            cells
+                .iter()
+                .map(|(n, s, st)| format!("  {n:wn$}  {s:ws$}  {st}")),
+        )
+        .collect()
+}
+
+/// `name list --json`.
+fn names_json(rows: &[NameRow]) -> json_out::NamesJson {
+    json_out::NamesJson {
+        names: rows
+            .iter()
+            .map(|r| {
+                let (status, number) = match r.status {
+                    NameStatus::Connected(n) => ("connected", Some(n)),
+                    NameStatus::NotConnected => ("not-connected", None),
+                    NameStatus::Hidden(n) => ("hidden", Some(n)),
+                    NameStatus::Missing(n) => ("missing-on-key", Some(n)),
+                    NameStatus::Unmatched => ("unmatched", None),
+                    NameStatus::OtherKey(n) => ("other-key", Some(n)),
+                    NameStatus::Unrecorded(n) => ("unrecorded", Some(n)),
+                };
+                json_out::NameRowJson {
+                    name: r.name.clone(),
+                    stored: match r.stored {
+                        keyroost_keyring::NameStore::Computer => "computer",
+                        keyroost_keyring::NameStore::Key => "key",
+                    },
+                    status,
+                    number,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn name_list() -> Result<(), Box<dyn std::error::Error>> {
+    // Scan first: it may record names read from keys, which the list shows.
+    let devices = crate::target::enumerate().unwrap_or_default();
+    let keyring = Keyring::load_default()?;
+    let rows = name_list_rows(&keyring, &devices);
+    if json_output() {
+        emit_json(&names_json(&rows))?;
+        return Ok(());
+    }
+    for line in name_list_lines(&rows) {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// Whether `dev` can be recorded in the name registry: it must be a row
 /// keyroost actually detected (not a synthetic `--reader`/`--path` override —
 /// `target::select` skips the capability check for those, so an override row
 /// can reach here) and it must carry a serial, which is the match key
-/// `name add` stores. A Molto2 is never connected during detection, so it
+/// `name set` stores. A Molto2 is never connected during detection, so it
 /// always has an empty serial and can't be named yet.
 fn nameable(dev: &keyroost_resolve::Device) -> Result<(), String> {
     if dev.id.starts_with("override:") {
@@ -11354,109 +12049,6 @@ fn record_meta_for(
         },
         vendor: (dev.vendor == "Yubico").then(|| "yubico".to_string()),
     }
-}
-
-/// `name add`: give a key its first name on this computer. A key that
-/// already has one is refused rather than silently renamed, so a script
-/// using `--device <old name>` never breaks without a word.
-fn add_computer_name(
-    keyring: &mut Keyring,
-    serial: &str,
-    name: &str,
-    meta: keyroost_keyring::RecordMeta,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(old) = keyring.local_name_for(serial) {
-        let old = sanitize_terminal(old);
-        return Err(format!(
-            "this key is already named \"{old}\"; remove that name first with \
-             `keyroostctl name delete {old}`"
-        )
-        .into());
-    }
-    keyring.set_name(serial, name, keyroost_keyring::NameStore::Computer, meta)?;
-    Ok(())
-}
-
-fn key_name_add(
-    name: &str,
-    path: Option<&Path>,
-    reader: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    keyroost_keyring::validate_name(name)?;
-    let mut keyring = Keyring::load_default()?;
-    // Any row with a serial (FIDO, card-only, prog token) — the same rows the
-    // GUI can name. The serial is the correlated one (whole-set attribution).
-    let dev = crate::target::select(Need::Nameable, reader, path)?;
-    nameable(&dev)?;
-    let hids = keyroost_hid::enumerate().unwrap_or_default();
-    add_computer_name(
-        &mut keyring,
-        &dev.serial,
-        name,
-        record_meta_for(&dev, &hids),
-    )?;
-    // Opt-in disclosure: state plainly what is stored, and how to undo it.
-    eprintln!(
-        "Recording \"{}\" \u{2192} {}.",
-        sanitize_terminal(name),
-        sanitize_terminal(&dev.model)
-    );
-    eprintln!(
-        "This saves a fingerprint of the key's serial number (salted for this \
-         computer, not the serial itself) to keys.json so the key can be \
-         recognized by name later — delete it any time with \
-         `keyroostctl name delete {}`.",
-        name
-    );
-    let written = keyring.save_default()?;
-    output::status(&format!("Saved to {}.", written.display()));
-    Ok(())
-}
-
-fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
-    let keyring = Keyring::load_default()?;
-    if keyring.keys.is_empty() {
-        println!("(no named keys; add one with `keyroostctl name add <name>`)");
-        return Ok(());
-    }
-    let devices = crate::target::enumerate().unwrap_or_default();
-    for k in &keyring.keys {
-        let status = match &k.fingerprint {
-            None => "can't be matched to a key; delete this name and set it again",
-            Some(fp) => {
-                let here = devices
-                    .iter()
-                    .any(|d| keyring.fingerprint_of(&d.serial).as_ref() == Some(fp));
-                if here {
-                    "connected"
-                } else {
-                    "not connected"
-                }
-            }
-        };
-        let stored = match k.stored {
-            keyroost_keyring::NameStore::Computer => "this computer",
-            keyroost_keyring::NameStore::Key => "on the key",
-        };
-        println!(
-            "  {:<20} ({}) [{}]",
-            sanitize_terminal(&k.name),
-            stored,
-            status
-        );
-    }
-    Ok(())
-}
-
-fn key_name_delete(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut keyring = Keyring::load_default()?;
-    if keyring.remove(name).is_some() {
-        keyring.save_default()?;
-        println!("Removed \"{}\".", name);
-    } else {
-        println!("No key named \"{}\".", name);
-    }
-    Ok(())
 }
 
 fn format_aaguid(aaguid: &[u8; 16]) -> String {
@@ -12368,9 +12960,10 @@ fn run_fido_large_blob_add(
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
-    // A name read from this key may change; never reuse an older read.
-    keyroost_resolve::forget_key_names();
-    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    // Names read from keys before or during the write are stale.
+    keyroost_resolve::with_key_names_forgotten(|| {
+        keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+    })?;
     println!("Note added; {} entries now.", updated.len());
     Ok(())
 }
@@ -12395,9 +12988,10 @@ fn run_fido_large_blob_edit(
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
-    // A name read from this key may change; never reuse an older read.
-    keyroost_resolve::forget_key_names();
-    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    // Names read from keys before or during the write are stale.
+    keyroost_resolve::with_key_names_forgotten(|| {
+        keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+    })?;
     println!("Note {} updated.", index);
     Ok(())
 }
@@ -12448,9 +13042,10 @@ fn run_fido_large_blob_delete(
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
-    // A name read from this key may change; never reuse an older read.
-    keyroost_resolve::forget_key_names();
-    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    // Names read from keys before or during the write are stale.
+    keyroost_resolve::with_key_names_forgotten(|| {
+        keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+    })?;
     println!("Entry deleted; {} entries now.", updated.len());
     Ok(())
 }
@@ -12511,9 +13106,10 @@ fn run_fido_large_blob_clear(
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
     let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
-    // A name read from this key may change; never reuse an older read.
-    keyroost_resolve::forget_key_names();
-    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
+    // Names read from keys before or during the write are stale.
+    keyroost_resolve::with_key_names_forgotten(|| {
+        keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+    })?;
     println!("Large-blob array cleared ({} entries wiped).", total);
     Ok(())
 }
@@ -12843,9 +13439,8 @@ fn fido_reset_at(
     if announce_touch {
         eprintln!("Resetting {} — touch the key now…", path.display());
     }
-    // A name read from this key may change; never reuse an older read.
-    keyroost_resolve::forget_key_names();
-    keyroost_ctap::reset(&mut dev)?;
+    // Names read from keys before or during the write are stale.
+    keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::reset(&mut dev))?;
     println!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
 }
@@ -12869,19 +13464,20 @@ fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::E
     }
     output::status("Power-cycling the card and sending the reset\u{2026}");
     let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(exact_reader)?;
-    // A name read from this key may change; never reuse an older read.
-    keyroost_resolve::forget_key_names();
-    keyroost_ctap::reset(&mut dev).map_err(|e| -> Box<dyn std::error::Error> {
-        let s = e.to_string();
-        if s.contains("NOT_ALLOWED") || s.contains("0x30") {
-            "the card refused the reset even straight after a power cycle. Some cards \
+    // Names read from keys before or during the write are stale.
+    keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::reset(&mut dev)).map_err(
+        |e| -> Box<dyn std::error::Error> {
+            let s = e.to_string();
+            if s.contains("NOT_ALLOWED") || s.contains("0x30") {
+                "the card refused the reset even straight after a power cycle. Some cards \
              only accept a FIDO reset over NFC (contactless) rather than a contact \
              reader — try a contactless reader or the vendor's mobile app."
-                .into()
-        } else {
-            Box::new(e)
-        }
-    })?;
+                    .into()
+            } else {
+                Box::new(e)
+            }
+        },
+    )?;
     println!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
 }
@@ -14222,9 +14818,9 @@ mod cli_tests {
             .chain(ONE_WAY_SETTINGS.iter().map(|p| (*p, ONE_WAY)))
             .collect();
         // Commands that ask before a change that destroys no key, seed or
-        // certificate: a token setting, plus `piv cert request`, which
-        // replaces a key only with the optional `--generate-key`.
-        let confirms_only = ["prog config", "piv cert request"];
+        // certificate: a token setting, `piv cert request`, which replaces a
+        // key only with the optional `--generate-key`, and a key's name.
+        let confirms_only = ["prog config", "piv cert request", "name set", "name clear"];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
             assert!(tree.iter().any(|(t, _)| t == p), "{p:?} is not a command");
@@ -15551,25 +16147,286 @@ mod cli_tests {
     }
 
     #[test]
-    fn name_add_refuses_a_key_that_already_has_a_name() {
+    fn set_decision_table() {
+        use keyroost_resolve::NameSource as S;
+        for (current, store, want) in [
+            (None, None, Ok(NamePlace::Computer)),
+            (None, Some(StoreArg::Local), Ok(NamePlace::Computer)),
+            (None, Some(StoreArg::Key), Ok(NamePlace::Key)),
+            (Some(S::Computer), None, Ok(NamePlace::Computer)),
+            (
+                Some(S::Computer),
+                Some(StoreArg::Local),
+                Ok(NamePlace::Computer),
+            ),
+            (Some(S::Computer), Some(StoreArg::Key), Ok(NamePlace::Key)),
+            (Some(S::Key), None, Ok(NamePlace::Key)),
+            (Some(S::Key), Some(StoreArg::Key), Ok(NamePlace::Key)),
+            (
+                Some(S::Key),
+                Some(StoreArg::Local),
+                Err(NameSetRefusal::NameIsOnTheKey),
+            ),
+        ] {
+            assert_eq!(plan_name_set(current, store), want, "{current:?} {store:?}");
+        }
+        assert_eq!(
+            NameSetRefusal::NameIsOnTheKey.message("2"),
+            "this key carries its name on the key; rename it there (omit --store) \
+             or clear it first with: keyroostctl -d 2 name clear"
+        );
+    }
+
+    #[test]
+    fn a_name_held_by_another_key_is_refused_with_the_clear_hint() {
         let mut k = Keyring::default();
         let meta = keyroost_keyring::RecordMeta::default;
-        add_computer_name(&mut k, "12345678", "work", meta()).unwrap();
-        // A second name for the same key is refused, not a silent rename…
-        let e = add_computer_name(&mut k, "12345678", "work2", meta())
+        k.set_name(
+            "12345678",
+            "Work",
+            keyroost_keyring::NameStore::Computer,
+            meta(),
+        )
+        .unwrap();
+        let e = refuse_name_held_elsewhere(&k, "Work", &["ABCDEF01"])
             .unwrap_err()
             .to_string();
-        assert!(e.contains("already named \"work\""), "{e}");
-        assert!(e.contains("name delete work"), "{e}");
+        assert_eq!(
+            e,
+            "the name 'Work' already belongs to another key on this computer; pick \
+             another name, or free it with: keyroostctl name clear 'Work'"
+        );
         assert!(!e.contains("12345678"), "{e}");
-        // …so is the same name again…
-        assert!(add_computer_name(&mut k, "12345678", "work", meta()).is_err());
-        // …and another key can't take the name.
-        assert!(add_computer_name(&mut k, "ABCDEF01", "work", meta()).is_err());
-        assert_eq!(k.keys.len(), 1);
-        assert_eq!(k.local_name_for("12345678"), Some("work"));
-        add_computer_name(&mut k, "ABCDEF01", "home", meta()).unwrap();
-        assert_eq!(k.keys.len(), 2);
+        // The key's own name, and a free name, pass.
+        assert!(refuse_name_held_elsewhere(&k, "Work", &["12345678"]).is_ok());
+        assert!(refuse_name_held_elsewhere(&k, "Home", &["ABCDEF01"]).is_ok());
+        // A record that can't be matched to any key still holds its name.
+        k.keys[0].fingerprint = None;
+        assert!(refuse_name_held_elsewhere(&k, "Work", &["12345678"]).is_err());
+    }
+
+    #[test]
+    fn label_refusals_name_the_fix() {
+        use keyroost_ctap::device_label::LabelError;
+        assert_eq!(
+            label_refusal(LabelError::NoPin, "2", 0),
+            "this key has no FIDO PIN; set one first with: keyroostctl -d 2 fido pin set"
+        );
+        assert_eq!(
+            label_refusal(LabelError::Unsupported, "2", 0),
+            "this key has no storage for a name on the key (no FIDO2 large-blob \
+             support); use --store local"
+        );
+        assert_eq!(
+            label_refusal(
+                LabelError::TooLarge {
+                    size: 1100,
+                    max: 1024
+                },
+                "2",
+                1000
+            ),
+            "not enough large-blob space for the name: need 100 bytes, 24 free"
+        );
+        assert_eq!(
+            label_refusal(LabelError::Changed, "2", 0),
+            "the large-blob array changed while waiting for the PIN; nothing was changed"
+        );
+    }
+
+    #[test]
+    fn clear_name_and_device_conflict_exit_2() {
+        for (args, device, conflict) in [
+            (&["keyroostctl", "name", "clear", "x"][..], Some("1"), true),
+            (&["keyroostctl", "name", "clear", "x"], None, false),
+            (&["keyroostctl", "name", "clear"], Some("1"), false),
+            (&["keyroostctl", "name", "set", "x"], Some("1"), false),
+        ] {
+            let cli = parse(args).unwrap();
+            assert_eq!(
+                name_clear_conflict(cli.command.as_ref(), device),
+                conflict.then_some("pass a NAME or select the key with -d, not both"),
+                "{args:?} {device:?}"
+            );
+        }
+        // NAME with --path / --reader is the same mistake, caught by clap.
+        assert!(parse(&["keyroostctl", "name", "clear", "x", "--path", "/p"]).is_err());
+        assert!(parse(&["keyroostctl", "name", "clear", "x", "--reader", "r"]).is_err());
+    }
+
+    /// A key row for the name tests: FIDO2 over HID, named by `naming`.
+    fn name_row(serial: &str, naming: keyroost_resolve::Naming) -> keyroost_resolve::Device {
+        let mut d = test_fido_row();
+        d.id = format!("hid:{serial}");
+        d.serial = serial.into();
+        d.hid_path = Some(format!("/dev/hidraw-{serial}").into());
+        d.name = naming.plain.clone();
+        d.naming = naming;
+        d
+    }
+
+    #[test]
+    fn name_list_rows_say_where_each_name_lives() {
+        use keyroost_keyring::{KeyRecord, NameStore, RecordMeta};
+        use keyroost_resolve::{KeyLabel, NameSource, Naming};
+        let mut k = Keyring::default();
+        k.set_name("11111111", "Work", NameStore::Key, RecordMeta::default())
+            .unwrap();
+        // A computer name kept from before the key took its own name.
+        let fp = k.fingerprint_of("11111111");
+        k.keys.push(KeyRecord {
+            name: "Home".into(),
+            fingerprint: fp,
+            stored: NameStore::Computer,
+            source: Default::default(),
+            vendor: None,
+            aaguid: None,
+            note: None,
+        });
+        k.set_name(
+            "22222222",
+            "Old label",
+            NameStore::Key,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        k.set_name(
+            "33333333",
+            "Lab",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        k.keys.push(KeyRecord {
+            name: "Spare".into(),
+            fingerprint: None,
+            stored: NameStore::Computer,
+            source: Default::default(),
+            vendor: None,
+            aaguid: None,
+            note: None,
+        });
+        let on_key = |l: &str, selectable: bool| Naming {
+            plain: Some(l.into()),
+            source: Some(NameSource::Key),
+            selectable,
+            on_key: KeyLabel::Present(l.into()),
+            missing_on_key: None,
+        };
+        let devices = vec![
+            name_row("11111111", on_key("Work", true)),
+            name_row(
+                "22222222",
+                Naming {
+                    on_key: KeyLabel::Absent,
+                    missing_on_key: Some("Old label".into()),
+                    ..Naming::default()
+                },
+            ),
+            {
+                let mut d = name_row("44445678", on_key("Work", false));
+                d.name = Some("Work (5678)".into());
+                d
+            },
+        ];
+        let numbered = overview::numbered(&devices);
+        let num = |serial: &str| numbered.iter().find(|(_, d)| d.serial == serial).unwrap().0;
+        let rows = name_list_rows(&k, &devices);
+        let find = |name: &str| {
+            rows.iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("{name}: {rows:?}"))
+        };
+        assert_eq!(find("Work").status, NameStatus::Connected(num("11111111")));
+        assert_eq!(find("Work").stored, NameStore::Key);
+        assert_eq!(find("Home").status, NameStatus::Hidden(num("11111111")));
+        assert_eq!(
+            find("Old label").status,
+            NameStatus::Missing(num("22222222"))
+        );
+        assert_eq!(find("Lab").status, NameStatus::NotConnected);
+        assert_eq!(find("Spare").status, NameStatus::Unmatched);
+        assert_eq!(
+            find("Work (5678)").status,
+            NameStatus::OtherKey(num("44445678"))
+        );
+        assert_eq!(rows.len(), 6, "{rows:?}");
+
+        let lines = name_list_lines(&rows);
+        let text = lines.join("\n");
+        assert!(lines[0].starts_with("  NAME"), "{text}");
+        for want in [
+            format!(
+                "hidden: key #{} carries its own name; clear with: keyroostctl name clear 'Home'",
+                num("11111111")
+            ),
+            format!(
+                "#{n} no longer carries it; restore with: keyroostctl -d {n} name set \
+                 'Old label' --store key",
+                n = num("22222222")
+            ),
+            "'Spare' can't be matched (keys.json salt missing); clear with: \
+             keyroostctl name clear 'Spare'"
+                .to_string(),
+            format!(
+                "connected (#{n}), a different key; select it with --device {n}",
+                n = num("44445678")
+            ),
+            "not connected".to_string(),
+        ] {
+            assert!(text.contains(&want), "{want}\n{text}");
+        }
+        assert!(text.contains("(unmatched)"), "{text}");
+        // Stored serials are never shown.
+        for serial in ["11111111", "22222222", "33333333"] {
+            assert!(!text.contains(serial), "{text}");
+        }
+        assert_eq!(
+            name_list_lines(&[]),
+            vec!["(no names; add one with: keyroostctl -d <key> name set NAME)".to_string()]
+        );
+    }
+
+    #[test]
+    fn name_list_json_shape() {
+        let rows = vec![
+            NameRow {
+                name: "Work".into(),
+                stored: keyroost_keyring::NameStore::Key,
+                status: NameStatus::Connected(1),
+            },
+            NameRow {
+                name: "Spare".into(),
+                stored: keyroost_keyring::NameStore::Computer,
+                status: NameStatus::Unmatched,
+            },
+        ];
+        let v = serde_json::to_value(names_json(&rows)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"names": [
+                {"name": "Work", "stored": "key", "status": "connected", "number": 1},
+                {"name": "Spare", "stored": "computer", "status": "unmatched", "number": null},
+            ]})
+        );
+    }
+
+    #[test]
+    fn name_set_with_no_key_is_the_no_candidates_refusal() {
+        let sel = keyroost_resolve::Selector {
+            device: None,
+            reader: None,
+            path: None,
+        };
+        let e = keyroost_resolve::resolve_target(
+            &[],
+            &sel,
+            Need::Nameable,
+            &mut keyroost_resolve::NoPicker,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("key that reports a serial"), "{e}");
     }
 
     #[test]
@@ -17802,7 +18659,8 @@ mod cli_tests {
             &["keyroostctl", "fido", "ssh", "list"],
             &["keyroostctl", "fido", "ssh", "extract", "--id", "ssh:demo"],
             &["keyroostctl", "name", "list"],
-            &["keyroostctl", "name", "delete", "x"],
+            &["keyroostctl", "name", "clear", "x"],
+            &["keyroostctl", "name", "set", "x", "--store", "key"],
         ] {
             assert!(parse(a).is_ok(), "{a:?}");
         }
@@ -20899,12 +21757,12 @@ mod cli_tests {
     }
 
     #[test]
-    fn key_name_add_takes_reader_or_path() {
-        assert!(parse(&["keyroostctl", "name", "add", "desk", "--reader", "Molto"]).is_ok());
+    fn name_set_takes_reader_or_path() {
+        assert!(parse(&["keyroostctl", "name", "set", "desk", "--reader", "Molto"]).is_ok());
         assert!(parse(&[
             "keyroostctl",
             "name",
-            "add",
+            "set",
             "desk",
             "--path",
             "/dev/hidraw3"
@@ -21276,7 +22134,6 @@ mod cli_tests {
             (&["keyroostctl", "completions", "bash"], Some("completions")),
             (&["keyroostctl", "manpage", "d"], Some("manpage")),
             (&["keyroostctl", "name", "list"], Some("name list")),
-            (&["keyroostctl", "name", "delete", "x"], Some("name delete")),
             (
                 &[
                     "keyroostctl",
@@ -21293,7 +22150,8 @@ mod cli_tests {
                 None,
             ),
             (&["keyroostctl", "list"], None),
-            (&["keyroostctl", "name", "add", "x"], None),
+            (&["keyroostctl", "name", "set", "x"], None),
+            (&["keyroostctl", "name", "clear"], None),
             (&["keyroostctl", "piv", "info"], None),
         ] {
             let cli = parse(args).unwrap();
