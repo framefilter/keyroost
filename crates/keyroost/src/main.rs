@@ -114,6 +114,9 @@ fn key_name_refusal(e: keyroost_ctap::device_label::LabelError, used: u64) -> St
 const KEY_NAME_STALE: &str = "The key's name changed since the naming field opened; nothing \
                               was changed. Open Rename again to try.";
 
+/// The naming dialog's message when an on-key save needs the PIN typed.
+const KEY_NAME_PIN_NEEDED: &str = "Enter the key's FIDO PIN to save the name on the key.";
+
 /// What an on-key name save did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyNameWrite {
@@ -153,7 +156,8 @@ fn key_name_failure(e: keyroost_ctap::device_label::LabelError, used: u64) -> Ke
 /// Set (`Some`) or clear (`None`) the name stored on the key at `path`, the
 /// way `keyroostctl name set --store key` does: open, getInfo, read, plan
 /// (refusing what can't work before the PIN is used), PIN token, write only
-/// over the array planned from, then read the name back. `expected` is the
+/// over the array planned from, then read the name back. An empty `pin`
+/// refuses only once planning found a write is needed. `expected` is the
 /// name the dialog showed: a different name found now refuses, since the
 /// question asked was about that one. Names read from keys are forgotten
 /// around the write.
@@ -195,6 +199,10 @@ fn write_key_name(
     }
     if previous == name {
         return Ok(KeyNameWrite::AlreadySo); // nothing to write
+    }
+    // Asked for only now, so the certain refusals above come first.
+    if pin.is_empty() {
+        return Err(KEY_NAME_PIN_NEEDED.into());
     }
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
@@ -9895,10 +9903,9 @@ impl App {
             device::NameSave::Unchanged => self.close_rename(),
             device::NameSave::Local(name) => self.save_name_locally(&target, name),
             device::NameSave::OnKey { name, question } => {
-                if self.rename_needs_pin() && self.rename_pin.is_empty() {
-                    self.rename_failed("Enter the key's FIDO PIN to save the name on the key.");
-                    return;
-                }
+                // An empty PIN is checked by the worker after it plans, so a
+                // certain refusal (no FIDO PIN on the key, no large-blob
+                // storage, not enough space) shows before a PIN is asked for.
                 if let Some(n) = &name {
                     match keyroost_keyring::Keyring::load_default() {
                         Ok(k)
@@ -9964,10 +9971,6 @@ impl App {
             }
         };
         wipe(&mut self.rename_pin);
-        if pin.is_empty() {
-            self.rename_failed("Enter the key's FIDO PIN to save the name on the key.");
-            return;
-        }
         let Some(path) = target.hid_path.clone() else {
             self.rename_failed(KEY_NAME_NO_STORAGE);
             return;
@@ -24654,16 +24657,22 @@ mod tests {
     }
 
     #[test]
-    fn naming_dialog_asks_for_the_pin_before_anything_else() {
+    fn naming_dialog_reports_a_certain_refusal_before_asking_for_the_pin() {
+        // Removing the name stays clear of keys.json until the write, so
+        // this never loads the real file.
         let mut app = App::default();
-        app.apply_rename_actions(&key_with_storage(None), true, false, false);
-        app.rename_target.as_mut().unwrap().store = device::NameStoreChoice::Key;
-        app.rename_input = "Lab".into();
+        app.apply_rename_actions(&key_with_storage(Some("Desk")), true, false, false);
+        // No HID path at save time: the save can't work, which shows
+        // without a PIN typed (the PIN is asked for only after planning).
+        app.rename_target.as_mut().unwrap().hid_path = None;
+        app.rename_input.clear();
+        assert!(app.rename_needs_pin());
         app.save_device_name();
+        assert!(app.rename_target.as_ref().unwrap().confirm.is_some());
+        app.apply_rename_question(true, false);
         let t = app.rename_target.clone().expect("field stays open");
-        assert!(t.error.unwrap().contains("PIN"));
+        assert_eq!(t.error.as_deref(), Some(KEY_NAME_NO_STORAGE));
         assert!(!t.saving);
-        assert!(t.confirm.is_none());
     }
 
     #[test]
