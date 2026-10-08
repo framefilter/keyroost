@@ -1136,9 +1136,11 @@ enum PivKeyCmd {
     },
     /// Move a slot's private key to another slot, without it leaving the card.
     ///
-    /// Refuses if the destination slot already holds a key (delete it first
-    /// or pick an empty slot). Only the key moves; the certificate stays in
-    /// the source slot. Needs the management key.
+    /// Refuses when the card reports that the destination slot already
+    /// holds a key (delete it first or pick an empty slot). When keyroost
+    /// can't tell, it says so and sends the move; the card decides. Only the
+    /// key moves; the certificate stays in the source slot. Needs the
+    /// management key.
     ///
     /// Moving keys between slots is an extension to standard PIV (YubiKey
     /// 5.7+ and other keys that implement it). If keyroost's list marks this
@@ -2897,9 +2899,10 @@ enum OtpCmd {
     /// Choose which USB interfaces the key offers (FIDO, keyboard, CCID). Irreversible: asks for a typed confirmation (`--yes` to skip).
     ///
     /// Sends SET_DEVICE_TYPE. You name the interfaces to ENABLE; any not named
-    /// are disabled. At least TWO must remain enabled: disabling all of them
-    /// bricks the key, and leaving only one risks locking you out, so the tool
-    /// refuses fewer than two. Turning an interface back on needs a host that
+    /// are disabled. At least TWO must remain enabled: with all of them off,
+    /// the key offers no USB interface to turn one back on through, and
+    /// leaving only one risks locking you out, so the tool refuses fewer
+    /// than two. Turning an interface back on needs a host that
     /// reaches the key through one that stays on.
     Interface {
         /// Enable the FIDO2/U2F interface.
@@ -3915,6 +3918,20 @@ struct RetiredFlag {
 /// clap only hands us the flag name, never its value or the next token, so
 /// nothing a user typed can leak through these messages.
 const RETIRED_FLAGS: &[RetiredFlag] = &[
+    RetiredFlag {
+        flag: "--admin-pin-env",
+        words: &["openpgp", "pin", "change", "--admin"],
+        msg: "--admin-pin-env was removed: with --admin, --pin is the admin PIN \
+              (--pin env:NAME or --pin stdin)",
+        now: &["--pin"],
+    },
+    RetiredFlag {
+        flag: "--admin-pin-stdin",
+        words: &["openpgp", "pin", "change", "--admin"],
+        msg: "--admin-pin-stdin was removed: with --admin, --pin is the admin PIN \
+              (--pin env:NAME or --pin stdin)",
+        now: &["--pin"],
+    },
     RetiredFlag {
         flag: "-p",
         words: &["molto"],
@@ -4950,6 +4967,46 @@ fn secret_flag_precedes(argv: &[String], prefix: &str) -> bool {
     })
 }
 
+/// Whether `value` is the word after a flag that directly follows a secret
+/// source (`--seed stdin -s VALUE`, `--seed=env:X --slot VALUE`).
+fn value_follows_source(argv: &[String], value: &str) -> bool {
+    let is_source = |w: &str| w == "stdin" || w == "default" || w.starts_with("env:");
+    argv.windows(3).any(|w| {
+        let source = match w[0].split_once('=') {
+            Some((flag, v)) if flag.starts_with("--") => v,
+            _ => w[0].as_str(),
+        };
+        is_source(source) && w[1].starts_with('-') && w[2] == value
+    })
+}
+
+/// `keyroostctl` and the subcommands `argv` names.
+fn command_path(argv: &[String]) -> Vec<String> {
+    use clap::CommandFactory;
+    let mut root = Cli::command();
+    root.build();
+    let (path, _) = walk_argv(&root, argv);
+    std::iter::once("keyroostctl")
+        .chain(path)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The fixed refusal for a secret flag with its value glued on
+/// (`--pin123456`, `--pin:123456`, the retired `--pin-env123456`), or
+/// `None`. A word made only of letters and dashes is a typo'd flag name.
+fn glued_secret_flag(word: &str) -> Option<String> {
+    if looks_like_flag_typo(word) {
+        return None;
+    }
+    let rest = word.strip_prefix("--")?;
+    crate::secrets::SECRET_FLAGS
+        .iter()
+        .filter(|f| rest.starts_with(f.long))
+        .max_by_key(|f| f.long.len())
+        .and_then(|f| crate::secrets::literal_refusal(f.long))
+}
+
 /// Whether a word right after a secret source starts like one of the short
 /// flags with a value glued on (`--pin stdin -s3cret`). clap would take
 /// the rest as a slot, device or file name and could repeat it in an
@@ -5007,8 +5064,11 @@ fn is_secret_arg(a: &clap::Arg) -> bool {
 /// source (`--pin stdin -123456`, `--pin env:KR_PIN -123456`) unless it's
 /// shaped like a typo'd flag name. A secret flag (any `<SOURCE>` flag)
 /// given something other than a source (`--pin 123456`) is refused with a
-/// fixed message naming the sources it takes, never the value. Any other error about a flag keeps clap's
-/// message: clap names only the flag, never a value.
+/// fixed message naming the sources it takes, never the value, and so is
+/// a secret flag with the value glued on (`--pin123456`). An invalid value
+/// right after a secret source and a flag (`--seed stdin -s S3CRET`) names
+/// only the flag. Any other error about a flag keeps clap's message: clap
+/// names only the flag, never a value.
 fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     use clap::CommandFactory;
@@ -5043,9 +5103,23 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
         }
         // A source flag the table doesn't list is refused all the same.
         let source = format!("<{}>", crate::secrets::SOURCE);
-        return arg
-            .contains(&source)
-            .then(|| format!("--{long} takes env:NAME or stdin — never the secret itself"));
+        if arg.contains(&source) {
+            return Some(format!(
+                "--{long} takes env:NAME or stdin — never the secret itself"
+            ));
+        }
+        // A value right after a secret source and this flag (`--seed stdin
+        // -s S3CRET`) may be the secret typed in the wrong place.
+        let Some(ContextValue::String(value)) = e.get(ContextKind::InvalidValue) else {
+            return None;
+        };
+        return value_follows_source(argv, value).then(|| {
+            format!(
+                "invalid value for --{long} (not shown, in case it is a secret); \
+                 see `{} --help`",
+                command_path(argv).join(" ")
+            )
+        });
     }
 
     if e.kind() != ErrorKind::UnknownArgument {
@@ -5055,6 +5129,9 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
         return None;
     };
     if let Some(msg) = retired_flag_hint(arg, argv) {
+        return Some(msg);
+    }
+    if let Some(msg) = glued_secret_flag(arg) {
         return Some(msg);
     }
 
@@ -8253,9 +8330,10 @@ fn run_otp(
         } => {
             use keyroost_token2otp::{DEV_CCID, DEV_FIDO, DEV_KEYBOARD};
             // Require at least TWO interfaces to remain enabled. Disabling all
-            // three bricks the key; leaving only one is fragile (if that single
-            // interface can't be reached you'd be locked out), so the tool keeps
-            // a two-interface minimum as a safety margin.
+            // three leaves no USB interface to turn one back on through;
+            // leaving only one is fragile (if that single interface can't be
+            // reached you'd be locked out), so the tool keeps a two-interface
+            // minimum as a safety margin.
             let enabled_count = [*fido, *keyboard, *ccid].iter().filter(|x| **x).count();
             if enabled_count < 2 {
                 return Err(
@@ -10204,7 +10282,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     guard_piv_feature(s, keyroost_piv::compat::PivExtension::MoveKey, *force)?;
                     authenticate_piv(s, &mgmt)?;
-                    s.move_key(from.to_slot(), to.to_slot())?;
+                    let dest = to.to_slot();
+                    if let Some(note) = piv_move_dest_note(s.slot_key_presence(dest), &dest.label())
+                    {
+                        eprintln!("note: {note}");
+                    }
+                    s.move_key(from.to_slot(), dest)?;
                     println!(
                         "Moved the private key {} \u{2192} {}; the certificate remains in {}.",
                         from.to_slot().label(),
@@ -10217,6 +10300,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
     Ok(())
+}
+
+/// The note `piv key move` prints when keyroost can't read whether the
+/// destination holds a key: the move is then sent, and the card decides.
+fn piv_move_dest_note(presence: keyroost_transport::SlotKeyPresence, slot: &str) -> Option<String> {
+    matches!(presence, keyroost_transport::SlotKeyPresence::Unknown)
+        .then(|| format!("keyroost can't tell whether {slot} holds a key; the card decides"))
 }
 
 /// Re-find the selected key before reopening it when a secret was typed at
@@ -15224,6 +15314,137 @@ mod cli_tests {
         );
     }
 
+    /// A secret flag with the value glued on (`--pin123456`, `--pin:123456`,
+    /// the retired `--pin-env123456`) is refused with the fixed text and
+    /// never repeated. A glued word made only of letters and dashes is a
+    /// typo'd flag name and keeps clap's own message.
+    #[test]
+    fn a_secret_flag_with_the_value_glued_on_is_never_repeated() {
+        let argv: fn(&[&str]) -> Vec<String> =
+            |a| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let redacted = |args: &[&str]| {
+            let e = parse(args)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} parsed"));
+            redacted_parse_error(&e, &argv(args))
+        };
+        for (args, want) in [
+            (
+                &["keyroostctl", "piv", "test", "--slot", "9a", "--pin123456"][..],
+                "--pin takes env:NAME or stdin — never the PIN itself",
+            ),
+            (
+                &["keyroostctl", "piv", "test", "--slot", "9a", "--pin:123456"][..],
+                "--pin takes env:NAME or stdin — never the PIN itself",
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "piv",
+                    "test",
+                    "--slot",
+                    "9a",
+                    "--pin-env123456",
+                ][..],
+                "--pin takes env:NAME or stdin — never the PIN itself",
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "piv",
+                    "test",
+                    "--slot",
+                    "9a",
+                    "--pinenv:123456",
+                ][..],
+                "--pin takes env:NAME or stdin — never the PIN itself",
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "seed",
+                    "--slot",
+                    "99",
+                    "--seed123456",
+                ][..],
+                "--seed takes env:NAME or stdin",
+            ),
+            (
+                &["keyroostctl", "piv", "pin", "change", "--new-pin123456"][..],
+                "--new-pin takes env:NAME or stdin",
+            ),
+        ] {
+            let msg = redacted(args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
+            assert!(msg.contains(want), "{args:?}: {msg}");
+            assert!(!msg.contains("123456"), "{msg}");
+        }
+        // A typo'd flag name keeps clap's message and its tip.
+        assert!(redacted(&["keyroostctl", "piv", "test", "--slot", "9a", "--pinn"]).is_none());
+    }
+
+    /// A word right after a secret source and a non-secret flag (`--seed
+    /// stdin -s S3CRET`) may be the secret typed in the wrong place: an
+    /// invalid value there names the flag, never the value.
+    #[test]
+    fn an_invalid_value_right_after_a_secret_source_is_never_repeated() {
+        let argv: fn(&[&str]) -> Vec<String> =
+            |a| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let redacted = |args: &[&str]| {
+            let e = parse(args)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} parsed"));
+            redacted_parse_error(&e, &argv(args))
+        };
+        for args in [
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "--seed",
+                "stdin",
+                "-s",
+                "S3CRET",
+            ][..],
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "--seed=env:X",
+                "--slot",
+                "S3CRET",
+            ][..],
+        ] {
+            let msg = redacted(args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
+            assert!(msg.contains("--slot"), "{msg}");
+            assert!(!msg.contains("S3CRET"), "{msg}");
+        }
+        // Anywhere else, clap's own message (which shows the value) stays.
+        assert!(redacted(&["keyroostctl", "molto", "seed", "-s", "S3CRET"]).is_none());
+    }
+
+    /// `openpgp pin change --admin` takes the admin PIN through --pin.
+    #[test]
+    fn the_admin_pin_hint_on_pin_change_names_pin_under_admin() {
+        let argv: Vec<String> = [
+            "keyroostctl",
+            "openpgp",
+            "pin",
+            "change",
+            "--admin",
+            "--admin-pin-env",
+            "X",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let msg = retired_flag_hint("--admin-pin-env", &argv).expect("hint");
+        assert!(
+            msg.contains("with --admin, --pin is the admin PIN"),
+            "{msg}"
+        );
+    }
+
     /// A dash-led word right after a stdin source (`--pin stdin
     /// -123456`) is hidden the same way as a bare stray value — clap only
     /// reports the short-flag prefix it choked on (`-1`), but the rest of
@@ -18237,6 +18458,17 @@ mod cli_tests {
     }
 
     #[test]
+    fn piv_move_notes_a_destination_it_cannot_read() {
+        use keyroost_transport::SlotKeyPresence as K;
+        assert_eq!(
+            piv_move_dest_note(K::Unknown, "9a").as_deref(),
+            Some("keyroost can't tell whether 9a holds a key; the card decides")
+        );
+        assert_eq!(piv_move_dest_note(K::Present, "9a"), None);
+        assert_eq!(piv_move_dest_note(K::NoKey, "9a"), None);
+    }
+
+    #[test]
     fn piv_move_key_parses_standard_and_retired_slots() {
         match parse(&[
             "keyroostctl",
@@ -20707,7 +20939,8 @@ mod cli_tests {
 
     #[test]
     fn piv_key_move_takes_no_yes_and_never_replaces() {
-        // Moving refuses an occupied destination, so there is nothing to confirm.
+        // Moving refuses a destination the card reports holds a key, so there
+        // is nothing to confirm.
         assert!(parse(&[
             "keyroostctl",
             "piv",
@@ -20748,7 +20981,10 @@ mod cli_tests {
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         );
-        assert!(help.contains("Refuses if the destination slot already holds a key"));
+        assert!(help.contains(
+            "Refuses when the card reports that the destination slot already holds a key"
+        ));
+        assert!(help.contains("When keyroost can't tell, it says so and sends the move"));
         assert!(!help.contains("Irreversible") && !help.contains("replace"));
     }
 

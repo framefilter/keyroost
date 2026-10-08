@@ -698,6 +698,28 @@ const CASES: &[(&[&str], &str)] = &[
         "--admin-pin stdin",
     ),
     (
+        &[
+            "openpgp",
+            "pin",
+            "change",
+            "--admin",
+            "--admin-pin-env",
+            "S3CRETVALUE",
+        ],
+        "with --admin, --pin is the admin PIN",
+    ),
+    (
+        &[
+            "openpgp",
+            "pin",
+            "change",
+            "--admin",
+            "--admin-pin-stdin",
+            "S3CRETVALUE",
+        ],
+        "with --admin, --pin is the admin PIN",
+    ),
+    (
         &["piv", "chuid", "generate", "--mgmt-key-env", "S3CRETVALUE"],
         "--mgmt-key env:VAR",
     ),
