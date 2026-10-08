@@ -82,8 +82,13 @@
       <code>-i</code>, <code>-s</code>), and an existing output file is no
       longer replaced without asking (see
       <a href="#v0-13-0-names">command and flag names</a> below).
+      A key can now carry its own name, and <code>keys.json</code> no longer
+      holds serials (see <a href="#v0-13-0-key-names">names</a> below).
       Library consumers: <code>keyroost-resolve</code> drops its HID-only
-      name resolver for the shared device model.</p>
+      name resolver for the shared device model, and
+      <code>keyroost-ctap</code>, <code>keyroost-keyring</code> and
+      <code>keyroost-resolve</code> change their public API (see the table
+      at the end).</p>
     <h3>CLI</h3>
     <div class="kr-table-wrap">
     <table class="kr-table">
@@ -163,9 +168,9 @@
       <tr><td><code>--device</code> was ignored by commands that touch no
           key</td>
         <td>Refused on <code>doctor</code>, <code>name list</code>,
-          <code>name delete</code>, <code>completions</code>,
-          <code>manpage</code> and <code>molto import --file …
-          --dry-run</code>. Remove it.</td></tr>
+          <code>completions</code>, <code>manpage</code> and <code>molto
+          import --file … --dry-run</code>. Remove it. <code>name clear</code>
+          takes a NAME or <code>-d</code>, not both.</td></tr>
       <tr><td><code>completions &lt;shell&gt;</code> printed a full static
           script</td>
         <td>Prints a short script that calls back into
@@ -185,6 +190,44 @@
         <td><code>piv cert generate</code> / <code>piv cert request</code> write the slot's standard PIV key usage, marked critical
           (same as <code>--key-usage default</code>). Use <code>--key-usage
           undefined</code> for the old output.</td></tr>
+    </table>
+    </div>
+    <h3 id="v0-13-0-key-names">Names and keys.json</h3>
+    <p>A name can now be kept on the key itself
+      (<code>keyroostctl name set NAME --store key</code>), where every
+      computer running keyroost shows it. Names kept on this computer work
+      as before. See <a href="naming.html">Naming</a>.</p>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>keys.json</code> held each named key's serial</td>
+        <td>It holds a salted fingerprint of the key instead, with the salt
+          in <code>keys.salt</code> beside it. The first time v0.13.0 reads
+          an older <code>keys.json</code> it converts it, keeping a backup of
+          the old file until the conversion succeeds and then removing it.
+          Nothing to do. If you go back to v0.12, it can't read the converted
+          file and shows your keys unnamed. If <code>keys.salt</code> is
+          lost, clear the names and set them again; restoring the old
+          <code>keys.salt</code> doesn't bring them back.</td></tr>
+      <tr><td><code>fido blob clear</code> erased the whole array</td>
+        <td>It still does, and the warning now names the key's name if one
+          is stored on the key. <code>--keep-name</code> keeps it.
+          <code>fido blob edit</code> refuses the name entry (use
+          <code>name set</code>), and <code>fido blob delete</code> on it
+          warns first.</td></tr>
+      <tr><td>One large-blob element that wasn't in the standard entry
+          format made <code>fido blob list</code> fail</td>
+        <td>That element is skipped and counted (<code>skipped</code> in the
+          JSON), and every write keeps it unchanged.</td></tr>
+      <tr><td><code>list --json</code> rows had a <code>name</code></td>
+        <td>They also have <code>name_source</code>: <code>"key"</code>,
+          <code>"computer"</code> or <code>null</code>. A key carrying a
+          name another key holds here shows <code>"Name (1234)"</code> (the
+          last four characters of its serial); select it by the row's
+          <code>device</code> value. <code>fido blob list --json</code> has
+          a <code>"key-name"</code> kind, and <code>name list --json</code>
+          prints <code>{"names": [{"name", "stored", "status",
+          "number"}]}</code>.</td></tr>
     </table>
     </div>
     <h3 id="v0-13-0-secrets">CLI: secrets</h3>
@@ -511,7 +554,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
       <tr><td><code>keyroostctl otp unlock-list</code></td><td><code>keyroostctl otp list --unlock auto</code>; <code>--pin-only</code> is <code>--unlock pin</code>, the default</td></tr>
       <tr><td><code>keyroostctl molto sync-time</code></td><td><code>keyroostctl molto sync</code></td></tr>
       <tr><td><code>keyroostctl molto import-file</code></td><td><code>keyroostctl molto import --file PATH</code>; <code>--start</code> is <code>--slot</code> (the first slot to fill)</td></tr>
-      <tr><td><code>keyroostctl key-name</code></td><td><code>keyroostctl name add</code>, <code>name list</code>, <code>name delete</code> (<code>key-name remove</code> is now <code>name delete</code>)</td></tr>
+      <tr><td><code>keyroostctl key-name</code></td><td><code>keyroostctl name set</code>, <code>name list</code>, <code>name clear</code> (<code>key-name add</code> is now <code>name set</code>, <code>key-name remove</code> is now <code>name clear</code>)</td></tr>
       <tr><td><code>keyroostctl --list-readers</code></td>
         <td><code>keyroostctl list</code>; the flag is removed</td></tr>
       <tr><td><code>keyroostctl molto title -p 99 NAME</code> (also <code>--profile</code>, on <code>seed</code>, <code>title</code>, <code>delete</code>, <code>config</code>, <code>sync-time</code> and <code>import</code>)</td>
@@ -663,6 +706,57 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
           about a slot's key). Both structs and the enum are
           <code>#[non_exhaustive]</code>, so nothing existing
           breaks.</td></tr>
+      <tr><td><code>keyroost-ctap</code></td>
+        <td><code>LargeBlobArray</code>'s <code>entries</code> and
+          <code>raw_array</code> fields are now methods
+          (<code>entries()</code>, <code>entry(i)</code>, <code>len()</code>,
+          <code>raw_array()</code>), and the array is built with
+          <code>LargeBlobArray::parse</code>.
+          <code>serialize_with_checksum</code> returns
+          <code>Result</code>: it refuses an array read with bytes after its
+          end. <code>EntryKind</code> gains <code>KeyName</code>, so an
+          exhaustive <code>match</code> needs a new arm.
+          <code>extract_cert_from_entries</code> takes the
+          <code>&amp;LargeBlobArray</code>. New: the
+          <code>device_label</code> module (the on-key name format, see
+          <a href="https://github.com/framefilter/keyroost/blob/main/docs/PROTOCOL-device-label.md">PROTOCOL-device-label.md</a>),
+          <code>skipped_count</code>, <code>without_entry</code>,
+          <code>label</code>, <code>with_label</code>,
+          <code>only_label</code>, and <code>cbor::item_len</code>,
+          <code>split_array</code>, <code>split_map</code>,
+          <code>array_header</code>.</td></tr>
+      <tr><td><code>keyroost-keyring</code></td>
+        <td><code>keys.json</code> format 2. <code>KeyEntry</code> is
+          <code>KeyRecord</code>: <code>serial</code> is replaced by
+          <code>fingerprint</code> and <code>stored</code>
+          (<code>NameStore</code>). Removed: <code>add</code>,
+          <code>by_name</code>, <code>by_serial</code>,
+          <code>name_for</code>, <code>resolve</code>,
+          <code>ConnectedKey</code>, <code>ResolveError</code> and
+          <code>KeyringError::DuplicateSerial</code>; <code>remove</code> returns the removed record. New:
+          <code>set_name</code>,
+          <code>holder</code>, <code>local_name_for</code>,
+          <code>records_for</code>, <code>record_first_seen</code>,
+          <code>clear_key</code>, <code>load_report</code>, the
+          fingerprint API (<code>Salt</code>, <code>Fingerprint</code>,
+          <code>fingerprint</code>, <code>SALT_FILE</code>) and
+          <code>KeyringError</code> variants <code>MalformedSalt</code>,
+          <code>NoSerial</code>, <code>Unconverted</code>,
+          <code>NewerFormat</code> and <code>Damaged</code>.
+          <code>save_to</code> and <code>save_default</code> take
+          <code>&amp;mut self</code>. New dependencies on
+          <code>getrandom</code> and <code>keyroost-proto</code>.</td></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td><code>Device</code> gains public fields <code>naming</code>
+          and <code>hid_serial</code>, <code>EnumerateOptions</code> gains
+          <code>skip_key_names</code>, and <code>SelectError</code> gains
+          <code>NameNotConnected</code>; code that builds these structs or
+          matches the enum exhaustively needs updating. New: the
+          <code>names</code> module (<code>Naming</code>,
+          <code>NameSource</code>, <code>KeyLabel</code>,
+          <code>apply_names</code>, …). <code>enumerate()</code> reads the
+          name stored on each FIDO key unless <code>skip_key_names</code>
+          is set. New dependency on <code>keyroost-ctap</code>.</td></tr>
       <tr><td><code>keyroost-proto</code>, <code>keyroost-ctap</code></td>
         <td>New, additive: the <code>keyroost_proto::trace</code> module (the
           shared <code>--debug</code> line format) and
