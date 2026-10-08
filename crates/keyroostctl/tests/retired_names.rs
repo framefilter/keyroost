@@ -568,6 +568,239 @@ const CASES: &[(&[&str], &str)] = &[
         ],
         "--out",
     ),
+    (
+        &["molto", "--key", "S3CRETVALUE", "info"],
+        "--customer-key env:NAME",
+    ),
+    (
+        &["molto", "--key-ascii", "S3CRETVALUE", "info"],
+        "--customer-key-encoding ascii",
+    ),
+    (
+        &["molto", "--key-env", "S3CRETVALUE", "info"],
+        "--customer-key env:VAR",
+    ),
+    (
+        &["molto", "--key-ascii-env", "S3CRETVALUE", "info"],
+        "--customer-key env:VAR --customer-key-encoding ascii",
+    ),
+    (
+        &["molto", "customer-key", "--hex", "S3CRETVALUE"],
+        "--new-customer-key env:NAME (hex is the default encoding)",
+    ),
+    (
+        &["molto", "customer-key", "--ascii", "S3CRETVALUE"],
+        "--new-customer-key env:NAME --encoding ascii",
+    ),
+    (
+        &["molto", "customer-key", "--hex-env", "S3CRETVALUE"],
+        "--new-customer-key env:VAR (hex",
+    ),
+    (
+        &["molto", "customer-key", "--hex-stdin", "S3CRETVALUE"],
+        "--new-customer-key stdin (hex",
+    ),
+    (
+        &["molto", "customer-key", "--ascii-env", "S3CRETVALUE"],
+        "--new-customer-key env:VAR --encoding ascii",
+    ),
+    (
+        &["molto", "customer-key", "--ascii-stdin", "S3CRETVALUE"],
+        "--new-customer-key stdin --encoding ascii",
+    ),
+    (
+        &["molto", "seed", "--slot", "1", "--hex", "S3CRETVALUE"],
+        "--seed env:NAME --encoding hex",
+    ),
+    (
+        &["prog", "seed", "--base32", "S3CRETVALUE"],
+        "--seed env:NAME (base32",
+    ),
+    (
+        &["molto", "seed", "--slot", "1", "--hex-stdin", "S3CRETVALUE"],
+        "--seed stdin --encoding hex",
+    ),
+    (
+        &["prog", "seed", "--base32-env", "S3CRETVALUE"],
+        "--seed env:VAR (base32",
+    ),
+    (
+        &[
+            "molto",
+            "seed",
+            "--slot",
+            "1",
+            "--base32-stdin",
+            "S3CRETVALUE",
+        ],
+        "--seed stdin (base32",
+    ),
+    (
+        &["oath", "add", "n", "--secret-env", "S3CRETVALUE"],
+        "--seed env:VAR",
+    ),
+    (
+        &["oath", "add", "n", "--secret-stdin", "S3CRETVALUE"],
+        "--seed stdin",
+    ),
+    (
+        &["piv", "pin", "change", "--old-pin-stdin", "S3CRETVALUE"],
+        "--pin stdin (the current PIN)",
+    ),
+    (
+        &["fido", "pin", "set", "--new-pin-stdin", "S3CRETVALUE"],
+        "--new-pin stdin",
+    ),
+    (
+        &["piv", "pin", "unblock", "--puk-env", "S3CRETVALUE"],
+        "--puk env:VAR",
+    ),
+    (
+        &["piv", "pin", "unblock", "--puk-stdin", "S3CRETVALUE"],
+        "--puk stdin",
+    ),
+    (
+        &["piv", "puk", "change", "--old-puk-env", "S3CRETVALUE"],
+        "--puk env:VAR (the current PUK)",
+    ),
+    (
+        &["piv", "puk", "change", "--old-puk-stdin", "S3CRETVALUE"],
+        "--puk stdin (the current PUK)",
+    ),
+    (
+        &["piv", "puk", "change", "--new-puk-env", "S3CRETVALUE"],
+        "--new-puk env:VAR",
+    ),
+    (
+        &["piv", "puk", "change", "--new-puk-stdin", "S3CRETVALUE"],
+        "--new-puk stdin",
+    ),
+    (
+        &[
+            "openpgp",
+            "name",
+            "set",
+            "x",
+            "--admin-pin-env",
+            "S3CRETVALUE",
+        ],
+        "--admin-pin env:VAR",
+    ),
+    (
+        &[
+            "openpgp",
+            "url",
+            "set",
+            "x",
+            "--admin-pin-stdin",
+            "S3CRETVALUE",
+        ],
+        "--admin-pin stdin",
+    ),
+    (
+        &["piv", "chuid", "generate", "--mgmt-key-env", "S3CRETVALUE"],
+        "--mgmt-key env:VAR",
+    ),
+    (
+        &[
+            "piv",
+            "key",
+            "delete",
+            "--slot",
+            "9a",
+            "--mgmt-key-stdin",
+            "S3CRETVALUE",
+        ],
+        "--mgmt-key stdin",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "delete",
+            "--slot",
+            "9a",
+            "--mgmt-key-default",
+            "S3CRETVALUE",
+        ],
+        "--mgmt-key default",
+    ),
+    (
+        &[
+            "piv",
+            "mgmt-key",
+            "change",
+            "--old-mgmt-key-env",
+            "S3CRETVALUE",
+        ],
+        "--mgmt-key env:VAR (the current management key)",
+    ),
+    (
+        &[
+            "piv",
+            "mgmt-key",
+            "change",
+            "--old-mgmt-key-stdin",
+            "S3CRETVALUE",
+        ],
+        "--mgmt-key stdin (the current management key)",
+    ),
+    (
+        &[
+            "piv",
+            "mgmt-key",
+            "change",
+            "--old-mgmt-key-default",
+            "S3CRETVALUE",
+        ],
+        "--mgmt-key default (the current management key)",
+    ),
+    (
+        &[
+            "piv",
+            "mgmt-key",
+            "change",
+            "--new-mgmt-key-env",
+            "S3CRETVALUE",
+        ],
+        "--new-mgmt-key env:VAR",
+    ),
+    (
+        &[
+            "piv",
+            "mgmt-key",
+            "change",
+            "--new-mgmt-key-stdin",
+            "S3CRETVALUE",
+        ],
+        "--new-mgmt-key stdin",
+    ),
+    (
+        &["oath", "list", "--password-env", "S3CRETVALUE"],
+        "--password env:VAR",
+    ),
+    (
+        &["oath", "list", "--password-stdin", "S3CRETVALUE"],
+        "--password stdin",
+    ),
+    (
+        &[
+            "oath",
+            "password",
+            "set",
+            "--new-password-stdin",
+            "S3CRETVALUE",
+        ],
+        "--new-password stdin",
+    ),
+    (
+        &["prog", "seed", "--seed-stdin", "S3CRETVALUE"],
+        "--seed stdin",
+    ),
+    (
+        &["molto", "import", "--slot", "1", "--uri-env", "S3CRETVALUE"],
+        "--uri env:VAR",
+    ),
 ];
 
 #[test]
@@ -612,6 +845,45 @@ fn every_retired_command_row_has_a_case() {
                 .any(|(a, _)| a.windows(words.len()).any(|w| w == words.as_slice())),
             "no case for `{}`",
             words.join(" ")
+        );
+    }
+}
+
+/// Every `RETIRED_FLAGS` row in main.rs has a case above.
+#[test]
+fn every_retired_flag_row_has_a_case() {
+    let src = include_str!("../src/main.rs");
+    let block = src
+        .split("const RETIRED_FLAGS")
+        .nth(1)
+        .unwrap()
+        .split("];")
+        .next()
+        .unwrap();
+    for row in block.split("RetiredFlag {").skip(1) {
+        let flag = row
+            .split("flag: \"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let words: Vec<&str> = row
+            .split("words: &[")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap()
+            .split(',')
+            .map(|w| w.trim().trim_matches('"'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        assert!(
+            CASES
+                .iter()
+                .any(|(a, _)| a.contains(&flag) && words.iter().all(|w| a.contains(w))),
+            "no case for {flag} {words:?}"
         );
     }
 }

@@ -66,6 +66,7 @@ struct Cli {
     // id keeps the global selector separate from all of them.
     #[arg(
         long,
+        short = 'd',
         global = true,
         help_heading = "Global options",
         value_name = "KEY",
@@ -192,7 +193,7 @@ enum Cmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Skip the typed confirmation (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// Some cards protect reset behind management auth, checked just
         /// before the PIV step. Whether that applies to the selected device
@@ -835,7 +836,7 @@ enum PivCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). Optional and never asked
@@ -867,7 +868,7 @@ enum PivCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// Run even on a device listed as incompatible. There it sends one bare
         /// RESET without blocking the PIN or PUK; if the card can't reset, it
@@ -979,7 +980,7 @@ enum PivRetriesCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -1062,7 +1063,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// Key type to generate (OpenPGP's `nistp256` is `eccp256` here).
         #[arg(long, value_enum, default_value = "eccp256")]
@@ -1094,7 +1095,7 @@ enum PivKeyCmd {
         /// the temporary file altogether, use `--generate-key` on `piv cert
         /// request`/`piv cert generate`, which folds this key generation into
         /// the signing command.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -1103,7 +1104,7 @@ enum PivKeyCmd {
         #[arg(long)]
         force: bool,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Delete a slot's private key; the slot's certificate is left in place.
@@ -1118,7 +1119,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
@@ -1127,7 +1128,7 @@ enum PivKeyCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
         mgmt_key: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long)]
@@ -1161,7 +1162,7 @@ enum PivKeyCmd {
         #[arg(long)]
         force: bool,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -1189,10 +1190,10 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// Certificate file to import (`.der` or `.pem`).
-        #[arg(long = "in", value_name = "FILE")]
+        #[arg(long = "in", short = 'i', value_name = "FILE")]
         in_file: std::path::PathBuf,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
@@ -1203,7 +1204,7 @@ enum PivCertCmd {
         #[command(flatten)]
         compression: CertCompressArgs,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Export a slot's certificate as PEM (default) or DER, to a file or stdout. No PIN required.
@@ -1212,10 +1213,10 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// Write the certificate to this file instead of stdout.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -1231,7 +1232,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
         /// (supported attributes: CN, O, OU, C, L, ST).
@@ -1243,7 +1244,7 @@ enum PivCertCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         /// Write the request (PEM) to this file instead of stdout.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -1269,7 +1270,7 @@ enum PivCertCmd {
         #[command(flatten)]
         key_usage: KeyUsageArgs,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Create a self-signed certificate for the key in a slot and store it
@@ -1285,7 +1286,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
         /// (supported attributes: CN, O, OU, C, L, ST).
@@ -1321,7 +1322,7 @@ enum PivCertCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
         mgmt_key: Option<SecretSource>,
         /// Also write the certificate (PEM) to this file.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -1340,7 +1341,7 @@ enum PivCertCmd {
         #[command(flatten)]
         key_usage: KeyUsageArgs,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Delete a slot's certificate; the slot's private key is left in place.
@@ -1353,7 +1354,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
+        #[arg(long, short = 's', value_enum)]
         slot: CliPivSlot,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
@@ -1362,7 +1363,7 @@ enum PivCertCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
         mgmt_key: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -1448,11 +1449,11 @@ enum OpenpgpCmd {
     /// for ECDSA, `R||S` for Ed25519.
     Sign {
         /// File whose contents to sign.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'i', value_name = "FILE")]
         r#in: std::path::PathBuf,
         /// Write the raw signature bytes here. Without it, the signature is
         /// printed as hex to stdout.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -1476,11 +1477,11 @@ enum OpenpgpCmd {
         /// For an RSA slot `--in` is the raw cryptogram; for an ECDH slot it is
         /// the sender's ephemeral public point (`04||X||Y`, or 32 raw bytes for
         /// X25519) and the output is the shared secret.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'i', value_name = "FILE")]
         r#in: std::path::PathBuf,
         /// Write the recovered plaintext (or, for ECDH, the shared secret)
         /// here. Without it, the bytes are printed as hex to stdout.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -1502,11 +1503,11 @@ enum OpenpgpCmd {
     /// DER) for ECDSA, `R||S` for Ed25519.
     Authenticate {
         /// File whose contents to authenticate-sign.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'i', value_name = "FILE")]
         r#in: std::path::PathBuf,
         /// Write the raw signature bytes here. Without it, the signature is
         /// printed as hex to stdout.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -1529,7 +1530,7 @@ enum OpenpgpCmd {
     /// Also works to recover a card whose PINs are blocked.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -1614,7 +1615,7 @@ enum OpenpgpKeyCmd {
     /// key.
     Generate {
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
-        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        #[arg(long, short = 's', value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
         /// Key algorithm to generate. Omit to keep the slot's current algorithm
         /// (RSA-2048 on a factory card). Ed25519 fits the sign/auth slots,
@@ -1624,7 +1625,7 @@ enum OpenpgpKeyCmd {
         #[arg(long, value_enum)]
         algorithm: Option<CliOpenpgpKeyAlg>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
         /// reads one line (hidden when typed at a terminal). With neither, a
@@ -1650,13 +1651,18 @@ enum OpenpgpKeyCmd {
         /// PKCS#8, PEM or DER; auto-detected). Mutually exclusive with
         /// `--generate`. The key is read locally and imported; it is never
         /// logged. Prefer an unencrypted key file you can delete afterward.
-        #[arg(long = "in", value_name = "FILE", conflicts_with = "generate")]
+        #[arg(
+            long = "in",
+            short = 'i',
+            value_name = "FILE",
+            conflicts_with = "generate"
+        )]
         in_file: Option<std::path::PathBuf>,
         /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
-        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        #[arg(long, short = 's', value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
         /// reads one line (hidden when typed at a terminal). With neither, a
@@ -1670,7 +1676,7 @@ enum OpenpgpKeyCmd {
     /// modulus and exponent, ECC keys the public point, in hex.
     Show {
         /// Which key slot: `sign`, `decrypt`, or `auth`.
-        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        #[arg(long, short = 's', value_enum, default_value_t = OpenpgpSlot::Sign)]
         slot: OpenpgpSlot,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -1987,7 +1993,7 @@ enum OathCmd {
         #[command(flatten)]
         access: OathAccess,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Set or clear the OATH applet's access password.
@@ -2003,7 +2009,7 @@ enum OathCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -2092,7 +2098,7 @@ enum ProgCmd {
         #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
         encoding: SeedEncoding,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Set the device configuration and seed the clock with the host's UTC time.
@@ -2109,7 +2115,7 @@ enum ProgCmd {
         #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
         display_timeout: TimeoutArg,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -2136,7 +2142,7 @@ enum MoltoCmd {
     /// --encoding says how it is written (base32 unless --encoding hex).
     Seed {
         /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: u8,
         /// The seed: env:NAME reads that environment variable, stdin reads
         /// one line (second line when --customer-key stdin is also given;
@@ -2147,14 +2153,14 @@ enum MoltoCmd {
         #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
         encoding: SeedEncoding,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Write a slot title (1..=12 ASCII chars), or print the current
     /// one when TITLE is omitted (reading needs no customer key).
     Title {
         /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: u8,
         /// New title; omit to read the slot's stored title instead.
         #[arg(value_parser = parse_molto_title)]
@@ -2166,16 +2172,16 @@ enum MoltoCmd {
     /// card holder (hardware-verified), so the only gate is the confirmation.
     Delete {
         /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: u8,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Set a slot's TOTP configuration (and seed the clock with the host's UTC time).
     Config {
         /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: u8,
         /// HMAC algorithm for the codes.
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
@@ -2193,7 +2199,7 @@ enum MoltoCmd {
     /// Push the host's current UTC time to one slot (or all slots).
     Sync {
         /// Slot number, 0-99 (Token2 calls these profiles). Omit with `--all`.
-        #[arg(long, value_name = "SLOT", conflicts_with = "all", value_parser = parse_molto_slot)]
+        #[arg(long, short = 's', value_name = "SLOT", conflicts_with = "all", value_parser = parse_molto_slot)]
         slot: Option<u8>,
         /// Sync time on every slot 0..=99.
         #[arg(long)]
@@ -2219,7 +2225,7 @@ enum MoltoCmd {
         #[arg(long, value_enum, default_value_t = KeyEncoding::Hex)]
         encoding: KeyEncoding,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Import an otpauth:// URI to a slot, or every entry of an export file
@@ -2236,7 +2242,7 @@ enum MoltoCmd {
     Import {
         /// Slot number, 0-99 (Token2 calls these profiles). With --file, the
         /// first slot to fill (default 0); entries fill consecutive slots.
-        #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot, required_unless_present = "file")]
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot, required_unless_present = "file")]
         slot: Option<u8>,
         /// Override the slot title (default: derived from the URI issuer/account).
         #[arg(long, value_parser = parse_molto_title, conflicts_with = "file")]
@@ -2268,7 +2274,7 @@ enum MoltoCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, requires = "file")]
         password: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Sweep plausible read APDUs against the device and report what the firmware
@@ -2280,7 +2286,7 @@ enum MoltoCmd {
     #[command(hide = true)]
     Probe {
         /// Confirm you understand this sends ~256–512 experimental APDUs.
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// Also probe the secure class (CLA 0x84) after authenticating. Without
         /// this, only CLA 0x80 is scanned (no auth needed).
@@ -2293,7 +2299,7 @@ enum MoltoCmd {
         /// Slot to use in P2 for `authed` scans (P2 is the slot number
         /// for the known secure commands). Defaults to a high, presumably-unused
         /// slot.
-        #[arg(long, default_value_t = 99)]
+        #[arg(long, short = 's', default_value_t = 99)]
         slot: u8,
     },
     /// Factory-reset the device: wipe all slots and restore the default
@@ -2302,7 +2308,7 @@ enum MoltoCmd {
     /// Requires physical button confirmation on the device.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -2332,7 +2338,7 @@ enum FidoCmd {
     /// immediately. No touch is involved.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         #[arg(long, value_name = "PATH", conflicts_with = "reader", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
@@ -2432,7 +2438,7 @@ enum FidoPinCmd {
         #[arg(long)]
         force_change: bool,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2483,7 +2489,7 @@ enum FidoCredentialCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Show how many passkeys the key holds and how many more fit. Needs the
@@ -2557,7 +2563,7 @@ enum FidoFingerprintCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -2610,7 +2616,7 @@ enum FidoAttestationCmd {
     /// Turning it off again typically requires a FIDO2 reset.
     Enable {
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2647,7 +2653,7 @@ enum SshCertCmd {
         #[arg(long, value_name = "RP_ID")]
         id: Option<String>,
         /// Output file (default: <rp-id-sanitized>-cert.pub).
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -2724,7 +2730,7 @@ enum LargeBlobCmd {
         /// Zero-based entry index as printed by `fido blob list`.
         index: usize,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2743,7 +2749,7 @@ enum LargeBlobCmd {
         /// Zero-based entry index as printed by `fido blob list`.
         index: usize,
         /// File to write the entry's bytes to.
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, short = 'o', value_name = "FILE")]
         out: std::path::PathBuf,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
@@ -2757,7 +2763,7 @@ enum LargeBlobCmd {
     /// Irreversible: asks first (`--yes` to skip).
     Clear {
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2866,7 +2872,7 @@ enum OtpCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Erase every OTP entry on the key. Irreversible: asks first (`--yes` to
@@ -2875,7 +2881,7 @@ enum OtpCmd {
     /// The key then needs a confirming button press.
     Reset {
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Read the device serial number (over USB, or NFC where the model allows).
@@ -2908,7 +2914,7 @@ enum OtpCmd {
         #[arg(long)]
         ccid: bool,
         /// Skip the typed confirmation (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Set, change, clear, check or verify the OTP PIN.
@@ -3038,14 +3044,14 @@ enum OtpButtonCmd {
         #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
         encoding: SeedEncoding,
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
     /// Delete the HOTP-on-button keystroke slot. Irreversible: asks first
     /// (`--yes` to skip).
     Delete {
         /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
+        #[arg(long, short = 'y')]
         yes: bool,
     },
 }
@@ -4946,6 +4952,23 @@ fn secret_flag_precedes(argv: &[String], prefix: &str) -> bool {
     })
 }
 
+/// Whether a word right after a secret source starts like one of the short
+/// flags with a value glued on (`--pin stdin -s3cret`). clap would take
+/// the rest as a slot, device or file name and could repeat it in an
+/// error, and the word may be a secret that starts with a dash. A short
+/// flag on its own (`-s 9a`, `-y`) is not matched.
+fn short_glued_after_source(argv: &[String]) -> bool {
+    let is_source = |w: &str| w == "stdin" || w == "default" || w.starts_with("env:");
+    argv.windows(2).any(|w| {
+        let value = match w[0].split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => value,
+            _ => w[0].as_str(),
+        };
+        let b = w[1].as_bytes();
+        is_source(value) && b.len() > 2 && b[0] == b'-' && b"dyois".contains(&b[1])
+    })
+}
+
 /// "--pin needs a value: env:NAME or stdin" when a secret flag in `argv` is
 /// followed by a flag-shaped word (`--pin --yes`): clap takes that word as
 /// the value (a secret flag accepts a dash-led one), so the value is most
@@ -5093,12 +5116,19 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let argv: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if short_glued_after_source(&argv) {
+        eprintln!(
+            "error: unexpected argument after a secret source (not shown, in case it is a \
+             secret); give a short flag its value as a separate word (`-s 9a`)"
+        );
+        std::process::exit(2);
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
-            let argv: Vec<String> = std::env::args_os()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
             if let Some(msg) = redacted_parse_error(&e, &argv) {
                 eprintln!("error: {msg}");
                 std::process::exit(2);
@@ -5310,10 +5340,10 @@ fn run_molto(
         ..
     } = cmd
     {
-        let start = &slot.unwrap_or(0);
+        let start = slot.unwrap_or(0);
         molto_dry_run_key(&mut sec, key, password.as_ref())?;
         let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
-        let last = (*start as usize).saturating_add(entries.len());
+        let last = (start as usize).saturating_add(entries.len());
         println!(
             "Found {} entries; would fill slots #{}..#{} (dry run).",
             entries.len(),
@@ -5321,7 +5351,7 @@ fn run_molto(
             last.saturating_sub(1)
         );
         for (i, entry) in entries.iter().enumerate() {
-            let p = *start as usize + i;
+            let p = start as usize + i;
             println!(
                 "  #{:02}: {:?} ({} bytes, {:?}, {} digits, {:?})",
                 p,
@@ -5741,7 +5771,7 @@ fn run_molto(
             dry_run,
             ..
         } => {
-            let start = &slot.unwrap_or(0);
+            let start = slot.unwrap_or(0);
             // dry-run prints the plan and returns *before* authentication
             // (see the pre-auth handling above) — it is always false here.
             debug_assert!(!*dry_run);
@@ -5750,7 +5780,7 @@ fn run_molto(
                 .as_deref()
                 .ok_or("internal error: bulk entries not loaded")?;
             let n = entries.len();
-            let last = *start as usize + n;
+            let last = start as usize + n;
             output::status(&format!(
                 "Found {} entries; programming slots #{}..#{}.",
                 n,
@@ -5784,7 +5814,7 @@ fn run_molto(
                 )?;
                 written += 1;
             }
-            println!("{}", import_file_ack(written, *start, last - 1));
+            println!("{}", import_file_ack(written, start, last - 1));
         }
         MoltoCmd::Reset { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Probe { .. } => unreachable!("handled above before auth"),
@@ -13896,6 +13926,33 @@ mod cli_tests {
         assert_eq!(secret_flag_problems(&bad), want);
     }
 
+    /// A dash-led secret right after a source can start like a short flag
+    /// with its value attached (`-s3cret` is `-s 3cret`); clap would then
+    /// take it as a slot, device or file and could repeat it. Refused
+    /// before parsing; a short flag on its own is fine.
+    #[test]
+    fn an_attached_short_after_a_source_is_refused() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for line in [
+            "k molto seed --seed stdin -s3cret",
+            "k piv pin change --pin stdin --new-pin stdin -d3cret",
+            "k piv key move --mgmt-key=default -y3cret",
+            "k piv key generate --mgmt-key env:K -o3cret",
+            "k openpgp key import --admin-pin stdin -i3cret",
+        ] {
+            assert!(short_glued_after_source(&argv(line)), "{line}");
+        }
+        for line in [
+            "k molto seed --seed stdin -s 1 -y",
+            "k molto seed -s1 --seed stdin -y",
+            "k piv pin change --pin stdin -d k",
+            "k piv x --pin stdin --slot 9a",
+            "k piv x --pin stdin -123456",
+        ] {
+            assert!(!short_glued_after_source(&argv(line)), "{line}");
+        }
+    }
+
     #[test]
     fn a_dash_led_word_after_any_source_is_hidden() {
         let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
@@ -17088,6 +17145,162 @@ mod cli_tests {
         Cli::command().debug_assert();
     }
 
+    /// Exactly five short flags, each with one meaning, and every one of
+    /// the five long flags has its short wherever it appears.
+    #[test]
+    fn short_flags_are_the_five_and_mean_one_thing() {
+        const SHORTS: [(char, &str); 5] = [
+            ('d', "device"),
+            ('y', "yes"),
+            ('o', "out"),
+            ('i', "in"),
+            ('s', "slot"),
+        ];
+        for (path, cmd) in all_commands() {
+            let mut seen = std::collections::BTreeSet::new();
+            for a in cmd.get_arguments() {
+                if matches!(a.get_id().as_str(), "help" | "version") {
+                    continue;
+                }
+                if let Some(s) = a.get_short() {
+                    let (_, long) = SHORTS
+                        .iter()
+                        .find(|(c, _)| *c == s)
+                        .unwrap_or_else(|| panic!("{path}: -{s} is not one of the five"));
+                    assert_eq!(a.get_long(), Some(*long), "{path}: -{s} means --{long}");
+                    assert!(seen.insert(s), "{path}: -{s} twice");
+                }
+                if let Some((c, _)) = SHORTS.iter().find(|(_, l)| a.get_long() == Some(l)) {
+                    assert_eq!(
+                        a.get_short(),
+                        Some(*c),
+                        "{path}: --{} has no -{c}",
+                        a.get_long().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_flags_parse() {
+        for a in [
+            &["keyroostctl", "-d", "yubi-test", "piv", "info"][..],
+            &[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "export",
+                "-s",
+                "9a",
+                "-o",
+                "c.pem",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "import",
+                "-s",
+                "9a",
+                "-i",
+                "c.der",
+                "-y",
+            ],
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "-s",
+                "1",
+                "--seed",
+                "stdin",
+                "-y",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "key",
+                "generate",
+                "-s",
+                "9a",
+                "-o",
+                "p.pem",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "key",
+                "move",
+                "--from",
+                "9a",
+                "--to",
+                "9c",
+                "-y",
+            ],
+        ] {
+            assert!(parse(a).is_ok(), "{a:?}");
+        }
+    }
+
+    /// A retired-name message that spells a flag as `-x/--long` names a
+    /// short that exists: every `--long` in the tree has `-x`. Only the
+    /// retired flag a row is about may be missing from the tree.
+    #[test]
+    fn retired_messages_name_real_short_flags() {
+        let all = all_commands();
+        let check = |msg: &str, retired: Option<&str>| {
+            let b = msg.as_bytes();
+            for i in 0..b.len().saturating_sub(4) {
+                let starts = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-');
+                if !(starts
+                    && b[i] == b'-'
+                    && b[i + 1].is_ascii_alphabetic()
+                    && msg[i + 2..].starts_with("/--"))
+                {
+                    continue;
+                }
+                let c = b[i + 1] as char;
+                let long: String = msg[i + 5..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+                    .collect();
+                let args: Vec<clap::Arg> = all
+                    .iter()
+                    .flat_map(|(_, cmd)| cmd.get_arguments().cloned().collect::<Vec<_>>())
+                    .filter(|a| a.get_long() == Some(long.as_str()))
+                    .collect();
+                if args.is_empty() {
+                    assert!(
+                        retired.is_some_and(|f| f == format!("-{c}") || f == format!("--{long}")),
+                        "{msg:?}: --{long} is in no command"
+                    );
+                    continue;
+                }
+                for a in args {
+                    assert_eq!(a.get_short(), Some(c), "{msg:?}: --{long} has no -{c}");
+                }
+            }
+        };
+        for r in RETIRED_FLAGS {
+            check(r.msg, Some(r.flag));
+        }
+        for r in RETIRED_COMMANDS {
+            check(r.new, None);
+            check(r.note, None);
+        }
+        // The positional messages built in `redacted_parse_error`.
+        for a in [
+            &["keyroostctl", "fido", "blob", "export", "0", "out.bin"][..],
+            &["keyroostctl", "molto", "import", "--slot", "1", "-"],
+        ] {
+            let argv: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            let e = parse(a).err().expect("refused");
+            let msg = redacted_parse_error(&e, &argv).expect("a message");
+            check(&msg, None);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_private_file_is_owner_only() {
@@ -17428,6 +17641,25 @@ mod cli_tests {
             ],
             // --dry-run needs --file
             &["keyroostctl", "molto", "import", "--slot", "1", "--dry-run"],
+            // --password is for an encrypted --file; --qr is one URI
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--slot",
+                "1",
+                "--password",
+                "stdin",
+            ],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--file",
+                "v.json",
+                "--qr",
+                "x.png",
+            ],
             &[
                 "keyroostctl",
                 "molto",
@@ -18974,31 +19206,17 @@ mod cli_tests {
 
     #[test]
     fn piv_secret_flags_all_have_help() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let piv = cmd.find_subcommand("piv").unwrap();
-        let leaves = piv.get_subcommands().flat_map(|c| {
-            let subs: Vec<&clap::Command> = c.get_subcommands().collect();
-            if subs.is_empty() {
-                vec![c]
-            } else {
-                subs
+        for (path, cmd) in all_commands() {
+            if !path.starts_with("piv ") {
+                continue;
             }
-        });
-        for sub in leaves {
-            if sub.get_name() == "reset" {
-                continue; // Task 9
-            }
-            for arg in sub.get_arguments() {
-                let long = arg.get_long().unwrap_or_default();
-                if long.ends_with("-env") || long.ends_with("-stdin") || long.ends_with("-default")
-                {
-                    assert!(
-                        arg.get_help().is_some(),
-                        "piv {} --{long} has no help",
-                        sub.get_name()
-                    );
-                }
+            for arg in cmd.get_arguments().filter(|a| is_secret_arg(a)) {
+                let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+                assert!(
+                    help.contains("env:NAME") && help.contains("stdin"),
+                    "{path} --{} has no help naming its sources",
+                    arg.get_long().unwrap_or_default()
+                );
             }
         }
     }
@@ -19413,8 +19631,9 @@ mod cli_tests {
                 cmd.get_arguments()
                     .any(|a| a.get_long() == Some(long) && is_secret_arg(a))
             };
-            if !source(flags[0]) || args_conflict(cmd, arg(flags[0]), arg(flags[1])) {
-                continue; // an old pair (Task 3), or one choice of two
+            assert!(source(flags[0]) && source(flags[1]), "{line}");
+            if args_conflict(cmd, arg(flags[0]), arg(flags[1])) {
+                continue; // one choice of two
             }
             let help = |long: &str| arg(long).get_help().unwrap().to_string();
             assert!(help(flags[0]).contains("first line"), "{line}");
@@ -20914,7 +21133,7 @@ mod prop_tests {
         /// the device's own reader as the `auto` open-time fallback (#82) —
         /// and fails closed when the device lacks the endpoint a specific
         /// transport needs. Device name-match / ambiguity is the shared
-        /// resolver's job now (`resolve_target`, covered in Task 5), so this
+        /// resolver's job now (`resolve_target`, tested on its own), so this
         /// only varies the one selected device's endpoints.
         #[test]
         fn otp_target_for_maps_every_endpoint(

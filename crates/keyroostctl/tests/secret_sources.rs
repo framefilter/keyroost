@@ -334,32 +334,35 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// One literal value per secret flag (and a few shapes of it): each is
+/// refused with exit 2 and never echoed.
+const LITERAL_CASES: &[&[&str]] = &[
+    &["piv", "pin", "change", "--pin", "S3CRETVALUE"],
+    &["piv", "pin", "change", "--pin=S3CRETVALUE"],
+    &["piv", "pin", "change", "--pin", "-S3CRETVALUE"],
+    &["piv", "pin", "change", "--new-pin", "env:"],
+    &["piv", "puk", "change", "--puk", "STDIN"],
+    &["piv", "puk", "change", "--new-puk", "S3CRETVALUE"],
+    &["piv", "chuid", "generate", "--mgmt-key", "S3CRETVALUE"],
+    &["piv", "mgmt-key", "change", "--new-mgmt-key", "default"],
+    &["openpgp", "name", "set", "x", "--admin-pin", "S3CRETVALUE"],
+    &["oath", "list", "--password", "S3CRETVALUE"],
+    &["oath", "password", "set", "--new-password", "S3CRETVALUE"],
+    &["oath", "add", "n", "--seed", "S3CRETVALUE"],
+    &["fido", "pin", "change", "--pin", "default"],
+    &["molto", "--customer-key", "S3CRETVALUE", "info"],
+    &["molto", "info", "--customer-key=S3CRETVALUE"],
+    &["molto", "customer-key", "--new-customer-key", "S3CRETVALUE"],
+    &["molto", "seed", "--slot", "1", "--seed", "S3CRETVALUE"],
+    &["prog", "seed", "--seed", "-S3CRETVALUE"],
+    &["molto", "import", "--slot", "1", "--uri", "S3CRETVALUE"],
+];
+
 /// A literal value given to a secret flag, in any spelling, is refused
 /// with exit 2 before any key is looked at, and never repeated.
 #[test]
 fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
-    let cases: &[&[&str]] = &[
-        &["piv", "pin", "change", "--pin", "S3CRETVALUE"],
-        &["piv", "pin", "change", "--pin=S3CRETVALUE"],
-        &["piv", "pin", "change", "--pin", "-S3CRETVALUE"],
-        &["piv", "pin", "change", "--new-pin", "env:"],
-        &["piv", "puk", "change", "--puk", "STDIN"],
-        &["piv", "puk", "change", "--new-puk", "S3CRETVALUE"],
-        &["piv", "chuid", "generate", "--mgmt-key", "S3CRETVALUE"],
-        &["piv", "mgmt-key", "change", "--new-mgmt-key", "default"],
-        &["openpgp", "name", "set", "x", "--admin-pin", "S3CRETVALUE"],
-        &["oath", "list", "--password", "S3CRETVALUE"],
-        &["oath", "password", "set", "--new-password", "S3CRETVALUE"],
-        &["oath", "add", "n", "--seed", "S3CRETVALUE"],
-        &["fido", "pin", "change", "--pin", "default"],
-        &["molto", "--customer-key", "S3CRETVALUE", "info"],
-        &["molto", "info", "--customer-key=S3CRETVALUE"],
-        &["molto", "customer-key", "--new-customer-key", "S3CRETVALUE"],
-        &["molto", "seed", "--slot", "1", "--seed", "S3CRETVALUE"],
-        &["prog", "seed", "--seed", "-S3CRETVALUE"],
-        &["molto", "import", "--slot", "1", "--uri", "S3CRETVALUE"],
-    ];
-    for args in cases {
+    for args in LITERAL_CASES {
         let (code, err) = run(args);
         assert_eq!(code, 2, "{args:?}: {err}");
         assert!(err.contains(" takes env:NAME"), "{args:?}: {err}");
@@ -429,4 +432,33 @@ fn a_flag_after_a_secret_flag_is_a_missing_value() {
         err.contains("--mgmt-key needs a value: env:NAME, stdin or default"),
         "{err}"
     );
+}
+
+/// Every flag in `SECRET_FLAGS` has a literal case in `LITERAL_CASES`.
+#[test]
+fn every_secret_flag_has_a_literal_case() {
+    let src = include_str!("../src/secrets.rs");
+    let block = src
+        .split("const SECRET_FLAGS")
+        .nth(1)
+        .unwrap()
+        .split("];")
+        .next()
+        .unwrap();
+    let longs: Vec<&str> = block
+        .split("long: \"")
+        .skip(1)
+        .map(|r| r.split('"').next().unwrap())
+        .collect();
+    assert!(longs.len() > 10, "{longs:?}");
+    for long in longs {
+        let flag = format!("--{long}");
+        let eq = format!("--{long}=");
+        assert!(
+            LITERAL_CASES
+                .iter()
+                .any(|a| a.iter().any(|w| *w == flag || w.starts_with(&eq))),
+            "no literal case for {flag}"
+        );
+    }
 }
