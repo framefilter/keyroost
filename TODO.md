@@ -232,7 +232,7 @@ plan's two-key manual steps were never executed):
   The manifest in `packaging/flatpak/` can't be reused for this.
 
 - **Friendly names for Molto2 tokens** — detection never connects to a
-  Molto2, so its row carries no serial and `name add` can't name it.
+  Molto2, so its row carries no serial and `name set` can't name it.
   Needs a way to get the token's serial during detection, without logging in
   with the customer key.
 
