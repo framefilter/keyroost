@@ -32,7 +32,7 @@ mod secrets;
 mod target;
 
 use crate::output::{emit_json, json_output};
-use crate::secrets::{Secrets, Source, Spec};
+use crate::secrets::{SecretSource, Secrets, Source, Spec};
 
 /// The global `--device` selector, captured once in `run()` so the FIDO device
 /// resolver can honor it without threading it through every subcommand handler.
@@ -199,48 +199,18 @@ enum Cmd {
         /// is only known once it's fingerprinted: running this command
         /// without a management key (or, depending on the card, a PIN)
         /// either succeeds outright, or refuses and asks you to re-run it
-        /// with --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default or
-        /// --pin-env/--pin-stdin supplied. This flag is the management key,
-        /// as hex, read from this environment variable. Mutually exclusive
-        /// with the PIN options below — pick whichever credential you
-        /// actually have.
-        #[arg(
-            long,
-            value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
-        )]
-        mgmt_key_env: Option<String>,
-        /// Same credential, read from stdin (one line, hex; hidden when typed
-        /// at a terminal) instead of an environment variable.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
-        )]
-        mgmt_key_stdin: bool,
-        /// Same credential, but not typed in: try this device's well-known
-        /// factory-default management key, if one is known; fails with a
-        /// clear error if it isn't.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env", "pin_stdin"]
-        )]
-        mgmt_key_default: bool,
-        /// Same requirement, satisfied with a PIN instead of the management
-        /// key — only useful when the selected card actually accepts a PIN
-        /// for it. Read from this environment variable.
-        #[arg(
-            long,
-            value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
-        )]
-        pin_env: Option<String>,
-        /// Same PIN, read from stdin (one line; hidden when typed at a
-        /// terminal) instead of an environment variable.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
-        )]
-        pin_stdin: bool,
+        /// with --mgmt-key or --pin. This flag is the management key (hex):
+        /// env:NAME reads that environment variable, stdin reads one line
+        /// (hidden when typed at a terminal), default uses the
+        /// factory-default management key keyroost knows for this device.
+        /// Give this or --pin, whichever credential you have.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, conflicts_with = "pin")]
+        mgmt_key: Option<SecretSource>,
+        /// The PIN, for a card that accepts one instead of the management
+        /// key: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Print shell completions to stdout.
     ///
@@ -821,19 +791,16 @@ enum PivCmd {
     ChangePin {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
-        /// Read the current PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
-        old_pin_env: Option<String>,
-        /// Read the current PIN from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        old_pin_stdin: bool,
-        /// Read the new PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (second line when --old-pin-stdin is also given; hidden when
-        /// typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The current PIN: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The new PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --pin stdin is also given; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
     },
     /// Change the PUK (PIN Unblocking Key). Each PUK comes from an
     /// environment variable, stdin (the current PUK on the first line, the
@@ -841,37 +808,31 @@ enum PivCmd {
     ChangePuk {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
-        /// Read the current PUK from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "old_puk_stdin")]
-        old_puk_env: Option<String>,
-        /// Read the current PUK from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        old_puk_stdin: bool,
-        /// Read the new PUK from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_puk_stdin")]
-        new_puk_env: Option<String>,
-        /// Read the new PUK from stdin (second line when --old-puk-stdin is also given; hidden when
-        /// typed at a terminal).
-        #[arg(long)]
-        new_puk_stdin: bool,
+        /// The current PUK: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        puk: Option<SecretSource>,
+        /// The new PUK: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --puk stdin is also given; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_puk: Option<SecretSource>,
     },
     /// Unblock a blocked PIN using the PUK, setting a new PIN.
     UnblockPin {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
-        /// Read the PUK from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "puk_stdin")]
-        puk_env: Option<String>,
-        /// Read the PUK from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        puk_stdin: bool,
-        /// Read the new PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (second line when --puk-stdin is also given; hidden when
-        /// typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The PUK: env:NAME reads that environment variable, stdin reads one
+        /// line (first line; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        puk: Option<SecretSource>,
+        /// The new PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --puk stdin is also given; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
     },
     /// Set the PIN and PUK retry counts (Yubico extension); this also resets
     /// the PIN and PUK themselves to their factory defaults. Needs the
@@ -887,23 +848,18 @@ enum PivCmd {
         /// permanently blocked.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
         puk_tries: u8,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (second line when --pin-stdin is also given;
-        /// hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal), default uses the factory-default
+        /// management key keyroost knows for this device. With none of these, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (first line; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -937,30 +893,18 @@ enum PivCmd {
         // args — the `--old-mgmt-key-*` trio in particular — together.
         #[arg(long, value_name = "SUBSTR", display_order = 10, help = READER_HELP)]
         reader: Option<String>,
-        /// Read the current management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["old_mgmt_key_stdin", "old_mgmt_key_default"], display_order = 11)]
-        old_mgmt_key_env: Option<String>,
-        /// Read the current management key (hex) from stdin (first line; hidden when typed at a
-        /// terminal).
-        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_default"], display_order = 12)]
-        old_mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device
-        /// as the current key. PIV only: other applets have default PINs you
-        /// already know. There is no such option for the new key.
-        #[arg(long, conflicts_with_all = ["old_mgmt_key_env", "old_mgmt_key_stdin"], display_order = 13)]
-        old_mgmt_key_default: bool,
-        /// Read the new management key (hex) from the named environment variable.
-        #[arg(
-            long,
-            value_name = "VAR",
-            conflicts_with = "new_mgmt_key_stdin",
-            display_order = 14
-        )]
-        new_mgmt_key_env: Option<String>,
-        /// Read the new management key (hex) from stdin (second line when --old-mgmt-key-stdin is
-        /// also given; hidden when typed at a terminal).
-        #[arg(long, display_order = 15)]
-        new_mgmt_key_stdin: bool,
+        /// The current management key (hex): env:NAME reads that environment
+        /// variable, stdin reads one line (first line; hidden when typed at a
+        /// terminal), default uses the factory-default management key keyroost
+        /// knows for this device. With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, display_order = 11)]
+        mgmt_key: Option<SecretSource>,
+        /// The new management key (hex): env:NAME reads that environment
+        /// variable, stdin reads one line (second line when --mgmt-key stdin is
+        /// also given; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, display_order = 14)]
+        new_mgmt_key: Option<SecretSource>,
         /// Algorithm of the NEW management key.
         #[arg(long, value_enum, default_value = "aes192", display_order = 16)]
         new_algorithm: CliPivMgmtAlg,
@@ -1005,16 +949,12 @@ enum PivCmd {
         /// (firmware-dependent).
         #[arg(long, value_enum, default_value = "default")]
         touch_policy: CliTouchPolicy,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
         /// Also write the generated public key (PEM) to this path. Needed to
         /// `request-cert`/`self-sign` this same key from a *later*, separate
         /// `keyroostctl` invocation on cards that don't support GET METADATA
@@ -1062,16 +1002,12 @@ enum PivCmd {
         /// Certificate file to import (`.der` or `.pem`).
         #[arg(long = "in", value_name = "FILE")]
         in_file: std::path::PathBuf,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
         #[command(flatten)]
         compression: CertCompressArgs,
         /// Confirm without asking (required when not run from a terminal).
@@ -1109,13 +1045,11 @@ enum PivCmd {
         /// (supported attributes: CN, O, OU, C, L, ST).
         #[arg(long, value_name = "DN")]
         subject: String,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (first line, the only one without --generate-key; hidden when
-        /// typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (first line, the only one without --generate-key; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         /// Write the request (PEM) to this file instead of stdout.
         #[arg(long, value_name = "FILE")]
         out: Option<std::path::PathBuf>,
@@ -1128,33 +1062,14 @@ enum PivCmd {
         /// the slot's key material. `--generate-key` sidesteps this entirely.
         #[arg(long, value_name = "PATH")]
         load_pubkey: Option<std::path::PathBuf>,
-        /// Read the management key (hex) from the named environment variable. Only with
-        /// --generate-key, for the key-generation step; the request itself needs
-        /// just the PIN.
-        #[arg(
-            long,
-            value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"],
-            requires = "generate_key"
-        )]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (second line when --pin-stdin is also given;
-        /// hidden when typed at a terminal). Only with --generate-key.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"],
-            requires = "generate_key"
-        )]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know. Only with
-        /// --generate-key.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"],
-            requires = "generate_key"
-        )]
-        mgmt_key_default: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal), default uses the factory-default
+        /// management key keyroost knows for this device. With none of these, a
+        /// terminal asks. Only with --generate-key, for the key-generation
+        /// step; the request itself needs just the PIN.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, requires = "generate_key")]
+        mgmt_key: Option<SecretSource>,
         #[command(flatten)]
         keygen: InlineKeyGen,
         #[command(flatten)]
@@ -1199,23 +1114,18 @@ enum PivCmd {
         /// days from now); defaults to 1 year if none of the three is given.
         #[arg(long, value_name = "N", value_parser = parse_valid_days)]
         days: Option<u32>,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (second line when --pin-stdin is also given;
-        /// hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (first line; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal), default uses the factory-default
+        /// management key keyroost knows for this device. With none of these, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
         /// Also write the certificate (PEM) to this file.
         #[arg(long, value_name = "FILE")]
         out: Option<std::path::PathBuf>,
@@ -1245,7 +1155,7 @@ enum PivCmd {
     /// key-agree for ECDH curves, sign for RSA / ECDSA / Ed25519), run a fixed
     /// challenge on the card and verify the result against the slot
     /// certificate's public key. Reports each operation's pass / fail /
-    /// skipped. `--pin-env` / `--pin-stdin` are always optional: it's your
+    /// skipped. `--pin` is always optional: it's your
     /// call whether to test with or without a PIN. Depending on device state
     /// and PIN policy, omitting it may fail.
     Test {
@@ -1255,14 +1165,11 @@ enum PivCmd {
         /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        /// Read the PIN from the named environment variable.
-        /// Optional; omit it to test without a PIN.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (one line; hidden when typed at a terminal).
-        /// Optional; omit it to test without a PIN.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). Optional and never asked
+        /// for; omit it to test without a PIN.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Write a fresh, randomly-generated CHUID (Card Holder Unique
     /// Identifier). Needs the management key.
@@ -1274,16 +1181,12 @@ enum PivCmd {
     NewChuid {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
         /// CHUID expiration, in whole calendar years from now, applied
         /// before `--months`/`--days` — the same month and day as today,
         /// that many years later (a Feb 29 clamps to Feb 28 in a target
@@ -1324,9 +1227,8 @@ enum PivCmd {
     /// PIN/PUK convention above. Whether that applies to the selected device
     /// is only known once it's fingerprinted: running this command without a
     /// management key (or, depending on the card, a PIN) either succeeds
-    /// outright, or refuses and asks you to re-run it with
-    /// --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default or
-    /// --pin-env/--pin-stdin supplied.
+    /// outright, or refuses and asks you to re-run it with --mgmt-key
+    /// env:NAME, stdin or default, or --pin env:NAME or stdin.
     Reset {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -1338,47 +1240,18 @@ enum PivCmd {
         /// refuses.
         #[arg(long)]
         force: bool,
-        /// The management key, as hex, read from this environment variable
-        /// — only consulted when the selected device turns out to need one.
-        /// Mutually exclusive with the PIN options below — pick whichever
-        /// credential you actually have.
-        #[arg(
-            long,
-            value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default", "pin_env", "pin_stdin"]
-        )]
-        mgmt_key_env: Option<String>,
-        /// Same credential, read from stdin (one line, hex; hidden when typed
-        /// at a terminal) instead of an environment variable.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_default", "pin_env", "pin_stdin"]
-        )]
-        mgmt_key_stdin: bool,
-        /// Same credential, but not typed in: try this device's well-known
-        /// factory-default management key, if one is known; fails with a
-        /// clear error if it isn't.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "pin_env", "pin_stdin"]
-        )]
-        mgmt_key_default: bool,
-        /// Same requirement, satisfied with a PIN instead of the management
-        /// key — only useful when the selected card actually accepts a PIN
-        /// for it. Read from this environment variable.
-        #[arg(
-            long,
-            value_name = "VAR",
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_stdin"]
-        )]
-        pin_env: Option<String>,
-        /// Same PIN, read from stdin (one line; hidden when typed at a
-        /// terminal) instead of an environment variable.
-        #[arg(
-            long,
-            conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin", "mgmt_key_default", "pin_env"]
-        )]
-        pin_stdin: bool,
+        /// The management key (hex), only used when the selected device
+        /// turns out to need one: env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default
+        /// uses the factory-default management key keyroost knows for this
+        /// device. Give this or --pin, whichever credential you have.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, conflicts_with = "pin")]
+        mgmt_key: Option<SecretSource>,
+        /// The PIN, for a card that accepts one instead of the management
+        /// key: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Delete a slot's certificate; the slot's private key is left in place.
     /// Needs the management key. Irreversible: asks first (`--yes` to skip).
@@ -1392,16 +1265,12 @@ enum PivCmd {
         /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -1420,16 +1289,12 @@ enum PivCmd {
         /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -1454,16 +1319,12 @@ enum PivCmd {
         to: CliPivSlot,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
-        /// Read the management key (hex) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["mgmt_key_stdin", "mgmt_key_default"])]
-        mgmt_key_env: Option<String>,
-        /// Read the management key (hex) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_default"])]
-        mgmt_key_stdin: bool,
-        /// Use the factory-default management key keyroost knows for this device.
-        /// PIV only: other applets have default PINs you already know.
-        #[arg(long, conflicts_with_all = ["mgmt_key_env", "mgmt_key_stdin"])]
-        mgmt_key_default: bool,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
         /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long)]
         force: bool,
@@ -1484,15 +1345,14 @@ enum OpenpgpCmd {
     /// hidden prompt — never argv.
     Verify {
         /// Which PIN to check: `user` (PW1) or `admin` (PW3). The PIN itself
-        /// comes from --pin-env, --pin-stdin or the prompt.
+        /// comes from --pin or the prompt.
         #[arg(long, value_enum, value_name = "KIND", default_value_t = OpenpgpPinKind::User)]
         which: OpenpgpPinKind,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1531,12 +1391,11 @@ enum OpenpgpCmd {
         /// Cardholder name to write (UTF-8). The OpenPGP convention is
         /// `Surname<<Given`, but it is stored verbatim.
         name: String,
-        /// Read the admin PIN (PW3) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
-        admin_pin_env: Option<String>,
-        /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        admin_pin_stdin: bool,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1546,12 +1405,11 @@ enum OpenpgpCmd {
     SetUrl {
         /// URL to write.
         url: String,
-        /// Read the admin PIN (PW3) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
-        admin_pin_env: Option<String>,
-        /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        admin_pin_stdin: bool,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1576,12 +1434,11 @@ enum OpenpgpCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// Read the admin PIN (PW3) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
-        admin_pin_env: Option<String>,
-        /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        admin_pin_stdin: bool,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1609,12 +1466,11 @@ enum OpenpgpCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// Read the admin PIN (PW3) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
-        admin_pin_env: Option<String>,
-        /// Read the admin PIN (PW3) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        admin_pin_stdin: bool,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1635,12 +1491,11 @@ enum OpenpgpCmd {
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
-        /// Read the signing PIN (PW1) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the signing PIN (PW1) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The signing PIN (PW1): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         /// Digest algorithm for the PKCS#1 v1.5 DigestInfo. SHA-256 is the
         /// modern default; SHA-1 is offered for interop with old verifiers.
         #[arg(long, value_enum, default_value_t = SignHash::Sha256)]
@@ -1664,12 +1519,11 @@ enum OpenpgpCmd {
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
-        /// Read the user PIN (PW1) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the user PIN (PW1) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The user PIN (PW1): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1691,12 +1545,11 @@ enum OpenpgpCmd {
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
-        /// Read the user PIN (PW1) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the user PIN (PW1) from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The user PIN (PW1): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         /// Digest algorithm for the PKCS#1 v1.5 DigestInfo. SHA-256 is the
         /// modern default; SHA-1 is offered for interop with old verifiers.
         #[arg(long, value_enum, default_value_t = SignHash::Sha256)]
@@ -1708,20 +1561,16 @@ enum OpenpgpCmd {
     /// variable, stdin (the current PIN on the first line, the new one on the
     /// second) or, with neither, a hidden prompt — never argv.
     ChangePin {
-        /// Read the current user PIN (PW1) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
-        old_pin_env: Option<String>,
-        /// Read the current user PIN (PW1) from stdin (first line; hidden when typed at a
-        /// terminal).
-        #[arg(long)]
-        old_pin_stdin: bool,
-        /// Read the new user PIN (PW1) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new user PIN (PW1) from stdin (second line when --old-pin-stdin is also given;
-        /// hidden when typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The current user PIN (PW1): env:NAME reads that environment
+        /// variable, stdin reads one line (first line; hidden when typed at a
+        /// terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The new user PIN (PW1): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1729,20 +1578,16 @@ enum OpenpgpCmd {
     /// variable, stdin (the current PIN on the first line, the new one on the
     /// second) or, with neither, a hidden prompt — never argv.
     ChangeAdminPin {
-        /// Read the current admin PIN (PW3) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
-        old_pin_env: Option<String>,
-        /// Read the current admin PIN (PW3) from stdin (first line; hidden when typed at a
-        /// terminal).
-        #[arg(long)]
-        old_pin_stdin: bool,
-        /// Read the new admin PIN (PW3) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new admin PIN (PW3) from stdin (second line when --old-pin-stdin is also given;
-        /// hidden when typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The current admin PIN (PW3): env:NAME reads that environment
+        /// variable, stdin reads one line (first line; hidden when typed at a
+        /// terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The new admin PIN (PW3): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1754,19 +1599,17 @@ enum OpenpgpCmd {
     /// the first line, the new user PIN on the second) or, with neither, a
     /// hidden prompt — never argv.
     UnblockPin {
-        /// Read the admin PIN (PW3) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "admin_pin_stdin")]
-        admin_pin_env: Option<String>,
-        /// Read the admin PIN (PW3) from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        admin_pin_stdin: bool,
-        /// Read the new user PIN (PW1) from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new user PIN (PW1) from stdin (second line when --admin-pin-stdin is also
-        /// given; hidden when typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
+        /// The new user PIN (PW1): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --admin-pin stdin is also
+        /// given; hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1946,22 +1789,20 @@ enum KeyNameCmd {
 struct OathAccess {
     #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
     reader: Option<String>,
-    /// Read the applet password from the named environment variable. Needed for
-    /// password-protected applets (e.g. a YubiKey with an OATH password set).
-    #[arg(long, value_name = "VAR", conflicts_with = "password_stdin")]
-    password_env: Option<String>,
-    /// Read the applet password from stdin (hidden when typed at a terminal).
-    /// `set-password` reads it on the first line, before the new password;
-    /// `add` reads it after the seed (second line when --seed-stdin is also
-    /// given).
-    #[arg(long)]
-    password_stdin: bool,
+    /// The applet password: env:NAME reads that environment variable, stdin
+    /// reads one line (hidden when typed at a terminal). With neither, a
+    /// terminal asks. Needed for password-protected applets (e.g. a YubiKey
+    /// with an OATH password set). `set-password` reads it on the first line,
+    /// before the new password; `add` reads it after the seed (second line when
+    /// --seed stdin is also given).
+    #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+    password: Option<SecretSource>,
 }
 
 impl OathAccess {
     /// Where the applet password comes from, if a flag names a source.
     fn source(&self) -> Source<'_> {
-        Source::new(self.password_env.as_deref(), self.password_stdin)
+        Source::from_flag(self.password.as_ref())
     }
 }
 
@@ -1994,12 +1835,11 @@ enum OathCmd {
         /// Credential type: time-based (TOTP) or counter-based (HOTP).
         #[arg(long = "type", value_enum, default_value_t = OathTypeArg::Totp)]
         oath_type: OathTypeArg,
-        /// Read the base32 seed from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
-        seed_env: Option<String>,
-        /// Read the base32 seed from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        seed_stdin: bool,
+        /// The base32 seed: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
         /// HMAC algorithm.
         #[arg(long, value_enum, default_value_t = OathAlgoArg::Sha1)]
         algorithm: OathAlgoArg,
@@ -2032,18 +1872,17 @@ enum OathCmd {
     /// or the prompt), then the new one. To remove the password, use `oath
     /// clear-password`.
     SetPassword {
-        /// Read the new password from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_password_stdin")]
-        new_password_env: Option<String>,
-        /// Read the new password from stdin (second line when --password-stdin
-        /// is also given; hidden when typed at a terminal).
-        #[arg(long)]
-        new_password_stdin: bool,
+        /// The new password: env:NAME reads that environment variable, stdin
+        /// reads one line (second line when --password stdin is also given;
+        /// hidden when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_password: Option<SecretSource>,
         #[command(flatten)]
         access: OathAccess,
     },
     /// Remove the applet password. The current password comes from
-    /// `--password-env`/`--password-stdin` or, with neither, a hidden prompt.
+    /// `--password env:NAME` / `--password stdin` or, with neither, a hidden
+    /// prompt.
     ClearPassword {
         #[command(flatten)]
         access: OathAccess,
@@ -2285,8 +2124,8 @@ enum MoltoCmd {
     /// asks first (`--yes` to skip).
     ///
     /// Asks only when a target slot is occupied. For encrypted Aegis vaults, pass the password via
-    /// `--password-stdin` (suitable for piping from a file or password manager)
-    /// or `--password-env VAR`; with neither, a terminal asks for it (hidden).
+    /// `--password stdin` (suitable for piping from a file or password manager)
+    /// or `--password env:NAME`; with neither, a terminal asks for it (hidden).
     ImportFile {
         /// Path to the export file. Format is auto-detected.
         path: std::path::PathBuf,
@@ -2299,12 +2138,11 @@ enum MoltoCmd {
         /// Print what would be written, but don't touch the device.
         #[arg(long)]
         dry_run: bool,
-        /// Read the vault password from stdin (one line; hidden when typed at a terminal).
-        #[arg(long, conflicts_with = "password_env")]
-        password_stdin: bool,
-        /// Read the vault password from the named environment variable.
-        #[arg(long, value_name = "VAR")]
-        password_env: Option<String>,
+        /// The vault password: env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        password: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -2430,12 +2268,11 @@ enum FidoPinCmd {
     /// PIN comes from an environment variable, stdin or, with neither, a
     /// hidden prompt (asked twice) — never argv.
     Set {
-        /// Read the new PIN from the given environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The new PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2443,19 +2280,16 @@ enum FidoPinCmd {
     /// stdin (the current PIN on the first line, the new one on the second)
     /// or, with neither, a hidden prompt — never argv.
     Change {
-        /// Read the current PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
-        old_pin_env: Option<String>,
-        /// Read the current PIN from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        old_pin_stdin: bool,
-        /// Read the new PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new PIN from stdin (second line when --old-pin-stdin is also given; hidden when
-        /// typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The current PIN: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The new PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --pin stdin is also given; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2467,13 +2301,11 @@ enum FidoPinCmd {
 enum FidoCredentialsCmd {
     /// List every resident credential on the authenticator, grouped by RP.
     List {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2483,13 +2315,11 @@ enum FidoCredentialsCmd {
         /// Hex-encoded credentialId as printed by `fido credentials list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         cred_id: String,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
         /// Confirm without asking (required when not run from a terminal).
@@ -2499,13 +2329,11 @@ enum FidoCredentialsCmd {
     /// Show how many passkeys the key holds and how many more fit. Needs the
     /// PIN.
     Metadata {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2516,13 +2344,11 @@ enum FidoCredentialsCmd {
 enum FidoFingerprintsCmd {
     /// List enrolled fingerprints (template id + name).
     List {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2532,13 +2358,11 @@ enum FidoFingerprintsCmd {
         /// Optional friendly name to set on the new fingerprint once enrolled.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2551,13 +2375,11 @@ enum FidoFingerprintsCmd {
         /// New friendly name.
         #[arg(long, value_name = "NAME")]
         name: String,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2567,13 +2389,11 @@ enum FidoFingerprintsCmd {
         /// Hex-encoded template id as printed by `fido fingerprints list`.
         #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
         template_id: String,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
         /// Confirm without asking (required when not run from a terminal).
@@ -2587,25 +2407,21 @@ enum FidoFingerprintsCmd {
 enum FidoConfigCmd {
     /// Turn on "always require user verification" (alwaysUv). Does nothing if it is already on.
     EnableAlwaysUv {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Turn off "always require user verification" (alwaysUv). Does nothing if it is already off.
     DisableAlwaysUv {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2624,25 +2440,21 @@ enum FidoConfigCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
     /// Force a PIN change on next use, without changing the minimum length.
     ForcePinChange {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2653,13 +2465,11 @@ enum FidoConfigCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2676,13 +2486,11 @@ enum SshCertCmd {
     /// List resident SSH credentials (ssh:* RP IDs) and whether each has a
     /// certificate stored in its largeBlob.
     List {
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2697,13 +2505,11 @@ enum SshCertCmd {
         out: Option<std::path::PathBuf>,
         #[arg(long, help = OVERWRITE_HELP)]
         overwrite: bool,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2739,13 +2545,11 @@ enum LargeBlobCmd {
         /// The note text to store (plain UTF-8). Visible in argv to other
         /// local processes — never a secret.
         text: String,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2757,13 +2561,11 @@ enum LargeBlobCmd {
         index: usize,
         /// The new note text (plain UTF-8). Visible in argv to other processes.
         text: String,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2778,13 +2580,11 @@ enum LargeBlobCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2813,13 +2613,11 @@ enum LargeBlobCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
-        /// Read the PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the PIN from stdin (hidden when typed at a terminal); with
-        /// neither flag, a hidden prompt asks for it.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2834,7 +2632,7 @@ enum OtpCmd {
     ///
     /// On a PIN-protected
     /// (R3.4+) key, `--unlock pin` (the default) takes the PIN from
-    /// `--pin-env`/`--pin-stdin` or, with neither, a hidden prompt; a key
+    /// `--pin env:NAME` / `--pin stdin` or, with neither, a hidden prompt; a key
     /// without a PIN is never asked. `--unlock fingerprint` unlocks by a
     /// fingerprint touch instead, and `--unlock auto` tries the fingerprint
     /// and falls back to a PIN given by flag (never asked for).
@@ -2843,13 +2641,12 @@ enum OtpCmd {
         /// PIN when the key needs one and no flag gives it.
         #[arg(long, value_enum, default_value_t = OtpUnlock::Pin)]
         unlock: OtpUnlock,
-        /// Read the OTP PIN from the named environment variable (protected keys).
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (hidden when typed at a terminal) to
-        /// unlock a protected key.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The OTP PIN to unlock a protected key: env:NAME reads that
+        /// environment variable, stdin reads one line (hidden when typed at a
+        /// terminal). With neither, a terminal asks when the key has a PIN
+        /// (`--unlock pin` only).
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Print the current code for one entry, identified by app and account.
     /// A button-required entry will prompt for a touch.
@@ -2889,24 +2686,22 @@ enum OtpCmd {
         /// Require a button press on the key to emit this code.
         #[arg(long)]
         touch: bool,
-        /// Read the base32 seed from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
-        seed_env: Option<String>,
-        /// Read the base32 seed from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        seed_stdin: bool,
-        /// Read the OTP PIN from the named environment variable (protected keys).
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (second line when --seed-stdin is also given; hidden when
-        /// typed at a terminal) to unlock a protected key.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The base32 seed: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
+        /// The OTP PIN to unlock a protected key: env:NAME reads that
+        /// environment variable, stdin reads one line (second line when --seed
+        /// stdin is also given; hidden when typed at a terminal). With neither,
+        /// a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Delete one OTP entry by app and account. Irreversible: asks first
     /// (`--yes` to skip).
     ///
-    /// A PIN-protected (R3.4+) key's PIN comes from `--pin-env`/`--pin-stdin`
+    /// A PIN-protected (R3.4+) key's PIN comes from `--pin env:NAME` / `--pin stdin`
     /// or, with neither, a hidden prompt after the question.
     Delete {
         /// Application/issuer name as stored (may be empty).
@@ -2915,13 +2710,11 @@ enum OtpCmd {
         /// Account name as stored.
         #[arg(long)]
         account: String,
-        /// Read the OTP PIN from the named environment variable (protected keys).
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (hidden when typed at a terminal) to
-        /// unlock a protected key.
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The OTP PIN to unlock a protected key: env:NAME reads that
+        /// environment variable, stdin reads one line (hidden when typed at a
+        /// terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -2957,12 +2750,11 @@ enum OtpCmd {
         /// Type the digits using the numeric-keypad scancodes.
         #[arg(long)]
         numpad: bool,
-        /// Read the base32 seed from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "seed_stdin")]
-        seed_env: Option<String>,
-        /// Read the base32 seed from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        seed_stdin: bool,
+        /// The base32 seed: env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -3005,7 +2797,7 @@ enum OtpCmd {
     /// Set an OTP PIN on a currently-unprotected key.
     ///
     /// After this, reading codes needs the PIN (`otp list` asks for it, or
-    /// takes `--pin-env`/`--pin-stdin`). The new PIN comes from an
+    /// takes `--pin`). The new PIN comes from an
     /// environment variable, stdin or, with neither, a hidden prompt (asked
     /// twice) — never argv.
     ///
@@ -3013,50 +2805,44 @@ enum OtpCmd {
     /// blocked PIN is recoverable only by erasing every OTP entry on the key
     /// (`otp reset`). Keep a record of the PIN somewhere you trust.
     SetPin {
-        /// Read the new OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new OTP PIN from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The new OTP PIN: env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
     },
     /// Verify the OTP PIN, opening the read window for this connection (mostly
     /// for testing; `otp list` takes `--pin-*` directly). PIN via env, stdin or,
     /// with neither, a hidden prompt.
     Verify {
-        /// Read the OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The OTP PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Change the OTP PIN: current first, then new (stdin lines 1 and 2, env
     /// vars, or the prompt).
     ChangePin {
-        /// Read the current OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "old_pin_stdin")]
-        old_pin_env: Option<String>,
-        /// Read the current OTP PIN from stdin (first line; hidden when typed at a terminal).
-        #[arg(long)]
-        old_pin_stdin: bool,
-        /// Read the new OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "new_pin_stdin")]
-        new_pin_env: Option<String>,
-        /// Read the new OTP PIN from stdin (second line when --old-pin-stdin is also given; hidden
-        /// when typed at a terminal).
-        #[arg(long)]
-        new_pin_stdin: bool,
+        /// The current OTP PIN: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The new OTP PIN: env:NAME reads that environment variable, stdin
+        /// reads one line (second line when --pin stdin is also given; hidden
+        /// when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
     },
     /// Remove the OTP PIN. Needs the current OTP PIN: via env, stdin or, with
     /// neither, a hidden prompt.
     ClearPin {
-        /// Read the OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The OTP PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Report whether the key supports fingerprint-protected OTP and whether
     /// it is on.
@@ -3064,33 +2850,31 @@ enum OtpCmd {
     /// Enable fingerprint protection for OTP. Needs the current OTP PIN. After
     /// this, codes can be unlocked by a fingerprint touch as well as the PIN.
     FingerprintEnable {
-        /// Read the OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The OTP PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
     /// Disable fingerprint protection for OTP. Needs the current OTP PIN.
     FingerprintDisable {
-        /// Read the OTP PIN from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with = "pin_stdin")]
-        pin_env: Option<String>,
-        /// Read the OTP PIN from stdin (hidden when typed at a terminal).
-        #[arg(long)]
-        pin_stdin: bool,
+        /// The OTP PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
     },
 }
 
 /// How `otp list` unlocks the codes on a PIN-protected key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OtpUnlock {
-    /// The OTP PIN: from --pin-env/--pin-stdin, or asked for when the key needs one.
+    /// The OTP PIN: from --pin, or asked for when the key needs one.
     Pin,
     /// A fingerprint touch, no PIN (fingerprint protection must be on).
     Fingerprint,
     /// A fingerprint touch when fingerprint protection is on, falling back to
-    /// the PIN given by --pin-env/--pin-stdin (never asked for).
+    /// the PIN given by --pin (never asked for).
     Auto,
 }
 
@@ -3265,7 +3049,7 @@ const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
     .prompt_as("otpauth:// URI")
     .hint("`-` to read it from stdin, --uri-env VAR or --qr IMAGE")
     .legacy();
-const VAULT_PASSWORD: Spec = Spec::current("vault password", "password").legacy();
+const VAULT_PASSWORD: Spec = Spec::current("vault password", "password");
 const IMPORT_URI_IN_ARGV: &str = "the otpauth:// URI can't be given on the command line any more (it contains the secret, and the command line ends up in shell history and `ps`): pass `-` and pipe it on stdin, use --uri-env VAR, or --qr IMAGE";
 
 /// The Molto2 customer key: from --key-env / --key-ascii-env, or the
@@ -3776,12 +3560,11 @@ fn molto_occupied(
 }
 
 /// Load a bulk-import file, transparently decrypting an Aegis encrypted
-/// vault if `--password-stdin` or `--password-env` was supplied.
+/// vault if `--password` was supplied.
 fn load_bulk_entries(
     sec: &mut Secrets,
     path: &std::path::Path,
-    password_stdin: bool,
-    password_env: Option<&str>,
+    password: Option<&SecretSource>,
 ) -> Result<Vec<keyroost_import::BulkEntry>, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
 
@@ -3816,12 +3599,12 @@ fn load_bulk_entries(
     let aegis_encrypted = keyroost_import::aegis::is_encrypted(&text).unwrap_or(false);
 
     if aegis_encrypted {
-        let password = sec.read(&VAULT_PASSWORD, Source::new(password_env, password_stdin))?;
+        let password = sec.read(&VAULT_PASSWORD, Source::from_flag(password))?;
         let plaintext = keyroost_import::aegis::decrypt(&text, password.as_bytes())?;
         return Ok(keyroost_import::aegis::parse(&plaintext)?);
     }
 
-    if password_stdin || password_env.is_some() {
+    if password.is_some() {
         output::warn("password supplied but file is not an encrypted Aegis vault");
     }
     Ok(keyroost_import::parse_bulk_any(&text)?)
@@ -3829,7 +3612,7 @@ fn load_bulk_entries(
 
 /// `--device` on a command that never touches a key is a mistake (it used
 /// to be silently ignored). `list` and the bare overview filter by it.
-/// The usage mistake in `otp list --unlock fingerprint --pin-env/--pin-stdin`:
+/// The usage mistake in `otp list --unlock fingerprint --pin SOURCE`:
 /// a fingerprint unlock takes no PIN. clap can't tie a conflict to one value
 /// of `--unlock`, so `run` checks this straight after parsing and exits 2,
 /// like any other usage error, before a key is looked at.
@@ -3839,12 +3622,11 @@ fn otp_unlock_conflict(cmd: Option<&Cmd>) -> Option<&'static str> {
             cmd:
                 OtpCmd::List {
                     unlock: OtpUnlock::Fingerprint,
-                    pin_env,
-                    pin_stdin,
+                    pin,
                 },
             ..
-        }) if pin_env.is_some() || *pin_stdin => Some(
-            "`--unlock fingerprint` takes no PIN; drop --pin-env/--pin-stdin, or use --unlock auto for a PIN fallback",
+        }) if pin.is_some() => Some(
+            "`--unlock fingerprint` takes no PIN; drop --pin, or use --unlock auto for a PIN fallback",
         ),
         _ => None,
     }
@@ -3932,132 +3714,338 @@ fn list_json_rows(
         .collect()
 }
 
-/// Removed or renamed flags, keyed by (the flag as clap reports it, words
-/// that must all appear in argv to disambiguate which subcommand's flag this
-/// is, the message to print). The message never
-/// repeats the value the user passed — clap only hands us the flag name,
-/// never its value or the next token, so there is nothing to leak here.
-const RETIRED_FLAGS: &[(&str, &[&str], &str)] = &[
-    (
-        "-p",
-        &["molto"],
-        "-p/--profile was renamed --slot (Token2 calls slots profiles)",
-    ),
-    (
-        "--profile",
-        &["molto"],
-        "-p/--profile was renamed --slot (Token2 calls slots profiles)",
-    ),
-    (
-        "--time-step",
-        &["molto"],
-        "--time-step was renamed --period (same values: 30 or 60)",
-    ),
-    (
-        "--time-step",
-        &["prog"],
-        "--time-step was renamed --period (same values: 30 or 60)",
-    ),
-    (
-        "--key",
-        &["molto"],
-        "--key was removed: secrets on the command line end up in shell history and `ps`; use --key-env VAR",
-    ),
-    (
-        "--key-ascii",
-        &["molto"],
-        "--key-ascii was removed: secrets on the command line end up in shell history and `ps`; use --key-ascii-env VAR",
-    ),
-    (
-        "--hex",
-        &["seed"],
-        "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
-    ),
-    (
-        "--base32",
-        &["seed"],
-        "--base32 was removed: secrets on the command line end up in shell history and `ps`; use --base32-env VAR or --base32-stdin",
-    ),
-    (
-        "--hex",
-        &["customer-key"],
-        "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
-    ),
-    (
-        "--ascii",
-        &["customer-key"],
-        "--ascii was removed: secrets on the command line end up in shell history and `ps`; use --ascii-env VAR or --ascii-stdin",
-    ),
-    (
-        "--secret-env",
-        &["oath"],
-        "--secret-env was renamed --seed-env (the same name `otp add` uses)",
-    ),
-    (
-        "--secret-stdin",
-        &["oath"],
-        "--secret-stdin was renamed --seed-stdin (the same name `otp add` uses)",
-    ),
-    (
-        "--pin",
-        &["openpgp", "verify"],
-        "--pin (which PIN to check) was renamed --which user|admin; the PIN itself comes from --pin-env VAR, --pin-stdin or the prompt",
-    ),
-    (
-        "--current-env",
-        &["otp", "change-pin"],
-        "--current-env was renamed --old-pin-env",
-    ),
-    (
-        "--new-env",
-        &["otp", "change-pin"],
-        "--new-env was renamed --new-pin-env",
-    ),
-    (
-        "--pin-stdin",
-        &["otp", "change-pin"],
-        "--pin-stdin was split: use --old-pin-stdin (first line) and --new-pin-stdin (second line)",
-    ),
-    (
-        "--pin-env",
-        &["otp", "set-pin"],
-        "--pin-env was renamed --new-pin-env (the PIN being set; the same name `fido pin set` uses)",
-    ),
-    (
-        "--pin-stdin",
-        &["otp", "set-pin"],
-        "--pin-stdin was renamed --new-pin-stdin (the PIN being set; the same name `fido pin set` uses)",
-    ),
-    (
-        "--pin-only",
-        &["otp", "list"],
-        "--pin-only was replaced by --unlock pin (the old `otp unlock-list` is now `otp list --unlock auto`)",
-    ),
-    (
-        "--file",
-        &["piv", "import-cert"],
-        "--file was renamed --in (the certificate file to read)",
-    ),
-    (
-        "--file",
-        &["piv", "export-cert"],
-        "--file was renamed --out (the file to write)",
-    ),
-    (
-        "--file",
-        &["piv", "request-cert"],
-        "--file was renamed --out (the file to write)",
-    ),
-    (
-        "--file",
-        &["piv", "self-sign"],
-        "--file was renamed --out (the file to write)",
-    ),
-    (
-        "--list-readers",
-        &[],
-        "--list-readers was removed; `keyroostctl list` shows the smart-card readers",
-    ),
+/// A removed or renamed flag. `words` must all appear in argv for the row
+/// to apply (empty = any command); `msg` is static text that never repeats
+/// a value; `now` lists the flags `msg` recommends, each of which exists
+/// on that command (checked by `retired_flag_rows_name_real_flags`).
+/// Specific rows come before generic (`words: &[]`) ones.
+struct RetiredFlag {
+    flag: &'static str,
+    words: &'static [&'static str],
+    msg: &'static str,
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "checked by retired_flag_rows_name_real_flags")
+    )]
+    now: &'static [&'static str],
+}
+
+/// clap only hands us the flag name, never its value or the next token, so
+/// nothing a user typed can leak through these messages.
+const RETIRED_FLAGS: &[RetiredFlag] = &[
+    RetiredFlag {
+        flag: "-p",
+        words: &["molto"],
+        msg: "-p/--profile was renamed -s/--slot (Token2 calls slots profiles)",
+        now: &["--slot"],
+    },
+    RetiredFlag {
+        flag: "--profile",
+        words: &["molto"],
+        msg: "-p/--profile was renamed -s/--slot (Token2 calls slots profiles)",
+        now: &["--slot"],
+    },
+    RetiredFlag {
+        flag: "--time-step",
+        words: &["molto"],
+        msg: "--time-step was renamed --period (same values: 30 or 60)",
+        now: &["--period"],
+    },
+    RetiredFlag {
+        flag: "--time-step",
+        words: &["prog"],
+        msg: "--time-step was renamed --period (same values: 30 or 60)",
+        now: &["--period"],
+    },
+    RetiredFlag {
+        flag: "--key",
+        words: &["molto"],
+        msg: "--key was removed: secrets on the command line end up in shell history and `ps`; use --key-env VAR",
+        now: &["--key-env"],
+    },
+    RetiredFlag {
+        flag: "--key-ascii",
+        words: &["molto"],
+        msg: "--key-ascii was removed: secrets on the command line end up in shell history and `ps`; use --key-ascii-env VAR",
+        now: &["--key-ascii-env"],
+    },
+    RetiredFlag {
+        flag: "--hex",
+        words: &["seed"],
+        msg: "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
+        now: &["--hex-env", "--hex-stdin"],
+    },
+    RetiredFlag {
+        flag: "--base32",
+        words: &["seed"],
+        msg: "--base32 was removed: secrets on the command line end up in shell history and `ps`; use --base32-env VAR or --base32-stdin",
+        now: &["--base32-env", "--base32-stdin"],
+    },
+    RetiredFlag {
+        flag: "--hex",
+        words: &["customer-key"],
+        msg: "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
+        now: &["--hex-env", "--hex-stdin"],
+    },
+    RetiredFlag {
+        flag: "--ascii",
+        words: &["customer-key"],
+        msg: "--ascii was removed: secrets on the command line end up in shell history and `ps`; use --ascii-env VAR or --ascii-stdin",
+        now: &["--ascii-env", "--ascii-stdin"],
+    },
+    RetiredFlag {
+        flag: "--secret-env",
+        words: &["oath"],
+        msg: "--secret-env VAR is now --seed env:VAR",
+        now: &["--seed"],
+    },
+    RetiredFlag {
+        flag: "--secret-stdin",
+        words: &["oath"],
+        msg: "--secret-stdin is now --seed stdin",
+        now: &["--seed"],
+    },
+    RetiredFlag {
+        flag: "--current-env",
+        words: &["otp"],
+        msg: "--current-env VAR is now --pin env:VAR (the current PIN)",
+        now: &["--pin"],
+    },
+    RetiredFlag {
+        flag: "--new-env",
+        words: &["otp"],
+        msg: "--new-env VAR is now --new-pin env:VAR",
+        now: &["--new-pin"],
+    },
+    RetiredFlag {
+        flag: "--pin-stdin",
+        words: &["otp", "change-pin"],
+        msg: "--pin-stdin is now --pin stdin --new-pin stdin: the current PIN on the first line, the new one on the second",
+        now: &["--pin", "--new-pin"],
+    },
+    RetiredFlag {
+        flag: "--pin-env",
+        words: &["otp", "set-pin"],
+        msg: "--pin-env VAR is now --new-pin env:VAR (the PIN being set)",
+        now: &["--new-pin"],
+    },
+    RetiredFlag {
+        flag: "--pin-stdin",
+        words: &["otp", "set-pin"],
+        msg: "--pin-stdin is now --new-pin stdin (the PIN being set)",
+        now: &["--new-pin"],
+    },
+    RetiredFlag {
+        flag: "--pin-only",
+        words: &["otp", "list"],
+        msg: "--pin-only was replaced by --unlock pin, the default",
+        now: &["--unlock"],
+    },
+    RetiredFlag {
+        flag: "--file",
+        words: &["piv", "import-cert"],
+        msg: "--file was renamed -i/--in (the certificate file to read)",
+        now: &["--in"],
+    },
+    RetiredFlag {
+        flag: "--file",
+        words: &["piv", "export-cert"],
+        msg: "--file was renamed -o/--out (the file to write)",
+        now: &["--out"],
+    },
+    RetiredFlag {
+        flag: "--file",
+        words: &["piv", "request-cert"],
+        msg: "--file was renamed -o/--out (the file to write)",
+        now: &["--out"],
+    },
+    RetiredFlag {
+        flag: "--file",
+        words: &["piv", "self-sign"],
+        msg: "--file was renamed -o/--out (the file to write)",
+        now: &["--out"],
+    },
+    RetiredFlag {
+        flag: "--force",
+        words: &["ssh-cert", "extract"],
+        msg: "--force was renamed --overwrite (replace an existing file)",
+        now: &["--overwrite"],
+    },
+    RetiredFlag {
+        flag: "--list-readers",
+        words: &[],
+        msg: "--list-readers was removed; `keyroostctl list` shows the smart-card readers",
+        now: &[],
+    },
+    // Generic: a retired flag family, on any command. Keep these last.
+    RetiredFlag {
+        flag: "--pin-env",
+        words: &[],
+        msg: "--pin-env VAR is now --pin env:VAR",
+        now: &["--pin"],
+    },
+    RetiredFlag {
+        flag: "--pin-stdin",
+        words: &[],
+        msg: "--pin-stdin is now --pin stdin",
+        now: &["--pin"],
+    },
+    RetiredFlag {
+        flag: "--old-pin-env",
+        words: &[],
+        msg: "--old-pin-env VAR is now --pin env:VAR (the current PIN)",
+        now: &["--pin"],
+    },
+    RetiredFlag {
+        flag: "--old-pin-stdin",
+        words: &[],
+        msg: "--old-pin-stdin is now --pin stdin (the current PIN)",
+        now: &["--pin"],
+    },
+    RetiredFlag {
+        flag: "--new-pin-env",
+        words: &[],
+        msg: "--new-pin-env VAR is now --new-pin env:VAR",
+        now: &["--new-pin"],
+    },
+    RetiredFlag {
+        flag: "--new-pin-stdin",
+        words: &[],
+        msg: "--new-pin-stdin is now --new-pin stdin",
+        now: &["--new-pin"],
+    },
+    RetiredFlag {
+        flag: "--puk-env",
+        words: &[],
+        msg: "--puk-env VAR is now --puk env:VAR",
+        now: &["--puk"],
+    },
+    RetiredFlag {
+        flag: "--puk-stdin",
+        words: &[],
+        msg: "--puk-stdin is now --puk stdin",
+        now: &["--puk"],
+    },
+    RetiredFlag {
+        flag: "--old-puk-env",
+        words: &[],
+        msg: "--old-puk-env VAR is now --puk env:VAR (the current PUK)",
+        now: &["--puk"],
+    },
+    RetiredFlag {
+        flag: "--old-puk-stdin",
+        words: &[],
+        msg: "--old-puk-stdin is now --puk stdin (the current PUK)",
+        now: &["--puk"],
+    },
+    RetiredFlag {
+        flag: "--new-puk-env",
+        words: &[],
+        msg: "--new-puk-env VAR is now --new-puk env:VAR",
+        now: &["--new-puk"],
+    },
+    RetiredFlag {
+        flag: "--new-puk-stdin",
+        words: &[],
+        msg: "--new-puk-stdin is now --new-puk stdin",
+        now: &["--new-puk"],
+    },
+    RetiredFlag {
+        flag: "--admin-pin-env",
+        words: &[],
+        msg: "--admin-pin-env VAR is now --admin-pin env:VAR",
+        now: &["--admin-pin"],
+    },
+    RetiredFlag {
+        flag: "--admin-pin-stdin",
+        words: &[],
+        msg: "--admin-pin-stdin is now --admin-pin stdin",
+        now: &["--admin-pin"],
+    },
+    RetiredFlag {
+        flag: "--mgmt-key-env",
+        words: &[],
+        msg: "--mgmt-key-env VAR is now --mgmt-key env:VAR",
+        now: &["--mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--mgmt-key-stdin",
+        words: &[],
+        msg: "--mgmt-key-stdin is now --mgmt-key stdin",
+        now: &["--mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--mgmt-key-default",
+        words: &[],
+        msg: "--mgmt-key-default is now --mgmt-key default",
+        now: &["--mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--old-mgmt-key-env",
+        words: &[],
+        msg: "--old-mgmt-key-env VAR is now --mgmt-key env:VAR (the current management key)",
+        now: &["--mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--old-mgmt-key-stdin",
+        words: &[],
+        msg: "--old-mgmt-key-stdin is now --mgmt-key stdin (the current management key)",
+        now: &["--mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--old-mgmt-key-default",
+        words: &[],
+        msg: "--old-mgmt-key-default is now --mgmt-key default (the current management key)",
+        now: &["--mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--new-mgmt-key-env",
+        words: &[],
+        msg: "--new-mgmt-key-env VAR is now --new-mgmt-key env:VAR",
+        now: &["--new-mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--new-mgmt-key-stdin",
+        words: &[],
+        msg: "--new-mgmt-key-stdin is now --new-mgmt-key stdin",
+        now: &["--new-mgmt-key"],
+    },
+    RetiredFlag {
+        flag: "--password-env",
+        words: &[],
+        msg: "--password-env VAR is now --password env:VAR",
+        now: &["--password"],
+    },
+    RetiredFlag {
+        flag: "--password-stdin",
+        words: &[],
+        msg: "--password-stdin is now --password stdin",
+        now: &["--password"],
+    },
+    RetiredFlag {
+        flag: "--new-password-env",
+        words: &[],
+        msg: "--new-password-env VAR is now --new-password env:VAR",
+        now: &["--new-password"],
+    },
+    RetiredFlag {
+        flag: "--new-password-stdin",
+        words: &[],
+        msg: "--new-password-stdin is now --new-password stdin",
+        now: &["--new-password"],
+    },
+    RetiredFlag {
+        flag: "--seed-env",
+        words: &[],
+        msg: "--seed-env VAR is now --seed env:VAR",
+        now: &["--seed"],
+    },
+    RetiredFlag {
+        flag: "--seed-stdin",
+        words: &[],
+        msg: "--seed-stdin is now --seed stdin",
+        now: &["--seed"],
+    },
 ];
 
 /// A renamed or removed subcommand. `parent` is the command path above it
@@ -4299,10 +4287,8 @@ fn retired_command_hint(invalid: &str, argv: &[String]) -> Option<String> {
 fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<&'static str> {
     RETIRED_FLAGS
         .iter()
-        .find(|(flag, words, _)| {
-            *flag == invalid && words.iter().all(|w| argv.iter().any(|a| a == w))
-        })
-        .map(|(_, _, msg)| *msg)
+        .find(|r| r.flag == invalid && r.words.iter().all(|w| argv.iter().any(|a| a == w)))
+        .map(|r| r.msg)
 }
 
 /// A double-dash word made only of letters and dashes — a typo'd flag name
@@ -4348,7 +4334,7 @@ fn is_secret_arg(a: &clap::Arg) -> bool {
 /// DEADBEEF` or `--hex-stdin=DEADBEEF`, both of which clap reports as
 /// `TooManyValues` for a flag that takes none) is redacted the same way, and
 /// so is a dash-led word right after a secret source (`--pin stdin
-/// -123456`, `--pin env:KR_PIN -123456`, `--old-pin-stdin -123456`) unless
+/// -123456`, `--pin env:KR_PIN -123456`, `--hex-stdin -123456`) unless
 /// it's shaped like a typo'd flag name. A secret flag (any `<SOURCE>` flag)
 /// given something other than a source (`--pin 123456`) is refused with a
 /// fixed message naming the sources it takes, never the value. Any other error about a flag keeps clap's
@@ -4628,22 +4614,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Cmd::FactoryReset {
         reader,
         yes,
-        mgmt_key_env,
-        mgmt_key_stdin,
-        mgmt_key_default,
-        pin_env,
-        pin_stdin,
+        mgmt_key,
+        pin,
     } = cmd
     {
         return run_factory_reset(
             reader.as_deref(),
             *yes,
             cli.debug,
-            mgmt_key_env.as_deref(),
-            *mgmt_key_stdin,
-            *mgmt_key_default,
-            pin_env.as_deref(),
-            *pin_stdin,
+            mgmt_key.as_ref(),
+            pin.as_ref(),
         );
     }
 
@@ -4678,12 +4658,11 @@ fn run_molto(
         start,
         display_timeout: _,
         dry_run: true,
-        password_stdin,
-        password_env,
+        password,
         yes: _,
     } = cmd
     {
-        let entries = load_bulk_entries(&mut sec, path, *password_stdin, password_env.as_deref())?;
+        let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
         let last = (*start as usize).saturating_add(entries.len());
         println!(
             "Found {} entries; would fill slots #{}..#{} (dry run).",
@@ -4928,12 +4907,10 @@ fn run_molto(
         MoltoCmd::ImportFile {
             path,
             start,
-            password_stdin,
-            password_env,
+            password,
             ..
         } => {
-            let entries =
-                load_bulk_entries(&mut sec, path, *password_stdin, password_env.as_deref())?;
+            let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
             let n = entries.len();
             let last = (*start as usize).saturating_add(n);
             if last > 100 {
@@ -5604,9 +5581,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-const OATH_PASSWORD: Spec = Spec::current("OATH password", "password").legacy();
-const OATH_NEW_PASSWORD: Spec = Spec::new_secret("new OATH password", "new-password").legacy();
-const OATH_SEED: Spec = Spec::value("seed", "seed").base32().legacy();
+const OATH_PASSWORD: Spec = Spec::current("OATH password", "password");
+const OATH_NEW_PASSWORD: Spec = Spec::new_secret("new OATH password", "new-password");
+const OATH_SEED: Spec = Spec::value("seed", "seed").base32();
 
 /// Open the OATH applet on the announced key, unlocking it when it is
 /// password-protected. Nothing is held while a password is typed: see
@@ -5705,11 +5682,8 @@ fn run_factory_reset(
     reader: Option<&str>,
     yes: bool,
     debug: bool,
-    mgmt_key_env: Option<&str>,
-    mgmt_key_stdin: bool,
-    mgmt_key_default: bool,
-    pin_env: Option<&str>,
-    pin_stdin: bool,
+    mgmt_key: Option<&SecretSource>,
+    pin: Option<&SecretSource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_resolve::{factory_reset_plan, ResetStep, StepOutcome, StepReport};
 
@@ -5754,14 +5728,7 @@ fn run_factory_reset(
     // and before any card session; only the probe below can say whether it
     // is needed.
     let mut sec = Secrets::real();
-    let reset_input = read_reset_auth_input(
-        &mut sec,
-        mgmt_key_env,
-        mgmt_key_stdin,
-        mgmt_key_default,
-        pin_env,
-        pin_stdin,
-    )?;
+    let reset_input = read_reset_auth_input(&mut sec, mgmt_key, pin)?;
     crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
 
     // Fingerprint PIV before running anything destructive — mirrors the GUI's
@@ -6556,7 +6523,7 @@ enum ResetCliAuth {
 }
 
 /// A RESET credential as given on the command line, read before any card
-/// session: a management key (hex), `--mgmt-key-default` (resolved inside the
+/// session: a management key (hex), `--mgmt-key default` (resolved inside the
 /// session, from the applet's fingerprint), or a PIN.
 enum ResetAuthInput {
     Key(zeroize::Zeroizing<Vec<u8>>),
@@ -6566,36 +6533,32 @@ enum ResetAuthInput {
 
 const RESET_MGMT_KEY: Spec = Spec::current("PIV management key", "mgmt-key")
     .hex()
-    .legacy();
-const RESET_PIN: Spec = Spec::current("PIV PIN", "pin").legacy();
+    .with_default();
+const RESET_PIN: Spec = Spec::current("PIV PIN", "pin");
 
-/// Read a RESET command's optional credential from its five `--mgmt-key-*`/
-/// `--pin-*` flags, already mutually exclusive by construction (each
-/// `conflicts_with_all`s the other four) — shared by `factory-reset` and
-/// `piv reset`, the two commands that can hit `PivQuirk::
-/// ResetNeedsManagementAuth`'s precondition. Only the flag given is read;
-/// with none, nothing is — never a prompt: whether a credential is needed at
-/// all, and of which kind, is only known once the card is open, and nothing
-/// may be read while it is. `--mgmt-key-stdin`/`--pin-stdin` typed at a
-/// terminal read hidden ([`Secrets::prompted`]).
+/// Read a RESET command's optional credential from its `--mgmt-key` /
+/// `--pin` flags, mutually exclusive by construction — shared by
+/// `factory-reset` and `piv reset`, the two commands that can hit
+/// `PivQuirk::ResetNeedsManagementAuth`'s precondition. Only the flag given
+/// is read; with none, nothing is — never a prompt: whether a credential is
+/// needed at all, and of which kind, is only known once the card is open,
+/// and nothing may be read while it is. `--mgmt-key stdin` / `--pin stdin`
+/// typed at a terminal read hidden ([`Secrets::prompted`]).
 ///
-/// `--mgmt-key-default` is the CLI equivalent of the GUI's "Use default XAUTH
+/// `--mgmt-key default` is the CLI equivalent of the GUI's "Use default XAUTH
 /// key" convenience: it reads nothing and instead reaches for keyroost's own
 /// per-fingerprint quirks-table default (`PivSession::default_management_key`)
 /// — a deliberate opt-in, so a scripted `--yes` run only reaches for a
 /// well-known key when the caller explicitly asked for it.
 fn read_reset_auth_input<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
-    mgmt_key_env: Option<&str>,
-    mgmt_key_stdin: bool,
-    mgmt_key_default: bool,
-    pin_env: Option<&str>,
-    pin_stdin: bool,
+    mgmt_key: Option<&SecretSource>,
+    pin: Option<&SecretSource>,
 ) -> Result<Option<ResetAuthInput>, Box<dyn std::error::Error>> {
-    if mgmt_key_default {
+    if crate::secrets::wants_default(mgmt_key) {
         return Ok(Some(ResetAuthInput::Default));
     }
-    let key_src = Source::new(mgmt_key_env, mgmt_key_stdin);
+    let key_src = Source::from_flag(mgmt_key);
     if key_src.given() {
         return Ok(Some(ResetAuthInput::Key(read_mgmt_key_hex(
             sec,
@@ -6604,7 +6567,7 @@ fn read_reset_auth_input<I: crate::secrets::SecretIo>(
         )?)));
     }
     Ok(sec
-        .read_given(&RESET_PIN, Source::new(pin_env, pin_stdin))?
+        .read_given(&RESET_PIN, Source::from_flag(pin))?
         .map(ResetAuthInput::Pin))
 }
 
@@ -6619,7 +6582,7 @@ fn read_reset_auth_input<I: crate::secrets::SecretIo>(
 /// ResetNeedsManagementAuth` says a credential is needed; it says nothing
 /// about which kinds this fingerprint actually accepts).
 ///
-/// `session` is only consulted for `--mgmt-key-default` — every other branch
+/// `session` is only consulted for `--mgmt-key default` — every other branch
 /// ignores it. Both real call sites already have one open (fingerprinting
 /// the device is how `PivQuirk::ResetNeedsManagementAuth` gets checked in
 /// the first place) and pass `Some`; it's `Option` rather than a required
@@ -6633,14 +6596,14 @@ fn resolve_reset_cli_auth(
     match input {
         Some(ResetAuthInput::Default) => {
             let session = session.expect(
-                "--mgmt-key-default always runs with an already-open PivSession at both call sites",
+                "--mgmt-key default always runs with an already-open PivSession at both call sites",
             );
             return session
                 .default_management_key()
                 .map(|key| ResetCliAuth::Key(zeroize::Zeroizing::new(key.to_vec())))
                 .ok_or_else(|| {
-                    "--mgmt-key-default: keyroost has no known factory-default management key \
-                     on record for this device; pass --mgmt-key-env/--mgmt-key-stdin instead"
+                    "--mgmt-key default: keyroost has no known factory-default management key \
+                     on record for this device; pass --mgmt-key env:NAME or --mgmt-key stdin instead"
                         .into()
                 });
         }
@@ -6651,17 +6614,17 @@ fn resolve_reset_cli_auth(
     use keyroost_piv::compat::FeatureGate;
     let pin_hint = match pin_gate {
         FeatureGate::Supported => {
-            " or --pin-env/--pin-stdin (a PIN works too, instead of the management key)"
+            " or --pin env:NAME or stdin (a PIN works too, instead of the management key)"
         }
         FeatureGate::Unverified => {
-            " or --pin-env/--pin-stdin (a PIN may also work instead of the management key, \
+            " or --pin env:NAME or stdin (a PIN may also work instead of the management key, \
              but that's unverified on this device)"
         }
         FeatureGate::Unsupported => "",
     };
     Err(format!(
         "this device needs a management-key credential to reset PIV \u{2014} pass \
-         --mgmt-key-env/--mgmt-key-stdin/--mgmt-key-default{pin_hint}"
+         --mgmt-key env:NAME, stdin or default{pin_hint}"
     )
     .into())
 }
@@ -6864,8 +6827,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         OathCmd::Add {
             name,
             oath_type,
-            seed_env,
-            seed_stdin,
+            seed,
             algorithm,
             digits,
             counter,
@@ -6876,7 +6838,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 return Err("--counter only applies to --type hotp".into());
             }
             let mut sec = Secrets::real();
-            let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
+            let seed_src = Source::from_flag(seed.as_ref());
             sec.check(&OATH_SEED, seed_src)?;
             crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
             // The seed first (stdin line 1); the applet password, if it needs
@@ -6918,12 +6880,11 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             println!("Deleted OATH credential {:?}.", name);
         }
         OathCmd::SetPassword {
-            new_password_env,
-            new_password_stdin,
+            new_password,
             access,
         } => {
             let mut sec = Secrets::real();
-            let new_src = Source::new(new_password_env.as_deref(), *new_password_stdin);
+            let new_src = Source::from_flag(new_password.as_ref());
             sec.check(&OATH_NEW_PASSWORD, new_src)?;
             // The current password first (stdin line 1, when the applet has
             // one), then the new one. The helper refuses an empty new
@@ -7184,10 +7145,10 @@ fn ensure_otp_feature(
     Ok(())
 }
 
-const OTP_PIN: Spec = Spec::current("OTP PIN", "pin").legacy();
-const OTP_OLD_PIN: Spec = Spec::current("current OTP PIN", "old-pin").legacy();
-const OTP_NEW_PIN: Spec = Spec::new_secret("new OTP PIN", "new-pin").legacy();
-const OTP_SEED: Spec = Spec::value("seed", "seed").base32().legacy();
+const OTP_PIN: Spec = Spec::current("OTP PIN", "pin");
+const OTP_OLD_PIN: Spec = Spec::current("current OTP PIN", "pin");
+const OTP_NEW_PIN: Spec = Spec::new_secret("new OTP PIN", "new-pin");
+const OTP_SEED: Spec = Spec::value("seed", "seed").base32();
 
 /// The OTP PIN for a command that needs it only when the key has one set
 /// (list, add, delete). A PIN given by flag is read as is; otherwise a
@@ -7238,11 +7199,10 @@ fn otp_pin_if_needed(
 fn otp_required_secret(
     sel: &OtpSelect<'_>,
     spec: &Spec,
-    env: &Option<String>,
-    stdin: bool,
+    flag: Option<&SecretSource>,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
-    let src = Source::new(env.as_deref(), stdin);
+    let src = Source::from_flag(flag);
     sec.check(spec, src)?;
     let dev = select_otp(sel)?;
     let secret = sec.read(spec, src)?;
@@ -7279,8 +7239,7 @@ fn run_otp(
     match cmd {
         OtpCmd::List {
             unlock: OtpUnlock::Pin,
-            pin_env,
-            pin_stdin,
+            pin,
         } => {
             let dev = select_otp(&sel)?;
             let pin = otp_pin_if_needed(
@@ -7288,7 +7247,7 @@ fn run_otp(
                 &dev,
                 sel.transport,
                 debug,
-                Source::new(pin_env.as_deref(), *pin_stdin),
+                Source::from_flag(pin.as_ref()),
                 false,
             )?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
@@ -7301,11 +7260,10 @@ fn run_otp(
         }
         OtpCmd::List {
             unlock: OtpUnlock::Fingerprint,
-            pin_env,
-            pin_stdin,
+            pin,
         } => {
             // A PIN flag here was refused at parse time (otp_unlock_conflict).
-            debug_assert!(pin_env.is_none() && !*pin_stdin);
+            debug_assert!(pin.is_none());
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
@@ -7316,14 +7274,13 @@ fn run_otp(
         }
         OtpCmd::List {
             unlock: OtpUnlock::Auto,
-            pin_env,
-            pin_stdin,
+            pin,
         } => {
             // The PIN is only the fingerprint's fallback: read when a flag
             // names it, never prompted for.
             let mut sec = Secrets::real();
             let dev = select_otp(&sel)?;
-            let pin = sec.read_given(&OTP_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
+            let pin = sec.read_given(&OTP_PIN, Source::from_flag(pin.as_ref()))?;
             crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
@@ -7370,13 +7327,11 @@ fn run_otp(
             digits,
             period,
             touch,
-            seed_env,
-            seed_stdin,
-            pin_env,
-            pin_stdin,
+            seed,
+            pin,
         } => {
             let mut sec = Secrets::real();
-            let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
+            let seed_src = Source::from_flag(seed.as_ref());
             sec.check(&OTP_SEED, seed_src)?;
             let dev = select_otp(&sel)?;
             // The seed first (stdin line 1); the OTP PIN, if the key has one,
@@ -7390,7 +7345,7 @@ fn run_otp(
                 &dev,
                 sel.transport,
                 debug,
-                Source::new(pin_env.as_deref(), *pin_stdin),
+                Source::from_flag(pin.as_ref()),
                 waited,
             )?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
@@ -7416,8 +7371,7 @@ fn run_otp(
         OtpCmd::Delete {
             app,
             account,
-            pin_env,
-            pin_stdin,
+            pin,
             yes,
         } => {
             let label = if app.is_empty() {
@@ -7439,7 +7393,7 @@ fn run_otp(
                 &dev,
                 sel.transport,
                 debug,
-                Source::new(pin_env.as_deref(), *pin_stdin),
+                Source::from_flag(pin.as_ref()),
                 asked,
             )?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
@@ -7472,12 +7426,11 @@ fn run_otp(
             no_enter,
             long_touch,
             numpad,
-            seed_env,
-            seed_stdin,
+            seed,
             yes,
         } => {
             let mut sec = Secrets::real();
-            let seed_src = Source::new(seed_env.as_deref(), *seed_stdin);
+            let seed_src = Source::from_flag(seed.as_ref());
             sec.check(&OTP_SEED, seed_src)?;
             let dev = select_otp(&sel)?;
             // An unsupported key fails here, and an empty button slot needs
@@ -7661,32 +7614,24 @@ fn run_otp(
                 ),
             }
         }
-        OtpCmd::SetPin {
-            new_pin_env,
-            new_pin_stdin,
-        } => {
-            let pin = otp_required_secret(&sel, &OTP_NEW_PIN, new_pin_env, *new_pin_stdin)?;
+        OtpCmd::SetPin { new_pin } => {
+            let pin = otp_required_secret(&sel, &OTP_NEW_PIN, new_pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_pin(pin.as_str())?;
             println!("OTP PIN set. Codes now require the PIN to read.");
         }
-        OtpCmd::Verify { pin_env, pin_stdin } => {
-            let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
+        OtpCmd::Verify { pin } => {
+            let pin = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.verify_pin(pin.as_str())?;
             println!("OTP PIN verified; read window open for this connection.");
         }
-        OtpCmd::ChangePin {
-            old_pin_env,
-            old_pin_stdin,
-            new_pin_env,
-            new_pin_stdin,
-        } => {
+        OtpCmd::ChangePin { pin, new_pin } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
-            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let first_src = Source::from_flag(pin.as_ref());
+            let second_src = Source::from_flag(new_pin.as_ref());
             sec.check(&OTP_OLD_PIN, first_src)?;
             sec.check(&OTP_NEW_PIN, second_src)?;
             let dev = select_otp(&sel)?;
@@ -7701,8 +7646,8 @@ fn run_otp(
             session.change_pin(current.as_str(), new.as_str())?;
             println!("OTP PIN changed.");
         }
-        OtpCmd::ClearPin { pin_env, pin_stdin } => {
-            let current = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
+        OtpCmd::ClearPin { pin } => {
+            let current = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.remove_pin(current.as_str())?;
@@ -7717,15 +7662,15 @@ fn run_otp(
                 None => println!("Fingerprint-protected OTP: not available on this firmware"),
             }
         }
-        OtpCmd::FingerprintEnable { pin_env, pin_stdin } => {
-            let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
+        OtpCmd::FingerprintEnable { pin } => {
+            let pin = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), true)?;
             println!("Fingerprint protection enabled. Touch the sensor to unlock codes.");
         }
-        OtpCmd::FingerprintDisable { pin_env, pin_stdin } => {
-            let pin = otp_required_secret(&sel, &OTP_PIN, pin_env, *pin_stdin)?;
+        OtpCmd::FingerprintDisable { pin } => {
+            let pin = otp_required_secret(&sel, &OTP_PIN, pin.as_ref())?;
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             session.set_fp_protection(pin.as_str(), false)?;
@@ -7861,14 +7806,14 @@ fn print_openpgp_public_key(slot_label: &str, attrs: &[u8], key: &keyroost_openp
     }
 }
 
-const PGP_USER_PIN: Spec = Spec::current("user PIN (PW1)", "pin").legacy();
-const PGP_SIGN_PIN: Spec = Spec::current("signing PIN (PW1)", "pin").legacy();
-const PGP_ADMIN_PIN_VERIFY: Spec = Spec::current("admin PIN (PW3)", "pin").legacy();
-const PGP_ADMIN_PIN: Spec = Spec::current("admin PIN (PW3)", "admin-pin").legacy();
-const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "old-pin").legacy();
-const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin").legacy();
-const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "old-pin").legacy();
-const PGP_NEW_ADMIN_PIN: Spec = Spec::new_secret("new admin PIN (PW3)", "new-pin").legacy();
+const PGP_USER_PIN: Spec = Spec::current("user PIN (PW1)", "pin");
+const PGP_SIGN_PIN: Spec = Spec::current("signing PIN (PW1)", "pin");
+const PGP_ADMIN_PIN_VERIFY: Spec = Spec::current("admin PIN (PW3)", "pin");
+const PGP_ADMIN_PIN: Spec = Spec::current("admin PIN (PW3)", "admin-pin");
+const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "pin");
+const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin");
+const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "pin");
+const PGP_NEW_ADMIN_PIN: Spec = Spec::new_secret("new admin PIN (PW3)", "new-pin");
 
 fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -7929,18 +7874,13 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 None => println!("Signatures:     (unavailable)"),
             }
         }
-        OpenpgpCmd::Verify {
-            which,
-            pin_env,
-            pin_stdin,
-            reader,
-        } => {
+        OpenpgpCmd::Verify { which, pin, reader } => {
             let spec = match which {
                 OpenpgpPinKind::User => &PGP_USER_PIN,
                 OpenpgpPinKind::Admin => &PGP_ADMIN_PIN_VERIFY,
             };
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(spec, src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let pin = sec.read(spec, src)?;
@@ -7998,15 +7938,14 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             slot,
             algorithm,
             yes,
-            admin_pin_env,
-            admin_pin_stdin,
+            admin_pin,
             reader,
         } => {
             if let Some(a) = algorithm {
                 a.to_alg().attributes(slot.to_crt())?;
             }
             let mut sec = Secrets::real();
-            let src = Source::new(admin_pin_env.as_deref(), *admin_pin_stdin);
+            let src = Source::from_flag(admin_pin.as_ref());
             sec.check(&PGP_ADMIN_PIN, src)?;
             let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
@@ -8039,12 +7978,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             in_file,
             slot,
             yes,
-            admin_pin_env,
-            admin_pin_stdin,
+            admin_pin,
             reader,
         } => {
             let mut sec = Secrets::real();
-            let src = Source::new(admin_pin_env.as_deref(), *admin_pin_stdin);
+            let src = Source::from_flag(admin_pin.as_ref());
             sec.check(&PGP_ADMIN_PIN, src)?;
 
             // Obtain the RSA-2048 key parts (full CRT set, big-endian) either by
@@ -8102,12 +8040,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::SetName {
             name: cardholder,
-            admin_pin_env,
-            admin_pin_stdin,
+            admin_pin,
             reader,
         } => {
             let mut sec = Secrets::real();
-            let src = Source::new(admin_pin_env.as_deref(), *admin_pin_stdin);
+            let src = Source::from_flag(admin_pin.as_ref());
             sec.check(&PGP_ADMIN_PIN, src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
@@ -8119,12 +8056,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::SetUrl {
             url,
-            admin_pin_env,
-            admin_pin_stdin,
+            admin_pin,
             reader,
         } => {
             let mut sec = Secrets::real();
-            let src = Source::new(admin_pin_env.as_deref(), *admin_pin_stdin);
+            let src = Source::from_flag(admin_pin.as_ref());
             sec.check(&PGP_ADMIN_PIN, src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
             let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
@@ -8138,14 +8074,13 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             r#in,
             out,
             overwrite,
-            pin_env,
-            pin_stdin,
+            pin,
             hash,
             reader,
         } => {
             let out_mode = crate::prompt::check_secret_overwrite(out.as_deref(), *overwrite)?;
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(&PGP_SIGN_PIN, src)?;
             let data = std::fs::read(r#in)
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
@@ -8173,13 +8108,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             r#in,
             out,
             overwrite,
-            pin_env,
-            pin_stdin,
+            pin,
             reader,
         } => {
             let out_mode = crate::prompt::check_secret_overwrite(out.as_deref(), *overwrite)?;
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(&PGP_USER_PIN, src)?;
             let cryptogram = std::fs::read(r#in)
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
@@ -8230,14 +8164,13 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             r#in,
             out,
             overwrite,
-            pin_env,
-            pin_stdin,
+            pin,
             hash,
             reader,
         } => {
             let out_mode = crate::prompt::check_secret_overwrite(out.as_deref(), *overwrite)?;
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(&PGP_USER_PIN, src)?;
             let data = std::fs::read(r#in)
                 .map_err(|e| format!("cannot read {}: {}", r#in.display(), e))?;
@@ -8268,14 +8201,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::ChangePin {
             reader,
-            old_pin_env,
-            old_pin_stdin,
-            new_pin_env,
-            new_pin_stdin,
+            pin,
+            new_pin,
         } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
-            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let first_src = Source::from_flag(pin.as_ref());
+            let second_src = Source::from_flag(new_pin.as_ref());
             sec.check(&PGP_OLD_USER_PIN, first_src)?;
             sec.check(&PGP_NEW_USER_PIN, second_src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
@@ -8292,14 +8223,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::ChangeAdminPin {
             reader,
-            old_pin_env,
-            old_pin_stdin,
-            new_pin_env,
-            new_pin_stdin,
+            pin,
+            new_pin,
         } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
-            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let first_src = Source::from_flag(pin.as_ref());
+            let second_src = Source::from_flag(new_pin.as_ref());
             sec.check(&PGP_OLD_ADMIN_PIN, first_src)?;
             sec.check(&PGP_NEW_ADMIN_PIN, second_src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
@@ -8315,14 +8244,12 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         }
         OpenpgpCmd::UnblockPin {
             reader,
-            admin_pin_env,
-            admin_pin_stdin,
-            new_pin_env,
-            new_pin_stdin,
+            admin_pin,
+            new_pin,
         } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(admin_pin_env.as_deref(), *admin_pin_stdin);
-            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let first_src = Source::from_flag(admin_pin.as_ref());
+            let second_src = Source::from_flag(new_pin.as_ref());
             sec.check(&PGP_ADMIN_PIN, first_src)?;
             sec.check(&PGP_NEW_USER_PIN, second_src)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
@@ -8342,23 +8269,19 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-const PIV_PIN: Spec = Spec::current("PIN", "pin").legacy();
-const PIV_OLD_PIN: Spec = Spec::current("current PIN", "old-pin").legacy();
-const PIV_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin").legacy();
-const PIV_PUK: Spec = Spec::current("PUK", "puk").legacy();
-const PIV_OLD_PUK: Spec = Spec::current("current PUK", "old-puk").legacy();
-const PIV_NEW_PUK: Spec = Spec::new_secret("new PUK", "new-puk").legacy();
+const PIV_PIN: Spec = Spec::current("PIN", "pin");
+const PIV_OLD_PIN: Spec = Spec::current("current PIN", "pin");
+const PIV_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
+const PIV_PUK: Spec = Spec::current("PUK", "puk");
+const PIV_OLD_PUK: Spec = Spec::current("current PUK", "puk");
+const PIV_NEW_PUK: Spec = Spec::new_secret("new PUK", "new-puk");
 const PIV_MGMT_KEY: Spec = Spec::current("management key", "mgmt-key")
     .hex()
-    .with_default()
-    .legacy();
-const PIV_OLD_MGMT_KEY: Spec = Spec::current("current management key", "old-mgmt-key")
+    .with_default();
+const PIV_OLD_MGMT_KEY: Spec = Spec::current("current management key", "mgmt-key")
     .hex()
-    .with_default()
-    .legacy();
-const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key")
-    .hex()
-    .legacy();
+    .with_default();
+const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key").hex();
 
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -8491,14 +8414,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         PivCmd::ChangePin {
             reader,
-            old_pin_env,
-            old_pin_stdin,
-            new_pin_env,
-            new_pin_stdin,
+            pin,
+            new_pin,
         } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
-            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let first_src = Source::from_flag(pin.as_ref());
+            let second_src = Source::from_flag(new_pin.as_ref());
             sec.check(&PIV_OLD_PIN, first_src)?;
             sec.check(&PIV_NEW_PIN, second_src)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
@@ -8521,14 +8442,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         PivCmd::ChangePuk {
             reader,
-            old_puk_env,
-            old_puk_stdin,
-            new_puk_env,
-            new_puk_stdin,
+            puk,
+            new_puk,
         } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(old_puk_env.as_deref(), *old_puk_stdin);
-            let second_src = Source::new(new_puk_env.as_deref(), *new_puk_stdin);
+            let first_src = Source::from_flag(puk.as_ref());
+            let second_src = Source::from_flag(new_puk.as_ref());
             sec.check(&PIV_OLD_PUK, first_src)?;
             sec.check(&PIV_NEW_PUK, second_src)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
@@ -8551,14 +8470,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         PivCmd::UnblockPin {
             reader,
-            puk_env,
-            puk_stdin,
-            new_pin_env,
-            new_pin_stdin,
+            puk,
+            new_pin,
         } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(puk_env.as_deref(), *puk_stdin);
-            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let first_src = Source::from_flag(puk.as_ref());
+            let second_src = Source::from_flag(new_pin.as_ref());
             sec.check(&PIV_PUK, first_src)?;
             sec.check(&PIV_NEW_PIN, second_src)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
@@ -8580,18 +8497,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             pin_tries,
             puk_tries,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
-            pin_env,
-            pin_stdin,
+            mgmt_key,
+            pin,
             yes,
         } => {
             let mut sec = Secrets::real();
-            let pin_src = Source::new(pin_env.as_deref(), *pin_stdin);
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            let pin_src = Source::from_flag(pin.as_ref());
             sec.check(&PIV_PIN, pin_src)?;
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
@@ -8599,7 +8512,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 "set PIV retry counts (resets the PIN and PUK to factory defaults)",
             )?;
             let pin = sec.read(&PIV_PIN, pin_src)?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
@@ -8621,25 +8534,20 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         PivCmd::ChangeManagementKey {
             reader,
-            old_mgmt_key_env,
-            old_mgmt_key_stdin,
-            old_mgmt_key_default,
-            new_mgmt_key_env,
-            new_mgmt_key_stdin,
+            mgmt_key,
+            new_mgmt_key,
             new_algorithm,
             touch,
             allow_pin_unlock,
             force,
         } => {
             let mut sec = Secrets::real();
-            let old_src = Source::new(old_mgmt_key_env.as_deref(), *old_mgmt_key_stdin);
-            let new_src = Source::new(new_mgmt_key_env.as_deref(), *new_mgmt_key_stdin);
-            check_mgmt_key(&sec, &PIV_OLD_MGMT_KEY, old_src, *old_mgmt_key_default)?;
+            let new_src = Source::from_flag(new_mgmt_key.as_ref());
+            check_mgmt_key(&sec, &PIV_OLD_MGMT_KEY, mgmt_key.as_ref())?;
             sec.check(&PIV_NEW_MGMT_KEY, new_src)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             // The current key first (stdin line 1), then the new one (line 2).
-            let old =
-                read_mgmt_key_input(&mut sec, &PIV_OLD_MGMT_KEY, old_src, *old_mgmt_key_default)?;
+            let old = read_mgmt_key_input(&mut sec, &PIV_OLD_MGMT_KEY, mgmt_key.as_ref())?;
             let new = read_mgmt_key_hex(&mut sec, &PIV_NEW_MGMT_KEY, new_src)?;
             let new_alg = new_algorithm.to_alg();
             if new.len() != new_alg.key_len() {
@@ -8788,9 +8696,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             algorithm,
             pin_policy,
             touch_policy,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            mgmt_key,
             save_pubkey,
             overwrite,
             force,
@@ -8806,8 +8712,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // needs neither extension, so both checks are skipped outright
             // when the caller didn't ask for anything non-default.
             let mut sec = Secrets::real();
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let gate = piv_confirm_replace(
                 dev,
@@ -8816,7 +8721,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 &format!("replace the key in PIV slot {}", slot_name(*slot)),
                 |s| piv_slot_known_empty(s, slot.to_slot()),
             )?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
@@ -8908,15 +8813,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             slot,
             in_file,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            mgmt_key,
             compression,
             yes,
         } => {
             let mut sec = Secrets::real();
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let bytes =
                 std::fs::read(in_file).map_err(|e| format!("read {}: {}", in_file.display(), e))?;
             let der = cert_to_der(&bytes)?;
@@ -8928,7 +8830,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 &format!("replace the certificate in PIV slot {}", slot_name(*slot)),
                 |s| piv_cert_known_absent(s, slot.to_slot()),
             )?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
@@ -9005,14 +8907,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             slot,
             subject,
-            pin_env,
-            pin_stdin,
+            pin,
             out,
             overwrite,
             load_pubkey,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            mgmt_key,
             keygen,
             key_usage,
             yes,
@@ -9022,11 +8921,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 *overwrite,
             )?;
             let mut sec = Secrets::real();
-            let pin_src = Source::new(pin_env.as_deref(), *pin_stdin);
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            let pin_src = Source::from_flag(pin.as_ref());
             sec.check(&PIV_PIN, pin_src)?;
             if keygen.generate_key {
-                check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+                check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             }
             // Judge `--key-usage` and whether the target key can sign before
             // the PIN or the management key is asked for: the algorithm is
@@ -9064,8 +8962,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 Some(read_mgmt_key_input(
                     &mut sec,
                     &PIV_MGMT_KEY,
-                    mgmt_src,
-                    *mgmt_key_default,
+                    mgmt_key.as_ref(),
                 )?)
             } else {
                 None
@@ -9124,11 +9021,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             days,
             months,
             years,
-            pin_env,
-            pin_stdin,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            pin,
+            mgmt_key,
             out,
             overwrite,
             load_pubkey,
@@ -9144,10 +9038,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
             let mut sec = Secrets::real();
-            let pin_src = Source::new(pin_env.as_deref(), *pin_stdin);
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
+            let pin_src = Source::from_flag(pin.as_ref());
             sec.check(&PIV_PIN, pin_src)?;
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             // Judge `--key-usage` and whether the target key can sign before
             // the PIN or the management key is asked for (see request-cert).
             let known_alg = early_key_alg(keygen, load_pubkey.as_deref())?;
@@ -9183,7 +9076,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // The PIN covers the signature (stdin line 1); management-key
             // auth covers the certificate import (line 2).
             let pin = sec.read(&PIV_PIN, pin_src)?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
@@ -9241,12 +9134,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::Test {
-            reader,
-            slot,
-            pin_env,
-            pin_stdin,
-        } => {
+        PivCmd::Test { reader, slot, pin } => {
             let piv_slot = slot.to_slot();
             // The PIN is always optional, independent of the slot's PIN
             // policy — it's the caller's call whether to test with or
@@ -9254,7 +9142,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // PIN fails before any op and costs just one retry.
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             let mut sec = Secrets::real();
-            let pin = sec.read_given(&PIV_PIN, Source::new(pin_env.as_deref(), *pin_stdin))?;
+            let pin = sec.read_given(&PIV_PIN, Source::from_flag(pin.as_ref()))?;
             reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -9345,17 +9233,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         PivCmd::NewChuid {
             reader,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            mgmt_key,
             days,
             months,
             years,
             guid,
         } => {
             let mut sec = Secrets::real();
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
             let guid = match guid {
@@ -9367,7 +9252,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             };
             let expiration = valid_for.chuid_expiration(u64::from(unix_now()));
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -9386,11 +9271,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             yes,
             force,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
-            pin_env,
-            pin_stdin,
+            mgmt_key,
+            pin,
         } => {
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let name = crate::target::reader_of(&dev)?;
@@ -9413,14 +9295,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             // The credential, if one was given, is read before the session
             // opens; only the session can say whether it is needed.
             let mut sec = Secrets::real();
-            let reset_input = read_reset_auth_input(
-                &mut sec,
-                mgmt_key_env.as_deref(),
-                *mgmt_key_stdin,
-                *mgmt_key_default,
-                pin_env.as_deref(),
-                *pin_stdin,
-            )?;
+            let reset_input = read_reset_auth_input(&mut sec, mgmt_key.as_ref(), pin.as_ref())?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -9502,21 +9377,18 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         PivCmd::DeleteCert {
             reader,
             slot,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            mgmt_key,
             yes,
         } => {
             let mut sec = Secrets::real();
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete the certificate in PIV slot {}", slot_name(*slot)),
             )?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
@@ -9538,22 +9410,19 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
         PivCmd::DeleteKey {
             reader,
             slot,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            mgmt_key,
             yes,
             force,
         } => {
             let mut sec = Secrets::real();
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 &format!("delete the key in PIV slot {}", slot_name(*slot)),
             )?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             // Gate on the applet's fingerprint before authenticating — the
             // fingerprint probe re-SELECTs PIV and would clear the auth.
@@ -9579,16 +9448,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             from,
             to,
             reader,
-            mgmt_key_env,
-            mgmt_key_stdin,
-            mgmt_key_default,
+            mgmt_key,
             force,
         } => {
             let mut sec = Secrets::real();
-            let mgmt_src = Source::new(mgmt_key_env.as_deref(), *mgmt_key_stdin);
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_src, *mgmt_key_default)?;
+            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -9654,7 +9520,7 @@ fn open_openpgp_at(
 ///
 /// Every call site opens the plain session via
 /// [`keyroost_transport::PivSession::with_transaction_traced`] first, since
-/// resolving `--mgmt-key-default` (via [`mgmt_key_bytes`]) and feature
+/// resolving `--mgmt-key default` (via [`mgmt_key_bytes`]) and feature
 /// gates like [`guard_piv_feature`] both need one already open — the latter's
 /// fingerprint probe re-SELECTs PIV and clears the auth state, so it must run
 /// before this, not after.
@@ -10078,40 +9944,42 @@ fn inline_generate_key(
 }
 
 /// A PIV management key as given: read before any card session (env /
-/// stdin / prompt), or `--…-default`, resolved inside the session because
+/// stdin / prompt), or `--mgmt-key default`, resolved inside the session because
 /// it depends on the applet's fingerprint.
 enum MgmtKeyInput {
     Key(zeroize::Zeroizing<Vec<u8>>),
     Default,
 }
 
-/// [`Secrets::check`] for a management key, which `--…-default` also
+/// [`Secrets::check`] for a management key, which `--mgmt-key default` also
 /// satisfies.
 fn check_mgmt_key<I: crate::secrets::SecretIo>(
     sec: &Secrets<I>,
     spec: &Spec,
-    src: Source<'_>,
-    use_default: bool,
+    flag: Option<&SecretSource>,
 ) -> Result<(), String> {
-    if use_default {
+    if crate::secrets::wants_default(flag) {
         Ok(())
     } else {
-        sec.check(spec, src)
+        sec.check(spec, Source::from_flag(flag))
     }
 }
 
 /// Read a management key (hex) before any card session, or defer
-/// `--…-default` to [`mgmt_key_bytes`].
+/// `--mgmt-key default` to [`mgmt_key_bytes`].
 fn read_mgmt_key_input<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
     spec: &Spec,
-    src: Source<'_>,
-    use_default: bool,
+    flag: Option<&SecretSource>,
 ) -> Result<MgmtKeyInput, Box<dyn std::error::Error>> {
-    if use_default {
+    if crate::secrets::wants_default(flag) {
         return Ok(MgmtKeyInput::Default);
     }
-    Ok(MgmtKeyInput::Key(read_mgmt_key_hex(sec, spec, src)?))
+    Ok(MgmtKeyInput::Key(read_mgmt_key_hex(
+        sec,
+        spec,
+        Source::from_flag(flag),
+    )?))
 }
 
 /// Read a management key given as hex and decode it.
@@ -10126,7 +9994,7 @@ fn read_mgmt_key_hex<I: crate::secrets::SecretIo>(
     Ok(zeroize::Zeroizing::new(key))
 }
 
-/// The key bytes for `input`; `--…-default` looks up this device's known
+/// The key bytes for `input`; `--mgmt-key default` looks up this device's known
 /// factory default on the open session's fingerprint
 /// ([`keyroost_transport::PivSession::default_management_key`]).
 fn mgmt_key_bytes(
@@ -10487,20 +10355,19 @@ fn format_aaguid(aaguid: &[u8; 16]) -> String {
     s
 }
 
-const FIDO_PIN: Spec = Spec::current("PIN", "pin").legacy();
-const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "old-pin").legacy();
-const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin").legacy();
+const FIDO_PIN: Spec = Spec::current("PIN", "pin");
+const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "pin");
+const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
 
 /// The PIN for a FIDO command that always needs it: refused before any
 /// device I/O when it has no source, read after the key is announced and
 /// before the command opens it.
 fn fido_pin(
     path: Option<&std::path::Path>,
-    env: &Option<String>,
-    stdin: bool,
+    flag: Option<&SecretSource>,
 ) -> Result<zeroize::Zeroizing<String>, Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
-    let src = Source::new(env.as_deref(), stdin);
+    let src = Source::from_flag(flag);
     sec.check(&FIDO_PIN, src)?;
     let dev = crate::target::select_fido(path)?;
     let pin = sec.read(&FIDO_PIN, src)?;
@@ -10577,13 +10444,9 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_pin_retries(path.as_deref())?;
             Ok(())
         }
-        FidoPinCmd::Set {
-            new_pin_env,
-            new_pin_stdin,
-            path,
-        } => {
+        FidoPinCmd::Set { new_pin, path } => {
             let mut sec = Secrets::real();
-            let src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let src = Source::from_flag(new_pin.as_ref());
             sec.check(&FIDO_NEW_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let new_pin = sec.read(&FIDO_NEW_PIN, src)?;
@@ -10591,16 +10454,10 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_pin_set(path.as_deref(), &new_pin)?;
             Ok(())
         }
-        FidoPinCmd::Change {
-            old_pin_env,
-            old_pin_stdin,
-            new_pin_env,
-            new_pin_stdin,
-            path,
-        } => {
+        FidoPinCmd::Change { pin, new_pin, path } => {
             let mut sec = Secrets::real();
-            let first_src = Source::new(old_pin_env.as_deref(), *old_pin_stdin);
-            let second_src = Source::new(new_pin_env.as_deref(), *new_pin_stdin);
+            let first_src = Source::from_flag(pin.as_ref());
+            let second_src = Source::from_flag(new_pin.as_ref());
             sec.check(&FIDO_OLD_PIN, first_src)?;
             sec.check(&FIDO_NEW_PIN, second_src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
@@ -10618,26 +10475,21 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_fido_credentials(cmd: &FidoCredentialsCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoCredentialsCmd::List {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+        FidoCredentialsCmd::List { pin, path } => {
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_creds_list(path.as_deref(), &pin)?;
             Ok(())
         }
         FidoCredentialsCmd::Delete {
             cred_id,
-            pin_env,
-            pin_stdin,
+            pin,
             path,
             yes,
         } => {
             let cred_id_bytes =
                 hex_decode(cred_id).map_err(|e| format!("--cred-id is not valid hex: {}", e))?;
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let asked = crate::prompt::confirm_then_read(
@@ -10650,12 +10502,8 @@ fn run_fido_credentials(cmd: &FidoCredentialsCmd) -> Result<(), Box<dyn std::err
             run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
             Ok(())
         }
-        FidoCredentialsCmd::Metadata {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+        FidoCredentialsCmd::Metadata { pin, path } => {
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_creds_metadata(path.as_deref(), &pin)?;
             Ok(())
         }
@@ -10664,49 +10512,38 @@ fn run_fido_credentials(cmd: &FidoCredentialsCmd) -> Result<(), Box<dyn std::err
 
 fn run_fido_fingerprints(cmd: &FidoFingerprintsCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoFingerprintsCmd::List {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+        FidoFingerprintsCmd::List { pin, path } => {
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_fingerprint_list(path.as_deref(), &pin)?;
             Ok(())
         }
-        FidoFingerprintsCmd::Add {
-            name,
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+        FidoFingerprintsCmd::Add { name, pin, path } => {
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_fingerprint_enroll(path.as_deref(), &pin, name.as_deref())?;
             Ok(())
         }
         FidoFingerprintsCmd::Rename {
             template_id,
             name,
-            pin_env,
-            pin_stdin,
+            pin,
             path,
         } => {
             let id = hex_decode(template_id)
                 .map_err(|e| format!("--template-id is not valid hex: {}", e))?;
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_fingerprint_rename(path.as_deref(), &pin, &id, name)?;
             Ok(())
         }
         FidoFingerprintsCmd::Delete {
             template_id,
-            pin_env,
-            pin_stdin,
+            pin,
             path,
             yes,
         } => {
             let id = hex_decode(template_id)
                 .map_err(|e| format!("--template-id is not valid hex: {}", e))?;
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let asked = crate::prompt::confirm_then_read(
@@ -10761,11 +10598,10 @@ fn always_uv_pre_pin_step(
 fn run_fido_always_uv(
     want_on: bool,
     path: Option<&std::path::Path>,
-    pin_env: &Option<String>,
-    pin_stdin: bool,
+    pin: Option<&SecretSource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
-    let src = Source::new(pin_env.as_deref(), pin_stdin);
+    let src = Source::from_flag(pin);
     sec.check(&FIDO_PIN, src)?;
     let dev = crate::target::select_fido(path)?;
     let word = if want_on { "on" } else { "off" };
@@ -10803,26 +10639,21 @@ fn run_fido_always_uv(
 
 fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoConfigCmd::EnableAlwaysUv {
-            pin_env,
-            pin_stdin,
-            path,
-        } => run_fido_always_uv(true, path.as_deref(), pin_env, *pin_stdin),
-        FidoConfigCmd::DisableAlwaysUv {
-            pin_env,
-            pin_stdin,
-            path,
-        } => run_fido_always_uv(false, path.as_deref(), pin_env, *pin_stdin),
+        FidoConfigCmd::EnableAlwaysUv { pin, path } => {
+            run_fido_always_uv(true, path.as_deref(), pin.as_ref())
+        }
+        FidoConfigCmd::DisableAlwaysUv { pin, path } => {
+            run_fido_always_uv(false, path.as_deref(), pin.as_ref())
+        }
         FidoConfigCmd::SetMinPinLength {
             length,
             force_change,
             yes,
-            pin_env,
-            pin_stdin,
+            pin,
             path,
         } => {
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let pin = confirm_then_read_pin(
@@ -10850,12 +10681,8 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
             })?;
             Ok(())
         }
-        FidoConfigCmd::ForcePinChange {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+        FidoConfigCmd::ForcePinChange { pin, path } => {
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             with_configurator(path.as_deref(), &pin, |cfg, _info| {
                 cfg.force_pin_change()?;
                 println!("A PIN change is now required on next use of this key.");
@@ -10863,14 +10690,9 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
             })?;
             Ok(())
         }
-        FidoConfigCmd::EnableEnterpriseAttestation {
-            yes,
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
+        FidoConfigCmd::EnableEnterpriseAttestation { yes, pin, path } => {
             let mut sec = Secrets::real();
-            let src = Source::new(pin_env.as_deref(), *pin_stdin);
+            let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
             let pin = confirm_then_read_pin(
@@ -10896,34 +10718,27 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
     match cmd {
         LargeBlobCmd::List { path } => run_fido_large_blob_list(path.as_deref()),
         LargeBlobCmd::Get { index, path } => run_fido_large_blob_get(path.as_deref(), *index),
-        LargeBlobCmd::Add {
-            text,
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+        LargeBlobCmd::Add { text, pin, path } => {
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_large_blob_add(path.as_deref(), &pin, text)
         }
         LargeBlobCmd::Edit {
             index,
             text,
-            pin_env,
-            pin_stdin,
+            pin,
             path,
         } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_large_blob_edit(path.as_deref(), &pin, *index, text)
         }
         LargeBlobCmd::Delete {
             index,
             yes,
-            pin_env,
-            pin_stdin,
+            pin,
             path,
         } => run_fido_large_blob_delete(
             path.as_deref(),
-            Source::new(pin_env.as_deref(), *pin_stdin),
+            Source::from_flag(pin.as_ref()),
             *index,
             *yes,
         ),
@@ -10937,40 +10752,28 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
             let [out_mode] = crate::prompt::check_overwrites([Some(out.as_path())], *overwrite)?;
             run_fido_large_blob_export(path.as_deref(), *index, out, out_mode, *as_cert)
         }
-        LargeBlobCmd::Clear {
-            yes,
-            pin_env,
-            pin_stdin,
-            path,
-        } => run_fido_large_blob_clear(
-            path.as_deref(),
-            Source::new(pin_env.as_deref(), *pin_stdin),
-            *yes,
-        ),
+        LargeBlobCmd::Clear { yes, pin, path } => {
+            run_fido_large_blob_clear(path.as_deref(), Source::from_flag(pin.as_ref()), *yes)
+        }
     }
 }
 
 /// Dispatch for `fido ssh-cert` — list SSH credentials or extract a cert.
 fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        SshCertCmd::List {
-            pin_env,
-            pin_stdin,
-            path,
-        } => {
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+        SshCertCmd::List { pin, path } => {
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_ssh_cert_list(path.as_deref(), &pin)
         }
         SshCertCmd::Extract {
             credential,
             out,
             overwrite,
-            pin_env,
-            pin_stdin,
+            pin,
             path,
         } => {
             let [out_mode] = crate::prompt::check_overwrites([out.as_deref()], *overwrite)?;
-            let pin = fido_pin(path.as_deref(), pin_env, *pin_stdin)?;
+            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_ssh_cert_extract(
                 path.as_deref(),
                 &pin,
@@ -13962,28 +13765,38 @@ mod cli_tests {
             (
                 "--secret-env",
                 "keyroostctl oath add n --secret-env V",
-                "--seed-env",
+                "--seed env:VAR",
             ),
             (
                 "--secret-stdin",
                 "keyroostctl oath add n --secret-stdin",
-                "--seed-stdin",
+                "--seed stdin",
             ),
-            ("--pin", "keyroostctl openpgp verify --pin admin", "--which"),
             (
                 "--current-env",
                 "keyroostctl otp change-pin --current-env V",
-                "--old-pin-env",
+                "--pin env:VAR",
             ),
             (
                 "--new-env",
                 "keyroostctl otp change-pin --new-env V",
-                "--new-pin-env",
+                "--new-pin env:VAR",
             ),
             (
                 "--pin-stdin",
                 "keyroostctl otp change-pin --pin-stdin",
-                "--old-pin-stdin",
+                "--pin stdin --new-pin stdin",
+            ),
+            // Generic rows apply on any command.
+            (
+                "--pin-stdin",
+                "keyroostctl fido credentials list --pin-stdin",
+                "--pin stdin",
+            ),
+            (
+                "--old-mgmt-key-default",
+                "keyroostctl piv change-management-key --old-mgmt-key-default",
+                "--mgmt-key default",
             ),
         ] {
             let msg = retired_flag_hint(flag, &argv(line)).unwrap_or_else(|| panic!("{line}"));
@@ -13992,7 +13805,7 @@ mod cli_tests {
                 assert!(!msg.contains(value), "{msg}");
             }
         }
-        // Scoped: an unknown --pin elsewhere is not "renamed --which".
+        // Scoped: a row only applies under the words it names.
         assert!(retired_flag_hint("--pin", &argv("keyroostctl fido info --pin")).is_none());
         assert!(retired_flag_hint("--hex", &argv("keyroostctl oath add n --hex")).is_none());
     }
@@ -14037,7 +13850,8 @@ mod cli_tests {
                     "keyroostctl",
                     "piv",
                     "change-pin",
-                    "--old-pin-stdin",
+                    "--pin",
+                    "stdin",
                     "S3CRET",
                 ],
                 "keyroostctl piv change-pin",
@@ -14048,7 +13862,8 @@ mod cli_tests {
                     "oath",
                     "add",
                     "n",
-                    "--seed-stdin",
+                    "--seed",
+                    "stdin",
                     "--",
                     "S3CRET",
                 ],
@@ -14103,33 +13918,36 @@ mod cli_tests {
                 .unwrap_or_else(|| panic!("{args:?} parsed"));
             redacted_parse_error(&e, &argv(args))
         };
-        for args in [
-            &[
-                "keyroostctl",
-                "molto",
-                "seed",
-                "--slot",
-                "99",
-                "--hex-stdin=S3CRET",
-            ][..],
-            &[
-                "keyroostctl",
-                "piv",
-                "change-pin",
-                "--old-pin-stdin",
-                "--new-pin-stdin=S3CRET",
-            ],
-        ] {
-            let msg = redacted(args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
-            assert!(
-                msg.contains("takes no value") && msg.contains("standard input"),
-                "{msg}"
-            );
-            assert!(!msg.contains("S3CRET"), "{msg}");
-        }
+        let args = [
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--slot",
+            "99",
+            "--hex-stdin=S3CRET",
+        ];
+        let msg = redacted(&args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
+        assert!(
+            msg.contains("takes no value") && msg.contains("standard input"),
+            "{msg}"
+        );
+        assert!(!msg.contains("S3CRET"), "{msg}");
+        // A retired `--X-stdin` flag gets its replacement, never the value.
+        let args = [
+            "keyroostctl",
+            "piv",
+            "change-pin",
+            "--old-pin-stdin",
+            "--new-pin-stdin=S3CRET",
+        ];
+        let msg = redacted(&args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
+        assert!(
+            msg.contains("--pin stdin") && !msg.contains("S3CRET"),
+            "{msg}"
+        );
     }
 
-    /// A dash-led word right after a `-stdin` flag (`--old-pin-stdin
+    /// A dash-led word right after a stdin source (`--pin stdin
     /// -123456`) is hidden the same way as a bare stray value — clap only
     /// reports the short-flag prefix it choked on (`-1`), but the rest of
     /// the word never reached argv's own InvalidArg context, so it must be
@@ -14149,7 +13967,8 @@ mod cli_tests {
             "keyroostctl",
             "piv",
             "change-pin",
-            "--old-pin-stdin",
+            "--pin",
+            "stdin",
             "-123456",
         ];
         let msg = redacted(&args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
@@ -14158,14 +13977,15 @@ mod cli_tests {
             "{msg}"
         );
         assert!(!msg.contains("123456"), "{msg}");
-        // A typo'd flag name after the same `-stdin` flag is still clap's
-        // own message, with its "similar argument" tip.
+        // A typo'd flag name after the same source is still clap's own
+        // message, with its "similar argument" tip.
         assert!(redacted(&[
             "keyroostctl",
             "piv",
             "change-pin",
-            "--old-pin-stdin",
-            "--new-pin-stdn"
+            "--pin",
+            "stdin",
+            "--new-pn"
         ])
         .is_none());
     }
@@ -14224,7 +14044,8 @@ mod cli_tests {
             "--out",
             "id-cert.pub",
             "--overwrite",
-            "--pin-stdin",
+            "--pin",
+            "stdin",
         ])
         .unwrap()
         .command
@@ -14237,14 +14058,14 @@ mod cli_tests {
                                 credential,
                                 out,
                                 overwrite,
-                                pin_stdin,
+                                pin,
                                 ..
                             },
                     },
             }) => {
                 assert_eq!(credential.as_deref(), Some("ssh:demo"));
                 assert_eq!(out.as_deref(), Some(std::path::Path::new("id-cert.pub")));
-                assert!(overwrite && pin_stdin);
+                assert!(overwrite && pin == Some(SecretSource::Stdin));
             }
             _ => panic!("expected fido ssh-cert extract"),
         }
@@ -14309,16 +14130,16 @@ mod cli_tests {
         }
 
         // A stdin secret source must route to its own field, not somewhere else.
-        match parse(&["keyroostctl", "fido", "pin", "set", "--new-pin-stdin"])
+        match parse(&["keyroostctl", "fido", "pin", "set", "--new-pin", "stdin"])
             .unwrap()
             .command
         {
             Some(Cmd::Fido {
                 cmd:
                     FidoCmd::Pin {
-                        cmd: FidoPinCmd::Set { new_pin_stdin, .. },
+                        cmd: FidoPinCmd::Set { new_pin, .. },
                     },
-            }) => assert!(new_pin_stdin),
+            }) => assert_eq!(new_pin, Some(SecretSource::Stdin)),
             _ => panic!("expected fido pin set"),
         }
 
@@ -14501,7 +14322,7 @@ mod cli_tests {
             .unwrap_err()
             .to_string();
         assert!(!e.contains("KR_UNSET"), "{e}");
-        assert!(e.contains("--pin-env"), "{e}");
+        assert!(e.contains("--pin"), "{e}");
     }
 
     /// A terminal that answers "y" to every question.
@@ -14541,7 +14362,7 @@ mod cli_tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(!e.contains("KR_T") && e.contains("--pin-env"), "{e}");
+        assert!(!e.contains("KR_T") && e.contains("--pin"), "{e}");
         assert!(!reverify_ran.get(), "re-check ran before the PIN was read");
     }
 
@@ -14576,7 +14397,7 @@ mod cli_tests {
         fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
             for a in cmd.get_arguments() {
                 let long = a.get_long().unwrap_or_default();
-                if long.ends_with("pin-env") || long.ends_with("pin-stdin") {
+                if is_secret_arg(a) && long.contains("pin") {
                     let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
                     if help.is_empty() {
                         out.push(format!("{path} --{long}"));
@@ -14598,11 +14419,8 @@ mod cli_tests {
             .find_subcommand("change")
             .unwrap();
         for (flag, line) in [
-            ("old-pin-stdin", "first line"),
-            (
-                "new-pin-stdin",
-                "second line when --old-pin-stdin is also given",
-            ),
+            ("pin", "first line"),
+            ("new-pin", "second line when --pin stdin is also given"),
         ] {
             let help = change
                 .get_arguments()
@@ -15460,17 +15278,9 @@ mod cli_tests {
             .unwrap()
             .command
         {
-            Some(Cmd::FactoryReset {
-                mgmt_key_env,
-                mgmt_key_stdin,
-                pin_env,
-                pin_stdin,
-                ..
-            }) => {
-                assert_eq!(mgmt_key_env, None);
-                assert!(!mgmt_key_stdin);
-                assert_eq!(pin_env, None);
-                assert!(!pin_stdin);
+            Some(Cmd::FactoryReset { mgmt_key, pin, .. }) => {
+                assert_eq!(mgmt_key, None);
+                assert_eq!(pin, None);
             }
             _ => panic!("expected factory-reset"),
         }
@@ -15478,26 +15288,37 @@ mod cli_tests {
             "keyroostctl",
             "factory-reset",
             "--yes",
-            "--mgmt-key-env",
-            "XAUTH",
+            "--mgmt-key",
+            "env:XAUTH",
         ])
         .unwrap()
         .command
         {
-            Some(Cmd::FactoryReset { mgmt_key_env, .. }) => {
-                assert_eq!(mgmt_key_env.as_deref(), Some("XAUTH"))
+            Some(Cmd::FactoryReset { mgmt_key, .. }) => {
+                assert_eq!(mgmt_key, Some(SecretSource::Env("XAUTH".into())))
             }
             _ => panic!("expected factory-reset"),
         }
-        match parse(&["keyroostctl", "factory-reset", "--yes", "--pin-env", "GPIN"])
+        match parse(&["keyroostctl", "factory-reset", "--yes", "--pin", "env:GPIN"])
             .unwrap()
             .command
         {
-            Some(Cmd::FactoryReset { pin_env, .. }) => {
-                assert_eq!(pin_env.as_deref(), Some("GPIN"))
+            Some(Cmd::FactoryReset { pin, .. }) => {
+                assert_eq!(pin, Some(SecretSource::Env("GPIN".into())))
             }
             _ => panic!("expected factory-reset"),
         }
+        // The two credentials are one choice.
+        assert!(parse(&[
+            "keyroostctl",
+            "factory-reset",
+            "--yes",
+            "--mgmt-key",
+            "default",
+            "--pin",
+            "stdin",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -15508,23 +15329,25 @@ mod cli_tests {
         use crate::secrets::fake::FakeIo;
         use keyroost_piv::compat::FeatureGate;
         let mut sec = Secrets::new(FakeIo::default());
-        let input = read_reset_auth_input(&mut sec, None, false, false, None, false).unwrap();
+        let input = read_reset_auth_input(&mut sec, None, None).unwrap();
         assert!(input.is_none());
         match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Unsupported, None) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
-                assert!(msg.contains("--mgmt-key-env"), "{msg}");
-                assert!(msg.contains("--mgmt-key-default"), "{msg}");
-                assert!(!msg.contains("--pin-env"), "{msg}");
+                assert!(
+                    msg.contains("--mgmt-key env:NAME, stdin or default"),
+                    "{msg}"
+                );
+                assert!(!msg.contains("--pin"), "{msg}");
             }
         }
         match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Supported, None) {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
-                assert!(msg.contains("--mgmt-key-env"), "{msg}");
-                assert!(msg.contains("--pin-env"), "{msg}");
+                assert!(msg.contains("--mgmt-key env:NAME"), "{msg}");
+                assert!(msg.contains("--pin env:NAME or stdin"), "{msg}");
                 assert!(!msg.contains("unverified"), "{msg}");
             }
         }
@@ -15532,8 +15355,8 @@ mod cli_tests {
             Ok(_) => panic!("no credential source was given"),
             Err(e) => {
                 let msg = e.to_string();
-                assert!(msg.contains("--mgmt-key-env"), "{msg}");
-                assert!(msg.contains("--pin-env"), "{msg}");
+                assert!(msg.contains("--mgmt-key env:NAME"), "{msg}");
+                assert!(msg.contains("--pin env:NAME or stdin"), "{msg}");
                 assert!(msg.contains("unverified"), "{msg}");
             }
         }
@@ -15545,7 +15368,7 @@ mod cli_tests {
         // not asked for either.
         use crate::secrets::fake::FakeIo;
         let mut sec = Secrets::new(FakeIo::terminal());
-        let input = read_reset_auth_input(&mut sec, None, false, false, None, false).unwrap();
+        let input = read_reset_auth_input(&mut sec, None, None).unwrap();
         assert!(input.is_none());
         assert!(sec.io.prompts.is_empty());
         assert!(!sec.prompted());
@@ -15557,7 +15380,8 @@ mod cli_tests {
         use keyroost_piv::compat::FeatureGate;
         // Management key from env: hex, surrounding whitespace trimmed.
         let mut sec = Secrets::new(FakeIo::terminal().var("K", " 0102ff \n"));
-        let input = read_reset_auth_input(&mut sec, Some("K"), false, false, None, false).unwrap();
+        let input =
+            read_reset_auth_input(&mut sec, Some(&SecretSource::Env("K".into())), None).unwrap();
         match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Unsupported, None) {
             Ok(ResetCliAuth::Key(k)) => assert_eq!(&k[..], &[0x01, 0x02, 0xff]),
             _ => panic!("expected the management key"),
@@ -15565,29 +15389,29 @@ mod cli_tests {
         assert!(!sec.prompted());
         // PIN from piped stdin: kept exactly, line ending stripped.
         let mut sec = Secrets::new(FakeIo::piped(&["12 34\n"]));
-        let input = read_reset_auth_input(&mut sec, None, false, false, None, true).unwrap();
+        let input = read_reset_auth_input(&mut sec, None, Some(&SecretSource::Stdin)).unwrap();
         match resolve_reset_cli_auth(input.as_ref(), FeatureGate::Supported, None) {
             Ok(ResetCliAuth::Pin(p)) => assert_eq!(p.as_str(), "12 34"),
             _ => panic!("expected the PIN"),
         }
         assert!(!sec.prompted());
-        // --mgmt-key-default reads nothing; it resolves inside the session.
+        // --mgmt-key default reads nothing; it resolves inside the session.
         let mut sec = Secrets::new(FakeIo::terminal());
-        let input = read_reset_auth_input(&mut sec, None, false, true, None, false).unwrap();
+        let input = read_reset_auth_input(&mut sec, Some(&SecretSource::Default), None).unwrap();
         assert!(matches!(input, Some(ResetAuthInput::Default)));
         assert!(sec.io.prompts.is_empty());
         // Unset env var names the flag, never the variable.
         let mut sec = Secrets::new(FakeIo::default());
-        match read_reset_auth_input(&mut sec, None, false, false, Some("NOPE"), false) {
+        match read_reset_auth_input(&mut sec, None, Some(&SecretSource::Env("NOPE".into()))) {
             Ok(_) => panic!("the variable is unset"),
             Err(e) => {
                 let msg = e.to_string();
-                assert!(!msg.contains("NOPE") && msg.contains("--pin-env"), "{msg}");
+                assert!(!msg.contains("NOPE") && msg.contains("--pin"), "{msg}");
             }
         }
         // Bad hex says so without echoing the input.
         let mut sec = Secrets::new(FakeIo::default().var("K", "zz"));
-        match read_reset_auth_input(&mut sec, Some("K"), false, false, None, false) {
+        match read_reset_auth_input(&mut sec, Some(&SecretSource::Env("K".into())), None) {
             Ok(_) => panic!("not hex"),
             Err(e) => assert!(e.to_string().contains("not valid hex"), "{e}"),
         }
@@ -15597,7 +15421,7 @@ mod cli_tests {
     fn reset_stdin_flag_at_a_terminal_reads_hidden_and_counts_as_prompted() {
         use crate::secrets::fake::FakeIo;
         let mut sec = Secrets::new(FakeIo::terminal().typing(&["0102"]));
-        let input = read_reset_auth_input(&mut sec, None, true, false, None, false).unwrap();
+        let input = read_reset_auth_input(&mut sec, Some(&SecretSource::Stdin), None).unwrap();
         match input {
             Some(ResetAuthInput::Key(k)) => assert_eq!(&k[..], &[0x01, 0x02]),
             _ => panic!("expected the management key"),
@@ -15609,56 +15433,61 @@ mod cli_tests {
 
     #[test]
     fn factory_reset_global_reset_credential_flags_are_mutually_exclusive() {
-        // Any two of the five (mgmt-key-env/mgmt-key-stdin/mgmt-key-default/
-        // pin-env/pin-stdin) at once must refuse -- only one credential
-        // source at a time.
+        // --mgmt-key and --pin together must refuse -- only one credential
+        // at a time.
         assert!(parse(&[
             "keyroostctl",
             "factory-reset",
             "--yes",
-            "--mgmt-key-env",
-            "XAUTH",
-            "--pin-env",
-            "GPIN",
+            "--mgmt-key",
+            "env:XAUTH",
+            "--pin",
+            "env:GPIN",
         ])
         .is_err());
         assert!(parse(&[
             "keyroostctl",
             "factory-reset",
             "--yes",
-            "--mgmt-key-stdin",
-            "--pin-stdin",
+            "--mgmt-key",
+            "stdin",
+            "--pin",
+            "stdin",
         ])
         .is_err());
         assert!(parse(&[
             "keyroostctl",
             "factory-reset",
             "--yes",
-            "--mgmt-key-default",
-            "--mgmt-key-env",
-            "XAUTH",
+            "--mgmt-key",
+            "default",
+            "--mgmt-key",
+            "env:XAUTH",
         ])
         .is_err());
         assert!(parse(&[
             "keyroostctl",
             "factory-reset",
             "--yes",
-            "--mgmt-key-default",
-            "--pin-stdin",
+            "--mgmt-key",
+            "default",
+            "--pin",
+            "stdin",
         ])
         .is_err());
         match parse(&[
             "keyroostctl",
             "factory-reset",
             "--yes",
-            "--mgmt-key-default",
+            "--mgmt-key",
+            "default",
         ])
         .unwrap()
         .command
         {
-            Some(Cmd::FactoryReset {
-                mgmt_key_default, ..
-            }) => assert!(mgmt_key_default),
+            Some(Cmd::FactoryReset { mgmt_key, .. }) => {
+                assert_eq!(mgmt_key, Some(SecretSource::Default))
+            }
             _ => panic!("expected factory-reset"),
         }
     }
@@ -15670,7 +15499,15 @@ mod cli_tests {
         // the clap id `name` (a global arg merges with same-id subcommand args),
         // so `oath add <NAME>` routed the credential name into device resolution
         // and could never run. The global selector's id/flag is now `--device`.
-        let cli = parse(&["keyroostctl", "oath", "add", "issuer:acct", "--seed-stdin"]).unwrap();
+        let cli = parse(&[
+            "keyroostctl",
+            "oath",
+            "add",
+            "issuer:acct",
+            "--seed",
+            "stdin",
+        ])
+        .unwrap();
         assert!(
             cli.device.is_none(),
             "the global --device selector must stay unset when only a positional is given"
@@ -15689,22 +15526,22 @@ mod cli_tests {
 
     #[test]
     fn oath_add_takes_seed_flags_not_secret() {
-        match parse(&["keyroostctl", "oath", "add", "n", "--seed-stdin"])
+        match parse(&["keyroostctl", "oath", "add", "n", "--seed", "stdin"])
             .unwrap()
             .command
         {
             Some(Cmd::Oath {
-                cmd: OathCmd::Add { seed_stdin, .. },
-            }) => assert!(seed_stdin),
+                cmd: OathCmd::Add { seed, .. },
+            }) => assert_eq!(seed, Some(SecretSource::Stdin)),
             _ => panic!("expected oath add"),
         }
-        match parse(&["keyroostctl", "oath", "add", "n", "--seed-env", "V"])
+        match parse(&["keyroostctl", "oath", "add", "n", "--seed", "env:V"])
             .unwrap()
             .command
         {
             Some(Cmd::Oath {
-                cmd: OathCmd::Add { seed_env, .. },
-            }) => assert_eq!(seed_env.as_deref(), Some("V")),
+                cmd: OathCmd::Add { seed, .. },
+            }) => assert_eq!(seed, Some(SecretSource::Env("V".into()))),
             _ => panic!("expected oath add"),
         }
         for old in ["--secret-stdin", "--secret-env"] {
@@ -15721,17 +15558,17 @@ mod cli_tests {
         let cmd = Cli::command();
         let oath = cmd.find_subcommand("oath").unwrap();
         for (sub, flag, line) in [
-            ("set-password", "password-stdin", "first line"),
+            ("set-password", "password", "first line"),
             (
                 "set-password",
-                "new-password-stdin",
-                "second line when --password-stdin is also given",
+                "new-password",
+                "second line when --password stdin is also given",
             ),
-            ("add", "seed-stdin", "first line"),
+            ("add", "seed", "first line"),
             (
                 "add",
-                "password-stdin",
-                "second line when --seed-stdin is also given",
+                "password",
+                "second line when --seed stdin is also given",
             ),
         ] {
             let arg = oath
@@ -15751,27 +15588,20 @@ mod cli_tests {
             "keyroostctl",
             "otp",
             "change-pin",
-            "--old-pin-env",
-            "A",
-            "--new-pin-stdin",
+            "--pin",
+            "env:A",
+            "--new-pin",
+            "stdin",
         ])
         .unwrap()
         .command
         {
             Some(Cmd::Otp {
-                cmd:
-                    OtpCmd::ChangePin {
-                        old_pin_env,
-                        old_pin_stdin,
-                        new_pin_env,
-                        new_pin_stdin,
-                    },
+                cmd: OtpCmd::ChangePin { pin, new_pin },
                 ..
             }) => {
-                assert_eq!(old_pin_env.as_deref(), Some("A"));
-                assert!(!old_pin_stdin);
-                assert!(new_pin_env.is_none());
-                assert!(new_pin_stdin);
+                assert_eq!(pin, Some(SecretSource::Env("A".into())));
+                assert_eq!(new_pin, Some(SecretSource::Stdin));
             }
             _ => panic!("expected otp change-pin"),
         }
@@ -15779,20 +15609,22 @@ mod cli_tests {
             &["--current-env", "V"][..],
             &["--new-env", "V"][..],
             &["--pin-stdin"][..],
+            &["--old-pin-env", "V"][..],
         ] {
             let mut argv = vec!["keyroostctl", "otp", "change-pin"];
             argv.extend_from_slice(old);
             let e = parse(&argv).err().unwrap();
             assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "{old:?}");
         }
-        // Each source of one PIN excludes the other.
+        // One PIN, one source.
         assert!(parse(&[
             "keyroostctl",
             "otp",
             "change-pin",
-            "--old-pin-env",
-            "A",
-            "--old-pin-stdin",
+            "--pin",
+            "env:A",
+            "--pin",
+            "stdin",
         ])
         .is_err());
     }
@@ -15803,23 +15635,23 @@ mod cli_tests {
         let cmd = Cli::command();
         let openpgp = cmd.find_subcommand("openpgp").unwrap();
         for (sub, flag, line) in [
-            ("change-pin", "old-pin-stdin", "first line"),
+            ("change-pin", "pin", "first line"),
             (
                 "change-pin",
-                "new-pin-stdin",
-                "second line when --old-pin-stdin is also given",
+                "new-pin",
+                "second line when --pin stdin is also given",
             ),
-            ("change-admin-pin", "old-pin-stdin", "first line"),
+            ("change-admin-pin", "pin", "first line"),
             (
                 "change-admin-pin",
-                "new-pin-stdin",
-                "second line when --old-pin-stdin is also given",
+                "new-pin",
+                "second line when --pin stdin is also given",
             ),
-            ("unblock-pin", "admin-pin-stdin", "first line"),
+            ("unblock-pin", "admin-pin", "first line"),
             (
                 "unblock-pin",
-                "new-pin-stdin",
-                "second line when --admin-pin-stdin is also given",
+                "new-pin",
+                "second line when --admin-pin stdin is also given",
             ),
         ] {
             let arg = openpgp
@@ -15839,18 +15671,14 @@ mod cli_tests {
         let cmd = Cli::command();
         let otp = cmd.find_subcommand("otp").unwrap();
         for (sub, flag, line) in [
-            ("change-pin", "old-pin-stdin", "first line"),
+            ("change-pin", "pin", "first line"),
             (
                 "change-pin",
-                "new-pin-stdin",
-                "second line when --old-pin-stdin is also given",
+                "new-pin",
+                "second line when --pin stdin is also given",
             ),
-            ("add", "seed-stdin", "first line"),
-            (
-                "add",
-                "pin-stdin",
-                "second line when --seed-stdin is also given",
-            ),
+            ("add", "seed", "first line"),
+            ("add", "pin", "second line when --seed stdin is also given"),
         ] {
             let arg = otp
                 .find_subcommand(sub)
@@ -15882,7 +15710,7 @@ mod cli_tests {
         let mut sec = Secrets::new(FakeIo::default());
         let e = otp_pin_after_probe(&mut sec, Ok::<_, String>(true)).unwrap_err();
         assert!(e.contains("PIN-protected"), "{e}");
-        assert!(e.contains("--pin-env VAR or --pin-stdin"), "{e}");
+        assert!(e.contains("--pin env:NAME or --pin stdin"), "{e}");
     }
 
     #[test]
@@ -15897,7 +15725,7 @@ mod cli_tests {
         let mut sec = Secrets::new(FakeIo::default());
         let e = otp_pin_after_probe(&mut sec, Err("read failed")).unwrap_err();
         assert!(e.contains("read failed"), "{e}");
-        assert!(e.contains("--pin-env VAR or --pin-stdin"), "{e}");
+        assert!(e.contains("--pin env:NAME or --pin stdin"), "{e}");
     }
 
     #[test]
@@ -16273,7 +16101,7 @@ mod cli_tests {
     #[test]
     fn fido_is_nested() {
         assert!(parse(&["keyroostctl", "fido", "info"]).is_ok());
-        assert!(parse(&["keyroostctl", "fido", "pin", "set", "--new-pin-stdin"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "pin", "set", "--new-pin", "stdin"]).is_ok());
         assert!(parse(&["keyroostctl", "fido", "credentials", "list"]).is_ok());
         assert!(parse(&["keyroostctl", "fido-info"]).is_err());
         assert!(parse(&["keyroostctl", "fido-creds-list"]).is_err());
@@ -16285,24 +16113,30 @@ mod cli_tests {
             "keyroostctl",
             "openpgp",
             "change-pin",
-            "--old-pin-stdin",
-            "--new-pin-stdin"
+            "--pin",
+            "stdin",
+            "--new-pin",
+            "stdin"
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
             "keyroostctl",
             "openpgp",
             "change-admin-pin",
-            "--old-pin-stdin",
-            "--new-pin-stdin"
+            "--pin",
+            "stdin",
+            "--new-pin",
+            "stdin"
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
             "keyroostctl",
             "openpgp",
             "unblock-pin",
-            "--admin-pin-stdin",
-            "--new-pin-stdin"
+            "--admin-pin",
+            "stdin",
+            "--new-pin",
+            "stdin"
         ])
         .is_ok());
     }
@@ -16315,24 +16149,25 @@ mod cli_tests {
             "verify",
             "--which",
             "admin",
-            "--pin-stdin",
+            "--pin",
+            "stdin",
         ])
         .unwrap()
         .command
         {
             Some(Cmd::Openpgp {
-                cmd: OpenpgpCmd::Verify {
-                    which, pin_stdin, ..
-                },
+                cmd: OpenpgpCmd::Verify { which, pin, .. },
             }) => {
-                assert!(matches!(which, OpenpgpPinKind::Admin) && pin_stdin)
+                assert!(matches!(which, OpenpgpPinKind::Admin) && pin == Some(SecretSource::Stdin))
             }
             _ => panic!("expected openpgp verify"),
         }
+        // `--pin admin` (which PIN, in older releases) is now a literal
+        // given to the PIN's source flag, refused like any other.
         let e = parse(&["keyroostctl", "openpgp", "verify", "--pin", "admin"])
             .err()
             .unwrap();
-        assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
@@ -16451,7 +16286,7 @@ mod cli_tests {
     fn otp_unlock_conflict_only_flags_a_pin_with_fingerprint() {
         for (args, conflict) in [
             (&["keyroostctl", "otp", "list"][..], false),
-            (&["keyroostctl", "otp", "list", "--pin-env", "V"], false),
+            (&["keyroostctl", "otp", "list", "--pin", "env:V"], false),
             (
                 &[
                     "keyroostctl",
@@ -16459,7 +16294,8 @@ mod cli_tests {
                     "list",
                     "--unlock",
                     "auto",
-                    "--pin-stdin",
+                    "--pin",
+                    "stdin",
                 ],
                 false,
             ),
@@ -16474,8 +16310,8 @@ mod cli_tests {
                     "list",
                     "--unlock",
                     "fingerprint",
-                    "--pin-env",
-                    "V",
+                    "--pin",
+                    "env:V",
                 ],
                 true,
             ),
@@ -16486,7 +16322,8 @@ mod cli_tests {
                     "list",
                     "--unlock",
                     "fingerprint",
-                    "--pin-stdin",
+                    "--pin",
+                    "stdin",
                 ],
                 true,
             ),
@@ -16514,7 +16351,7 @@ mod cli_tests {
             &["keyroostctl", "otp", "fingerprint-status"],
             &["keyroostctl", "otp", "fingerprint-enable"],
             &["keyroostctl", "otp", "fingerprint-disable"],
-            &["keyroostctl", "otp", "set-pin", "--new-pin-env", "V"],
+            &["keyroostctl", "otp", "set-pin", "--new-pin", "env:V"],
         ] {
             assert!(parse(a).is_ok(), "{a:?}");
         }
@@ -16745,16 +16582,10 @@ mod cli_tests {
             .command
         {
             Some(Cmd::Piv {
-                cmd:
-                    PivCmd::Test {
-                        slot,
-                        pin_env,
-                        pin_stdin,
-                        ..
-                    },
+                cmd: PivCmd::Test { slot, pin, .. },
             }) => {
                 assert_eq!(slot.to_slot().key_ref(), 0x9E);
-                assert!(pin_env.is_none() && !pin_stdin);
+                assert!(pin.is_none());
             }
             _ => panic!("expected piv test"),
         }
@@ -16764,15 +16595,15 @@ mod cli_tests {
             "test",
             "--slot",
             "9a",
-            "--pin-env",
-            "KR_PIN",
+            "--pin",
+            "env:KR_PIN",
         ])
         .unwrap()
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::Test { pin_env, .. },
-            }) => assert_eq!(pin_env.as_deref(), Some("KR_PIN")),
+                cmd: PivCmd::Test { pin, .. },
+            }) => assert_eq!(pin, Some(SecretSource::Env("KR_PIN".into()))),
             _ => panic!("expected piv test"),
         }
     }
@@ -16840,19 +16671,10 @@ mod cli_tests {
             .command
         {
             Some(Cmd::Piv {
-                cmd:
-                    PivCmd::Reset {
-                        mgmt_key_env,
-                        mgmt_key_stdin,
-                        pin_env,
-                        pin_stdin,
-                        ..
-                    },
+                cmd: PivCmd::Reset { mgmt_key, pin, .. },
             }) => {
-                assert_eq!(mgmt_key_env, None);
-                assert!(!mgmt_key_stdin);
-                assert_eq!(pin_env, None);
-                assert!(!pin_stdin);
+                assert_eq!(mgmt_key, None);
+                assert_eq!(pin, None);
             }
             _ => panic!("expected piv reset"),
         }
@@ -16861,42 +16683,41 @@ mod cli_tests {
             "piv",
             "reset",
             "--yes",
-            "--mgmt-key-env",
-            "XAUTH",
+            "--mgmt-key",
+            "env:XAUTH",
         ])
         .unwrap()
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::Reset { mgmt_key_env, .. },
-            }) => assert_eq!(mgmt_key_env.as_deref(), Some("XAUTH")),
+                cmd: PivCmd::Reset { mgmt_key, .. },
+            }) => assert_eq!(mgmt_key, Some(SecretSource::Env("XAUTH".into()))),
             _ => panic!("expected piv reset"),
         }
-        match parse(&["keyroostctl", "piv", "reset", "--yes", "--pin-env", "GPIN"])
+        match parse(&["keyroostctl", "piv", "reset", "--yes", "--pin", "env:GPIN"])
             .unwrap()
             .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::Reset { pin_env, .. },
-            }) => assert_eq!(pin_env.as_deref(), Some("GPIN")),
+                cmd: PivCmd::Reset { pin, .. },
+            }) => assert_eq!(pin, Some(SecretSource::Env("GPIN".into()))),
             _ => panic!("expected piv reset"),
         }
     }
 
     #[test]
     fn piv_reset_credential_flags_are_mutually_exclusive() {
-        // Any two of the five (mgmt-key-env/mgmt-key-stdin/mgmt-key-default/
-        // pin-env/pin-stdin) at once must refuse -- only one credential
-        // source at a time.
+        // --mgmt-key and --pin together must refuse -- only one credential
+        // at a time.
         assert!(parse(&[
             "keyroostctl",
             "piv",
             "reset",
             "--yes",
-            "--mgmt-key-env",
-            "XAUTH",
-            "--pin-env",
-            "GPIN",
+            "--mgmt-key",
+            "env:XAUTH",
+            "--pin",
+            "env:GPIN",
         ])
         .is_err());
         assert!(parse(&[
@@ -16904,8 +16725,10 @@ mod cli_tests {
             "piv",
             "reset",
             "--yes",
-            "--mgmt-key-stdin",
-            "--pin-stdin",
+            "--mgmt-key",
+            "stdin",
+            "--pin",
+            "stdin",
         ])
         .is_err());
         assert!(parse(&[
@@ -16913,8 +16736,10 @@ mod cli_tests {
             "piv",
             "reset",
             "--yes",
-            "--mgmt-key-default",
-            "--mgmt-key-stdin",
+            "--mgmt-key",
+            "default",
+            "--mgmt-key",
+            "stdin",
         ])
         .is_err());
         assert!(parse(&[
@@ -16922,20 +16747,26 @@ mod cli_tests {
             "piv",
             "reset",
             "--yes",
-            "--mgmt-key-default",
-            "--pin-env",
-            "GPIN",
+            "--mgmt-key",
+            "default",
+            "--pin",
+            "env:GPIN",
         ])
         .is_err());
-        match parse(&["keyroostctl", "piv", "reset", "--yes", "--mgmt-key-default"])
-            .unwrap()
-            .command
+        match parse(&[
+            "keyroostctl",
+            "piv",
+            "reset",
+            "--yes",
+            "--mgmt-key",
+            "default",
+        ])
+        .unwrap()
+        .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::Reset {
-                    mgmt_key_default, ..
-                },
-            }) => assert!(mgmt_key_default),
+                cmd: PivCmd::Reset { mgmt_key, .. },
+            }) => assert_eq!(mgmt_key, Some(SecretSource::Default)),
             _ => panic!("expected piv reset"),
         }
     }
@@ -17110,8 +16941,8 @@ mod cli_tests {
             "9a",
             "--subject",
             "CN=x",
-            "--mgmt-key-env",
-            "MK",
+            "--mgmt-key",
+            "env:MK",
         ])
         .is_err());
     }
@@ -17493,13 +17324,13 @@ mod cli_tests {
         use crate::secrets::fake::FakeIo;
         let sec = crate::secrets::Secrets::new(FakeIo::default());
         for (spec, label, flag) in [
-            (&PIV_OLD_PIN, "current PIN", "old-pin"),
-            (&PIV_OLD_PUK, "current PUK", "old-puk"),
-            (&PIV_OLD_MGMT_KEY, "current management key", "old-mgmt-key"),
+            (&PIV_OLD_PIN, "current PIN", "pin"),
+            (&PIV_OLD_PUK, "current PUK", "puk"),
+            (&PIV_OLD_MGMT_KEY, "current management key", "mgmt-key"),
         ] {
             let e = sec.check(spec, Source::NONE).unwrap_err();
             assert!(
-                e.starts_with(&format!("no {label} given: pass --{flag}-env")),
+                e.starts_with(&format!("no {label} given: pass --{flag} env:NAME")),
                 "{e}"
             );
         }
@@ -17515,21 +17346,20 @@ mod cli_tests {
             " 010203040506070801020304050607080102030405060708 \n",
         ]));
         assert!(matches!(
-            read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, Source::NONE, true).unwrap(),
+            read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, Some(&SecretSource::Default)).unwrap(),
             MgmtKeyInput::Default
         ));
-        assert_eq!(sec.io.lines_read, 0, "--mgmt-key-default reads nothing");
-        match read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, Source::new(None, true), false).unwrap()
-        {
+        assert_eq!(sec.io.lines_read, 0, "--mgmt-key default reads nothing");
+        match read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, Some(&SecretSource::Stdin)).unwrap() {
             MgmtKeyInput::Key(k) => assert_eq!(k.len(), 24),
             MgmtKeyInput::Default => panic!(),
         }
         let sec = crate::secrets::Secrets::new(FakeIo::default());
         assert_eq!(
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, Source::NONE, false).unwrap_err(),
-            "no management key given: pass --mgmt-key-env VAR, --mgmt-key-stdin or --mgmt-key-default"
+            check_mgmt_key(&sec, &PIV_MGMT_KEY, None).unwrap_err(),
+            "no management key given: pass --mgmt-key env:NAME, --mgmt-key stdin or --mgmt-key default"
         );
-        assert!(check_mgmt_key(&sec, &PIV_MGMT_KEY, Source::NONE, true).is_ok());
+        assert!(check_mgmt_key(&sec, &PIV_MGMT_KEY, Some(&SecretSource::Default)).is_ok());
     }
 
     #[test]
@@ -17537,10 +17367,14 @@ mod cli_tests {
         use crate::secrets::fake::FakeIo;
         let mut sec =
             crate::secrets::Secrets::new(FakeIo::default().var("KR_MK", "zz0102secretish"));
-        let e = read_mgmt_key_input(&mut sec, &PIV_OLD_MGMT_KEY, Source::env("KR_MK"), false)
-            .err()
-            .unwrap()
-            .to_string();
+        let e = read_mgmt_key_input(
+            &mut sec,
+            &PIV_OLD_MGMT_KEY,
+            Some(&SecretSource::Env("KR_MK".into())),
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(
             e.starts_with("the current management key is not valid hex"),
             "{e}"
@@ -17554,47 +17388,47 @@ mod cli_tests {
         let cmd = Cli::command();
         let piv = cmd.find_subcommand("piv").unwrap();
         for (sub, flag, line) in [
-            ("change-pin", "old-pin-stdin", "first line"),
+            ("change-pin", "pin", "first line"),
             (
                 "change-pin",
-                "new-pin-stdin",
-                "second line when --old-pin-stdin is also given",
+                "new-pin",
+                "second line when --pin stdin is also given",
             ),
-            ("change-puk", "old-puk-stdin", "first line"),
+            ("change-puk", "puk", "first line"),
             (
                 "change-puk",
-                "new-puk-stdin",
-                "second line when --old-puk-stdin is also given",
+                "new-puk",
+                "second line when --puk stdin is also given",
             ),
-            ("unblock-pin", "puk-stdin", "first line"),
+            ("unblock-pin", "puk", "first line"),
             (
                 "unblock-pin",
-                "new-pin-stdin",
-                "second line when --puk-stdin is also given",
+                "new-pin",
+                "second line when --puk stdin is also given",
             ),
-            ("set-retries", "pin-stdin", "first line"),
+            ("set-retries", "pin", "first line"),
             (
                 "set-retries",
-                "mgmt-key-stdin",
-                "second line when --pin-stdin is also given",
+                "mgmt-key",
+                "second line when --pin stdin is also given",
             ),
-            ("change-management-key", "old-mgmt-key-stdin", "first line"),
+            ("change-management-key", "mgmt-key", "first line"),
             (
                 "change-management-key",
-                "new-mgmt-key-stdin",
-                "second line when --old-mgmt-key-stdin is also given",
+                "new-mgmt-key",
+                "second line when --mgmt-key stdin is also given",
             ),
-            ("self-sign", "pin-stdin", "first line"),
+            ("self-sign", "pin", "first line"),
             (
                 "self-sign",
-                "mgmt-key-stdin",
-                "second line when --pin-stdin is also given",
+                "mgmt-key",
+                "second line when --pin stdin is also given",
             ),
-            ("request-cert", "pin-stdin", "first line"),
+            ("request-cert", "pin", "first line"),
             (
                 "request-cert",
-                "mgmt-key-stdin",
-                "second line when --pin-stdin is also given",
+                "mgmt-key",
+                "second line when --pin stdin is also given",
             ),
         ] {
             let arg = piv
@@ -17633,17 +17467,24 @@ mod cli_tests {
 
     const SECRET_TABLE: &str = include_str!("../tests/secret_flags.txt");
 
-    /// (path, every -env/-stdin prefix pair) for each subcommand, from the
-    /// clap tree.
+    /// (path, every secret flag) for each visible subcommand, from the clap
+    /// tree: the long of each `<SOURCE>` flag, and the prefix of each old
+    /// `--X-env`/`--X-stdin` pair that is left. A global flag counts on the
+    /// command that declares it, not on every command below.
     fn secret_pairs() -> std::collections::BTreeMap<String, Vec<String>> {
         use clap::CommandFactory;
         fn walk(
             cmd: &clap::Command,
             path: String,
+            inherited: &[clap::Id],
             out: &mut std::collections::BTreeMap<String, Vec<String>>,
         ) {
-            let longs: Vec<&str> = cmd
+            let own: Vec<&clap::Arg> = cmd
                 .get_arguments()
+                .filter(|a| !inherited.contains(a.get_id()))
+                .collect();
+            let longs: Vec<&str> = own
+                .iter()
                 .filter(|a| !a.is_global_set())
                 .filter_map(|a| a.get_long())
                 .collect();
@@ -17653,32 +17494,48 @@ mod cli_tests {
                 .filter(|p| longs.contains(&format!("{p}-env").as_str()))
                 .map(str::to_owned)
                 .collect();
+            pairs.extend(
+                own.iter()
+                    .filter(|a| is_secret_arg(a))
+                    .filter_map(|a| a.get_long())
+                    .map(str::to_owned),
+            );
             pairs.sort();
-            if !pairs.is_empty() {
+            if !pairs.is_empty() && !path.is_empty() {
                 out.insert(path.clone(), pairs);
             }
-            for sub in cmd.get_subcommands() {
+            let mut inherited = inherited.to_vec();
+            inherited.extend(
+                own.iter()
+                    .filter(|a| a.is_global_set())
+                    .map(|a| a.get_id().clone()),
+            );
+            for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
                 let p = if path.is_empty() {
                     sub.get_name().to_owned()
                 } else {
                     format!("{path} {}", sub.get_name())
                 };
-                walk(sub, p, out);
+                walk(sub, p, &inherited, out);
             }
         }
         let mut root = Cli::command();
         root.build();
         let mut out = std::collections::BTreeMap::new();
-        walk(&root, String::new(), &mut out);
+        walk(&root, String::new(), &[], &mut out);
         out
     }
 
     /// Whether clap refuses `a` and `b` together: a direct conflict, or both
     /// in an exclusive (`multiple(false)`) group.
     fn args_conflict(cmd: &clap::Command, a: &clap::Arg, b: &clap::Arg) -> bool {
-        cmd.get_arg_conflicts_with(a)
-            .iter()
-            .any(|c| c.get_id() == b.get_id())
+        let one_way = |x: &clap::Arg, y: &clap::Arg| {
+            cmd.get_arg_conflicts_with(x)
+                .iter()
+                .any(|c| c.get_id() == y.get_id())
+        };
+        one_way(a, b)
+            || one_way(b, a)
             || cmd.get_groups().any(|g| {
                 let ids: Vec<&clap::Id> = g.get_args().collect();
                 !g.clone().is_multiple() && ids.contains(&a.get_id()) && ids.contains(&b.get_id())
@@ -17686,10 +17543,14 @@ mod cli_tests {
     }
 
     #[test]
-    fn every_secret_flag_pair_is_in_the_table_with_help_and_line_order() {
+    fn every_secret_flag_is_in_the_table_with_help_and_line_order() {
+        use crate::secrets::SECRET_FLAGS;
         use clap::CommandFactory;
         let tree = secret_pairs();
         let mut table = std::collections::BTreeMap::new();
+        // Column 3 as written: the stdin line order.
+        let mut order: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
         // A path may have several rows (one per mode, e.g. `otp list
         // --unlock auto`) as long as their extra args differ and they all
         // list the same secrets.
@@ -17702,11 +17563,13 @@ mod cli_tests {
             assert!(cols.len() == 3 || cols.len() == 4, "bad row: {line:?}");
             let extra = if cols.len() == 4 { cols[1] } else { "" };
             assert!(seen.insert((cols[0], extra)), "duplicate row: {line:?}");
-            let mut all: Vec<String> = cols[cols.len() - 2].split(' ').map(str::to_owned).collect();
+            let written: Vec<String> = cols[cols.len() - 2].split(' ').map(str::to_owned).collect();
+            let mut all = written.clone();
             all.sort();
             if let Some(prev) = table.insert(cols[0].to_owned(), all.clone()) {
                 assert_eq!(prev, all, "rows for one path disagree: {line:?}");
             }
+            order.insert(cols[0].to_owned(), written);
         }
         assert_eq!(tree, table, "tests/secret_flags.txt is out of date");
         let mut root = Cli::command();
@@ -17716,6 +17579,7 @@ mod cli_tests {
             for name in path.split(' ') {
                 cmd = cmd.find_subcommand(name).unwrap();
             }
+            let help_of = |a: &clap::Arg| a.get_help().map(|h| h.to_string()).unwrap_or_default();
             for a in cmd.get_arguments().filter(|a| {
                 a.get_long()
                     .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
@@ -17728,7 +17592,7 @@ mod cli_tests {
                 // Every stdin flag falls back to a hidden prompt at a
                 // terminal, and its help says so.
                 if a.get_long().is_some_and(|l| l.ends_with("-stdin")) {
-                    let help = a.get_help().unwrap().to_string();
+                    let help = help_of(a);
                     assert!(
                         help.contains("hidden when typed at a terminal"),
                         "{path} --{}: {help}",
@@ -17736,24 +17600,134 @@ mod cli_tests {
                     );
                 }
             }
-            // Two stdin flags that can be combined: each states its line.
+            // Every `<SOURCE>` flag names its sources and is in the
+            // refusal table with the same `default`.
+            for a in cmd.get_arguments().filter(|a| is_secret_arg(a)) {
+                let long = a.get_long().unwrap();
+                let help = help_of(a);
+                for want in ["env:NAME", "stdin", "hidden when typed at a terminal"] {
+                    assert!(help.contains(want), "{path} --{long}: {want:?} in {help}");
+                }
+                let f = SECRET_FLAGS
+                    .iter()
+                    .find(|f| f.long == long)
+                    .unwrap_or_else(|| panic!("{path} --{long}: not in SECRET_FLAGS"));
+                assert!(
+                    !f.default_ok || help.contains("default"),
+                    "{path} --{long}: the help doesn't name `default`: {help}"
+                );
+            }
+            // Two stdin sources that can be combined: each states its line,
+            // and column 3 lists the first-line one first.
             let stdin_args: Vec<&clap::Arg> = cmd
                 .get_arguments()
-                .filter(|a| a.get_long().is_some_and(|l| l.ends_with("-stdin")))
+                .filter(|a| is_secret_arg(a) || a.get_long().is_some_and(|l| l.ends_with("-stdin")))
                 .collect();
+            let short = |a: &clap::Arg| -> String {
+                let l = a.get_long().unwrap();
+                l.strip_suffix("-stdin").unwrap_or(l).to_owned()
+            };
             for a in &stdin_args {
-                let combinable = stdin_args
+                let combinable: Vec<&&clap::Arg> = stdin_args
                     .iter()
-                    .any(|b| b.get_id() != a.get_id() && !args_conflict(cmd, a, b));
-                if combinable {
-                    let help = a.get_help().unwrap().to_string();
+                    .filter(|b| b.get_id() != a.get_id() && !args_conflict(cmd, a, b))
+                    .collect();
+                if combinable.is_empty() {
+                    continue;
+                }
+                let help = help_of(a);
+                let first = help.contains("first line");
+                let second = help.contains("second line");
+                assert!(
+                    first || second,
+                    "{path} --{}: {help}",
+                    a.get_long().unwrap()
+                );
+                if first && !second {
+                    let col = &order[path];
+                    let pos = |n: &str| col.iter().position(|c| c == n);
+                    for b in &combinable {
+                        let hb = help_of(b);
+                        if hb.contains("second line") && !hb.contains("first line") {
+                            assert!(
+                                pos(&short(a)) < pos(&short(b)),
+                                "{path}: column 3 lists --{} after --{}",
+                                short(a),
+                                short(b)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retired_flag_rows_name_real_flags() {
+        use clap::CommandFactory;
+        let mut root = Cli::command();
+        root.build();
+        let all = all_commands();
+        for r in RETIRED_FLAGS {
+            for f in r.now {
+                assert!(r.msg.contains(f), "{}: message doesn't name {f}", r.flag);
+                let long = f.trim_start_matches('-');
+                // On the command the words name, when they name one;
+                // otherwise somewhere in the tree.
+                let mut c = &root;
+                let mut on_path = true;
+                for w in r.words {
+                    match c.find_subcommand(w) {
+                        Some(s) => c = s,
+                        None => on_path = false,
+                    }
+                }
+                let here =
+                    |c: &clap::Command| c.get_arguments().any(|a| a.get_long() == Some(long));
+                if on_path && !r.words.is_empty() && c.get_subcommands().next().is_none() {
+                    assert!(here(c), "{}: {f} is not on `{}`", r.flag, r.words.join(" "));
+                } else {
                     assert!(
-                        help.contains("first line") || help.contains("second line"),
-                        "{path} --{}: {help}",
-                        a.get_long().unwrap()
+                        all.iter().any(|(_, c)| here(c)),
+                        "{}: {f} is in no command",
+                        r.flag
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn specific_retired_flag_rows_come_first() {
+        let first_generic = RETIRED_FLAGS
+            .iter()
+            .position(|r| r.words.is_empty() && r.flag != "--list-readers");
+        if let Some(i) = first_generic {
+            assert!(
+                RETIRED_FLAGS[i..].iter().all(|r| r.words.is_empty()),
+                "a specific row after the first generic one"
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_line_order_per_command() {
+        use crate::secrets::fake::FakeIo;
+        // (first spec, second spec): the first stdin line goes to the first.
+        for (a, b) in [
+            (PIV_OLD_PIN, PIV_NEW_PIN),
+            (PIV_OLD_PUK, PIV_NEW_PUK),
+            (PIV_PUK, PIV_NEW_PIN),
+            (PIV_OLD_MGMT_KEY, PIV_NEW_MGMT_KEY),
+            (OATH_SEED, OATH_PASSWORD),
+            (OATH_PASSWORD, OATH_NEW_PASSWORD),
+            (OTP_SEED, OTP_PIN),
+            (PGP_ADMIN_PIN, PGP_NEW_USER_PIN),
+        ] {
+            let mut s = Secrets::new(FakeIo::piped(&["11\n", "22\n"]));
+            let stdin = Source::from_flag(Some(&SecretSource::Stdin));
+            assert_eq!(&*s.read(&a, stdin).unwrap(), "11", "{}", a.label);
+            assert_eq!(&*s.read(&b, stdin).unwrap(), "22", "{}", b.label);
         }
     }
 
@@ -18778,7 +18752,7 @@ mod cli_tests {
             ],
             &["keyroostctl", "oath", "delete", "x"],
             &["keyroostctl", "otp", "delete", "--account", "a"],
-            &["keyroostctl", "otp", "set-button-hotp", "--seed-stdin"],
+            &["keyroostctl", "otp", "set-button-hotp", "--seed", "stdin"],
             &["keyroostctl", "otp", "delete-button-hotp"],
             &[
                 "keyroostctl",

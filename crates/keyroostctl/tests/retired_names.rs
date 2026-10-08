@@ -131,9 +131,9 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["otp", "set-pin", "--pin-env", "S3CRETVALUE"],
-        "--new-pin-env",
+        "--new-pin env:VAR",
     ),
-    (&["otp", "set-pin", "--pin-stdin"], "--new-pin-stdin"),
+    (&["otp", "set-pin", "--pin-stdin"], "--new-pin stdin"),
     (
         &["otp", "list", "--pin-only", "S3CRETVALUE"],
         "--unlock pin",

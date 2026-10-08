@@ -37,8 +37,8 @@ pub fn run(args: &[&str]) -> (i32, String, String) {
 #[test]
 fn otp_list_fingerprint_unlock_with_a_pin_flag_is_2() {
     for args in [
-        &["otp", "list", "--unlock", "fingerprint", "--pin-env", "V"][..],
-        &["otp", "list", "--unlock", "fingerprint", "--pin-stdin"],
+        &["otp", "list", "--unlock", "fingerprint", "--pin", "env:V"][..],
+        &["otp", "list", "--unlock", "fingerprint", "--pin", "stdin"],
     ] {
         let (code, out, err) = run(args);
         assert_eq!(code, 2, "{args:?}: {err}");
@@ -120,7 +120,8 @@ fn an_existing_output_file_is_refused_before_any_key() {
             "--generate-key",
             "--save-pubkey",
             f,
-            "--mgmt-key-default",
+            "--mgmt-key",
+            "default",
             "--yes",
         ],
         &[
@@ -135,7 +136,8 @@ fn an_existing_output_file_is_refused_before_any_key() {
             "--generate-key",
             "--save-pubkey",
             f,
-            "--mgmt-key-default",
+            "--mgmt-key",
+            "default",
             "--yes",
         ],
         &[
@@ -145,7 +147,8 @@ fn an_existing_output_file_is_refused_before_any_key() {
             "9a",
             "--save-pubkey",
             f,
-            "--mgmt-key-default",
+            "--mgmt-key",
+            "default",
             "--yes",
         ],
         &[
@@ -158,7 +161,8 @@ fn an_existing_output_file_is_refused_before_any_key() {
             "--generate-key",
             "--save-pubkey",
             f,
-            "--mgmt-key-default",
+            "--mgmt-key",
+            "default",
             "--yes",
         ],
         &[
@@ -221,7 +225,8 @@ fn an_output_that_cannot_be_replaced_is_refused_before_any_key() {
             "--generate-key",
             "--save-pubkey",
             d,
-            "--mgmt-key-default",
+            "--mgmt-key",
+            "default",
             "--yes",
             "--overwrite",
         ],

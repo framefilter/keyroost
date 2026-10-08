@@ -208,12 +208,6 @@ impl<'a> Source<'a> {
 pub(crate) const SOURCE: &str = "SOURCE";
 
 /// Where a secret flag says to read its secret from.
-// `allow`, not `expect`: older compilers count this as used through the
-// items below, newer ones don't.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "no flag reads a secret source yet")
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SecretSource {
     /// `env:NAME`: the named environment variable. NAME is never shown in a
@@ -231,29 +225,15 @@ pub(crate) enum SecretSource {
 /// clap value parser for a secret flag: `env:NAME` or `stdin`. The error
 /// text is never shown; [`literal_refusal`] replaces clap's message, which
 /// would repeat the value.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no flag reads a secret source yet")
-)]
 pub(crate) fn parse_source(s: &str) -> Result<SecretSource, &'static str> {
     parse(s, false)
 }
 
 /// [`parse_source`] that also accepts `default` (`--mgmt-key`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no flag reads a secret source yet")
-)]
 pub(crate) fn parse_source_or_default(s: &str) -> Result<SecretSource, &'static str> {
     parse(s, true)
 }
 
-// `allow`, not `expect`: older compilers count this as used through the
-// items below, newer ones don't.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "no flag reads a secret source yet")
-)]
 fn parse(s: &str, default_ok: bool) -> Result<SecretSource, &'static str> {
     match s {
         "stdin" => Ok(SecretSource::Stdin),
@@ -359,10 +339,6 @@ pub(crate) fn literal_refusal(long: &str) -> Option<String> {
 impl<'a> Source<'a> {
     /// The source a secret flag names; `default` and an absent flag are
     /// [`Source::NONE`] (the caller handles `default` itself).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no flag reads a secret source yet")
-    )]
     pub(crate) fn from_flag(flag: Option<&'a SecretSource>) -> Source<'a> {
         match flag {
             Some(SecretSource::Env(name)) => Source::env(name),
@@ -373,10 +349,6 @@ impl<'a> Source<'a> {
 }
 
 /// Whether a secret flag said `default`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no flag reads a secret source yet")
-)]
 pub(crate) fn wants_default(flag: Option<&SecretSource>) -> bool {
     matches!(flag, Some(SecretSource::Default))
 }
@@ -1141,7 +1113,7 @@ mod tests {
 
         let mut s = sec(FakeIo::terminal().typing(&["1234"]));
         s.read(&PIN, Source::new(None, true)).unwrap();
-        assert!(s.prompted(), "--pin-stdin typed at a terminal");
+        assert!(s.prompted(), "--pin stdin typed at a terminal");
 
         // A canceled prompt still counts: the person was at the keyboard.
         let mut s = sec(FakeIo::terminal());
