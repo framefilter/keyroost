@@ -11915,7 +11915,7 @@ fn run_fido_ssh_cert_list(
         let has_cert = c
             .large_blob_key
             .as_ref()
-            .and_then(|k| keyroost_ctap::large_blobs::extract_cert_from_entries(k, &array.entries))
+            .and_then(|k| keyroost_ctap::large_blobs::extract_cert_from_entries(k, &array))
             .is_some();
         println!(
             "{}  {}",
@@ -11992,7 +11992,7 @@ fn run_fido_ssh_cert_extract(
             sanitize_terminal(rp_id)
         )
     })?;
-    let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(key, &array.entries)
+    let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(key, &array)
         .ok_or_else(|| {
             format!(
                 "no SSH certificate found in credential '{}'s largeBlob (no matching entry, or the stored blob is not a certificate)",
@@ -12103,8 +12103,8 @@ fn large_blob_list_json(
     info: &keyroost_ctap::AuthenticatorInfo,
 ) -> json_out::FidoLargeBlobListJson {
     let entries = array
-        .entries
-        .iter()
+        .entries()
+        .into_iter()
         .enumerate()
         .map(|(index, e)| {
             let (kind, ssh_cert, _) = large_blob_kind(e);
@@ -12121,6 +12121,7 @@ fn large_blob_list_json(
     let cap = array.capacity(info);
     json_out::FidoLargeBlobListJson {
         entries,
+        skipped: array.skipped_count(),
         capacity: json_out::FidoLargeBlobCapacityJson {
             max_bytes: cap.max_bytes,
             used_bytes: cap.used_bytes,
@@ -12137,17 +12138,11 @@ fn run_fido_large_blob_list(
         emit_json(&large_blob_list_json(&array, &info))?;
         return Ok(());
     }
-    if array.entries.is_empty() {
+    let skipped = array.skipped_count();
+    if array.is_empty() && skipped == 0 {
         println!("(large-blob array is empty)");
-        let cap = array.capacity(&info);
-        println!();
-        println!(
-            "Capacity: {} of {} bytes used, {} free",
-            cap.used_bytes, cap.max_bytes, cap.free_bytes
-        );
-        return Ok(());
     }
-    for (i, e) in array.entries.iter().enumerate() {
+    for (i, e) in array.entries().into_iter().enumerate() {
         use keyroost_ctap::large_blobs::EntryKind;
         match e.classify() {
             EntryKind::Note(text) => {
@@ -12173,6 +12168,9 @@ fn run_fido_large_blob_list(
             ),
         }
     }
+    if skipped > 0 {
+        println!("{skipped} element(s) not in the standard format were skipped (kept unchanged)");
+    }
     let cap = array.capacity(&info);
     println!();
     println!(
@@ -12188,9 +12186,8 @@ fn run_fido_large_blob_get(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_dev, _info, array) = open_and_read_large_blobs(path)?;
     let entry = array
-        .entries
-        .get(index)
-        .ok_or_else(|| large_blob_bad_index(index, array.entries.len()))?;
+        .entry(index)
+        .ok_or_else(|| large_blob_bad_index(index, array.len()))?;
     let (kind, ssh_cert, classified) = large_blob_kind(entry);
     if json_output() {
         emit_json(&json_out::FidoLargeBlobGetJson {
@@ -12278,9 +12275,8 @@ fn run_fido_large_blob_export(
     use keyroost_ctap::large_blobs::EntryKind;
     let (_dev, _info, array) = open_and_read_large_blobs(path)?;
     let entry = array
-        .entries
-        .get(index)
-        .ok_or_else(|| large_blob_bad_index(index, array.entries.len()))?;
+        .entry(index)
+        .ok_or_else(|| large_blob_bad_index(index, array.len()))?;
     let bytes: Vec<u8> = if as_cert {
         match entry.classify() {
             EntryKind::SshCert { wire, .. } => keyroost_ctap::ssh_cert::to_cert_pub(&wire)
@@ -12324,7 +12320,7 @@ fn run_fido_large_blob_add(
     let updated = current.with_text_note(text);
     let serialized = updated.serialize_with_checksum();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
-    println!("Note added; {} entries now.", updated.entries.len());
+    println!("Note added; {} entries now.", updated.len());
     Ok(())
 }
 
@@ -12363,9 +12359,8 @@ fn run_fido_large_blob_delete(
     sec.check(&FIDO_PIN, src)?;
     let (dev, _info, current) = open_and_read_large_blobs(path)?;
     let entry = current
-        .entries
-        .get(index)
-        .ok_or_else(|| large_blob_bad_index(index, current.entries.len()))?;
+        .entry(index)
+        .ok_or_else(|| large_blob_bad_index(index, current.len()))?;
     if !entry.is_kr_note() {
         // Opaque RP-owned entry: deleting it can break the owning service.
         output::warn(&format!(
@@ -12390,12 +12385,9 @@ fn run_fido_large_blob_delete(
         return Err(LARGE_BLOB_CHANGED.into());
     }
 
-    let mut entries = again.entries;
-    entries.remove(index);
-    let updated = keyroost_ctap::large_blobs::LargeBlobArray {
-        entries,
-        raw_array: Vec::new(),
-    };
+    let updated = again
+        .without_entry(index)
+        .ok_or_else(|| large_blob_bad_index(index, again.len()))?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
         &pin,
@@ -12404,7 +12396,7 @@ fn run_fido_large_blob_delete(
     )?;
     let serialized = updated.serialize_with_checksum();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
-    println!("Entry deleted; {} entries now.", updated.entries.len());
+    println!("Entry deleted; {} entries now.", updated.len());
     Ok(())
 }
 
@@ -12417,8 +12409,15 @@ fn run_fido_large_blob_clear(
     sec.check(&FIDO_PIN, src)?;
     // Read first so we can report exactly what will be wiped.
     let (dev, _info, current) = open_and_read_large_blobs(path)?;
-    let total = current.entries.len();
-    let opaque = current.entries.iter().filter(|e| !e.is_kr_note()).count();
+    // Skipped (non-standard) elements are wiped too, so they count as opaque.
+    let skipped = current.skipped_count();
+    let total = current.len() + skipped;
+    let opaque = current
+        .entries()
+        .into_iter()
+        .filter(|e| !e.is_kr_note())
+        .count()
+        + skipped;
     if !yes {
         output::warn(&format!(
             "`clear` erases the ENTIRE large-blob array — ALL {total} \
@@ -12474,7 +12473,7 @@ fn large_blob_unchanged(
     before: &keyroost_ctap::large_blobs::LargeBlobArray,
     after: &keyroost_ctap::large_blobs::LargeBlobArray,
 ) -> bool {
-    before.raw_array == after.raw_array
+    before.raw_array() == after.raw_array()
 }
 
 /// A consistent "index out of range" error for the large-blob commands.
@@ -16070,10 +16069,7 @@ mod cli_tests {
     #[test]
     fn large_blob_unchanged_compares_the_raw_array() {
         use keyroost_ctap::large_blobs::LargeBlobArray;
-        let arr = |raw: &[u8]| LargeBlobArray {
-            entries: Vec::new(),
-            raw_array: raw.to_vec(),
-        };
+        let arr = |raw: &[u8]| LargeBlobArray::parse(raw).unwrap();
         assert!(large_blob_unchanged(&arr(&[0x80]), &arr(&[0x80])));
         assert!(!large_blob_unchanged(&arr(&[0x80]), &arr(&[0x81, 0x40])));
         assert!(!large_blob_unchanged(&arr(&[0x81, 0x40]), &arr(&[0x80])));
@@ -20535,24 +20531,55 @@ mod cli_tests {
 
     use keyroost_ctap::large_blobs::{LargeBlobArray, LargeBlobEntry};
 
+    /// The CBOR of an opaque RP-style entry map (no keyroost note magic).
+    fn opaque_entry_map() -> Vec<u8> {
+        use keyroost_ctap::cbor::{encode, Value};
+        encode(&Value::Map(vec![
+            (
+                Value::UInt(1),
+                Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x99]),
+            ),
+            (Value::UInt(2), Value::Bytes(vec![1u8; 12])),
+            (Value::UInt(3), Value::UInt(4)),
+        ]))
+    }
+
+    /// An array of the given raw CBOR elements, as read from a key.
+    fn large_blob_array_of(elements: &[&[u8]]) -> LargeBlobArray {
+        let mut bytes = keyroost_ctap::cbor::array_header(elements.len());
+        for e in elements {
+            bytes.extend_from_slice(e);
+        }
+        LargeBlobArray::parse(&bytes).unwrap()
+    }
+
     /// An opaque RP-style entry (no keyroost note magic).
     fn opaque_entry() -> LargeBlobEntry {
-        LargeBlobEntry {
-            ciphertext: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x99],
-            nonce: vec![1u8; 12],
-            orig_size: 4,
-        }
+        large_blob_array_of(&[&opaque_entry_map()])
+            .entry(0)
+            .unwrap()
+            .clone()
     }
 
     #[test]
     fn large_blob_list_json_classifies_note_vs_opaque() {
-        let array = LargeBlobArray {
-            entries: vec![LargeBlobEntry::from_text("hello"), opaque_entry()],
-            raw_array: Vec::new(),
+        // A note, an opaque entry, and one element not in the standard
+        // format (a bare text string), which is skipped and only counted.
+        let note = {
+            use keyroost_ctap::cbor::{encode, Value};
+            let mut body = keyroost_ctap::large_blobs::KR_NOTE_MAGIC.to_vec();
+            body.extend_from_slice(b"hello");
+            encode(&Value::Map(vec![
+                (Value::UInt(1), Value::Bytes(body)),
+                (Value::UInt(2), Value::Bytes(vec![0u8; 12])),
+                (Value::UInt(3), Value::UInt(5)),
+            ]))
         };
+        let array = large_blob_array_of(&[&note, &opaque_entry_map(), &[0x61, 0x78]]);
         let info = keyroost_ctap::AuthenticatorInfo::default();
         let shaped = large_blob_list_json(&array, &info);
         assert_eq!(shaped.entries.len(), 2);
+        assert_eq!(shaped.skipped, 1);
 
         // [0] is a keyroost note: is_note true, text present, size == byte len.
         assert_eq!(shaped.entries[0].index, 0);

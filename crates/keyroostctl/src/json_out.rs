@@ -374,6 +374,8 @@ pub(crate) struct FidoCredentialJson {
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobListJson {
     pub entries: Vec<FidoLargeBlobEntryJson>,
+    /// Elements not in the standard entry format: skipped, kept unchanged.
+    pub skipped: usize,
     pub capacity: FidoLargeBlobCapacityJson,
 }
 
@@ -1019,6 +1021,7 @@ mod tests {
         ];
         let v = to_v(&FidoLargeBlobListJson {
             entries,
+            skipped: 2,
             capacity: FidoLargeBlobCapacityJson {
                 max_bytes: 1024,
                 used_bytes: 17,
@@ -1028,6 +1031,7 @@ mod tests {
         for e in v["entries"].as_array().unwrap() {
             assert_shape(e, &entry_shape);
         }
+        assert_eq!(v["skipped"], 2);
         assert_eq!(
             v["entries"][1]["ssh_cert"]["serial"],
             "18446744073709551615"

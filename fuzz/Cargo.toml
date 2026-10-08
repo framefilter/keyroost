@@ -66,6 +66,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "large_blob"
+path = "fuzz_targets/large_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "oath_parse"
 path = "fuzz_targets/oath_parse.rs"
 test = false

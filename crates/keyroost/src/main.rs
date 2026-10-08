@@ -3263,7 +3263,7 @@ impl App {
                                     .security_keys
                                     .large_blobs
                                     .as_ref()
-                                    .and_then(|arr| arr.entries.get(idx));
+                                    .and_then(|arr| arr.entry(idx));
                                 self.security_keys.lb_status = Some(match entry {
                                     None => {
                                         format!("Export failed: entry {idx} no longer exists")
@@ -5185,9 +5185,8 @@ impl App {
         // Read the world-readable array BEFORE any credential-management borrow —
         // matches the CLI's device-ownership ordering (see `enumerate_ssh_credentials`).
         let array = keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
-        let wire =
-            keyroost_ctap::large_blobs::extract_cert_from_entries(large_blob_key, &array.entries)
-                .ok_or("no certificate is stored for this credential")?;
+        let wire = keyroost_ctap::large_blobs::extract_cert_from_entries(large_blob_key, &array)
+            .ok_or("no certificate is stored for this credential")?;
         let cert_pub = keyroost_ctap::ssh_cert::to_cert_pub(&wire)
             .ok_or("stored blob is not a valid OpenSSH certificate")?;
         // to_cert_pub already parsed the wire, so parse_wire here cannot fail;
@@ -13959,7 +13958,7 @@ impl App {
                 }
                 match result {
                     Ok((array, cap)) => {
-                        let n = array.entries.len();
+                        let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
                         app.security_keys.lb_new_text.clear();
@@ -14081,7 +14080,7 @@ impl App {
         })();
         match result {
             Ok((array, cap)) => {
-                let n = array.entries.len();
+                let n = array.len();
                 self.security_keys.large_blobs = Some(array);
                 self.security_keys.lb_capacity = Some(cap);
                 self.security_keys.lb_selected = None;
@@ -14112,9 +14111,9 @@ impl App {
                 Some("Unlock the key with your PIN first to modify large blobs.".into());
             return;
         };
-        if idx >= array.entries.len() {
+        let Some(target_entry) = array.entry(idx).cloned() else {
             return;
-        }
+        };
         let pin = session.pin.clone();
 
         // Capture the *target entry* (not its cached index). The actual removal
@@ -14122,7 +14121,6 @@ impl App {
         // RP entry written to the key since our last load is preserved and a
         // position shift can't delete the wrong entry. Matches the re-read shape
         // of `add_large_blob_note` / `edit_large_blob_note` / the CLI delete.
-        let target_entry = array.entries[idx].clone();
 
         let for_device = self.selected_device.clone();
         self.spawn_job("Updating large blobs\u{2026}", move || {
@@ -14150,18 +14148,13 @@ impl App {
                 // (by content, since `LargeBlobEntry` is `PartialEq`).
                 let live =
                     keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
-                let Some(pos) = live.entries.iter().position(|e| *e == target_entry) else {
+                let found = live.entries().into_iter().position(|e| *e == target_entry);
+                let Some(updated) = found.and_then(|pos| live.without_entry(pos)) else {
                     return Err(
                         "that entry is no longer on the key (its storage changed since it was \
                          loaded) \u{2014} nothing was deleted; reload and try again."
                             .into(),
                     );
-                };
-                let mut entries = live.entries;
-                entries.remove(pos);
-                let updated = keyroost_ctap::large_blobs::LargeBlobArray {
-                    entries,
-                    raw_array: Vec::new(),
                 };
                 let serialized = updated.serialize_with_checksum();
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
@@ -14180,7 +14173,7 @@ impl App {
                 }
                 match result {
                     Ok((array, cap)) => {
-                        let n = array.entries.len();
+                        let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
                         app.security_keys.lb_selected = None;
@@ -14216,10 +14209,6 @@ impl App {
         };
         let pin = session.pin.clone();
 
-        // Wipe all entries: an empty array, re-serialized with checksum inside
-        // the worker.
-        let new_entries = Vec::new();
-
         let for_device = self.selected_device.clone();
         self.spawn_job("Clearing large blobs\u{2026}", move || {
             let result = (|| -> Result<
@@ -14242,11 +14231,8 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?;
 
-                let updated = keyroost_ctap::large_blobs::LargeBlobArray {
-                    entries: new_entries,
-                    raw_array: Vec::new(),
-                };
-                let serialized = updated.serialize_with_checksum();
+                // Wipe every element, including any skipped (non-standard) ones.
+                let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14263,7 +14249,7 @@ impl App {
                 }
                 match result {
                     Ok((array, cap)) => {
-                        let n = array.entries.len();
+                        let n = array.len();
                         app.security_keys.large_blobs = Some(array);
                         app.security_keys.lb_capacity = Some(cap);
                         app.security_keys.lb_selected = None;
@@ -14334,7 +14320,7 @@ impl App {
                     .security_keys
                     .large_blobs
                     .as_ref()
-                    .map(|a| a.entries.len())
+                    .map(|a| a.len() + a.skipped_count())
                     .unwrap_or(0);
                 let unlocked = self.security_keys.session.is_some();
                 if entry_count > 0 && unlocked {
@@ -14454,7 +14440,8 @@ impl App {
         };
 
         ui.add_space(10.0);
-        if array.entries.is_empty() {
+        let skipped = array.skipped_count();
+        if array.is_empty() && skipped == 0 {
             ui.label(
                 egui::RichText::new("The large-blob array is empty.")
                     .font(theme::f_reg(12.5))
@@ -14469,7 +14456,7 @@ impl App {
         let mut cancel_edit = false;
         let selected = self.security_keys.lb_selected;
         let editing = self.security_keys.lb_editing;
-        for (idx, entry) in array.entries.iter().enumerate() {
+        for (idx, entry) in array.entries().into_iter().enumerate() {
             theme::card_frame(p).show(ui, |ui| {
                 use keyroost_ctap::large_blobs::EntryKind;
                 let classification = entry.classify();
@@ -14649,6 +14636,15 @@ impl App {
             });
             ui.add_space(8.0);
         }
+        if skipped > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{skipped} element(s) not in the standard format were skipped (kept unchanged)"
+                ))
+                .font(theme::f_reg(11.5))
+                .color(p.txt3),
+            );
+        }
 
         // Apply edit-related actions collected during the loop (kept outside it
         // to avoid borrowing `self` while iterating the cloned array).
@@ -14697,7 +14693,7 @@ impl App {
         // Clearing all storage is irreversible and wipes every note, so the
         // first click only arms this confirm; the user must confirm explicitly.
         if self.security_keys.lb_confirm_clear {
-            let n = array.entries.len();
+            let n = array.len() + skipped;
             ui.add_space(6.0);
             theme::card_frame(p)
                 .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
