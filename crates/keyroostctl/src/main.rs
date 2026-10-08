@@ -951,9 +951,10 @@ enum PivPukCmd {
 /// `piv retries` subcommands.
 #[derive(Subcommand)]
 enum PivRetriesCmd {
-    /// Set the PIN and PUK retry counts (Yubico extension); this also resets
-    /// the PIN and PUK themselves to their factory defaults. Needs the
-    /// management key and the current PIN.
+    /// Set how many wrong PIN and PUK entries are allowed. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Also resets the PIN and PUK to their factory defaults (a Yubico
+    /// extension to PIV). Needs the PIN and the management key.
     Set {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -1132,19 +1133,20 @@ enum PivKeyCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Move a slot's private key to another slot (Yubico MOVE KEY).
-    /// Non-destructive; refuses an occupied destination. The certificate stays
-    /// in the source slot.
+    /// Move a slot's private key to another slot. Irreversible: asks first (`--yes` to skip).
     ///
-    /// Moving keys between slots is an extension to standard PIV (YubiKey 5.7+
-    /// and other keys that implement it).
-    /// If keyroost's list marks this key as not supporting it, the command
-    /// stops unless `--force`; a key with no entry gets a warning.
+    /// The key may replace a key already in the destination slot. The
+    /// certificate stays in the source slot. Needs the management key.
+    ///
+    /// Moving keys between slots is an extension to standard PIV (YubiKey
+    /// 5.7+ and other keys that implement it). If keyroost's list marks this
+    /// key as not supporting it, the command stops unless `--force`; a key
+    /// with no entry gets a warning.
     Move {
         /// Source slot (9a/9c/9d/9e/82–95).
         #[arg(long)]
         from: CliPivSlot,
-        /// Destination slot (must be empty).
+        /// Destination slot.
         #[arg(long)]
         to: CliPivSlot,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
@@ -1158,6 +1160,9 @@ enum PivKeyCmd {
         /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long)]
         force: bool,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -2194,14 +2199,15 @@ enum MoltoCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Rotate the device's customer key (requires physical button
-    /// confirmation).
+    /// Replace the Molto2's customer key. Irreversible: asks first (`--yes` to skip).
     ///
-    /// The new key comes from --new-customer-key env:NAME or
-    /// --new-customer-key stdin, or a terminal asks for it twice (hidden);
-    /// --encoding says how it is written (hex unless --encoding ascii). The
-    /// current key comes from --customer-key (the factory default without
-    /// it).
+    /// The current key stops working. If the new one is lost, only `molto
+    /// reset` (which wipes every slot) recovers the token. The token also
+    /// asks for its up-arrow button before it changes the key. The new key
+    /// comes from --new-customer-key env:NAME or stdin, or a terminal asks
+    /// for it twice (hidden); --encoding says how it is written (hex unless
+    /// --encoding ascii). The current key comes from --customer-key (the
+    /// factory default without it).
     CustomerKey {
         /// The new customer key: env:NAME reads that environment variable,
         /// stdin reads one line (second line when --customer-key stdin is
@@ -2212,6 +2218,9 @@ enum MoltoCmd {
         /// How --new-customer-key is written.
         #[arg(long, value_enum, default_value_t = KeyEncoding::Hex)]
         encoding: KeyEncoding,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
     },
     /// Import an otpauth:// URI to a slot, or every entry of an export file
     /// to consecutive slots: writes seed, title, and config, replacing what
@@ -2881,13 +2890,13 @@ enum OtpCmd {
     /// Useful for diagnosing why the GUI's keyboard toggle or Touch HOTP gating
     /// behaves as it does.
     Info,
-    /// Enable or disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
+    /// Choose which USB interfaces the key offers (FIDO, keyboard, CCID). Irreversible: asks for a typed confirmation (`--yes` to skip).
     ///
     /// Sends SET_DEVICE_TYPE. You name the interfaces to ENABLE; any not named
     /// are disabled. At least TWO must remain enabled: disabling all of them
     /// bricks the key, and leaving only one risks locking you out, so the tool
-    /// refuses fewer than two. This reconfigures the hardware and requires
-    /// typing a confirmation phrase.
+    /// refuses fewer than two. Turning an interface back on needs a host that
+    /// reaches the key through one that stays on.
     Interface {
         /// Enable the FIDO2/U2F interface.
         #[arg(long)]
@@ -3360,6 +3369,7 @@ fn molto_validate<I: crate::secrets::SecretIo>(
         MoltoCmd::CustomerKey {
             new_customer_key,
             encoding,
+            ..
         } => sec.check(
             customer_key_spec(*encoding, true),
             Source::from_flag(new_customer_key.as_ref()),
@@ -3393,6 +3403,7 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
         MoltoCmd::CustomerKey {
             new_customer_key,
             encoding,
+            ..
         } => {
             let text = sec.read(
                 customer_key_spec(*encoding, true),
@@ -5603,6 +5614,11 @@ fn run_molto(
                 &format!("overwrite occupied Molto2 slot(s) {}", list.join(", ")),
             )?;
         }
+    }
+    // Replacing the customer key asks before either key is read, so a typed
+    // key comes after the answer.
+    if let MoltoCmd::CustomerKey { yes, .. } = cmd {
+        asked = crate::prompt::confirm_then_read(&dev, *yes, "replace the Molto2 customer key")?;
     }
     let (key, input) = molto_key_and_input(&mut sec, key, cmd, early_key)?;
     crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
@@ -10145,13 +10161,24 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     reader,
                     mgmt_key,
                     force,
+                    yes,
                 },
         } => {
             let mut sec = Secrets::real();
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
-            let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
+            let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
+            let asked = crate::prompt::confirm_then_read(
+                &dev,
+                *yes,
+                &format!(
+                    "move the private key {} \u{2192} {}",
+                    from.to_slot().label(),
+                    to.to_slot().label()
+                ),
+            )?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
-            reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
+            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
+            let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
                 debug,
@@ -13989,7 +14016,11 @@ mod cli_tests {
             ("molto import", IRREVERSIBLE),
             ("prog seed", IRREVERSIBLE),
             ("otp button set", IRREVERSIBLE),
+            ("piv key move", IRREVERSIBLE),
+            ("piv retries set", IRREVERSIBLE),
+            ("molto customer-key", IRREVERSIBLE),
             ("factory-reset", IRREVERSIBLE_TYPED),
+            ("otp interface", IRREVERSIBLE_TYPED),
         ];
         let marked: Vec<(&str, &str)> = irreversible
             .iter()
@@ -13997,14 +14028,9 @@ mod cli_tests {
             .chain(ONE_WAY_SETTINGS.iter().map(|p| (*p, ONE_WAY)))
             .collect();
         // Commands that ask before a change that destroys no key, seed or
-        // certificate: settings and retry counts, plus `piv cert request`,
-        // which replaces a key only with the optional `--generate-key`.
-        let confirms_only = [
-            "prog config",
-            "otp interface",
-            "piv retries set",
-            "piv cert request",
-        ];
+        // certificate: a token setting, plus `piv cert request`, which
+        // replaces a key only with the optional `--generate-key`.
+        let confirms_only = ["prog config", "piv cert request"];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
             assert!(tree.iter().any(|(t, _)| t == p), "{p:?} is not a command");
@@ -20435,6 +20461,9 @@ mod cli_tests {
                     }
                     | PivCmd::Cert {
                         cmd: PivCertCmd::Request { yes, .. },
+                    }
+                    | PivCmd::Key {
+                        cmd: PivKeyCmd::Move { yes, .. },
                     },
             } => yes,
             Cmd::Oath {
@@ -20459,7 +20488,10 @@ mod cli_tests {
                     },
             } => yes,
             Cmd::Molto {
-                cmd: MoltoCmd::Seed { yes, .. } | MoltoCmd::Import { yes, .. },
+                cmd:
+                    MoltoCmd::Seed { yes, .. }
+                    | MoltoCmd::Import { yes, .. }
+                    | MoltoCmd::CustomerKey { yes, .. },
                 ..
             } => yes,
             Cmd::Prog {
@@ -20468,6 +20500,44 @@ mod cli_tests {
             _ => return None,
         };
         Some(*yes)
+    }
+
+    #[test]
+    fn move_and_customer_key_have_yes() {
+        for (a, want) in [
+            (
+                &[
+                    "keyroostctl",
+                    "piv",
+                    "key",
+                    "move",
+                    "--from",
+                    "9a",
+                    "--to",
+                    "9c",
+                ][..],
+                false,
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "piv",
+                    "key",
+                    "move",
+                    "--from",
+                    "9a",
+                    "--to",
+                    "9c",
+                    "--yes",
+                ],
+                true,
+            ),
+            (&["keyroostctl", "molto", "customer-key"], false),
+            (&["keyroostctl", "molto", "customer-key", "--yes"], true),
+        ] {
+            let cli = parse(a).unwrap();
+            assert_eq!(confirm_yes(&cli), Some(want), "{a:?}");
+        }
     }
 
     #[test]
