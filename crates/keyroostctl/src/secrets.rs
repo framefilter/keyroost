@@ -1,8 +1,13 @@
 //! One way to read a secret: a PIN, password, management or customer key,
-//! a seed or an otpauth URI. Sources, in order: `--X-env VAR`; `--X-stdin`
-//! (one line, or a hidden prompt when stdin is a terminal); with neither
-//! flag, a hidden prompt when a terminal is present (stdin AND stderr, the
-//! rule every question uses); otherwise a refusal naming both flags. A new
+//! a seed or an otpauth URI. A secret flag names where the secret comes
+//! from, never the secret itself: `--X env:NAME` reads the environment
+//! variable NAME; `--X stdin` reads one line of standard input, or asks at
+//! a hidden prompt when stdin is a terminal; `--mgmt-key default` uses the
+//! factory-default key. With no flag, a hidden prompt asks when a terminal
+//! is present (stdin AND stderr, the rule every question uses); otherwise
+//! the command is refused with a message naming the sources. Any other
+//! value given to a secret flag is refused at parsing without being shown
+//! (`--X takes env:NAME or stdin — never ... itself`). A new
 //! PIN/password/key typed at a prompt is asked twice. Values live in
 //! `Zeroizing` buffers and are never echoed, printed or traced.
 //!
@@ -35,13 +40,17 @@ pub(crate) enum Form {
 pub(crate) struct Spec {
     /// What the user is asked for: "PIN", "new PIN", "admin PIN (PW3)".
     pub(crate) label: &'static str,
-    /// The flag prefix: "pin" means `--pin-env` / `--pin-stdin`.
+    /// The flag's long name: "pin" means `--pin env:NAME` / `--pin stdin`.
     pub(crate) flag: &'static str,
     pub(crate) kind: Kind,
     pub(crate) form: Form,
-    /// One more accepted flag named in the refusal (`--mgmt-key-default`).
-    pub(crate) also: Option<&'static str>,
-    /// Replaces the "--X-env VAR or --X-stdin" part (molto import's `-`).
+    /// The flag also takes `default` (`--mgmt-key default`), named in the
+    /// refusal.
+    pub(crate) default_ok: bool,
+    /// The flag is still an old `--X-env VAR` / `--X-stdin` pair; messages
+    /// name those.
+    pub(crate) legacy: bool,
+    /// Replaces the "--X env:NAME or --X stdin" part (molto import's `-`).
     pub(crate) hint: Option<&'static str>,
     /// Replaces the prompt's label, shown as written (not capitalized).
     pub(crate) prompt: Option<&'static str>,
@@ -54,7 +63,8 @@ impl Spec {
             flag,
             kind,
             form: Form::Text,
-            also: None,
+            default_ok: false,
+            legacy: false,
             hint: None,
             prompt: None,
         }
@@ -80,9 +90,15 @@ impl Spec {
             ..self
         }
     }
-    pub(crate) const fn also(self, flag: &'static str) -> Spec {
+    pub(crate) const fn with_default(self) -> Spec {
         Spec {
-            also: Some(flag),
+            default_ok: true,
+            ..self
+        }
+    }
+    pub(crate) const fn legacy(self) -> Spec {
+        Spec {
+            legacy: true,
             ..self
         }
     }
@@ -99,15 +115,23 @@ impl Spec {
         }
     }
 
-    /// "--pin-env VAR or --pin-stdin" (plus `also`), or the custom hint.
+    /// "--pin env:NAME or --pin stdin" (plus "or --mgmt-key default"), or the
+    /// custom hint.
     pub(crate) fn sources_hint(&self) -> String {
         if let Some(h) = self.hint {
             return h.to_string();
         }
         let f = self.flag;
-        match self.also {
-            Some(a) => format!("--{f}-env VAR, --{f}-stdin or {a}"),
-            None => format!("--{f}-env VAR or --{f}-stdin"),
+        if self.legacy {
+            if self.default_ok {
+                return format!("--{f}-env VAR, --{f}-stdin or --{f}-default");
+            }
+            return format!("--{f}-env VAR or --{f}-stdin");
+        }
+        if self.default_ok {
+            format!("--{f} env:NAME, --{f} stdin or --{f} default")
+        } else {
+            format!("--{f} env:NAME or --{f} stdin")
         }
     }
 
@@ -160,6 +184,179 @@ impl<'a> Source<'a> {
     pub(crate) fn given(&self) -> bool {
         self.env.is_some() || self.stdin
     }
+}
+
+/// The value name every secret flag shows in help: `--pin <SOURCE>`.
+pub(crate) const SOURCE: &str = "SOURCE";
+
+/// Where a secret flag says to read its secret from.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no flag reads a secret source yet")
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SecretSource {
+    /// `env:NAME`: the named environment variable. NAME is never shown in a
+    /// message: a user migrating from the old flags may type the secret
+    /// where the name goes.
+    Env(String),
+    /// `stdin`: one line of standard input; a hidden prompt when stdin is a
+    /// terminal.
+    Stdin,
+    /// `default` (`--mgmt-key` only): the factory-default key keyroost knows
+    /// for the selected device.
+    Default,
+}
+
+/// clap value parser for a secret flag: `env:NAME` or `stdin`. The error
+/// text is never shown; [`literal_refusal`] replaces clap's message, which
+/// would repeat the value.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no flag reads a secret source yet")
+)]
+pub(crate) fn parse_source(s: &str) -> Result<SecretSource, &'static str> {
+    parse(s, false)
+}
+
+/// [`parse_source`] that also accepts `default` (`--mgmt-key`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no flag reads a secret source yet")
+)]
+pub(crate) fn parse_source_or_default(s: &str) -> Result<SecretSource, &'static str> {
+    parse(s, true)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no flag reads a secret source yet")
+)]
+fn parse(s: &str, default_ok: bool) -> Result<SecretSource, &'static str> {
+    match s {
+        "stdin" => Ok(SecretSource::Stdin),
+        "default" if default_ok => Ok(SecretSource::Default),
+        _ => match s.strip_prefix("env:") {
+            Some(name) if !name.is_empty() => Ok(SecretSource::Env(name.to_owned())),
+            _ => Err("not a secret source"),
+        },
+    }
+}
+
+/// One secret flag: its long name, what it carries (for the refusal), and
+/// whether it takes `default`.
+pub(crate) struct SecretFlag {
+    pub(crate) long: &'static str,
+    pub(crate) what: &'static str,
+    pub(crate) default_ok: bool,
+}
+
+pub(crate) const SECRET_FLAGS: &[SecretFlag] = &[
+    SecretFlag {
+        long: "pin",
+        what: "the PIN",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "new-pin",
+        what: "the PIN",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "puk",
+        what: "the PUK",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "new-puk",
+        what: "the PUK",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "admin-pin",
+        what: "the admin PIN",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "mgmt-key",
+        what: "the management key",
+        default_ok: true,
+    },
+    SecretFlag {
+        long: "new-mgmt-key",
+        what: "the management key",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "password",
+        what: "the password",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "new-password",
+        what: "the password",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "seed",
+        what: "the seed",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "customer-key",
+        what: "the customer key",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "new-customer-key",
+        what: "the customer key",
+        default_ok: false,
+    },
+    SecretFlag {
+        long: "uri",
+        what: "the otpauth:// URI",
+        default_ok: false,
+    },
+];
+
+/// "--pin takes env:NAME or stdin — never the PIN itself", for a value that
+/// is neither. `None` when `long` is not a secret flag.
+pub(crate) fn literal_refusal(long: &str) -> Option<String> {
+    let f = SECRET_FLAGS.iter().find(|f| f.long == long)?;
+    let sources = if f.default_ok {
+        "env:NAME, stdin or default"
+    } else {
+        "env:NAME or stdin"
+    };
+    Some(format!(
+        "--{} takes {sources} — never {} itself",
+        f.long, f.what
+    ))
+}
+
+impl<'a> Source<'a> {
+    /// The source a secret flag names; `default` and an absent flag are
+    /// [`Source::NONE`] (the caller handles `default` itself).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no flag reads a secret source yet")
+    )]
+    pub(crate) fn from_flag(flag: Option<&'a SecretSource>) -> Source<'a> {
+        match flag {
+            Some(SecretSource::Env(name)) => Source::env(name),
+            Some(SecretSource::Stdin) => Source::new(None, true),
+            Some(SecretSource::Default) | None => Source::NONE,
+        }
+    }
+}
+
+/// Whether a secret flag said `default`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no flag reads a secret source yet")
+)]
+pub(crate) fn wants_default(flag: Option<&SecretSource>) -> bool {
+    matches!(flag, Some(SecretSource::Default))
 }
 
 pub(crate) enum EnvValue {
@@ -247,7 +444,7 @@ impl<I: SecretIo> Secrets<I> {
     }
 
     /// Whether any secret so far came from a hidden prompt (no flag at a
-    /// terminal, or `--X-stdin` typed at one). A person typing is a gap of
+    /// terminal, or `--X stdin` typed at one). A person typing is a gap of
     /// human length: the caller re-finds the key before opening it.
     pub(crate) fn prompted(&self) -> bool {
         self.prompted
@@ -258,7 +455,7 @@ impl<I: SecretIo> Secrets<I> {
     }
 
     /// Refuse early (no device I/O, nothing read) when a required secret
-    /// has no source and no terminal can ask for it, or when an `--X-env`
+    /// has no source and no terminal can ask for it, or when an `env:NAME`
     /// source is given but unusable (unset, empty, or not valid UTF-8) — a
     /// bad environment variable is caught before any key is selected, not
     /// after. A variable that disappears between this call and [`Self::read`]
@@ -267,8 +464,8 @@ impl<I: SecretIo> Secrets<I> {
         if let Some(var) = src.env {
             return match self.io.env(var) {
                 EnvValue::Set(v) => finish(spec, v, Origin::Env).map(|_| ()),
-                EnvValue::Unset => Err(env_problem(spec.flag, "is not set")),
-                EnvValue::NotUnicode => Err(env_problem(spec.flag, "is not valid UTF-8")),
+                EnvValue::Unset => Err(env_problem(spec, "is not set")),
+                EnvValue::NotUnicode => Err(env_problem(spec, "is not valid UTF-8")),
             };
         }
         if src.given() || self.terminal_present() {
@@ -298,8 +495,8 @@ impl<I: SecretIo> Secrets<I> {
         if let Some(var) = src.env {
             let raw = match self.io.env(var) {
                 EnvValue::Set(v) => v,
-                EnvValue::Unset => return Err(env_problem(spec.flag, "is not set")),
-                EnvValue::NotUnicode => return Err(env_problem(spec.flag, "is not valid UTF-8")),
+                EnvValue::Unset => return Err(env_problem(spec, "is not set")),
+                EnvValue::NotUnicode => return Err(env_problem(spec, "is not valid UTF-8")),
             };
             return finish(spec, raw, Origin::Env);
         }
@@ -319,7 +516,7 @@ impl<I: SecretIo> Secrets<I> {
             let trimmed = Zeroizing::new(strip_line_ending(&line).to_owned());
             return finish(spec, trimmed, Origin::Stdin(n));
         }
-        // `--X-stdin` at a terminal, or no flag with a terminal present.
+        // `--X stdin` at a terminal, or no flag with a terminal present.
         if src.stdin || self.terminal_present() {
             return self.prompt(spec);
         }
@@ -393,12 +590,21 @@ impl<I: SecretIo> Secrets<I> {
     }
 }
 
-/// "the environment variable given to --X-env is not set" — never the
-/// variable's name, which may be the secret itself: a user migrating from
-/// the old command line sometimes passes the secret where the name goes
-/// (`--pin-env DEADBEEF` instead of `--pin-env KR_PIN`).
-fn env_problem(flag: &str, problem: &str) -> String {
-    format!("the environment variable given to --{flag}-env {problem}")
+/// "the environment variable given to --pin is not set" — the flag, never
+/// the variable's name, which may be the secret itself: a user migrating
+/// from the old command line sometimes passes the secret where the name
+/// goes (`--pin env:DEADBEEF` instead of `--pin env:KR_PIN`).
+fn env_problem(spec: &Spec, problem: &str) -> String {
+    if spec.legacy {
+        return format!(
+            "the environment variable given to --{}-env {problem}",
+            spec.flag
+        );
+    }
+    format!(
+        "the environment variable given to --{} {problem}",
+        spec.flag
+    )
 }
 
 fn strip_line_ending(line: &str) -> &str {
@@ -424,7 +630,7 @@ fn finish(
         return Ok(value);
     }
     Err(match origin {
-        Origin::Env => env_problem(spec.flag, "is empty"),
+        Origin::Env => env_problem(spec, "is empty"),
         Origin::Stdin(n) => format!("the {} on stdin line {n} is empty", spec.label),
         Origin::Prompt => format!("no {} entered; nothing was changed", spec.label),
     })
@@ -434,10 +640,17 @@ fn join_hints(options: &[(Spec, Source<'_>)]) -> String {
     let parts: Vec<String> = options
         .iter()
         .flat_map(|(s, _)| {
-            [
-                format!("--{}-env VAR", s.flag),
-                format!("--{}-stdin", s.flag),
-            ]
+            if s.legacy {
+                [
+                    format!("--{}-env VAR", s.flag),
+                    format!("--{}-stdin", s.flag),
+                ]
+            } else {
+                [
+                    format!("--{} env:NAME", s.flag),
+                    format!("--{} stdin", s.flag),
+                ]
+            }
         })
         .collect();
     match parts.split_last() {
@@ -534,7 +747,7 @@ mod tests {
     const NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
     const MGMT: Spec = Spec::current("management key", "mgmt-key")
         .hex()
-        .also("--mgmt-key-default");
+        .with_default();
     const SEED: Spec = Spec::value("seed", "seed").base32();
 
     fn sec(io: FakeIo) -> Secrets<FakeIo> {
@@ -563,7 +776,7 @@ mod tests {
         let mut s = sec(FakeIo::terminal());
         assert_eq!(
             s.read(&PIN, Source::env("KR_NOPE")).unwrap_err(),
-            "the environment variable given to --pin-env is not set"
+            "the environment variable given to --pin is not set"
         );
         assert!(
             s.io.prompts.is_empty(),
@@ -590,7 +803,7 @@ mod tests {
             let mut s = sec(FakeIo::terminal());
             let e = s.read(&PIN, Source::env(name)).unwrap_err();
             assert_eq!(
-                e, "the environment variable given to --pin-env is not set",
+                e, "the environment variable given to --pin is not set",
                 "{name:?}"
             );
             assert!(!e.contains(name) || name.is_empty(), "{name:?}: {e}");
@@ -599,12 +812,12 @@ mod tests {
         let mut s = sec(FakeIo::default().var("DEADBEEF", ""));
         assert_eq!(
             s.read(&PIN, Source::env("DEADBEEF")).unwrap_err(),
-            "the environment variable given to --pin-env is empty"
+            "the environment variable given to --pin is empty"
         );
         let mut s = sec(FakeIo::default().not_unicode_var("DEADBEEF"));
         assert_eq!(
             s.read(&PIN, Source::env("DEADBEEF")).unwrap_err(),
-            "the environment variable given to --pin-env is not valid UTF-8"
+            "the environment variable given to --pin is not valid UTF-8"
         );
     }
 
@@ -613,7 +826,7 @@ mod tests {
         let mut s = sec(FakeIo::default().var("KR_E", ""));
         assert_eq!(
             s.read(&PIN, Source::env("KR_E")).unwrap_err(),
-            "the environment variable given to --pin-env is empty"
+            "the environment variable given to --pin is empty"
         );
     }
 
@@ -622,22 +835,22 @@ mod tests {
         let mut s = sec(FakeIo::default().var("KR_K", "  \t "));
         assert_eq!(
             s.read(&MGMT, Source::env("KR_K")).unwrap_err(),
-            "the environment variable given to --mgmt-key-env is empty"
+            "the environment variable given to --mgmt-key is empty"
         );
     }
 
     #[test]
     fn no_source_without_terminal_names_the_flags_per_prefix() {
         for (spec, want) in [
-            (PIN, "no PIN given: pass --pin-env VAR or --pin-stdin"),
-            (NEW_PIN, "no new PIN given: pass --new-pin-env VAR or --new-pin-stdin"),
+            (PIN, "no PIN given: pass --pin env:NAME or --pin stdin"),
+            (NEW_PIN, "no new PIN given: pass --new-pin env:NAME or --new-pin stdin"),
             (
                 Spec::current("admin PIN (PW3)", "admin-pin"),
-                "no admin PIN (PW3) given: pass --admin-pin-env VAR or --admin-pin-stdin",
+                "no admin PIN (PW3) given: pass --admin-pin env:NAME or --admin-pin stdin",
             ),
             (
                 MGMT,
-                "no management key given: pass --mgmt-key-env VAR, --mgmt-key-stdin or --mgmt-key-default",
+                "no management key given: pass --mgmt-key env:NAME, --mgmt-key stdin or --mgmt-key default",
             ),
             (
                 Spec::value("otpauth:// URI", "uri").hint("`-` to read it from stdin, --uri-env VAR or --qr IMAGE"),
@@ -776,7 +989,7 @@ mod tests {
         let e = sec(io).read(&PIN, Source::NONE).unwrap_err();
         assert!(
             e.starts_with("could not read the PIN at a hidden prompt (")
-                && e.ends_with("); pass --pin-env VAR or --pin-stdin instead"),
+                && e.ends_with("); pass --pin env:NAME or --pin stdin instead"),
             "{e}"
         );
     }
@@ -809,17 +1022,17 @@ mod tests {
         let s = sec(FakeIo::default());
         assert_eq!(
             s.check(&PIN, Source::env("KR_NOPE")).unwrap_err(),
-            "the environment variable given to --pin-env is not set"
+            "the environment variable given to --pin is not set"
         );
         let s = sec(FakeIo::default().var("KR_E", ""));
         assert_eq!(
             s.check(&PIN, Source::env("KR_E")).unwrap_err(),
-            "the environment variable given to --pin-env is empty"
+            "the environment variable given to --pin is empty"
         );
         let s = sec(FakeIo::default().not_unicode_var("KR_BAD"));
         assert_eq!(
             s.check(&PIN, Source::env("KR_BAD")).unwrap_err(),
-            "the environment variable given to --pin-env is not valid UTF-8"
+            "the environment variable given to --pin is not valid UTF-8"
         );
         assert_eq!(s.io.lines_read, 0);
     }
@@ -834,14 +1047,14 @@ mod tests {
         s.io.env.remove("KR_GONE");
         assert_eq!(
             s.read(&PIN, Source::env("KR_GONE")).unwrap_err(),
-            "the environment variable given to --pin-env is not set"
+            "the environment variable given to --pin is not set"
         );
     }
 
     #[test]
     fn exactly_one_of_two_encodings() {
-        const HEX: Spec = Spec::value("seed", "hex").hex();
-        const B32: Spec = Spec::value("seed", "base32").base32();
+        const HEX: Spec = Spec::value("seed", "hex").hex().legacy();
+        const B32: Spec = Spec::value("seed", "base32").base32().legacy();
         let mut s = sec(FakeIo::terminal());
         assert_eq!(
             s.read_one_of("seed", &[(HEX, Source::NONE), (B32, Source::NONE)])
@@ -873,7 +1086,7 @@ mod tests {
         let mut s = sec(FakeIo::terminal().not_unicode_var("KR_BAD"));
         assert_eq!(
             s.read(&PIN, Source::env("KR_BAD")).unwrap_err(),
-            "the environment variable given to --pin-env is not valid UTF-8"
+            "the environment variable given to --pin is not valid UTF-8"
         );
         assert!(
             s.io.prompts.is_empty(),
@@ -933,5 +1146,101 @@ mod tests {
             s.read(&NEW_PIN, Source::NONE).unwrap_err(),
             "no new PIN entered; nothing was changed"
         );
+    }
+
+    #[test]
+    fn parse_source_grammar() {
+        assert_eq!(parse_source("stdin"), Ok(SecretSource::Stdin));
+        assert_eq!(
+            parse_source("env:KR_PIN"),
+            Ok(SecretSource::Env("KR_PIN".into()))
+        );
+        assert_eq!(parse_source("env:a:b"), Ok(SecretSource::Env("a:b".into())));
+        for bad in [
+            "", "123456", "env:", "STDIN", "Stdin", "-", "default", "env", "-123456",
+        ] {
+            assert!(parse_source(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            parse_source_or_default("default"),
+            Ok(SecretSource::Default)
+        );
+        assert!(parse_source_or_default("DEFAULT").is_err());
+        assert_eq!(parse_source("x").unwrap_err(), "not a secret source");
+    }
+
+    #[test]
+    fn literal_refusal_text_per_flag() {
+        assert_eq!(
+            literal_refusal("pin").unwrap(),
+            "--pin takes env:NAME or stdin — never the PIN itself"
+        );
+        assert_eq!(
+            literal_refusal("mgmt-key").unwrap(),
+            "--mgmt-key takes env:NAME, stdin or default — never the management key itself"
+        );
+        assert!(literal_refusal("slot").is_none());
+        for f in SECRET_FLAGS {
+            let m = literal_refusal(f.long).unwrap();
+            assert!(m.starts_with(&format!("--{} takes ", f.long)), "{m}");
+        }
+    }
+
+    #[test]
+    fn env_problems_name_the_flag_never_the_variable() {
+        const P: Spec = Spec::current("PIN", "pin");
+        // Unset, empty, not UTF-8 — at check() and at read().
+        let mut s = sec(FakeIo::default()
+            .var("EMPTY_S3CRET", "")
+            .not_unicode_var("BAD_S3CRET"));
+        for (var, want) in [
+            (
+                "123456",
+                "the environment variable given to --pin is not set",
+            ),
+            (
+                "EMPTY_S3CRET",
+                "the environment variable given to --pin is empty",
+            ),
+            (
+                "BAD_S3CRET",
+                "the environment variable given to --pin is not valid UTF-8",
+            ),
+        ] {
+            let e = s.check(&P, Source::env(var)).unwrap_err();
+            assert_eq!(e, want);
+            let e = s.read(&P, Source::env(var)).unwrap_err();
+            assert_eq!(e, want);
+            assert!(!e.contains(var));
+        }
+    }
+
+    #[test]
+    fn sources_hint_new_grammar() {
+        assert_eq!(
+            Spec::current("PIN", "pin").sources_hint(),
+            "--pin env:NAME or --pin stdin"
+        );
+        assert_eq!(
+            Spec::current("management key", "mgmt-key")
+                .hex()
+                .with_default()
+                .sources_hint(),
+            "--mgmt-key env:NAME, --mgmt-key stdin or --mgmt-key default"
+        );
+        assert_eq!(
+            Spec::value("seed", "hex").hex().legacy().sources_hint(),
+            "--hex-env VAR or --hex-stdin"
+        );
+    }
+
+    #[test]
+    fn from_flag_maps_each_source() {
+        let env = SecretSource::Env("V".into());
+        assert_eq!(Source::from_flag(Some(&env)).env, Some("V"));
+        assert!(Source::from_flag(Some(&SecretSource::Stdin)).stdin);
+        assert!(!Source::from_flag(Some(&SecretSource::Default)).given());
+        assert!(!Source::from_flag(None).given());
+        assert!(wants_default(Some(&SecretSource::Default)) && !wants_default(None));
     }
 }

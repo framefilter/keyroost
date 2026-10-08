@@ -3255,16 +3255,17 @@ impl TimeoutArg {
     }
 }
 
-const MOLTO_KEY_HEX: Spec = Spec::current("customer key", "key").hex();
-const MOLTO_KEY_ASCII: Spec = Spec::current("customer key", "key-ascii");
-const SEED_HEX: Spec = Spec::value("seed", "hex").hex();
-const SEED_B32: Spec = Spec::value("seed", "base32").base32();
-const NEW_KEY_HEX: Spec = Spec::new_secret("new customer key", "hex").hex();
-const NEW_KEY_ASCII: Spec = Spec::new_secret("new customer key", "ascii");
+const MOLTO_KEY_HEX: Spec = Spec::current("customer key", "key").hex().legacy();
+const MOLTO_KEY_ASCII: Spec = Spec::current("customer key", "key-ascii").legacy();
+const SEED_HEX: Spec = Spec::value("seed", "hex").hex().legacy();
+const SEED_B32: Spec = Spec::value("seed", "base32").base32().legacy();
+const NEW_KEY_HEX: Spec = Spec::new_secret("new customer key", "hex").hex().legacy();
+const NEW_KEY_ASCII: Spec = Spec::new_secret("new customer key", "ascii").legacy();
 const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
     .prompt_as("otpauth:// URI")
-    .hint("`-` to read it from stdin, --uri-env VAR or --qr IMAGE");
-const VAULT_PASSWORD: Spec = Spec::current("vault password", "password");
+    .hint("`-` to read it from stdin, --uri-env VAR or --qr IMAGE")
+    .legacy();
+const VAULT_PASSWORD: Spec = Spec::current("vault password", "password").legacy();
 const IMPORT_URI_IN_ARGV: &str = "the otpauth:// URI can't be given on the command line any more (it contains the secret, and the command line ends up in shell history and `ps`): pass `-` and pipe it on stdin, use --uri-env VAR, or --qr IMAGE";
 
 /// The Molto2 customer key: from --key-env / --key-ascii-env, or the
@@ -4313,14 +4314,22 @@ fn looks_like_flag_typo(word: &str) -> bool {
     })
 }
 
-/// Whether `argv` has a `-stdin` flag immediately before a word starting
-/// with `prefix`. clap's `UnknownArgument` context sometimes names only a
-/// prefix of the real word: a dash-led value like `-123456` is parsed as a
-/// run of short flags and the error stops at the first unknown one (`-1`),
-/// not the whole thing — so this matches by prefix rather than equality.
-fn stdin_flag_precedes(argv: &[String], prefix: &str) -> bool {
-    argv.windows(2)
-        .any(|w| w[1].starts_with(prefix) && w[0].ends_with("-stdin"))
+/// Whether `argv` has a word starting with `prefix` right after a secret
+/// source that reads stdin (`--pin stdin`, `--pin=stdin`, or an old
+/// `--X-stdin` flag). clap's `UnknownArgument` context sometimes names
+/// only a prefix of the real word (`-1` for `-123456`), so this matches by
+/// prefix.
+fn secret_flag_precedes(argv: &[String], prefix: &str) -> bool {
+    argv.windows(2).any(|w| {
+        w[1].starts_with(prefix)
+            && (w[0] == "stdin" || w[0].ends_with("=stdin") || w[0].ends_with("-stdin"))
+    })
+}
+
+/// Whether `a` is a secret flag (its value names a source, never the secret).
+fn is_secret_arg(a: &clap::Arg) -> bool {
+    a.get_value_names()
+        .is_some_and(|v| v.iter().any(|n| n.as_str() == crate::secrets::SOURCE))
 }
 
 /// The message to print instead of clap's for a parse error that could
@@ -4334,10 +4343,12 @@ fn stdin_flag_precedes(argv: &[String], prefix: &str) -> bool {
 /// after `molto import -`). A `--X-stdin` flag given a value (`--hex-stdin
 /// DEADBEEF` or `--hex-stdin=DEADBEEF`, both of which clap reports as
 /// `TooManyValues` for a flag that takes none) is redacted the same way, and
-/// so is a dash-led word right after a `-stdin` flag (`--old-pin-stdin
-/// -123456`) unless it's shaped like a typo'd flag name. Any other error
-/// about a flag keeps clap's message: clap names only the flag, never a
-/// value.
+/// so is a dash-led word right after a source that reads stdin (`--pin
+/// stdin -123456`, `--old-pin-stdin -123456`) unless it's shaped like a
+/// typo'd flag name. A secret flag given something other than a source
+/// (`--pin 123456`) is refused with a fixed message naming the sources it
+/// takes, never the value. Any other error about a flag keeps clap's
+/// message: clap names only the flag, never a value.
 fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     use clap::CommandFactory;
@@ -4347,6 +4358,23 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
             return None;
         };
         return retired_command_hint(word, argv);
+    }
+
+    // A secret flag given something other than a source. clap's own
+    // message would repeat the value, which may be the secret itself.
+    if matches!(
+        e.kind(),
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
+    ) {
+        let Some(ContextValue::String(arg)) = e.get(ContextKind::InvalidArg) else {
+            return None;
+        };
+        let long = arg
+            .split([' ', '='])
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('-');
+        return crate::secrets::literal_refusal(long);
     }
 
     // A bare flag given a value it doesn't take. For a `--X-stdin` flag the
@@ -4401,12 +4429,13 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
         );
     }
     let takes_secret = cmd.get_arguments().any(|a| {
-        a.get_long()
-            .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
+        is_secret_arg(a)
+            || a.get_long()
+                .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
     });
 
     let hidden = if arg.starts_with('-') {
-        !looks_like_flag_typo(arg) && stdin_flag_precedes(argv, arg)
+        !looks_like_flag_typo(arg) && secret_flag_precedes(argv, arg)
     } else {
         takes_secret
     };
@@ -5564,9 +5593,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-const OATH_PASSWORD: Spec = Spec::current("OATH password", "password");
-const OATH_NEW_PASSWORD: Spec = Spec::new_secret("new OATH password", "new-password");
-const OATH_SEED: Spec = Spec::value("seed", "seed").base32();
+const OATH_PASSWORD: Spec = Spec::current("OATH password", "password").legacy();
+const OATH_NEW_PASSWORD: Spec = Spec::new_secret("new OATH password", "new-password").legacy();
+const OATH_SEED: Spec = Spec::value("seed", "seed").base32().legacy();
 
 /// Open the OATH applet on the announced key, unlocking it when it is
 /// password-protected. Nothing is held while a password is typed: see
@@ -6524,8 +6553,10 @@ enum ResetAuthInput {
     Pin(zeroize::Zeroizing<String>),
 }
 
-const RESET_MGMT_KEY: Spec = Spec::current("PIV management key", "mgmt-key").hex();
-const RESET_PIN: Spec = Spec::current("PIV PIN", "pin");
+const RESET_MGMT_KEY: Spec = Spec::current("PIV management key", "mgmt-key")
+    .hex()
+    .legacy();
+const RESET_PIN: Spec = Spec::current("PIV PIN", "pin").legacy();
 
 /// Read a RESET command's optional credential from its five `--mgmt-key-*`/
 /// `--pin-*` flags, already mutually exclusive by construction (each
@@ -7142,10 +7173,10 @@ fn ensure_otp_feature(
     Ok(())
 }
 
-const OTP_PIN: Spec = Spec::current("OTP PIN", "pin");
-const OTP_OLD_PIN: Spec = Spec::current("current OTP PIN", "old-pin");
-const OTP_NEW_PIN: Spec = Spec::new_secret("new OTP PIN", "new-pin");
-const OTP_SEED: Spec = Spec::value("seed", "seed").base32();
+const OTP_PIN: Spec = Spec::current("OTP PIN", "pin").legacy();
+const OTP_OLD_PIN: Spec = Spec::current("current OTP PIN", "old-pin").legacy();
+const OTP_NEW_PIN: Spec = Spec::new_secret("new OTP PIN", "new-pin").legacy();
+const OTP_SEED: Spec = Spec::value("seed", "seed").base32().legacy();
 
 /// The OTP PIN for a command that needs it only when the key has one set
 /// (list, add, delete). A PIN given by flag is read as is; otherwise a
@@ -7819,14 +7850,14 @@ fn print_openpgp_public_key(slot_label: &str, attrs: &[u8], key: &keyroost_openp
     }
 }
 
-const PGP_USER_PIN: Spec = Spec::current("user PIN (PW1)", "pin");
-const PGP_SIGN_PIN: Spec = Spec::current("signing PIN (PW1)", "pin");
-const PGP_ADMIN_PIN_VERIFY: Spec = Spec::current("admin PIN (PW3)", "pin");
-const PGP_ADMIN_PIN: Spec = Spec::current("admin PIN (PW3)", "admin-pin");
-const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "old-pin");
-const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin");
-const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "old-pin");
-const PGP_NEW_ADMIN_PIN: Spec = Spec::new_secret("new admin PIN (PW3)", "new-pin");
+const PGP_USER_PIN: Spec = Spec::current("user PIN (PW1)", "pin").legacy();
+const PGP_SIGN_PIN: Spec = Spec::current("signing PIN (PW1)", "pin").legacy();
+const PGP_ADMIN_PIN_VERIFY: Spec = Spec::current("admin PIN (PW3)", "pin").legacy();
+const PGP_ADMIN_PIN: Spec = Spec::current("admin PIN (PW3)", "admin-pin").legacy();
+const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "old-pin").legacy();
+const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin").legacy();
+const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "old-pin").legacy();
+const PGP_NEW_ADMIN_PIN: Spec = Spec::new_secret("new admin PIN (PW3)", "new-pin").legacy();
 
 fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -8300,19 +8331,23 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-const PIV_PIN: Spec = Spec::current("PIN", "pin");
-const PIV_OLD_PIN: Spec = Spec::current("current PIN", "old-pin");
-const PIV_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
-const PIV_PUK: Spec = Spec::current("PUK", "puk");
-const PIV_OLD_PUK: Spec = Spec::current("current PUK", "old-puk");
-const PIV_NEW_PUK: Spec = Spec::new_secret("new PUK", "new-puk");
+const PIV_PIN: Spec = Spec::current("PIN", "pin").legacy();
+const PIV_OLD_PIN: Spec = Spec::current("current PIN", "old-pin").legacy();
+const PIV_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin").legacy();
+const PIV_PUK: Spec = Spec::current("PUK", "puk").legacy();
+const PIV_OLD_PUK: Spec = Spec::current("current PUK", "old-puk").legacy();
+const PIV_NEW_PUK: Spec = Spec::new_secret("new PUK", "new-puk").legacy();
 const PIV_MGMT_KEY: Spec = Spec::current("management key", "mgmt-key")
     .hex()
-    .also("--mgmt-key-default");
+    .with_default()
+    .legacy();
 const PIV_OLD_MGMT_KEY: Spec = Spec::current("current management key", "old-mgmt-key")
     .hex()
-    .also("--old-mgmt-key-default");
-const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key").hex();
+    .with_default()
+    .legacy();
+const PIV_NEW_MGMT_KEY: Spec = Spec::new_secret("new management key", "new-mgmt-key")
+    .hex()
+    .legacy();
 
 fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -10094,12 +10129,22 @@ fn mgmt_key_bytes(
             .default_management_key()
             .map(|k| zeroize::Zeroizing::new(k.to_vec()))
             .ok_or_else(|| {
+                let f = spec.flag;
+                let (default, others) = if spec.legacy {
+                    (
+                        format!("--{f}-default"),
+                        format!("--{f}-env VAR or --{f}-stdin"),
+                    )
+                } else {
+                    (
+                        format!("--{f} default"),
+                        format!("--{f} env:NAME or --{f} stdin"),
+                    )
+                };
                 format!(
-                    "{}: keyroost has no known factory-default {} on record for this device; \
-                     pass --{f}-env VAR or --{f}-stdin instead",
-                    spec.also.unwrap_or("--mgmt-key-default"),
+                    "{default}: keyroost has no known factory-default {} on record for this \
+                     device; pass {others} instead",
                     spec.label,
-                    f = spec.flag
                 )
                 .into()
             }),
@@ -10441,9 +10486,9 @@ fn format_aaguid(aaguid: &[u8; 16]) -> String {
     s
 }
 
-const FIDO_PIN: Spec = Spec::current("PIN", "pin");
-const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "old-pin");
-const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin");
+const FIDO_PIN: Spec = Spec::current("PIN", "pin").legacy();
+const FIDO_OLD_PIN: Spec = Spec::current("current PIN", "old-pin").legacy();
+const FIDO_NEW_PIN: Spec = Spec::new_secret("new PIN", "new-pin").legacy();
 
 /// The PIN for a FIDO command that always needs it: refused before any
 /// device I/O when it has no source, read after the key is announced and
@@ -12873,6 +12918,75 @@ mod cli_tests {
     const IRREVERSIBLE_TYPED: &str =
         "Irreversible: asks for a typed confirmation (`--yes` to skip)";
     const ONE_WAY: &str = "One-way: asks first (`--yes` to skip)";
+
+    #[test]
+    fn literal_refusal_names_the_flag_never_the_value() {
+        use clap::{Arg, Command};
+        let cmd = || {
+            Command::new("t")
+                .arg(
+                    Arg::new("pin")
+                        .long("pin")
+                        .value_name("SOURCE")
+                        .allow_hyphen_values(true)
+                        .value_parser(crate::secrets::parse_source),
+                )
+                .arg(
+                    Arg::new("mgmt_key")
+                        .long("mgmt-key")
+                        .value_name("SOURCE")
+                        .allow_hyphen_values(true)
+                        .value_parser(crate::secrets::parse_source_or_default),
+                )
+        };
+        for (args, want) in [
+            (
+                &["t", "--pin", "S3CRETVALUE"][..],
+                "--pin takes env:NAME or stdin",
+            ),
+            (&["t", "--pin=S3CRETVALUE"], "--pin takes env:NAME or stdin"),
+            (
+                &["t", "--pin", "-S3CRETVALUE"],
+                "--pin takes env:NAME or stdin",
+            ),
+            (&["t", "--pin", "env:"], "--pin takes env:NAME or stdin"),
+            (&["t", "--pin", "default"], "--pin takes env:NAME or stdin"),
+            (
+                &["t", "--mgmt-key", "S3CRETVALUE"],
+                "--mgmt-key takes env:NAME, stdin or default",
+            ),
+        ] {
+            let e = cmd().try_get_matches_from(args).unwrap_err();
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let msg = redacted_parse_error(&e, &argv).expect("redacted");
+            assert!(msg.starts_with(want), "{args:?}: {msg}");
+            assert!(!msg.contains("S3CRET"), "{args:?}: {msg}");
+        }
+        assert!(cmd()
+            .try_get_matches_from(["t", "--mgmt-key", "default"])
+            .is_ok());
+    }
+
+    #[test]
+    fn a_dash_led_word_after_a_stdin_source_is_hidden() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert!(secret_flag_precedes(
+            &argv("k piv x --pin stdin -123456"),
+            "-1"
+        ));
+        assert!(secret_flag_precedes(
+            &argv("k piv x --pin=stdin -123456"),
+            "-1"
+        ));
+        assert!(secret_flag_precedes(
+            &argv("k piv x --old-pin-stdin -123456"),
+            "-1"
+        ));
+        assert!(!secret_flag_precedes(
+            &argv("k piv x --slot 9a -123456"),
+            "-1"
+        ));
+    }
 
     /// Every command in the tree with its path ("fido pin set"; "" for the root).
     fn all_commands() -> Vec<(String, clap::Command)> {
