@@ -1414,139 +1414,25 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Verify a PIN against the card (checks it's correct; changes nothing). The
-    /// PIN comes from an environment variable, stdin or, with neither, a
-    /// hidden prompt — never argv.
-    Verify {
-        /// Which PIN to check: `user` (PW1) or `admin` (PW3). The PIN itself
-        /// comes from --pin or the prompt.
-        #[arg(long, value_enum, value_name = "KIND", default_value_t = OpenpgpPinKind::User)]
-        which: OpenpgpPinKind,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
+    /// Check, change or unblock the user PIN (PW1) or the admin PIN (PW3).
+    Pin {
+        #[command(subcommand)]
+        cmd: OpenpgpPinCmd,
     },
-    /// Read the public key from a slot (read-only; no PIN). RSA keys print
-    /// modulus and exponent, ECC keys the public point, in hex.
-    PublicKey {
-        /// Which key slot: `sign`, `decrypt`, or `auth`.
-        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
-        slot: OpenpgpSlot,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
+    /// Generate, import or show the card's keys, and list the algorithms it supports.
+    Key {
+        #[command(subcommand)]
+        cmd: OpenpgpKeyCmd,
     },
-    /// List the key algorithms this card reports accepting per slot (read-only;
-    /// no PIN). Cards that don't publish the list accept any attempt and answer
-    /// with an error if they can't.
-    Algorithms {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
+    /// Set the cardholder name stored on the card.
+    Name {
+        #[command(subcommand)]
+        cmd: OpenpgpNameCmd,
     },
-    /// Factory-reset the OpenPGP applet: wipe ALL key slots and restore default
-    /// PINs (PW1 123456, PW3 12345678). Irreversible: asks first (`--yes` to
-    /// skip).
-    ///
-    /// Also works to recover a card whose PINs are blocked.
-    Reset {
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-    },
-    /// Set the cardholder name. Needs the admin PIN (PW3).
-    ///
-    /// Writes PUT DATA 005B.
-    SetName {
-        /// Cardholder name to write (UTF-8). The OpenPGP convention is
-        /// `Surname<<Given`, but it is stored verbatim.
-        name: String,
-        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        admin_pin: Option<SecretSource>,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-    },
-    /// Set the public-key URL. Needs the admin PIN (PW3).
-    ///
-    /// Writes PUT DATA 5F50.
-    SetUrl {
-        /// URL to write.
-        url: String,
-        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        admin_pin: Option<SecretSource>,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-    },
-    /// Generate a fresh key pair in a slot, replacing any key already there.
-    /// Irreversible: asks first (`--yes` to skip).
-    ///
-    /// Can switch the slot's algorithm first. Needs the admin PIN (PW3); on a
-    /// YubiKey a touch is also required. Also writes the key's v4 fingerprint
-    /// and a generation timestamp so an OpenPGP tool (e.g. gpg) recognizes the
-    /// key.
-    GenerateKey {
-        /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
-        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
-        slot: OpenpgpSlot,
-        /// Key algorithm to generate. Omit to keep the slot's current algorithm
-        /// (RSA-2048 on a factory card). Ed25519 fits the sign/auth slots,
-        /// X25519 the decrypt slot; the NIST/brainpool/secp256k1 curves fit any.
-        /// See `openpgp algorithms` for what this card accepts. (PIV's `eccp256`
-        /// is `nistp256` here.)
-        #[arg(long, value_enum)]
-        algorithm: Option<CliOpenpgpKeyAlg>,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
-        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        admin_pin: Option<SecretSource>,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-    },
-    /// Import an RSA-2048 key into a slot, replacing any key already there.
-    /// Irreversible: asks first (`--yes` to skip).
-    ///
-    /// The key comes from either `--generate` (fresh host keygen) or `--in
-    /// <FILE>` (an existing PKCS#1/PKCS#8 PEM or DER key); exactly one is
-    /// required. Needs the admin PIN (PW3). The key is registered (fingerprint
-    /// + timestamp) like `openpgp generate-key`.
-    ImportKey {
-        /// Generate a fresh RSA-2048 key on the host and import it.
-        /// Mutually exclusive with `--in`.
-        #[arg(long, conflicts_with = "in_file", required_unless_present = "in_file")]
-        generate: bool,
-        /// Import an existing RSA-2048 private key from a file (PKCS#1 or
-        /// PKCS#8, PEM or DER; auto-detected). Mutually exclusive with
-        /// `--generate`. The key is read locally and imported; it is never
-        /// logged. Prefer an unencrypted key file you can delete afterward.
-        #[arg(long = "in", value_name = "FILE", conflicts_with = "generate")]
-        in_file: Option<std::path::PathBuf>,
-        /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
-        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
-        slot: OpenpgpSlot,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
-        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        admin_pin: Option<SecretSource>,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
+    /// Set the public-key URL stored on the card.
+    Url {
+        #[command(subcommand)]
+        cmd: OpenpgpUrlCmd,
     },
     /// Sign a file with the key in the signature slot.
     ///
@@ -1631,50 +1517,70 @@ enum OpenpgpCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Change the user PIN (PW1). Each PIN comes from an environment
-    /// variable, stdin (the current PIN on the first line, the new one on the
-    /// second) or, with neither, a hidden prompt — never argv.
-    ChangePin {
-        /// The current user PIN (PW1): env:NAME reads that environment
-        /// variable, stdin reads one line (first line; hidden when typed at a
-        /// terminal). With neither, a terminal asks.
+    /// Factory-reset the OpenPGP applet: wipe ALL key slots and restore default
+    /// PINs (PW1 123456, PW3 12345678). Irreversible: asks first (`--yes` to
+    /// skip).
+    ///
+    /// Also works to recover a card whose PINs are blocked.
+    Reset {
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+}
+
+/// `openpgp pin`: the user PIN (PW1) and the admin PIN (PW3).
+#[derive(Subcommand)]
+enum OpenpgpPinCmd {
+    /// Check a PIN without changing anything (the user PIN, or the admin PIN with --admin).
+    ///
+    /// The PIN comes from an environment variable, stdin or, with neither, a
+    /// hidden prompt — never argv.
+    Verify {
+        /// Check the admin PIN (PW3) instead of the user PIN (PW1).
+        #[arg(long)]
+        admin: bool,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
-        /// The new user PIN (PW1): env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --pin stdin is also given;
-        /// hidden when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// Change the user PIN, or the admin PIN with --admin.
+    ///
+    /// Each PIN comes from an environment variable, stdin (the current PIN on
+    /// the first line, the new one on the second) or, with neither, a hidden
+    /// prompt — never argv.
+    Change {
+        /// Change the admin PIN (PW3) instead of the user PIN (PW1).
+        #[arg(long)]
+        admin: bool,
+        /// The current user PIN (PW1), or the current admin PIN (PW3) with
+        /// --admin: env:NAME reads that environment variable, stdin reads one
+        /// line (first line; hidden when typed at a terminal). With neither,
+        /// a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The new user PIN (PW1), or the new admin PIN (PW3) with --admin:
+        /// env:NAME reads that environment variable, stdin reads one line
+        /// (second line when --pin stdin is also given; hidden when typed at
+        /// a terminal). With neither, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         new_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Change the admin PIN (PW3). Each PIN comes from an environment
-    /// variable, stdin (the current PIN on the first line, the new one on the
-    /// second) or, with neither, a hidden prompt — never argv.
-    ChangeAdminPin {
-        /// On this command, --pin is the current admin PIN (PW3), not the user
-        /// PIN: env:NAME reads that environment variable, stdin reads one line
-        /// (first line; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-        /// On this command, --new-pin is the new admin PIN (PW3), not the user
-        /// PIN: env:NAME reads that environment variable, stdin reads one line
-        /// (second line when --pin stdin is also given; hidden when typed at a
-        /// terminal). With neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        new_pin: Option<SecretSource>,
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-    },
-    /// Unblock the user PIN (PW1) using the admin PIN (PW3), setting a new user
-    /// PIN.
+    /// Set a new user PIN using the admin PIN (after too many wrong user PINs).
     ///
     /// Recovers a card whose user PIN is blocked without a factory reset.
     /// Each PIN comes from an environment variable, stdin (the admin PIN on
     /// the first line, the new user PIN on the second) or, with neither, a
     /// hidden prompt — never argv.
-    UnblockPin {
+    Unblock {
         /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
         /// reads one line (first line; hidden when typed at a terminal). With
         /// neither, a terminal asks.
@@ -1686,6 +1592,127 @@ enum OpenpgpCmd {
         /// asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         new_pin: Option<SecretSource>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+}
+
+/// `openpgp key`: the card's key slots.
+#[derive(Subcommand)]
+enum OpenpgpKeyCmd {
+    /// Generate a fresh key pair in a slot, replacing any key already there.
+    /// Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Can switch the slot's algorithm first. Needs the admin PIN (PW3); on a
+    /// YubiKey a touch is also required. Also writes the key's v4 fingerprint
+    /// and a generation timestamp so an OpenPGP tool (e.g. gpg) recognizes the
+    /// key.
+    Generate {
+        /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
+        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        slot: OpenpgpSlot,
+        /// Key algorithm to generate. Omit to keep the slot's current algorithm
+        /// (RSA-2048 on a factory card). Ed25519 fits the sign/auth slots,
+        /// X25519 the decrypt slot; the NIST/brainpool/secp256k1 curves fit any.
+        /// See `openpgp key algorithms` for what this card accepts. (PIV's `eccp256`
+        /// is `nistp256` here.)
+        #[arg(long, value_enum)]
+        algorithm: Option<CliOpenpgpKeyAlg>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// Import an RSA-2048 key into a slot, replacing any key already there.
+    /// Irreversible: asks first (`--yes` to skip).
+    ///
+    /// The key comes from either `--generate` (fresh host keygen) or `--in
+    /// <FILE>` (an existing PKCS#1/PKCS#8 PEM or DER key); exactly one is
+    /// required. Needs the admin PIN (PW3). The key is registered (fingerprint
+    /// + timestamp) like `openpgp key generate`.
+    Import {
+        /// Generate a fresh RSA-2048 key on the host and import it.
+        /// Mutually exclusive with `--in`.
+        #[arg(long, conflicts_with = "in_file", required_unless_present = "in_file")]
+        generate: bool,
+        /// Import an existing RSA-2048 private key from a file (PKCS#1 or
+        /// PKCS#8, PEM or DER; auto-detected). Mutually exclusive with
+        /// `--generate`. The key is read locally and imported; it is never
+        /// logged. Prefer an unencrypted key file you can delete afterward.
+        #[arg(long = "in", value_name = "FILE", conflicts_with = "generate")]
+        in_file: Option<std::path::PathBuf>,
+        /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
+        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        slot: OpenpgpSlot,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// Read the public key from a slot (read-only; no PIN). RSA keys print
+    /// modulus and exponent, ECC keys the public point, in hex.
+    Show {
+        /// Which key slot: `sign`, `decrypt`, or `auth`.
+        #[arg(long, value_enum, default_value_t = OpenpgpSlot::Sign)]
+        slot: OpenpgpSlot,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// List the key algorithms this card reports accepting per slot (read-only;
+    /// no PIN). Cards that don't publish the list accept any attempt and answer
+    /// with an error if they can't.
+    Algorithms {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+}
+
+/// `openpgp name`: the cardholder name.
+#[derive(Subcommand)]
+enum OpenpgpNameCmd {
+    /// Set the cardholder name. Needs the admin PIN (PW3).
+    ///
+    /// Writes PUT DATA 005B.
+    Set {
+        /// Cardholder name to write (UTF-8). The OpenPGP convention is
+        /// `Surname<<Given`, but it is stored verbatim.
+        name: String,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+}
+
+/// `openpgp url`: the public-key URL.
+#[derive(Subcommand)]
+enum OpenpgpUrlCmd {
+    /// Set the public-key URL. Needs the admin PIN (PW3).
+    ///
+    /// Writes PUT DATA 5F50.
+    Set {
+        /// URL to write.
+        url: String,
+        /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
+        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        admin_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
@@ -1762,7 +1789,7 @@ impl OpenpgpSlot {
     }
 }
 
-/// Key algorithm for `openpgp generate-key --algorithm`. Names follow GnuPG's
+/// Key algorithm for `openpgp key generate --algorithm`. Names follow GnuPG's
 /// (`cv25519` is accepted as an alias of `x25519`).
 #[derive(Copy, Clone, ValueEnum)]
 enum CliOpenpgpKeyAlg {
@@ -1807,7 +1834,8 @@ impl CliOpenpgpKeyAlg {
     }
 }
 
-#[derive(Copy, Clone, ValueEnum)]
+/// Which OpenPGP PIN a command checks: `--admin` picks PW3 ([`pin_kind`]).
+#[derive(Copy, Clone)]
 enum OpenpgpPinKind {
     /// PW1 — the user PIN (signing / decryption / authentication).
     User,
@@ -1829,6 +1857,16 @@ impl OpenpgpPinKind {
             OpenpgpPinKind::User => "user (PW1)",
             OpenpgpPinKind::Admin => "admin (PW3)",
         }
+    }
+}
+
+/// The PIN `--admin` selects: the admin PIN (PW3) with it, the user PIN
+/// (PW1) without.
+fn pin_kind(admin: bool) -> OpenpgpPinKind {
+    if admin {
+        OpenpgpPinKind::Admin
+    } else {
+        OpenpgpPinKind::User
     }
 }
 
@@ -3997,6 +4035,12 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
         now: &["--unlock"],
     },
     RetiredFlag {
+        flag: "--which",
+        words: &["openpgp", "pin", "verify"],
+        msg: "--which admin is now --admin (without it, the user PIN is checked)",
+        now: &["--admin"],
+    },
+    RetiredFlag {
         flag: "--file",
         words: &["piv", "cert", "import"],
         msg: "--file was renamed -i/--in (the certificate file to read)",
@@ -4504,6 +4548,66 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         note: "",
     },
     RetiredCommand {
+        parent: "openpgp",
+        old: "verify",
+        new: "openpgp pin verify",
+        note: "the admin PIN is `--admin`",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "change-pin",
+        new: "openpgp pin change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "change-admin-pin",
+        new: "openpgp pin change --admin",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "unblock-pin",
+        new: "openpgp pin unblock",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "generate-key",
+        new: "openpgp key generate",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "import-key",
+        new: "openpgp key import",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "public-key",
+        new: "openpgp key show",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "algorithms",
+        new: "openpgp key algorithms",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "set-name",
+        new: "openpgp name set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "openpgp",
+        old: "set-url",
+        new: "openpgp url set",
+        note: "",
+    },
+    RetiredCommand {
         parent: "otp",
         old: "config",
         new: "otp info",
@@ -4644,7 +4748,7 @@ fn walk_argv<'c>(root: &'c clap::Command, argv: &[String]) -> (Vec<&'c str>, &'c
 ///
 /// A generic row (any command) names its replacement only when the command
 /// typed has it; otherwise the message lists the secret flags it does have
-/// (`--pin-env` on `openpgp set-name` points at `--admin-pin`).
+/// (`--pin-env` on `openpgp name set` points at `--admin-pin`).
 fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<String> {
     let r = RETIRED_FLAGS
         .iter()
@@ -8301,7 +8405,10 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 None => println!("Signatures:     (unavailable)"),
             }
         }
-        OpenpgpCmd::Verify { which, pin, reader } => {
+        OpenpgpCmd::Pin {
+            cmd: OpenpgpPinCmd::Verify { admin, pin, reader },
+        } => {
+            let which = pin_kind(*admin);
             let spec = match which {
                 OpenpgpPinKind::User => &PGP_USER_PIN,
                 OpenpgpPinKind::Admin => &PGP_ADMIN_PIN_VERIFY,
@@ -8316,13 +8423,17 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             session.verify_pin(which.pw_ref(), pin.as_bytes())?;
             println!("{} PIN verified.", which.label());
         }
-        OpenpgpCmd::PublicKey { slot, reader } => {
+        OpenpgpCmd::Key {
+            cmd: OpenpgpKeyCmd::Show { slot, reader },
+        } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             let attrs = session.algorithm_attributes(slot.to_crt())?;
             let key = session.read_public_key(slot.to_crt())?;
             print_openpgp_public_key(slot.label(), &attrs, &key);
         }
-        OpenpgpCmd::Algorithms { reader } => {
+        OpenpgpCmd::Key {
+            cmd: OpenpgpKeyCmd::Algorithms { reader },
+        } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             match session.supported_algorithms()? {
                 None => println!(
@@ -8361,12 +8472,15 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 ident
             );
         }
-        OpenpgpCmd::GenerateKey {
-            slot,
-            algorithm,
-            yes,
-            admin_pin,
-            reader,
+        OpenpgpCmd::Key {
+            cmd:
+                OpenpgpKeyCmd::Generate {
+                    slot,
+                    algorithm,
+                    yes,
+                    admin_pin,
+                    reader,
+                },
         } => {
             if let Some(a) = algorithm {
                 a.to_alg().attributes(slot.to_crt())?;
@@ -8400,13 +8514,16 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             println!("  fingerprint: {}", hex_encode(&fpr));
             println!("  created:     {} (unix)", creation_time);
         }
-        OpenpgpCmd::ImportKey {
-            generate,
-            in_file,
-            slot,
-            yes,
-            admin_pin,
-            reader,
+        OpenpgpCmd::Key {
+            cmd:
+                OpenpgpKeyCmd::Import {
+                    generate,
+                    in_file,
+                    slot,
+                    yes,
+                    admin_pin,
+                    reader,
+                },
         } => {
             let mut sec = Secrets::real();
             let src = Source::from_flag(admin_pin.as_ref());
@@ -8465,10 +8582,13 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             println!("  fingerprint: {}", hex_encode(&fpr));
             println!("  created:     {} (unix)", creation_time);
         }
-        OpenpgpCmd::SetName {
-            name: cardholder,
-            admin_pin,
-            reader,
+        OpenpgpCmd::Name {
+            cmd:
+                OpenpgpNameCmd::Set {
+                    name: cardholder,
+                    admin_pin,
+                    reader,
+                },
         } => {
             let mut sec = Secrets::real();
             let src = Source::from_flag(admin_pin.as_ref());
@@ -8481,10 +8601,13 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             session.set_cardholder_name(cardholder.as_bytes())?;
             println!("Cardholder name set.");
         }
-        OpenpgpCmd::SetUrl {
-            url,
-            admin_pin,
-            reader,
+        OpenpgpCmd::Url {
+            cmd:
+                OpenpgpUrlCmd::Set {
+                    url,
+                    admin_pin,
+                    reader,
+                },
         } => {
             let mut sec = Secrets::real();
             let src = Source::from_flag(admin_pin.as_ref());
@@ -8626,7 +8749,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 None => println!("{}", hex_encode(&sig)),
             }
         }
-        OpenpgpCmd::ChangePin { reader, .. } => {
+        OpenpgpCmd::Pin {
+            cmd: OpenpgpPinCmd::Change { admin, reader, .. },
+        } => {
             let mut sec = Secrets::real();
             let pair = pair_of(pgp_secret_pair(cmd))?;
             pair.check(&sec)?;
@@ -8635,21 +8760,20 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             // CHANGE REFERENCE DATA carries the old PIN itself — no prior VERIFY.
             let mut session = open_openpgp_at(&name, debug)?;
-            session.change_user_pin(old.as_bytes(), new.as_bytes())?;
-            println!("User PIN (PW1) changed.");
+            match pin_kind(*admin) {
+                OpenpgpPinKind::User => {
+                    session.change_user_pin(old.as_bytes(), new.as_bytes())?;
+                    println!("User PIN (PW1) changed.");
+                }
+                OpenpgpPinKind::Admin => {
+                    session.change_admin_pin(old.as_bytes(), new.as_bytes())?;
+                    println!("Admin PIN (PW3) changed.");
+                }
+            }
         }
-        OpenpgpCmd::ChangeAdminPin { reader, .. } => {
-            let mut sec = Secrets::real();
-            let pair = pair_of(pgp_secret_pair(cmd))?;
-            pair.check(&sec)?;
-            let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
-            let (old, new) = pair.read_text(&mut sec)?;
-            reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
-            let mut session = open_openpgp_at(&name, debug)?;
-            session.change_admin_pin(old.as_bytes(), new.as_bytes())?;
-            println!("Admin PIN (PW3) changed.");
-        }
-        OpenpgpCmd::UnblockPin { reader, .. } => {
+        OpenpgpCmd::Pin {
+            cmd: OpenpgpPinCmd::Unblock { reader, .. },
+        } => {
             let mut sec = Secrets::real();
             let pair = pair_of(pgp_secret_pair(cmd))?;
             pair.check(&sec)?;
@@ -10602,14 +10726,26 @@ fn piv_secret_pair(cmd: &PivCmd) -> Option<SecretPair<'_>> {
 
 fn pgp_secret_pair(cmd: &OpenpgpCmd) -> Option<SecretPair<'_>> {
     Some(match cmd {
-        OpenpgpCmd::ChangePin { pin, new_pin, .. } => {
-            secret_pair((&PGP_OLD_USER_PIN, pin), (&PGP_NEW_USER_PIN, new_pin))
-        }
-        OpenpgpCmd::ChangeAdminPin { pin, new_pin, .. } => {
-            secret_pair((&PGP_OLD_ADMIN_PIN, pin), (&PGP_NEW_ADMIN_PIN, new_pin))
-        }
-        OpenpgpCmd::UnblockPin {
-            admin_pin, new_pin, ..
+        OpenpgpCmd::Pin {
+            cmd:
+                OpenpgpPinCmd::Change {
+                    admin,
+                    pin,
+                    new_pin,
+                    ..
+                },
+        } => match pin_kind(*admin) {
+            OpenpgpPinKind::User => {
+                secret_pair((&PGP_OLD_USER_PIN, pin), (&PGP_NEW_USER_PIN, new_pin))
+            }
+            OpenpgpPinKind::Admin => {
+                secret_pair((&PGP_OLD_ADMIN_PIN, pin), (&PGP_NEW_ADMIN_PIN, new_pin))
+            }
+        },
+        OpenpgpCmd::Pin {
+            cmd: OpenpgpPinCmd::Unblock {
+                admin_pin, new_pin, ..
+            },
         } => secret_pair((&PGP_ADMIN_PIN, admin_pin), (&PGP_NEW_USER_PIN, new_pin)),
         _ => return None,
     })
@@ -13611,6 +13747,20 @@ mod cli_tests {
         out
     }
 
+    /// The built command at `path` (`&["openpgp", "pin", "unblock"]`).
+    fn find(path: &[&str]) -> clap::Command {
+        use clap::CommandFactory;
+        let mut root = Cli::command();
+        root.build();
+        let mut c = &root;
+        for name in path {
+            c = c
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no command {path:?}"));
+        }
+        c.clone()
+    }
+
     #[test]
     fn every_flag_and_argument_has_help() {
         let mut bad = Vec::new();
@@ -13653,8 +13803,8 @@ mod cli_tests {
             ("otp reset", IRREVERSIBLE),
             ("otp delete-button-hotp", IRREVERSIBLE),
             ("openpgp reset", IRREVERSIBLE),
-            ("openpgp generate-key", IRREVERSIBLE),
-            ("openpgp import-key", IRREVERSIBLE),
+            ("openpgp key generate", IRREVERSIBLE),
+            ("openpgp key import", IRREVERSIBLE),
             ("piv reset", IRREVERSIBLE),
             ("piv cert delete", IRREVERSIBLE),
             ("piv key delete", IRREVERSIBLE),
@@ -16515,23 +16665,20 @@ mod cli_tests {
     fn openpgp_two_secret_flags_name_their_stdin_line() {
         use clap::CommandFactory;
         let cmd = Cli::command();
-        let openpgp = cmd.find_subcommand("openpgp").unwrap();
+        let openpgp = cmd
+            .find_subcommand("openpgp")
+            .and_then(|c| c.find_subcommand("pin"))
+            .unwrap();
         for (sub, flag, line) in [
-            ("change-pin", "pin", "first line"),
+            ("change", "pin", "first line"),
             (
-                "change-pin",
+                "change",
                 "new-pin",
                 "second line when --pin stdin is also given",
             ),
-            ("change-admin-pin", "pin", "first line"),
+            ("unblock", "admin-pin", "first line"),
             (
-                "change-admin-pin",
-                "new-pin",
-                "second line when --pin stdin is also given",
-            ),
-            ("unblock-pin", "admin-pin", "first line"),
-            (
-                "unblock-pin",
+                "unblock",
                 "new-pin",
                 "second line when --admin-pin stdin is also given",
             ),
@@ -16963,6 +17110,65 @@ mod cli_tests {
     }
 
     #[test]
+    fn openpgp_nests_by_topic_and_admin_selects_pw3() {
+        for a in [
+            &["keyroostctl", "openpgp", "pin", "verify"][..],
+            &["keyroostctl", "openpgp", "pin", "verify", "--admin"],
+            &["keyroostctl", "openpgp", "pin", "change", "--admin"],
+            &["keyroostctl", "openpgp", "pin", "unblock"],
+            &[
+                "keyroostctl",
+                "openpgp",
+                "key",
+                "generate",
+                "--slot",
+                "sign",
+            ],
+            &[
+                "keyroostctl",
+                "openpgp",
+                "key",
+                "import",
+                "--generate",
+                "--slot",
+                "sign",
+            ],
+            &["keyroostctl", "openpgp", "key", "show", "--slot", "sign"],
+            &["keyroostctl", "openpgp", "key", "algorithms"],
+            &["keyroostctl", "openpgp", "name", "set", "x"],
+            &[
+                "keyroostctl",
+                "openpgp",
+                "url",
+                "set",
+                "https://example.invalid/k.asc",
+            ],
+        ] {
+            assert!(parse(a).is_ok(), "{a:?}");
+        }
+        assert!(matches!(pin_kind(true), OpenpgpPinKind::Admin));
+        assert!(matches!(pin_kind(false), OpenpgpPinKind::User));
+        // Commands that only ever check PW3 take --admin-pin, never --pin.
+        for p in [
+            &["openpgp", "pin", "unblock"][..],
+            &["openpgp", "name", "set"],
+            &["openpgp", "url", "set"],
+            &["openpgp", "key", "generate"],
+            &["openpgp", "key", "import"],
+        ] {
+            let c = find(p);
+            assert!(
+                c.get_arguments().any(|a| a.get_long() == Some("admin-pin")),
+                "{p:?}"
+            );
+            assert!(
+                !c.get_arguments().any(|a| a.get_long() == Some("pin")),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
     fn piv_nests_by_topic() {
         for a in [
             &["keyroostctl", "piv", "pin", "change"][..],
@@ -17099,7 +17305,8 @@ mod cli_tests {
         assert!(Cli::try_parse_from([
             "keyroostctl",
             "openpgp",
-            "change-pin",
+            "pin",
+            "change",
             "--pin",
             "stdin",
             "--new-pin",
@@ -17109,7 +17316,9 @@ mod cli_tests {
         assert!(Cli::try_parse_from([
             "keyroostctl",
             "openpgp",
-            "change-admin-pin",
+            "pin",
+            "change",
+            "--admin",
             "--pin",
             "stdin",
             "--new-pin",
@@ -17119,7 +17328,8 @@ mod cli_tests {
         assert!(Cli::try_parse_from([
             "keyroostctl",
             "openpgp",
-            "unblock-pin",
+            "pin",
+            "unblock",
             "--admin-pin",
             "stdin",
             "--new-pin",
@@ -17129,13 +17339,13 @@ mod cli_tests {
     }
 
     #[test]
-    fn openpgp_verify_takes_which_not_pin() {
+    fn openpgp_pin_verify_takes_admin_not_a_pin_kind() {
         match parse(&[
             "keyroostctl",
             "openpgp",
+            "pin",
             "verify",
-            "--which",
-            "admin",
+            "--admin",
             "--pin",
             "stdin",
         ])
@@ -17143,15 +17353,16 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Openpgp {
-                cmd: OpenpgpCmd::Verify { which, pin, .. },
-            }) => {
-                assert!(matches!(which, OpenpgpPinKind::Admin) && pin == Some(SecretSource::Stdin))
-            }
-            _ => panic!("expected openpgp verify"),
+                cmd:
+                    OpenpgpCmd::Pin {
+                        cmd: OpenpgpPinCmd::Verify { admin, pin, .. },
+                    },
+            }) => assert!(admin && pin == Some(SecretSource::Stdin)),
+            _ => panic!("expected openpgp pin verify"),
         }
         // `--pin admin` (which PIN, in older releases) is now a literal
         // given to the PIN's source flag, refused like any other.
-        let e = parse(&["keyroostctl", "openpgp", "verify", "--pin", "admin"])
+        let e = parse(&["keyroostctl", "openpgp", "pin", "verify", "--pin", "admin"])
             .err()
             .unwrap();
         assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation);
@@ -17161,14 +17372,17 @@ mod cli_tests {
     fn openpgp_generate_key_algorithm_is_optional_and_named_like_gpg() {
         // No --algorithm: None — generate whatever the slot's attributes say
         // (the pre-#106 behavior, unchanged for scripts).
-        match parse(&["keyroostctl", "openpgp", "generate-key", "--yes"])
+        match parse(&["keyroostctl", "openpgp", "key", "generate", "--yes"])
             .unwrap()
             .command
         {
             Some(Cmd::Openpgp {
-                cmd: OpenpgpCmd::GenerateKey { algorithm, .. },
+                cmd:
+                    OpenpgpCmd::Key {
+                        cmd: OpenpgpKeyCmd::Generate { algorithm, .. },
+                    },
             }) => assert!(algorithm.is_none()),
-            _ => panic!("expected openpgp generate-key"),
+            _ => panic!("expected openpgp key generate"),
         }
         for (name, want) in [
             ("ed25519", keyroost_openpgp::KeyAlg::Ed25519),
@@ -17181,7 +17395,8 @@ mod cli_tests {
             match parse(&[
                 "keyroostctl",
                 "openpgp",
-                "generate-key",
+                "key",
+                "generate",
                 "--yes",
                 "--algorithm",
                 name,
@@ -17191,14 +17406,17 @@ mod cli_tests {
             {
                 Some(Cmd::Openpgp {
                     cmd:
-                        OpenpgpCmd::GenerateKey {
-                            algorithm: Some(a), ..
+                        OpenpgpCmd::Key {
+                            cmd:
+                                OpenpgpKeyCmd::Generate {
+                                    algorithm: Some(a), ..
+                                },
                         },
                 }) => assert_eq!(a.to_alg(), want, "{name}"),
-                _ => panic!("expected openpgp generate-key --algorithm {name}"),
+                _ => panic!("expected openpgp key generate --algorithm {name}"),
             }
         }
-        assert!(parse(&["keyroostctl", "openpgp", "algorithms"]).is_ok());
+        assert!(parse(&["keyroostctl", "openpgp", "key", "algorithms"]).is_ok());
     }
 
     #[test]
@@ -18750,20 +18968,14 @@ mod cli_tests {
         }
     }
 
-    /// `openpgp change-admin-pin --pin` is the admin PIN, not the user PIN
-    /// `--pin` means elsewhere in `openpgp`; its help says so plainly.
+    /// On `openpgp pin change`, `--admin` turns `--pin` and `--new-pin`
+    /// into the admin PIN; their help says so plainly.
     #[test]
-    fn openpgp_change_admin_pin_help_names_the_admin_pin() {
-        use clap::CommandFactory;
-        let root = Cli::command();
-        let c = root
-            .find_subcommand("openpgp")
-            .unwrap()
-            .find_subcommand("change-admin-pin")
-            .unwrap();
+    fn openpgp_pin_change_help_names_the_admin_pin() {
+        let c = find(&["openpgp", "pin", "change"]);
         for (long, want) in [
-            ("pin", "the current admin PIN (PW3), not the user PIN"),
-            ("new-pin", "the new admin PIN (PW3), not the user PIN"),
+            ("pin", "the current admin PIN (PW3) with --admin"),
+            ("new-pin", "the new admin PIN (PW3) with --admin"),
         ] {
             let help = c
                 .get_arguments()
@@ -18827,7 +19039,7 @@ mod cli_tests {
         for (flag, line, want, never) in [
             (
                 "--pin-env",
-                "keyroostctl openpgp set-name x --pin-env V",
+                "keyroostctl openpgp name set x --pin-env V",
                 "--admin-pin",
                 "now --pin ",
             ),
@@ -18960,9 +19172,8 @@ mod cli_tests {
                 "fido pin change",
                 "oath add",
                 "oath set-password",
-                "openpgp change-pin",
-                "openpgp change-admin-pin",
-                "openpgp unblock-pin",
+                "openpgp pin change",
+                "openpgp pin unblock",
                 "piv pin change",
                 "piv pin unblock",
                 "piv puk change",

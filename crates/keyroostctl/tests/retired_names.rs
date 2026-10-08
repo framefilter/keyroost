@@ -30,6 +30,59 @@ const CASES: &[(&[&str], &str)] = &[
         &["openpgp", "status", "S3CRETVALUE"],
         "keyroostctl openpgp info",
     ),
+    (
+        &["openpgp", "verify", "--which", "S3CRETVALUE"],
+        "keyroostctl openpgp pin verify",
+    ),
+    (
+        &["openpgp", "verify", "S3CRETVALUE"],
+        "the admin PIN is `--admin`",
+    ),
+    (
+        &["openpgp", "change-pin", "--old-pin-env", "S3CRETVALUE"],
+        "keyroostctl openpgp pin change",
+    ),
+    (
+        &[
+            "openpgp",
+            "change-admin-pin",
+            "--old-pin-env",
+            "S3CRETVALUE",
+        ],
+        "keyroostctl openpgp pin change --admin",
+    ),
+    (
+        &["openpgp", "unblock-pin", "S3CRETVALUE"],
+        "keyroostctl openpgp pin unblock",
+    ),
+    (
+        &["openpgp", "generate-key", "S3CRETVALUE"],
+        "keyroostctl openpgp key generate",
+    ),
+    (
+        &["openpgp", "import-key", "--in", "S3CRETVALUE"],
+        "keyroostctl openpgp key import",
+    ),
+    (
+        &["openpgp", "public-key", "S3CRETVALUE"],
+        "keyroostctl openpgp key show",
+    ),
+    (
+        &["openpgp", "algorithms", "S3CRETVALUE"],
+        "keyroostctl openpgp key algorithms",
+    ),
+    (
+        &["openpgp", "set-name", "S3CRETVALUE"],
+        "keyroostctl openpgp name set",
+    ),
+    (
+        &["openpgp", "set-url", "S3CRETVALUE"],
+        "keyroostctl openpgp url set",
+    ),
+    (
+        &["openpgp", "pin", "verify", "--which", "S3CRETVALUE"],
+        "--admin",
+    ),
     (&["otp", "config", "S3CRETVALUE"], "keyroostctl otp info"),
     (&["otp", "get", "S3CRETVALUE"], "keyroostctl otp code"),
     (

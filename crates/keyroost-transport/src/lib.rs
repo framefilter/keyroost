@@ -607,7 +607,7 @@ impl fmt::Display for TransportError {
             TransportError::OpenPgpSlotNotRsa { slot, label } => write!(
                 f,
                 "the {slot} slot holds an ECC key ({label}); RSA import needs an RSA \
-                 slot — run `openpgp generate-key --slot {slot} --algorithm rsa2048` first"
+                 slot — run `openpgp key generate --slot {slot} --algorithm rsa2048` first"
             ),
             TransportError::PivImportCertificateKeyMismatch(slot) => write!(
                 f,

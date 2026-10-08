@@ -298,7 +298,7 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `openpgp import-key --in` loads and checks the key file before any key
+/// `openpgp key import --in` loads and checks the key file before any key
 /// is looked at, so a wrong path or a file that isn't an RSA-2048 key fails
 /// before the question and the admin PIN.
 #[test]
@@ -314,7 +314,7 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
         (&junk, "could not parse RSA private key"),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
-            .args(["openpgp", "import-key", "--yes", "--admin-pin"])
+            .args(["openpgp", "key", "import", "--yes", "--admin-pin"])
             .arg("env:KR_TEST_ADMIN_PIN")
             .arg("--in")
             .arg(path)
@@ -347,7 +347,7 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
         &["piv", "puk", "change", "--new-puk", "S3CRETVALUE"],
         &["piv", "chuid", "generate", "--mgmt-key", "S3CRETVALUE"],
         &["piv", "mgmt-key", "change", "--new-mgmt-key", "default"],
-        &["openpgp", "set-name", "x", "--admin-pin", "S3CRETVALUE"],
+        &["openpgp", "name", "set", "x", "--admin-pin", "S3CRETVALUE"],
         &["oath", "list", "--password", "S3CRETVALUE"],
         &["oath", "set-password", "--new-password", "S3CRETVALUE"],
         &["oath", "add", "n", "--seed", "S3CRETVALUE"],
