@@ -1535,7 +1535,7 @@ pub fn encode_chuid(guid: &[u8; 16], expiration: &[u8; 8]) -> Vec<u8> {
 /// and LRC (tags `0x3E`/`0xFE` — see [`encode_chuid`]). The signature and LRC
 /// carry no information worth surfacing in a UI (this crate's own
 /// [`encode_chuid`] always writes both empty), but a caller displaying raw
-/// protocol detail (e.g. `keyroostctl piv status`) may still want them, so
+/// protocol detail (e.g. `keyroostctl piv info`) may still want them, so
 /// [`parse_chuid`] keeps all five rather than silently dropping two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chuid {

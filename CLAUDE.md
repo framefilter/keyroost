@@ -45,7 +45,7 @@ tool. Workspace contains:
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots + Google Authenticator migration batches (always built; the GUI's separate `qr` feature gates *screen capture*, not this) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-screengrab` | Windows-only GDI screen capture for QR-from-screen; the sole `unsafe` FFI crate; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-winwebauthn` | Windows-only non-admin FIDO2 helper: detect a FIDO key, open Windows' security-key settings, relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
-| `keyroostctl` | CLI binary | `clap` (+ `clap_complete`/`clap_mangen`), `serde`/`serde_json`, `zeroize` |
+| `keyroostctl` | CLI binary | `clap` (+ `clap_complete`/`clap_mangen`), `serde`/`serde_json`, `zeroize`, `rpassword` (=7.5.4, hidden PIN/password prompt; pulls `rtoolbox`, `libc`/`windows-sys` per platform) |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `serde`/`serde_json`, `zeroize`, `base64`, plus platform UI deps (`arboard`, `rfd`, `pollster`, `png`; Linux `ashpd`/`x11rb` behind the `qr` feature); `winresource` as a Windows-only **build**-dependency (embeds the icon + version info into `keyroost.exe`; never linked into any binary, never compiled off Windows) |
 
 ## Where to start reading
@@ -110,7 +110,8 @@ workflow during bring-up is:
 - **Vendor over depend.** SM4, SHA-1, base32, hex, CBOR, TLV, and otpauth
   parsing are all in-tree. External deps are limited to a small, deliberate set
   of scoped exceptions — the transport/UI boundary (`pcsc`, `clap`,
-  `eframe`/`egui` + platform UI crates, `serde`), FFI-only crates
+  `eframe`/`egui` + platform UI crates, `serde`, `rpassword` for the hidden
+  terminal prompt), FFI-only crates
   (`hidapi` off-Linux, `windows-sys` on Windows), and vetted RustCrypto/`rsa`/
   `scrypt`/`aes-gcm`/`zeroize`/`getrandom` where hand-rolling the primitive
   would be irresponsible (see the per-crate deps in the table above). No new
@@ -174,19 +175,21 @@ host secrets as untouchable. A PreToolUse hook (`.claude/hooks/guard.sh`)
 enforces the rules below; **don't try to work around the guard** — if it
 blocks something, that's intended.
 
-- **Destructive FIDO ops** (`keyroostctl fido reset`, `fido creds-delete`) are
+- **Destructive FIDO ops** (`keyroostctl fido reset`, `fido credential delete`) are
   irreversible. This checkout is used only with disposable **test keys**, so
   the guard no longer blocks them — still treat them with care and never point
   them at a security key in real use.
 - **Never print or read secrets.** Don't `printenv`, don't `echo` a
   PIN/password/token variable, don't read `.env`, `*.pem`, SSH keys, or
   NetworkManager / `wpa_supplicant` WiFi configs. (Hook-blocked.)
-- **PIN entry is the user's job.** PINs come from `--pin-env` / `--pin-stdin`
-  the user sets in their own shell. Don't ask for the PIN, don't place it in
-  argv, don't read it back.
-- **Credential listings are private.** `fido creds-list` reveals which services
+- **PIN entry is the user's job.** keyroostctl takes no secret in argv; with
+  no `--pin env:NAME` / `--pin stdin` it asks at a hidden terminal prompt. The
+  user types it there, or sets `--pin env:NAME` / `--pin stdin` up in their own
+  shell.
+  Don't ask for the PIN, don't place it in argv, don't read it back.
+- **Credential listings are private.** `fido credential list` reveals which services
   the user has accounts with. Don't run it speculatively; if the user shares
   output, don't echo usernames / RP names beyond what the task needs.
 - **Safe to run freely against any key:** `keyroostctl doctor`, `keyroostctl list`,
-  `keyroostctl fido info`, `keyroostctl fido pin-retries` (read-only, no PIN, no
+  `keyroostctl fido info`, `keyroostctl fido pin retries` (read-only, no PIN, no
   counter change).

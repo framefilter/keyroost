@@ -372,7 +372,7 @@ pub fn set_config(sm4_key: &[u8; 16], profile: u8, cfg: &ProfileConfig) -> Comma
     }
 }
 
-/// Slim variant of set_config that only updates the UTC time TLV. Used by sync-time.
+/// Slim variant of set_config that only updates the UTC time TLV. Used by `molto sync`.
 pub fn sync_time(sm4_key: &[u8; 16], profile: u8, utc_time: u32) -> Command {
     let mut tlv = Vec::with_capacity(8);
     tlv.push(0x81);

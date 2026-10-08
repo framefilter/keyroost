@@ -127,15 +127,15 @@
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
       <p>A reset never guesses which key it is aimed at. With one key connected it uses
-        that key. With several, <code>factory-reset</code> and the <code>molto</code>,
-        <code>oath</code>, <code>openpgp</code>, and <code>piv</code> resets
-        <strong>refuse</strong> until you name one with <code>--device</code>, and
-        <code>fido reset</code> asks you to pick one from a list. Resets reject
-        <code>--reader</code> and <code>--device</code> together, since those can name
-        different keys. Every wipe also needs an explicit <code>--yes</code>. Reset
+        that key. With several, a terminal shows a numbered list to pick from; a script
+        is <strong>refused</strong> with the <code>--device</code> value for each key.
+        <code>--reader</code> or <code>--path</code> together with <code>--device</code>
+        is rejected, since they can name different keys. Before wiping, keyroost names
+        the key and asks <strong>y/N</strong> (<code>factory-reset</code> asks you to type
+        <code>reset</code>); a script must add <code>--yes</code> instead. Reset
         support spans the FIDO2, OATH, OpenPGP,
         PIV, Token2 on-device OTP, and Molto2 applets; read-only inspection
-        (<code>list</code>, <code>fido info</code>, <code>piv status</code>) never changes
+        (<code>list</code>, <code>fido info</code>, <code>piv info</code>) never changes
         anything and never needs a PIN.</p>
     </div>
   </section>
@@ -144,24 +144,28 @@
     <h2>Resetting a whole key at once</h2>
     <p>One command wipes every resettable applet the key exposes, in order — OATH, OpenPGP,
       Token2 on-device OTP, PIV, then FIDO2 last, because it ends with a ceremony:</p>
-<pre><code>keyroostctl factory-reset --yes</code></pre>
+<pre><code>keyroostctl factory-reset                       # asks you to type "reset"
+keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
     <p>The card applets run silently; the OTP step wants a confirming button press on the
       key. What the FIDO2 step asks for depends on the device's shape. A <strong>USB
-      key</strong> is prompted for an unplug, replug, and touch — keyroost pins the key's
-      identity before the sweep starts and <strong>verifies the key that comes back after
-      the replug is the one you confirmed</strong>; a key that exposes no serial is accepted
-      only when it is unambiguously the only one connected. A <strong>card in a smart-card
+      key</strong> is asked to be unplugged and plugged back in within 60 seconds — keyroost
+      notices the replug on its own, no Enter needed — and then touched. keyroost records
+      the key's identity before the sweep starts and <strong>verifies the key that comes
+      back after the replug is the one you confirmed</strong>; a key that exposes no serial
+      is accepted only when it is unambiguously the only one connected. If no replug is
+      seen, nothing is sent and the step is reported as skipped. A <strong>card in a smart-card
       reader</strong> has nothing to unplug and no touch surface, so it is reset in place:
       keyroost resets the card in the reader (which opens the same brief
       after-power-up window a replug does) and sends the wipe immediately. The same
       in-place path is available on its own as
-      <code>keyroostctl fido reset --yes --reader &lt;name&gt;</code>. Each step prints its
-      own result and the command exits nonzero if anything failed.</p>
+      <code>keyroostctl fido reset --reader &lt;name&gt;</code>. Each step prints its
+      own result, the command ends with a line like <code>factory reset: 5 wiped, 0
+      skipped, 0 failed</code>, and it exits nonzero if any step failed or was skipped.</p>
     <p>The desktop app offers the same sweep as a <strong>Factory reset</strong> card on a
       key's Overview tab, with a live per-step report — including a FIDO2 row — so you can
       see exactly which applets came back clean and which need another pass.</p>
     <p class="kr-muted">The Token2 Molto2 is not part of this sweep; it has its own
-      <code>keyroostctl molto reset --yes</code>, which also needs a physical button
+      <code>keyroostctl molto reset</code>, which also needs a physical button
       confirmation on the token. <a href="molto2.html">Molto2 →</a></p>
   </section>
 

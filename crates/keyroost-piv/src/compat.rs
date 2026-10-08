@@ -169,7 +169,7 @@ pub enum PivExtension {
     /// certificate, proving on-card key generation.
     Attest,
     /// Unlocking PIV management functionality (key-gen, cert import,
-    /// set-retries, management-key rotation, …) via PIN VERIFY instead of the
+    /// retry counts, management-key rotation, …) via PIN VERIFY instead of the
     /// standard `0x9B` GENERAL AUTHENTICATE round. Some devices (HID
     /// Crescendo) implement this directly — PIN VERIFY alone satisfies the
     /// same access condition GENERAL AUTHENTICATE on `0x9B` would. Others
@@ -614,7 +614,7 @@ pub enum PivQuirk {
     /// [`PivExtension::SlotPinPolicy`] is supported on this device in
     /// principle — GENERATE ASYMMETRIC KEYPAIR accepts the `0xAA` tag — but
     /// the specific `Once` value is rejected. A caller offering the PIN
-    /// policy picker (GUI combo box, `keyroostctl piv generate-key
+    /// policy picker (GUI combo box, `keyroostctl piv key generate
     /// --pin-policy`) disables/refuses just that one choice rather than
     /// dimming the whole control the way an [`PivExtension::SlotPinPolicy`]
     /// [`FeatureGate::Unsupported`] verdict would — every other value

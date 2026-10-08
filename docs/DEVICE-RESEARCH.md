@@ -122,6 +122,45 @@ Two constraints the implementation had to add that this plan did not anticipate:
   could each own is no longer guessed at by vendor name; contended sets are shown
   separately. That is privacy-review item 3 ("graceful degradation") answered
   concretely: where identity can't be established, say so rather than fake it.
+  ([#51](https://github.com/framefilter/keyroost/issues/51) follow-up below.)
+
+The HID-only resolver (`read_effective_serial`, `connected_keys`) was removed in
+v0.13.0; the GUI and CLI now share the device model (`keyroost_resolve::enumerate`),
+and the CLI picks a row with `select::resolve_target`.
+
+## Identity matching across interfaces (#51, v0.13.0)
+
+On Windows and macOS a key's FIDO-HID node and its smart-card reader carry no
+USB position, so the two halves of one key could not be joined when two keys of
+the same make were connected. Matching now runs in three steps: USB position
+(where the OS reports it), then the identity each side reports, then the
+existing vendor fallback. Identities are compared only within one encoding;
+two encodings whose relation no real key has confirmed are never equated.
+
+| Vendor | HID side | Smart-card side | Compared as |
+|---|---|---|---|
+| Yubico | management READ CONFIG over CTAPHID (vendor command `0xC2`, config page 0, as yubikit sends it); serial is TLV tag `0x02` | the serial already read by the reader probe (no extra traffic) | decimal serial |
+| Solo 2 | USB `iSerialNumber` (the device UUID); fallback: admin UUID over CTAPHID (vendor command `0xE2`) | SELECT the admin applet `A0000008470000 0001`, then `00 62 00 00` → 16-byte UUID | lowercase hex UUID |
+| Token2 | GET_INFO serial request (§6.10 of Token2's public OTP-on-FIDO protocol document) over HID, reply `D1 len …` | the same request after selecting the FIDO applet; if that fails, the OTP applet's reply, which is plain ASCII decimal | the FIDO-format reply with the FIDO-format reply only; the OTP-applet form only with itself |
+
+**Evidence.** YubiKey 5 (fw 5.7) and Solo 2 (fw 2.3.x) were matched by
+identity alone on hardware: with USB-position matching switched off in a test
+build, the device list came out identical to the USB-position result. The two
+CTAPHID vendor commands were confirmed read-only on the same keys (YubiKey
+configuration unchanged; Solo 2 returned its UUID, keys unchanged). Token2 is
+implemented from its public protocol document; how the FIDO-format and
+OTP-applet encodings relate is not yet confirmed on a real key, so they are
+compared only like-for-like until it is. A Windows community test is pending.
+The Molto2 and the single-profile programmable tokens are never sent an
+identity read.
+
+**Privacy.** Identities are read only to join the two halves of a key, held in
+memory for that scan, and written to disk only when the user names the key
+(`keys.json`, as before). Every read is read-only and traced under `--debug`;
+the HID reads give up after 1.5 seconds. Reads are planned only for what USB
+position leaves unmatched, so where USB position settles every key (Linux) no
+identity read is sent. Where several keys of one make are connected, a key
+that doesn't answer is shown as two entries, not guessed at.
 
 ---
 

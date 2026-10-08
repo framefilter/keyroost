@@ -10,6 +10,7 @@ pub mod sha1;
 pub mod sha256;
 pub mod sha512;
 pub mod sm4;
+pub mod trace;
 
 pub use commands::{
     answer_challenge, delete_seed, derive_sm4_key, factory_reset, get_challenge, get_info,

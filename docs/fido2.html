@@ -117,8 +117,9 @@
     </ul>
     <div class="kr-callout danger">
       <div class="kr-callout-title danger">Don't put your PIN in a command line</div>
-      <p>With keyroost, PINs come from <code>--pin-stdin</code> or <code>--pin-env</code> that
-        you control — never as a plain argument, and the tool never prints or stores them.</p>
+      <p>With keyroost, a PIN comes from a hidden prompt in your terminal, or in a script
+        from <code>--pin env:NAME</code> or <code>--pin stdin</code> — never as a plain
+        argument, and the tool never prints or stores it.</p>
     </div>
   </section>
 
@@ -130,7 +131,7 @@
         retries; <strong>set / change the PIN</strong> and unlock with it; list, inspect, and
         delete resident credentials; enrol, rename and delete fingerprints; set CTAP 2.1
         policy (always-require-UV, minimum PIN length, forced PIN change, enterprise
-        attestation); read and manage the key's <strong>large-blob store</strong> and extract
+        attestation); read and manage the key's <strong>largeBlob store</strong> and extract
         a stored OpenSSH certificate; and <strong>reset</strong> a key. Read-only inspection
         needs no PIN.</p>
     </div>
@@ -143,7 +144,7 @@
       advertises: <strong>Passkeys</strong> (resident credentials),
       <strong>Fingerprints</strong> on biometric keys
       (<a href="fingerprint.html">see Fingerprints</a>), and <strong>Storage</strong> for
-      the key's large-blob area (<a href="storage.html">see Storage</a>) — a key that
+      the key's largeBlob area (<a href="storage.html">see Storage</a>) — a key that
       doesn't advertise one of those simply gets no tab for it.
       <strong>Settings</strong> is always present on a CTAP2 key: it carries the FIDO2
       reset (a baseline CTAP2 command) as well as the security-policy controls such as
@@ -151,8 +152,17 @@
       <code>authnrCfg</code> (<a href="settings.html">see Settings</a>). Locking returns to
       the gate and clears the session for all of them.</p>
 <pre><code>keyroostctl fido info
-keyroostctl fido pin-retries
-keyroostctl fido creds-list --pin-stdin   # PIN read from stdin, never argv</code></pre>
+keyroostctl fido pin retries
+keyroostctl fido credential list               # asks for the PIN (hidden)
+keyroostctl fido credential delete --id &lt;hex&gt;  # asks y/N, then for the PIN
+keyroostctl fido credential list --pin env:KR_PIN   # in a script: PIN from a variable
+keyroostctl fido reset                          # asks y/N, then waits for a replug and a touch</code></pre>
+    <p>Deleting a credential or fingerprint and resetting name the key and ask
+      <strong>y/N</strong> first. A script has no terminal to ask on, so it adds
+      <code>--yes</code> (<code>-y</code>); so does a command whose PIN is piped in with
+      <code>--pin stdin</code>. <code>fido reset</code> on a USB key then asks you to unplug
+      it and plug it back in within 60 seconds (keyroost notices the replug itself), checks
+      it is the same key, and asks for a touch.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">On Windows</div>
       <p>Windows reserves direct FIDO access for elevated processes, so managing a key needs

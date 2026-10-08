@@ -3,22 +3,37 @@
 //! Bridges raw device enumeration ([`keyroost_hid`]) and the friendly-name
 //! registry ([`keyroost_keyring`]) into one place, so the CLI (`keyroostctl`) and the
 //! GUI (`keyroost`) are thin front-ends over a single resolver rather than each
-//! re-implementing serial computation.
+//! re-implementing identity matching.
 //!
-//! The key job is computing a device's *effective serial*: the USB
-//! `iSerialNumber` when present, else a serial read over CCID for YubiKeys
-//! (which expose none). YubiKeys are matched to their CCID reader by USB
-//! topology so two connected YubiKeys are never confused — see
-//! [`ccid_serial_for`].
+//! The device-model path ([`device::correlate`] / [`device::correlate_live`])
+//! is how every front end identifies a key: it merges HID enumeration with a
+//! PC/SC applet probe and, where topology alone can't decide, an on-demand
+//! identity read ([`identity::read_identities`]), then hands the result to
+//! [`select::resolve_target`] for `--device`/`--reader`/`--path`/picker
+//! matching. A USB
+//! `iSerialNumber` or a CCID-read YubiKey serial ([`ccid_serial_for`]) is one
+//! input into that merge, not a resolver of its own — this module no longer
+//! exposes a HID-only name lookup; use the device model instead.
 
 use keyroost_hid::HidDevice;
-use keyroost_keyring::{ConnectedKey, IdSource};
 use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
+pub mod identity;
+pub mod select;
 pub use device::{
-    correlate, enumerate, exclude_unresettable_piv, factory_reset_plan, CapState, Caps, Device,
-    DeviceId, DeviceKind, ResetStep, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
+    correlate, correlate_live, correlate_with, enumerate, enumerate_with, exclude_unresettable_piv,
+    factory_reset_plan, CapState, Caps, Device, DeviceId, DeviceKind, EnumerateOptions,
+    MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
+};
+pub use identity::{
+    plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
+    IdentityReader, IDENTITY_READERS,
+};
+pub use select::{
+    device_value, endpoint, list_number, list_order, parse_device_spec, resolve_target, row_label,
+    rows_matching, shell_quote, Candidate, Choice, DeviceSpec, Need, NoPicker, Picker, SelectError,
+    SelectedBy, Selector, Target,
 };
 
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.
@@ -54,6 +69,18 @@ pub fn effective_serials(devices: &[HidDevice]) -> Vec<Option<String>> {
 /// identity — and a caller that re-checks the serial to confirm it is talking to
 /// the key the user chose would then accept the wrong one.
 pub fn ccid_serials_for(devices: &[&HidDevice], readers: &[YubiKeyCcid]) -> Vec<Option<String>> {
+    ccid_serials_attributed(devices, readers, true)
+}
+
+/// [`ccid_serials_for`] with the single-reader fallback switchable: with
+/// `allow_guess` off, a serial is attributed only on exact USB topology, so a
+/// topology-free node gets none. Matching uses this when its vendor fallback
+/// is disabled, so no guessed serial can join rows behind the matcher's back.
+pub(crate) fn ccid_serials_attributed(
+    devices: &[&HidDevice],
+    readers: &[YubiKeyCcid],
+    allow_guess: bool,
+) -> Vec<Option<String>> {
     // Serials proven to belong to a node by exact USB topology. Those readers
     // are spoken for, so they are not available to a topology-free guess.
     let taken: Vec<String> = devices
@@ -72,24 +99,10 @@ pub fn ccid_serials_for(devices: &[&HidDevice], readers: &[YubiKeyCcid]) -> Vec<
         .map(|d| {
             let serial = ccid_serial_for(d, readers);
             let contended = claimants > 1 || serial.as_ref().is_some_and(|s| taken.contains(s));
-            if d.usb_bus.is_none() && contended {
+            if d.usb_bus.is_none() && (contended || !allow_guess) {
                 return None;
             }
             serial
-        })
-        .collect()
-}
-
-/// Map enumerated HID devices into the keyring resolver's view, filling in a
-/// CCID-read serial for YubiKeys that expose no USB serial.
-pub fn connected_keys(devices: &[HidDevice]) -> Vec<ConnectedKey> {
-    devices
-        .iter()
-        .zip(effective_serials(devices))
-        .map(|(d, serial)| ConnectedKey {
-            path: d.path.clone(),
-            serial,
-            label: d.product_name.clone(),
         })
         .collect()
 }
@@ -140,34 +153,6 @@ pub fn ccid_serial_for(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String>
         [only] => only.serial.clone(),
         _ => None,
     }
-}
-
-/// The effective serial + its source for a single device, reading the YubiKey
-/// CCID serial on demand. Used when naming one chosen device, where a clear
-/// error is wanted if a YubiKey serial can't be read. The `Err` is a
-/// ready-to-display message (front-ends convert it into their own error type).
-pub fn read_effective_serial(d: &HidDevice) -> Result<(String, IdSource), String> {
-    if let Some(s) = &d.serial_number {
-        return Ok((s.clone(), IdSource::Usb));
-    }
-    if d.vendor_id == VID_YUBICO {
-        let readers = keyroost_transport::yubikey_ccid_serials().map_err(|e| e.to_string())?;
-        if let Some(s) = ccid_serial_for(d, &readers) {
-            return Ok((s, IdSource::Ccid));
-        }
-        return Err(format!(
-            "{} ({}) is a YubiKey, but its serial couldn't be read over CCID. \
-             Check that the smart-card (PC/SC) service is running and that this key's CCID reader is \
-             present (`keyroostctl list` shows connected readers).",
-            d.path.display(),
-            d.product_name
-        ));
-    }
-    Err(format!(
-        "{} ({}) exposes no USB serial, so it can't be named yet.",
-        d.path.display(),
-        d.product_name
-    ))
 }
 
 #[cfg(test)]

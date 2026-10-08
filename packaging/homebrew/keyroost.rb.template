@@ -21,9 +21,14 @@ class Keyroost < Formula
   def install
     bin.install "keyroostctl"
     bin.install "keyroost"
+    # zsh only works when sourced from ~/.zshrc (see the README), not autoloaded.
+    generate_completions_from_executable(bin/"keyroostctl", "completions", shells: [:bash, :fish])
+    system bin/"keyroostctl", "manpage", buildpath/"man"
+    man1.install Dir[buildpath/"man/*.1"]
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/keyroostctl --version")
+    assert_match "keyroostctl", shell_output("#{bin}/keyroostctl completions bash")
   end
 end

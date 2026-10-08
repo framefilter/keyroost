@@ -53,9 +53,9 @@ What keyroost defends against:
   allows — PINs, CTAP session secrets and per-credential largeBlob keys,
   RSA key components, imported TOTP seeds, and the decrypted-vault /
   QR-payload buffers they pass through (buffer reallocations and
-  library-internal copies remain out of reach). PINs and passwords are
-  accepted via env/stdin only; Molto2 seeds and customer keys also accept
-  argv for convenience, with a warning, and each has an env/stdin variant.
+  library-internal copies remain out of reach). PINs, passwords, keys,
+  seeds and `otpauth://` URIs are accepted via an environment variable,
+  stdin or a hidden terminal prompt only — never argv.
 
 What keyroost does **not** defend against:
 

@@ -27,4 +27,4 @@ pub mod transport;
 pub use bio_enroll::{BioEnrollment, CaptureStatus, Enrollment, SensorInfo};
 pub use cmd::{get_info, reset, AuthenticatorInfo, CtapError};
 pub use config::Configurator;
-pub use hid::{CtapHidDevice, InitResponse};
+pub use hid::{set_trace, CtapHidDevice, InitResponse};

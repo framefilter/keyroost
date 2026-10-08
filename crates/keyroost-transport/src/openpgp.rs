@@ -12,6 +12,7 @@
 
 use crate::{trace, TransportError};
 use keyroost_openpgp as pgp;
+use keyroost_proto::trace::{format_line, Dir};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use zeroize::Zeroizing;
 
@@ -47,6 +48,10 @@ pub struct OpenPgpStatus {
     /// Digital-signature counter (number of signatures made), if the card
     /// reported a Security Support Template.
     pub signature_count: Option<u32>,
+    /// A Token2 key's full serial, read from its OTP applet by [`OpenPgpSession::status`]
+    /// (a cross-applet read, the same one PIV status makes). `None` on other
+    /// cards, or when the OTP applet didn't answer.
+    pub otp_applet_serial: Option<u128>,
 }
 
 impl OpenPgpStatus {
@@ -60,6 +65,8 @@ impl OpenPgpStatus {
     /// value is run through `crate::decode_bcd_serial` to recover the real
     /// serial; every other vendor's serial is a plain integer and passes
     /// through untouched.
+    ///
+    /// See [`Self::full_serial`] for the serial to show.
     #[must_use]
     pub fn serial(&self) -> Option<u32> {
         let raw = self
@@ -73,6 +80,26 @@ impl OpenPgpStatus {
             Some(u32::try_from(crate::decode_bcd_serial(u128::from(raw))).unwrap_or(raw))
         } else {
             Some(raw)
+        }
+    }
+
+    /// The serial to show: [`Self::otp_applet_serial`] when present, else [`Self::serial`].
+    #[must_use]
+    pub fn full_serial(&self) -> Option<u128> {
+        self.otp_applet_serial
+            .or_else(|| self.serial().map(u128::from))
+    }
+
+    /// The serial as front ends show it: [`Self::otp_applet_serial`] (a
+    /// Token2 key's full serial, as printed on the key) when present, else
+    /// [`Self::serial`] in decimal and hex (`19088743 (0x01234567)`). `None`
+    /// when the card reported neither.
+    #[must_use]
+    pub fn serial_text(&self) -> Option<String> {
+        match (self.otp_applet_serial, self.serial()) {
+            (Some(s), _) => Some(s.to_string()),
+            (None, Some(s)) => Some(format!("{s} (0x{s:08X})")),
+            (None, None) => None,
         }
     }
 
@@ -163,6 +190,19 @@ impl OpenPgpSession {
             _ => None,
         };
 
+        // Cross-applet read: on a Token2 card, the OpenPGP AID carries only a
+        // 4-byte BCD serial, while the key's OTP applet reports the full serial
+        // printed on the device. Read it on this same card handle, as PIV status
+        // does, then re-SELECT OpenPGP whatever the read returned: the next command
+        // on this session expects the OpenPGP applet.
+        let otp_applet_serial = if wants_otp_applet_serial(&ard.aid) {
+            let serial = crate::token2otp::read_otp_applet_serial(|apdu| self.transmit_full(apdu));
+            self.select()?;
+            serial
+        } else {
+            None
+        };
+
         Ok(OpenPgpStatus {
             sig_algo_id: ard.sig_algo_id(),
             dec_algo_id: ard.dec_algo_id(),
@@ -178,6 +218,7 @@ impl OpenPgpSession {
             tries_rc: ard.pw_status.tries_rc,
             tries_pw3: ard.pw_status.tries_pw3,
             signature_count,
+            otp_applet_serial,
         })
     }
 
@@ -312,8 +353,12 @@ impl OpenPgpSession {
             if needs_attribute_write(&current, alg) {
                 if self.debug {
                     eprintln!(
-                        "! openpgp generate: setting {crt:?} slot algorithm to {}",
-                        alg.label()
+                        "{}",
+                        format_line(
+                            Dir::Note,
+                            "openpgp generate",
+                            &format!("setting {crt:?} slot algorithm to {}", alg.label()),
+                        )
                     );
                 }
                 self.set_algorithm(crt, alg)?;
@@ -371,14 +416,22 @@ impl OpenPgpSession {
                 return ok_or_apdu("openpgp import key", sw);
             }
             trace::line(self.debug, || {
-                format!(
-                    "! openpgp import: extended length rejected (SW={sw:04X}); \
-                     retrying with command chaining"
+                format_line(
+                    Dir::Note,
+                    "openpgp import",
+                    &format!(
+                        "extended length rejected (SW={sw:04X}); \
+                         retrying with command chaining"
+                    ),
                 )
             });
         } else {
             trace::line(self.debug, || {
-                "! openpgp import: forcing command chaining (env override)".to_string()
+                format_line(
+                    Dir::Note,
+                    "openpgp import",
+                    "forcing command chaining (env override)",
+                )
             });
         }
 
@@ -466,8 +519,15 @@ impl OpenPgpSession {
         if sw != pgp::SW_OK {
             if self.debug {
                 eprintln!(
-                    "! openpgp: card has no Algorithm Information object (SW={sw:04X}); \
-                     offering every algorithm"
+                    "{}",
+                    format_line(
+                        Dir::Note,
+                        "openpgp",
+                        &format!(
+                            "card has no Algorithm Information object (SW={sw:04X}); \
+                             offering every algorithm"
+                        ),
+                    )
                 );
             }
             return Ok(None);
@@ -475,7 +535,12 @@ impl OpenPgpSession {
         let parsed = pgp::parse_algorithm_information(&bytes).ok();
         if parsed.is_none() && self.debug {
             eprintln!(
-                "! openpgp: Algorithm Information object did not parse; offering every algorithm"
+                "{}",
+                format_line(
+                    Dir::Note,
+                    "openpgp",
+                    "Algorithm Information object did not parse; offering every algorithm",
+                )
             );
         }
         Ok(parsed)
@@ -580,14 +645,22 @@ impl OpenPgpSession {
                 ok_or_apdu("openpgp decipher", sw)?;
             }
             trace::line(self.debug, || {
-                format!(
-                    "! openpgp decipher: extended length rejected (SW={sw:04X}); \
-                     retrying with command chaining"
+                format_line(
+                    Dir::Note,
+                    "openpgp decipher",
+                    &format!(
+                        "extended length rejected (SW={sw:04X}); \
+                         retrying with command chaining"
+                    ),
                 )
             });
         } else {
             trace::line(self.debug, || {
-                "! openpgp decipher: forcing command chaining (env override)".to_string()
+                format_line(
+                    Dir::Note,
+                    "openpgp decipher",
+                    "forcing command chaining (env override)",
+                )
             });
         }
 
@@ -724,6 +797,13 @@ impl OpenPgpSession {
     }
 }
 
+/// Whether `status` also reads the full serial through the OTP applet: only
+/// for a card whose AID names Token2 as the manufacturer, so no other card
+/// ever sees the extra SELECT.
+fn wants_otp_applet_serial(aid: &[u8]) -> bool {
+    pgp::aid_manufacturer_id(aid) == Some(pgp::MANUFACTURER_ID_TOKEN2)
+}
+
 /// The `--slot` value the CLI accepts for `crt`, for use in a "run this
 /// command" hint in an error message.
 fn crt_flag_name(crt: pgp::KeyCrt) -> &'static str {
@@ -800,6 +880,7 @@ mod tests {
             tries_rc: 0,
             tries_pw3: 3,
             signature_count: None,
+            otp_applet_serial: None,
         };
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Sign), "EdDSA Ed25519");
         assert_eq!(st.algorithm_label(pgp::KeyCrt::Decrypt), "ECDH X25519");
@@ -817,9 +898,9 @@ mod tests {
         aid
     }
 
-    #[test]
-    fn serial_bcd_decodes_only_for_token2_cards() {
-        let status = |aid: Vec<u8>| OpenPgpStatus {
+    /// A status with every field fixed except the AID.
+    fn status_with(aid: Vec<u8>) -> OpenPgpStatus {
+        OpenPgpStatus {
             aid,
             sig_algo_id: None,
             dec_algo_id: None,
@@ -834,7 +915,13 @@ mod tests {
             tries_rc: 0,
             tries_pw3: 3,
             signature_count: None,
-        };
+            otp_applet_serial: None,
+        }
+    }
+
+    #[test]
+    fn serial_bcd_decodes_only_for_token2_cards() {
+        let status = status_with;
 
         // Token2: the raw AID serial is BCD — its nibbles are the printed digits.
         assert_eq!(
@@ -853,5 +940,40 @@ mod tests {
         );
         // Too-short AID still yields no serial rather than panicking.
         assert_eq!(status(vec![]).serial(), None);
+    }
+
+    #[test]
+    fn serial_text_forms() {
+        // The OTP applet's full serial wins, shown as printed on the key.
+        let mut st = status_with(aid_with(0x0006, 1));
+        st.otp_applet_serial = Some(1_000_000_123_456);
+        assert_eq!(st.serial_text().as_deref(), Some("1000000123456"));
+        // Otherwise the AID serial, in decimal and hex.
+        assert_eq!(
+            status_with(aid_with(0x0006, 0x0123_4567))
+                .serial_text()
+                .as_deref(),
+            Some("19088743 (0x01234567)")
+        );
+        // Neither: nothing to show.
+        assert_eq!(status_with(vec![]).serial_text(), None);
+    }
+
+    #[test]
+    fn only_token2_aids_read_the_otp_applet_serial() {
+        assert!(wants_otp_applet_serial(&aid_with(
+            pgp::MANUFACTURER_ID_TOKEN2,
+            1
+        )));
+        assert!(!wants_otp_applet_serial(&aid_with(0x0006, 1))); // Yubico
+        assert!(!wants_otp_applet_serial(&[]));
+    }
+
+    #[test]
+    fn full_serial_prefers_the_otp_applet() {
+        let mut st = status_with(aid_with(pgp::MANUFACTURER_ID_TOKEN2, 0x1234_5678));
+        assert_eq!(st.full_serial(), Some(12_345_678));
+        st.otp_applet_serial = Some(1_000_000_123_456);
+        assert_eq!(st.full_serial(), Some(1_000_000_123_456));
     }
 }

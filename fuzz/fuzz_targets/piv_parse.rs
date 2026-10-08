@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_piv::parse_public_key(data);
     let _ = keyroost_piv::parse_metadata(data);
     // CHUID read-back (#102): the card hands back the object new-chuid wrote,
-    // and `piv status` parses whatever any card serves under that tag.
+    // and `piv info` parses whatever any card serves under that tag.
     let _ = keyroost_piv::parse_chuid(data);
     // Cert data-object parts (#147): the 0x70 value + the 0x71 gzip flag,
     // read from whatever a card serves under the slot cert object.
@@ -39,4 +39,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = keyroost_piv::fingerprint::parse_ascii_text(data)
         .and_then(|s| keyroost_piv::fingerprint::parse_dotted_version(&s));
     let _ = keyroost_piv::fingerprint::format_yubikey_name(data);
+    // Swissbit iShield replies (#163): the Management Application's GET
+    // DEVICE INFO (nested TLV) and the Card Manager's text replies.
+    let _ = keyroost_piv::fingerprint::parse_swissbit_device_name(data);
+    let _ = keyroost_piv::fingerprint::parse_swissbit_text(data);
 });

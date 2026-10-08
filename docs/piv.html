@@ -112,7 +112,7 @@
         new key you supply (generate a random one and keep it somewhere safe, such as a
         password manager). Lose a changed key and
         no admin changes are possible until a full applet reset. On the command line,
-        <code>--mgmt-key-default</code> uses the card's factory default when keyroost knows
+        <code>--mgmt-key default</code> uses the card's factory default when keyroost knows
         it for that card.</p>
     </div>
   </section>
@@ -133,52 +133,86 @@
         certificate or key, tests that a slot's key still works, writes a fresh CHUID, and
         resets the applet. The same controls are in the desktop app's PIV pane.</p>
     </div>
-<pre><code>keyroostctl piv status
-keyroostctl piv generate-key --slot 9a --algorithm eccp256 --mgmt-key-stdin
-keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --days 365 \
-    --pin-stdin --mgmt-key-stdin
-keyroostctl piv request-cert --slot 9a --subject "CN=Alice,O=Example" \
-    --pin-stdin --file request.csr</code></pre>
-    <p class="kr-muted">When two <code>--*-stdin</code> flags appear on one command, keyroost
-      reads them as consecutive lines in the order the operation needs them — for
-      <code>self-sign</code> that is the management key first, then the PIN.</p>
-    <p>Both commands take <code>--generate-key</code> to generate the slot's key in the
-      same step (with the same <code>--algorithm</code>, <code>--pin-policy</code> and
-      <code>--touch-policy</code> options as <code>generate-key</code>), which spares
-      cards without GET METADATA the save-pubkey / load-pubkey detour.</p>
+<pre><code>keyroostctl piv info
+keyroostctl piv key generate --slot 9a --algorithm eccp256    # asks for the management key
+keyroostctl piv cert generate --slot 9a --subject "CN=Alice" --days 365   # asks for the PIN and the management key
+keyroostctl piv cert request --slot 9a --subject "CN=Alice,O=Example" --out request.csr
+keyroostctl piv cert export --slot 9a                  # prints the certificate as PEM
+keyroostctl piv cert export --slot 9a --format der --out cert.der
+keyroostctl piv key generate --slot 9a --mgmt-key default    # a fresh card's factory-default key
+keyroostctl piv pin change                             # asks for the current PIN, then the new one</code></pre>
+    <p class="kr-muted">Typed by hand, each secret is asked for at a hidden prompt. In a
+      script, give it as <code>--pin env:NAME</code> or <code>--pin stdin</code> (and the
+      same for <code>--mgmt-key</code>, <code>--puk</code> and the <code>--new-…</code>
+      flags). When two flags read <code>stdin</code> on one command, keyroost reads them as
+      consecutive lines, and each flag's <code>--help</code> says which line it reads — for
+      <code>cert generate</code> that is the PIN first, then the management key; for a
+      change, the current secret first, then the new one. <code>-s</code> is short for
+      <code>--slot</code>, <code>-o</code> for <code>--out</code> and <code>-i</code> for
+      <code>--in</code>.</p>
+    <p>Both <code>cert</code> commands take <code>--generate-key</code> to generate the
+      slot's key in the same step (with the same <code>--algorithm</code>,
+      <code>--pin-policy</code> and <code>--touch-policy</code> options as <code>key
+      generate</code>), which spares cards without GET METADATA the
+      <code>--pubkey-out</code> / <code>--pubkey-in</code> detour.</p>
     <span id="certificates"></span>
+    <span id="slot-states"></span>
+    <p><strong>Slot states.</strong> In <code>piv info</code> and the app, a slot without a
+      certificate reads <em>empty</em> when the card says it holds no key, <em>key present,
+      no certificate</em> when the card confirms a key, and <em>no certificate (a key may be
+      present)</em> when keyroost can't tell. keyroost can't tell on cards where it doesn't
+      use GET METADATA's key type, and on cards whose GET METADATA answer neither names a key
+      nor says there is none.</p>
     <p><strong>Certificates.</strong> keyroost reads certificates stored gzip-compressed (the
       PIV standard's CertInfo <code>0x01</code> form) and verifies their checksum. A damaged
       one, or one that would decompress past 64&nbsp;KiB, shows as present but unreadable:
-      in <code>piv status</code>'s text, as <code>cert_unreadable</code> in
+      in <code>piv info</code>'s text, as <code>cert_unreadable</code> in
       <code>--json</code>, and as &ldquo;unreadable cert&rdquo; in the app. A certificate
       the card refuses as too large, even with the <a href="#compression">compression</a>
       choice below, fails with a clear &ldquo;too large&rdquo; message, or &ldquo;no room
       left&rdquo; when the card is full, and leaves the slot's existing certificate
       unchanged. keyroost also refuses a certificate whose public key doesn't match the key
-      already in the slot, when it can read that key.</p>
+      already in the slot, when it can read that key. <code>cert export</code> writes the
+      certificate as PEM, to stdout or to <code>--out FILE</code>; add <code>--format der</code>
+      for the raw DER bytes. <code>cert import</code> reads the certificate from <code>--in
+      FILE</code>. When an output file already exists (<code>--out</code> on
+      <code>cert export</code>, <code>cert request</code>, <code>cert generate</code> or
+      <code>key generate</code>, or <code>--pubkey-out</code>), a terminal asks "overwrite? [y/N]";
+      a script must add <code>--overwrite</code>. A directory as the output is refused
+      before the card is touched.</p>
     <span id="delete"></span>
-    <p><strong>Clearing a slot.</strong> <code>delete-cert</code> removes only the slot's
+    <p><strong>Clearing a slot.</strong> <code>cert delete</code> removes only the slot's
       X.509 certificate object and leaves the private key in place — standard PIV, so it
-      works on every card. <code>delete-key</code> permanently erases the slot's private key
+      works on every card. <code>key delete</code> permanently erases the slot's private key
       (a Yubico extension: YubiKey firmware 5.7 or newer, or another card that implements
       it; where it isn't available, overwrite the slot with a fresh
-      <code>generate-key</code> instead). Both need
-      the management key and are destructive, so they require an explicit <code>--yes</code>.</p>
-<pre><code>keyroostctl piv delete-cert --slot 9a --mgmt-key-stdin --yes
-keyroostctl piv delete-key  --slot 9a --mgmt-key-stdin --yes   # Yubico extension</code></pre>
+      <code>key generate</code> instead). Both need
+      the management key and are destructive, so they name the key and ask <strong>y/N</strong>
+      first. A script has no terminal to ask on and adds <code>--yes</code>; so does a command
+      whose management key is piped in with <code>--mgmt-key stdin</code>.
+      <code>key generate</code>, <code>cert import</code>, <code>cert generate</code> and
+      <code>--generate-key</code> ask the same way when the slot already holds a key or
+      certificate, and <code>retries set</code> always asks: it also resets the PIN and PUK
+      to their factory defaults (a Yubico extension).</p>
+<pre><code>keyroostctl piv cert delete --slot 9a                 # asks y/N, then for the management key
+keyroostctl piv key delete  --slot 9a                 # Yubico extension
+keyroostctl piv key delete  --slot 9a --mgmt-key env:PIV_MGMT --yes   # in a script</code></pre>
     <span id="move-key"></span>
-    <p><strong>Moving a key between slots.</strong> <code>move-key</code> relocates a slot's
+    <p><strong>Moving a key between slots.</strong> <code>key move</code> relocates a slot's
       private key without exporting it — the Yubico MOVE KEY instruction: YubiKey firmware
-      5.7 or newer, or another card that implements it. It is <em>non-destructive</em>: keyroost refuses an occupied
-      destination rather than overwriting it, refuses a same-slot move, and the source slot's
-      X.509 certificate object stays where it is (move the certificate separately with
-      <code>export-cert</code> + <code>import-cert</code> if you want it to follow). Both the
+      5.7 or newer, or another card that implements it. It is <em>non-destructive</em>, so it
+      doesn't ask first: keyroost refuses when the card reports that the destination slot
+      already holds a key (delete that slot's key first, or pick an empty slot). When keyroost
+      can't tell whether the destination holds a key, it says so and sends the move, and the
+      card decides. It also refuses a same-slot move, and the
+      source slot's X.509 certificate object stays where it is (move the certificate
+      separately with <code>cert export</code> + <code>cert import</code> if you want it to
+      follow). Both the
       standard and the retired slots are valid on either end, which makes archiving a
       superseded <code>9D</code> decryption key into a retired slot a single command. The
       desktop app offers the same thing as <strong>Move key…</strong>.</p>
-<pre><code>keyroostctl piv move-key --from 9d --to 82 --mgmt-key-stdin   # archive a rotated key
-keyroostctl piv move-key --from 82 --to 9d --mgmt-key-stdin   # bring it back</code></pre>
+<pre><code>keyroostctl piv key move --from 9d --to 82   # archive a rotated key (asks for the management key)
+keyroostctl piv key move --from 82 --to 9d   # bring it back</code></pre>
     <span id="test"></span>
     <p><strong>Testing a slot's key.</strong> <code>test</code> proves a slot's private key
       still works end to end, without changing anything on the card. keyroost reads the
@@ -195,32 +229,34 @@ keyroostctl piv move-key --from 82 --to 9d --mgmt-key-stdin   # bring it back</c
       run is fully reproducible and pulls in no randomness. The desktop app offers the same
       thing as <strong>Test…</strong> in the slot pane, just below Delete; the button is
       live only when the slot holds a certificate with a key type keyroost can test.</p>
-<pre><code>keyroostctl piv test --slot 9a --pin-stdin
-keyroostctl piv test --slot 9e                 # PIN policy "never" — omit the PIN
-keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
+<pre><code>keyroostctl piv test --slot 9a --pin env:PIV_PIN  # never asks: --pin names the PIN source
+keyroostctl piv test --slot 9e                 # PIN policy "never": no PIN needed
+keyroostctl --json piv test --slot 9c --pin env:PIV_PIN</code></pre>
     <p class="kr-muted">The command prints one line per operation —
       <code>Decrypt: passed</code>, <code>Sign: FAILED — …</code>,
       <code>Key Agree: skipped — not supported for …</code> — and exits non-zero if any
       operation failed. With <code>--json</code> it emits
-      <code>{ slot, algorithm, ok, operations: [ { operation, result, detail? } … ] }</code>
-      instead, with <code>detail</code> present only when the result is <code>failed</code>.
+      <code>{ slot, slot_name, algorithm, ok, operations: [ { operation, result, detail } … ] }</code>
+      instead: <code>slot</code> is the <code>--slot</code> value (<code>"9a"</code>),
+      <code>slot_name</code> its label, and <code>detail</code> is the reason when the
+      result is <code>failed</code>, otherwise <code>null</code>.
       A slot with no certificate, or a key type keyroost can't verify, is an error — nothing
       is tested.</p>
     <span id="new-chuid"></span>
-    <p><strong>Writing a new CHUID.</strong> <code>new-chuid</code> writes a fresh Card Holder
+    <p><strong>Writing a new CHUID.</strong> <code>chuid generate</code> writes a fresh Card Holder
       Unique Identifier with a randomly-generated GUID (or one you supply with
       <code>--guid</code>). Windows' PIV minidriver caches a card's contents keyed by the
       CHUID's GUID, so after reprovisioning a card Windows can keep showing stale data until
       the GUID changes — a new CHUID forces it to re-read the card. It needs the management
       key. The desktop app offers the same thing as <strong>New CHUID…</strong> in the card
       settings.</p>
-<pre><code>keyroostctl piv new-chuid --mgmt-key-stdin</code></pre>
+<pre><code>keyroostctl piv chuid generate                 # asks for the management key</code></pre>
     <span id="compression"></span>
     <p><strong>Compressed certificates.</strong> The PIV standard lets a slot's certificate
       be stored gzip-compressed: the certificate object's CertInfo byte says whether it is
       (NIST SP&nbsp;800-73-4, Part&nbsp;1, Appendix&nbsp;A). keyroost reads compressed
-      certificates, and <code>piv status</code> marks them <em>stored compressed</em>. When
-      writing one with <code>import-cert</code> or <code>self-sign</code>, keyroost stores the
+      certificates, and <code>piv info</code> marks them <em>stored compressed</em>. When
+      writing one with <code>cert import</code> or <code>cert generate</code>, keyroost stores the
       certificate uncompressed by default and compresses it only if the card refuses it as
       too large, then says it did and why. <code>--compress</code> always stores it
       compressed; <code>--no-compress</code> never does, so a certificate the card refuses
@@ -230,10 +266,9 @@ keyroostctl --json piv test --slot 9c --pin-env PIV_PIN</code></pre>
       certificate</strong> and <strong>Self-signed certificate</strong> dialogs offer the same
       choice as a <strong>Compression</strong> dropdown: Automatic (only if too large),
       Always, or Never.</p>
-<pre><code>keyroostctl piv import-cert --slot 9d --file cert.pem --mgmt-key-stdin   # compress only if needed
-keyroostctl piv import-cert --slot 9d --file cert.pem --mgmt-key-stdin --compress
-keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-stdin \
-    --no-compress</code></pre>
+<pre><code>keyroostctl piv cert import --slot 9d --in cert.pem       # compress only if needed
+keyroostctl piv cert import --slot 9d --in cert.pem --compress
+keyroostctl piv cert generate --slot 9a --subject "CN=Alice" --no-compress</code></pre>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Which software reads compressed certificates</div>
       <p>Readers confirmed to handle them include ykman, yubico-piv-tool / libykpiv / ykcs11
@@ -247,7 +282,7 @@ keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-
     <p><strong>What each key supports.</strong> Many management commands — extra key
       algorithms, PIN and touch policies, move and delete key, retry counts, changing the
       management key, reset — are vendor extensions rather than standard PIV. keyroost
-      identifies which PIV applet a card runs (shown in <code>piv status</code> and at the
+      identifies which PIV applet a card runs (shown in <code>piv info</code> and at the
       start of the app's PIV status line) and checks each of these against a per-applet
       list of what each supports. A feature listed as unsupported for a key is dimmed in the app, with
       the reason on hover; one with no entry yet stays usable, marked with a warning.</p>
@@ -259,12 +294,12 @@ keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-
       If the key can't do something, it just refuses. Reset isn't included: on the command
       line, <code>piv reset --force</code> sends a single reset without blocking the PIN or
       PUK. On the command
-      line, <code>generate-key</code>, <code>change-management-key</code>,
-      <code>move-key</code>, <code>delete-key</code> and <code>reset</code> refuse such a
+      line, <code>key generate</code>, <code>mgmt-key change</code>,
+      <code>key move</code>, <code>key delete</code> and <code>reset</code> refuse such a
       feature unless you add <code>--force</code>, which also sends those reads. Each read
       skipped or sent anyway leaves a line in the <code>--debug</code> output and the app's
       APDU trace.</p>
-<pre><code>keyroostctl piv move-key --from 9d --to 82 --mgmt-key-stdin --force</code></pre>
+<pre><code>keyroostctl piv key move --from 9d --to 82 --force</code></pre>
   </section>
 
   <section class="kr-section">
@@ -276,34 +311,39 @@ keyroostctl piv self-sign --slot 9a --subject "CN=Alice" --pin-stdin --mgmt-key-
     <p>For batch work the <strong>CLI is the intended path.</strong> The management key and
       PIN come from environment variables or stdin <em>once</em>, so a shell loop can
       provision every slot without re-entry. Keep the secrets out of <code>argv</code> —
-      always use the <code>--mgmt-key-env</code> / <code>--mgmt-key-stdin</code> and
-      <code>--pin-env</code> / <code>--pin-stdin</code> flags (never pass them as plain
-      arguments), so they never appear in your shell history or the process list.</p>
+      give them as <code>--mgmt-key env:NAME</code> / <code>--mgmt-key stdin</code> and
+      <code>--pin env:NAME</code> / <code>--pin stdin</code> (keyroost refuses the secret
+      itself as a value), so they never appear in your shell history or the process
+      list.</p>
 <pre><code># management key + PIN supplied once via env; the loop provisions each slot.
 # (set these in your own shell; don't commit or echo them)
 export PIV_MGMT=010203040506070801020304050607080102030405060708   # AES-192 / 3DES key, hex
 export PIV_PIN=123456
 
 for slot in 9a 9c 9d 9e; do
-  keyroostctl piv generate-key --slot "$slot" --algorithm eccp256 \
-      --mgmt-key-env PIV_MGMT --reader yubikey
-  keyroostctl piv self-sign --slot "$slot" --subject "CN=$USER" --days 365 \
-      --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --reader yubikey
+  keyroostctl piv key generate --slot "$slot" --algorithm eccp256 \
+      --mgmt-key env:PIV_MGMT --device my-yubikey
+  keyroostctl piv cert generate --slot "$slot" --subject "CN=$USER" --days 365 \
+      --mgmt-key env:PIV_MGMT --pin env:PIV_PIN --device my-yubikey
 done
 
 unset PIV_MGMT PIV_PIN   # clear the secrets when you're done</code></pre>
     <p>If a certificate authority issues your certificates, replace the
-      <code>self-sign</code> step with <code>request-cert</code> — note it takes no
+      <code>cert generate</code> step with <code>cert request</code> — note it takes no
       <code>--days</code>, and no management key unless you add <code>--generate-key</code>
       — the CSR signature itself needs only the PIN; the management key is for the
       key-generation step:</p>
-<pre><code>  keyroostctl piv request-cert --slot "$slot" --subject "CN=$USER" \
-      --pin-env PIV_PIN --file "slot-$slot.csr" --reader yubikey</code></pre>
+<pre><code>  keyroostctl piv cert request --slot "$slot" --subject "CN=$USER" \
+      --pin env:PIV_PIN --out "slot-$slot.csr" --device my-yubikey</code></pre>
     <p>Import each issued certificate later with
-      <code>import-cert --slot "$slot" --file … --mgmt-key-env PIV_MGMT</code>.
-      Use <code>--reader &lt;substr&gt;</code>
-      (or <code>--device</code> with a <a href="naming.html">friendly name</a>) to pin the loop
-      to one device when several are plugged in.</p>
+      <code>piv cert import --slot "$slot" --in … --mgmt-key env:PIV_MGMT</code>.
+      Rerunning the loop over CSR files from an earlier run asks before replacing each
+      one; add <code>--overwrite</code> to run it unattended.
+      <code>--device</code> keeps the loop on one key when several are plugged in: it takes a
+      <a href="naming.html">friendly name</a>, a serial, or the number
+      <code>keyroostctl list</code> shows (<code>--reader &lt;substr&gt;</code> works too).
+      Run in a terminal, each step that would replace a slot in use asks first; add
+      <code>--yes</code> to let the loop overwrite without asking.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">One slot? The GUI is fine.</div>
       <p>None of this replaces the desktop app — provisioning a slot or two there is

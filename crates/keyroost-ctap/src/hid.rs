@@ -23,7 +23,10 @@ use std::io;
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use keyroost_proto::trace::{format_line, Dir};
 
 /// Broadcast channel ID used for the initial `CTAPHID_INIT` request.
 pub const CTAPHID_BROADCAST_CID: u32 = 0xFFFF_FFFF;
@@ -426,9 +429,13 @@ impl CtapHidDevice {
         loop {
             if ctap_trace_enabled() {
                 eprintln!(
-                    "CTAP > cmd=0x{cmd:02x} len={} {}",
-                    payload.len(),
-                    trace_payload(payload, sensitive)
+                    "{}",
+                    ctap_line(
+                        Dir::Sent,
+                        cmd,
+                        payload.len(),
+                        &trace_payload(payload, sensitive)
+                    )
                 );
             }
             let outcome = self
@@ -438,9 +445,13 @@ impl CtapHidDevice {
                 Ok(resp) => {
                     if ctap_trace_enabled() {
                         eprintln!(
-                            "CTAP < len={} {}",
-                            resp.len(),
-                            trace_payload(&resp, sensitive)
+                            "{}",
+                            ctap_line(
+                                Dir::Received,
+                                cmd,
+                                resp.len(),
+                                &trace_payload(&resp, sensitive)
+                            )
                         );
                     }
                     return Ok(resp);
@@ -453,8 +464,15 @@ impl CtapHidDevice {
                         // Framing metadata only — no payload, so this line
                         // can't leak what the redacted trace withheld.
                         eprintln!(
-                            "CTAP ! cmd=0x{cmd:02x} error=0x{code:02x} busy, retry {attempt} in {}ms",
-                            delay.as_millis()
+                            "{}",
+                            format_line(
+                                Dir::Note,
+                                &format!("ctaphid {}", ctap_cmd_name(cmd)),
+                                &format!(
+                                    "busy (error 0x{code:02x}), retry {attempt} in {}ms",
+                                    delay.as_millis()
+                                ),
+                            )
                         );
                     }
                     self.sleep_between_attempts(delay)?;
@@ -489,8 +507,19 @@ impl CtapHidDevice {
 
     fn do_init(&mut self) -> Result<InitResponse, HidTransportError> {
         let nonce = generate_nonce();
+        if ctap_trace_enabled() {
+            let body = hexline(&nonce);
+            eprintln!("{}", ctap_line(Dir::Sent, CTAPHID_INIT, nonce.len(), &body));
+        }
         self.send(CTAPHID_BROADCAST_CID, CTAPHID_INIT, &nonce)?;
         let resp = self.recv(CTAPHID_BROADCAST_CID, CTAPHID_INIT)?;
+        if ctap_trace_enabled() {
+            let body = hexline(&resp);
+            eprintln!(
+                "{}",
+                ctap_line(Dir::Received, CTAPHID_INIT, resp.len(), &body)
+            );
+        }
         if resp.len() < 17 {
             return Err(HidTransportError::InitResponseTooShort);
         }
@@ -644,15 +673,50 @@ impl CtapHidDevice {
     }
 }
 
-/// True when `KEYROOST_CTAP_DEBUG` is set, enabling a stderr hex trace of every
-/// CTAP-HID transaction. Diagnostics only — never on by default.
-fn ctap_trace_enabled() -> bool {
-    std::env::var_os("KEYROOST_CTAP_DEBUG").is_some()
+static TRACE_ON: AtomicBool = AtomicBool::new(false);
+
+/// Turn the CTAP-HID stderr trace on or off for this process (the CLI's
+/// `--debug`). `KEYROOST_CTAP_DEBUG` set in the environment also enables it.
+pub fn set_trace(enabled: bool) {
+    TRACE_ON.store(enabled, Ordering::Relaxed);
 }
 
-/// True when a CTAPHID CBOR exchange carries personal data that must be
-/// redacted from the opt-in trace — in **both** directions, because requests
-/// carry the same material the responses enumerate:
+/// True when [`set_trace`] turned the trace on or `KEYROOST_CTAP_DEBUG` is
+/// set, enabling a stderr hex trace of every CTAP-HID transaction.
+/// Diagnostics only — never on by default.
+fn ctap_trace_enabled() -> bool {
+    TRACE_ON.load(Ordering::Relaxed) || std::env::var_os("KEYROOST_CTAP_DEBUG").is_some()
+}
+
+/// Short name of a CTAPHID command for the trace. Accepts the wire byte
+/// (init bit set, e.g. `0x90`) or the bare command number (`0x10`).
+fn ctap_cmd_name(cmd: u8) -> String {
+    match cmd & 0x7F {
+        0x01 => "ping".to_owned(),
+        0x03 => "msg".to_owned(),
+        0x06 => "init".to_owned(),
+        0x08 => "wink".to_owned(),
+        0x10 => "cbor".to_owned(),
+        0x11 => "cancel".to_owned(),
+        0x3B => "keepalive".to_owned(),
+        0x3F => "error".to_owned(),
+        _ => format!("0x{cmd:02x}"),
+    }
+}
+
+/// One CTAP-HID trace line in the shared `--debug` grammar. `payload` is
+/// already the (possibly redacted) body from [`trace_payload`].
+fn ctap_line(dir: Dir, cmd: u8, len: usize, payload: &str) -> String {
+    format_line(
+        dir,
+        &format!("ctaphid {}", ctap_cmd_name(cmd)),
+        &format!("len={len} {payload}"),
+    )
+}
+
+/// True when a CTAPHID CBOR exchange carries personal data or PIN material
+/// that must be redacted from the opt-in trace — in **both** directions,
+/// because requests carry the same material the responses enumerate:
 /// - authenticatorCredentialManagement (`0x0A`, preview `0x41`): responses
 ///   enumerate RP IDs and user names; `updateUserInformation` requests carry
 ///   the replacement user entity;
@@ -662,17 +726,41 @@ fn ctap_trace_enabled() -> bool {
 /// - authenticatorLargeBlobs (`0x0C`): reads return the serialized array,
 ///   which includes keyroost's own plaintext notes (see
 ///   `large_blobs::LargeBlobEntry::from_text` — explicitly NOT encryption),
-///   and writes carry the same bytes out.
+///   and writes carry the same bytes out;
+/// - authenticatorClientPIN (`0x06`): every subcommand except getRetries
+///   (`0x01`) and getKeyAgreement (`0x02`) carries PIN-derived ciphertext
+///   (pinHashEnc, newPinEnc) or returns the encrypted pinUvAuthToken. These
+///   are ciphertexts under an ephemeral ECDH secret the trace never shows,
+///   but they are withheld anyway, the way PIN VERIFY is on the APDU path;
+/// - authenticatorConfig (`0x0D`): every subcommand carries a
+///   pinUvAuthParam.
 ///
-/// (PIN material in other commands is ciphertext under the ECDH session key,
-/// not recoverable from the trace.) Add every future personal-data-bearing
-/// CTAP2 command here, not at the trace call sites.
+/// Add every future personal-data- or PIN-bearing CTAP2 command here, not at
+/// the trace call sites.
 fn exchange_is_sensitive(cmd: u8, payload: &[u8]) -> bool {
-    cmd == CTAPHID_CBOR
-        && matches!(
-            payload.first(),
-            Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40) | Some(0x0C)
-        )
+    if cmd != CTAPHID_CBOR {
+        return false;
+    }
+    match payload.first() {
+        Some(0x0A) | Some(0x41) | Some(0x09) | Some(0x40) | Some(0x0C) | Some(0x0D) => true,
+        Some(0x06) => !matches!(
+            client_pin_subcommand(&payload[1..]),
+            Some(0x01) | Some(0x02)
+        ),
+        _ => false,
+    }
+}
+
+/// The clientPIN subcommand (map key `0x02`) of a request body, or `None`
+/// when the body does not decode as a map carrying one — which the caller
+/// treats as sensitive (fail closed).
+fn client_pin_subcommand(body: &[u8]) -> Option<u64> {
+    let (value, _) = crate::cbor::decode(body).ok()?;
+    value
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_uint() == Some(0x02))
+        .and_then(|(_, v)| v.as_uint())
 }
 
 /// The payload portion of one trace line: full hex normally, a redaction
@@ -1118,12 +1206,64 @@ mod tests {
                 "CBOR cmd 0x{cbor_cmd:02x} must be redacted"
             );
         }
-        // getInfo / clientPIN traces stay visible (PIN material is ciphertext).
+        // getInfo stays visible.
         assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[0x04]));
-        assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[0x06]));
         // Non-CBOR frames (INIT, PING) are never redacted.
         assert!(!exchange_is_sensitive(CTAPHID_INIT, &[0x0A]));
         assert!(!exchange_is_sensitive(CTAPHID_CBOR, &[]));
+    }
+
+    #[test]
+    fn trace_redacts_client_pin_except_retries_and_key_agreement() {
+        // clientPIN carries PIN-derived ciphertext (pinHashEnc, newPinEnc)
+        // and the encrypted pinUvAuthToken; like PIN VERIFY on the APDU
+        // path, those exchanges are withheld. getRetries and
+        // getKeyAgreement carry no PIN material and stay visible.
+        // {1: 2, 2: sub}
+        let req = |sub: u8| vec![0x06, 0xA2, 0x01, 0x02, 0x02, sub];
+        assert!(
+            !exchange_is_sensitive(CTAPHID_CBOR, &req(0x01)),
+            "getRetries"
+        );
+        assert!(
+            !exchange_is_sensitive(CTAPHID_CBOR, &req(0x02)),
+            "getKeyAgreement"
+        );
+        for sub in [0x03, 0x04, 0x05, 0x06, 0x07, 0x09] {
+            assert!(
+                exchange_is_sensitive(CTAPHID_CBOR, &req(sub)),
+                "clientPIN subcommand 0x{sub:02x} must be redacted"
+            );
+        }
+        // A changePIN with its encrypted fields still classifies by the
+        // subcommand: {1: 2, 2: 4, 6: h'deadbeef'}.
+        let change = [
+            0x06, 0xA3, 0x01, 0x02, 0x02, 0x04, 0x06, 0x44, 0xDE, 0xAD, 0xBE, 0xEF,
+        ];
+        assert!(exchange_is_sensitive(CTAPHID_CBOR, &change));
+        let line = ctap_line(
+            Dir::Sent,
+            CTAPHID_CBOR,
+            change.len(),
+            &trace_payload(&change, true),
+        );
+        assert!(!line.contains("deadbeef"), "{line}");
+        // Unparseable or subcommand-less clientPIN fails closed.
+        assert!(exchange_is_sensitive(CTAPHID_CBOR, &[0x06]));
+        assert!(exchange_is_sensitive(CTAPHID_CBOR, &[0x06, 0xFF]));
+        assert!(exchange_is_sensitive(
+            CTAPHID_CBOR,
+            &[0x06, 0xA1, 0x01, 0x02]
+        ));
+    }
+
+    #[test]
+    fn trace_redacts_authenticator_config() {
+        // authenticatorConfig carries a pinUvAuthParam on every subcommand.
+        assert!(exchange_is_sensitive(
+            CTAPHID_CBOR,
+            &[0x0D, 0xA1, 0x01, 0x03]
+        ));
     }
 
     #[test]
@@ -1154,6 +1294,49 @@ mod tests {
         let body = trace_payload(resp, true);
         assert!(body.contains("redacted"));
         assert!(!body.contains(&hexline(b"note")));
+    }
+
+    #[test]
+    fn set_trace_enables_and_disables() {
+        set_trace(true);
+        assert!(ctap_trace_enabled());
+        set_trace(false);
+        if std::env::var_os("KEYROOST_CTAP_DEBUG").is_none() {
+            assert!(!ctap_trace_enabled());
+        }
+    }
+
+    #[test]
+    fn ctap_line_uses_shared_grammar() {
+        assert_eq!(
+            ctap_line(Dir::Sent, 0x10, 1, "04"),
+            "> ctaphid cbor          len=1 04"
+        );
+        // The wire command byte (init bit set) names the same command.
+        assert_eq!(
+            ctap_line(Dir::Received, CTAPHID_CBOR, 1, "00"),
+            "< ctaphid cbor          len=1 00"
+        );
+        assert_eq!(ctap_cmd_name(CTAPHID_INIT), "init");
+        assert_eq!(ctap_cmd_name(0x55), "0x55");
+    }
+
+    #[test]
+    fn ctap_line_keeps_sensitive_payloads_redacted() {
+        // The shared-grammar wrapper must not reintroduce what the
+        // redaction withheld: the line carries framing plus the marker only.
+        let mut payload = vec![0x09];
+        payload.extend_from_slice(b"\xa1\x02mAlice Example");
+        let sensitive = exchange_is_sensitive(CTAPHID_CBOR, &payload);
+        let line = ctap_line(
+            Dir::Sent,
+            CTAPHID_CBOR,
+            payload.len(),
+            &trace_payload(&payload, sensitive),
+        );
+        assert!(line.starts_with("> ctaphid cbor"));
+        assert!(line.contains("<redacted: personal-data payload>"));
+        assert!(!line.contains(&hexline(b"Alice")));
     }
 
     #[test]

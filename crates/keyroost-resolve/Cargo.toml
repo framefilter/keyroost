@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "Shared security-key identity resolution (USB + CCID serials) over the keyring."
 
+[features]
+# Test-only switch for the #51 matching-equivalence check: with it compiled
+# in, KEYROOST_MATCH_TEST=identity-only disables the topology and vendor
+# steps. Release builds never enable it.
+match-test-switch = []
+
 [lints]
 workspace = true
 
@@ -17,3 +23,4 @@ keyroost-transport = { path = "../keyroost-transport", version = "0.12.0" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.12.0" }
 keyroost-proto = { path = "../keyroost-proto", version = "0.12.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.12.0" }
+keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.12.0" }

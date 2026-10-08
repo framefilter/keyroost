@@ -3,6 +3,11 @@
 // View layer over the shared device model. The correlation/classification logic
 // now lives in `keyroost-resolve` (consumed by the CLI too); here we keep only
 // the GUI-specific capability-tab bar.
+//
+// Rows come from `keyroost_resolve::enumerate()`, the same matcher the CLI
+// uses: USB topology, then the identity each side reports (#51,
+// Windows/macOS), then the vendor fallback. On Linux topology settles every
+// row, so the sidebar is unchanged there.
 
 pub use keyroost_resolve::{enumerate, CapState, Caps, Device, DeviceId, DeviceKind};
 
