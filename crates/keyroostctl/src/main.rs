@@ -1134,10 +1134,11 @@ enum PivKeyCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Move a slot's private key to another slot. Irreversible: asks first (`--yes` to skip).
+    /// Move a slot's private key to another slot, without it leaving the card.
     ///
-    /// The key may replace a key already in the destination slot. The
-    /// certificate stays in the source slot. Needs the management key.
+    /// Refuses if the destination slot already holds a key (delete it first
+    /// or pick an empty slot). Only the key moves; the certificate stays in
+    /// the source slot. Needs the management key.
     ///
     /// Moving keys between slots is an extension to standard PIV (YubiKey
     /// 5.7+ and other keys that implement it). If keyroost's list marks this
@@ -1161,9 +1162,6 @@ enum PivKeyCmd {
         /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long)]
         force: bool,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
@@ -10191,23 +10189,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     reader,
                     mgmt_key,
                     force,
-                    yes,
                 },
         } => {
             let mut sec = Secrets::real();
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
-            let asked = crate::prompt::confirm_then_read(
-                &dev,
-                *yes,
-                &format!(
-                    "move the private key {} \u{2192} {}",
-                    from.to_slot().label(),
-                    to.to_slot().label()
-                ),
-            )?;
             let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
-            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
+            crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -13936,7 +13924,7 @@ mod cli_tests {
         for line in [
             "k molto seed --seed stdin -s3cret",
             "k piv pin change --pin stdin --new-pin stdin -d3cret",
-            "k piv key move --mgmt-key=default -y3cret",
+            "k piv key move --mgmt-key=default -s3cret",
             "k piv key generate --mgmt-key env:K -o3cret",
             "k openpgp key import --admin-pin stdin -i3cret",
         ] {
@@ -14073,7 +14061,6 @@ mod cli_tests {
             ("molto import", IRREVERSIBLE),
             ("prog seed", IRREVERSIBLE),
             ("otp button set", IRREVERSIBLE),
-            ("piv key move", IRREVERSIBLE),
             ("piv retries set", IRREVERSIBLE),
             ("molto customer-key", IRREVERSIBLE),
             ("factory-reset", IRREVERSIBLE_TYPED),
@@ -17226,17 +17213,6 @@ mod cli_tests {
                 "9a",
                 "-o",
                 "p.pem",
-            ],
-            &[
-                "keyroostctl",
-                "piv",
-                "key",
-                "move",
-                "--from",
-                "9a",
-                "--to",
-                "9c",
-                "-y",
             ],
         ] {
             assert!(parse(a).is_ok(), "{a:?}");
@@ -20680,9 +20656,6 @@ mod cli_tests {
                     }
                     | PivCmd::Cert {
                         cmd: PivCertCmd::Request { yes, .. },
-                    }
-                    | PivCmd::Key {
-                        cmd: PivKeyCmd::Move { yes, .. },
                     },
             } => yes,
             Cmd::Oath {
@@ -20722,41 +20695,61 @@ mod cli_tests {
     }
 
     #[test]
-    fn move_and_customer_key_have_yes() {
+    fn customer_key_has_yes() {
         for (a, want) in [
-            (
-                &[
-                    "keyroostctl",
-                    "piv",
-                    "key",
-                    "move",
-                    "--from",
-                    "9a",
-                    "--to",
-                    "9c",
-                ][..],
-                false,
-            ),
-            (
-                &[
-                    "keyroostctl",
-                    "piv",
-                    "key",
-                    "move",
-                    "--from",
-                    "9a",
-                    "--to",
-                    "9c",
-                    "--yes",
-                ],
-                true,
-            ),
-            (&["keyroostctl", "molto", "customer-key"], false),
+            (&["keyroostctl", "molto", "customer-key"][..], false),
             (&["keyroostctl", "molto", "customer-key", "--yes"], true),
         ] {
             let cli = parse(a).unwrap();
             assert_eq!(confirm_yes(&cli), Some(want), "{a:?}");
         }
+    }
+
+    #[test]
+    fn piv_key_move_takes_no_yes_and_never_replaces() {
+        // Moving refuses an occupied destination, so there is nothing to confirm.
+        assert!(parse(&[
+            "keyroostctl",
+            "piv",
+            "key",
+            "move",
+            "--from",
+            "9a",
+            "--to",
+            "9c",
+            "--yes"
+        ])
+        .is_err());
+        let cli = parse(&[
+            "keyroostctl",
+            "piv",
+            "key",
+            "move",
+            "--from",
+            "9a",
+            "--to",
+            "9c",
+        ])
+        .unwrap();
+        assert_eq!(confirm_yes(&cli), None);
+        let move_cmd = all_commands()
+            .into_iter()
+            .find(|(p, _)| p == "piv key move")
+            .unwrap()
+            .1;
+        let help = format!(
+            "{} {}",
+            move_cmd
+                .get_about()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            move_cmd
+                .get_long_about()
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        );
+        assert!(help.contains("Refuses if the destination slot already holds a key"));
+        assert!(!help.contains("Irreversible") && !help.contains("replace"));
     }
 
     #[test]

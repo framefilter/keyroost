@@ -9976,8 +9976,9 @@ fn piv_slot_occupancy(
     }
 }
 
-/// The red "replace?" warning for writing a key into `slot` (Generate, or
-/// the Move destination), or `None` when the slot is known to be empty.
+/// The red "replace?" warning for generating a key into `slot`, or `None`
+/// when the slot is known to be empty. (Move never replaces: see
+/// [`piv_move_dest_warning`].)
 fn piv_replace_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
     match occupancy {
         PivOccupancy::Key => Some(format!(
@@ -9987,6 +9988,19 @@ fn piv_replace_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
             "{slot} may already hold a key, which would be replaced. This cannot be undone."
         )),
         PivOccupancy::Empty => None,
+    }
+}
+
+/// The red note for a Move destination. Moving onto a slot that holds a key
+/// is refused before anything is sent to the card, so a known-occupied
+/// destination cannot be used; an unknown one needs no warning because the
+/// check happens before the move.
+fn piv_move_dest_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
+    match occupancy {
+        PivOccupancy::Key => Some(format!(
+            "{slot} already holds a key \u{2014} delete it first or pick an empty slot."
+        )),
+        PivOccupancy::MaybeKey | PivOccupancy::Empty => None,
     }
 }
 
@@ -15545,14 +15559,6 @@ impl App {
         } else {
             Vec::new()
         };
-        // Destinations offered above that keyroost can't vouch for as empty:
-        // choosing one shows the "may already hold a key" warning.
-        let move_maybe_dests: Vec<keyroost_piv::Slot> = move_dests
-            .iter()
-            .copied()
-            .filter(|&s| self.piv_occupancy(s) == PivOccupancy::MaybeKey)
-            .collect();
-
         // New CHUID's GUID field needs to stay on one line at its full
         // canonical `8-4-4-4-12` width (36 characters); every other flow
         // fits the default. Sized from the same measured field width the
@@ -16331,11 +16337,9 @@ impl App {
                                     });
                             });
                             ui.add_space(6.0);
-                            if let Some(dest) =
-                                self.piv.move_dest.filter(|d| move_maybe_dests.contains(d))
-                            {
+                            if let Some(dest) = self.piv.move_dest {
                                 if let Some(warning) =
-                                    piv_replace_warning(PivOccupancy::MaybeKey, &dest.label())
+                                    piv_move_dest_warning(self.piv_occupancy(dest), &dest.label())
                                 {
                                     ui.colored_label(
                                         p.err,
@@ -22981,6 +22985,15 @@ mod tests {
             piv_replace_warning(PivOccupancy::Key, "9a").is_some_and(|w| w.contains("OVERWRITES"))
         );
         assert_eq!(piv_replace_warning(PivOccupancy::Empty, "9a"), None);
+    }
+
+    #[test]
+    fn move_destination_never_warns_of_overwriting() {
+        let w = piv_move_dest_warning(PivOccupancy::Key, "9a").unwrap();
+        assert!(w.contains("already holds a key") && w.contains("delete it first"));
+        assert!(!w.contains("OVERWRITES") && !w.contains("replaced"));
+        assert_eq!(piv_move_dest_warning(PivOccupancy::MaybeKey, "9a"), None);
+        assert_eq!(piv_move_dest_warning(PivOccupancy::Empty, "9a"), None);
     }
 
     #[test]
