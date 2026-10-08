@@ -115,7 +115,7 @@
   <section class="kr-section" id="cli">
     <h2>Naming a key from the command line</h2>
     <p>The same registry is available from <code>keyroostctl</code> through the
-      <code>key-name</code> command, which has three subcommands:</p>
+      <code>name</code> command, which has three subcommands:</p>
     <ul>
       <li><strong><code>add</code></strong> — record a friendly name for a connected key.
         Pass the label as the first argument; keyroost reads the connected key's serial and
@@ -128,9 +128,9 @@
         whether that key is currently connected.</li>
       <li><strong><code>delete</code></strong> — delete a configured name by its label.</li>
     </ul>
-<pre><code>keyroostctl key-name add signing-yubikey
-keyroostctl key-name list
-keyroostctl key-name delete signing-yubikey</code></pre>
+<pre><code>keyroostctl name add signing-yubikey
+keyroostctl name list
+keyroostctl name delete signing-yubikey</code></pre>
     <p>Once a key is named, commands that target a single key accept
       <code>--device signing-yubikey</code> to pick it out, instead of a device path that
       changes between plugs. <code>--device</code> also takes a serial or the number

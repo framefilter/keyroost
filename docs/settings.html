@@ -71,7 +71,7 @@
         lowered again, and enterprise attestation can't be turned off, without a full reset
         of the key. keyroost confirms before applying those: the app asks you to type a
         confirmation, and the command line asks <strong>y/N</strong>, naming the key. A script, or
-        a command whose PIN is piped in with <code>--pin-stdin</code>, adds <code>--yes</code>
+        a command whose PIN is piped in with <code>--pin stdin</code>, adds <code>--yes</code>
         instead.</p>
     </div>
   </section>
@@ -111,17 +111,18 @@
 
   <section class="kr-section">
     <h2>Command line</h2>
-<pre><code>keyroostctl fido config enable-always-uv                                   --pin-env KR_PIN
-keyroostctl fido config disable-always-uv                                  --pin-env KR_PIN
-keyroostctl fido config set-min-pin-length --length 6 --yes                --pin-env KR_PIN
-keyroostctl fido config set-min-pin-length --length 8 --force-change --yes --pin-env KR_PIN
-keyroostctl fido config force-pin-change                                   --pin-env KR_PIN
-keyroostctl fido config enable-enterprise-attestation --yes                --pin-env KR_PIN</code></pre>
-    <p class="kr-muted">Each command takes the PIN via <code>--pin-env</code> (an environment
-      variable name) or <code>--pin-stdin</code>, or with neither asks for it at a hidden
-      prompt; with several keys connected, pick one with
+<pre><code>keyroostctl fido config always-uv enable
+keyroostctl fido config always-uv disable
+keyroostctl fido pin min-length --length 6                  # asks y/N first
+keyroostctl fido pin min-length --length 8 --force-change
+keyroostctl fido pin force-change
+keyroostctl fido config attestation enable                  # asks y/N first
+keyroostctl fido pin min-length --length 6 --yes --pin env:KR_PIN   # in a script</code></pre>
+    <p class="kr-muted">Each command asks for the PIN at a hidden prompt; a script passes
+      <code>--pin env:NAME</code> (an environment variable name) or <code>--pin
+      stdin</code> instead. With several keys connected, pick one with
       <code>--device</code> (or <code>--path</code>). The two one-way commands,
-      <code>set-min-pin-length</code> and <code>enable-enterprise-attestation</code>, ask first in a
+      <code>fido pin min-length</code> and <code>fido config attestation enable</code>, ask first in a
       terminal; in a script they need <code>--yes</code>, and without it they refuse and
       change nothing.</p>
   </section>

@@ -119,28 +119,29 @@
       <strong>Change PIN&hellip;</strong>, <strong>Remove PIN&hellip;</strong> and
       <strong>Lock now</strong>.</p>
     <p>On the command line:</p>
-<pre><code>keyroostctl otp pin-status              # is a PIN set, and how many tries are left
-keyroostctl otp set-pin --new-pin-stdin # protect this key (PIN on stdin, never argv)
-keyroostctl otp verify --pin-stdin      # open the read window for this connection
-keyroostctl otp change-pin --old-pin-stdin --new-pin-stdin  # current PIN on line 1, new on line 2
-keyroostctl otp clear-pin --pin-stdin   # back to unprotected
-keyroostctl otp list --pin-stdin        # unlock in passing; same for add and delete</code></pre>
-    <p class="kr-muted">The PIN is read from stdin (<code>--pin-stdin</code>), from a named
-      environment variable (<code>--pin-env</code>) or, with neither, from a hidden prompt in a
-      terminal &mdash; never from the command line, where it would land in your shell history
+<pre><code>keyroostctl otp pin status      # is a PIN set, and how many tries are left
+keyroostctl otp pin set         # protect this key (asks for the new PIN twice, hidden)
+keyroostctl otp pin verify      # open the read window for this connection
+keyroostctl otp pin change      # asks for the current PIN, then the new one
+keyroostctl otp pin clear       # back to unprotected
+keyroostctl otp list            # asks for the PIN when the key needs it; same for add and delete
+keyroostctl otp pin change --pin stdin --new-pin stdin   # in a script: current PIN on line 1, new on line 2</code></pre>
+    <p class="kr-muted">The PIN comes from a hidden prompt in a terminal or, in a script, from
+      <code>--pin env:NAME</code> (an environment variable) or <code>--pin stdin</code>
+      &mdash; never from the command line, where it would land in your shell history
       and in the process list. <code>list</code>,
-      <code>add</code> and <code>delete</code> all take both flags.</p>
+      <code>add</code> and <code>delete</code> all take <code>--pin</code>.</p>
     <h3>Unlocking with a fingerprint (Bio3)</h3>
     <p>On a Bio3 key with at least one fingerprint enrolled, a fingerprint touch can
       release the protected codes as an alternative to entering the PIN. Fingerprint
       enrollment itself is done through the key's FIDO2 fingerprint setup, not here;
       keyroost turns the OTP-side option on or off and unlocks with it. Enabling it
       needs the current PIN and an enrolled fingerprint.</p>
-<pre><code>keyroostctl otp fingerprint-status                  # is fingerprint unlock available, and is it on
-keyroostctl otp fingerprint-enable --pin-stdin      # turn it on (needs the current PIN)
-keyroostctl otp fingerprint-disable --pin-stdin     # turn it off
-keyroostctl otp list --unlock fingerprint           # touch the sensor to unlock, then list
-keyroostctl otp list --unlock auto --pin-stdin      # try the fingerprint, fall back to the PIN</code></pre>
+<pre><code>keyroostctl otp fingerprint status        # is fingerprint unlock available, and is it on
+keyroostctl otp fingerprint enable        # turn it on (asks for the current PIN)
+keyroostctl otp fingerprint disable       # turn it off
+keyroostctl otp list --unlock fingerprint # touch the sensor to unlock, then list
+keyroostctl otp list --unlock auto        # try the fingerprint, fall back to the PIN</code></pre>
     <p class="kr-muted">When fingerprint unlock is on, the GUI's unlock prompt shows a
       fingerprint-touch button alongside the PIN field, and either one opens the read
       window.</p>
@@ -167,7 +168,7 @@ keyroostctl otp list --unlock auto --pin-stdin      # try the fingerprint, fall 
 <pre><code>keyroostctl otp list                  # stored entries
 keyroostctl otp code --account &lt;name&gt;  # read a live code
 keyroostctl otp info                   # interface states &amp; slot status
-keyroostctl otp set-button-hotp --seed-stdin --digits 6   # provision HID-HOTP (seed via stdin)
+keyroostctl otp button set --digits 6                    # provision HID-HOTP (asks for the base32 seed, hidden)
 keyroostctl otp interface --fido --ccid --keyboard        # enable interfaces (re-plug after)</code></pre>
     <p class="kr-muted">Every <code>otp</code> subcommand accepts
       <code>--transport auto|hid|ccid</code> (default <code>auto</code>: USB-HID first,
@@ -178,7 +179,7 @@ keyroostctl otp interface --fido --ccid --keyboard        # enable interfaces (r
     <p class="kr-muted">With several Token2 keys connected, a terminal shows a numbered list
       to pick from; a script names one with <code>--device</code> (or <code>--reader</code> /
       <code>--path</code>). <code>delete</code>, <code>reset</code>,
-      <code>delete-button-hotp</code>, and <code>set-button-hotp</code> on a key that already has
+      <code>button delete</code>, and <code>button set</code> on a key that already has
       a button seed name the key and ask <strong>y/N</strong> first; a script, or a command
       whose seed or PIN is piped in, adds <code>--yes</code>. <code>interface</code> asks you
       to type <code>reconfigure interfaces</code> at the terminal, or takes

@@ -94,10 +94,13 @@
 
   <section class="kr-section">
     <h2>Command line</h2>
-<pre><code>keyroostctl fido fingerprints list   --pin-env KR_PIN
-keyroostctl fido fingerprints add    --pin-env KR_PIN --name "Right index"
-keyroostctl fido fingerprints rename --pin-env KR_PIN --template-id 0001 --name "Left index"
-keyroostctl fido fingerprints delete --pin-env KR_PIN --template-id 0002</code></pre>
+    <p>Each command asks for the PIN at a hidden prompt; a script passes
+      <code>--pin env:NAME</code> or <code>--pin stdin</code> instead.</p>
+<pre><code>keyroostctl fido fingerprint list
+keyroostctl fido fingerprint add    --name "Right index"
+keyroostctl fido fingerprint rename --id 0001 --name "Left index"
+keyroostctl fido fingerprint delete --id 0002          # asks y/N first
+keyroostctl fido fingerprint list --pin env:KR_PIN    # in a script</code></pre>
   </section>
 
   <section class="kr-section">

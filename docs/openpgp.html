@@ -104,7 +104,7 @@
         a PIN without changing anything; <strong>generate</strong> keys on-card in any
         algorithm the card accepts — RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
         secp256k1, brainpool — the choice offered from the card's own algorithm list
-        (<code>keyroostctl openpgp algorithms</code>), or <strong>import</strong> an RSA-2048
+        (<code>keyroostctl openpgp key algorithms</code>), or <strong>import</strong> an RSA-2048
         key by host keygen or from a PKCS#1/PKCS#8 PEM/DER file, for the sign, decrypt, or
         <strong>auth</strong> slot (<code>--slot decrypt</code>, <code>--slot auth</code>);
         <strong>sign</strong> (SHA-256 or
@@ -117,13 +117,19 @@
         Ed25519.</p>
     </div>
 <pre><code>keyroostctl openpgp info --device my-yubikey
-keyroostctl openpgp generate-key --slot sign --algorithm ed25519 --yes --admin-pin-stdin --device my-yubikey
-keyroostctl openpgp sign --in msg.txt --pin-stdin --device my-yubikey
-keyroostctl openpgp authenticate --in chal.bin --pin-stdin --device my-yubikey
-keyroostctl openpgp change-pin --old-pin-stdin --new-pin-stdin --device my-yubikey</code></pre>
-    <p class="kr-muted"><code>generate-key</code>, <code>import-key</code> and
+keyroostctl openpgp key generate --slot sign --algorithm ed25519 --device my-yubikey   # asks for the admin PIN, then y/N
+keyroostctl openpgp sign --in msg.txt --device my-yubikey          # asks for the PIN
+keyroostctl openpgp authenticate --in chal.bin --device my-yubikey
+keyroostctl openpgp pin change --device my-yubikey                 # the user PIN
+keyroostctl openpgp pin change --admin --device my-yubikey         # the admin PIN
+keyroostctl openpgp key generate --slot sign --algorithm ed25519 --yes --admin-pin env:ADMIN_PIN   # in a script</code></pre>
+    <p class="kr-muted"><code>key generate</code>, <code>key import</code> and
       <code>reset</code> name the key and ask <strong>y/N</strong> in a terminal; with the admin
-      PIN piped in, as above, or in a script, add <code>--yes</code>.</p>
+      PIN piped in, or in a script, add <code>--yes</code>. <code>pin change</code> and
+      <code>pin verify</code> act on the user PIN, or the admin PIN with <code>--admin</code>;
+      <code>name set</code>, <code>url set</code>, <code>key generate</code> and <code>key
+      import</code> take the admin PIN as <code>--admin-pin</code>, and <code>pin
+      unblock</code> takes <code>--admin-pin</code> and <code>--new-pin</code>.</p>
     <p class="kr-muted">The card byte layer is a pure-Rust, in-tree implementation of the
       OpenPGP Card spec (APDU + BER-TLV); RSA keygen/parsing is the one scoped host-side
       dependency. Host-side import of ECC keys and local signature verification are not
