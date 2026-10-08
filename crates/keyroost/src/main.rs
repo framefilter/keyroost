@@ -9619,7 +9619,15 @@ impl App {
             .unwrap_or_else(|| implicit.clone());
         let cleared = name.is_empty();
         let new_display = if cleared { implicit } else { name.clone() };
-        let mut keyring = keyroost_keyring::Keyring::load_default().unwrap_or_default();
+        // Never fall back to an empty registry here: saving it would replace
+        // every name in a keys.json that merely failed to load.
+        let mut keyring = match keyroost_keyring::Keyring::load_default() {
+            Ok(k) => k,
+            Err(e) => {
+                self.log(Severity::Err, format!("names not saved: {e}"));
+                return; // keep the field open; nothing was saved
+            }
+        };
         // A rename replaces this key's computer name in place; clearing drops
         // every record of the key.
         if cleared {

@@ -11354,6 +11354,27 @@ fn record_meta_for(
     }
 }
 
+/// `name add`: give a key its first name on this computer. A key that
+/// already has one is refused rather than silently renamed, so a script
+/// using `--device <old name>` never breaks without a word.
+fn add_computer_name(
+    keyring: &mut Keyring,
+    serial: &str,
+    name: &str,
+    meta: keyroost_keyring::RecordMeta,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(old) = keyring.local_name_for(serial) {
+        let old = sanitize_terminal(old);
+        return Err(format!(
+            "this key is already named \"{old}\"; remove that name first with \
+             `keyroostctl name delete {old}`"
+        )
+        .into());
+    }
+    keyring.set_name(serial, name, keyroost_keyring::NameStore::Computer, meta)?;
+    Ok(())
+}
+
 fn key_name_add(
     name: &str,
     path: Option<&Path>,
@@ -11366,10 +11387,10 @@ fn key_name_add(
     let dev = crate::target::select(Need::Nameable, reader, path)?;
     nameable(&dev)?;
     let hids = keyroost_hid::enumerate().unwrap_or_default();
-    keyring.set_name(
+    add_computer_name(
+        &mut keyring,
         &dev.serial,
         name,
-        keyroost_keyring::NameStore::Computer,
         record_meta_for(&dev, &hids),
     )?;
     // Opt-in disclosure: state plainly what is stored, and how to undo it.
@@ -11399,7 +11420,7 @@ fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
     let devices = crate::target::enumerate().unwrap_or_default();
     for k in &keyring.keys {
         let status = match &k.fingerprint {
-            None => "can't be matched to a key; name the key again",
+            None => "can't be matched to a key; delete this name and set it again",
             Some(fp) => {
                 let here = devices
                     .iter()
@@ -15513,6 +15534,28 @@ mod cli_tests {
             "--new-pn"
         ])
         .is_none());
+    }
+
+    #[test]
+    fn name_add_refuses_a_key_that_already_has_a_name() {
+        let mut k = Keyring::default();
+        let meta = keyroost_keyring::RecordMeta::default;
+        add_computer_name(&mut k, "12345678", "work", meta()).unwrap();
+        // A second name for the same key is refused, not a silent rename…
+        let e = add_computer_name(&mut k, "12345678", "work2", meta())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("already named \"work\""), "{e}");
+        assert!(e.contains("name delete work"), "{e}");
+        assert!(!e.contains("12345678"), "{e}");
+        // …so is the same name again…
+        assert!(add_computer_name(&mut k, "12345678", "work", meta()).is_err());
+        // …and another key can't take the name.
+        assert!(add_computer_name(&mut k, "ABCDEF01", "work", meta()).is_err());
+        assert_eq!(k.keys.len(), 1);
+        assert_eq!(k.local_name_for("12345678"), Some("work"));
+        add_computer_name(&mut k, "ABCDEF01", "home", meta()).unwrap();
+        assert_eq!(k.keys.len(), 2);
     }
 
     #[test]

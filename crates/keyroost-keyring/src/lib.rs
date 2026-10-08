@@ -123,9 +123,11 @@ enum Origin {
     Fresh,
     /// A version 2 file.
     V2,
-    /// A version 1 file (plain serials), converted in memory. While
-    /// `backup_pending`, the converted file isn't fully on disk yet: the next
-    /// save backs up the old file, writes the new one and removes the backup.
+    /// A version 1 file (plain serials), converted in memory.
+    /// `backup_pending: true`: the file on disk is still version 1; the next
+    /// save backs it up, writes the converted file and removes the backup.
+    /// `false`: the converted file is on disk and only removing the backup
+    /// is left.
     ConvertedFromV1 { backup_pending: bool },
 }
 
@@ -205,6 +207,9 @@ pub enum KeyringError {
     /// `keys.json` was written by a newer keyroost (this format version);
     /// it is neither read nor overwritten.
     NewerFormat(u64),
+    /// `keys.json` can't be read as any keys.json format (the detail never
+    /// quotes the file). It is left as it is and never overwritten.
+    Damaged(String),
 }
 
 impl fmt::Display for KeyringError {
@@ -244,6 +249,12 @@ impl fmt::Display for KeyringError {
                 "keys.json was written by a newer keyroost (format version {}); \
                  not changing it",
                 v
+            ),
+            KeyringError::Damaged(d) => write!(
+                f,
+                "keys.json can't be read ({}); it was left as it is and won't be \
+                 overwritten — fix or remove it by hand",
+                d
             ),
         }
     }
@@ -423,6 +434,9 @@ impl Keyring {
                     ..Keyring::default()
                 });
             }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return Err(KeyringError::Damaged("not text".into()))
+            }
             Err(e) => return Err(KeyringError::Io(e)),
         };
         let file = match parse(&text)? {
@@ -484,8 +498,17 @@ impl Keyring {
         // b. Records.
         let converted = old.keys.len();
         ring.keys = convert_v1(ring.salt.as_ref().expect("set above"), old);
-        // c–e. Backup, write, remove the backup.
-        let persisted = salt_on_disk && ring.finish_conversion(path, text.as_bytes()).is_ok();
+        // c–e. Backup, write, remove the backup. `persisted` means the
+        // converted file reached disk, even if removing the backup failed.
+        if salt_on_disk {
+            let _ = ring.finish_conversion(path, text.as_bytes());
+        }
+        let persisted = !matches!(
+            ring.origin,
+            Origin::ConvertedFromV1 {
+                backup_pending: true
+            }
+        );
         ring.report = Some(LoadReport {
             converted,
             persisted,
@@ -494,23 +517,36 @@ impl Keyring {
     }
 
     /// Steps c–e of a conversion: back up `original` (the version 1 bytes on
-    /// disk), write this ring over it, remove the backup. On failure the old
-    /// file is left (or put back) as it was.
+    /// disk), write this ring over it, remove the backup. If the write fails,
+    /// the atomic rename never happened and `path` still holds `original`.
     fn finish_conversion(&mut self, path: &Path, original: &[u8]) -> Result<(), KeyringError> {
         let backup = backup_path(path);
         // c.
         let _ = fs::remove_file(&backup);
         write_new_private(&backup, original)?;
         // d.
-        if let Err(e) = write_atomic(path, &self.to_json()?) {
-            if fs::read(path).ok().as_deref() != Some(original) {
-                let _ = fs::copy(&backup, path);
+        let json = self.to_json()?;
+        if let Err(e) = write_atomic(path, &json) {
+            // Drop the backup only once `path` is confirmed to still hold
+            // the original; otherwise it may be the only copy.
+            if fs::read(path).ok().as_deref() == Some(original) {
+                let _ = fs::remove_file(&backup);
             }
-            let _ = fs::remove_file(&backup);
             return Err(e);
         }
+        self.origin = Origin::ConvertedFromV1 {
+            backup_pending: false,
+        };
         // e. The backup holds plain serials; it must not outlive the
-        // conversion. If it can't be removed now, the next load removes it.
+        // conversion. Removed only once `path` is confirmed to hold the
+        // converted file (write_atomic has synced the directory, so the
+        // rename is durable first). If it can't be removed now, the next
+        // save or load removes it.
+        if fs::read(path).ok().as_deref() != Some(file_bytes(&json).as_slice()) {
+            return Err(KeyringError::Io(io::Error::other(
+                "keys.json changed during conversion; the backup was kept",
+            )));
+        }
         fs::remove_file(&backup)?;
         self.origin = Origin::V2;
         Ok(())
@@ -550,22 +586,31 @@ impl Keyring {
     /// still in version 1 is overwritten only by the ring that converted it
     /// ([`KeyringError::Unconverted`] otherwise — e.g. an empty ring from
     /// `load_default().unwrap_or_default()`), and a file from a newer
-    /// keyroost is never overwritten ([`KeyringError::NewerFormat`]). A
-    /// refused save writes nothing.
+    /// keyroost is never overwritten ([`KeyringError::NewerFormat`]). A file
+    /// that can't be read at all is never overwritten either
+    /// ([`KeyringError::Damaged`]): no ring can have been loaded from it, so
+    /// saving would replace names nobody has seen. A refused save writes
+    /// nothing.
     pub fn save_to(&mut self, path: &Path) -> Result<(), KeyringError> {
         let converting = matches!(self.origin, Origin::ConvertedFromV1 { .. });
+        let v1_pending = self.origin
+            == Origin::ConvertedFromV1 {
+                backup_pending: true,
+            };
         let mut v1_on_disk = None;
         match fs::read_to_string(path) {
-            Ok(text) => match parse(&text) {
-                Ok(Format::Newer(v)) => return Err(KeyringError::NewerFormat(v)),
-                Ok(Format::V1(_)) if !converting => return Err(KeyringError::Unconverted),
-                Ok(Format::V1(_)) => v1_on_disk = Some(text),
-                // A v2 file, or one too damaged to read: overwrite.
-                Ok(Format::V2(_)) | Err(_) => {}
+            Ok(text) => match parse(&text)? {
+                Format::Newer(v) => return Err(KeyringError::NewerFormat(v)),
+                Format::V1(_) if !v1_pending => return Err(KeyringError::Unconverted),
+                Format::V1(_) => v1_on_disk = Some(text),
+                Format::V2(_) => {}
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            // Not text at all: as damaged as an unparseable file.
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            // Not text at all. No ring can have been loaded from it (a load
+            // fails the same way), so nothing may overwrite it.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return Err(KeyringError::Damaged("not text".into()))
+            }
             Err(e) => return Err(KeyringError::Io(e)),
         }
         if let Some(parent) = path.parent() {
@@ -609,7 +654,7 @@ impl Keyring {
             version: FORMAT_VERSION,
             keys: &self.keys,
         })
-        .map_err(|e| parse_error(&e))
+        .map_err(|e| KeyringError::Parse(parse_detail(&e)))
     }
 
     /// The salt, generated in memory on first need.
@@ -826,9 +871,10 @@ fn salt_dir(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
 
-/// A parse error without the offending text: serde's messages can quote a
-/// value, and a value in keys.json may be a serial number.
-fn parse_error(e: &serde_json::Error) -> KeyringError {
+/// A parse error's kind and position, without the offending text: serde's
+/// messages can quote a value, and a value in keys.json may be a serial
+/// number.
+fn parse_detail(e: &serde_json::Error) -> String {
     let kind = match e.classify() {
         serde_json::error::Category::Io => "unreadable",
         serde_json::error::Category::Syntax => "invalid JSON",
@@ -836,30 +882,30 @@ fn parse_error(e: &serde_json::Error) -> KeyringError {
         serde_json::error::Category::Eof => "truncated",
     };
     if e.line() == 0 {
-        KeyringError::Parse(kind.to_string())
+        kind.to_string()
     } else {
-        KeyringError::Parse(format!(
-            "{kind} at line {}, column {}",
-            e.line(),
-            e.column()
-        ))
+        format!("{kind} at line {}, column {}", e.line(), e.column())
     }
+}
+
+fn damaged(e: &serde_json::Error) -> KeyringError {
+    KeyringError::Damaged(parse_detail(e))
 }
 
 /// Tell the formats apart: `version: 2` is v2; no `version` and a `keys`
 /// array whose every entry carries a `serial` (or no entries) is v1.
 fn parse(text: &str) -> Result<Format, KeyringError> {
-    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| parse_error(&e))?;
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| damaged(&e))?;
     match value.get("version").map(serde_json::Value::as_u64) {
         Some(Some(FORMAT_VERSION)) => serde_json::from_value(value)
             .map(Format::V2)
-            .map_err(|e| parse_error(&e)),
+            .map_err(|e| damaged(&e)),
         Some(Some(v)) if v > FORMAT_VERSION => Ok(Format::Newer(v)),
-        Some(_) => Err(KeyringError::Parse("unsupported version".into())),
+        Some(_) => Err(KeyringError::Damaged("unsupported version".into())),
         None if is_v1(&value) => serde_json::from_value(value)
             .map(Format::V1)
-            .map_err(|e| parse_error(&e)),
-        None => Err(KeyringError::Parse("unrecognized keys.json layout".into())),
+            .map_err(|e| damaged(&e)),
+        None => Err(KeyringError::Damaged("unrecognized layout".into())),
     }
 }
 
@@ -917,12 +963,22 @@ fn write_atomic(path: &Path, json: &str) -> Result<(), KeyringError> {
         }
         use std::io::Write;
         let mut f = opts.open(&tmp)?;
-        f.write_all(json.as_bytes())?;
-        f.write_all(b"\n")?;
+        f.write_all(&file_bytes(json))?;
         f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    // Make the rename itself durable before anything (such as removing a
+    // conversion backup) relies on it.
+    #[cfg(unix)]
+    fs::File::open(salt_dir(path))?.sync_all()?;
     Ok(())
+}
+
+/// The exact bytes `keys.json` holds for `json`.
+fn file_bytes(json: &str) -> Vec<u8> {
+    let mut b = json.as_bytes().to_vec();
+    b.push(b'\n');
+    b
 }
 
 #[cfg(test)]
@@ -1397,7 +1453,8 @@ mod tests {
             | KeyringError::MalformedSalt
             | KeyringError::NoSerial
             | KeyringError::Unconverted
-            | KeyringError::NewerFormat(_) => (),
+            | KeyringError::NewerFormat(_)
+            | KeyringError::Damaged(_) => (),
         };
         let mut errs = vec![
             KeyringError::NoConfigDir,
@@ -1405,6 +1462,7 @@ mod tests {
             KeyringError::NoSerial,
             KeyringError::Unconverted,
             KeyringError::NewerFormat(3),
+            KeyringError::Damaged("invalid JSON".into()),
             KeyringError::Io(io::Error::other("disk full")),
         ];
         let mut k = Keyring::load_from(&path).unwrap();
@@ -1436,6 +1494,44 @@ mod tests {
     }
 
     #[test]
+    fn damaged_file_is_never_overwritten() {
+        let dir = temp_dir("damaged");
+        let path = dir.join("keys.json");
+        for bad in [
+            b"not json at all".as_slice(),
+            br#"{"version":1,"keys":[]}"#,
+            br#"{"version":"2","keys":[]}"#,
+            br#"{"keys":[{"name":"x"}]}"#,
+            br#"{"something":"else"}"#,
+            &[0xff, 0xfe, b'{'],
+        ] {
+            fs::write(&path, bad).unwrap();
+            assert!(matches!(
+                Keyring::load_from(&path),
+                Err(KeyringError::Damaged(_))
+            ));
+            // The fallback ring a caller builds on a failed load can't save
+            // over it, named or not; nothing else is written either.
+            let mut empty = Keyring::default();
+            assert!(matches!(
+                empty.save_to(&path),
+                Err(KeyringError::Damaged(_))
+            ));
+            let mut named = Keyring::default();
+            named
+                .set_name("12345678", "a", NameStore::Computer, meta())
+                .unwrap();
+            assert!(matches!(
+                named.save_to(&path),
+                Err(KeyringError::Damaged(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bad);
+            assert!(!dir.join(SALT_FILE).exists());
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn parse_errors_never_quote_the_file() {
         let dir = temp_dir("parse-err");
         let path = dir.join("keys.json");
@@ -1449,7 +1545,7 @@ mod tests {
             let e = Keyring::load_from(&path).unwrap_err().to_string();
             assert!(matches!(
                 Keyring::load_from(&path),
-                Err(KeyringError::Parse(_))
+                Err(KeyringError::Damaged(_))
             ));
             assert!(
                 !e.contains("12345678") && !e.to_lowercase().contains("abcdef01"),
