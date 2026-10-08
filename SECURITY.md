@@ -39,8 +39,9 @@ What keyroost defends against:
   and bounded; a fuzzing device gets an error, not a hang or a panic.
 - **Accidental secret disclosure by the tool itself.** keyroost persists no
   secrets of its own accord — the only files it writes unprompted are the
-  friendly-name registry (`keys.json`) and the GUI's `settings.json`, both
-  created owner-only (`0600`) and neither holding key material. Secret
+  friendly-name registry (`keys.json`, which holds salted fingerprints, not
+  serials, and its salt file `keys.salt`) and the GUI's `settings.json`, all
+  created owner-only (`0600`) and none holding key material. Secret
   output reaches disk only when you name a destination for it (e.g.
   `openpgp decrypt --out`), and those writes go through an owner-only
   temp file that is fsynced and atomically renamed, refusing to follow a

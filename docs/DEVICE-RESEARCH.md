@@ -158,8 +158,9 @@ The Molto2 and the single-profile programmable tokens are never sent an
 identity read.
 
 **Privacy.** Identities are read only to join the two halves of a key, held in
-memory for that scan, and written to disk only when the user names the key
-(`keys.json`, as before). Every read is read-only and traced under `--debug`;
+memory for that scan, and never written to disk: `keys.json` holds only a salted
+fingerprint, saved when the user names the key or when a key carrying its own
+name is first seen. Every read is read-only and traced under `--debug`;
 the HID reads give up after 1.5 seconds. Reads are planned only for what USB
 position leaves unmatched, so where USB position settles every key (Linux) no
 identity read is sent. Where several keys of one make are connected, a key

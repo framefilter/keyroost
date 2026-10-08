@@ -106,7 +106,7 @@
 <pre><code>keyroostctl name set signing-yubikey                # on this computer
 keyroostctl name set signing-yubikey --store key    # on the key (asks for the FIDO PIN)
 keyroostctl name list                               # every name, where it lives, what is connected
-keyroostctl -d signing-yubikey piv info             # use it
+keyroostctl piv info -d signing-yubikey             # use it
 keyroostctl name clear signing-yubikey              # remove it, wherever it is stored</code></pre>
     <ul>
       <li><strong><code>name set NAME</code></strong> names the key, or renames it. A rename

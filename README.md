@@ -746,7 +746,7 @@ still the same key before acting.
 keyroostctl name set "Work YubiKey"                # keep the name on this computer
 keyroostctl name set "Work YubiKey" --store key    # keep it on the key (asks for the FIDO PIN)
 keyroostctl name list                              # every name, where it lives, what is connected
-keyroostctl -d "Work YubiKey" piv info             # use it
+keyroostctl piv info -d "Work YubiKey"             # use it
 keyroostctl name clear "Work YubiKey"              # remove it, wherever it is stored
 ```
 
