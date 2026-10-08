@@ -68,18 +68,19 @@
       connected and no selector, a script is refused instead of acting on
       the first key found: pick one with <code>--device</code> (the refusal
       lists the exact values, and <code>list --json</code> gives them too).
-      No secret is taken on the command line any more: the flags that took
-      one as a plain argument are gone, a few secret flags are renamed, and
-      with no <code>-env</code> / <code>-stdin</code> flag a terminal asks
-      for the secret at a hidden prompt, except for the Molto2 seed and
-      key commands, which need a flag to choose the encoding (see
-      <a href="#v0-13-0-secrets">secrets</a> below).
+      No secret is taken on the command line any more: each secret has one
+      flag whose value says where it comes from (<code>--pin env:NAME</code>
+      or <code>--pin stdin</code>), and with no flag a terminal asks for it
+      at a hidden prompt (see <a href="#v0-13-0-secrets">secrets</a> below).
       Output is more consistent too: stdout carries only the result,
       <code>--json</code> always prints one object with every field present,
-      and <code>piv export-cert</code> prints PEM (see
-      <a href="#v0-13-0-output">output and JSON</a> below). Many commands
-      and flags have new names, and an existing output file is no longer
-      replaced without asking (see
+      and <code>piv cert export</code> prints PEM (see
+      <a href="#v0-13-0-output">output and JSON</a> below). Commands are
+      regrouped by what they act on (<code>piv pin change</code>,
+      <code>fido credential list</code>), five short flags mean the same
+      thing everywhere (<code>-d</code>, <code>-y</code>, <code>-o</code>,
+      <code>-i</code>, <code>-s</code>), and an existing output file is no
+      longer replaced without asking (see
       <a href="#v0-13-0-names">command and flag names</a> below).
       Library consumers: <code>keyroost-resolve</code> drops its HID-only
       name resolver for the shared device model.</p>
@@ -87,21 +88,33 @@
     <div class="kr-table-wrap">
     <table class="kr-table">
       <tr><th>Before</th><th>Now</th></tr>
-      <tr><td>These ran without asking: <code>oath delete</code>,
+      <tr><td>These ran without asking (v0.12 names): <code>oath delete</code>,
           <code>otp delete</code>, <code>otp button-hotp</code> (with a seed
           already set), <code>otp delete-button-hotp</code>,
           <code>fido creds-delete</code>, <code>fido fingerprint-delete</code>,
           <code>molto seed</code> / <code>import</code> /
-          <code>import-file</code> (on used slots), <code>prog seed</code>,
+          <code>import-file</code> (on used slots), <code>molto
+          customer-key</code>, <code>prog seed</code>,
           <code>prog config</code>, <code>piv set-retries</code>, and
           <code>piv generate-key</code> / <code>import-cert</code> /
           <code>self-sign</code> / <code>--generate-key</code> on
           <code>self-sign</code> and <code>request-cert</code> (on a slot in
           use)</td>
-        <td>A y/N question in a terminal. A script, or a command whose PIN,
-          seed or management key is piped in on stdin, must add
-          <code>--yes</code>, or the command refuses and changes
-          nothing.</td></tr>
+        <td>A y/N question in a terminal: <code>oath delete</code>,
+          <code>otp delete</code>, <code>otp button set</code>,
+          <code>otp button delete</code>, <code>fido credential
+          delete</code>, <code>fido fingerprint delete</code>,
+          <code>molto seed</code> and <code>molto import</code> (on used
+          slots), <code>molto customer-key</code>, <code>prog seed</code>,
+          <code>prog config</code>, <code>piv retries set</code> (which also
+          resets the PIN and PUK to their factory defaults), and
+          <code>piv key generate</code>, <code>piv cert import</code>,
+          <code>piv cert generate</code> and <code>--generate-key</code> on
+          a slot in use. A script, or a command whose PIN, seed or
+          management key is piped in on stdin, must add <code>--yes</code>
+          (<code>-y</code>), or the command refuses and changes nothing.
+          <code>piv key move</code> still doesn't ask: it refuses a
+          destination slot that already holds a key.</td></tr>
       <tr><td>Commands that already took <code>--yes</code> refused without
           it, even in a terminal</td>
         <td>In a terminal they ask y/N instead (the hidden <code>molto
@@ -149,12 +162,12 @@
           force which. A value that matches several keys is refused.</td></tr>
       <tr><td><code>--device</code> was ignored by commands that touch no
           key</td>
-        <td>Refused on <code>doctor</code>, <code>key-name list</code>,
-          <code>key-name delete</code>, <code>completions</code>,
-          <code>manpage</code> and <code>molto import-file
+        <td>Refused on <code>doctor</code>, <code>name list</code>,
+          <code>name delete</code>, <code>completions</code>,
+          <code>manpage</code> and <code>molto import --file …
           --dry-run</code>. Remove it.</td></tr>
       <tr><td><code>fido ssh-cert extract --force</code></td>
-        <td><code>fido ssh-cert extract --overwrite</code>. The old flag is
+        <td><code>fido ssh extract --overwrite</code>. The old flag is
           gone.</td></tr>
       <tr><td><code>completions &lt;shell&gt;</code> printed a full static
           script</td>
@@ -172,86 +185,145 @@
           --device X</code> shows just that key.</td></tr>
       <tr><td><code>piv self-sign</code> / <code>request-cert</code> without
           <code>--key-usage</code> wrote no key usage</td>
-        <td>They write the slot's standard PIV key usage, marked critical
+        <td><code>piv cert generate</code> / <code>piv cert request</code> write the slot's standard PIV key usage, marked critical
           (same as <code>--key-usage default</code>). Use <code>--key-usage
           undefined</code> for the old output.</td></tr>
     </table>
     </div>
     <h3 id="v0-13-0-secrets">CLI: secrets</h3>
-    <p>Every PIN, password, key, seed and <code>otpauth://</code> URI now
-      comes from <code>--X-env VAR</code>, from <code>--X-stdin</code> (one
-      line), or, with neither and a terminal present, from a hidden prompt.
-      The exceptions are <code>molto seed</code>, <code>prog seed</code> and
-      <code>molto customer-key</code>: the flag you use says whether the
-      value is hex, base32 or ASCII, so one of those flags is required.
-      New PINs, passwords and keys typed at the prompt are asked twice. A
-      script with no source is refused with an error naming the flags. A
-      removed or renamed flag is refused with an error naming its
+    <p>Each PIN, password, key, seed and <code>otpauth://</code> URI has one
+      flag, and its value says where the secret comes from:
+      <code>env:NAME</code> reads the environment variable
+      <code>NAME</code>, <code>stdin</code> reads one line from standard
+      input, and <code>--mgmt-key default</code> uses the factory-default
+      management key. With no flag, a terminal asks at a hidden prompt; that
+      is the normal way to run a command by hand. New PINs, passwords and
+      keys typed at the prompt are asked twice. A script with no flag is
+      refused with an error naming it. The secret itself typed as the value
+      (<code>--pin 123456</code>) is refused with exit 2 and never shown.
+      The <code>--old-…</code> flags are now the plain name:
+      <code>--pin</code> is the current PIN and <code>--new-pin</code> the
+      new one. A removed or renamed flag is refused with an error naming its
       replacement; the value given with it is never printed.</p>
+<pre><code>keyroostctl piv pin change                                     # by hand: asks for both PINs, hidden
+keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a script</code></pre>
     <div class="kr-table-wrap">
     <table class="kr-table">
       <tr><th>Old (≤ 0.12.x)</th><th>New (0.13.0+)</th></tr>
-      <tr><td><code>keyroostctl molto --key HEX …</code></td>
-        <td><code>keyroostctl molto --key-env VAR …</code> (with no key
-          flag, the factory-default key is used, as before)</td></tr>
-      <tr><td><code>keyroostctl molto --key-ascii TEXT …</code></td>
-        <td><code>keyroostctl molto --key-ascii-env VAR …</code></td></tr>
-      <tr><td><code>keyroostctl molto seed -p 5 --hex HEX</code><br><code>keyroostctl molto seed -p 5 --base32 B32</code></td>
-        <td><code>keyroostctl molto seed --slot 5 --hex-env VAR</code> or
-          <code>--hex-stdin</code>;<br><code>keyroostctl molto seed --slot 5
-          --base32-env VAR</code> or <code>--base32-stdin</code></td></tr>
-      <tr><td><code>keyroostctl prog seed --hex HEX</code><br><code>keyroostctl prog seed --base32 B32</code></td>
-        <td><code>keyroostctl prog seed --hex-env VAR</code> or
-          <code>--hex-stdin</code>;<br><code>keyroostctl prog seed
-          --base32-env VAR</code> or <code>--base32-stdin</code></td></tr>
+      <tr><td><code>keyroostctl molto --key HEX …</code><br><code>keyroostctl molto --key-env VAR …</code></td>
+        <td><code>keyroostctl molto --customer-key env:VAR …</code> (with no
+          <code>--customer-key</code>, the factory-default key is used, as
+          before)</td></tr>
+      <tr><td><code>keyroostctl molto --key-ascii TEXT …</code><br><code>keyroostctl molto --key-ascii-env VAR …</code></td>
+        <td><code>keyroostctl molto --customer-key env:VAR
+          --customer-key-encoding ascii …</code></td></tr>
+      <tr><td><code>keyroostctl molto seed -p 5 --hex HEX</code><br><code>keyroostctl molto seed -p 5 --hex-env VAR</code> / <code>--hex-stdin</code></td>
+        <td><code>keyroostctl molto seed --slot 5 --seed env:VAR --encoding
+          hex</code> or <code>--seed stdin --encoding hex</code></td></tr>
+      <tr><td><code>keyroostctl molto seed -p 5 --base32 B32</code><br><code>keyroostctl molto seed -p 5 --base32-env VAR</code> / <code>--base32-stdin</code></td>
+        <td><code>keyroostctl molto seed --slot 5 --seed env:VAR</code> or
+          <code>--seed stdin</code> (base32 is the default encoding); with
+          no <code>--seed</code>, a terminal asks (hidden)</td></tr>
+      <tr><td><code>keyroostctl prog seed --hex HEX</code><br><code>keyroostctl prog seed --hex-env VAR</code> / <code>--hex-stdin</code></td>
+        <td><code>keyroostctl prog seed --seed env:VAR --encoding hex</code>
+          or <code>--seed stdin --encoding hex</code></td></tr>
+      <tr><td><code>keyroostctl prog seed --base32 B32</code><br><code>keyroostctl prog seed --base32-env VAR</code> / <code>--base32-stdin</code></td>
+        <td><code>keyroostctl prog seed --seed env:VAR</code> or
+          <code>--seed stdin</code>; with no <code>--seed</code>, a terminal
+          asks (hidden)</td></tr>
       <tr><td><code>keyroostctl prog seed --base32-stdin</code> read all of stdin</td>
-        <td>Reads one line, like every other <code>-stdin</code>
-          flag.</td></tr>
-      <tr><td><code>keyroostctl molto customer-key --hex HEX</code><br><code>keyroostctl molto customer-key --ascii TEXT</code></td>
-        <td><code>keyroostctl molto customer-key --hex-env VAR</code> or
-          <code>--hex-stdin</code>;<br><code>keyroostctl molto customer-key
-          --ascii-env VAR</code> or <code>--ascii-stdin</code> (typed at a
-          terminal, the new key is asked twice)</td></tr>
+        <td><code>--seed stdin</code> reads one line, like every other
+          source.</td></tr>
+      <tr><td><code>keyroostctl molto customer-key --hex HEX</code><br><code>keyroostctl molto customer-key --hex-env VAR</code> / <code>--hex-stdin</code></td>
+        <td><code>keyroostctl molto customer-key --new-customer-key
+          env:VAR</code> or <code>--new-customer-key stdin</code> (hex is the
+          default encoding); with no flag, a terminal asks twice
+          (hidden)</td></tr>
+      <tr><td><code>keyroostctl molto customer-key --ascii TEXT</code><br><code>keyroostctl molto customer-key --ascii-env VAR</code> / <code>--ascii-stdin</code></td>
+        <td><code>keyroostctl molto customer-key --new-customer-key env:VAR
+          --encoding ascii</code></td></tr>
       <tr><td><code>keyroostctl molto import -p 0 'otpauth://…'</code></td>
-        <td><code>keyroostctl molto import --slot 0 -</code> with the URI piped
-          on stdin, <code>keyroostctl molto import --slot 0 --uri-env
-          VAR</code>, or <code>--qr IMAGE</code>; with none of them, a
-          terminal asks for the URI (hidden)</td></tr>
+        <td><code>keyroostctl molto import --slot 0 --uri env:VAR</code>,
+          <code>--uri stdin</code>, or <code>--qr IMAGE</code>; with none of
+          them, a terminal asks for the URI (hidden)</td></tr>
       <tr><td><code>keyroostctl oath add NAME --secret-env VAR</code><br><code>keyroostctl oath add NAME --secret-stdin</code></td>
-        <td><code>keyroostctl oath add NAME --seed-env VAR</code> or
-          <code>--seed-stdin</code> (the names <code>otp add</code>
-          uses)</td></tr>
+        <td><code>keyroostctl oath add NAME --seed env:VAR</code> or
+          <code>--seed stdin</code> (base32 unless <code>--encoding
+          hex</code>)</td></tr>
       <tr><td><code>keyroostctl openpgp verify --pin admin</code></td>
-        <td><code>keyroostctl openpgp verify --which admin</code> (the PIN
-          itself comes from <code>--pin-env</code>, <code>--pin-stdin</code>
-          or the prompt)</td></tr>
+        <td><code>keyroostctl openpgp pin verify --admin</code> (the PIN
+          itself comes from <code>--pin env:VAR</code>, <code>--pin
+          stdin</code> or the prompt)</td></tr>
       <tr><td><code>keyroostctl otp change-pin --current-env OLD --new-env NEW</code></td>
-        <td><code>keyroostctl otp change-pin --old-pin-env OLD --new-pin-env
-          NEW</code></td></tr>
+        <td><code>keyroostctl otp pin change --pin env:OLD --new-pin
+          env:NEW</code></td></tr>
       <tr><td><code>keyroostctl otp change-pin --pin-stdin</code> (current PIN on line 1, new PIN on line 2)</td>
-        <td><code>keyroostctl otp change-pin --old-pin-stdin
-          --new-pin-stdin</code> (same two lines, same order)</td></tr>
+        <td><code>keyroostctl otp pin change --pin stdin --new-pin
+          stdin</code> (same two lines, same order)</td></tr>
+      <tr><td><code>keyroostctl otp set-pin --pin-env VAR</code> / <code>--pin-stdin</code></td>
+        <td><code>keyroostctl otp pin set --new-pin env:VAR</code> /
+          <code>--new-pin stdin</code></td></tr>
+      <tr><td><code>--pin-env VAR</code> / <code>--pin-stdin</code></td>
+        <td><code>--pin env:VAR</code> / <code>--pin stdin</code></td></tr>
+      <tr><td><code>--old-pin-env VAR</code> / <code>--old-pin-stdin</code></td>
+        <td><code>--pin env:VAR</code> / <code>--pin stdin</code> (the
+          current PIN)</td></tr>
+      <tr><td><code>--new-pin-env VAR</code> / <code>--new-pin-stdin</code></td>
+        <td><code>--new-pin env:VAR</code> / <code>--new-pin stdin</code></td></tr>
+      <tr><td><code>--puk-env VAR</code> / <code>--puk-stdin</code></td>
+        <td><code>--puk env:VAR</code> / <code>--puk stdin</code></td></tr>
+      <tr><td><code>--old-puk-env VAR</code> / <code>--old-puk-stdin</code></td>
+        <td><code>--puk env:VAR</code> / <code>--puk stdin</code> (the
+          current PUK)</td></tr>
+      <tr><td><code>--new-puk-env VAR</code> / <code>--new-puk-stdin</code></td>
+        <td><code>--new-puk env:VAR</code> / <code>--new-puk stdin</code></td></tr>
+      <tr><td><code>--admin-pin-env VAR</code> / <code>--admin-pin-stdin</code></td>
+        <td><code>--admin-pin env:VAR</code> / <code>--admin-pin
+          stdin</code></td></tr>
+      <tr><td><code>--mgmt-key-env VAR</code> / <code>--mgmt-key-stdin</code> / <code>--mgmt-key-default</code></td>
+        <td><code>--mgmt-key env:VAR</code> / <code>--mgmt-key stdin</code>
+          / <code>--mgmt-key default</code></td></tr>
+      <tr><td><code>--old-mgmt-key-env VAR</code> / <code>--old-mgmt-key-stdin</code> / <code>--old-mgmt-key-default</code></td>
+        <td><code>--mgmt-key env:VAR</code> / <code>--mgmt-key stdin</code>
+          / <code>--mgmt-key default</code> (the current management
+          key)</td></tr>
+      <tr><td><code>--new-mgmt-key-env VAR</code> / <code>--new-mgmt-key-stdin</code></td>
+        <td><code>--new-mgmt-key env:VAR</code> / <code>--new-mgmt-key
+          stdin</code></td></tr>
+      <tr><td><code>--password-env VAR</code> / <code>--password-stdin</code></td>
+        <td><code>--password env:VAR</code> / <code>--password
+          stdin</code></td></tr>
+      <tr><td><code>--new-password-env VAR</code> / <code>--new-password-stdin</code></td>
+        <td><code>--new-password env:VAR</code> / <code>--new-password
+          stdin</code></td></tr>
+      <tr><td><code>--seed-env VAR</code> / <code>--seed-stdin</code></td>
+        <td><code>--seed env:VAR</code> / <code>--seed stdin</code></td></tr>
       <tr><td><code>keyroostctl oath set-password --password-stdin --new-password-stdin</code> read the new password on line 1 and the current one on line 2</td>
-        <td>The current password is line 1 and the new one line 2. Swap
-          the lines in a script that pipes both.</td></tr>
+        <td><code>keyroostctl oath password set --password stdin
+          --new-password stdin</code> reads the current password on line 1
+          and the new one on line 2. Swap the lines in a script that pipes
+          both.</td></tr>
       <tr><td><code>keyroostctl piv change-management-key --old-mgmt-key-stdin --new-mgmt-key-stdin</code> read the new key on line 1 and the current one on line 2</td>
-        <td>The current key is line 1 and the new one line 2. Swap the
-          lines in a script that pipes both.</td></tr>
+        <td><code>keyroostctl piv mgmt-key change --mgmt-key stdin
+          --new-mgmt-key stdin</code> reads the current key on line 1 and
+          the new one on line 2. Swap the lines in a script that pipes
+          both.</td></tr>
       <tr><td>No <code>-env</code> / <code>-stdin</code> flag: refused, even in a terminal. A <code>-stdin</code> flag typed at a terminal showed the secret, with a warning</td>
-        <td>In a terminal: a hidden prompt, except for the Molto2 seed and
-          key commands above (<code>--X-stdin</code> typed
-          at a terminal is hidden too). In a script: refused, naming the
-          flags. After a secret is typed at the prompt, keyroost checks it
-          is still the same key before acting.</td></tr>
+        <td>In a terminal: a hidden prompt, for every secret (the Molto2
+          and <code>prog</code> seeds and the new Molto2 customer key
+          included). <code>stdin</code> typed at a terminal is hidden too.
+          In a script: refused, naming the flag. After a secret is typed at
+          the prompt, keyroost checks it is still the same key before
+          acting.</td></tr>
       <tr><td><code>keyroostctl piv reset</code> / <code>factory-reset</code> ignored an unset <code>--mgmt-key-env</code> or <code>--pin-env</code> variable when the card didn't need it</td>
-        <td>The credential is read before anything is reset, so an unset
-          variable is an error up front. Drop the flag if the card doesn't
-          need it.</td></tr>
+        <td>The <code>--mgmt-key</code> or <code>--pin</code> source is read
+          before anything is reset, so an unset variable is an error up
+          front. Drop the flag if the card doesn't need it.</td></tr>
     </table>
     </div>
     <p>In Git Bash (mintty) on Windows the hidden prompt needs a real
       console: run <code>winpty keyroostctl …</code>, or pass the secret
-      with an <code>-env</code> flag.</p>
+      with <code>env:NAME</code>.</p>
     <h3 id="v0-13-0-output">CLI: output and JSON</h3>
     <p>stdout now carries only a command's result; prompts, progress and
       notes go to stderr, so <code>keyroostctl molto slots &gt;
@@ -340,8 +412,9 @@
           UTC on stdout, since they are its result.</td></tr>
       <tr><td><code>piv export-cert</code> wrote DER, and refused to write
           it to a terminal</td>
-        <td>Writes PEM, so <code>keyroostctl piv export-cert --slot
-          9a</code> at a terminal prints the certificate. Add <code>--format
+        <td><code>piv cert export</code> writes PEM, so <code>keyroostctl
+          piv cert export --slot 9a</code> at a terminal prints the
+          certificate. Add <code>--format
           der</code> for the old bytes.</td></tr>
       <tr><td>Some out-of-range values (<code>oath add --digits 9</code>,
           <code>piv set-retries --pin-tries 0</code>) exited 1</td>
@@ -372,99 +445,172 @@
     </table>
     </div>
     <h3 id="v0-13-0-names">CLI: command and flag names</h3>
-    <p>Commands and flags are renamed so related ones read alike. An old
-      name is refused with an error naming the new one; there are no hidden
-      aliases, so update scripts as follows.</p>
+    <p>Commands are grouped by what they act on, in separate words, and
+      flags are renamed to match. An old name is refused with an error
+      naming the new one; there are no hidden aliases, so update scripts as
+      follows. Secret flags are listed under
+      <a href="#v0-13-0-secrets">secrets</a> above.</p>
     <div class="kr-table-wrap">
     <table class="kr-table">
-      <tr><th>Old</th><th>New</th></tr>
+      <tr><th>Old (≤ 0.12.x)</th><th>New (0.13.0+)</th></tr>
       <tr><td><code>keyroostctl fido pin-set</code></td><td><code>keyroostctl fido pin set</code></td></tr>
       <tr><td><code>keyroostctl fido pin-change</code></td><td><code>keyroostctl fido pin change</code></td></tr>
       <tr><td><code>keyroostctl fido pin-retries</code></td><td><code>keyroostctl fido pin retries</code></td></tr>
-      <tr><td><code>keyroostctl fido creds-list</code></td><td><code>keyroostctl fido credentials list</code></td></tr>
-      <tr><td><code>keyroostctl fido creds-delete</code></td><td><code>keyroostctl fido credentials delete</code></td></tr>
-      <tr><td><code>keyroostctl fido creds-metadata</code></td><td><code>keyroostctl fido credentials metadata</code></td></tr>
-      <tr><td><code>keyroostctl fido fingerprint-list</code></td><td><code>keyroostctl fido fingerprints list</code></td></tr>
-      <tr><td><code>keyroostctl fido fingerprint-enroll</code></td><td><code>keyroostctl fido fingerprints add</code></td></tr>
-      <tr><td><code>keyroostctl fido fingerprint-rename</code></td><td><code>keyroostctl fido fingerprints rename</code></td></tr>
-      <tr><td><code>keyroostctl fido fingerprint-delete</code></td><td><code>keyroostctl fido fingerprints delete</code></td></tr>
-      <tr><td><code>keyroostctl fido always-uv</code></td>
-        <td><code>keyroostctl fido config enable-always-uv</code> or
-          <code>keyroostctl fido config disable-always-uv</code>; no longer
-          a toggle (see below)</td></tr>
-      <tr><td><code>keyroostctl fido set-min-pin</code></td><td><code>keyroostctl fido config set-min-pin-length</code></td></tr>
-      <tr><td><code>keyroostctl fido force-pin-change</code></td><td><code>keyroostctl fido config force-pin-change</code></td></tr>
-      <tr><td><code>keyroostctl fido enterprise-attestation</code></td><td><code>keyroostctl fido config enable-enterprise-attestation</code></td></tr>
+      <tr><td><code>keyroostctl fido creds-list</code></td><td><code>keyroostctl fido credential list</code></td></tr>
+      <tr><td><code>keyroostctl fido creds-delete</code></td><td><code>keyroostctl fido credential delete</code></td></tr>
+      <tr><td><code>keyroostctl fido creds-metadata</code></td><td><code>keyroostctl fido credential metadata</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-list</code></td><td><code>keyroostctl fido fingerprint list</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-enroll</code></td><td><code>keyroostctl fido fingerprint add</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-rename</code></td><td><code>keyroostctl fido fingerprint rename</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-delete</code></td><td><code>keyroostctl fido fingerprint delete</code></td></tr>
+      <tr><td><code>keyroostctl fido always-uv</code></td><td><code>keyroostctl fido config always-uv enable</code> or <code>keyroostctl fido config always-uv disable</code>; no longer a toggle (see below)</td></tr>
+      <tr><td><code>keyroostctl fido set-min-pin</code></td><td><code>keyroostctl fido pin min-length</code></td></tr>
+      <tr><td><code>keyroostctl fido force-pin-change</code></td><td><code>keyroostctl fido pin force-change</code></td></tr>
+      <tr><td><code>keyroostctl fido enterprise-attestation</code></td><td><code>keyroostctl fido config attestation enable</code></td></tr>
+      <tr><td><code>keyroostctl fido large-blob</code></td><td><code>keyroostctl fido blob</code>; same subcommands</td></tr>
+      <tr><td><code>keyroostctl fido ssh-cert</code></td><td><code>keyroostctl fido ssh</code>; same subcommands</td></tr>
       <tr><td><code>keyroostctl piv status</code></td><td><code>keyroostctl piv info</code></td></tr>
+      <tr><td><code>keyroostctl piv change-pin</code></td><td><code>keyroostctl piv pin change</code></td></tr>
+      <tr><td><code>keyroostctl piv unblock-pin</code></td><td><code>keyroostctl piv pin unblock</code></td></tr>
+      <tr><td><code>keyroostctl piv change-puk</code></td><td><code>keyroostctl piv puk change</code></td></tr>
+      <tr><td><code>keyroostctl piv set-retries</code></td><td><code>keyroostctl piv retries set</code></td></tr>
+      <tr><td><code>keyroostctl piv change-management-key</code></td><td><code>keyroostctl piv mgmt-key change</code></td></tr>
+      <tr><td><code>keyroostctl piv generate-key</code></td><td><code>keyroostctl piv key generate</code></td></tr>
+      <tr><td><code>keyroostctl piv delete-key</code></td><td><code>keyroostctl piv key delete</code></td></tr>
+      <tr><td><code>keyroostctl piv move-key</code></td><td><code>keyroostctl piv key move</code></td></tr>
+      <tr><td><code>keyroostctl piv import-cert</code></td><td><code>keyroostctl piv cert import</code></td></tr>
+      <tr><td><code>keyroostctl piv export-cert</code></td><td><code>keyroostctl piv cert export</code></td></tr>
+      <tr><td><code>keyroostctl piv delete-cert</code></td><td><code>keyroostctl piv cert delete</code></td></tr>
+      <tr><td><code>keyroostctl piv request-cert</code></td><td><code>keyroostctl piv cert request</code></td></tr>
+      <tr><td><code>keyroostctl piv self-sign</code></td><td><code>keyroostctl piv cert generate</code></td></tr>
+      <tr><td><code>keyroostctl piv new-chuid</code></td><td><code>keyroostctl piv chuid generate</code></td></tr>
       <tr><td><code>keyroostctl openpgp status</code></td><td><code>keyroostctl openpgp info</code></td></tr>
-      <tr><td><code>keyroostctl otp config</code></td><td><code>keyroostctl otp info</code></td></tr>
+      <tr><td><code>keyroostctl openpgp verify</code></td><td><code>keyroostctl openpgp pin verify</code>; the admin PIN is <code>--admin</code></td></tr>
+      <tr><td><code>keyroostctl openpgp change-pin</code></td><td><code>keyroostctl openpgp pin change</code></td></tr>
+      <tr><td><code>keyroostctl openpgp change-admin-pin</code></td><td><code>keyroostctl openpgp pin change --admin</code></td></tr>
+      <tr><td><code>keyroostctl openpgp unblock-pin</code></td><td><code>keyroostctl openpgp pin unblock</code></td></tr>
+      <tr><td><code>keyroostctl openpgp generate-key</code></td><td><code>keyroostctl openpgp key generate</code></td></tr>
+      <tr><td><code>keyroostctl openpgp import-key</code></td><td><code>keyroostctl openpgp key import</code></td></tr>
+      <tr><td><code>keyroostctl openpgp public-key</code></td><td><code>keyroostctl openpgp key show</code></td></tr>
+      <tr><td><code>keyroostctl openpgp algorithms</code></td><td><code>keyroostctl openpgp key algorithms</code></td></tr>
+      <tr><td><code>keyroostctl openpgp set-name</code></td><td><code>keyroostctl openpgp name set</code></td></tr>
+      <tr><td><code>keyroostctl openpgp set-url</code></td><td><code>keyroostctl openpgp url set</code></td></tr>
+      <tr><td><code>keyroostctl oath set-password</code></td><td><code>keyroostctl oath password set</code></td></tr>
+      <tr><td><code>keyroostctl oath clear-password</code></td><td><code>keyroostctl oath password clear</code></td></tr>
       <tr><td><code>keyroostctl otp get</code></td><td><code>keyroostctl otp code</code></td></tr>
-      <tr><td><code>keyroostctl otp button-hotp</code></td><td><code>keyroostctl otp set-button-hotp</code></td></tr>
+      <tr><td><code>keyroostctl otp config</code></td><td><code>keyroostctl otp info</code></td></tr>
       <tr><td><code>keyroostctl otp erase-all</code></td><td><code>keyroostctl otp reset</code></td></tr>
-      <tr><td><code>keyroostctl otp remove-pin</code></td><td><code>keyroostctl otp clear-pin</code></td></tr>
-      <tr><td><code>keyroostctl otp fp-status</code></td><td><code>keyroostctl otp fingerprint-status</code></td></tr>
-      <tr><td><code>keyroostctl otp fp-enable</code></td><td><code>keyroostctl otp fingerprint-enable</code></td></tr>
-      <tr><td><code>keyroostctl otp fp-disable</code></td><td><code>keyroostctl otp fingerprint-disable</code></td></tr>
+      <tr><td><code>keyroostctl otp button-hotp</code></td><td><code>keyroostctl otp button set</code></td></tr>
+      <tr><td><code>keyroostctl otp delete-button-hotp</code></td><td><code>keyroostctl otp button delete</code></td></tr>
+      <tr><td><code>keyroostctl otp pin-status</code></td><td><code>keyroostctl otp pin status</code></td></tr>
+      <tr><td><code>keyroostctl otp set-pin</code></td><td><code>keyroostctl otp pin set</code></td></tr>
+      <tr><td><code>keyroostctl otp verify</code></td><td><code>keyroostctl otp pin verify</code></td></tr>
+      <tr><td><code>keyroostctl otp change-pin</code></td><td><code>keyroostctl otp pin change</code></td></tr>
+      <tr><td><code>keyroostctl otp remove-pin</code></td><td><code>keyroostctl otp pin clear</code></td></tr>
+      <tr><td><code>keyroostctl otp fp-status</code></td><td><code>keyroostctl otp fingerprint status</code></td></tr>
+      <tr><td><code>keyroostctl otp fp-enable</code></td><td><code>keyroostctl otp fingerprint enable</code></td></tr>
+      <tr><td><code>keyroostctl otp fp-disable</code></td><td><code>keyroostctl otp fingerprint disable</code></td></tr>
       <tr><td><code>keyroostctl otp fp-list</code></td><td><code>keyroostctl otp list --unlock fingerprint</code></td></tr>
-      <tr><td><code>keyroostctl otp unlock-list</code></td>
-        <td><code>keyroostctl otp list --unlock auto</code>;
-          <code>unlock-list --pin-only</code> is <code>keyroostctl otp list
-          --unlock pin</code> (the default)</td></tr>
-      <tr><td><code>keyroostctl key-name remove NAME</code></td><td><code>keyroostctl key-name delete NAME</code></td></tr>
+      <tr><td><code>keyroostctl otp unlock-list</code></td><td><code>keyroostctl otp list --unlock auto</code>; <code>--pin-only</code> is <code>--unlock pin</code>, the default</td></tr>
+      <tr><td><code>keyroostctl molto sync-time</code></td><td><code>keyroostctl molto sync</code></td></tr>
+      <tr><td><code>keyroostctl molto import-file</code></td><td><code>keyroostctl molto import --file PATH</code>; <code>--start</code> is <code>--slot</code> (the first slot to fill)</td></tr>
+      <tr><td><code>keyroostctl key-name</code></td><td><code>keyroostctl name add</code>, <code>name list</code>, <code>name delete</code> (<code>key-name remove</code> is now <code>name delete</code>)</td></tr>
       <tr><td><code>keyroostctl --list-readers</code></td>
         <td><code>keyroostctl list</code>; the flag is removed</td></tr>
       <tr><td><code>keyroostctl molto title -p 99 NAME</code> (also <code>--profile</code>, on <code>seed</code>, <code>title</code>, <code>delete</code>, <code>config</code>, <code>sync-time</code> and <code>import</code>)</td>
-        <td><code>keyroostctl molto title --slot 99 NAME</code> (Token2
-          calls slots profiles)</td></tr>
+        <td><code>keyroostctl molto title --slot 99 NAME</code> or
+          <code>-s 99</code> (Token2 calls slots profiles)</td></tr>
       <tr><td><code>keyroostctl molto config -p 5 --time-step 60</code></td>
         <td><code>keyroostctl molto config --slot 5 --period 60</code> (same
           values)</td></tr>
       <tr><td><code>keyroostctl prog config --time-step 60</code></td>
         <td><code>keyroostctl prog config --period 60</code> (same
           values)</td></tr>
-      <tr><td><code>keyroostctl otp set-pin --pin-env VAR</code> / <code>--pin-stdin</code></td>
-        <td><code>keyroostctl otp set-pin --new-pin-env VAR</code> /
-          <code>--new-pin-stdin</code></td></tr>
+      <tr><td><code>keyroostctl molto import-file export.json --start 10</code></td>
+        <td><code>keyroostctl molto import --file export.json --slot
+          10</code></td></tr>
       <tr><td><code>keyroostctl piv import-cert --slot 9a --file cert.pem</code></td>
-        <td><code>keyroostctl piv import-cert --slot 9a --in cert.pem</code></td></tr>
+        <td><code>keyroostctl piv cert import --slot 9a --in cert.pem</code>
+          (or <code>-i cert.pem</code>)</td></tr>
       <tr><td><code>keyroostctl piv export-cert --slot 9a --file cert.pem</code> (also <code>request-cert</code> and <code>self-sign</code>)</td>
-        <td><code>keyroostctl piv export-cert --slot 9a --out cert.pem</code></td></tr>
+        <td><code>keyroostctl piv cert export --slot 9a --out cert.pem</code>
+          (or <code>-o cert.pem</code>; also <code>piv cert request</code>
+          and <code>piv cert generate</code>)</td></tr>
+      <tr><td><code>keyroostctl piv generate-key --slot 9a --save-pubkey pub.pem</code></td>
+        <td><code>keyroostctl piv key generate --slot 9a --out
+          pub.pem</code></td></tr>
+      <tr><td><code>keyroostctl piv self-sign --generate-key --save-pubkey pub.pem …</code> (also <code>request-cert</code>)</td>
+        <td><code>keyroostctl piv cert generate --generate-key --pubkey-out
+          pub.pem …</code> (also <code>piv cert request</code>)</td></tr>
+      <tr><td><code>keyroostctl piv request-cert --load-pubkey pub.pem …</code> (also <code>self-sign</code>)</td>
+        <td><code>keyroostctl piv cert request --pubkey-in pub.pem …</code>
+          (also <code>piv cert generate</code>)</td></tr>
+      <tr><td><code>keyroostctl piv change-management-key --new-algorithm aes256</code></td>
+        <td><code>keyroostctl piv mgmt-key change --algorithm
+          aes256</code></td></tr>
+      <tr><td><code>keyroostctl fido creds-delete --cred-id HEX</code></td>
+        <td><code>keyroostctl fido credential delete --id HEX</code></td></tr>
+      <tr><td><code>keyroostctl fido fingerprint-rename --template-id HEX</code> (also <code>fingerprint-delete</code>)</td>
+        <td><code>keyroostctl fido fingerprint rename --id HEX</code> (also
+          <code>fido fingerprint delete</code>)</td></tr>
+      <tr><td><code>keyroostctl fido ssh-cert extract --credential ssh:demo</code></td>
+        <td><code>keyroostctl fido ssh extract --id ssh:demo</code> (the SSH
+          credential's RP ID)</td></tr>
+      <tr><td><code>keyroostctl fido ssh-cert extract --force</code></td>
+        <td><code>keyroostctl fido ssh extract --overwrite</code></td></tr>
       <tr><td><code>keyroostctl fido large-blob export 1 entry.bin</code></td>
-        <td><code>keyroostctl fido large-blob export 1 --out entry.bin</code></td></tr>
+        <td><code>keyroostctl fido blob export 1 --out entry.bin</code> (or
+          <code>-o entry.bin</code>)</td></tr>
     </table>
     </div>
     <div class="kr-table-wrap">
     <table class="kr-table">
       <tr><th>Before</th><th>Now</th></tr>
+      <tr><td>Short flags differed by command (<code>-p</code> for a Molto2
+          slot)</td>
+        <td>Five short flags, with the same meaning on every command:
+          <code>-d</code> (<code>--device</code>), <code>-y</code>
+          (<code>--yes</code>), <code>-o</code> (<code>--out</code>),
+          <code>-i</code> (<code>--in</code>) and <code>-s</code>
+          (<code>--slot</code>). <code>-p</code> is gone.</td></tr>
+      <tr><td>The flag name said how a seed or customer key was written
+          (<code>--hex-env</code>, <code>--base32-env</code>,
+          <code>--key-ascii-env</code>)</td>
+        <td><code>--encoding</code>: seeds are base32 unless
+          <code>--encoding hex</code> (<code>oath add</code>, <code>otp
+          add</code>, <code>otp button set</code>, <code>molto seed</code>,
+          <code>prog seed</code>); a new Molto2 customer key is hex unless
+          <code>--encoding ascii</code>. The current customer key uses
+          <code>--customer-key-encoding</code>.</td></tr>
+      <tr><td><code>molto customer-key</code> ran without asking</td>
+        <td>It asks first; a script passes <code>--yes</code>.</td></tr>
       <tr><td>An existing output file was replaced without asking
           (<code>fido ssh-cert extract</code> refused it unless
           <code>--force</code>)</td>
-        <td><code>piv export-cert</code>, <code>request-cert</code>,
-          <code>self-sign</code> and <code>generate-key
-          --save-pubkey</code>, <code>openpgp sign</code>,
-          <code>decrypt</code> and <code>authenticate</code>, and
-          <code>fido large-blob export</code> and <code>ssh-cert
-          extract</code> ask "overwrite? [y/N]" at a terminal and refuse in a
-          script. Add <code>--overwrite</code> to replace the file. A
-          directory as the output (and a symlink, for the
+        <td><code>piv cert export</code>, <code>piv cert request</code>,
+          <code>piv cert generate</code> and <code>piv key generate
+          --out</code>, <code>openpgp sign</code>, <code>decrypt</code> and
+          <code>authenticate</code>, and <code>fido blob export</code> and
+          <code>fido ssh extract</code> ask "overwrite? [y/N]" at a terminal
+          and refuse in a script. Add <code>--overwrite</code> to replace
+          the file. A directory as the output (and a symlink, for the
           <code>openpgp</code> outputs) is refused before the key is
           touched. <code>--overwrite</code> covers only the file;
           <code>--yes</code> still confirms what happens on the
           key.</td></tr>
       <tr><td><code>fido always-uv</code> flipped the setting, whatever it
           was</td>
-        <td><code>keyroostctl fido config enable-always-uv</code> turns it
-          on and <code>keyroostctl fido config disable-always-uv</code> turns
-          it off. Each does nothing, says so and exits 0 when the key is
-          already in that state.</td></tr>
+        <td><code>keyroostctl fido config always-uv enable</code> turns it
+          on and <code>keyroostctl fido config always-uv disable</code>
+          turns it off. Each does nothing, says so and exits 0 when the key
+          is already in that state.</td></tr>
       <tr><td><code>otp unlock-list --pin-only</code> never asked for the
           PIN</td>
         <td><code>keyroostctl otp list --unlock pin</code> asks for it at a
-          terminal when the key needs one and no
-          <code>--pin-env</code> / <code>--pin-stdin</code> gives it. A
-          script still needs one of the flags. <code>--unlock
-          fingerprint</code> with a PIN flag is a usage error (exit
-          2).</td></tr>
+          terminal when the key needs one and no <code>--pin</code> gives
+          it. A script still needs <code>--pin env:VAR</code> or
+          <code>--pin stdin</code>. <code>--unlock fingerprint</code> with
+          <code>--pin</code> is a usage error (exit 2).</td></tr>
       <tr><td><code>piv status</code> and the GUI called every slot without
           a certificate "empty"</td>
         <td>"empty" when the card says the slot holds no key, "key present,
@@ -536,7 +682,8 @@
     <h2>v0.12.0</h2>
     <p>PIV gained applet fingerprinting, per-key feature support and certificate
       compression. Scripts should check the <code>piv status --json</code>
-      serial and any <code>piv reset</code> that relied on being refused.
+      serial (today <code>piv info --json</code>) and any <code>piv reset</code>
+      that relied on being refused.
       Library consumers: <code>PivSession</code> now lives inside a
       transaction closure, and several PIV signatures gained a parameter.</p>
     <h3>CLI</h3>
@@ -657,12 +804,12 @@
           silently won</td>
         <td>An error; pass one selector.</td></tr>
       <tr><td><code>fido set-min-pin --length 8 --pin-env KR_PIN</code></td>
-        <td><code>fido set-min-pin --length 8 --yes --pin-env KR_PIN</code>
-          &mdash; without <code>--yes</code> it refuses and leaves the key
-          unchanged. Same for <code>fido enterprise-attestation</code>.
-          (Since v0.13.0: <code>keyroostctl fido config set-min-pin-length</code>
-          and <code>keyroostctl fido config
-          enable-enterprise-attestation</code>.)</td></tr>
+        <td><code>keyroostctl fido pin min-length --length 8 --yes --pin
+          env:KR_PIN</code> &mdash; without <code>--yes</code> it refuses and
+          leaves the key unchanged. Same for <code>keyroostctl fido config
+          attestation enable</code>. (From v0.11.0 to v0.12.x this was
+          <code>fido set-min-pin --length 8 --yes --pin-env KR_PIN</code>
+          and <code>fido enterprise-attestation</code>.)</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>
@@ -814,9 +961,11 @@
       <li><code>keyroostctl factory-reset</code> is a <strong>new top-level command</strong>
         that resets every applet on a key. It reuses a name that was removed in v0.6.0 with a
         different meaning — see the warning under v0.6.0 below.</li>
-      <li><code>keyroostctl piv move-key --from &lt;slot&gt; --to &lt;slot&gt;</code> — new;
-        the 20 retired PIV slots (82–95) are now accepted anywhere <code>--slot</code> is.</li>
-      <li><code>keyroostctl fido ssh-cert list|extract</code> — new; read-only.</li>
+      <li><code>piv move-key --from &lt;slot&gt; --to &lt;slot&gt;</code> (today
+        <code>keyroostctl piv key move</code>) — new; the 20 retired PIV slots (82–95) are
+        now accepted anywhere <code>--slot</code> is.</li>
+      <li><code>fido ssh-cert list</code> / <code>extract</code> (today
+        <code>keyroostctl fido ssh list</code> / <code>extract</code>) — new; read-only.</li>
     </ul>
   </section>
 
@@ -834,7 +983,8 @@
 <pre><code>keyroostctl --name mykey fido info      # ≤ 0.7.4
 keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
     <p><code>--name</code> collided with the <code>--name</code> option of the fingerprint
-      subcommands (<code>fido fingerprint-enroll</code> / <code>fingerprint-rename</code>),
+      subcommands (<code>fido fingerprint-enroll</code> / <code>fingerprint-rename</code>,
+      today <code>fido fingerprint add</code> / <code>rename</code>),
       where it names the <em>fingerprint</em>. No compatibility alias is provided — an
       alias would recreate the exact collision the rename fixes.</p>
     <div class="kr-callout note">
@@ -891,24 +1041,25 @@ keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
       <tr><td><code>keyroostctl set-seed …</code></td><td><code>keyroostctl molto seed …</code></td></tr>
       <tr><td><code>keyroostctl set-title …</code></td><td><code>keyroostctl molto title …</code></td></tr>
       <tr><td><code>keyroostctl configure …</code></td><td><code>keyroostctl molto config …</code></td></tr>
-      <tr><td><code>keyroostctl sync-time …</code></td><td><code>keyroostctl molto sync-time …</code></td></tr>
+      <tr><td><code>keyroostctl sync-time …</code></td><td><code>keyroostctl molto sync …</code></td></tr>
       <tr><td><code>keyroostctl set-customer-key …</code></td><td><code>keyroostctl molto customer-key …</code></td></tr>
       <tr><td><code>keyroostctl import …</code></td><td><code>keyroostctl molto import …</code></td></tr>
-      <tr><td><code>keyroostctl import-file …</code></td><td><code>keyroostctl molto import-file …</code></td></tr>
+      <tr><td><code>keyroostctl import-file …</code></td><td><code>keyroostctl molto import --file …</code></td></tr>
       <tr><td><code>keyroostctl factory-reset …</code></td><td><code>keyroostctl molto reset …</code> — <strong>see the warning below</strong></td></tr>
       <tr><td><code>keyroostctl fido-info</code></td><td><code>keyroostctl fido info</code></td></tr>
       <tr><td><code>keyroostctl fido-reset …</code></td><td><code>keyroostctl fido reset …</code></td></tr>
       <tr><td><code>keyroostctl fido-pin-set …</code></td><td><code>keyroostctl fido pin set …</code></td></tr>
       <tr><td><code>keyroostctl fido-pin-change …</code></td><td><code>keyroostctl fido pin change …</code></td></tr>
       <tr><td><code>keyroostctl fido-pin-retries</code></td><td><code>keyroostctl fido pin retries</code></td></tr>
-      <tr><td><code>keyroostctl fido-creds-list …</code></td><td><code>keyroostctl fido credentials list …</code></td></tr>
-      <tr><td><code>keyroostctl fido-creds-metadata …</code></td><td><code>keyroostctl fido credentials metadata …</code></td></tr>
-      <tr><td><code>keyroostctl fido-creds-delete …</code></td><td><code>keyroostctl fido credentials delete …</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-list …</code></td><td><code>keyroostctl fido credential list …</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-metadata …</code></td><td><code>keyroostctl fido credential metadata …</code></td></tr>
+      <tr><td><code>keyroostctl fido-creds-delete …</code></td><td><code>keyroostctl fido credential delete …</code></td></tr>
       <tr><td><code>keyroostctl manpage &gt; x.1</code></td><td><code>keyroostctl manpage ./man</code></td></tr>
     </table>
     </div>
-    <p>The New column shows today's names: from v0.6.0 to v0.12.x the FIDO
-      PIN and credential commands were <code>fido pin-set</code>,
+    <p>The New column shows today's names: from v0.6.0 to v0.12.x the
+      commands were <code>molto sync-time</code>, <code>molto
+      import-file</code>, <code>fido pin-set</code>,
       <code>pin-change</code>, <code>pin-retries</code>,
       <code>creds-list</code>, <code>creds-metadata</code> and
       <code>creds-delete</code> (see <a href="#v0-13-0-names">v0.13.0</a>).</p>
@@ -925,7 +1076,9 @@ keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
     </div>
     <p>The customer-key flags (<code>--key</code>, <code>--key-ascii</code>,
       <code>--key-env</code>, <code>--key-ascii-env</code>) moved under
-      <code>molto</code> — e.g. <code>keyroostctl molto customer-key --key-env K</code>.
+      <code>molto</code>. Since v0.13.0 they are <code>--customer-key env:K</code>
+      (with <code>--customer-key-encoding ascii</code> for an ASCII key) — e.g.
+      <code>keyroostctl molto customer-key --customer-key env:K</code>.
       The <code>piv</code>, <code>oath</code>, <code>openpgp</code>, <code>otp</code>,
       <code>key-name</code>, <code>list</code>, <code>doctor</code>, and
       <code>completions</code> commands were unchanged.</p>
