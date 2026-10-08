@@ -18,11 +18,14 @@
 //! ```
 //!
 //! Key 4 of `P` is reserved; readers ignore keys they don't know. An array
-//! holds at most one name entry: writers remove every one and append one,
-//! readers take the last. The label is stored exactly as given; writers
-//! SHOULD use Unicode NFC. Callers validate the label's text (keyroost uses
-//! `keyroost_keyring::validate_name`); this module checks only its type and
-//! length.
+//! holds at most one version-1 name entry: writers remove every one and
+//! append one, readers take the last. An entry under `K` that is not a valid
+//! version-1 name (a later version, or a malformed one) is not a name to
+//! this reader: it is kept untouched like any other entry. The label is
+//! stored exactly as given, with no Unicode normalization. Callers validate
+//! the label's text (keyroost uses `keyroost_keyring::validate_name`); this
+//! module checks only its type and length, and holds the writer tag to the
+//! same 1–64 character rule on both sides.
 //!
 //! # Reading and writing
 //!
@@ -72,10 +75,11 @@ pub enum LabelError {
     Unsupported,
     /// The key has no FIDO PIN, so nothing can be written to its storage.
     NoPin,
-    /// The change needs `need` more bytes; the key has `free`.
+    /// The array would be `size` bytes (with its checksum), over the key's
+    /// `max` (`maxSerializedLargeBlobArray`, or the spec floor of 1024).
     TooLarge {
-        need: u64,
-        free: u64,
+        size: u64,
+        max: u64,
     },
     /// The array on the key changed between planning and writing.
     Changed,
@@ -97,10 +101,11 @@ impl std::fmt::Display for LabelError {
                 "this key has no FIDO PIN, which writing its storage needs; \
                  set one first with `keyroostctl fido pin set`"
             ),
-            LabelError::TooLarge { need, free } => write!(
+            LabelError::TooLarge { size, max } => write!(
                 f,
-                "not enough large-blob space for the name: it needs {need} more \
-                 bytes and {free} are free"
+                "not enough large-blob space: the key's storage would hold {size} \
+                 bytes, {} bytes over its {max}-byte limit",
+                size.saturating_sub(*max)
             ),
             LabelError::Changed => write!(
                 f,
@@ -131,23 +136,15 @@ fn fits(s: &str) -> bool {
     (1..=MAX_LABEL_CHARS).contains(&s.chars().count())
 }
 
-/// The label text as it is stored. Version 1 stores it exactly as given
-/// (writers SHOULD pass NFC); this is the one place a normalization step
-/// would go.
-fn stored_label(label: &str) -> String {
-    label.to_owned()
-}
-
 /// The canonical CBOR plaintext for `l`: `{1: 1, 2: label, 3?: writer}`.
 /// Refuses a label (or writer) that is empty or over 64 characters.
 pub fn plaintext(l: &DeviceLabel) -> Result<Vec<u8>, LabelError> {
-    let label = stored_label(&l.label);
-    if !fits(&label) || l.writer.as_deref().is_some_and(|w| !fits(w)) {
+    if !fits(&l.label) || l.writer.as_deref().is_some_and(|w| !fits(w)) {
         return Err(LabelError::InvalidLabel);
     }
     let mut map = vec![
         (Value::UInt(P_VERSION), Value::UInt(LABEL_FORMAT_VERSION)),
-        (Value::UInt(P_LABEL), Value::Text(label)),
+        (Value::UInt(P_LABEL), Value::Text(l.label.clone())),
     ];
     if let Some(w) = &l.writer {
         map.push((Value::UInt(P_WRITER), Value::Text(w.clone())));
@@ -184,7 +181,7 @@ pub fn encode_entry(l: &DeviceLabel, nonce: [u8; 12]) -> Result<LargeBlobEntry, 
 /// The name `e` holds, or `None` when `e` is not a name entry: its tag must
 /// verify under [`label_key`], it must inflate to exactly `origSize` bytes
 /// of one CBOR map with version 1 and a 1–64 character text label. A writer
-/// that isn't text of at most 64 characters is dropped; unknown keys are
+/// that isn't 1–64 characters of text is dropped; unknown keys are
 /// ignored; of duplicate keys the first wins.
 pub fn decode_entry(e: &LargeBlobEntry) -> Option<DeviceLabel> {
     let compressed = gcm_decrypt(&label_key(), &e.nonce, &e.ciphertext, e.orig_size)?;
@@ -200,7 +197,7 @@ pub fn decode_entry(e: &LargeBlobEntry) -> Option<DeviceLabel> {
     let writer = map
         .get_uint_key(P_WRITER)
         .and_then(Value::as_text)
-        .filter(|w| w.chars().count() <= MAX_LABEL_CHARS);
+        .filter(|w| fits(w));
     Some(DeviceLabel {
         label: label.to_owned(),
         writer: writer.map(str::to_owned),
@@ -266,13 +263,10 @@ pub fn plan_label_change(
     }
     let after = current.with_label(label, nonce)?;
     let serialized = after.serialize_with_checksum()?;
-    let capacity = current.capacity(info);
     let size = serialized.len() as u64;
-    if size > capacity.max_bytes {
-        return Err(LabelError::TooLarge {
-            need: size.saturating_sub(capacity.used_bytes),
-            free: capacity.free_bytes,
-        });
+    let max = current.capacity(info).max_bytes;
+    if size > max {
+        return Err(LabelError::TooLarge { size, max });
     }
     Ok(LabelPlan {
         before_raw: current.raw_array().to_vec(),
@@ -532,6 +526,12 @@ mod tests {
             Value::Text("w".repeat(65)),
         )])));
         assert_eq!(decode_entry(&long_writer), Some(v1()));
+        // Readers apply the writers' rule: an empty writer is dropped.
+        let empty_writer = seal_value(&Value::Map(label_map(vec![(
+            Value::UInt(3),
+            Value::Text(String::new()),
+        )])));
+        assert_eq!(decode_entry(&empty_writer), Some(v1()));
         // Duplicate keys: the first one wins.
         let dup = seal_value(&Value::Map(label_map(vec![(
             Value::UInt(2),
@@ -822,9 +822,23 @@ mod tests {
             let mut i = info(true, Some(true));
             i.max_serialized_large_blob_array = max;
             match plan_label_change(&current, &i, Some(&v1()), NONCE) {
-                Err(LabelError::TooLarge { need, free }) => assert_eq!((need, free), (58, 24)),
+                Err(LabelError::TooLarge { size, max }) => assert_eq!((size, max), (1058, 1024)),
                 other => panic!("expected TooLarge, got {other:?}"),
             }
+        }
+        // An array already over the limit reports its total, never "0 more".
+        let over = array_of_size(1100);
+        let i = info(true, Some(true));
+        match plan_label_change(&over, &i, None, NONCE) {
+            Err(
+                e @ LabelError::TooLarge {
+                    size: 1100,
+                    max: 1024,
+                },
+            ) => {
+                assert!(e.to_string().contains("76 bytes over"), "{e}")
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
         }
         // It fits exactly when the key has the room.
         let mut i = info(true, Some(true));

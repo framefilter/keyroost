@@ -54,6 +54,34 @@ type OpenFido = (
     Option<InitResponse>,
 );
 
+/// A large-blob-write token for `pin`, obtained only after the change was
+/// planned (and any certain refusal raised) from `before`. Getting the token
+/// talks to the key, so the array is read again afterwards and the write is
+/// refused unless it is still exactly `before`.
+fn large_blob_write_token(
+    dev: &mut impl keyroost_ctap::transport::CtapTransport,
+    info: &keyroost_ctap::AuthenticatorInfo,
+    pin: &str,
+    before: &keyroost_ctap::large_blobs::LargeBlobArray,
+) -> Result<keyroost_ctap::client_pin::PinUvAuthToken, String> {
+    let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
+        dev,
+        pin,
+        info,
+        keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
+    )
+    .map_err(|e| e.to_string())?;
+    let now = keyroost_ctap::large_blobs::read(dev, info).map_err(|e| e.to_string())?;
+    if now.raw_array() != before.raw_array() {
+        return Err(
+            "the key's large-blob storage changed while it was being unlocked \
+                    \u{2014} nothing was written; reload and try again."
+                .into(),
+        );
+    }
+    Ok(token)
+}
+
 /// Open a CTAP transport for `target`, returning the boxed transport, whether
 /// it speaks CTAP2 (CBOR), and the HID `InitResponse` when available (HID only;
 /// `None` over PC/SC, which has no INIT phase). The InitResponse carries the
@@ -13933,18 +13961,12 @@ impl App {
                     keyroost_ctap::large_blobs::read(&mut dev, &info).map_err(|e| e.to_string())?;
                 let _ = loaded; // cached copy only informs the UI, not the write
 
-                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-                    &mut dev,
-                    &pin,
-                    &info,
-                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
-                )
-                .map_err(|e| e.to_string())?;
-
+                // Plan before unlocking, so a certain refusal costs no PIN try.
                 let updated = current.with_text_note(&text);
                 let serialized = updated
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
+                let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14016,18 +14038,11 @@ impl App {
                     "that entry is not an editable keyroost note (it may have \
                             changed on the key — reload and try again)",
                 )?;
-
-                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-                    &mut dev,
-                    &pin,
-                    &info,
-                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
-                )
-                .map_err(|e| e.to_string())?;
-
+                // Plan before unlocking, so a certain refusal costs no PIN try.
                 let serialized = updated
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
+                let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14140,13 +14155,6 @@ impl App {
                     return Err("device is U2F-only".into());
                 }
                 let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
-                let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
-                    &mut dev,
-                    &pin,
-                    &info,
-                    keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
-                )
-                .map_err(|e| e.to_string())?;
 
                 // Re-read the live array and remove the matching entry from it
                 // (by content, since `LargeBlobEntry` is `PartialEq`).
@@ -14160,9 +14168,11 @@ impl App {
                             .into(),
                     );
                 };
+                // Plan before unlocking, so a certain refusal costs no PIN try.
                 let serialized = updated
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
+                let token = large_blob_write_token(&mut dev, &info, &pin, &live)?;
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
