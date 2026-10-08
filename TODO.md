@@ -87,6 +87,23 @@ Being worked on right now — check with whoever holds it before starting.
   download that release by hand once), signed → signed, and a changed key
   (must be refused). Research notes: kept locally by the maintainer. (M)
 
+- **v0.13.0: one word per action across the whole CLI.** Walk every
+  command group and confirm that paired and opposing actions use the same
+  words everywhere: what creates and what removes (`add`/`delete`,
+  `generate`/`delete`, `import`/`export`), what gives a value and what takes
+  it away (`set`/`clear`), what turns something on and off
+  (`enable`/`disable`), and status words (`info`, `list`, `status`). The
+  same function must not have a different word in a different group. Every
+  mismatch found is either renamed (with a retired-name error, as in
+  v0.13.0) or noted with the reason it differs. (S–M)
+
+- **Investigate a CLI style guide for contributors.** A short page on how
+  new keyroostctl commands and flags should look (command words, flags,
+  secret input, confirmations, output, help text), so contributions match
+  the existing CLI without a review round to align them. Decide first
+  whether it belongs in CONTRIBUTING, the Learn site, or a doc of its own,
+  and what it covers; the maintainer settles the content. (S)
+
 - **Duplicate keys on Windows/macOS with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — identity matching on PR #165, awaiting a Windows community test.**
   Where the OS reports no USB position, keyroost now asks each side of a key
   for the identity it reports (YubiKey serial, Solo 2 UUID, Token2 §6.10
