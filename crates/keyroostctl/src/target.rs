@@ -32,6 +32,18 @@ pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
     Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
         debug: debug_on(),
         skip_identity_reads: false,
+        skip_key_names: false,
+    })?)
+}
+
+/// The shared device model with identity reads but without reading the
+/// names stored on keys (local names only). Selection adds those names only
+/// when the choice could depend on them (see [`select_from`]).
+pub(crate) fn enumerate_without_key_names() -> Result<Vec<Device>, Box<dyn Error>> {
+    Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
+        debug: debug_on(),
+        skip_identity_reads: false,
+        skip_key_names: true,
     })?)
 }
 
@@ -42,6 +54,7 @@ pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn 
     Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
         debug: debug_on(),
         skip_identity_reads: true,
+        skip_key_names: true,
     })?)
 }
 
@@ -94,6 +107,8 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
         kind: DeviceKind::Key,
         hid_path,
         reader,
+        hid_serial: None,
+        naming: Default::default(),
     }
 }
 
@@ -143,7 +158,6 @@ pub(crate) fn select(
     path: Option<&Path>,
 ) -> Result<Device, Box<dyn Error>> {
     memoised(&RESOLVED, need, || {
-        let devices = enumerate()?;
         let sel = Selector {
             device: device_flag(),
             reader,
@@ -151,10 +165,35 @@ pub(crate) fn select(
         };
         let mut term = RealTerm;
         let mut picker = TermPicker::new(&mut term);
-        let (dev, line) = choose(&devices, &sel, need, &mut picker)?;
+        let (dev, line) = select_from(
+            enumerate_without_key_names,
+            |devices: &mut Vec<Device>| keyroost_resolve::add_key_names(devices, debug_on()),
+            &sel,
+            need,
+            &mut picker,
+        )?;
         eprintln!("{line}");
         Ok(dev)
     })
+}
+
+/// Scan with `scan` (no names read from keys), add them with `add_names`
+/// only when the choice could depend on them — the name commands always,
+/// otherwise per [`keyroost_resolve::selection_needs_key_names`] — then
+/// choose. Reading a key's name costs a CTAP round trip per FIDO key, so a
+/// key picked by serial, list number or override skips it.
+fn select_from(
+    scan: impl FnOnce() -> Result<Vec<Device>, Box<dyn Error>>,
+    add_names: impl FnOnce(&mut Vec<Device>),
+    sel: &Selector<'_>,
+    need: Need,
+    picker: &mut dyn Picker,
+) -> Result<(Device, String), Box<dyn Error>> {
+    let mut devices = scan()?;
+    if need == Need::Nameable || keyroost_resolve::selection_needs_key_names(&devices, sel, need) {
+        add_names(&mut devices);
+    }
+    Ok(choose(&devices, sel, need, picker)?)
 }
 
 /// The exact reader of the selected key (never re-matched as a substring).
@@ -286,7 +325,9 @@ fn reverify_verdict(
 /// [`reverify_verdict`] for which first-look results are escalated.
 pub(crate) fn reverify(before: &Device) -> Result<(), Box<dyn Error>> {
     let first = recheck(before, &enumerate_without_identity_reads()?);
-    let verdict = reverify_verdict(first, || Ok(recheck(before, &enumerate()?)))?;
+    let verdict = reverify_verdict(first, || {
+        Ok(recheck(before, &enumerate_without_key_names()?))
+    })?;
     let label = crate::prompt::key_label(before);
     match verdict {
         Recheck::Same => Ok(()),
@@ -329,7 +370,83 @@ mod tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw16".into()),
             reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00".into()),
+            hid_serial: None,
+            naming: keyroost_resolve::Naming::local(name),
         }
+    }
+
+    /// Two FIDO keys over USB with distinct serials and paths.
+    fn two_fido_keys() -> Vec<Device> {
+        let mut a = dev(None, "12345678");
+        a.id = "serial:12345678".into();
+        a.caps = Caps::FIDO2;
+        a.reader = None;
+        a.hid_path = Some("/dev/hidraw1".into());
+        let mut b = dev(None, "ABCDEF01");
+        b.id = "serial:ABCDEF01".into();
+        b.caps = Caps::FIDO2;
+        b.reader = None;
+        b.hid_path = Some("/dev/hidraw2".into());
+        vec![a, b]
+    }
+
+    /// Run `select_from` over `devices` with a name reader that counts calls.
+    fn name_reads(
+        devices: Vec<Device>,
+        device: Option<&str>,
+        path: Option<&Path>,
+        need: Need,
+    ) -> (usize, Result<Device, String>) {
+        let reads = Cell::new(0);
+        let sel = Selector {
+            device,
+            reader: None,
+            path,
+        };
+        let got = select_from(
+            || Ok(devices),
+            |_: &mut Vec<Device>| reads.set(reads.get() + 1),
+            &sel,
+            need,
+            &mut NoPicker,
+        )
+        .map(|(d, _)| d)
+        .map_err(|e| e.to_string());
+        (reads.get(), got)
+    }
+
+    #[test]
+    fn a_serial_picked_command_never_reads_key_names() {
+        for v in ["12345678", "serial:12345678", "list:1", "1"] {
+            let (reads, got) = name_reads(two_fido_keys(), Some(v), None, Need::FidoHid);
+            assert_eq!(reads, 0, "{v}");
+            assert_eq!(got.unwrap().serial, "12345678", "{v}");
+        }
+        // A --path override and a lone candidate need no names either.
+        let p = Path::new("/dev/hidraw2");
+        assert_eq!(
+            name_reads(two_fido_keys(), None, Some(p), Need::FidoHid).0,
+            0
+        );
+        let one = two_fido_keys().into_iter().take(1).collect();
+        assert_eq!(name_reads(one, None, None, Need::FidoHid).0, 0);
+    }
+
+    #[test]
+    fn a_value_that_could_be_a_name_reads_key_names_once() {
+        for v in ["Work", "name:Work"] {
+            assert_eq!(
+                name_reads(two_fido_keys(), Some(v), None, Need::FidoHid).0,
+                1,
+                "{v}"
+            );
+        }
+        // Several candidates (picker or refusal) and the name commands do too.
+        assert_eq!(name_reads(two_fido_keys(), None, None, Need::FidoHid).0, 1);
+        assert_eq!(
+            name_reads(two_fido_keys(), Some("12345678"), None, Need::Nameable).0,
+            1
+        );
     }
 
     #[test]

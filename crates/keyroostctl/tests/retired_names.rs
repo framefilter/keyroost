@@ -1,15 +1,16 @@
 //! Every retired command, flag and positional exits 2 with an error naming
 //! its replacement, and never repeats what was typed after it.
+mod common;
+use common::ConfigIn;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn run(args: &[&str]) -> (i32, String, String) {
     let dir = std::env::temp_dir().join(format!("kr-retired-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+    let out = common::keyroostctl()
         .args(args)
-        .env("XDG_CONFIG_HOME", &dir)
-        .env("APPDATA", &dir)
+        .config_in(&dir)
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
         .stdin(Stdio::null())
         .output()
@@ -333,7 +334,7 @@ const CASES: &[(&[&str], &str)] = &[
     (&["key-name", "remove", "S3CRETVALUE"], "keyroostctl name"),
     (
         &["key-name", "list", "S3CRETVALUE"],
-        "`key-name remove` is now `name delete`",
+        "`key-name remove` is now `name clear`",
     ),
     (
         &["--device", "pin-set", "fido", "pin-set"],

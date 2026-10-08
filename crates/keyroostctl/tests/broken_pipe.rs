@@ -11,9 +11,11 @@
 //! (`install_broken_pipe_guard` / `is_broken_pipe_panic`) — std's `println!`
 //! `Display` form and clap_complete's `Debug` form — are covered by the
 //! `broken_pipe_panic_detection` unit test in `main.rs`.
+mod common;
+use common::ConfigIn;
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Enough names that the completion output dwarfs any pipe buffer (64 KiB on
 /// Linux, smaller elsewhere).
@@ -32,6 +34,8 @@ fn broken_pipe_exits_without_panicking() {
         output_len > 2 * 64 * 1024,
         "output too small: {output_len} bytes"
     );
+    // Old version 1 entries on purpose: completion converts the file in this
+    // temp directory first and must still offer every name.
     let entries: Vec<String> = names
         .iter()
         .enumerate()
@@ -44,10 +48,9 @@ fn broken_pipe_exits_without_panicking() {
     .unwrap();
 
     // Completion needs no hardware: candidates come from keys.json only.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+    let mut child = common::keyroostctl()
         .env("KEYROOSTCTL_COMPLETE", "fish")
-        .env("XDG_CONFIG_HOME", &dir)
-        .env("APPDATA", &dir)
+        .config_in(&dir)
         .args(["--", "keyroostctl", "--device", ""])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

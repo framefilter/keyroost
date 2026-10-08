@@ -120,12 +120,15 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   reset in place (no replug, no touch — the card is power-cycled in the
   reader). Only manufacturer-intended resets are used, and each step reports
   its own outcome rather than being folded into one "done".
-- **Friendly device names** — an opt-in `keys.json` registry to target a specific
-  physical key by name when several are connected, instead of by a reshuffling
-  `/dev/hidrawN` path. Destructive operations always resolve to an explicit
-  target, never a default. The registry lives under `%APPDATA%` on Windows (the
-  platform config dir elsewhere), and names are validated with anti-spoofing
-  checks while allowing a relaxed, readable character set.
+- **Friendly device names** — name a key to target it with `--device NAME`
+  when several are connected, instead of by a reshuffling `/dev/hidrawN` path.
+  Keep the name on this computer (`keys.json`, which stores a salted
+  fingerprint of the key, never its serial) or on the key itself, where every
+  computer running keyroost sees it (see [Naming a key](#naming-a-key)).
+  Destructive operations always resolve to an explicit target, never a
+  default. `keys.json` lives under `%APPDATA%` on Windows (the platform config
+  dir elsewhere), and names are validated with anti-spoofing checks while
+  allowing a relaxed, readable character set.
   On Windows and macOS the OS reports no USB position, so keyroost asks each
   side of a key for the identity it reports (a YubiKey's serial, a Solo 2's
   ID, a Token2 key's serial) and joins them into one entry when they match. If
@@ -624,8 +627,8 @@ keyroostctl completions powershell | Out-String | Invoke-Expression
 ```
 
 The script asks `keyroostctl` for suggestions as you type, so
-`--device <Tab>` offers the names you saved with `name add` (it reads
-only your saved names, never the keys). If you installed a completion file
+`--device <Tab>` offers the names recorded in this computer's `keys.json`
+(it never reads the keys). If you installed a completion file
 from v0.12.0 or earlier, generate it again to get this.
 
 ## Quick start
@@ -699,7 +702,8 @@ keyroostctl factory-reset --device my-yubikey          # asks you to type "reset
 keyroostctl factory-reset --device my-yubikey --yes    # in a script
 
 # name a key to target it when several are plugged in (opt-in)
-keyroostctl name add my-yubikey
+keyroostctl name set my-yubikey                 # on this computer
+keyroostctl name set my-yubikey --store key     # on the key (asks for the FIDO PIN)
 keyroostctl name list
 
 # machine-readable output for scripts (status and query commands)
@@ -735,6 +739,56 @@ overwriting a used slot or seed) name the key and ask y/N first
 no terminal to ask on, so it adds `--yes`; so does a command whose PIN or
 seed is piped in on stdin. If you answered a question, keyroost checks it is
 still the same key before acting.
+
+### Naming a key
+
+```bash
+keyroostctl name set "Work YubiKey"                # keep the name on this computer
+keyroostctl name set "Work YubiKey" --store key    # keep it on the key (asks for the FIDO PIN)
+keyroostctl name list                              # every name, where it lives, what is connected
+keyroostctl piv info -d "Work YubiKey"             # use it
+keyroostctl name clear "Work YubiKey"              # remove it, wherever it is stored
+```
+
+With several keys connected, say which one to name with `-d` (a `list`
+number or `serial:…`), or pick from the list a terminal shows. Running
+`name set` on a named key renames it where its name already is; a name on
+this computer moves to the key with `--store key`.
+
+A name on this computer goes in `keys.json` with a salted fingerprint of the
+key, never its serial. The salt is a random value in `keys.salt` beside it.
+If `keys.salt` is lost, the names on this computer no longer match their keys:
+clear them and set them again (putting the old `keys.salt` back doesn't help).
+A `keys.json` from v0.12 or earlier, which held serials, is converted the
+first time this version reads it.
+
+#### Names on the key
+
+- A name on the key is visible to anyone who has the key, and every computer
+  running keyroost shows it, without a PIN.
+- Saving, changing or removing it needs the key's FIDO PIN, and the key needs
+  FIDO2 large-blob storage. A key without it can only be named on a
+  computer.
+- A name on the key is shown first; a name this computer saved for the key
+  shows only when the key carries none.
+- If two keys carry the same name, the one this computer saw first keeps it,
+  and `-d "Work YubiKey"` always means that one. The other shows as
+  `Work YubiKey (1234)`, with the last four characters of its serial; select
+  it by its `list` number or `serial:…`.
+- Keys that report the same serial on every unit (the OnlyKey, for example)
+  can't be told apart by their fingerprint, so naming them works as it did
+  before.
+- On Windows without administrator rights, keyroost can't read a key's FIDO
+  side, so it shows only names saved on this computer.
+- `fido blob clear` and a FIDO reset erase the name with everything else
+  (`fido blob clear --keep-name` keeps it). The FIDO2 standard also lets
+  other software remove large-blob entries that no passkey uses; we haven't
+  seen it happen. If a key loses its name, it shows as unnamed until the name
+  is written back: `name list` prints the command to do so, and the desktop
+  app offers to.
+
+The format of the name entry, with test vectors for other tools, is in
+[`docs/PROTOCOL-device-label.md`](docs/PROTOCOL-device-label.md).
 
 ### Giving keyroost a PIN
 
@@ -818,15 +872,15 @@ old script.
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
 | `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for per-credential largeBlob, `zeroize`; `hidapi` on macOS/Windows |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management + SPKI/PEM, applet fingerprinting and per-device feature gates | `zeroize` |
 | `keyroost-pivtest` | Host-side round-trip self-test for a PIV slot key (decrypt / key-agree / sign), checked against the slot certificate's public key | `rsa`, `p256`, `p384`, `p521`, `ed25519-dalek`, `x25519-dalek`, `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO byte/codec layer (APDU + HID framing) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for ECDH seed encryption and the OTP-PIN session, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
-| `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching | `serde`, `serde_json` |
-| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | none |
+| `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints) | `serde`, `serde_json`, `getrandom` (the per-computer salt); in-tree SHA-256 from `keyroost-proto` |
+| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (names on the key and on this computer) | none (in-tree only, including `keyroost-ctap`) |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand`, `zeroize` |
 | `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
@@ -841,8 +895,10 @@ The Molto2 wire protocol is documented in [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
 — the APDUs, the SM4-based MAC, and the TLV config payload, described as facts
 about the device rather than any one implementation. The sibling single-profile
 programmable token (OTPC / miniOTP / C30x) is documented the same way in
-[`docs/PROTOCOL-token2prog.md`](docs/PROTOCOL-token2prog.md). The FIDO2, OATH,
-OpenPGP and PIV layers follow their respective public standards.
+[`docs/PROTOCOL-token2prog.md`](docs/PROTOCOL-token2prog.md). The name a key
+can carry in its FIDO2 large-blob array is documented, with test vectors, in
+[`docs/PROTOCOL-device-label.md`](docs/PROTOCOL-device-label.md). The FIDO2,
+OATH, OpenPGP and PIV layers follow their respective public standards.
 
 ## Contact
 

@@ -22,7 +22,11 @@ pub(crate) struct AccountsJson<T: Serialize> {
 pub(crate) struct DeviceJson {
     pub vendor: String,
     pub model: String,
+    /// The name shown (a key carrying a name another key holds here has its
+    /// serial tail appended).
     pub name: Option<String>,
+    /// Where that name lives: "key" or "computer".
+    pub name_source: Option<&'static str>,
     pub serial: String,
     pub transport: String,
     /// "key" or "token".
@@ -42,7 +46,11 @@ pub(crate) struct DeviceJson {
 pub(crate) struct ListRowJson {
     pub number: usize,
     pub device: String,
+    /// The name shown (a key carrying a name another key holds here has its
+    /// serial tail appended); `device` is the exact value that selects it.
     pub name: Option<String>,
+    /// Where that name lives: "key" or "computer".
+    pub name_source: Option<&'static str>,
     pub vendor: String,
     pub model: String,
     pub serial: String,
@@ -51,6 +59,27 @@ pub(crate) struct ListRowJson {
     pub capabilities_unverified: Vec<&'static str>,
     pub readers: Vec<String>,
     pub hid_paths: Vec<String>,
+}
+
+/// `keyroostctl name --json list`.
+#[derive(Serialize)]
+pub(crate) struct NamesJson {
+    pub names: Vec<NameRowJson>,
+}
+
+/// One name this computer knows, or one a connected key carries.
+#[derive(Serialize)]
+pub(crate) struct NameRowJson {
+    /// The name as shown (a key carrying another key's name has its serial
+    /// tail appended).
+    pub name: String,
+    /// "computer" or "key".
+    pub stored: &'static str,
+    /// "connected", "not-connected", "hidden", "missing-on-key",
+    /// "unmatched", "other-key" or "unrecorded".
+    pub status: &'static str,
+    /// The connected key's `list` number, if any.
+    pub number: Option<usize>,
 }
 
 /// `keyroostctl molto --json info`.
@@ -374,6 +403,8 @@ pub(crate) struct FidoCredentialJson {
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobListJson {
     pub entries: Vec<FidoLargeBlobEntryJson>,
+    /// Elements not in the standard entry format: skipped, kept unchanged.
+    pub skipped: usize,
     pub capacity: FidoLargeBlobCapacityJson,
 }
 
@@ -414,9 +445,10 @@ pub(crate) struct FidoLargeBlobEntryJson {
     /// Whether this entry is a keyroost-authored plaintext note (true) or an
     /// opaque RP-encrypted record (false).
     pub is_note: bool,
-    /// The note text when `is_note`; `null` for opaque entries.
+    /// The note text when `is_note`, the name for a "key-name" entry; `null`
+    /// for other entries.
     pub text: Option<String>,
-    /// Entry classification: "note", "ssh-cert", or "opaque".
+    /// Entry classification: "note", "key-name", "ssh-cert", or "opaque".
     pub kind: &'static str,
     pub ssh_cert: Option<FidoLargeBlobSshCertJson>,
 }
@@ -428,7 +460,7 @@ pub(crate) struct FidoLargeBlobGetJson {
     pub size: u64,
     pub is_note: bool,
     pub text: Option<String>,
-    /// Entry classification: "note", "ssh-cert", or "opaque".
+    /// Entry classification: "note", "key-name", "ssh-cert", or "opaque".
     pub kind: &'static str,
     pub ssh_cert: Option<FidoLargeBlobSshCertJson>,
     /// Hex of the raw ciphertext bytes (the note magic + UTF-8 for a note, or
@@ -562,6 +594,7 @@ mod tests {
             ("vendor", "string"),
             ("model", "string"),
             ("name", "string|null"),
+            ("name_source", "string|null"),
             ("serial", "string"),
             ("transport", "string"),
             ("kind", "string"),
@@ -572,6 +605,7 @@ mod tests {
             let d = DeviceJson {
                 vendor: "V".into(),
                 model: "M".into(),
+                name_source: name.as_ref().map(|_| "computer"),
                 name,
                 serial: "1".into(),
                 transport: "USB".into(),
@@ -591,6 +625,7 @@ mod tests {
             ("number", "number"),
             ("device", "string"),
             ("name", "string|null"),
+            ("name_source", "string|null"),
             ("vendor", "string"),
             ("model", "string"),
             ("serial", "string"),
@@ -604,6 +639,7 @@ mod tests {
             let r = ListRowJson {
                 number: 1,
                 device: "1".into(),
+                name_source: name.as_ref().map(|_| "key"),
                 name,
                 vendor: "V".into(),
                 model: "M".into(),
@@ -1019,6 +1055,7 @@ mod tests {
         ];
         let v = to_v(&FidoLargeBlobListJson {
             entries,
+            skipped: 2,
             capacity: FidoLargeBlobCapacityJson {
                 max_bytes: 1024,
                 used_bytes: 17,
@@ -1028,6 +1065,7 @@ mod tests {
         for e in v["entries"].as_array().unwrap() {
             assert_shape(e, &entry_shape);
         }
+        assert_eq!(v["skipped"], 2);
         assert_eq!(
             v["entries"][1]["ssh_cert"]["serial"],
             "18446744073709551615"

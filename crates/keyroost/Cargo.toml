@@ -95,6 +95,8 @@ ashpd = { version = "0.13", default-features = false, features = ["async-io", "s
 winresource = "0.1"
 
 [dev-dependencies]
+# Test builds resolve the config dir to a temp dir, never the real one.
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.12.0", features = ["test-isolation"] }
 # Approved dev-only exception (tests only, never in release builds):
 # randomized property coverage for the pure device-binding guards
 # (completion_still_valid, reset_reinsert_matches, otp_target_for,

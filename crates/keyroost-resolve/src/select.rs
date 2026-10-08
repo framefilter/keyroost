@@ -152,7 +152,9 @@ pub fn rows_matching(devices: &[Device], spec: DeviceSpec<'_>) -> Vec<usize> {
         order
             .iter()
             .copied()
-            .filter(|&i| devices[i].name.as_deref() == Some(n))
+            .filter(|&i| {
+                devices[i].naming.selectable && devices[i].naming.plain.as_deref() == Some(n)
+            })
             .collect()
     };
     let by_serial = |s: &str| -> Vec<usize> {
@@ -187,21 +189,50 @@ pub fn rows_matching(devices: &[Device], spec: DeviceSpec<'_>) -> Vec<usize> {
     hits
 }
 
+/// Whether resolving `sel` for `need` over `devices` could depend on names
+/// stored on keys, so a scan must read them first (it costs a CTAP round
+/// trip per FIDO key). `devices` already carry this computer's own names.
+///
+/// Not needed when `--reader` / `--path` override the choice, when
+/// `--device` is a connected key's exact serial, a `serial:` / `list:` form
+/// or an existing list number, or when no `--device` is given and at most
+/// one key qualifies (nothing to tell apart; the announce line shows the
+/// local name only). Needed for anything that could be a name, and for the
+/// picker or refusal that lists several keys.
+pub fn selection_needs_key_names(devices: &[Device], sel: &Selector<'_>, need: Need) -> bool {
+    if sel.reader.is_some() || sel.path.is_some() {
+        return false;
+    }
+    match sel.device.map(parse_device_spec) {
+        Some(DeviceSpec::Serial(_) | DeviceSpec::Number(_) | DeviceSpec::BadNumber(_)) => false,
+        Some(DeviceSpec::Name(_)) => true,
+        Some(DeviceSpec::Any(v)) => {
+            let serial = !v.is_empty() && devices.iter().any(|d| d.serial.eq_ignore_ascii_case(v));
+            let number = parse_number(v).is_some_and(|k| (1..=devices.len()).contains(&k));
+            !(serial || number)
+        }
+        None => devices.iter().filter(|d| need.admits(d)).count() > 1,
+    }
+}
+
 /// The exact `--device` value that selects `devices[index]` and nothing
 /// else: its name, serial or list number when that alone is unique, else
 /// the prefixed form. Used by refusals and `list --json`.
 pub fn device_value(devices: &[Device], index: usize) -> String {
     let d = &devices[index];
     let number = list_number(devices, index).unwrap_or(0);
+    // Only a name `--device` can select is offered; a newcomer's shown name
+    // (with its serial tail) never is.
+    let name = d.naming.plain.as_ref().filter(|_| d.naming.selectable);
     let mut tries: Vec<String> = Vec::new();
-    if let Some(n) = &d.name {
+    if let Some(n) = name {
         tries.push(n.clone());
     }
     if !d.serial.is_empty() {
         tries.push(d.serial.clone());
     }
     tries.push(number.to_string());
-    if let Some(n) = &d.name {
+    if let Some(n) = name {
         tries.push(format!("name:{n}"));
     }
     if !d.serial.is_empty() {
@@ -363,6 +394,13 @@ pub enum SelectError {
         value: String,
         matches: Vec<Candidate>,
     },
+    /// `--device NAME` (or `name:NAME`) matched no key this computer first
+    /// saw with that name, but `newcomers` carry it (shown with a serial
+    /// tail); each is listed with its own `--device` value.
+    NameNotConnected {
+        value: String,
+        newcomers: Vec<Candidate>,
+    },
     LacksCapability {
         selector: String,
         need: Need,
@@ -447,6 +485,17 @@ impl fmt::Display for SelectError {
                 matches.len(),
                 join(matches)
             ),
+            NameNotConnected { value, newcomers } => write!(
+                f,
+                "no key named '{}' is connected; {}: {}",
+                clean(value),
+                if newcomers.len() == 1 {
+                    "a different key carries that name".to_string()
+                } else {
+                    format!("{} different keys carry that name", newcomers.len())
+                },
+                join(newcomers)
+            ),
             LacksCapability {
                 selector,
                 need,
@@ -491,7 +540,9 @@ impl std::error::Error for SelectError {}
 /// Resolve the one row a command acts on.
 ///
 /// - `--device` matches name, serial (case-insensitive) or list number, and
-///   the row must serve `need`.
+///   the row must serve `need`. A name selects only the key this computer
+///   first saw with it ([`crate::names::Naming::selectable`]); when only
+///   other keys carry it, [`SelectError::NameNotConnected`] names them.
 /// - `--reader` matches a reader name exactly (case-insensitive), else by a
 ///   unique case-insensitive substring; `--path` matches a HID path exactly.
 ///   Both are expert overrides: the matched row is used without the
@@ -536,8 +587,31 @@ pub fn resolve_target<'d>(
     };
 
     if let Some(v) = sel.device {
-        let rows = rows_matching(devices, parse_device_spec(v));
+        let spec = parse_device_spec(v);
+        let rows = rows_matching(devices, spec);
+        // No key this computer first saw with that name, but other keys carry
+        // it: say so and name each by a value that selects it.
+        let named = match spec {
+            DeviceSpec::Any(n) | DeviceSpec::Name(n) => Some(n),
+            _ => None,
+        };
+        let newcomers: Vec<usize> = named
+            .map(|n| {
+                order
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        !devices[i].naming.selectable
+                            && devices[i].naming.plain.as_deref() == Some(n)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         return match rows.as_slice() {
+            [] if !newcomers.is_empty() => Err(SelectError::NameNotConnected {
+                value: named.unwrap_or(v).to_string(),
+                newcomers: describe(&newcomers),
+            }),
             [] => Err(SelectError::NotFound {
                 value: v.to_string(),
                 need,
@@ -645,6 +719,7 @@ pub fn resolve_target<'d>(
 mod tests {
     use super::*;
     use crate::device::{Caps, DeviceKind};
+    use crate::names::{NameSource, Naming};
     use std::path::PathBuf;
 
     fn row(
@@ -672,6 +747,8 @@ mod tests {
             kind,
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(str::to_owned),
+            hid_serial: None,
+            naming: Naming::local(name),
         }
     }
     fn yubi() -> Device {
@@ -967,6 +1044,7 @@ mod tests {
         // Row "2" by name is list #1; list #2 is another row.
         let mut a = solo();
         a.name = Some("2".into());
+        a.naming = Naming::local(Some("2"));
         let devs = [a, yubi()];
         let err = resolve_target(&devs, &sel(Some("2"), None, None), Need::Any, &mut NoPicker)
             .unwrap_err();
@@ -1019,6 +1097,7 @@ mod tests {
         // A name equal to its own row's number is one row, not two.
         let mut b = solo();
         b.name = Some("1".into());
+        b.naming = Naming::local(Some("1"));
         let devs = [b, yubi()];
         assert!(
             resolve_target(&devs, &sel(Some("1"), None, None), Need::Any, &mut NoPicker).is_ok()
@@ -1221,6 +1300,230 @@ mod tests {
         assert_eq!(t.device.name.as_deref(), Some("yubi-test"));
     }
 
+    /// A FIDO key whose name came from the key itself.
+    fn on_key(serial: &str, plain: &str, selectable: bool) -> Device {
+        let mut d = row(
+            None,
+            serial,
+            &[Caps::FIDO2],
+            Some(&format!("/dev/hid-{serial}")),
+            None,
+            DeviceKind::Key,
+        );
+        d.name = Some(if selectable || serial.is_empty() {
+            plain.to_string()
+        } else {
+            format!("{plain} ({})", crate::names::serial_tail(serial))
+        });
+        d.naming = Naming {
+            plain: Some(plain.into()),
+            source: Some(NameSource::Key),
+            selectable,
+            ..Naming::default()
+        };
+        d
+    }
+
+    fn work_pair() -> [Device; 2] {
+        // A: first seen with "Work"; B: a newcomer carrying the same name.
+        [
+            on_key("12345678", "Work", true),
+            on_key("99995678", "Work", false),
+        ]
+    }
+
+    #[test]
+    fn plain_name_selects_the_first_seen_key_only() {
+        let devs = work_pair();
+        let t = resolve_target(
+            &devs,
+            &sel(Some("Work"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert_eq!(t.device.serial, "12345678");
+        assert_eq!(rows_matching(&devs, parse_device_spec("Work")), vec![0]);
+    }
+
+    #[test]
+    fn only_newcomer_connected_is_refused_and_named() {
+        let devs = [on_key("99995678", "Work", false)];
+        let e = resolve_target(
+            &devs,
+            &sel(Some("Work"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap_err();
+        assert!(matches!(e, SelectError::NameNotConnected { .. }), "{e:?}");
+        let msg = e.to_string();
+        assert!(msg.starts_with("no key named 'Work' is connected"), "{msg}");
+        assert!(msg.contains("Work (5678)"), "{msg}");
+        assert!(msg.contains("--device 99995678"), "{msg}");
+        assert!(!msg.contains("--device 'Work (5678)'"), "{msg}");
+        // A key with no serial carrying the name: named by its list number.
+        let devs = [on_key("", "Work", false)];
+        let msg = resolve_target(
+            &devs,
+            &sel(Some("Work"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("--device 1 (Work"), "{msg}");
+    }
+
+    #[test]
+    fn suffixed_display_text_never_selects() {
+        let devs = work_pair();
+        for v in ["Work (5678)", "name:Work (5678)"] {
+            let e = resolve_target(&devs, &sel(Some(v), None, None), Need::Any, &mut NoPicker)
+                .unwrap_err();
+            assert!(matches!(e, SelectError::NotFound { .. }), "{v}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn name_prefix_follows_the_same_rule() {
+        let devs = work_pair();
+        let t = resolve_target(
+            &devs,
+            &sel(Some("name:Work"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap();
+        assert_eq!(t.device.serial, "12345678");
+        let only_b = [on_key("99995678", "Work", false)];
+        let e = resolve_target(
+            &only_b,
+            &sel(Some("name:Work"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, SelectError::NameNotConnected { value, .. } if value == "Work"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn device_value_for_newcomer_is_serial_or_number() {
+        let devs = work_pair();
+        assert_eq!(device_value(&devs, 0), "Work");
+        assert_eq!(device_value(&devs, 1), "99995678");
+        let devs = [on_key("12345678", "Work", true), on_key("", "Work", false)];
+        assert_eq!(device_value(&devs, 1), "2");
+    }
+
+    #[test]
+    fn fixed_serial_units_sharing_a_name_are_ambiguous() {
+        let mut one = on_key("00000000", "Shared", true);
+        one.id = "serial:00000000#/dev/a".into();
+        let mut two = on_key("00000000", "Shared", true);
+        two.id = "serial:00000000#/dev/b".into();
+        let devs = [one, two];
+        let e = resolve_target(
+            &devs,
+            &sel(Some("Shared"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap_err();
+        assert!(matches!(e, SelectError::Ambiguous { .. }), "{e:?}");
+        assert_eq!(device_value(&devs, 0), "1");
+        assert_eq!(device_value(&devs, 1), "2");
+    }
+
+    #[test]
+    fn a_key_whose_name_read_failed_selects_like_an_unnamed_key() {
+        // A's name couldn't be read this time: it is an unnamed key for this
+        // scan. B carries "Work" as a newcomer.
+        let mut a = on_key("12345678", "Work", true);
+        a.name = None;
+        a.naming = Naming {
+            on_key: crate::names::KeyLabel::ReadFailed,
+            ..Naming::default()
+        };
+        let b = on_key("99995678", "Work", false);
+        let devs = [a.clone(), b];
+        let e = resolve_target(
+            &devs,
+            &sel(Some("Work"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap_err();
+        assert!(matches!(e, SelectError::NameNotConnected { .. }), "{e:?}");
+        for v in ["12345678", "1"] {
+            let t =
+                resolve_target(&devs, &sel(Some(v), None, None), Need::Any, &mut NoPicker).unwrap();
+            assert_eq!(t.device.serial, "12345678");
+        }
+        assert_eq!(device_value(&devs, 0), "12345678");
+        let alone = [a];
+        let e = resolve_target(
+            &alone,
+            &sel(Some("Work"), None, None),
+            Need::Any,
+            &mut NoPicker,
+        )
+        .unwrap_err();
+        assert!(matches!(e, SelectError::NotFound { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn key_names_are_read_only_when_a_name_could_decide() {
+        let devs = [yubi(), solo()];
+        let needs = |device: Option<&str>, need: Need| {
+            selection_needs_key_names(&devs, &sel(device, None, None), need)
+        };
+        // Chosen by serial, serial:/list: form or list number: never.
+        assert!(!needs(Some("11111111"), Need::Any));
+        assert!(!needs(Some("07a9568fbe31ad5dad1f2298476cf0d4"), Need::Any));
+        assert!(!needs(Some("serial:nope"), Need::Any));
+        assert!(!needs(Some("list:2"), Need::Any));
+        assert!(!needs(Some("list:x"), Need::Any));
+        assert!(!needs(Some("2"), Need::Any));
+        // Anything that could be a name: yes.
+        assert!(needs(Some("Work"), Need::Any));
+        assert!(needs(Some("name:11111111"), Need::Any));
+        assert!(needs(Some("9"), Need::Any));
+        // Overrides never.
+        let p = std::path::Path::new("/dev/hidraw0");
+        assert!(!selection_needs_key_names(
+            &devs,
+            &sel(None, Some("Yubico"), None),
+            Need::Any
+        ));
+        assert!(!selection_needs_key_names(
+            &devs,
+            &sel(None, None, Some(p)),
+            Need::Any
+        ));
+        // No --device: only when several keys qualify (picker / refusal).
+        assert!(!needs(None, Need::Oath));
+        assert!(needs(None, Need::Piv));
+        assert!(!needs(None, Need::Molto2));
+    }
+
+    #[test]
+    fn picker_label_shows_the_tail() {
+        let devs = work_pair();
+        assert!(row_label(&devs[1]).starts_with("Work (5678), Model"));
+        let mut p = FakePicker {
+            interactive: true,
+            answer: Ok(1),
+            seen: Vec::new(),
+        };
+        let t = resolve_target(&devs, &Selector::default(), Need::Any, &mut p).unwrap();
+        assert_eq!(t.device.serial, "99995678");
+        assert!(p.seen[1].label.starts_with("Work (5678)"), "{:?}", p.seen);
+    }
+
     #[test]
     fn quoting_and_sanitising() {
         assert_eq!(shell_quote("yubi-test"), "yubi-test");
@@ -1228,6 +1531,7 @@ mod tests {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         let mut evil = yubi();
         evil.name = Some("a\u{1b}[31m\nb".into());
+        evil.naming = Naming::local(evil.name.as_deref());
         let devs = [evil, solo()];
         let msg = resolve_target(&devs, &Selector::default(), Need::Piv, &mut NoPicker)
             .unwrap_err()

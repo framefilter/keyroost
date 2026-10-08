@@ -18,6 +18,7 @@ pub mod client_pin;
 pub mod cmd;
 pub mod config;
 pub mod cred_mgmt;
+pub mod device_label;
 pub mod hid;
 pub mod large_blobs;
 pub mod pin;

@@ -20,20 +20,27 @@ use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
 pub mod identity;
+pub mod names;
 pub mod select;
 pub use device::{
-    correlate, correlate_live, correlate_with, enumerate, enumerate_with, exclude_unresettable_piv,
-    factory_reset_plan, CapState, Caps, Device, DeviceId, DeviceKind, EnumerateOptions,
-    MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
+    add_key_names, correlate, correlate_live, correlate_with, enumerate, enumerate_with,
+    exclude_unresettable_piv, factory_reset_plan, forget_key_names, load_keyring_for_scan,
+    name_from_keys, take_scan_warnings, with_key_names_forgotten, CapState, Caps, Device, DeviceId,
+    DeviceKind, EnumerateOptions, MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport,
+    PIV_GLOBAL_RESET_LABEL,
 };
 pub use identity::{
     plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
     IdentityReader, IDENTITY_READERS,
 };
+pub use names::{
+    apply_names, apply_updates, clear_key_names, name_held_elsewhere, row_serials, serial_tail,
+    set_key_name, KeyLabel, NameSource, NameUpdate, Naming,
+};
 pub use select::{
     device_value, endpoint, list_number, list_order, parse_device_spec, resolve_target, row_label,
-    rows_matching, shell_quote, Candidate, Choice, DeviceSpec, Need, NoPicker, Picker, SelectError,
-    SelectedBy, Selector, Target,
+    rows_matching, selection_needs_key_names, shell_quote, Candidate, Choice, DeviceSpec, Need,
+    NoPicker, Picker, SelectError, SelectedBy, Selector, Target,
 };
 
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.
@@ -159,6 +166,16 @@ pub fn ccid_serial_for(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String>
 mod tests {
     use super::*;
     use keyroost_hid::{HID_USAGE_FIDO_AUTHENTICATOR, HID_USAGE_PAGE_FIDO};
+
+    /// The `test-isolation` dev-dependency feature is on: a test here can
+    /// never resolve, read or write the person's config directory.
+    #[test]
+    fn tests_never_resolve_the_real_config_dir() {
+        let tmp = std::env::temp_dir();
+        let dir = keyroost_keyring::config_dir().expect("always set in tests");
+        assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
+        assert!(keyroost_keyring::config_path().unwrap().starts_with(&tmp));
+    }
 
     fn yubikey(path: &str, bus: Option<u8>, addr: Option<u8>) -> HidDevice {
         HidDevice {

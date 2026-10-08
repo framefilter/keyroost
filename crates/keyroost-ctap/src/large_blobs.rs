@@ -21,10 +21,12 @@
 //! ```
 //!
 //! Each entry map has the shape `{1: ciphertext (bstr), 2: nonce (bstr, 12
-//! bytes), 3: origSize (uint)}`. We parse entries structurally so that edits
-//! re-serialize cleanly and the trailing checksum is always recomputed — a
-//! naive raw-byte edit that left a stale checksum would make the key reject the
-//! whole array (or fail future credential writes) until a reset.
+//! bytes), 3: origSize (uint)}`; other keys are allowed. We parse entries
+//! structurally so that edits re-serialize cleanly and the trailing checksum is
+//! always recomputed — a naive raw-byte edit that left a stale checksum would
+//! make the key reject the whole array (or fail future credential writes) until
+//! a reset. An element that isn't such a map is skipped on read (§6.10.4) and
+//! kept, unchanged and in place, on every write.
 //!
 //! # Reading
 //!
@@ -48,6 +50,7 @@
 use crate::cbor::{self, Value};
 use crate::client_pin::PinUvAuthToken;
 use crate::cmd::{AuthenticatorInfo, CtapError};
+use crate::device_label::{self, DeviceLabel, LabelError};
 use crate::hid::CTAPHID_CBOR;
 use crate::pin::left16_sha256;
 use crate::ssh_cert;
@@ -117,6 +120,9 @@ pub struct LargeBlobEntry {
     pub nonce: Vec<u8>,
     /// Declared size of the plaintext before encryption/compression.
     pub orig_size: u64,
+    /// The exact CBOR this entry was read as; `None` for an entry built here.
+    /// Re-emitted unchanged so unknown map keys survive a rewrite.
+    original: Option<Vec<u8>>,
 }
 
 /// Magic prefix that marks an entry as a keyroost-authored plaintext note,
@@ -140,6 +146,17 @@ impl LargeBlobEntry {
             ciphertext,
             nonce: vec![0u8; 12],
             orig_size: text.len() as u64,
+            original: None,
+        }
+    }
+
+    /// An entry built here from its fields (no bytes read from a key).
+    pub(crate) fn built(ciphertext: Vec<u8>, nonce: Vec<u8>, orig_size: u64) -> Self {
+        LargeBlobEntry {
+            ciphertext,
+            nonce,
+            orig_size,
+            original: None,
         }
     }
 
@@ -157,10 +174,14 @@ impl LargeBlobEntry {
         self.ciphertext.starts_with(KR_NOTE_MAGIC)
     }
 
-    /// Classify this entry. Conservative by construction: the keyroost note
-    /// magic wins outright, certificate recognition requires a complete,
-    /// well-formed parse, and everything else is opaque.
+    /// Classify this entry. Conservative by construction: a name entry must
+    /// pass its AEAD tag under the published name key, the keyroost note
+    /// magic wins over everything else, certificate recognition requires a
+    /// complete, well-formed parse, and everything else is opaque.
     pub fn classify(&self) -> EntryKind {
+        if let Some(label) = device_label::decode_entry(self) {
+            return EntryKind::KeyName(label);
+        }
         if let Some(text) = self.as_text() {
             return EntryKind::Note(text);
         }
@@ -184,6 +205,8 @@ impl LargeBlobEntry {
 pub enum EntryKind {
     /// keyroost plaintext note (magic-prefixed).
     Note(String),
+    /// The key's own name ([`device_label`]).
+    KeyName(DeviceLabel),
     /// A recognized OpenSSH certificate. `wire` holds the canonical binary
     /// certificate (decoded from base64 when the entry stored the text form),
     /// ready for export as a `-cert.pub`.
@@ -196,33 +219,154 @@ pub enum EntryKind {
     Opaque,
 }
 
-/// A parsed large-blob array: the structured entries plus the exact raw bytes
-/// they were decoded from (handy for a hex/ASCII view and for diffing).
+/// One element of the serialized array, with the bytes it was read as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Item {
+    /// A conforming large-blob map (§6.10.3): key 1 bstr, key 2 bstr of
+    /// exactly 12 bytes, key 3 uint; other keys allowed.
+    Entry(LargeBlobEntry),
+    /// Any other element. Skipped by every reader, kept by every writer.
+    Skipped(Vec<u8>),
+}
+
+/// A parsed large-blob array: its elements in stored order plus the exact raw
+/// bytes they were decoded from (handy for a hex/ASCII view and for diffing).
+///
+/// Elements that are not a conforming entry map are *skipped* (CTAP 2.1
+/// §6.10.4: readers ignore them) but never dropped: every rewrite emits them
+/// again, unchanged and in place. Entry indices ([`entries`](Self::entries),
+/// [`entry`](Self::entry), [`with_replaced_note`](Self::with_replaced_note),
+/// [`without_entry`](Self::without_entry)) count conforming entries only.
 #[derive(Debug, Clone)]
 pub struct LargeBlobArray {
-    pub entries: Vec<LargeBlobEntry>,
+    items: Vec<Item>,
     /// The serialized array WITHOUT the checksum trailer.
-    pub raw_array: Vec<u8>,
+    raw_array: Vec<u8>,
+    /// Bytes read after the array's end (before the checksum). A rewrite
+    /// can't keep them, so [`serialize_with_checksum`](Self::serialize_with_checksum)
+    /// refuses while there are any.
+    trailing: usize,
 }
 
 impl LargeBlobArray {
-    /// Re-serialize the current entries and append a freshly-computed checksum,
-    /// yielding bytes ready to hand to [`write()`].
-    pub fn serialize_with_checksum(&self) -> Vec<u8> {
-        let array = encode_entries(&self.entries);
+    /// Parse a serialized array (without the checksum trailer).
+    ///
+    /// Fails only when the array itself is unreadable (not a definite-length
+    /// array, truncated, or an element whose extent can't be measured) —
+    /// then nothing in it can be kept safely. A single element that isn't a
+    /// conforming entry is skipped instead.
+    pub fn parse(array_bytes: &[u8]) -> Result<LargeBlobArray, CtapError> {
+        let (items, trailing) = parse_items(array_bytes)?;
+        Ok(LargeBlobArray {
+            items,
+            raw_array: array_bytes.to_vec(),
+            trailing,
+        })
+    }
+
+    /// Conforming entries in array order; indices used by `fido blob` and the GUI.
+    pub fn entries(&self) -> Vec<&LargeBlobEntry> {
+        self.entry_iter().collect()
+    }
+
+    /// The conforming entry at `idx` (counting conforming entries only).
+    pub fn entry(&self, idx: usize) -> Option<&LargeBlobEntry> {
+        self.entry_iter().nth(idx)
+    }
+
+    /// Number of conforming entries.
+    pub fn len(&self) -> usize {
+        self.entry_iter().count()
+    }
+
+    /// Whether there are no conforming entries (skipped elements may remain).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Elements skipped because they don't conform (kept on every write).
+    pub fn skipped_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i, Item::Skipped(_)))
+            .count()
+    }
+
+    /// The bytes read from the key (empty for an array changed here).
+    pub fn raw_array(&self) -> &[u8] {
+        &self.raw_array
+    }
+
+    fn entry_iter(&self) -> impl Iterator<Item = &LargeBlobEntry> {
+        self.items.iter().filter_map(|i| match i {
+            Item::Entry(e) => Some(e),
+            Item::Skipped(_) => None,
+        })
+    }
+
+    /// Position in `items` of the conforming entry numbered `idx`.
+    fn item_index(&self, idx: usize) -> Option<usize> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, Item::Entry(_)))
+            .nth(idx)
+            .map(|(pos, _)| pos)
+    }
+
+    /// `items` as a changed copy of this array (it carries the trailing
+    /// bytes' count along, so the copy refuses to serialize too).
+    fn changed(&self, items: Vec<Item>) -> LargeBlobArray {
+        LargeBlobArray {
+            items,
+            raw_array: Vec::new(),
+            trailing: self.trailing,
+        }
+    }
+
+    /// Re-serialize the current elements and append a freshly-computed
+    /// checksum, yielding bytes ready to hand to [`write()`].
+    ///
+    /// Every element read from the key is emitted exactly as it was read —
+    /// an entry's unknown map keys (§6.10.3 allows them) and skipped elements
+    /// survive byte-for-byte. Only entries built here are encoded fresh.
+    ///
+    /// Refuses an array that was read with bytes after its end: a rewrite
+    /// would silently drop them, so nothing is produced to write.
+    pub fn serialize_with_checksum(&self) -> Result<Vec<u8>, CtapError> {
+        if self.trailing > 0 {
+            return Err(CtapError::InvalidResponseShape(
+                "largeBlobs: the stored array has extra bytes after its end; \
+                 refusing to rewrite it, which would drop them",
+            ));
+        }
+        let array = self.array_bytes();
         let mut out = array.clone();
         out.extend_from_slice(&left16_sha256(&array));
-        out
+        Ok(out)
+    }
+
+    /// The elements behind a canonical header, without the checksum.
+    fn array_bytes(&self) -> Vec<u8> {
+        let mut array = cbor::array_header(self.items.len());
+        for item in &self.items {
+            match item {
+                Item::Entry(LargeBlobEntry {
+                    original: Some(raw),
+                    ..
+                })
+                | Item::Skipped(raw) => array.extend_from_slice(raw),
+                Item::Entry(e) => array.extend_from_slice(&encode_entry(e)),
+            }
+        }
+        array
     }
 
     /// Return a copy of this array with a new keyroost text note appended.
     pub fn with_text_note(&self, text: &str) -> LargeBlobArray {
-        let mut entries = self.entries.clone();
-        entries.push(LargeBlobEntry::from_text(text));
-        LargeBlobArray {
-            entries,
-            raw_array: Vec::new(),
-        }
+        let mut items = self.items.clone();
+        items.push(Item::Entry(LargeBlobEntry::from_text(text)));
+        self.changed(items)
     }
 
     /// Return a copy of this array with the keyroost note at `idx` replaced by
@@ -230,22 +374,75 @@ impl LargeBlobArray {
     /// is NOT a keyroost note — relying-party entries are AEAD-encrypted by
     /// their owner and must never be rewritten as plaintext.
     pub fn with_replaced_note(&self, idx: usize, text: &str) -> Option<LargeBlobArray> {
-        let target = self.entries.get(idx)?;
-        if !target.is_kr_note() {
+        if !self.entry(idx)?.is_kr_note() {
             return None;
         }
-        let mut entries = self.entries.clone();
-        entries[idx] = LargeBlobEntry::from_text(text);
-        Some(LargeBlobArray {
-            entries,
-            raw_array: Vec::new(),
-        })
+        let pos = self.item_index(idx)?;
+        let mut items = self.items.clone();
+        items[pos] = Item::Entry(LargeBlobEntry::from_text(text));
+        Some(self.changed(items))
     }
 
-    /// Compute capacity from the entries as currently held (re-serialized,
+    /// Return a copy of this array without the conforming entry at `idx`
+    /// (counting conforming entries only). `None` if `idx` is out of range.
+    pub fn without_entry(&self, idx: usize) -> Option<LargeBlobArray> {
+        let pos = self.item_index(idx)?;
+        let mut items = self.items.clone();
+        items.remove(pos);
+        Some(self.changed(items))
+    }
+
+    /// The last name entry (its entry index and the name), if any.
+    pub fn label(&self) -> Option<(usize, DeviceLabel)> {
+        self.entry_iter()
+            .enumerate()
+            .filter_map(|(i, e)| Some((i, device_label::decode_entry(e)?)))
+            .last()
+    }
+
+    /// A copy with every name entry removed and, when `label` is given, one
+    /// new name entry (encrypted with `nonce`) appended. Nothing else moves
+    /// or changes.
+    pub fn with_label(
+        &self,
+        label: Option<&DeviceLabel>,
+        nonce: [u8; 12],
+    ) -> Result<LargeBlobArray, LabelError> {
+        let mut items: Vec<Item> = self
+            .items
+            .iter()
+            .filter(|i| !is_label_item(i))
+            .cloned()
+            .collect();
+        if let Some(l) = label {
+            items.push(Item::Entry(device_label::encode_entry(l, nonce)?));
+        }
+        Ok(self.changed(items))
+    }
+
+    /// A copy holding only the name entries, as read (`fido blob clear
+    /// --keep-name`).
+    pub fn only_label(&self) -> LargeBlobArray {
+        let items = self
+            .items
+            .iter()
+            .filter(|i| is_label_item(i))
+            .cloned()
+            .collect();
+        self.changed(items)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_entry_for_test(&self, e: LargeBlobEntry) -> LargeBlobArray {
+        let mut items = self.items.clone();
+        items.push(Item::Entry(e));
+        self.changed(items)
+    }
+
+    /// Compute capacity from the elements as currently held (re-serialized,
     /// so it stays correct after local adds/edits that haven't been written).
     pub fn capacity(&self, info: &AuthenticatorInfo) -> BlobCapacity {
-        let used = self.serialize_with_checksum().len() as u64;
+        let used = (self.array_bytes().len() + self.trailing + CHECKSUM_LEN) as u64;
         let max = info
             .max_serialized_large_blob_array
             .unwrap_or(SPEC_MIN_SERIALIZED_ARRAY);
@@ -253,26 +450,26 @@ impl LargeBlobArray {
             max_bytes: max,
             used_bytes: used,
             free_bytes: max.saturating_sub(used),
-            entry_count: self.entries.len(),
+            entry_count: self.len(),
         }
     }
 }
 
-fn encode_entries(entries: &[LargeBlobEntry]) -> Vec<u8> {
-    let items = entries
-        .iter()
-        .map(|e| {
-            Value::Map(vec![
-                (
-                    Value::UInt(ENTRY_CIPHERTEXT),
-                    Value::Bytes(e.ciphertext.clone()),
-                ),
-                (Value::UInt(ENTRY_NONCE), Value::Bytes(e.nonce.clone())),
-                (Value::UInt(ENTRY_ORIG_SIZE), Value::UInt(e.orig_size)),
-            ])
-        })
-        .collect();
-    cbor::encode(&Value::Array(items))
+/// Whether `item` is a name entry ([`device_label`]).
+fn is_label_item(item: &Item) -> bool {
+    matches!(item, Item::Entry(e) if device_label::decode_entry(e).is_some())
+}
+
+/// The canonical `{1: ciphertext, 2: nonce, 3: origSize}` map for `e`.
+fn encode_entry(e: &LargeBlobEntry) -> Vec<u8> {
+    cbor::encode(&Value::Map(vec![
+        (
+            Value::UInt(ENTRY_CIPHERTEXT),
+            Value::Bytes(e.ciphertext.clone()),
+        ),
+        (Value::UInt(ENTRY_NONCE), Value::Bytes(e.nonce.clone())),
+        (Value::UInt(ENTRY_ORIG_SIZE), Value::UInt(e.orig_size)),
+    ]))
 }
 
 /// Effective maximum `set`/`get` fragment length for this authenticator.
@@ -369,62 +566,65 @@ pub fn read(
         ));
     }
 
-    let entries = parse_entries(array_bytes)?;
-    Ok(LargeBlobArray {
-        entries,
-        raw_array: array_bytes.to_vec(),
-    })
+    LargeBlobArray::parse(array_bytes)
 }
 
-fn parse_entries(array_bytes: &[u8]) -> Result<Vec<LargeBlobEntry>, CtapError> {
-    let (value, _) = cbor::decode(array_bytes)?;
-    let Value::Array(items) = value else {
+/// The array's elements, and how many bytes follow the array.
+fn parse_items(array_bytes: &[u8]) -> Result<(Vec<Item>, usize), CtapError> {
+    if array_bytes.first().map(|b| b >> 5) != Some(4) {
         return Err(CtapError::InvalidResponseShape("largeBlobs: not an array"));
-    };
-    let mut entries = Vec::with_capacity(items.len());
-    for item in items {
-        let Value::Map(map) = item else {
-            return Err(CtapError::InvalidResponseShape(
-                "largeBlobs: entry not a map",
-            ));
+    }
+    let (elements, rest) = cbor::split_array(array_bytes)?;
+    // CTAP 2.1 §6.10.4 step 6: readers skip elements that don't conform.
+    // They are kept as read, so a rewrite emits them again unchanged.
+    let items = elements
+        .into_iter()
+        .map(|raw| match conforming_entry(raw) {
+            Some(entry) => Item::Entry(entry),
+            None => Item::Skipped(raw.to_vec()),
+        })
+        .collect();
+    Ok((items, rest.len()))
+}
+
+/// `raw` as a large-blob entry if it is a conforming entry map (§6.10.3):
+/// key 1 a byte string, key 2 a 12-byte byte string, key 3 an unsigned
+/// integer, each exactly once; other keys are allowed and kept in `original`.
+///
+/// Only keys 1–3 and their values are decoded; any other key or value is
+/// just measured, so one the decoder refuses (a float, a tag) is tolerated.
+fn conforming_entry(raw: &[u8]) -> Option<LargeBlobEntry> {
+    let (pairs, rest) = cbor::split_map(raw).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut ciphertext = None;
+    let mut nonce = None;
+    let mut orig_size = None;
+    for (k, v) in pairs {
+        let key = match cbor::decode(k) {
+            Ok((Value::UInt(n @ ENTRY_CIPHERTEXT..=ENTRY_ORIG_SIZE), [])) => n,
+            _ => continue, // another key: allowed, kept in `original`
         };
-        let mut ciphertext = None;
-        let mut nonce = None;
-        let mut orig_size = None;
-        for (k, v) in map {
-            match k {
-                Value::UInt(ENTRY_CIPHERTEXT) => {
-                    if let Value::Bytes(b) = v {
-                        ciphertext = Some(b);
-                    }
-                }
-                Value::UInt(ENTRY_NONCE) => {
-                    if let Value::Bytes(b) = v {
-                        nonce = Some(b);
-                    }
-                }
-                Value::UInt(ENTRY_ORIG_SIZE) => {
-                    if let Value::UInt(n) = v {
-                        orig_size = Some(n);
-                    }
-                }
-                _ => {}
-            }
-        }
-        match (ciphertext, nonce, orig_size) {
-            (Some(ciphertext), Some(nonce), Some(orig_size)) => entries.push(LargeBlobEntry {
-                ciphertext,
-                nonce,
-                orig_size,
-            }),
-            _ => {
-                return Err(CtapError::InvalidResponseShape(
-                    "largeBlobs: entry missing required field",
-                ))
-            }
+        let (value, []) = cbor::decode(v).ok()? else {
+            return None;
+        };
+        let slot_taken = match (key, value) {
+            (ENTRY_CIPHERTEXT, Value::Bytes(b)) => ciphertext.replace(b).is_some(),
+            (ENTRY_NONCE, Value::Bytes(b)) if b.len() == 12 => nonce.replace(b).is_some(),
+            (ENTRY_ORIG_SIZE, Value::UInt(n)) => orig_size.replace(n).is_some(),
+            _ => return None, // a required key with the wrong type
+        };
+        if slot_taken {
+            return None; // a duplicate required key: ambiguous, never guess
         }
     }
-    Ok(entries)
+    Some(LargeBlobEntry {
+        ciphertext: ciphertext?,
+        nonce: nonce?,
+        orig_size: orig_size?,
+        original: Some(raw.to_vec()),
+    })
 }
 
 /// The `pinUvAuthParam` for a `set` fragment at `offset`:
@@ -520,6 +720,32 @@ pub(crate) fn gcm_decrypt(
         .ok()
 }
 
+/// AES-256-GCM encrypt for a largeBlob entry, the inverse of
+/// [`gcm_decrypt`]: AAD `b"blob" || u64le(orig_size)`; the result carries
+/// the 16-byte tag.
+pub(crate) fn gcm_encrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    plain: &[u8],
+    orig_size: u64,
+) -> Vec<u8> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+
+    let mut aad = Vec::with_capacity(12);
+    aad.extend_from_slice(b"blob");
+    aad.extend_from_slice(&orig_size.to_le_bytes());
+    Aes256Gcm::new(key.into())
+        .encrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: plain,
+                aad: &aad,
+            },
+        )
+        .expect("AES-GCM encryption of a small buffer cannot fail")
+}
+
 /// Host-side ceiling on the inflated plaintext of a single largeBlob entry.
 ///
 /// `origSize` is chosen by the authenticator, so without a ceiling of our own
@@ -560,12 +786,13 @@ pub(crate) fn inflate_raw(compressed: &[u8], orig_size: u64) -> Option<Vec<u8>> 
 /// GCM tag identifies the matching entry), inflates the raw-DEFLATE plaintext,
 /// and returns the certificate **wire bytes** when the result parses as an
 /// OpenSSH certificate. None when no entry is this credential's, or the
-/// decrypted blob is not a certificate. Pure over already-read entries.
+/// decrypted blob is not a certificate. Pure over an already-read array;
+/// skipped (non-conforming) elements are never tried.
 pub fn extract_cert_from_entries(
     large_blob_key: &[u8; 32],
-    entries: &[LargeBlobEntry],
+    array: &LargeBlobArray,
 ) -> Option<Vec<u8>> {
-    for e in entries {
+    for e in array.entry_iter() {
         let Some(plain) = gcm_decrypt(large_blob_key, &e.nonce, &e.ciphertext, e.orig_size) else {
             continue; // not this credential's entry (tag failed)
         };
@@ -679,7 +906,306 @@ mod tests {
             ciphertext: vec![seed; 20],
             nonce: vec![seed.wrapping_add(1); 12],
             orig_size: seed as u64 + 4,
+            original: None,
         }
+    }
+
+    /// An array holding `entries` as built here (no bytes read from a key).
+    fn array_of(entries: Vec<LargeBlobEntry>) -> LargeBlobArray {
+        LargeBlobArray {
+            items: entries.into_iter().map(Item::Entry).collect(),
+            raw_array: Vec::new(),
+            trailing: 0,
+        }
+    }
+
+    /// The entries of `arr` with the read-back bytes forgotten, for comparing
+    /// the decoded fields against entries built here.
+    fn fields(arr: &LargeBlobArray) -> Vec<LargeBlobEntry> {
+        arr.entries()
+            .into_iter()
+            .map(|e| LargeBlobEntry {
+                original: None,
+                ..e.clone()
+            })
+            .collect()
+    }
+
+    /// An array of the given raw elements, behind a canonical header.
+    fn raw_array_of(elements: &[&[u8]]) -> Vec<u8> {
+        let mut out = cbor::array_header(elements.len());
+        for e in elements {
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    fn map_bytes(pairs: Vec<(Value, Value)>) -> Vec<u8> {
+        cbor::encode(&Value::Map(pairs))
+    }
+
+    #[test]
+    fn parse_skips_non_conforming_elements() {
+        let missing_size = map_bytes(vec![
+            (Value::UInt(1), Value::Bytes(vec![0xaa])),
+            (Value::UInt(2), Value::Bytes(vec![0x22; 12])),
+        ]);
+        let short_nonce = map_bytes(vec![
+            (Value::UInt(1), Value::Bytes(vec![0xaa])),
+            (Value::UInt(2), Value::Bytes(vec![0x22; 11])),
+            (Value::UInt(3), Value::UInt(1)),
+        ]);
+        let note = encode_entry(&LargeBlobEntry::from_text("kept"));
+        let bytes = raw_array_of(&[
+            &[0x61, 0x78],
+            &missing_size,
+            &short_nonce,
+            &[0xc1, 0x01],
+            &[0xf9, 0x3c, 0x00],
+            &note,
+        ]);
+        let arr = LargeBlobArray::parse(&bytes).expect("odd elements are skipped, not fatal");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.skipped_count(), 5);
+        assert_eq!(arr.entry(0).unwrap().as_text().as_deref(), Some("kept"));
+        assert!(arr.entry(1).is_none());
+        assert_eq!(arr.raw_array(), &bytes[..]);
+    }
+
+    #[test]
+    fn parse_skips_ambiguous_and_mistyped_entry_maps() {
+        let dup_key = map_bytes(vec![
+            (Value::UInt(1), Value::Bytes(vec![0xaa])),
+            (Value::UInt(1), Value::Bytes(vec![0xbb])),
+            (Value::UInt(2), Value::Bytes(vec![0x22; 12])),
+            (Value::UInt(3), Value::UInt(1)),
+        ]);
+        let text_ciphertext = map_bytes(vec![
+            (Value::UInt(1), Value::Text("x".into())),
+            (Value::UInt(2), Value::Bytes(vec![0x22; 12])),
+            (Value::UInt(3), Value::UInt(1)),
+        ]);
+        let arr = LargeBlobArray::parse(&raw_array_of(&[&dup_key, &text_ciphertext])).unwrap();
+        assert_eq!((arr.len(), arr.skipped_count()), (0, 2));
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn extra_keys_may_hold_values_the_decoder_rejects() {
+        // §6.10.3 allows any value under other keys: a float, a tag and a
+        // simple value there (and a tag used as a key) keep the entry readable.
+        let mut tolerant = vec![0xa7, 0x01, 0x41, 0xaa, 0x02, 0x4c];
+        tolerant.extend_from_slice(&[0x22; 12]);
+        tolerant.extend_from_slice(&[0x03, 0x01]);
+        tolerant.extend_from_slice(&[0x04, 0xf9, 0x3c, 0x00]); // 4: 1.0 (half float)
+        tolerant.extend_from_slice(&[0x05, 0xc1, 0x01]); // 5: tag 1 (epoch time)
+        tolerant.extend_from_slice(&[0x06, 0xf8, 0x20]); // 6: simple(32)
+        tolerant.extend_from_slice(&[0xc1, 0x01, 0x00]); // tag-1 key: 0
+
+        // A required key holding a float is still mistyped.
+        let mut mistyped = vec![0xa3, 0x01, 0x41, 0xaa, 0x02, 0x4c];
+        mistyped.extend_from_slice(&[0x22; 12]);
+        mistyped.extend_from_slice(&[0x03, 0xf9, 0x3c, 0x00]);
+        let bytes = raw_array_of(&[&tolerant, &mistyped]);
+        let arr = LargeBlobArray::parse(&bytes).unwrap();
+        assert_eq!((arr.len(), arr.skipped_count()), (1, 1));
+        let e = arr.entry(0).unwrap();
+        assert_eq!((e.ciphertext.as_slice(), e.orig_size), (&[0xaa][..], 1));
+        let mut want = bytes.clone();
+        want.extend_from_slice(&left16_sha256(&bytes));
+        assert_eq!(arr.serialize_with_checksum().unwrap(), want);
+    }
+
+    #[test]
+    fn rewrite_refuses_bytes_after_the_array() {
+        // Bytes between the array's end and the checksum can be read past,
+        // but a rewrite would drop them, so every rewrite is refused.
+        let note = encode_entry(&LargeBlobEntry::from_text("kept"));
+        let mut bytes = raw_array_of(&[&note]);
+        bytes.push(0x00);
+        let arr = LargeBlobArray::parse(&bytes).expect("still readable");
+        assert_eq!(arr.entry(0).unwrap().as_text().as_deref(), Some("kept"));
+        assert!(arr.serialize_with_checksum().is_err());
+        assert!(arr.with_text_note("n").serialize_with_checksum().is_err());
+        assert!(arr
+            .without_entry(0)
+            .unwrap()
+            .serialize_with_checksum()
+            .is_err());
+        // Capacity still counts the stray byte as used.
+        let cap = arr.capacity(&AuthenticatorInfo::default());
+        assert_eq!(cap.used_bytes, (bytes.len() + CHECKSUM_LEN) as u64);
+    }
+
+    #[test]
+    fn parse_still_fails_on_a_broken_array() {
+        // Truncated: declares two elements, holds one.
+        assert!(LargeBlobArray::parse(&[0x82, 0x01]).is_err());
+        // An element with an indefinite length can't be measured.
+        assert!(LargeBlobArray::parse(&[0x81, 0x5f, 0x41, 0x00, 0xff]).is_err());
+        // Not an array at all.
+        assert!(LargeBlobArray::parse(&[0xa0]).is_err());
+        assert!(LargeBlobArray::parse(&[]).is_err());
+    }
+
+    /// Canned-response transport: answers each transact() with the next
+    /// queued response.
+    struct ScriptedTransport {
+        responses: Vec<Vec<u8>>,
+    }
+
+    impl CtapTransport for ScriptedTransport {
+        fn transact(&mut self, _cmd: u8, _payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            if self.responses.is_empty() {
+                return Err(CtapError::EmptyResponse);
+            }
+            Ok(self.responses.remove(0))
+        }
+    }
+
+    /// An RP entry carrying an extra map key (4: "x") that §6.10.3 allows.
+    fn rp_entry_with_unknown_key() -> Vec<u8> {
+        let mut b = vec![0xa4, 0x01, 0x54];
+        b.extend_from_slice(&[0x11; 20]);
+        b.extend_from_slice(&[0x02, 0x4c]);
+        b.extend_from_slice(&[0x22; 12]);
+        b.extend_from_slice(&[0x03, 0x05, 0x04, 0x61, 0x78]);
+        b
+    }
+
+    /// [RP entry with key 4, keyroost note, tagged item, non-map].
+    fn mixed_fixture() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let elements = vec![
+            rp_entry_with_unknown_key(),
+            encode_entry(&LargeBlobEntry::from_text("note")),
+            vec![0xc1, 0x01],
+            vec![0x61, 0x78],
+        ];
+        let refs: Vec<&[u8]> = elements.iter().map(|e| e.as_slice()).collect();
+        let bytes = raw_array_of(&refs);
+        (elements, bytes)
+    }
+
+    /// Split a serialized array (with checksum) into its raw elements,
+    /// checking the checksum and that it parses with `skipped` skipped.
+    fn split_checked(serialized: &[u8], skipped: usize) -> Vec<Vec<u8>> {
+        let (array, trailer) = serialized.split_at(serialized.len() - CHECKSUM_LEN);
+        assert_eq!(trailer, left16_sha256(array));
+        assert_eq!(
+            LargeBlobArray::parse(array).unwrap().skipped_count(),
+            skipped
+        );
+        let (items, rest) = cbor::split_array(array).unwrap();
+        assert!(rest.is_empty());
+        items.into_iter().map(|i| i.to_vec()).collect()
+    }
+
+    #[test]
+    fn rewrite_keeps_every_other_item_byte_identical() {
+        let (input, bytes) = mixed_fixture();
+        assert_eq!(
+            hex(&input[0]),
+            "a401541111111111111111111111111111111111111111024c2222222222222222222222220305046178"
+        );
+        let arr = LargeBlobArray::parse(&bytes).unwrap();
+        assert_eq!((arr.len(), arr.skipped_count()), (2, 2));
+
+        let added = split_checked(
+            &arr.with_text_note("n").serialize_with_checksum().unwrap(),
+            2,
+        );
+        assert_eq!(added.len(), 5);
+        assert_eq!(&added[..4], &input[..]);
+
+        let edited = split_checked(
+            &arr.with_replaced_note(1, "m")
+                .unwrap()
+                .serialize_with_checksum()
+                .unwrap(),
+            2,
+        );
+        assert_eq!(edited.len(), 4);
+        assert_eq!(edited[0], input[0]);
+        assert_ne!(edited[1], input[1]);
+        assert_eq!(&edited[2..], &input[2..]);
+
+        let removed = split_checked(
+            &arr.without_entry(1)
+                .unwrap()
+                .serialize_with_checksum()
+                .unwrap(),
+            2,
+        );
+        assert_eq!(
+            removed,
+            vec![input[0].clone(), input[2].clone(), input[3].clone()]
+        );
+    }
+
+    #[test]
+    fn without_entry_counts_only_conforming_entries() {
+        let (_, bytes) = mixed_fixture();
+        let arr = LargeBlobArray::parse(&bytes).unwrap();
+        let removed = arr.without_entry(1).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed.skipped_count(), 2);
+        assert!(!removed.entry(0).unwrap().is_kr_note());
+        assert!(removed.raw_array().is_empty());
+        // Index 2 would be a skipped element by position; it is out of range.
+        assert!(arr.without_entry(2).is_none());
+    }
+
+    #[test]
+    fn unmodified_array_reserializes_identically() {
+        // A non-shortest uint (`18 05`) inside an entry and a tagged element
+        // must come back exactly as stored when nothing was changed.
+        let mut odd_entry = vec![0xa3, 0x01, 0x41, 0xaa, 0x02, 0x4c];
+        odd_entry.extend_from_slice(&[0x33; 12]);
+        odd_entry.extend_from_slice(&[0x03, 0x18, 0x05]);
+        let (_, mixed) = mixed_fixture();
+        for x in [
+            mixed,
+            raw_array_of(&[&odd_entry, &[0xc1, 0x01]]),
+            vec![0x80],
+        ] {
+            let mut want = x.clone();
+            want.extend_from_slice(&left16_sha256(&x));
+            assert_eq!(
+                LargeBlobArray::parse(&x)
+                    .unwrap()
+                    .serialize_with_checksum()
+                    .unwrap(),
+                want
+            );
+        }
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn read_skips_instead_of_failing() {
+        let note = encode_entry(&LargeBlobEntry::from_text("still here"));
+        let array = raw_array_of(&[&[0xc1, 0x01], &note]);
+        let mut stored = array.clone();
+        stored.extend_from_slice(&left16_sha256(&array));
+        let mut response = vec![0x00];
+        response.extend_from_slice(&cbor::encode(&Value::Map(vec![(
+            Value::UInt(RESP_CONFIG),
+            Value::Bytes(stored),
+        )])));
+        let mut dev = ScriptedTransport {
+            responses: vec![response],
+        };
+        let arr = read(&mut dev, &AuthenticatorInfo::default()).expect("read succeeds");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.skipped_count(), 1);
+        assert_eq!(
+            arr.entry(0).unwrap().as_text().as_deref(),
+            Some("still here")
+        );
+        assert_eq!(arr.raw_array(), &array[..]);
     }
 
     #[test]
@@ -691,28 +1217,29 @@ mod tests {
         let (array, trailer) = bytes.split_at(bytes.len() - CHECKSUM_LEN);
         assert_eq!(trailer, left16_sha256(array));
         // Parsing the array part yields zero entries.
-        assert!(parse_entries(array).unwrap().is_empty());
+        assert!(LargeBlobArray::parse(array).unwrap().is_empty());
     }
 
     #[test]
     fn entries_encode_parse_roundtrip() {
         let entries = vec![sample_entry(1), sample_entry(2), sample_entry(3)];
-        let encoded = encode_entries(&entries);
-        let parsed = parse_entries(&encoded).unwrap();
-        assert_eq!(parsed, entries);
+        let serialized = array_of(entries.clone()).serialize_with_checksum().unwrap();
+        let encoded = &serialized[..serialized.len() - CHECKSUM_LEN];
+        let parsed = LargeBlobArray::parse(encoded).unwrap();
+        assert_eq!(fields(&parsed), entries);
     }
 
     #[test]
     fn serialize_with_checksum_is_verifiable() {
-        let arr = LargeBlobArray {
-            entries: vec![sample_entry(7), sample_entry(9)],
-            raw_array: Vec::new(),
-        };
-        let serialized = arr.serialize_with_checksum();
+        let arr = array_of(vec![sample_entry(7), sample_entry(9)]);
+        let serialized = arr.serialize_with_checksum().unwrap();
         let (array, trailer) = serialized.split_at(serialized.len() - CHECKSUM_LEN);
         assert_eq!(trailer, left16_sha256(array));
         // And the array round-trips back to the same entries.
-        assert_eq!(parse_entries(array).unwrap(), arr.entries);
+        assert_eq!(
+            fields(&LargeBlobArray::parse(array).unwrap()),
+            vec![sample_entry(7), sample_entry(9)]
+        );
     }
 
     #[test]
@@ -740,18 +1267,16 @@ mod tests {
     #[test]
     fn text_note_roundtrips_through_serialization() {
         let text = "hello \u{1f511} keyroost note — 123";
-        let arr = LargeBlobArray {
-            entries: vec![LargeBlobEntry::from_text(text)],
-            raw_array: Vec::new(),
-        };
+        let arr = array_of(vec![LargeBlobEntry::from_text(text)]);
         // Serialize (with checksum), strip the trailer, re-parse, decode text.
-        let serialized = arr.serialize_with_checksum();
+        let serialized = arr.serialize_with_checksum().unwrap();
         let (array, _trailer) = serialized.split_at(serialized.len() - CHECKSUM_LEN);
-        let parsed = parse_entries(array).unwrap();
+        let parsed = LargeBlobArray::parse(array).unwrap();
         assert_eq!(parsed.len(), 1);
-        assert!(parsed[0].is_kr_note());
-        assert_eq!(parsed[0].as_text().as_deref(), Some(text));
-        assert_eq!(parsed[0].orig_size, text.len() as u64);
+        let note = parsed.entry(0).unwrap();
+        assert!(note.is_kr_note());
+        assert_eq!(note.as_text().as_deref(), Some(text));
+        assert_eq!(note.orig_size, text.len() as u64);
     }
 
     #[test]
@@ -786,16 +1311,18 @@ mod tests {
             ciphertext: ct,
             nonce: nonce.to_vec(),
             orig_size,
+            original: None,
         };
         // A decoy entry encrypted with a different key must be skipped.
         let decoy = LargeBlobEntry {
             ciphertext: vec![0u8; 40],
             nonce: vec![0u8; 12],
             orig_size: 8,
+            original: None,
         };
 
-        let got =
-            extract_cert_from_entries(&key, &[decoy.clone(), entry.clone()]).expect("cert found");
+        let both = array_of(vec![decoy, entry]);
+        let got = extract_cert_from_entries(&key, &both).expect("cert found");
         assert_eq!(got, wire);
         // Full round trip back to -cert.pub reproduces the original type +
         // base64 body (the comment is not part of the certificate, so it is
@@ -806,7 +1333,7 @@ mod tests {
         assert_eq!(parts.next(), orig_parts.next());
         assert_eq!(parts.next(), orig_parts.next());
         // Wrong key → nothing.
-        assert!(extract_cert_from_entries(&[0x99u8; 32], &[decoy, entry]).is_none());
+        assert!(extract_cert_from_entries(&[0x99u8; 32], &both).is_none());
     }
 
     #[test]
@@ -816,6 +1343,7 @@ mod tests {
             ciphertext: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x99],
             nonce: vec![1u8; 12],
             orig_size: 4,
+            original: None,
         };
         assert!(!rp.is_kr_note());
         assert_eq!(rp.as_text(), None);
@@ -823,33 +1351,30 @@ mod tests {
 
     #[test]
     fn with_text_note_appends_without_disturbing_existing() {
-        let arr = LargeBlobArray {
-            entries: vec![sample_entry(5)],
-            raw_array: Vec::new(),
-        };
+        let arr = array_of(vec![sample_entry(5)]);
         let updated = arr.with_text_note("note");
-        assert_eq!(updated.entries.len(), 2);
+        assert_eq!(updated.len(), 2);
         // Original (RP) entry untouched and still not a note.
-        assert_eq!(updated.entries[0], sample_entry(5));
-        assert!(!updated.entries[0].is_kr_note());
+        assert_eq!(updated.entry(0), Some(&sample_entry(5)));
+        assert!(!updated.entry(0).unwrap().is_kr_note());
         // New entry decodes back to the text.
-        assert_eq!(updated.entries[1].as_text().as_deref(), Some("note"));
+        assert_eq!(updated.entry(1).unwrap().as_text().as_deref(), Some("note"));
     }
 
     #[test]
     fn replace_note_swaps_only_keyroost_notes() {
-        let arr = LargeBlobArray {
-            entries: vec![
-                sample_entry(5),                       // RP entry
-                LargeBlobEntry::from_text("original"), // kr note
-            ],
-            raw_array: Vec::new(),
-        };
+        let arr = array_of(vec![
+            sample_entry(5),                       // RP entry
+            LargeBlobEntry::from_text("original"), // kr note
+        ]);
         // Editing the note succeeds and changes only that entry.
         let edited = arr.with_replaced_note(1, "updated").unwrap();
-        assert_eq!(edited.entries.len(), 2);
-        assert_eq!(edited.entries[0], sample_entry(5));
-        assert_eq!(edited.entries[1].as_text().as_deref(), Some("updated"));
+        assert_eq!(edited.len(), 2);
+        assert_eq!(edited.entry(0), Some(&sample_entry(5)));
+        assert_eq!(
+            edited.entry(1).unwrap().as_text().as_deref(),
+            Some("updated")
+        );
         // Attempting to edit the RP entry is refused.
         assert!(arr.with_replaced_note(0, "hack").is_none());
         // Out-of-range index is refused.
@@ -858,10 +1383,7 @@ mod tests {
 
     #[test]
     fn capacity_of_empty_array() {
-        let arr = LargeBlobArray {
-            entries: Vec::new(),
-            raw_array: Vec::new(),
-        };
+        let arr = array_of(Vec::new());
         let info = AuthenticatorInfo::default(); // no 0x0B advertised -> spec minimum
         let cap = arr.capacity(&info);
         // Empty CBOR array (0x80, 1 byte) + 16-byte checksum trailer.
@@ -873,17 +1395,17 @@ mod tests {
 
     #[test]
     fn capacity_uses_advertised_max_and_saturates() {
-        let arr = LargeBlobArray {
-            entries: vec![LargeBlobEntry::from_text("hello")],
-            raw_array: Vec::new(),
-        };
+        let arr = array_of(vec![LargeBlobEntry::from_text("hello")]);
         let info = AuthenticatorInfo {
             max_serialized_large_blob_array: Some(4096),
             ..Default::default()
         };
         let cap = arr.capacity(&info);
         assert_eq!(cap.max_bytes, 4096);
-        assert_eq!(cap.used_bytes, arr.serialize_with_checksum().len() as u64);
+        assert_eq!(
+            cap.used_bytes,
+            arr.serialize_with_checksum().unwrap().len() as u64
+        );
         assert_eq!(cap.free_bytes, cap.max_bytes - cap.used_bytes);
         assert_eq!(cap.entry_count, 1);
 
@@ -915,6 +1437,7 @@ mod tests {
             ciphertext: wire.clone(),
             nonce: vec![0; 12],
             orig_size: wire.len() as u64,
+            original: None,
         };
         match wire_entry.classify() {
             EntryKind::SshCert { info, wire: w } => {
@@ -929,6 +1452,7 @@ mod tests {
             ciphertext: FIXTURE_CERT_PUB.as_bytes().to_vec(),
             nonce: vec![0; 12],
             orig_size: FIXTURE_CERT_PUB.len() as u64,
+            original: None,
         };
         match text_entry.classify() {
             EntryKind::SshCert { info, wire: w } => {
@@ -943,6 +1467,7 @@ mod tests {
             ciphertext: vec![0xde, 0xad, 0xbe, 0xef],
             nonce: vec![1; 12],
             orig_size: 4,
+            original: None,
         };
         assert!(matches!(rp.classify(), EntryKind::Opaque));
     }

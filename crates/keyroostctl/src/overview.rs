@@ -130,11 +130,16 @@ pub fn correlated_lines(rows: &[(usize, &Device)]) -> Vec<String> {
                 (None, Some(r)) => format!("'{}' (no HID)", sanitize_terminal(r)),
                 (None, None) => "(none)".to_string(),
             };
+            let stored = match d.naming.source {
+                Some(keyroost_resolve::NameSource::Key) if d.name.is_some() => " (name on the key)",
+                _ => "",
+            };
             format!(
-                "  {n:>2}) {:5}  {} {}  {}  {}",
+                "  {n:>2}) {:5}  {} {}{}  {}  {}",
                 kind,
                 sanitize_terminal(&d.vendor),
                 label(d),
+                stored,
                 badge_line(d),
                 pairing
             )
@@ -186,6 +191,8 @@ mod tests {
             kind,
             hid_path: None,
             reader: None,
+            hid_serial: None,
+            naming: keyroost_resolve::Naming::local(name),
         }
     }
 
@@ -359,5 +366,54 @@ mod tests {
         assert!(lines[0].contains("Token"));
         assert!(lines[0].contains("TOTP token"));
         assert!(lines[0].contains("(no HID)"));
+    }
+
+    #[test]
+    fn a_newcomer_row_shows_its_tail_and_where_the_name_lives() {
+        use keyroost_resolve::{KeyLabel, NameSource, Naming};
+        let on_key = |serial: &str, shown: &str, selectable: bool| {
+            let mut d = dev(
+                "Yubico",
+                "YubiKey 5",
+                Some(shown),
+                serial,
+                "USB",
+                caps_of(&[Caps::FIDO2]),
+                DeviceKind::Key,
+            );
+            d.naming = Naming {
+                plain: Some("Work".into()),
+                source: Some(NameSource::Key),
+                selectable,
+                on_key: KeyLabel::Present("Work".into()),
+                missing_on_key: None,
+            };
+            d
+        };
+        let devs = [
+            on_key("11111111", "Work", true),
+            on_key("22225678", "Work (5678)", false),
+        ];
+        let rows = numbered(&devs);
+        let over = overview_lines(&rows).join("\n");
+        assert!(over.contains("Work (5678)"), "{over}");
+        let corr = correlated_lines(&rows);
+        assert!(corr.iter().any(|l| l.contains("Work (5678)")), "{corr:?}");
+        assert!(
+            corr.iter().all(|l| l.contains("(name on the key)")),
+            "{corr:?}"
+        );
+        // A name saved on this computer carries no marker.
+        let local = [dev(
+            "Yubico",
+            "YubiKey 5",
+            Some("Home"),
+            "1",
+            "USB",
+            caps_of(&[Caps::FIDO2]),
+            DeviceKind::Key,
+        )];
+        let corr = correlated_lines(&numbered(&local));
+        assert!(!corr[0].contains("on the key"), "{corr:?}");
     }
 }

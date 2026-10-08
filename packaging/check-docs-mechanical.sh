@@ -27,9 +27,11 @@
 # Usage:
 #   packaging/check-docs-mechanical.sh
 #
-# Entirely offline. Always (re)builds target/release/keyroostctl first — a
-# no-op when current — so CLI invocations are validated against the REAL,
-# up-to-date binary's --help tree, never against the source or a stale build.
+# Entirely offline. Always (re)builds keyroostctl first, into its own target
+# dir (target/docs-check) — a no-op when current — so CLI invocations are
+# validated against the REAL, up-to-date binary's --help tree, never against
+# the source or a stale build. A separate dir keeps target/release (which a
+# developer may run day to day) untouched by a docs check on a feature branch.
 #
 # Deliberate-old-command escapes in docs/migration.html:
 #   - the first column of any table whose header starts with "Old" is skipped;
@@ -49,10 +51,10 @@ for arg in "$@"; do
   esac
 done
 
-BIN=target/release/keyroostctl
+BIN=target/docs-check/release/keyroostctl
 # Always build: a binary left over from an older checkout would validate the
 # docs against a stale --help tree. On an up-to-date tree this is a no-op.
-cargo build --release --offline -p keyroostctl
+CARGO_TARGET_DIR=target/docs-check cargo build --release --offline -p keyroostctl
 "$BIN" --version >/dev/null || { echo "error: ${BIN} does not run" >&2; exit 2; }
 
 KEYROOSTCTL_BIN="$BIN" python3 - <<'PY'

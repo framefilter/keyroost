@@ -73,6 +73,39 @@ Being worked on right now — check with whoever holds it before starting.
     show the new design after the next release.
   (M–L)
 
+- **v0.13.0: sign the AppImage.** Today it has a `.sha256` sidecar and a
+  build attestation, but its embedded signature sections are empty. The
+  linuxdeploy plugin already in use signs when `LDAI_SIGN` /
+  `LDAI_SIGN_KEY` are set; the signature covers the update information and
+  the `.zsync` is generated from the signed file. Plan: a dedicated AppImage
+  key (not the Flatpak key), kept only as `release-publish` environment
+  secrets; `cargo build` in its own step before the key is imported; fail
+  the job if the key is missing or the signature sections are empty; commit
+  the public key and put its fingerprint in SECURITY.md and the README. Test
+  locally with `appimageupdatetool` before release: unsigned v0.12.0 →
+  signed (unknown: updaters may refuse, in which case release notes say to
+  download that release by hand once), signed → signed, and a changed key
+  (must be refused). Research notes: kept locally by the maintainer. (M)
+
+- **v0.13.0: one word per action across the whole CLI.** Walk every
+  command group and confirm that paired and opposing actions use the same
+  words everywhere: what creates and what removes (`add`/`delete`,
+  `generate`/`delete`, `import`/`export`), what gives a value and what takes
+  it away (`set`/`clear`), what turns something on and off
+  (`enable`/`disable`), and status words (`info`, `list`, `status`). The
+  same function must not have a different word in a different group. Every
+  mismatch found is either renamed (with a retired-name error, as in
+  v0.13.0) or noted with the reason it differs. (S–M)
+
+- **Investigate a CLI style guide for contributors.** A short page on how
+  new keyroostctl commands and flags should look (command words, flags,
+  secret input, confirmations, output, help text), so contributions match
+  the existing CLI without a review round to align them. Link it from
+  CLAUDE.md too, so AI coding agents reuse the established words and flags
+  instead of inventing new ones. Decide first
+  whether it belongs in CONTRIBUTING, the Learn site, or a doc of its own,
+  and what it covers; the maintainer settles the content. (S)
+
 - **Duplicate keys on Windows/macOS with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — identity matching on PR #165, awaiting a Windows community test.**
   Where the OS reports no USB position, keyroost now asks each side of a key
   for the identity it reports (YubiKey serial, Solo 2 UUID, Token2 §6.10
@@ -199,7 +232,7 @@ plan's two-key manual steps were never executed):
   The manifest in `packaging/flatpak/` can't be reused for this.
 
 - **Friendly names for Molto2 tokens** — detection never connects to a
-  Molto2, so its row carries no serial and `name add` can't name it.
+  Molto2, so its row carries no serial and `name set` can't name it.
   Needs a way to get the token's serial during detection, without logging in
   with the customer key.
 

@@ -213,7 +213,7 @@ keyroostctl list
 the form `<path> <vid>:<pid> usage=f1d0:0001 <model> serial=… [FIDO]`. A
 `serial=…(ccid)` suffix means the serial came from the card interface because
 the key exposes none over USB; `name=…` appears once you've named the key with
-`keyroostctl name add`. Below the raw sections, `list` prints a correlated
+`keyroostctl name set`. Below the raw sections, `list` prints a correlated
 per-device summary built from the same snapshot, numbered. With multiple keys
 plugged in you'll get one numbered line each; pick one with the global
 `--device N` (that number, a serial, or a saved name). Without it, a terminal

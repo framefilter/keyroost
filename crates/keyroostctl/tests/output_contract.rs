@@ -1,7 +1,9 @@
 //! Output-contract tests: stream, exit-code and shape rules for the CLI.
 //! Each runs the real binary with no PC/SC service reachable.
+mod common;
+use common::ConfigIn;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Per-call counter so concurrent `run` calls in one test binary never share
@@ -17,10 +19,9 @@ pub fn run(args: &[&str]) -> (i32, String, String) {
         RUN_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+    let out = common::keyroostctl()
         .args(args)
-        .env("XDG_CONFIG_HOME", &dir)
-        .env("APPDATA", &dir)
+        .config_in(&dir)
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
         .stdin(Stdio::null())
         .output()

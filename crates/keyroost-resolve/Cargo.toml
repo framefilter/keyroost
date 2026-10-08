@@ -19,8 +19,14 @@ workspace = true
 [dependencies]
 keyroost-keyring = { path = "../keyroost-keyring", version = "0.12.0" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.12.0" }
+# Reads the name a key stores on itself (large-blob label entry) during a scan.
+keyroost-ctap = { path = "../keyroost-ctap", version = "0.12.0" }
 keyroost-transport = { path = "../keyroost-transport", version = "0.12.0" }
 keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.12.0" }
 keyroost-proto = { path = "../keyroost-proto", version = "0.12.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.12.0" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.12.0" }
+
+[dev-dependencies]
+# Test builds resolve the config dir to a temp dir, never the real one.
+keyroost-keyring = { path = "../keyroost-keyring", version = "0.12.0", features = ["test-isolation"] }

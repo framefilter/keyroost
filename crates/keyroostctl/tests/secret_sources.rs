@@ -1,9 +1,10 @@
 //! Removed and renamed secret flags fail with a message naming the
 //! replacement, exit 2, and never repeat the value given.
-use std::process::{Command, Stdio};
+mod common;
+use std::process::Stdio;
 
 fn run(args: &[&str]) -> (i32, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+    let out = common::keyroostctl()
         .args(args)
         .stdin(Stdio::null())
         // pcsc-lite: no daemon reachable, so nothing can talk to a card.
@@ -247,15 +248,12 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
         let help = {
             let mut a = path.clone();
             a.push("--help");
-            let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
-                .args(&a)
-                .output()
-                .unwrap();
+            let out = common::keyroostctl().args(&a).output().unwrap();
             String::from_utf8_lossy(&out.stdout).into_owned()
                 + &String::from_utf8_lossy(&out.stderr)
         };
         for i in 0..required.len() {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_keyroostctl"));
+            let mut cmd = common::keyroostctl();
             cmd.args(&path)
                 .args(&extra)
                 .current_dir(&dir)
@@ -313,7 +311,7 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
         (&missing, "cannot read key file"),
         (&junk, "could not parse RSA private key"),
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+        let out = common::keyroostctl()
             .args(["openpgp", "key", "import", "--yes", "--admin-pin"])
             .arg("env:KR_TEST_ADMIN_PIN")
             .arg("--in")

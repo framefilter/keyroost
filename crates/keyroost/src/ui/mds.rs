@@ -209,8 +209,11 @@ fn external_mds_paths() -> Vec<std::path::PathBuf> {
         }
     }
 
-    // 2. Platform config dir.
-    let cfg: Option<PathBuf> = if cfg!(target_os = "windows") {
+    // 2. Platform config dir. Tests read the isolated temp config dir
+    //    instead (see `keyroost_keyring::config_dir`), never the person's.
+    let cfg: Option<PathBuf> = if cfg!(test) {
+        keyroost_keyring::config_dir().and_then(|d| d.parent().map(PathBuf::from))
+    } else if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME")

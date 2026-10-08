@@ -2,12 +2,15 @@
 //! and PC/SC reader(s), with a capability union and a Molto2-vs-key
 //! classification. Consumed by both the GUI and the CLI so they never drift.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use keyroost_hid::HidDevice;
 use keyroost_keyring::Keyring;
 use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
+
+use crate::names::{KeyLabel, Naming};
 
 /// Capability bit-set. Hand-rolled (no `bitflags` dep). Each physical key
 /// advertises the union of the applets it answers.
@@ -96,6 +99,12 @@ pub struct Device {
     pub kind: DeviceKind,
     pub hid_path: Option<PathBuf>,
     pub reader: Option<String>,
+    /// The FIDO HID node's own serial, when this merged row's `serial` came
+    /// from its card applet and differs: a name saved under it still applies.
+    pub hid_serial: Option<String>,
+    /// How the row is named (see [`crate::names::apply_names`]); `name` is
+    /// the text to show.
+    pub naming: Naming,
 }
 
 impl Device {
@@ -597,7 +606,7 @@ pub fn correlate_with(
         caps.insert(Caps::TOTP);
         devices.push(Device {
             id: format!("molto:{}", p.reader_name),
-            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            name: None,
             vendor: "Token2".into(),
             model: "Molto2".into(),
             serial,
@@ -608,6 +617,8 @@ pub fn correlate_with(
             kind: DeviceKind::Token,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
+            hid_serial: None,
+            naming: Naming::default(),
         });
     }
 
@@ -622,7 +633,7 @@ pub fn correlate_with(
         caps.insert(Caps::PROG);
         devices.push(Device {
             id: format!("prog:{}", p.reader_name),
-            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            name: None,
             vendor: "Token2".into(),
             model,
             serial,
@@ -633,6 +644,8 @@ pub fn correlate_with(
             kind: DeviceKind::ProgToken,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
+            hid_serial: None,
+            naming: Naming::default(),
         });
     }
 
@@ -675,7 +688,7 @@ pub fn correlate_with(
         let model = clean_model(&p.reader_name, &vendor);
         devices.push(Device {
             id,
-            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            name: None,
             vendor,
             model,
             serial,
@@ -688,6 +701,8 @@ pub fn correlate_with(
             kind: DeviceKind::Key,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
+            hid_serial: None,
+            naming: Naming::default(),
         });
     }
 
@@ -786,9 +801,11 @@ pub fn correlate_with(
             dev.transport = "USB · PC/SC + FIDO HID".into();
             if dev.serial.is_empty() {
                 dev.serial = serial.clone();
-            }
-            if dev.name.is_none() {
-                dev.name = keyring.name_for(Some(&serial)).map(str::to_owned);
+            } else if keyroost_keyring::canonical_serial(&serial)
+                != keyroost_keyring::canonical_serial(&dev.serial)
+                && !keyroost_keyring::canonical_serial(&serial).is_empty()
+            {
+                dev.hid_serial = Some(serial.clone());
             }
         } else {
             let id = if !serial.is_empty() {
@@ -817,7 +834,7 @@ pub fn correlate_with(
             };
             devices.push(Device {
                 id,
-                name: keyring.name_for(Some(&serial)).map(str::to_owned),
+                name: None,
                 vendor,
                 model,
                 serial,
@@ -828,6 +845,8 @@ pub fn correlate_with(
                 kind: DeviceKind::Key,
                 hid_path: Some(hid.path.clone()),
                 reader: reader_name,
+                hid_serial: None,
+                naming: Naming::default(),
             });
         }
     }
@@ -855,6 +874,9 @@ pub fn correlate_with(
             .then_with(|| a.model.cmp(&b.model))
             .then_with(|| a.id.cmp(&b.id))
     });
+    // Local names only: without names read from keys the pass learns nothing
+    // to record.
+    crate::names::apply_names(&mut devices, keyring, &std::collections::HashMap::new());
     devices
 }
 
@@ -923,23 +945,373 @@ pub struct EnumerateOptions {
     /// Match by topology, vendor and reported serials only, sending no
     /// identity reads to any key ([`correlate`]). For time-critical or
     /// re-check scans where an unanswered identity read would only cost time.
+    /// Also skips reading names stored on keys.
     pub skip_identity_reads: bool,
+    /// Don't read names stored on keys (local names only).
+    pub skip_key_names: bool,
+}
+
+/// Warnings already given in this process, and those a front end hasn't
+/// taken yet ([`take_scan_warnings`]).
+static WARNINGS: std::sync::Mutex<(Vec<String>, Vec<String>)> =
+    std::sync::Mutex::new((Vec::new(), Vec::new()));
+
+/// Report `msg` once per process: on stderr, and queued for a front end
+/// that shows warnings itself (the GUI).
+fn warn_once(msg: String) {
+    let Ok(mut w) = WARNINGS.lock() else {
+        return;
+    };
+    if w.0.contains(&msg) {
+        return;
+    }
+    eprintln!("warning: {msg}");
+    w.0.push(msg.clone());
+    w.1.push(msg);
+}
+
+/// Warnings scans have given since the last call, each once per process
+/// (an unreadable `keys.json`, names that couldn't be recorded). For front
+/// ends without a terminal to show them in.
+pub fn take_scan_warnings() -> Vec<String> {
+    WARNINGS
+        .lock()
+        .map(|mut w| std::mem::take(&mut w.1))
+        .unwrap_or_default()
+}
+
+/// Load `keys.json` for a scan. A file that can't be read never breaks a
+/// scan: the keys are shown without the names saved on this computer, the
+/// problem is reported once per process, and the returned flag is `false`
+/// so nothing learned during the scan is ever saved over it (and no name
+/// read from a key becomes selectable, since none can be recorded).
+/// With `debug`, a load that converted a version 1 file prints one trace
+/// line with counts only.
+pub fn load_keyring_for_scan(debug: bool) -> (Keyring, bool) {
+    match Keyring::load_default() {
+        Ok(k) => {
+            if let (true, Some(r)) = (debug, k.load_report()) {
+                let line = format!(
+                    "converted keys.json to version 2: {}; {}",
+                    plural(r.converted, "record", "records"),
+                    if r.persisted {
+                        "saved"
+                    } else {
+                        "not saved yet (the old file is kept; the next save retries)"
+                    }
+                );
+                eprintln!("{}", format_line(Dir::Note, "names", &line));
+            }
+            (k, true)
+        }
+        Err(keyroost_keyring::KeyringError::NoConfigDir) => (Keyring::default(), false),
+        Err(e) => {
+            warn_once(format!(
+                "{e}. Keys are shown without the names saved on this computer, and \
+                 names read from keys work for this session only."
+            ));
+            (Keyring::default(), false)
+        }
+    }
+}
+
+/// How long a name read from a key is reused: covers one CLI run's repeated
+/// scans and the GUI's staggered scan burst after a hotplug, so a key that
+/// doesn't answer costs one timeout per burst, not one per scan.
+const LABEL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Names read from keys, by HID path and serial, with when they were read.
+type LabelCache = Vec<((PathBuf, String), std::time::Instant, KeyLabel)>;
+static LABEL_CACHE: std::sync::Mutex<LabelCache> = std::sync::Mutex::new(Vec::new());
+
+/// Bumped by every [`forget_key_names`]: a read that started before a
+/// forget is never cached after it.
+static LABEL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn label_generation() -> u64 {
+    LABEL_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Forget every name read from a key. Call before and after anything that
+/// writes a key's large-blob storage or resets it, so no scan reuses a
+/// stale read; a read still under way when this runs is not cached.
+pub fn forget_key_names() {
+    if let Ok(mut c) = LABEL_CACHE.lock() {
+        LABEL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        c.clear();
+    }
+}
+
+/// Run `write` — anything that writes a key's large-blob storage or resets
+/// it — with every name read from keys forgotten before and after, so no
+/// scan reuses a name read before the write: neither one that starts during
+/// it nor one that was already reading.
+pub fn with_key_names_forgotten<T>(write: impl FnOnce() -> T) -> T {
+    forget_key_names();
+    let r = write();
+    forget_key_names();
+    r
+}
+
+/// Cache `label`, read under generation `read_gen`, unless a forget ran
+/// since (`now_gen` differs): a read that started before a write must not
+/// outlive it. Replaces older reads of `key` and drops expired ones.
+/// Returns whether it was cached.
+fn cache_label(
+    cache: &mut LabelCache,
+    read_gen: u64,
+    now_gen: u64,
+    key: (PathBuf, String),
+    at: std::time::Instant,
+    label: KeyLabel,
+) -> bool {
+    if read_gen != now_gen {
+        return false;
+    }
+    cache.retain(|(k, t, _)| *k != key && at.duration_since(*t) < LABEL_CACHE_TTL);
+    cache.push((key, at, label));
+    true
+}
+
+/// For every row with FIDO2 and a HID path: open it, ask getInfo, and read
+/// the name stored on the key (no PIN). A failed read is
+/// [`KeyLabel::ReadFailed`], traced under `debug` (never a serial). Reads
+/// are reused for [`LABEL_CACHE_TTL`].
+fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabel> {
+    use keyroost_ctap::device_label::{read_label, LabelState};
+    let now = std::time::Instant::now();
+    let mut labels = HashMap::new();
+    for d in devices.iter().filter(|d| d.caps.has(Caps::FIDO2)) {
+        let Some(path) = d.hid_path.as_deref() else {
+            continue;
+        };
+        let key = (path.to_path_buf(), d.serial.clone());
+        let cached = LABEL_CACHE.lock().ok().and_then(|c| {
+            c.iter()
+                .find(|(k, at, _)| *k == key && now.duration_since(*at) < LABEL_CACHE_TTL)
+                .map(|(_, _, l)| l.clone())
+        });
+        if let Some(l) = cached {
+            labels.insert(d.id.clone(), l);
+            continue;
+        }
+        let read_gen = label_generation();
+        let read = || -> Result<KeyLabel, String> {
+            let (mut dev, _) =
+                keyroost_ctap::CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+            let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+            Ok(
+                match read_label(&mut dev, &info).map_err(|e| e.to_string())? {
+                    LabelState::Unsupported => KeyLabel::Unsupported,
+                    LabelState::Absent => KeyLabel::Absent,
+                    LabelState::Present(l) => KeyLabel::from_text(&l.label),
+                },
+            )
+        };
+        let label = read().unwrap_or_else(|e| {
+            if debug {
+                eprintln!(
+                    "{}",
+                    format_line(
+                        Dir::Note,
+                        "names",
+                        &format!("{}: name not read: {e}", path.display()),
+                    )
+                );
+            }
+            KeyLabel::ReadFailed
+        });
+        if let Ok(mut c) = LABEL_CACHE.lock() {
+            // Under the lock, so no forget can slip in between the check
+            // and the insert.
+            cache_label(
+                &mut c,
+                read_gen,
+                label_generation(),
+                key,
+                now,
+                label.clone(),
+            );
+        }
+        labels.insert(d.id.clone(), label);
+    }
+    labels
+}
+
+/// What one naming pass with names read from keys did: counts only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Learned {
+    /// Keys whose storage answered.
+    read: usize,
+    /// Of those, keys carrying a (valid or not) name entry.
+    with_name: usize,
+    recorded: usize,
+    dropped: usize,
+    /// Why what the pass learned couldn't be saved.
+    save_error: Option<String>,
+    /// Changes learned but not saved because nothing may be saved.
+    unsaved: usize,
+    /// First-seen names on keys without a usable serial (never recorded).
+    unrecordable: usize,
+}
+
+/// Record `updates` in the `keys.json` at `path`, re-read just before
+/// saving so records another keyroost process wrote meanwhile are kept.
+/// Returns the saved ring and the counts applied.
+fn record_updates_at(
+    path: &std::path::Path,
+    updates: &[crate::names::NameUpdate],
+) -> Result<(Keyring, usize, usize), keyroost_keyring::KeyringError> {
+    let mut ring = Keyring::load_from(path)?;
+    let (recorded, dropped) = crate::names::apply_updates(&mut ring, updates);
+    if recorded + dropped > 0 {
+        ring.save_to(path)?;
+    }
+    Ok((ring, recorded, dropped))
+}
+
+/// Name every row from `keyring` and `labels`. What the pass learned is
+/// recorded in the `keys.json` at `save` (`None`: it may not be saved), and
+/// the rows are named again from the saved file, so records another
+/// keyroost process wrote meanwhile count too.
+fn learn_names(
+    devices: &mut [Device],
+    keyring: &Keyring,
+    labels: &HashMap<DeviceId, KeyLabel>,
+    save: Option<&std::path::Path>,
+) -> Learned {
+    let updates = crate::names::apply_names(devices, keyring, labels);
+    let unrecordable = updates
+        .iter()
+        .filter(|u| matches!(u, crate::names::NameUpdate::Unrecordable { .. }))
+        .count();
+    let updates: Vec<_> = updates
+        .into_iter()
+        .filter(|u| !matches!(u, crate::names::NameUpdate::Unrecordable { .. }))
+        .collect();
+    let mut learned = Learned {
+        read: labels
+            .values()
+            .filter(|l| !matches!(l, KeyLabel::NotRead | KeyLabel::ReadFailed))
+            .count(),
+        with_name: labels
+            .values()
+            .filter(|l| matches!(l, KeyLabel::Present(_) | KeyLabel::Unreadable))
+            .count(),
+        unrecordable,
+        ..Learned::default()
+    };
+    if updates.is_empty() {
+        return learned;
+    }
+    let Some(path) = save else {
+        learned.unsaved = updates.len();
+        return learned;
+    };
+    match record_updates_at(path, &updates) {
+        Ok((saved, recorded, dropped)) => {
+            learned.recorded = recorded;
+            learned.dropped = dropped;
+            crate::names::apply_names(devices, &saved, labels);
+        }
+        Err(e) => learned.save_error = Some(e.to_string()),
+    }
+    learned
+}
+
+/// Whether the "couldn't record names" warning was given in this process.
+static UNRECORDED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The warning when names read from keys can't be recorded on this computer
+/// (a failed save, no config directory, a key without a usable serial).
+/// Such names still work for this session, as on a computer seeing the keys
+/// for the first time. A keys.json that couldn't be loaded was already
+/// reported by [`load_keyring_for_scan`], so it adds nothing here.
+fn unrecorded_names_warning(learned: &Learned, has_config_dir: bool) -> Option<String> {
+    let why = if let Some(e) = &learned.save_error {
+        e.clone()
+    } else if learned.unsaved > 0 && !has_config_dir {
+        keyroost_keyring::KeyringError::NoConfigDir.to_string()
+    } else if learned.unrecordable > 0 {
+        "a key reports no usable serial".to_string()
+    } else {
+        return None;
+    };
+    Some(format!(
+        "this computer couldn't record names read from keys ({why}); they work for \
+         this session only"
+    ))
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Read the names stored on the scanned keys (no PIN) and name every row.
+/// First-seen names are recorded in `keys.json` best-effort: a scan never
+/// fails over it. A failed save is reported once per process
+/// ([`take_scan_warnings`]); nothing is saved when `may_save` is false
+/// (see [`load_keyring_for_scan`]). A name that isn't recorded still works
+/// for this session, as on a computer seeing the key for the first time.
+pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool, debug: bool) {
+    let labels = read_key_labels(devices, debug);
+    let path = if may_save {
+        keyroost_keyring::config_path()
+    } else {
+        None
+    };
+    let learned = learn_names(devices, keyring, &labels, path.as_deref());
+    if let Some(w) = unrecorded_names_warning(&learned, keyroost_keyring::config_path().is_some()) {
+        // One such warning per process, whatever the reason.
+        if !UNRECORDED_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            warn_once(w);
+        }
+    }
+    if debug {
+        let mut line = format!(
+            "read {} ({} with a name on the key); recorded {}",
+            plural(learned.read, "key", "keys"),
+            learned.with_name,
+            plural(learned.recorded, "first-seen name", "first-seen names"),
+        );
+        if learned.dropped > 0 {
+            line.push_str(&format!(
+                "; dropped {}",
+                plural(learned.dropped, "stale name", "stale names")
+            ));
+        }
+        eprintln!("{}", format_line(Dir::Note, "names", &line));
+    }
+}
+
+/// [`name_from_keys`] over rows from a scan that skipped name reads
+/// (`skip_key_names`), loading `keys.json` itself: for a caller that learns
+/// only after scanning that it needs names stored on keys.
+pub fn add_key_names(devices: &mut [Device], debug: bool) {
+    let (keyring, may_save) = load_keyring_for_scan(debug);
+    name_from_keys(devices, &keyring, may_save, debug);
 }
 
 /// Build the unified device list (see [`enumerate`]) with options.
 pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
     let probes = keyroost_transport::probe_readers().unwrap_or_default();
-    let keyring = Keyring::load_default().unwrap_or_default();
+    let (keyring, may_save) = load_keyring_for_scan(opts.debug);
     if opts.skip_identity_reads {
         return Ok(correlate(&hids, &probes, &keyring));
     }
-    Ok(correlate_live(&hids, &probes, &keyring, opts.debug))
+    let mut devices = correlate_live(&hids, &probes, &keyring, opts.debug);
+    if !opts.skip_key_names {
+        name_from_keys(&mut devices, &keyring, may_save, opts.debug);
+    }
+    Ok(devices)
 }
 
 /// Build the unified device list. Blocking: enumerates FIDO HID nodes and probes
 /// PC/SC readers, then correlates, matching by device-reported identity where
-/// topology is unavailable. A HID-layer failure is a hard error; PC/SC
+/// topology is unavailable, and names every row — reading the name a FIDO
+/// key stores on itself (no PIN) and recording first-seen names best-effort
+/// ([`name_from_keys`]). A HID-layer failure is a hard error; PC/SC
 /// problems degrade to an empty probe list (FIDO-only keys still appear).
 pub fn enumerate() -> Result<Vec<Device>, String> {
     enumerate_with(&EnumerateOptions::default())
@@ -2764,5 +3136,241 @@ mod plan_tests {
         assert_eq!(ResetStep::Piv.label(), "PIV");
         assert_eq!(ResetStep::Token2Otp.label(), "OTP");
         assert_eq!(ResetStep::Fido.label(), "FIDO2");
+    }
+
+    #[test]
+    fn enumerate_options_skip_flags_default_off() {
+        let o = EnumerateOptions::default();
+        assert!(!o.debug);
+        assert!(!o.skip_identity_reads);
+        assert!(!o.skip_key_names);
+    }
+
+    fn named_scan() -> Vec<Device> {
+        let key = |path: &str, serial: &str| HidDevice {
+            path: path.into(),
+            vendor_id: 0x1209,
+            product_id: 0xbeee,
+            product_name: "Security Key".into(),
+            usage_page: keyroost_hid::HID_USAGE_PAGE_FIDO,
+            usage: keyroost_hid::HID_USAGE_FIDO_AUTHENTICATOR,
+            serial_number: Some(serial.into()),
+            usb_bus: None,
+            usb_address: None,
+        };
+        let hids = [
+            key("/dev/hidraw1", "12345678"),
+            key("/dev/hidraw2", "ABCDEF01"),
+        ];
+        correlate(&hids, &[], &Keyring::default())
+    }
+
+    /// A fresh temp dir for a test's keys.json; removed by the caller.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "keyroost-resolve-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn work_labels(devs: &[Device]) -> HashMap<DeviceId, KeyLabel> {
+        [
+            (devs[0].id.clone(), KeyLabel::Present("Work".into())),
+            (devs[1].id.clone(), KeyLabel::Absent),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn learn_names_records_first_seen_and_counts() {
+        let dir = temp_dir("learn");
+        let path = dir.join("keys.json");
+        let mut devs = named_scan();
+        let labels = work_labels(&devs);
+        let got = learn_names(&mut devs, &Keyring::default(), &labels, Some(&path));
+        assert_eq!(
+            got,
+            Learned {
+                read: 2,
+                with_name: 1,
+                recorded: 1,
+                dropped: 0,
+                save_error: None,
+                unsaved: 0,
+                unrecordable: 0,
+            }
+        );
+        assert!(Keyring::load_from(&path).unwrap().holder("Work").is_some());
+        // Recorded, and selectable.
+        let work = devs.iter().find(|d| d.name.as_deref() == Some("Work"));
+        assert!(work.is_some_and(|d| d.naming.selectable));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn learn_names_never_saves_without_a_savable_keyring() {
+        // A keys.json that failed to load: rows are still named from the
+        // keys and work for this session, and nothing is saved.
+        let mut devs = named_scan();
+        let labels = work_labels(&devs);
+        let got = learn_names(&mut devs, &Keyring::default(), &labels, None);
+        assert_eq!((got.recorded, got.dropped), (0, 0));
+        assert_eq!(got.unsaved, 1);
+        let work = devs.iter().find(|d| d.name.as_deref() == Some("Work"));
+        assert!(work.is_some_and(|d| d.naming.selectable));
+    }
+
+    #[test]
+    fn a_name_that_cant_be_recorded_gets_one_warning_with_the_reason() {
+        let w = |l: Learned, dir: bool| unrecorded_names_warning(&l, dir);
+        let failed = Learned {
+            save_error: Some("disk full".into()),
+            ..Learned::default()
+        };
+        assert_eq!(
+            w(failed, true).as_deref(),
+            Some(
+                "this computer couldn't record names read from keys (disk full); \
+                 they work for this session only"
+            )
+        );
+        let no_dir = Learned {
+            unsaved: 1,
+            ..Learned::default()
+        };
+        assert!(w(no_dir.clone(), false)
+            .unwrap()
+            .contains("could not determine config dir"));
+        // With a config dir, nothing was saved because keys.json couldn't be
+        // loaded, which was already reported on its own.
+        assert_eq!(w(no_dir, true), None);
+        let serial_less = Learned {
+            unrecordable: 1,
+            ..Learned::default()
+        };
+        assert!(w(serial_less, true)
+            .unwrap()
+            .contains("a key reports no usable serial"));
+        assert_eq!(w(Learned::default(), false), None);
+    }
+
+    #[test]
+    fn a_name_read_before_a_forget_is_never_cached() {
+        let mut cache = LabelCache::new();
+        let key = (PathBuf::from("/dev/hidraw-t"), "12345678".to_string());
+        let now = std::time::Instant::now();
+        let before = label_generation();
+        forget_key_names();
+        assert_ne!(label_generation(), before);
+        // A read that started before the forget lands after it: dropped.
+        assert!(!cache_label(
+            &mut cache,
+            before,
+            before + 1,
+            key.clone(),
+            now,
+            KeyLabel::Absent
+        ));
+        assert!(cache.is_empty());
+        // A read with no forget in between is kept, replacing older ones.
+        assert!(cache_label(
+            &mut cache,
+            7,
+            7,
+            key.clone(),
+            now,
+            KeyLabel::Absent
+        ));
+        assert!(cache_label(
+            &mut cache,
+            7,
+            7,
+            key,
+            now,
+            KeyLabel::Present("Work".into())
+        ));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].2, KeyLabel::Present("Work".into()));
+    }
+
+    #[test]
+    fn learn_names_reports_a_failed_save_and_never_overwrites_a_damaged_file() {
+        let dir = temp_dir("damaged");
+        let path = dir.join("keys.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let mut devs = named_scan();
+        let labels = work_labels(&devs);
+        let got = learn_names(&mut devs, &Keyring::default(), &labels, Some(&path));
+        assert!(got.save_error.is_some());
+        assert_eq!(got.recorded, 0);
+        // The sighting still works for this session.
+        let work = devs.iter().find(|d| d.name.as_deref() == Some("Work"));
+        assert!(work.is_some_and(|d| d.naming.selectable));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_seen_saves_keep_both_records() {
+        // Two processes load keys.json, each sees a different key's name,
+        // and they save one after the other: neither record is lost.
+        let dir = temp_dir("concurrent");
+        let path = dir.join("keys.json");
+        let mut seed = Keyring::default();
+        seed.set_name(
+            "00000000",
+            "Other",
+            keyroost_keyring::NameStore::Computer,
+            keyroost_keyring::RecordMeta::default(),
+        )
+        .unwrap();
+        seed.save_to(&path).unwrap();
+        let stale_one = Keyring::load_from(&path).unwrap();
+        let stale_two = Keyring::load_from(&path).unwrap();
+
+        let mut one = named_scan();
+        let l1: HashMap<DeviceId, KeyLabel> =
+            [(one[0].id.clone(), KeyLabel::Present("Work".into()))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            learn_names(&mut one, &stale_one, &l1, Some(&path)).recorded,
+            1
+        );
+
+        let mut two = named_scan();
+        let l2: HashMap<DeviceId, KeyLabel> =
+            [(two[1].id.clone(), KeyLabel::Present("Home".into()))]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            learn_names(&mut two, &stale_two, &l2, Some(&path)).recorded,
+            1
+        );
+
+        let ring = Keyring::load_from(&path).unwrap();
+        for n in ["Other", "Work", "Home"] {
+            assert!(ring.holder(n).is_some(), "{n} lost");
+        }
+        // A second process seeing the same name on another key after the
+        // first recorded it: never recorded, shown with the tail.
+        let mut three = named_scan();
+        let l3: HashMap<DeviceId, KeyLabel> =
+            [(three[1].id.clone(), KeyLabel::Present("Work".into()))]
+                .into_iter()
+                .collect();
+        let got = learn_names(&mut three, &stale_one, &l3, Some(&path));
+        assert_eq!(got.recorded, 0);
+        let b = three.iter().find(|d| d.serial == "ABCDEF01").unwrap();
+        assert_eq!(b.name.as_deref(), Some("Work (EF01)"));
+        assert!(!b.naming.selectable);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
