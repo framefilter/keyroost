@@ -82,6 +82,11 @@ fn large_blob_write_token(
     Ok(token)
 }
 
+/// Borrow owned serials for the `keyroost_resolve` naming helpers.
+fn serial_refs(serials: &[String]) -> Vec<&str> {
+    serials.iter().map(String::as_str).collect()
+}
+
 /// The naming dialog's message for a key with no storage for its own name.
 const KEY_NAME_NO_STORAGE: &str =
     "This key can't store a name on itself; save the name on this computer.";
@@ -100,10 +105,48 @@ fn key_name_refusal(e: keyroost_ctap::device_label::LabelError, used: u64) -> St
             size.saturating_sub(used),
             max.saturating_sub(used)
         ),
-        LabelError::Changed => "The key's storage changed while saving; nothing was \
-                                changed. Try again."
-            .into(),
         other => format!("Couldn't save the name on the key: {other}"),
+    }
+}
+
+/// The naming dialog's message when the key's name changed after the dialog
+/// opened: retrying the same dialog can't succeed, so it closes and rescans.
+const KEY_NAME_STALE: &str = "The key's name changed since the naming field opened; nothing \
+                              was changed. Open Rename again to try.";
+
+/// What an on-key name save did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyNameWrite {
+    Written,
+    /// The key already carried what was asked; nothing was written.
+    AlreadySo,
+}
+
+/// Why an on-key name save didn't happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyNameFailure {
+    /// The name or array on the key changed since the dialog opened.
+    Stale,
+    Failed(String),
+}
+
+impl From<String> for KeyNameFailure {
+    fn from(e: String) -> Self {
+        KeyNameFailure::Failed(e)
+    }
+}
+
+impl From<&str> for KeyNameFailure {
+    fn from(e: &str) -> Self {
+        KeyNameFailure::Failed(e.to_string())
+    }
+}
+
+/// [`key_name_refusal`], with a changed array as [`KeyNameFailure::Stale`].
+fn key_name_failure(e: keyroost_ctap::device_label::LabelError, used: u64) -> KeyNameFailure {
+    match e {
+        keyroost_ctap::device_label::LabelError::Changed => KeyNameFailure::Stale,
+        e => KeyNameFailure::Failed(key_name_refusal(e, used)),
     }
 }
 
@@ -119,7 +162,7 @@ fn write_key_name(
     name: Option<&str>,
     expected: Option<&str>,
     pin: &str,
-) -> Result<(), String> {
+) -> Result<KeyNameWrite, KeyNameFailure> {
     use keyroost_ctap::device_label::{
         apply_label_plan, plan_label_change, random_nonce, read_label, DeviceLabel, LabelState,
         WRITER_KEYROOST,
@@ -139,7 +182,7 @@ fn write_key_name(
         writer: Some(WRITER_KEYROOST.to_string()),
     });
     let plan = plan_label_change(&current, &info, new.as_ref(), random_nonce())
-        .map_err(|e| key_name_refusal(e, used))?;
+        .map_err(|e| key_name_failure(e, used))?;
     // An unreadable name on the key counts as none: only a readable one
     // other than the name the dialog showed is a change to refuse.
     let previous = plan
@@ -148,13 +191,10 @@ fn write_key_name(
         .map(|l| l.label.as_str())
         .filter(|l| keyroost_keyring::validate_name(l).is_ok());
     if previous != expected {
-        return Err(key_name_refusal(
-            keyroost_ctap::device_label::LabelError::Changed,
-            used,
-        ));
+        return Err(KeyNameFailure::Stale);
     }
     if previous == name {
-        return Ok(()); // already so; nothing to write
+        return Ok(KeyNameWrite::AlreadySo); // nothing to write
     }
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
@@ -164,7 +204,7 @@ fn write_key_name(
     )
     .map_err(|e| format!("Couldn't unlock the key: {e}"))?;
     keyroost_resolve::with_key_names_forgotten(|| apply_label_plan(&mut dev, &info, &token, &plan))
-        .map_err(|e| key_name_refusal(e, used))?;
+        .map_err(|e| key_name_failure(e, used))?;
     let now = read_label(&mut dev, &info).map_err(|e| e.to_string())?;
     let kept = match (&now, name) {
         (LabelState::Present(l), Some(n)) => l.label == n,
@@ -172,25 +212,41 @@ fn write_key_name(
         _ => false,
     };
     if kept {
-        Ok(())
+        Ok(KeyNameWrite::Written)
     } else {
-        Err("The key didn't keep the change; try again.".into())
+        Err("The key didn't keep the change; try again."
+            .to_string()
+            .into())
     }
 }
 
 /// Record on this computer that the key with `serials` carries `name` (or,
-/// for `None`, drop every record of it), after an on-key save.
+/// for `None`, drop every record of it), after an on-key save. When the key
+/// already carried the name (`written` false), keys.json is touched only if
+/// that record is missing, as `keyroostctl name set` leaves it alone.
 fn record_key_name(
     serials: &[String],
     name: Option<&str>,
+    written: bool,
     meta: keyroost_keyring::RecordMeta,
 ) -> Result<(), String> {
     let mut k = keyroost_keyring::Keyring::load_default().map_err(|e| e.to_string())?;
+    if let (false, Some(n)) = (written, name) {
+        if device::has_key_record(&k, &serial_refs(serials), n) {
+            return Ok(());
+        }
+    }
     match name {
-        Some(n) => device::set_key_name(&mut k, serials, n, keyroost_keyring::NameStore::Key, meta)
-            .map_err(|e| e.to_string())?,
+        Some(n) => keyroost_resolve::set_key_name(
+            &mut k,
+            &serial_refs(serials),
+            n,
+            keyroost_keyring::NameStore::Key,
+            meta,
+        )
+        .map_err(|e| e.to_string())?,
         None => {
-            device::clear_key_names(&mut k, serials);
+            keyroost_resolve::clear_key_names(&mut k, &serial_refs(serials));
         }
     }
     k.save_default().map(|_| ()).map_err(|e| e.to_string())
@@ -527,7 +583,7 @@ struct RenameTarget {
     /// The row the field was opened on; completions of an on-key save act on
     /// the dialog only while it is still open for this row.
     device_id: DeviceId,
-    /// Every serial the key may be recorded under ([`device::row_serials`]),
+    /// Every serial the key may be recorded under ([`keyroost_resolve::row_serials`]),
     /// its own first (the device serial, not the reader-name serial). A
     /// device with no serial can't be named.
     serials: Vec<String>,
@@ -9758,7 +9814,10 @@ impl App {
         self.rename_target = Some(RenameTarget {
             name_at_open: dev.name.clone(),
             device_id: dev.id.clone(),
-            serials: device::row_serials(dev),
+            serials: keyroost_resolve::row_serials(dev)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             hid_path: dev.hid_path.clone(),
             naming: dev.naming.clone(),
             lacks_storage: device::lacks_key_storage(dev),
@@ -9842,7 +9901,13 @@ impl App {
                 }
                 if let Some(n) = &name {
                     match keyroost_keyring::Keyring::load_default() {
-                        Ok(k) if device::name_held_elsewhere(&k, n, &target.serials) => {
+                        Ok(k)
+                            if keyroost_resolve::name_held_elsewhere(
+                                &k,
+                                n,
+                                &serial_refs(&target.serials),
+                            ) =>
+                        {
                             self.rename_failed(format!(
                                 "Another key on this computer already has the name \"{n}\". \
                                  Pick another name, or clear that key's name first."
@@ -9928,8 +9993,14 @@ impl App {
             "Removing the name from the key\u{2026}"
         };
         let queued = self.spawn_job(label, move || {
-            let result = write_key_name(&path, name.as_deref(), expected.as_deref(), &pin)
-                .map(|()| record_key_name(&serials, name.as_deref(), meta).err());
+            let result =
+                write_key_name(&path, name.as_deref(), expected.as_deref(), &pin).map(|w| {
+                    let written = w == KeyNameWrite::Written;
+                    (
+                        w,
+                        record_key_name(&serials, name.as_deref(), written, meta).err(),
+                    )
+                });
             drop(pin);
             Box::new(move |app: &mut App| {
                 let open_here = completion_still_valid(
@@ -9937,17 +10008,25 @@ impl App {
                     app.rename_target.as_ref().map(|t| &t.device_id),
                 );
                 match result {
-                    Ok(record_error) => {
-                        let what = if name.is_some() {
-                            "name saved on the key"
+                    Ok((written, record_error)) => {
+                        if written == KeyNameWrite::AlreadySo {
+                            app.log_global(
+                                Severity::Info,
+                                LogKind::User,
+                                format!("{new_display}: already so on the key; nothing changed"),
+                            );
                         } else {
-                            "name removed from the key"
-                        };
-                        app.log_global(
-                            Severity::Ok,
-                            LogKind::User,
-                            format!("{new_display}: {what}, was {old_display}"),
-                        );
+                            let what = if name.is_some() {
+                                "name saved on the key"
+                            } else {
+                                "name removed from the key"
+                            };
+                            app.log_global(
+                                Severity::Ok,
+                                LogKind::User,
+                                format!("{new_display}: {what}, was {old_display}"),
+                            );
+                        }
                         if let Some(e) = record_error {
                             app.log_global(
                                 Severity::Warn,
@@ -9968,7 +10047,21 @@ impl App {
                         }
                         app.refresh_devices();
                     }
-                    Err(e) => {
+                    // Retrying the same dialog can't succeed: close it and
+                    // rescan, so a reopened field shows the key's current name.
+                    Err(KeyNameFailure::Stale) => {
+                        app.log_global(
+                            Severity::Warn,
+                            LogKind::User,
+                            format!("{old_display}: {KEY_NAME_STALE}"),
+                        );
+                        if open_here {
+                            app.close_rename();
+                        }
+                        keyroost_resolve::forget_key_names();
+                        app.refresh_devices();
+                    }
+                    Err(KeyNameFailure::Failed(e)) => {
                         if open_here {
                             app.rename_failed(e);
                         } else {
@@ -10016,10 +10109,11 @@ impl App {
         match &name {
             // Clearing drops every record of the key.
             None => {
-                device::clear_key_names(&mut keyring, &target.serials);
+                keyroost_resolve::clear_key_names(&mut keyring, &serial_refs(&target.serials));
             }
             Some(n) => {
-                if device::name_held_elsewhere(&keyring, n, &target.serials) {
+                if keyroost_resolve::name_held_elsewhere(&keyring, n, &serial_refs(&target.serials))
+                {
                     self.rename_failed(format!(
                         "Another key on this computer already has the name \"{n}\". \
                          Pick another name, or clear that key's name first."
@@ -10030,9 +10124,9 @@ impl App {
                     source: keyroost_keyring::IdSource::default(),
                     vendor: Some(target.vendor.to_ascii_lowercase()),
                 };
-                if let Err(e) = device::set_key_name(
+                if let Err(e) = keyroost_resolve::set_key_name(
                     &mut keyring,
-                    &target.serials,
+                    &serial_refs(&target.serials),
                     n,
                     keyroost_keyring::NameStore::Computer,
                     meta,
@@ -12762,7 +12856,6 @@ impl App {
         });
     }
 
-    /// Device hero strip at the top of a key's pane.
     /// Act on the hero's offer to write the lost name `name` back onto `dev`.
     /// Writing opens the naming field on the key with the name filled in
     /// (and saves at once when the key's FIDO session is unlocked; otherwise
@@ -12850,8 +12943,9 @@ impl App {
     /// goes (and the choice, when the key can hold its own name), the PIN
     /// field for an on-key save, the last error, and the replace/remove
     /// question. `what` is "key" or "token". Returns (confirm, cancel the
-    /// question).
-    fn rename_details(&mut self, ui: &mut egui::Ui, p: &Palette, what: &str) -> (bool, bool) {
+    /// question, Enter pressed in the PIN field — a save like the name
+    /// field's Enter).
+    fn rename_details(&mut self, ui: &mut egui::Ui, p: &Palette, what: &str) -> (bool, bool, bool) {
         let note = |ui: &mut egui::Ui, text: &str| {
             ui.label(
                 egui::RichText::new(text)
@@ -12867,7 +12961,7 @@ impl App {
         let on_key = self.rename_goes_on_key();
         let blocked = self.rename_blocked();
         let Some(t) = self.rename_target.as_mut() else {
-            return (false, false);
+            return (false, false, false);
         };
         ui.add_space(3.0);
         if t.choices.contains(&device::NameStoreChoice::Key) {
@@ -12902,9 +12996,11 @@ impl App {
             ui.add_space(3.0);
             ui.colored_label(p.err, device::NAME_IS_ON_THE_KEY);
         }
+        let mut submit = false;
         if on_key && needs_pin && !t.saving {
             ui.add_space(4.0);
             let pin = &mut self.rename_pin;
+            let held = t.confirm.is_some();
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Key PIN")
@@ -12917,10 +13013,12 @@ impl App {
                         .desired_width(160.0),
                 );
                 guard_secret_field(ui.ctx(), &resp);
+                submit =
+                    !held && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             });
         }
         let Some(t) = self.rename_target.as_mut() else {
-            return (false, false);
+            return (false, false, false);
         };
         if let Some(e) = &t.error {
             ui.add_space(3.0);
@@ -12949,7 +13047,7 @@ impl App {
                     });
                 });
         }
-        (confirm, cancel)
+        (confirm, cancel, submit)
     }
 
     /// Apply what [`Self::rename_details`] returned.
@@ -12963,11 +13061,12 @@ impl App {
         }
     }
 
+    /// Device hero strip at the top of a key's pane.
     fn device_hero(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
         let mut open_rename = false;
         let mut do_save = false;
         let mut do_cancel = false;
-        let (mut do_confirm, mut do_unconfirm) = (false, false);
+        let (mut do_confirm, mut do_unconfirm, mut pin_enter) = (false, false, false);
         let mut write_back: Option<WriteBack> = None;
         let offer = device::write_back_offer(dev, self.write_back_dismissed.contains(&dev.id))
             .filter(|_| self.rename_target.is_none())
@@ -13021,7 +13120,7 @@ impl App {
                     }
                 });
                 if self.rename_target.is_some() {
-                    (do_confirm, do_unconfirm) = self.rename_details(ui, p, "key");
+                    (do_confirm, do_unconfirm, pin_enter) = self.rename_details(ui, p, "key");
                 }
                 ui.add_space(2.0);
                 let serial = if dev.serial.is_empty() {
@@ -13081,7 +13180,8 @@ impl App {
             });
         });
         self.apply_rename_question(do_confirm, do_unconfirm);
-        self.apply_rename_actions(dev, open_rename, do_cancel, do_save);
+        let save = (do_save || pin_enter) && !self.rename_blocked();
+        self.apply_rename_actions(dev, open_rename, do_cancel, save);
         if let (Some(action), Some(n)) = (write_back, offer) {
             self.apply_write_back(dev, action, &n);
         }
@@ -24491,6 +24591,25 @@ mod tests {
         app.rename_input = "Lab".into();
         assert!(app.rename_goes_on_key());
         assert!(app.rename_needs_pin());
+    }
+
+    #[test]
+    fn a_changed_key_name_is_stale_not_a_retry() {
+        use keyroost_ctap::device_label::LabelError;
+        // A changed array can't succeed on retry from the same dialog.
+        assert_eq!(
+            key_name_failure(LabelError::Changed, 0),
+            KeyNameFailure::Stale
+        );
+        assert!(!KEY_NAME_STALE.contains("Try again"));
+        match key_name_failure(LabelError::NoPin, 0) {
+            KeyNameFailure::Failed(m) => assert!(m.contains("Set a PIN"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            key_name_failure(LabelError::Unsupported, 0),
+            KeyNameFailure::Failed(KEY_NAME_NO_STORAGE.into())
+        );
     }
 
     #[test]

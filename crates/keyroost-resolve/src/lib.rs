@@ -34,7 +34,8 @@ pub use identity::{
     IdentityReader, IDENTITY_READERS,
 };
 pub use names::{
-    apply_names, apply_updates, serial_tail, KeyLabel, NameSource, NameUpdate, Naming,
+    apply_names, apply_updates, clear_key_names, name_held_elsewhere, row_serials, serial_tail,
+    set_key_name, KeyLabel, NameSource, NameUpdate, Naming,
 };
 pub use select::{
     device_value, endpoint, list_number, list_order, parse_device_spec, resolve_target, row_label,

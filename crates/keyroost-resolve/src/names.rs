@@ -163,12 +163,8 @@ pub fn apply_names(
         };
         let serial = d.serial.clone();
         let canon = canonical_serial(&serial);
-        // The serials this row may be known by: its own, then its FIDO HID
-        // node's when that differs (a merged row named under the HID serial).
-        let known: Vec<&str> = std::iter::once(serial.as_str())
-            .chain(d.hid_serial.as_deref())
-            .filter(|s| !canonical_serial(s).is_empty())
-            .collect();
+        let hid_serial = d.hid_serial.clone();
+        let known = known_serials(&serial, hid_serial.as_deref());
         let mut shown = None;
         if let KeyLabel::Present(l) = &on_key {
             naming.source = Some(NameSource::Key);
@@ -245,6 +241,67 @@ pub fn apply_names(
         d.naming = naming;
     }
     updates
+}
+
+/// The serials a row may be known by: its own, then its FIDO HID node's
+/// when that differs (a merged row named under the HID serial). Unusable
+/// (empty) serials are left out.
+fn known_serials<'a>(serial: &'a str, hid_serial: Option<&'a str>) -> Vec<&'a str> {
+    std::iter::once(serial)
+        .chain(hid_serial)
+        .filter(|s| !canonical_serial(s).is_empty())
+        .collect()
+}
+
+/// Every serial `d` may be recorded under: its own, then its FIDO HID
+/// node's when that differs — the serials the naming pass looks names up by.
+pub fn row_serials(d: &Device) -> Vec<&str> {
+    known_serials(&d.serial, d.hid_serial.as_deref())
+}
+
+/// Whether a record of another key (or one that matches no key) holds
+/// `name`; `serials` are this key's ([`row_serials`]).
+pub fn name_held_elsewhere(keyring: &Keyring, name: &str, serials: &[&str]) -> bool {
+    let Some(h) = keyring.holder(name) else {
+        return false;
+    };
+    let ours = h.fingerprint.is_some()
+        && serials
+            .iter()
+            .any(|s| keyring.fingerprint_of(s) == h.fingerprint);
+    !ours
+}
+
+/// [`Keyring::set_name`] for the key with `serials` (its own first, as
+/// [`row_serials`] gives them), first dropping what it would replace under
+/// its other serial (a record kept under the HID serial from when the row
+/// wasn't merged), so a rename never leaves a second record.
+pub fn set_key_name(
+    keyring: &mut Keyring,
+    serials: &[&str],
+    name: &str,
+    store: NameStore,
+    meta: keyroost_keyring::RecordMeta,
+) -> Result<(), keyroost_keyring::KeyringError> {
+    let Some((primary, rest)) = serials.split_first() else {
+        return Err(keyroost_keyring::KeyringError::NoSerial);
+    };
+    let ours = keyring.fingerprint_of(primary);
+    let others: Vec<_> = rest
+        .iter()
+        .filter_map(|s| keyring.fingerprint_of(s))
+        .filter(|fp| Some(fp) != ours.as_ref())
+        .collect();
+    keyring.keys.retain(|r| {
+        let other = r.fingerprint.as_ref().is_some_and(|fp| others.contains(fp));
+        !(other && (store == NameStore::Key || r.stored == NameStore::Computer || r.name == name))
+    });
+    keyring.set_name(primary, name, store, meta)
+}
+
+/// Remove every record of the key with `serials`; returns how many.
+pub fn clear_key_names(keyring: &mut Keyring, serials: &[&str]) -> usize {
+    serials.iter().map(|s| keyring.clear_key(s).len()).sum()
 }
 
 /// Apply the pass's updates to `keyring`. Returns how many first-seen
@@ -663,5 +720,88 @@ mod tests {
         apply_names(&mut devs, &ring, &HashMap::new());
         assert_eq!(devs[0].name, None);
         assert_eq!(devs[0].naming, Naming::default());
+    }
+
+    #[test]
+    fn row_serials_include_a_distinct_hid_serial() {
+        let mut d = key(A);
+        assert_eq!(row_serials(&d), vec![A]);
+        d.hid_serial = Some(B.into());
+        assert_eq!(row_serials(&d), vec![A, B]);
+        d.serial = String::new();
+        assert_eq!(row_serials(&d), vec![B]);
+    }
+
+    #[test]
+    fn a_name_held_by_another_key_is_held_elsewhere_ours_is_not() {
+        let mut k = Keyring::default();
+        k.set_name(A, "Work", NameStore::Computer, RecordMeta::default())
+            .unwrap();
+        assert!(name_held_elsewhere(&k, "Work", &[B]));
+        assert!(!name_held_elsewhere(&k, "Work", &[A]));
+        assert!(!name_held_elsewhere(&k, "Home", &[B]));
+        // A record that can't be matched to any key still holds its name.
+        k.keys[0].fingerprint = None;
+        assert!(name_held_elsewhere(&k, "Work", &[A]));
+    }
+
+    #[test]
+    fn a_rename_replaces_a_record_kept_under_the_other_serial() {
+        let serials = [A, B];
+        // Named once under the HID serial (an unmerged row back then).
+        let mut k = Keyring::default();
+        k.set_name(B, "Old", NameStore::Computer, RecordMeta::default())
+            .unwrap();
+        set_key_name(
+            &mut k,
+            &serials,
+            "New",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        let names: Vec<&str> = k.keys.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["New"]);
+        // Moving the old name onto the key is not a clash with itself.
+        let mut k = Keyring::default();
+        k.set_name(B, "Old", NameStore::Computer, RecordMeta::default())
+            .unwrap();
+        set_key_name(
+            &mut k,
+            &serials,
+            "Old",
+            NameStore::Key,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(k.keys.len(), 1);
+        assert_eq!(k.keys[0].stored, NameStore::Key);
+        // Another key's records are untouched.
+        k.set_name(
+            "99999999",
+            "Other",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        set_key_name(
+            &mut k,
+            &serials,
+            "Newer",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        assert!(k.holder("Other").is_some());
+        // Clearing drops every record of the key, and only those.
+        assert_eq!(
+            clear_key_names(&mut k, &serials),
+            2,
+            "\"Old\" on the key, \"Newer\" here"
+        );
+        assert_eq!(k.keys.len(), 1);
+        assert!(
+            set_key_name(&mut k, &[], "X", NameStore::Computer, RecordMeta::default()).is_err()
+        );
     }
 }

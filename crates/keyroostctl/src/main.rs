@@ -11464,15 +11464,6 @@ fn plan_name_set(
     }
 }
 
-/// Every serial `d` may be recorded under: its own, then its FIDO HID
-/// node's when that differs (the same set the naming pass looks names up by).
-fn row_serials(d: &keyroost_resolve::Device) -> Vec<&str> {
-    std::iter::once(d.serial.as_str())
-        .chain(d.hid_serial.as_deref())
-        .filter(|s| !keyroost_keyring::canonical_serial(s).is_empty())
-        .collect()
-}
-
 /// `'X'` for a copy-pasteable command, quoted even when plain so a hint
 /// reads the same for every name.
 fn quoted_name(name: &str) -> String {
@@ -11492,14 +11483,7 @@ fn refuse_name_held_elsewhere(
     name: &str,
     serials: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(h) = keyring.holder(name) else {
-        return Ok(());
-    };
-    let ours = h.fingerprint.is_some()
-        && serials
-            .iter()
-            .any(|s| keyring.fingerprint_of(s) == h.fingerprint);
-    if ours {
+    if !keyroost_resolve::name_held_elsewhere(keyring, name, serials) {
         return Ok(());
     }
     let q = quoted_name(name);
@@ -11626,7 +11610,7 @@ fn name_set(
     let v = key_hint_value(&dev);
     let place = plan_name_set(dev.naming.source, store).map_err(|r| r.message(&v))?;
     let keyring = Keyring::load_default()?;
-    refuse_name_held_elsewhere(&keyring, name, &row_serials(&dev))?;
+    refuse_name_held_elsewhere(&keyring, name, &keyroost_resolve::row_serials(&dev))?;
     let shown = sanitize_terminal(name);
     let unchanged = dev.naming.plain.as_deref() == Some(name)
         && dev.naming.source
@@ -11658,7 +11642,13 @@ fn name_set(
             // Re-read keys.json: the re-check after the PIN may have saved
             // what a scan learned meanwhile.
             let saved = Keyring::load_default().and_then(|mut k| {
-                set_key_name(&mut k, &dev, name, keyroost_keyring::NameStore::Key, meta)?;
+                keyroost_resolve::set_key_name(
+                    &mut k,
+                    &keyroost_resolve::row_serials(&dev),
+                    name,
+                    keyroost_keyring::NameStore::Key,
+                    meta,
+                )?;
                 k.save_default()
             });
             if let Err(e) = saved {
@@ -11674,30 +11664,6 @@ fn name_set(
     }
 }
 
-/// [`Keyring::set_name`] for `dev`, first dropping what it would replace
-/// under the row's other serial (a record kept under the HID serial from
-/// when the row wasn't merged), so a rename never leaves a second record.
-fn set_key_name(
-    keyring: &mut Keyring,
-    dev: &keyroost_resolve::Device,
-    name: &str,
-    store: keyroost_keyring::NameStore,
-    meta: keyroost_keyring::RecordMeta,
-) -> Result<(), keyroost_keyring::KeyringError> {
-    use keyroost_keyring::NameStore;
-    let ours = keyring.fingerprint_of(&dev.serial);
-    let others: Vec<_> = row_serials(dev)
-        .into_iter()
-        .filter_map(|s| keyring.fingerprint_of(s))
-        .filter(|fp| Some(fp) != ours.as_ref())
-        .collect();
-    keyring.keys.retain(|r| {
-        let other = r.fingerprint.as_ref().is_some_and(|fp| others.contains(fp));
-        !(other && (store == NameStore::Key || r.stored == NameStore::Computer || r.name == name))
-    });
-    keyring.set_name(&dev.serial, name, store, meta)
-}
-
 /// `name set` on this computer: record (or rename) the key's computer name.
 fn name_set_local(
     mut keyring: Keyring,
@@ -11705,9 +11671,9 @@ fn name_set_local(
     name: &str,
     meta: keyroost_keyring::RecordMeta,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    set_key_name(
+    keyroost_resolve::set_key_name(
         &mut keyring,
-        dev,
+        &keyroost_resolve::row_serials(dev),
         name,
         keyroost_keyring::NameStore::Computer,
         meta,
@@ -11794,7 +11760,7 @@ fn name_clear_by_name(
     if rec.stored == keyroost_keyring::NameStore::Key {
         let here = rec.fingerprint.as_ref().and_then(|fp| {
             devices.iter().find(|d| {
-                row_serials(d)
+                keyroost_resolve::row_serials(d)
                     .iter()
                     .any(|s| keyring.fingerprint_of(s).as_ref() == Some(fp))
             })
@@ -11841,10 +11807,8 @@ fn name_clear_selected(
         cleared_on_key = true;
     }
     let mut keyring = Keyring::load_default()?;
-    let mut gone = 0;
-    for s in row_serials(&dev) {
-        gone += keyring.clear_key(s).len();
-    }
+    let gone =
+        keyroost_resolve::clear_key_names(&mut keyring, &keyroost_resolve::row_serials(&dev));
     let note = unread_name_note(&dev);
     if gone == 0 && !cleared_on_key && note.is_none() {
         return Err("this key has no name on this computer or on the key".into());
@@ -11895,7 +11859,7 @@ fn name_list_rows(keyring: &Keyring, devices: &[keyroost_resolve::Device]) -> Ve
     use keyroost_resolve::{KeyLabel, NameSource};
     let numbered = overview::numbered(devices);
     let is_of = |d: &keyroost_resolve::Device, fp: &keyroost_keyring::Fingerprint| {
-        row_serials(d)
+        keyroost_resolve::row_serials(d)
             .iter()
             .any(|s| keyring.fingerprint_of(s).as_ref() == Some(fp))
     };
@@ -16369,62 +16333,6 @@ mod cli_tests {
         // A record that can't be matched to any key still holds its name.
         k.keys[0].fingerprint = None;
         assert!(refuse_name_held_elsewhere(&k, "Work", &["12345678"]).is_err());
-    }
-
-    #[test]
-    fn a_rename_replaces_a_record_kept_under_the_other_serial() {
-        use keyroost_keyring::{NameStore, RecordMeta};
-        let mut dev = test_fido_row();
-        dev.serial = "12345678".into();
-        dev.hid_serial = Some("ABCDEF01".into());
-        // Named once under the HID serial (an unmerged row back then).
-        let mut k = Keyring::default();
-        k.set_name(
-            "ABCDEF01",
-            "Old",
-            NameStore::Computer,
-            RecordMeta::default(),
-        )
-        .unwrap();
-        set_key_name(
-            &mut k,
-            &dev,
-            "New",
-            NameStore::Computer,
-            RecordMeta::default(),
-        )
-        .unwrap();
-        let names: Vec<&str> = k.keys.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["New"]);
-        // Moving the old name onto the key is not a clash with itself.
-        let mut k = Keyring::default();
-        k.set_name(
-            "ABCDEF01",
-            "Old",
-            NameStore::Computer,
-            RecordMeta::default(),
-        )
-        .unwrap();
-        set_key_name(&mut k, &dev, "Old", NameStore::Key, RecordMeta::default()).unwrap();
-        assert_eq!(k.keys.len(), 1);
-        assert_eq!(k.keys[0].stored, NameStore::Key);
-        // Another key's records are untouched.
-        k.set_name(
-            "99999999",
-            "Other",
-            NameStore::Computer,
-            RecordMeta::default(),
-        )
-        .unwrap();
-        set_key_name(
-            &mut k,
-            &dev,
-            "Newer",
-            NameStore::Computer,
-            RecordMeta::default(),
-        )
-        .unwrap();
-        assert!(k.holder("Other").is_some());
     }
 
     #[test]
