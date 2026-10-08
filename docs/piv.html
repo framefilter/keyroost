@@ -194,15 +194,17 @@ keyroostctl piv pin change                             # asks for the current PI
       <code>--generate-key</code> ask the same way when the slot already holds a key or
       certificate, and <code>retries set</code> always asks: it also resets the PIN and PUK
       to their factory defaults (a Yubico extension).</p>
-<pre><code>keyroostctl piv cert delete --slot 9a                 # asks for the management key, then y/N
+<pre><code>keyroostctl piv cert delete --slot 9a                 # asks y/N, then for the management key
 keyroostctl piv key delete  --slot 9a                 # Yubico extension
 keyroostctl piv key delete  --slot 9a --mgmt-key env:PIV_MGMT --yes   # in a script</code></pre>
     <span id="move-key"></span>
     <p><strong>Moving a key between slots.</strong> <code>key move</code> relocates a slot's
       private key without exporting it — the Yubico MOVE KEY instruction: YubiKey firmware
       5.7 or newer, or another card that implements it. It is <em>non-destructive</em>, so it
-      doesn't ask first: keyroost refuses an occupied destination rather than overwriting it
-      (delete that slot's key first, or pick an empty slot), refuses a same-slot move, and the
+      doesn't ask first: keyroost refuses when the card reports that the destination slot
+      already holds a key (delete that slot's key first, or pick an empty slot). When keyroost
+      can't tell whether the destination holds a key, it says so and sends the move, and the
+      card decides. It also refuses a same-slot move, and the
       source slot's X.509 certificate object stays where it is (move the certificate
       separately with <code>cert export</code> + <code>cert import</code> if you want it to
       follow). Both the
@@ -227,7 +229,7 @@ keyroostctl piv key move --from 82 --to 9d   # bring it back</code></pre>
       run is fully reproducible and pulls in no randomness. The desktop app offers the same
       thing as <strong>Test…</strong> in the slot pane, just below Delete; the button is
       live only when the slot holds a certificate with a key type keyroost can test.</p>
-<pre><code>keyroostctl piv test --slot 9a                 # asks for the PIN
+<pre><code>keyroostctl piv test --slot 9a --pin env:PIV_PIN  # never asks: --pin names the PIN source
 keyroostctl piv test --slot 9e                 # PIN policy "never": no PIN needed
 keyroostctl --json piv test --slot 9c --pin env:PIV_PIN</code></pre>
     <p class="kr-muted">The command prints one line per operation —

@@ -113,8 +113,8 @@
           a slot in use. A script, or a command whose PIN, seed or
           management key is piped in on stdin, must add <code>--yes</code>
           (<code>-y</code>), or the command refuses and changes nothing.
-          <code>piv key move</code> still doesn't ask: it refuses a
-          destination slot that already holds a key.</td></tr>
+          <code>piv key move</code> still doesn't ask: it refuses when the
+          card reports that the destination slot already holds a key.</td></tr>
       <tr><td>Commands that already took <code>--yes</code> refused without
           it, even in a terminal</td>
         <td>In a terminal they ask y/N instead (the hidden <code>molto
@@ -166,9 +166,6 @@
           <code>name delete</code>, <code>completions</code>,
           <code>manpage</code> and <code>molto import --file …
           --dry-run</code>. Remove it.</td></tr>
-      <tr><td><code>fido ssh-cert extract --force</code></td>
-        <td><code>fido ssh extract --overwrite</code>. The old flag is
-          gone.</td></tr>
       <tr><td><code>completions &lt;shell&gt;</code> printed a full static
           script</td>
         <td>Prints a short script that calls back into
@@ -582,8 +579,6 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
           <code>prog seed</code>); a new Molto2 customer key is hex unless
           <code>--encoding ascii</code>. The current customer key uses
           <code>--customer-key-encoding</code>.</td></tr>
-      <tr><td><code>molto customer-key</code> ran without asking</td>
-        <td>It asks first; a script passes <code>--yes</code>.</td></tr>
       <tr><td>An existing output file was replaced without asking
           (<code>fido ssh-cert extract</code> refused it unless
           <code>--force</code>)</td>

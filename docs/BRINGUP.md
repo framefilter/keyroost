@@ -282,7 +282,7 @@ ssh-keygen -t ecdsa-sk -O resident -O application=ssh:moltotest \
 # Read back — confirm it appears, copy the FULL id= value.
 keyroostctl fido credential list --device N
 
-# Destructive: delete by full credentialId. Asks for the PIN, then y/N.
+# Destructive: delete by full credentialId. Asks y/N, then for the PIN.
 keyroostctl fido credential delete --device N --id <full hex from id=>
 
 # Confirm empty.

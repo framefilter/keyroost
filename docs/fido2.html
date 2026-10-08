@@ -154,7 +154,7 @@
 <pre><code>keyroostctl fido info
 keyroostctl fido pin retries
 keyroostctl fido credential list               # asks for the PIN (hidden)
-keyroostctl fido credential delete --id &lt;hex&gt;  # asks for the PIN, then y/N
+keyroostctl fido credential delete --id &lt;hex&gt;  # asks y/N, then for the PIN
 keyroostctl fido credential list --pin env:KR_PIN   # in a script: PIN from a variable
 keyroostctl fido reset                          # asks y/N, then waits for a replug and a touch</code></pre>
     <p>Deleting a credential or fingerprint and resetting name the key and ask

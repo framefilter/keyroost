@@ -117,7 +117,7 @@
         Ed25519.</p>
     </div>
 <pre><code>keyroostctl openpgp info --device my-yubikey
-keyroostctl openpgp key generate --slot sign --algorithm ed25519 --device my-yubikey   # asks for the admin PIN, then y/N
+keyroostctl openpgp key generate --slot sign --algorithm ed25519 --device my-yubikey   # asks y/N, then for the admin PIN
 keyroostctl openpgp sign --in msg.txt --device my-yubikey          # asks for the PIN
 keyroostctl openpgp authenticate --in chal.bin --device my-yubikey
 keyroostctl openpgp pin change --device my-yubikey                 # the user PIN
