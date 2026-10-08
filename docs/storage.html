@@ -96,6 +96,11 @@
       clear.</p>
     <p><strong>Edit a note.</strong> keyroost's own notes have an <em>Edit</em> button that
       replaces the text in place. Relying-party entries cannot be edited.</p>
+    <p><strong>The key's name.</strong> A name stored on the key (see
+      <a href="naming.html">Naming</a>) is one entry in this array, shown as
+      <code>key name: "…"</code>. Change it with <strong>Rename</strong> (or
+      <code>keyroostctl name set</code>), not here: its <em>Edit</em> is disabled. Deleting
+      it removes the key's name, and keyroost says so first.</p>
     <p><strong>Delete an entry.</strong> Any entry can be deleted, and every delete is confirmed:
       the CLI asks <strong>y/N</strong> in a terminal and needs <code>--yes</code> in a script or
       when the PIN is piped in (the desktop app asks you to confirm). Deleting an entry a
@@ -104,7 +109,9 @@
       keyroost then rewrites the array without the entry.</p>
     <p><strong>Erase everything.</strong> A separate wipe-all action clears the entire array —
       relying-party data included, not just keyroost notes. It is irreversible, needs your PIN,
-      and is double-confirmed in the app (y/N or <code>--yes</code> on the CLI).</p>
+      and is double-confirmed in the app (y/N or <code>--yes</code> on the CLI). The key's
+      name goes too, and the warning names it, unless you keep it: <strong>Keep the key's
+      name</strong> in the app, <code>--keep-name</code> on the CLI.</p>
   </section>
 
   <section class="kr-section">
@@ -118,6 +125,10 @@
       recomputes the checksum before writing. Each write re-reads the key's current array
       first, so concurrent relying-party entries are preserved. Writes are authenticated with
       a Large-Blob-Write token derived from your PIN.</p>
+    <p class="kr-muted">Every entry keyroost doesn't change is written back byte for byte,
+      in its original order, including fields keyroost doesn't know. An element that isn't
+      in the standard entry format is skipped when reading (the listing says how many, and
+      the rest of the array still shows) and kept unchanged when writing.</p>
   </section>
 
   <section class="kr-section">
@@ -130,6 +141,7 @@ keyroostctl fido blob export 1 --out entry.bin            # raw bytes, no PIN
 keyroostctl fido blob export 1 -o id_ecdsa_sk-cert.pub --as-cert
 keyroostctl fido blob delete 1                            # asks y/N; RP-owned entries also print a warning
 keyroostctl fido blob clear                               # wipes the whole array, asks y/N
+keyroostctl fido blob clear --keep-name                   # ...but keeps the key's name
 keyroostctl fido blob delete 1 --pin stdin --yes          # in a script: piped PIN, so --yes</code></pre>
     <p class="kr-muted">Reading (<code>list</code>, <code>get</code>, <code>export</code>) needs
       no PIN — the array is world-readable. Note that <code>add</code> and <code>edit</code>

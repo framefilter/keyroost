@@ -4,18 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Give your keys names — keyroost</title>
-<meta name="description" content="When you own several hardware security keys, keyroost can attach a friendly name to each one — matched by the key's stable serial number — so the GUI and keyroostctl recognize it by name instead of a path that changes on every replug.">
+<meta name="description" content="When you own several hardware security keys, keyroost can give each one a name, kept on this computer or on the key itself, so the GUI and keyroostctl recognize it by name instead of a path that changes on every replug.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyroost">
 <meta property="og:title" content="Give your keys names — keyroost">
-<meta property="og:description" content="When you own several hardware security keys, keyroost can attach a friendly name to each one — matched by the key's stable serial number — so the GUI and keyroostctl recognize it by name instead of a path that changes on every replug.">
+<meta property="og:description" content="When you own several hardware security keys, keyroost can give each one a name, kept on this computer or on the key itself, so the GUI and keyroostctl recognize it by name instead of a path that changes on every replug.">
 <meta property="og:url" content="https://framefilter.github.io/keyroost/naming.html">
 <meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Give your keys names — keyroost">
-<meta name="twitter:description" content="When you own several hardware security keys, keyroost can attach a friendly name to each one — matched by the key's stable serial number — so the GUI and keyroostctl recognize it by name instead of a path that changes on every replug.">
+<meta name="twitter:description" content="When you own several hardware security keys, keyroost can give each one a name, kept on this computer or on the key itself, so the GUI and keyroostctl recognize it by name instead of a path that changes on every replug.">
 <meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 
 <link rel="icon" type="image/png" href="assets/keyroost-logo.png">
@@ -66,8 +66,7 @@
     <p>If you keep two or three keys plugged in — or rotate a primary and a backup — they all
       look alike to the operating system, and the path the OS assigns each one
       (<code>/dev/hidraw3</code> today, <code>/dev/hidraw5</code> tomorrow) shifts on every
-      replug. A friendly name fixes that: keyroost matches it to the key's <strong>stable
-      serial number</strong>, so "signing-yubikey" always means the same physical key no
+      replug. A name fixes that: "signing-yubikey" always means the same physical key, no
       matter which port it's in.</p>
     <p>This makes the device list easier to read at a glance, and it lets you target a
       specific key on the command line with <code>--device</code> instead of hunting for the
@@ -75,89 +74,155 @@
   </section>
 
   <section class="kr-section">
-    <h2>How keyroost identifies a key</h2>
-    <p>A name is bound to the key's serial number, not to a port or a slot:</p>
+    <h2>Two places to keep a name</h2>
+    <p>When you name a key, you choose where the name lives:</p>
+    <ul>
+      <li><strong>On this computer</strong> (the default). The name goes in a
+        <code>keys.json</code> file on this computer. Other computers don't see it.</li>
+      <li><strong>On the key.</strong> The name is written into the key's FIDO2
+        large-blob storage, so every computer running keyroost shows it, with no setup.
+        Saving it asks for the key's FIDO PIN. The name is <strong>visible to anyone who has
+        the key</strong>: reading it needs no PIN. Only keys with large-blob storage
+        offer this choice.</li>
+    </ul>
+    <p>A name on the key is shown first. A name this computer saved shows only when the key
+      carries none.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Naming a key in the app</h2>
+    <p>In the keyroost desktop app, select the key and use the <strong>Name this key</strong>
+      action next to its title (it reads <strong>Rename</strong> once the key has a name).
+      Type a name, choose <strong>On this computer</strong> or <strong>On this key</strong>,
+      and confirm. For a name on the key, the dialog asks for the key's PIN. Renaming a key
+      whose name is on the key changes it there.</p>
+    <p>If a key no longer carries the name this computer saw on it, the app says so and
+      offers <strong>Write it back</strong>, <strong>Forget</strong> (remove the name from
+      this computer) or <strong>Not now</strong>.</p>
+  </section>
+
+  <section class="kr-section" id="cli">
+    <h2>Naming a key from the command line</h2>
+<pre><code>keyroostctl name set signing-yubikey                # on this computer
+keyroostctl name set signing-yubikey --store key    # on the key (asks for the FIDO PIN)
+keyroostctl name list                               # every name, where it lives, what is connected
+keyroostctl -d signing-yubikey piv info             # use it
+keyroostctl name clear signing-yubikey              # remove it, wherever it is stored</code></pre>
+    <ul>
+      <li><strong><code>name set NAME</code></strong> names the key, or renames it. A rename
+        keeps the name where it is; <code>--store key</code> moves a name from this computer
+        onto the key. If several keys are plugged in, a terminal shows a numbered list to
+        pick from; in a script, say which one with <code>-d</code> (a serial or a
+        <code>list</code> number), <code>--reader</code> or <code>--path</code>. Any key
+        that reports a serial can be named; Molto2 tokens can't be named yet.</li>
+      <li><strong><code>name list</code></strong> shows every name this computer knows,
+        where it lives, and which key is connected. If a key lost its name, the line says
+        how to write it back.</li>
+      <li><strong><code>name clear NAME</code></strong> removes a name wherever it is stored
+        (a name on the key needs the key connected and its PIN). <code>-d KEY name
+        clear</code> removes the selected key's name.</li>
+    </ul>
+    <p>Once a key is named, commands that target a single key accept
+      <code>--device signing-yubikey</code> (or <code>-d</code>). <code>--device</code>
+      also takes a serial or the number <code>keyroostctl list</code> shows; prefix
+      <code>name:</code>, <code>serial:</code> or <code>list:</code> to say which you mean.
+      With the shell completions installed, pressing Tab after <code>--device</code> offers
+      the names in this computer's <code>keys.json</code>.</p>
+    <div class="kr-callout note">
+      <div class="kr-callout-title note">Name rules</div>
+      <p>A name is 1–64 characters and otherwise free-form: letters of any case or script,
+        digits, spaces and punctuation are all fine — <code>Signing YubiKey</code>,
+        <code>Clé de bureau</code>, <code>backup-2</code>. It is stored exactly as typed. Only
+        control, zero-width and bidi characters are rejected, because those let a name spoof
+        what it displays as. A name read from a key that breaks these rules is not shown,
+        and the key is treated as unnamed. Each name on this computer belongs to one
+        key.</p>
+    </div>
+  </section>
+
+  <section class="kr-section">
+    <h2>Two keys with the same name</h2>
+    <p>Anyone can write any name onto a key, so two keys can carry the same one. The first
+      key this computer saw with a name keeps it: <code>--device "Work YubiKey"</code>
+      always means that key. Another key carrying the same name shows as
+      <strong>Work YubiKey (1234)</strong>, with the last four characters of its serial.
+      That text is for display only; select the second key by its <code>list</code>
+      number, by <code>serial:…</code>, or from the picker. If only the second key is
+      plugged in, <code>--device "Work YubiKey"</code> says no key by that name is
+      connected and shows <strong>Work YubiKey (1234)</strong> as the key that carries
+      it.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>How keyroost tells keys apart</h2>
+    <p>keyroost recognizes a key by its serial number, not by a port or a slot:</p>
     <ul>
       <li>For most keys (SoloKeys, Nitrokey, and similar) the serial is the USB
         <code>iSerialNumber</code> the key reports to the operating system.</li>
       <li>For keys that don't expose a USB serial (such as YubiKeys), keyroost reads the
         serial from a vendor management applet over the smart-card (CCID) interface instead.</li>
     </ul>
-    <p>Either way, matching is a plain string comparison against that serial — so a named key
-      is recognized the moment it's connected, in any port, and is shown as "not connected"
-      when it's absent. keyroost pairs a card reader to its USB device by exact bus address
-      first and refuses to fall back to a name-based guess when the evidence is ambiguous, so
-      in a crowded, hard-to-disambiguate set a key may read as not connected rather than being
-      confidently mistaken for its neighbour — deliberately, since a wrong match would send
-      card operations and FIDO operations to two different physical keys.</p>
+    <p>So a named key is recognized the moment it's connected, in any port, and is shown as
+      "not connected" when it's absent. keyroost pairs a card reader to its USB device by
+      exact bus address first and refuses to fall back to a name-based guess when the
+      evidence is ambiguous, so in a crowded, hard-to-disambiguate set a key may read as
+      not connected rather than being confidently mistaken for its neighbor — deliberately,
+      since a wrong match would send card operations and FIDO operations to two different
+      physical keys.</p>
     <p>Windows and macOS don't report that bus address. There, keyroost asks each side of the
       key for the identity it reports (a YubiKey's serial, a Solo 2's ID, a Token2 key's
       serial) and joins the two only when they match. These reads change nothing on the key.
       If two keys of the same make are connected and one doesn't answer, it is shown as two
       entries rather than guessed at.</p>
-    <div class="kr-callout tip">
-      <div class="kr-callout-title tip">Naming is opt-in and stays on your computer</div>
-      <p>Nothing is written to disk until you explicitly add a name. When you do, keyroost
-        saves an entry to a local <code>keys.json</code> file on this computer — the friendly
-        label plus the key's serial number — so the key can be recognized later. Merely
-        viewing or matching keys records nothing, and you can remove an entry at any time.</p>
-    </div>
+    <p>Some keys report the same serial on every unit (the OnlyKey, for example). keyroost
+      can't tell such units apart, so naming them works as it did before: units that share
+      a name are refused as ambiguous rather than guessed at.</p>
   </section>
 
   <section class="kr-section">
-    <h2>Naming a key in the app</h2>
-    <p>In the keyroost desktop app, select the key you want to label and use the
-      <strong>Name this key</strong> action next to its title (it reads <strong>Rename</strong>
-      once a name is already set). Type a short label and confirm — the key then appears under
-      that name in the device list, and keeps it across replugs.</p>
-  </section>
-
-  <section class="kr-section" id="cli">
-    <h2>Naming a key from the command line</h2>
-    <p>The same registry is available from <code>keyroostctl</code> through the
-      <code>name</code> command, which has three subcommands:</p>
-    <ul>
-      <li><strong><code>add</code></strong> — record a friendly name for a connected key.
-        Pass the label as the first argument; keyroost reads the connected key's serial and
-        writes it to <code>keys.json</code>. If several keys are plugged in, a terminal shows
-        a numbered list to pick from; in a script, say which one with <code>--device</code>
-        (a serial or a <code>list</code> number), <code>--reader</code> or
-        <code>--path</code>. Any key that reports a serial can be named; Molto2 tokens can't
-        be named yet.</li>
-      <li><strong><code>list</code></strong> — show every configured name, its serial, and
-        whether that key is currently connected.</li>
-      <li><strong><code>delete</code></strong> — delete a configured name by its label.</li>
-    </ul>
-<pre><code>keyroostctl name add signing-yubikey
-keyroostctl name list
-keyroostctl name delete signing-yubikey</code></pre>
-    <p>Once a key is named, commands that target a single key accept
-      <code>--device signing-yubikey</code> to pick it out, instead of a device path that
-      changes between plugs. <code>--device</code> also takes a serial or the number
-      <code>keyroostctl list</code> shows; prefix <code>name:</code>, <code>serial:</code> or
-      <code>list:</code> to say which you mean. With the shell completions installed,
-      pressing Tab after <code>--device</code> offers your saved names.</p>
-    <div class="kr-callout note">
-      <div class="kr-callout-title note">Label rules</div>
-      <p>A label is 1–64 characters and otherwise free-form: letters of any case or script,
-        digits, spaces and punctuation are all fine — <code>Signing YubiKey</code>,
-        <code>Clé de bureau</code>, <code>backup-2</code>. Only control, zero-width and
-        bidi-override characters are rejected, because those let a saved name spoof what it
-        displays as. Names must be unique, and each serial can carry only one name — keyroost
-        refuses a duplicate name or a second name for the same key.</p>
-    </div>
-  </section>
-
-  <section class="kr-section">
-    <h2>What keyroost stores</h2>
+    <h2>What keyroost stores on this computer</h2>
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
-      <p>A small <code>keys.json</code> registry on this computer: for each named key, the
-        <strong>label</strong>, the <strong>serial number</strong>, and how that serial was
-        obtained (USB or CCID). Naming is pure local config and matching — keyroost never
-        enumerates or contacts a server to do it, and removing a name deletes the entry. No
-        secrets, PINs, or credentials are ever part of a name.</p>
+      <p><code>keys.json</code> holds, for each name, the <strong>name</strong>, where it
+        lives (this computer or the key), and a <strong>salted fingerprint</strong> of the
+        key: a keyed hash of its serial, not the serial itself. The salt is a random value
+        in <code>keys.salt</code> beside it, made on first use and never shared, so the
+        file shows no serials and two computers' files can't be matched against each
+        other. No secrets, PINs, or credentials are ever part of a name.</p>
     </div>
+    <p>A name on the key is recorded here too, the first time this computer sees it. That
+      record is how this computer knows which key carried the name first.</p>
+    <p>If <code>keys.salt</code> is lost, names saved on this computer no longer match their
+      keys, and <code>name list</code> shows them as unmatched. Clear them with
+      <code>name clear</code> and set them again; putting the old <code>keys.salt</code>
+      back doesn't help.</p>
+    <p>If this computer can't record a key (for example, the key reports no serial, or
+      <code>keys.json</code> can't be written), keyroost warns once and treats the key as
+      seen here for the first time on every run.</p>
+    <h3>Coming from v0.12 or earlier</h3>
+    <p>Older versions kept plain serials in <code>keys.json</code>. The first time this
+      version reads the file, it converts it to fingerprints. It keeps a backup of the
+      old file until the conversion has succeeded, then removes it, so no serial stays on
+      disk. Your names keep working. If you go back to v0.12, it can't read the converted
+      file and shows your keys unnamed.</p>
+  </section>
+
+  <section class="kr-section">
+    <h2>Limits</h2>
+    <ul>
+      <li><strong>Windows without administrator rights:</strong> keyroost can't reach a
+        key's FIDO side, so it shows only names saved on this computer.</li>
+      <li><strong>Erasing the key's storage:</strong> <code>fido blob clear</code> and a FIDO
+        reset erase a name on the key with everything else. <code>fido blob clear
+        --keep-name</code> keeps it.</li>
+      <li><strong>Other software:</strong> the FIDO2 standard lets a browser or system tool
+        remove large-blob entries that no passkey uses, which would include the name. We
+        haven't seen it happen. If it does, keyroost shows the name this computer saved for
+        the key, if any, and offers to write it back.</li>
+    </ul>
+    <p class="kr-muted">The format of the name on the key is published, with test vectors, in
+      <a href="https://github.com/framefilter/keyroost/blob/main/docs/PROTOCOL-device-label.md">PROTOCOL-device-label.md</a>,
+      so other tools can read and write the same name.</p>
   </section>
 
   <section class="kr-section kr-res-section">
@@ -166,6 +231,7 @@ keyroostctl name delete signing-yubikey</code></pre>
     <div class="kr-res">
       <a href="security-keys.html"><span class="who">keyroost</span>What a security key is</a>
       <a href="fido2.html"><span class="who">keyroost</span>FIDO2 &amp; passkeys</a>
+      <a href="storage.html"><span class="who">keyroost</span>Large-blob storage</a>
       <a href="reset.html"><span class="who">keyroost</span>Resetting a key safely</a>
     </div>
     <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="reset.html">Next: Resetting →</a></p>
@@ -176,7 +242,7 @@ keyroostctl name delete signing-yubikey</code></pre>
 <footer class="kr-footer">
   <div class="kr-wrap">
     <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
-    <p class="kr-small">Friendly names are stored only on your own computer; keyroost is independent and not affiliated with or endorsed by any vendor named here. Product names are used descriptively.</p>
+    <p class="kr-small">Names are kept on your own computer or on the key you choose; keyroost is independent and not affiliated with or endorsed by any vendor named here. Product names are used descriptively.</p>
   </div>
 </footer>
 
