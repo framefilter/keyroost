@@ -3097,11 +3097,7 @@ fn decode_seed(text: &str, e: SeedEncoding) -> Result<zeroize::Zeroizing<Vec<u8>
 
 /// Decode a customer key: hex, or ASCII taken as its bytes. `flag` is the
 /// flag named in the error ("--customer-key" or "--new-customer-key").
-fn decode_customer_key(
-    text: &str,
-    e: KeyEncoding,
-    flag: &str,
-) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+fn decode_customer_key(text: &str, e: KeyEncoding, flag: &str) -> Result<CustomerKey, String> {
     match e {
         KeyEncoding::Hex => hex_decode(text)
             .map(zeroize::Zeroizing::new)
@@ -3116,7 +3112,7 @@ fn decode_customer_key(
 fn customer_key<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
     args: &KeyArgs,
-) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+) -> Result<CustomerKey, String> {
     let Some(flag) = args.customer_key.as_ref() else {
         return Ok(zeroize::Zeroizing::new(DEFAULT_CUSTOMER_KEY.to_vec()));
     };
@@ -3130,7 +3126,7 @@ fn customer_key<I: crate::secrets::SecretIo>(
 enum MoltoInput {
     Nothing,
     Seed(zeroize::Zeroizing<Vec<u8>>),
-    NewKey(zeroize::Zeroizing<Vec<u8>>),
+    NewKey(CustomerKey),
     Entry {
         entry: keyroost_import::BulkEntry,
         title: String,
@@ -3275,11 +3271,29 @@ fn molto_early_key<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
     key: &KeyArgs,
     cmd: &MoltoCmd,
-) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
+) -> Result<Option<CustomerKey>, String> {
     match cmd {
         MoltoCmd::ImportFile { .. } => customer_key(sec, key).map(Some),
         _ => Ok(None),
     }
+}
+
+/// `molto import-file --dry-run` never uses the customer key. It reads and
+/// drops it only when both it and the password are piped on stdin, so the
+/// password stays on line 2 as in a real import; at a terminal each is its
+/// own prompt, so the key is not asked for.
+fn molto_dry_run_key<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    key: &KeyArgs,
+    password: Option<&SecretSource>,
+) -> Result<(), String> {
+    let both_piped = matches!(key.customer_key, Some(SecretSource::Stdin))
+        && matches!(password, Some(SecretSource::Stdin))
+        && !sec.io.stdin_is_terminal();
+    if both_piped {
+        customer_key(sec, key)?;
+    }
+    Ok(())
 }
 
 /// After any question, with nothing held: the customer key (unless
@@ -3289,7 +3303,7 @@ fn molto_key_and_input<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
     key: &KeyArgs,
     cmd: &MoltoCmd,
-    early_key: Option<zeroize::Zeroizing<Vec<u8>>>,
+    early_key: Option<CustomerKey>,
 ) -> Result<(CustomerKey, MoltoInput), Box<dyn std::error::Error>> {
     let key = match early_key {
         Some(k) => k,
@@ -4093,7 +4107,8 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
         words: &[],
         msg: "--seed-stdin is now --seed stdin",
         now: &["--seed"],
-    },    RetiredFlag {
+    },
+    RetiredFlag {
         flag: "--uri-env",
         words: &[],
         msg: "--uri-env VAR is now --uri env:VAR",
@@ -4722,7 +4737,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Token2 Molto2 / Molto2v2 commands all talk to the Molto2 PC/SC reader,
-    // authenticated with the customer key (scoped to this group via --key*).
+    // authenticated with the customer key (--customer-key).
     if let Cmd::Molto { key, cmd, reader } = cmd {
         return run_molto(cmd, key, reader.as_deref(), cli.debug);
     }
@@ -4761,7 +4776,8 @@ fn open_molto_session(reader: Option<&str>) -> Result<Session, Box<dyn std::erro
 }
 
 /// Dispatch the Token2 Molto2 / Molto2v2 subcommands. The customer key comes
-/// from the Molto2-scoped `--key*` flags (`KeyArgs`), not a global flag.
+/// from `--customer-key` (`KeyArgs`), accepted before or after the
+/// subcommand.
 fn run_molto(
     cmd: &MoltoCmd,
     key: &KeyArgs,
@@ -4783,9 +4799,7 @@ fn run_molto(
         yes: _,
     } = cmd
     {
-        // A piped customer key is stdin line 1 even here, so the password
-        // stays on line 2.
-        molto_early_key(&mut sec, key, cmd)?;
+        molto_dry_run_key(&mut sec, key, password.as_ref())?;
         let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
         let last = (*start as usize).saturating_add(entries.len());
         println!(
@@ -4983,12 +4997,18 @@ fn run_molto(
                 "refusing to probe without --yes (see `keyroostctl molto probe --help`)".into(),
             );
         }
+        // Read before the session opens: nothing is held while a key is
+        // typed.
+        let key = if *authed {
+            Some(customer_key(&mut sec, key)?)
+        } else {
+            None
+        };
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let info = session.read_info()?;
         write_info(&mut std::io::stderr(), &info)?;
-        if *authed {
-            let key = customer_key(&mut sec, key)?;
+        if let Some(key) = key {
             match session.authenticate(&key) {
                 Ok(()) => output::status("Authenticated."),
                 // The Display impl renders the tries-remaining count (or
@@ -18501,6 +18521,14 @@ mod cli_tests {
         // An encrypted Aegis vault as far as the importer can tell; its
         // password is read, then decryption fails.
         std::fs::write(&vault, r#"{"version":1,"db":"AAAA"}"#).unwrap();
+        // Removed on every path, a failing assert included.
+        struct Cleanup<'a>(&'a std::path::Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+        let _cleanup = Cleanup(&vault);
         let vault_arg = vault.to_str().unwrap();
         let argv: Vec<&str> = argv
             .iter()
@@ -18538,7 +18566,44 @@ mod cli_tests {
                 _ => panic!("{line}: read the wrong input"),
             },
         }
-        let _ = std::fs::remove_file(&vault);
+    }
+
+    /// `molto import-file --dry-run` never uses the customer key: it reads
+    /// (and drops) it only to keep a piped password on stdin line 2, and
+    /// never asks for it at a terminal.
+    #[test]
+    fn dry_run_reads_the_customer_key_only_for_stdin_order() {
+        use crate::secrets::fake::FakeIo;
+        let parts = |argv: &[&str]| {
+            let mut full = vec!["keyroostctl", "molto", "import-file", "v.json", "--dry-run"];
+            full.extend(argv);
+            match parse(&full).unwrap().command {
+                Some(Cmd::Molto {
+                    key,
+                    cmd: MoltoCmd::ImportFile { password, .. },
+                    ..
+                }) => (key, password),
+                _ => unreachable!(),
+            }
+        };
+        let both = ["--customer-key", "stdin", "--password", "stdin"];
+
+        // Piped, both on stdin: line 1 (the key) is consumed.
+        let (key, pw) = parts(&both);
+        let mut sec = Secrets::new(FakeIo::piped(&["11\n", "pw\n"]));
+        molto_dry_run_key(&mut sec, &key, pw.as_ref()).unwrap();
+        assert_eq!(sec.io.lines_read, 1);
+
+        // At a terminal: each is its own prompt, so the key is not asked for.
+        let mut sec = Secrets::new(FakeIo::terminal());
+        molto_dry_run_key(&mut sec, &key, pw.as_ref()).unwrap();
+        assert!(sec.io.prompts.is_empty(), "{:?}", sec.io.prompts);
+
+        // Piped, but the password comes from elsewhere: nothing is read.
+        let (key, pw) = parts(&["--customer-key", "stdin", "--password", "env:P"]);
+        let mut sec = Secrets::new(FakeIo::piped(&["11\n"]));
+        molto_dry_run_key(&mut sec, &key, pw.as_ref()).unwrap();
+        assert_eq!(sec.io.lines_read, 0);
     }
 
     #[test]
