@@ -6181,6 +6181,8 @@ fn run_doctor() {
     }
 }
 
+// `name_for` is the keyring's transitional shim until the naming pass lands.
+#[allow(deprecated)]
 fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // `--json`: one row per key, nothing else on stdout (announce lines, if
     // any, stay on stderr — but filter_rows below never announces).
@@ -11328,32 +11330,27 @@ fn nameable(dev: &keyroost_resolve::Device) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the registry entry for naming `dev`: the serial it was resolved
-/// with, and whether that serial came off the USB-HID node itself (vs. a
-/// smart-card applet read) — the same union the shared device model already
-/// correlated, so this never re-derives identity on its own.
-fn key_entry_for(
-    name: &str,
+/// The descriptive fields for naming `dev`: whether the serial it was
+/// resolved with came off the USB-HID node itself (vs. a smart-card applet
+/// read) — the same union the shared device model already correlated, so this
+/// never re-derives identity on its own.
+fn record_meta_for(
     dev: &keyroost_resolve::Device,
     hids: &[keyroost_hid::HidDevice],
-) -> keyroost_keyring::KeyEntry {
+) -> keyroost_keyring::RecordMeta {
     let usb = dev
         .hid_path
         .as_ref()
         .and_then(|p| hids.iter().find(|h| &h.path == p))
         .and_then(|h| h.serial_number.as_deref())
         == Some(dev.serial.as_str());
-    keyroost_keyring::KeyEntry {
-        name: name.to_string(),
-        serial: dev.serial.clone(),
+    keyroost_keyring::RecordMeta {
         source: if usb {
             keyroost_keyring::IdSource::Usb
         } else {
             keyroost_keyring::IdSource::Ccid
         },
         vendor: (dev.vendor == "Yubico").then(|| "yubico".to_string()),
-        aaguid: None,
-        note: None,
     }
 }
 
@@ -11369,17 +11366,22 @@ fn key_name_add(
     let dev = crate::target::select(Need::Nameable, reader, path)?;
     nameable(&dev)?;
     let hids = keyroost_hid::enumerate().unwrap_or_default();
-    keyring.add(key_entry_for(name, &dev, &hids))?;
+    keyring.set_name(
+        &dev.serial,
+        name,
+        keyroost_keyring::NameStore::Computer,
+        record_meta_for(&dev, &hids),
+    )?;
     // Opt-in disclosure: state plainly what is stored, and how to undo it.
     eprintln!(
-        "Recording \"{}\" \u{2192} serial {} ({}).",
+        "Recording \"{}\" \u{2192} {}.",
         sanitize_terminal(name),
-        sanitize_terminal(&dev.serial),
         sanitize_terminal(&dev.model)
     );
     eprintln!(
-        "This saves the key's serial number to keys.json on this computer so the \
-         key can be recognized by name later — delete it any time with \
+        "This saves a fingerprint of the key's serial number (salted for this \
+         computer, not the serial itself) to keys.json so the key can be \
+         recognized by name later — delete it any time with \
          `keyroostctl name delete {}`.",
         name
     );
@@ -11396,14 +11398,27 @@ fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
     }
     let devices = crate::target::enumerate().unwrap_or_default();
     for k in &keyring.keys {
-        let here = devices
-            .iter()
-            .any(|d| !d.serial.is_empty() && d.serial.eq_ignore_ascii_case(&k.serial));
-        let status = if here { "connected" } else { "not connected" };
+        let status = match &k.fingerprint {
+            None => "can't be matched to a key; name the key again",
+            Some(fp) => {
+                let here = devices
+                    .iter()
+                    .any(|d| keyring.fingerprint_of(&d.serial).as_ref() == Some(fp));
+                if here {
+                    "connected"
+                } else {
+                    "not connected"
+                }
+            }
+        };
+        let stored = match k.stored {
+            keyroost_keyring::NameStore::Computer => "this computer",
+            keyroost_keyring::NameStore::Key => "on the key",
+        };
         println!(
-            "  {:<20} serial={} [{}]",
+            "  {:<20} ({}) [{}]",
             sanitize_terminal(&k.name),
-            sanitize_terminal(&k.serial),
+            stored,
             status
         );
     }
@@ -11412,7 +11427,7 @@ fn key_name_list() -> Result<(), Box<dyn std::error::Error>> {
 
 fn key_name_delete(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut keyring = Keyring::load_default()?;
-    if keyring.remove(name) {
+    if keyring.remove(name).is_some() {
         keyring.save_default()?;
         println!("Removed \"{}\".", name);
     } else {
@@ -15502,17 +15517,16 @@ mod cli_tests {
 
     #[test]
     fn device_completion_offers_saved_names_only() {
-        let entry = |name: &str, serial: &str| keyroost_keyring::KeyEntry {
-            name: name.into(),
-            serial: serial.into(),
-            source: keyroost_keyring::IdSource::Usb,
-            vendor: None,
-            aaguid: None,
-            note: None,
-        };
         let mut k = Keyring::default();
-        k.add(entry("yubi-test", "1")).unwrap();
-        k.add(entry("solo test", "2")).unwrap();
+        for (serial, name) in [("1", "yubi-test"), ("2", "solo test")] {
+            k.set_name(
+                serial,
+                name,
+                keyroost_keyring::NameStore::Computer,
+                keyroost_keyring::RecordMeta::default(),
+            )
+            .unwrap();
+        }
         let got: Vec<String> = device_candidates_from(&k)
             .iter()
             .map(|c| c.get_value().to_string_lossy().into_owned())
@@ -20800,17 +20814,17 @@ mod cli_tests {
             usb_bus: None,
             usb_address: None,
         };
-        let e = key_entry_for("work", &yk, std::slice::from_ref(&hid));
+        let e = record_meta_for(&yk, std::slice::from_ref(&hid));
         assert_eq!(
-            (e.serial.as_str(), e.source, e.vendor.as_deref()),
-            ("12345678", keyroost_keyring::IdSource::Ccid, Some("yubico"))
+            (e.source, e.vendor.as_deref()),
+            (keyroost_keyring::IdSource::Ccid, Some("yubico"))
         );
         let mut solo = yk.clone();
         solo.vendor = "SoloKeys".into();
         solo.serial = "07A9".into();
         let mut solo_hid = hid;
         solo_hid.serial_number = Some("07A9".into());
-        let e = key_entry_for("s", &solo, &[solo_hid]);
+        let e = record_meta_for(&solo, &[solo_hid]);
         assert_eq!(
             (e.source, e.vendor),
             (keyroost_keyring::IdSource::Usb, None)

@@ -1,37 +1,54 @@
-//! Friendly-name registry for security keys, plus device-identity resolution.
+//! Friendly-name registry for security keys.
 //!
 //! Lets a user attach a memorable label (e.g. `signing-yubikey`) to a physical
-//! key, matched by its stable **serial number**, so commands can target a key
-//! by `--device` instead of a `/dev/hidrawN` path that changes on every replug.
+//! key, recognized by its stable **serial number**, so commands can target a
+//! key by `--device` instead of a `/dev/hidrawN` path that changes on every
+//! replug.
 //!
 //! This crate is pure config + matching logic: it has no hardware or PC/SC
-//! dependencies and never enumerates devices itself. The caller supplies the
-//! list of connected devices (as [`ConnectedKey`]) — for the CLI that's the
-//! HID enumeration plus, for keys without a USB serial, a CCID-read serial.
-//! Front-end concerns (interactive pickers, TTY handling, confirmations) live
-//! in the caller, so both the CLI and the GUI reuse this same core.
+//! dependencies and never enumerates devices itself. The caller hands in the
+//! serial a connected key reported (USB or read over CCID) and asks which
+//! record, if any, belongs to it. Front-end concerns (interactive pickers, TTY
+//! handling, confirmations) live in the caller, so both the CLI and the GUI
+//! reuse this same core.
+//!
+//! ## What `keys.json` holds
+//!
+//! Version 2 of the file holds one [`KeyRecord`] per name: the name, the key's
+//! salted [`Fingerprint`], and where the name lives ([`NameStore`]): on this
+//! computer only, or on the key itself (a name written to the key's large-blob
+//! storage, recorded here so this computer knows it saw that key first).
 //!
 //! ## Privacy
 //!
-//! Persisting a key's serial to disk is **opt-in**: nothing is written unless
-//! the caller explicitly invokes [`Keyring::save_to`] / [`Keyring::save_default`]
-//! (i.e. the user ran an "add a name" action). Loading and in-memory matching
-//! record nothing.
+//! **No serial number is ever stored.** A record carries only a fingerprint:
+//! HMAC-SHA-256 of the serial under a random salt kept in `keys.salt` beside
+//! `keys.json` (see [`fingerprint`]). The salt never leaves this computer, so
+//! the file alone reveals no serial and the same key fingerprints differently
+//! on every other computer.
+//!
+//! Writing is opt-in: nothing reaches disk unless the caller invokes
+//! [`Keyring::save_to`] / [`Keyring::save_default`]. A name chosen on this
+//! computer is saved when the user names a key. A name found on a key is
+//! recorded the first time this computer sees it ([`Keyring::record_first_seen`]),
+//! so that later a different key showing the same name can be told apart.
 
-// The salt file helpers are wired into load/save by the keys.json v2 change.
-#[cfg_attr(not(test), allow(dead_code))]
 mod fingerprint;
 
 pub use fingerprint::{fingerprint, Fingerprint, Salt, SALT_FILE};
 
+use fingerprint::{canonical_serial, generate_salt, load_salt, persist_salt};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// The `keys.json` format version this crate reads and writes.
+pub const FORMAT_VERSION: u64 = 2;
+
 /// How a key's serial is obtained — recorded for display/diagnostics. Matching
-/// is always by serial-string equality regardless of source.
+/// is always by fingerprint regardless of source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IdSource {
@@ -42,12 +59,26 @@ pub enum IdSource {
     Ccid,
 }
 
-/// One named key in the registry. `serial` is the match key; `name` is the
-/// unique user-facing label.
+/// Where a name lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NameStore {
+    /// Only in this computer's `keys.json`.
+    Computer,
+    /// On the key itself; the record notes that this computer has seen it.
+    Key,
+}
+
+/// One name in the registry. Names are unique across the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyEntry {
+pub struct KeyRecord {
     pub name: String,
-    pub serial: String,
+    /// The key's salted fingerprint. `None`: the record can't be matched to
+    /// any key (there was no serial when it was converted, or the salt file
+    /// was lost).
+    #[serde(default)]
+    pub fingerprint: Option<Fingerprint>,
+    pub stored: NameStore,
     #[serde(default)]
     pub source: IdSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,24 +89,80 @@ pub struct KeyEntry {
     pub note: Option<String>,
 }
 
-/// The on-disk registry (`keys.json`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Descriptive fields for a record written by [`Keyring::set_name`].
+#[derive(Debug, Clone, Default)]
+pub struct RecordMeta {
+    pub source: IdSource,
+    pub vendor: Option<String>,
+}
+
+/// The registry (`keys.json`) plus this computer's fingerprint salt.
+#[derive(Debug, Clone, Default)]
 pub struct Keyring {
+    pub keys: Vec<KeyRecord>,
+    /// `None` until a salt is loaded or first needed.
+    salt: Option<Salt>,
+    /// Whether `salt` is already in `keys.salt`.
+    salt_persisted: bool,
+    /// What was on disk when this ring was loaded.
+    origin: Origin,
+}
+
+/// What `keys.json` held when a [`Keyring`] was loaded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Origin {
+    /// No file (or a ring built in memory).
+    #[default]
+    Fresh,
+    /// A version 2 file.
+    V2,
+    /// A version 1 file (plain serials), read into memory only. Saving over
+    /// it is refused until conversion writes it out properly.
+    V1,
+}
+
+/// `keys.json` as written.
+#[derive(Serialize)]
+struct FileOut<'a> {
+    version: u64,
+    keys: &'a [KeyRecord],
+}
+
+/// `keys.json` as read (version 2).
+#[derive(Deserialize)]
+struct FileIn {
     #[serde(default)]
-    pub keys: Vec<KeyEntry>,
+    keys: Vec<KeyRecord>,
 }
 
-/// A currently-connected device as seen by the resolver. The caller builds
-/// these from device enumeration; `serial` is the device's effective serial
-/// (USB or CCID), `None` if it couldn't be determined.
-#[derive(Debug, Clone)]
-pub struct ConnectedKey {
-    pub path: PathBuf,
-    pub serial: Option<String>,
-    pub label: String,
+/// A version 1 file: no `version`, one entry per name with its plain serial.
+#[derive(Deserialize)]
+struct FileV1 {
+    keys: Vec<EntryV1>,
 }
 
-/// Errors loading, saving, or mutating the registry.
+#[derive(Deserialize)]
+struct EntryV1 {
+    name: String,
+    serial: String,
+    #[serde(default)]
+    source: IdSource,
+    #[serde(default)]
+    vendor: Option<String>,
+    #[serde(default)]
+    aaguid: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Which `keys.json` format a file holds.
+enum Format {
+    V1(FileV1),
+    V2(FileIn),
+}
+
+/// Errors loading, saving, or mutating the registry. No variant ever carries a
+/// serial number.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum KeyringError {
@@ -83,13 +170,14 @@ pub enum KeyringError {
     Parse(String),
     NoConfigDir,
     DuplicateName(String),
-    DuplicateSerial {
-        serial: String,
-        existing_name: String,
-    },
     InvalidName(String),
     /// `keys.salt` exists but isn't 64 hex characters; it is left untouched.
     MalformedSalt,
+    /// The key reported no serial, so there is nothing to recognize it by.
+    NoSerial,
+    /// `keys.json` is still in the old format and this ring didn't convert
+    /// it; saving would overwrite every name in it.
+    Unconverted,
 }
 
 impl fmt::Display for KeyringError {
@@ -104,12 +192,6 @@ impl fmt::Display for KeyringError {
                 )
             }
             KeyringError::DuplicateName(n) => write!(f, "a key named '{}' already exists", n),
-            KeyringError::DuplicateSerial {
-                serial,
-                existing_name,
-            } => {
-                write!(f, "serial {} is already named '{}'", serial, existing_name)
-            }
             KeyringError::InvalidName(n) => {
                 write!(
                     f,
@@ -121,6 +203,14 @@ impl fmt::Display for KeyringError {
                 f,
                 "{} is damaged (expected 64 hex characters); it was left as it is",
                 SALT_FILE
+            ),
+            KeyringError::NoSerial => {
+                write!(f, "this key reports no serial number, so it can't be named")
+            }
+            KeyringError::Unconverted => write!(
+                f,
+                "keys.json is in the old format and hasn't been converted yet; \
+                 not overwriting it"
             ),
         }
     }
@@ -140,60 +230,6 @@ impl From<io::Error> for KeyringError {
         KeyringError::Io(e)
     }
 }
-
-/// Errors resolving a `--device` name to a connected device.
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum ResolveError {
-    UnknownName {
-        name: String,
-        known: Vec<String>,
-    },
-    NotConnected {
-        name: String,
-        serial: String,
-    },
-    Ambiguous {
-        name: String,
-        serial: String,
-        count: usize,
-    },
-}
-
-impl fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ResolveError::UnknownName { name, known } if known.is_empty() => write!(
-                f,
-                "no key named '{}': no named keys yet — add one with `keyroostctl name add`",
-                name
-            ),
-            ResolveError::UnknownName { name, known } => {
-                write!(
-                    f,
-                    "no key named '{}'. Known names: {}",
-                    name,
-                    known.join(", ")
-                )
-            }
-            ResolveError::NotConnected { name, serial } => {
-                write!(f, "key '{}' (serial {}) is not connected", name, serial)
-            }
-            ResolveError::Ambiguous {
-                name,
-                serial,
-                count,
-            } => write!(
-                f,
-                "name '{}' matches {} connected devices with serial {}; \
-                 refusing to guess which one",
-                name, count, serial
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ResolveError {}
 
 /// Validate a friendly name. A name is a human-facing label, so the rules are
 /// deliberately permissive about content — letters of any case or script,
@@ -312,6 +348,18 @@ pub fn config_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("keys.json"))
 }
 
+/// Strip spoofing characters from the free-text fields of a record, the same
+/// cleaning on the way in and on the way back out of `keys.json`.
+fn sanitize_record(r: &mut KeyRecord) {
+    strip_control_chars(&mut r.name);
+    for field in [&mut r.vendor, &mut r.aaguid, &mut r.note]
+        .into_iter()
+        .flatten()
+    {
+        strip_control_chars(field);
+    }
+}
+
 impl Keyring {
     /// Load from the default config path. A missing file yields an empty
     /// registry (reading records nothing).
@@ -320,45 +368,78 @@ impl Keyring {
         Self::load_from(&path)
     }
 
-    /// Load from a specific path. A missing file yields an empty registry.
+    /// Load from a specific path; the salt is read from `keys.salt` in the
+    /// same directory. A missing file yields an empty registry.
     pub fn load_from(path: &Path) -> Result<Keyring, KeyringError> {
-        match fs::read_to_string(path) {
-            Ok(s) => {
-                let mut ring: Keyring =
-                    serde_json::from_str(&s).map_err(|e| KeyringError::Parse(e.to_string()))?;
-                // `add` validates names before they ever reach disk; on the
-                // way back in every field — including the name — is sanitized
-                // rather than rejected. Rejecting would make one hand-edited
-                // entry render the whole registry unloadable, and callers
-                // that fall back to an empty registry on error would then
-                // overwrite keys.json and destroy every other entry on the
-                // next save.
-                for entry in &mut ring.keys {
-                    strip_control_chars(&mut entry.name);
-                    strip_control_chars(&mut entry.serial);
-                    for field in [&mut entry.vendor, &mut entry.aaguid, &mut entry.note]
-                        .into_iter()
-                        .flatten()
-                    {
-                        strip_control_chars(field);
-                    }
-                }
-                Ok(ring)
+        let dir = salt_dir(path);
+        let text = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let salt = load_salt(dir)?;
+                return Ok(Keyring {
+                    keys: Vec::new(),
+                    salt_persisted: salt.is_some(),
+                    salt,
+                    origin: Origin::Fresh,
+                });
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Keyring::default()),
-            Err(e) => Err(KeyringError::Io(e)),
+            Err(e) => return Err(KeyringError::Io(e)),
+        };
+        let file = match parse(&text)? {
+            Format::V2(file) => file,
+            Format::V1(old) => {
+                let (salt, salt_persisted) = match load_salt(dir)? {
+                    Some(s) => (s, true),
+                    None => (generate_salt()?, false),
+                };
+                let keys = convert_v1(&salt, old);
+                return Ok(Keyring {
+                    keys,
+                    salt: Some(salt),
+                    salt_persisted,
+                    origin: Origin::V1,
+                });
+            }
+        };
+        let mut keys = file.keys;
+        // Names are validated before they ever reach disk; on the way back in
+        // every field — including the name — is sanitized rather than
+        // rejected. Rejecting would make one hand-edited entry render the
+        // whole registry unloadable, and callers that fall back to an empty
+        // registry on error would then overwrite keys.json and destroy every
+        // other entry on the next save.
+        for r in &mut keys {
+            sanitize_record(r);
         }
+        let salt = load_salt(dir)?;
+        if salt.is_none() {
+            // Without the salt no stored fingerprint can be reproduced: keep
+            // the records (their names still list) but unmatched. The next
+            // save writes a fresh salt.
+            for r in &mut keys {
+                r.fingerprint = None;
+            }
+        }
+        Ok(Keyring {
+            keys,
+            salt_persisted: salt.is_some(),
+            salt,
+            origin: Origin::V2,
+        })
     }
 
     /// Persist to the default config path, creating parent dirs. Opt-in: only
     /// call this from an explicit user action. Returns the path written.
-    pub fn save_default(&self) -> Result<PathBuf, KeyringError> {
+    pub fn save_default(&mut self) -> Result<PathBuf, KeyringError> {
         let path = config_path().ok_or(KeyringError::NoConfigDir)?;
         self.save_to(&path)?;
         Ok(path)
     }
 
-    /// Persist to a specific path, creating parent dirs. Opt-in.
+    /// Persist to a specific path, creating parent dirs. Opt-in. The salt is
+    /// written to `keys.salt` first if it isn't on disk yet, so no
+    /// fingerprint is ever saved without the salt that reproduces it.
+    ///
     /// Concurrency: this is a load-modify-save with no file lock. The temp-file
     /// and atomic-rename below mean a save can never *corrupt* the registry (a
     /// reader always sees a complete old or new file), but two processes editing
@@ -367,8 +448,13 @@ impl Keyring {
     /// `keys.json` is a per-user convenience registry written rarely and
     /// interactively, so the collision window is tiny and the only loss is one
     /// un-persisted rename, not data integrity. Add advisory locking only if
-    /// that assumption stops holding.
-    pub fn save_to(&self, path: &Path) -> Result<(), KeyringError> {
+    /// that assumption stops holding. The salt is the exception: it is created
+    /// once and never replaced, and a save refuses rather than pair this
+    /// ring's fingerprints with a salt another process wrote meanwhile.
+    pub fn save_to(&mut self, path: &Path) -> Result<(), KeyringError> {
+        if self.origin == Origin::V1 {
+            return Err(KeyringError::Unconverted);
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
             // Owner-only on the directory too, matching the file below. Only
@@ -386,132 +472,616 @@ impl Keyring {
                 }
             }
         }
-        let json =
-            serde_json::to_string_pretty(self).map_err(|e| KeyringError::Parse(e.to_string()))?;
-        // Write a sibling temp file and rename into place: a crash mid-write
-        // can no longer corrupt the registry, and the file is created
-        // owner-only — which security keys a person owns is their business —
-        // instead of inheriting the umask default (typically world-readable).
-        let tmp = path.with_extension("json.tmp");
-        // Remove any stale temp file so `create_new` below can succeed.
-        // `create_new` (not `create`) matters twice over: a pre-existing file
-        // would keep its old permissions (the 0o600 applies only at creation),
-        // and a symlink planted at the temp path would otherwise be followed.
-        let _ = fs::remove_file(&tmp);
-        {
-            let mut opts = fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+        self.persist_salt_if_needed(salt_dir(path))?;
+        write_atomic(path, &self.to_json()?)
+    }
+
+    fn to_json(&self) -> Result<String, KeyringError> {
+        serde_json::to_string_pretty(&FileOut {
+            version: FORMAT_VERSION,
+            keys: &self.keys,
+        })
+        .map_err(|e| parse_error(&e))
+    }
+
+    /// The salt, generated in memory on first need.
+    fn ensure_salt(&mut self) -> Result<&Salt, KeyringError> {
+        if self.salt.is_none() {
+            self.salt = Some(generate_salt()?);
+            self.salt_persisted = false;
+        }
+        Ok(self.salt.as_ref().expect("salt was just set"))
+    }
+
+    fn persist_salt_if_needed(&mut self, dir: &Path) -> Result<(), KeyringError> {
+        self.ensure_salt()?;
+        if self.salt_persisted {
+            return Ok(());
+        }
+        let salt = self.salt.as_ref().expect("ensured above");
+        match persist_salt(dir, salt) {
+            Ok(()) => {}
+            Err(KeyringError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // Another keyroost process created the salt since this ring
+                // was loaded. Same salt (it was loaded from there): fine.
+                // Different: every fingerprint made here would be wrong.
+                if load_salt(dir)?.as_ref() != Some(salt) {
+                    return Err(KeyringError::Io(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "{SALT_FILE} was created by another keyroost process; \
+                             reload and try again"
+                        ),
+                    )));
+                }
             }
-            use std::io::Write;
-            let mut f = opts.open(&tmp)?;
-            f.write_all(json.as_bytes())?;
-            f.write_all(b"\n")?;
-            f.sync_all()?;
+            Err(e) => return Err(e),
         }
-        fs::rename(&tmp, path)?;
+        self.salt_persisted = true;
         Ok(())
     }
 
-    /// Add a new entry. Rejects duplicate names and duplicate serials.
-    pub fn add(&mut self, mut entry: KeyEntry) -> Result<(), KeyringError> {
-        validate_name(&entry.name)?;
-        // Sanitize on the way in with the same rules `load_from` applies on
-        // the way out, so a device-reported serial (or note) containing
-        // control characters is stored exactly as it will round-trip —
-        // otherwise the value would silently mutate on the next load, and
-        // duplicate-serial detection would compare against a phantom.
-        strip_control_chars(&mut entry.serial);
-        for field in [&mut entry.vendor, &mut entry.aaguid, &mut entry.note]
-            .into_iter()
-            .flatten()
-        {
-            strip_control_chars(field);
+    /// This computer's fingerprint of `serial`. `None` for an empty serial,
+    /// or before any salt exists (then no stored record can match anyway).
+    pub fn fingerprint_of(&self, serial: &str) -> Option<Fingerprint> {
+        if canonical_serial(serial).is_empty() {
+            return None;
         }
-        if self.keys.iter().any(|k| k.name == entry.name) {
-            return Err(KeyringError::DuplicateName(entry.name));
-        }
-        if let Some(existing) = self.keys.iter().find(|k| k.serial == entry.serial) {
-            return Err(KeyringError::DuplicateSerial {
-                serial: entry.serial.clone(),
-                existing_name: existing.name.clone(),
-            });
-        }
-        self.keys.push(entry);
-        Ok(())
+        self.salt.as_ref().map(|s| fingerprint(s, serial))
     }
 
-    /// Remove the entry with `name`. Returns true if one was removed.
-    pub fn remove(&mut self, name: &str) -> bool {
-        let before = self.keys.len();
-        self.keys.retain(|k| k.name != name);
-        self.keys.len() != before
+    fn is_of(r: &KeyRecord, fp: &Option<Fingerprint>) -> bool {
+        fp.is_some() && r.fingerprint == *fp
     }
 
-    pub fn by_name(&self, name: &str) -> Option<&KeyEntry> {
-        self.keys.iter().find(|k| k.name == name)
+    /// The record that claims `name`, if any (names are unique in the file).
+    pub fn holder(&self, name: &str) -> Option<&KeyRecord> {
+        self.keys.iter().find(|r| r.name == name)
     }
 
-    pub fn by_serial(&self, serial: &str) -> Option<&KeyEntry> {
-        self.keys.iter().find(|k| k.serial == serial)
-    }
-
-    /// The friendly name for a connected device's serial, if one is registered.
-    /// Used by `list` to annotate devices.
-    pub fn name_for(&self, serial: Option<&str>) -> Option<&str> {
-        let serial = serial?;
-        self.by_serial(serial).map(|k| k.name.as_str())
-    }
-
-    /// Resolve a `--device` name to a connected device by matching serials.
-    /// Fails closed when more than one live device advertises the entry's serial
-    /// (KEY-015): a cloned/duplicate serial must never silently pick the first.
-    pub fn resolve<'a>(
-        &self,
-        name: &str,
-        connected: &'a [ConnectedKey],
-    ) -> Result<&'a ConnectedKey, ResolveError> {
-        let entry = self
-            .by_name(name)
-            .ok_or_else(|| ResolveError::UnknownName {
-                name: name.to_string(),
-                known: self.keys.iter().map(|k| k.name.clone()).collect(),
-            })?;
-        let matches: Vec<&ConnectedKey> = connected
+    /// This computer's own (`stored = computer`) name for the key with
+    /// `serial`.
+    pub fn local_name_for(&self, serial: &str) -> Option<&str> {
+        let fp = self.fingerprint_of(serial);
+        self.keys
             .iter()
-            .filter(|d| d.serial.as_deref() == Some(entry.serial.as_str()))
-            .collect();
-        match matches.as_slice() {
-            [] => Err(ResolveError::NotConnected {
-                name: name.to_string(),
-                serial: entry.serial.clone(),
-            }),
-            [one] => Ok(one),
-            many => Err(ResolveError::Ambiguous {
-                name: name.to_string(),
-                serial: entry.serial.clone(),
-                count: many.len(),
-            }),
-        }
+            .find(|r| r.stored == NameStore::Computer && Self::is_of(r, &fp))
+            .map(|r| r.name.as_str())
     }
+
+    /// Transitional alias for [`Keyring::local_name_for`] while callers move
+    /// to the record-based API.
+    #[deprecated(note = "use local_name_for")]
+    pub fn name_for(&self, serial: Option<&str>) -> Option<&str> {
+        self.local_name_for(serial?)
+    }
+
+    /// Every record of the key with `serial`.
+    pub fn records_for(&self, serial: &str) -> Vec<&KeyRecord> {
+        let fp = self.fingerprint_of(serial);
+        self.keys.iter().filter(|r| Self::is_of(r, &fp)).collect()
+    }
+
+    /// Name (or rename) the key with `serial` in `store`. Refuses
+    /// [`KeyringError::DuplicateName`] when another key's record holds `name`.
+    /// `Computer` replaces this key's computer record; `Key` replaces this
+    /// key's key records and drops its computer record (one name, one place).
+    /// The new record takes the place of the first one it replaces, so a
+    /// rename keeps the file's order.
+    pub fn set_name(
+        &mut self,
+        serial: &str,
+        name: &str,
+        store: NameStore,
+        meta: RecordMeta,
+    ) -> Result<(), KeyringError> {
+        validate_name(name)?;
+        if canonical_serial(serial).is_empty() {
+            return Err(KeyringError::NoSerial);
+        }
+        let fp = Some(fingerprint(self.ensure_salt()?, serial));
+        if let Some(h) = self.holder(name) {
+            if !Self::is_of(h, &fp) {
+                return Err(KeyringError::DuplicateName(name.to_string()));
+            }
+        }
+        let replaced = |r: &KeyRecord| {
+            Self::is_of(r, &fp)
+                && (store == NameStore::Key || r.stored == NameStore::Computer || r.name == name)
+        };
+        let mut record = KeyRecord {
+            name: name.to_string(),
+            fingerprint: fp.clone(),
+            stored: store,
+            source: meta.source,
+            vendor: meta.vendor,
+            aaguid: None,
+            note: None,
+        };
+        sanitize_record(&mut record);
+        // The new record takes the slot of the first one it replaces; no
+        // record before that one is removed, so the index still holds.
+        let at = self.keys.iter().position(&replaced);
+        self.keys.retain(|r| !replaced(r));
+        match at {
+            Some(i) => self.keys.insert(i, record),
+            None => self.keys.push(record),
+        }
+        Ok(())
+    }
+
+    /// First sight of a name stored on the key with `serial`: record it
+    /// (`stored = key`) only if no record holds `name` yet. Returns whether a
+    /// record was added.
+    pub fn record_first_seen(&mut self, serial: &str, name: &str) -> bool {
+        if validate_name(name).is_err()
+            || canonical_serial(serial).is_empty()
+            || self.holder(name).is_some()
+        {
+            return false;
+        }
+        let Ok(salt) = self.ensure_salt() else {
+            return false;
+        };
+        let fp = fingerprint(salt, serial);
+        self.keys.push(KeyRecord {
+            name: name.to_string(),
+            fingerprint: Some(fp),
+            stored: NameStore::Key,
+            source: IdSource::default(),
+            vendor: None,
+            aaguid: None,
+            note: None,
+        });
+        true
+    }
+
+    /// Drop this key's `stored = key` records whose name differs from
+    /// `current` (the name now on the key). Returns how many were dropped.
+    pub fn drop_stale_key_records(&mut self, serial: &str, current: &str) -> usize {
+        let fp = self.fingerprint_of(serial);
+        let before = self.keys.len();
+        self.keys
+            .retain(|r| !(Self::is_of(r, &fp) && r.stored == NameStore::Key && r.name != current));
+        before - self.keys.len()
+    }
+
+    /// Remove every record of the key with `serial`, returning them.
+    pub fn clear_key(&mut self, serial: &str) -> Vec<KeyRecord> {
+        let fp = self.fingerprint_of(serial);
+        let (gone, kept) = std::mem::take(&mut self.keys)
+            .into_iter()
+            .partition(|r| Self::is_of(r, &fp));
+        self.keys = kept;
+        gone
+    }
+
+    /// Remove the record holding `name`.
+    pub fn remove(&mut self, name: &str) -> Option<KeyRecord> {
+        let i = self.keys.iter().position(|r| r.name == name)?;
+        Some(self.keys.remove(i))
+    }
+}
+
+/// The directory holding `keys.json` (and so `keys.salt`).
+fn salt_dir(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+/// A parse error without the offending text: serde's messages can quote a
+/// value, and a value in keys.json may be a serial number.
+fn parse_error(e: &serde_json::Error) -> KeyringError {
+    let kind = match e.classify() {
+        serde_json::error::Category::Io => "unreadable",
+        serde_json::error::Category::Syntax => "invalid JSON",
+        serde_json::error::Category::Data => "unexpected contents",
+        serde_json::error::Category::Eof => "truncated",
+    };
+    if e.line() == 0 {
+        KeyringError::Parse(kind.to_string())
+    } else {
+        KeyringError::Parse(format!(
+            "{kind} at line {}, column {}",
+            e.line(),
+            e.column()
+        ))
+    }
+}
+
+/// Tell the formats apart: `version: 2` is v2; no `version` and a `keys`
+/// array whose every entry carries a `serial` (or no entries) is v1.
+fn parse(text: &str) -> Result<Format, KeyringError> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| parse_error(&e))?;
+    match value.get("version") {
+        Some(v) if v.as_u64() == Some(FORMAT_VERSION) => serde_json::from_value(value)
+            .map(Format::V2)
+            .map_err(|e| parse_error(&e)),
+        Some(_) => Err(KeyringError::Parse("unsupported version".into())),
+        None if is_v1(&value) => serde_json::from_value(value)
+            .map(Format::V1)
+            .map_err(|e| parse_error(&e)),
+        None => Err(KeyringError::Parse("unrecognized keys.json layout".into())),
+    }
+}
+
+fn is_v1(value: &serde_json::Value) -> bool {
+    value
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|keys| {
+            keys.iter()
+                .all(|k| k.get("serial").is_some_and(serde_json::Value::is_string))
+        })
+}
+
+/// Version 1 entries as v2 records: the serial becomes this computer's
+/// fingerprint (`None` for an empty serial) and every name was this
+/// computer's own. Fields are sanitized as a v1 load always did.
+fn convert_v1(salt: &Salt, old: FileV1) -> Vec<KeyRecord> {
+    old.keys
+        .into_iter()
+        .map(|e| {
+            let mut r = KeyRecord {
+                fingerprint: (!canonical_serial(&e.serial).is_empty())
+                    .then(|| fingerprint(salt, &e.serial)),
+                name: e.name,
+                stored: NameStore::Computer,
+                source: e.source,
+                vendor: e.vendor,
+                aaguid: e.aaguid,
+                note: e.note,
+            };
+            sanitize_record(&mut r);
+            r
+        })
+        .collect()
+}
+
+/// Write a sibling temp file and rename it into place: a crash mid-write can
+/// never corrupt the registry, and the file is created owner-only — which
+/// security keys a person owns is their business — instead of inheriting the
+/// umask default (typically world-readable).
+fn write_atomic(path: &Path, json: &str) -> Result<(), KeyringError> {
+    let tmp = path.with_extension("json.tmp");
+    // Remove any stale temp file so `create_new` below can succeed.
+    // `create_new` (not `create`) matters twice over: a pre-existing file
+    // would keep its old permissions (the 0o600 applies only at creation),
+    // and a symlink planted at the temp path would otherwise be followed.
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        let mut f = opts.open(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn entry(name: &str, serial: &str) -> KeyEntry {
-        KeyEntry {
-            name: name.into(),
-            serial: serial.into(),
-            source: IdSource::Usb,
-            vendor: None,
-            aaguid: None,
-            note: None,
+    /// A fresh, empty directory under the system temp dir, unique per test.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("keyroost-kr-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn meta() -> RecordMeta {
+        RecordMeta::default()
+    }
+
+    fn names(k: &Keyring) -> Vec<(&str, NameStore)> {
+        k.keys.iter().map(|r| (r.name.as_str(), r.stored)).collect()
+    }
+
+    #[test]
+    fn set_name_computer_renames_in_place() {
+        let mut k = Keyring::default();
+        k.set_name("12345678", "first", NameStore::Computer, meta())
+            .unwrap();
+        k.set_name("ABCDEF01", "other", NameStore::Computer, meta())
+            .unwrap();
+        k.set_name(" 12345678 ", "renamed", NameStore::Computer, meta())
+            .unwrap();
+        assert_eq!(
+            names(&k),
+            vec![
+                ("renamed", NameStore::Computer),
+                ("other", NameStore::Computer)
+            ]
+        );
+        assert_eq!(k.local_name_for("12345678"), Some("renamed"));
+        assert_eq!(k.local_name_for("abcdef01"), Some("other"));
+        // Setting the same name again is not a duplicate of itself.
+        k.set_name("12345678", "renamed", NameStore::Computer, meta())
+            .unwrap();
+        assert_eq!(k.keys.len(), 2);
+    }
+
+    #[test]
+    fn set_name_key_drops_the_local_record() {
+        let mut k = Keyring::default();
+        k.set_name("12345678", "local", NameStore::Computer, meta())
+            .unwrap();
+        k.set_name("12345678", "on key", NameStore::Key, meta())
+            .unwrap();
+        assert_eq!(names(&k), vec![("on key", NameStore::Key)]);
+        assert_eq!(k.local_name_for("12345678"), None);
+        // A second key-store name replaces the first.
+        k.set_name("12345678", "on key 2", NameStore::Key, meta())
+            .unwrap();
+        assert_eq!(names(&k), vec![("on key 2", NameStore::Key)]);
+    }
+
+    #[test]
+    fn duplicate_name_on_another_key_is_refused() {
+        let mut k = Keyring::default();
+        k.set_name("12345678", "work", NameStore::Computer, meta())
+            .unwrap();
+        for store in [NameStore::Computer, NameStore::Key] {
+            assert!(matches!(
+                k.set_name("ABCDEF01", "work", store, meta()),
+                Err(KeyringError::DuplicateName(_))
+            ));
         }
+        assert!(matches!(
+            k.set_name("ABCDEF01", "bad\u{202E}", NameStore::Computer, meta()),
+            Err(KeyringError::InvalidName(_))
+        ));
+        assert!(matches!(
+            k.set_name("  ", "fine", NameStore::Computer, meta()),
+            Err(KeyringError::NoSerial)
+        ));
+        assert_eq!(k.keys.len(), 1);
+    }
+
+    #[test]
+    fn record_first_seen_only_when_unclaimed() {
+        let mut k = Keyring::default();
+        k.set_name("12345678", "taken", NameStore::Computer, meta())
+            .unwrap();
+        assert!(!k.record_first_seen("ABCDEF01", "taken"));
+        assert!(!k.record_first_seen("", "free"));
+        assert!(!k.record_first_seen("ABCDEF01", "bad\u{200B}"));
+        assert!(k.record_first_seen("ABCDEF01", "free"));
+        assert!(!k.record_first_seen("00000000", "free"));
+        let r = k.holder("free").unwrap();
+        assert_eq!(r.stored, NameStore::Key);
+        assert_eq!(r.fingerprint, k.fingerprint_of("abcdef01"));
+    }
+
+    #[test]
+    fn drop_stale_key_records_keeps_computer_records() {
+        let mut k = Keyring::default();
+        k.set_name("12345678", "local", NameStore::Computer, meta())
+            .unwrap();
+        assert!(k.record_first_seen("12345678", "old label"));
+        assert!(k.record_first_seen("12345678", "current"));
+        assert!(k.record_first_seen("ABCDEF01", "elsewhere"));
+        assert_eq!(k.drop_stale_key_records("12345678", "current"), 1);
+        assert_eq!(
+            names(&k),
+            vec![
+                ("local", NameStore::Computer),
+                ("current", NameStore::Key),
+                ("elsewhere", NameStore::Key)
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_key_removes_every_record() {
+        let mut k = Keyring::default();
+        k.set_name("12345678", "local", NameStore::Computer, meta())
+            .unwrap();
+        assert!(k.record_first_seen("12345678", "label"));
+        assert!(k.record_first_seen("ABCDEF01", "other"));
+        let gone = k.clear_key("12345678");
+        assert_eq!(gone.len(), 2);
+        assert_eq!(names(&k), vec![("other", NameStore::Key)]);
+        assert!(k.records_for("12345678").is_empty());
+        assert_eq!(k.records_for("ABCDEF01").len(), 1);
+        assert_eq!(k.remove("other").map(|r| r.name), Some("other".into()));
+        assert!(k.remove("other").is_none());
+    }
+
+    #[test]
+    fn local_name_for_ignores_key_records() {
+        let mut k = Keyring::default();
+        assert!(k.record_first_seen("12345678", "label"));
+        assert_eq!(k.local_name_for("12345678"), None);
+        assert_eq!(k.records_for("12345678").len(), 1);
+        assert_eq!(k.local_name_for(""), None);
+        assert_eq!(k.fingerprint_of("   "), None);
+    }
+
+    #[test]
+    fn a_fresh_ring_matches_nothing_and_never_panics() {
+        let k = Keyring::default();
+        assert_eq!(k.fingerprint_of("12345678"), None);
+        assert_eq!(k.local_name_for("12345678"), None);
+        assert!(k.records_for("12345678").is_empty());
+    }
+
+    #[test]
+    fn v2_round_trip_keeps_records_and_matches() {
+        let dir = temp_dir("roundtrip");
+        let path = dir.join("keys.json");
+        let mut k = Keyring::default();
+        k.set_name(
+            "12345678",
+            "signing-yubikey",
+            NameStore::Computer,
+            RecordMeta {
+                source: IdSource::Ccid,
+                vendor: Some("yubico".into()),
+            },
+        )
+        .unwrap();
+        assert!(k.record_first_seen("ABCDEF01", "lab key"));
+        k.save_to(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["keys"][0]["stored"], "computer");
+        assert_eq!(v["keys"][0]["vendor"], "yubico");
+        assert_eq!(v["keys"][1]["stored"], "key");
+        assert!(!text.contains("12345678") && !text.to_lowercase().contains("abcdef01"));
+
+        let back = Keyring::load_from(&path).unwrap();
+        assert_eq!(back.local_name_for("12345678"), Some("signing-yubikey"));
+        assert_eq!(back.keys[0].source, IdSource::Ccid);
+        assert_eq!(back.holder("lab key").unwrap().stored, NameStore::Key);
+        assert_eq!(back.records_for("abcdef01").len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_missing_is_empty() {
+        let dir = temp_dir("missing");
+        let k = Keyring::load_from(&dir.join("keys.json")).unwrap();
+        assert!(k.keys.is_empty());
+        // Loading wrote nothing.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_sanitizes_invalid_names_and_strips_control_chars() {
+        let dir = temp_dir("sanitize");
+        let path = dir.join("keys.json");
+
+        // A name with an ANSI escape is sanitized, not fatal: one bad
+        // hand-edited entry must never make the whole registry unloadable
+        // (an unwrap_or_default + save would wipe every other entry).
+        fs::write(
+            &path,
+            "{\"version\":2,\"keys\":[{\"name\":\"evil\\u001b[31m\",\"fingerprint\":null,\"stored\":\"computer\"},{\"name\":\"good\",\"fingerprint\":null,\"stored\":\"key\"}]}",
+        )
+        .unwrap();
+        let k = Keyring::load_from(&path).unwrap();
+        assert_eq!(k.keys[0].name, "evil[31m");
+        assert_eq!(k.keys[1].name, "good");
+
+        // Control chars in free-text fields are stripped, not fatal.
+        fs::write(
+            &path,
+            "{\"version\":2,\"keys\":[{\"name\":\"ok\",\"stored\":\"computer\",\"vendor\":\"y\\u001b[2Jk\",\"note\":\"a\\u0007b\"}]}",
+        )
+        .unwrap();
+        let k = Keyring::load_from(&path).unwrap();
+        assert_eq!(k.keys[0].vendor.as_deref(), Some("y[2Jk"));
+        assert_eq!(k.keys[0].note.as_deref(), Some("ab"));
+        assert_eq!(k.keys[0].fingerprint, None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_name_sanitizes_device_supplied_fields() {
+        let mut k = Keyring::default();
+        k.set_name(
+            "12345678",
+            "weird",
+            NameStore::Computer,
+            RecordMeta {
+                source: IdSource::Usb,
+                vendor: Some("v\u{1b}[31m\u{202E}x".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(k.keys[0].vendor.as_deref(), Some("v[31mx"));
+        // A serial with spoofing characters matches its cleaned form, as an
+        // older file stored it.
+        assert_eq!(k.local_name_for("1234\u{200B}5678"), Some("weird"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perm");
+        let path = dir.join("keys.json");
+        let mut k = Keyring::default();
+        k.set_name("12345678", "test-key", NameStore::Computer, meta())
+            .unwrap();
+        k.save_to(&path).unwrap();
+        for f in [&path, &dir.join(SALT_FILE)] {
+            let mode = fs::metadata(f).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{} must be owner-only", f.display());
+        }
+        // No temp file left behind.
+        assert!(!path.with_extension("json.tmp").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v1_file_reads_in_memory_and_is_never_overwritten_unconverted() {
+        let dir = temp_dir("v1-read");
+        let path = dir.join("keys.json");
+        let v1 = r#"{"keys":[{"name":"yubi","serial":"12345678","source":"ccid"},{"name":"blank","serial":""}]}"#;
+        fs::write(&path, v1).unwrap();
+        let mut k = Keyring::load_from(&path).unwrap();
+        assert_eq!(k.local_name_for("12345678"), Some("yubi"));
+        assert_eq!(k.keys[0].source, IdSource::Ccid);
+        assert_eq!(k.keys[1].fingerprint, None);
+        assert!(matches!(k.save_to(&path), Err(KeyringError::Unconverted)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), v1);
+        // An empty old-format file is old-format too.
+        fs::write(&path, r#"{"keys":[]}"#).unwrap();
+        assert!(Keyring::load_from(&path).unwrap().keys.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_errors_never_quote_the_file() {
+        let dir = temp_dir("parse-err");
+        let path = dir.join("keys.json");
+        for bad in [
+            r#"{"keys":[{"name":"x","serial":12345678}]}"#,
+            r#"{"keys":[{"name":"x","serial":"12345678"},{"name":7,"serial":"ABCDEF01"}]}"#,
+            r#"{"version":2,"keys":[{"name":"x","stored":"12345678"}]}"#,
+            r#"{"keys":[{"name":"x","serial":"12345678""#,
+        ] {
+            fs::write(&path, bad).unwrap();
+            let e = Keyring::load_from(&path).unwrap_err().to_string();
+            assert!(matches!(
+                Keyring::load_from(&path),
+                Err(KeyringError::Parse(_))
+            ));
+            assert!(
+                !e.contains("12345678") && !e.to_lowercase().contains("abcdef01"),
+                "{e}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_never_pairs_fingerprints_with_a_foreign_salt() {
+        let dir = temp_dir("foreign-salt");
+        let path = dir.join("keys.json");
+        let mut k = Keyring::default();
+        k.set_name("12345678", "a", NameStore::Computer, meta())
+            .unwrap();
+        // Another process writes its own salt first.
+        let other = generate_salt().unwrap();
+        persist_salt(&dir, &other).unwrap();
+        assert!(k.save_to(&path).is_err());
+        assert!(!path.exists());
+        assert_eq!(load_salt(&dir).unwrap(), Some(other));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -574,208 +1144,6 @@ mod tests {
         }
         assert!(!is_spoofing_char('a'));
         assert!(!is_spoofing_char('世'));
-    }
-
-    #[test]
-    fn add_rejects_duplicates() {
-        let mut k = Keyring::default();
-        k.add(entry("a", "111")).unwrap();
-        assert!(matches!(
-            k.add(entry("a", "222")),
-            Err(KeyringError::DuplicateName(_))
-        ));
-        assert!(matches!(
-            k.add(entry("b", "111")),
-            Err(KeyringError::DuplicateSerial { .. })
-        ));
-        k.add(entry("b", "222")).unwrap();
-        assert_eq!(k.keys.len(), 2);
-    }
-
-    #[test]
-    fn remove_and_lookup() {
-        let mut k = Keyring::default();
-        k.add(entry("solo", "ABC")).unwrap();
-        assert_eq!(k.by_name("solo").map(|e| e.serial.as_str()), Some("ABC"));
-        assert_eq!(k.name_for(Some("ABC")), Some("solo"));
-        assert_eq!(k.name_for(Some("XYZ")), None);
-        assert_eq!(k.name_for(None), None);
-        assert!(k.remove("solo"));
-        assert!(!k.remove("solo"));
-    }
-
-    #[test]
-    fn resolve_matches_by_serial() {
-        let mut k = Keyring::default();
-        k.add(entry("solo", "ABC")).unwrap();
-        let connected = vec![
-            ConnectedKey {
-                path: "/dev/hidraw5".into(),
-                serial: Some("ABC".into()),
-                label: "Solo 2".into(),
-            },
-            ConnectedKey {
-                path: "/dev/hidraw9".into(),
-                serial: None,
-                label: "YubiKey".into(),
-            },
-        ];
-        assert_eq!(
-            k.resolve("solo", &connected).unwrap().path,
-            PathBuf::from("/dev/hidraw5")
-        );
-        assert!(matches!(
-            k.resolve("nope", &connected),
-            Err(ResolveError::UnknownName { .. })
-        ));
-        assert!(matches!(
-            k.resolve("solo", &[]),
-            Err(ResolveError::NotConnected { .. })
-        ));
-    }
-
-    #[test]
-    fn resolve_fails_closed_on_duplicate_live_serials() {
-        let mut kr = Keyring::default();
-        kr.keys.push(entry("work", "DUP123"));
-
-        let connected = vec![
-            ConnectedKey {
-                path: "/dev/hidraw0".into(),
-                serial: Some("DUP123".into()),
-                label: "Key A".into(),
-            },
-            ConnectedKey {
-                path: "/dev/hidraw1".into(),
-                serial: Some("DUP123".into()),
-                label: "Key B".into(),
-            },
-        ];
-
-        match kr.resolve("work", &connected) {
-            Err(ResolveError::Ambiguous { name, count, .. }) => {
-                assert_eq!(name, "work");
-                assert_eq!(count, 2);
-            }
-            other => panic!("expected Ambiguous, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn json_round_trip_and_defaults() {
-        let mut k = Keyring::default();
-        k.add(KeyEntry {
-            name: "signing-yubikey".into(),
-            serial: "37806840".into(),
-            source: IdSource::Ccid,
-            vendor: Some("yubico".into()),
-            aaguid: None,
-            note: Some("daily".into()),
-        })
-        .unwrap();
-        let json = serde_json::to_string_pretty(&k).unwrap();
-        let back: Keyring = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.keys[0].name, "signing-yubikey");
-        assert_eq!(back.keys[0].source, IdSource::Ccid);
-        assert_eq!(back.keys[0].vendor.as_deref(), Some("yubico"));
-
-        // `source` defaults to Usb when absent in JSON.
-        let minimal: Keyring =
-            serde_json::from_str(r#"{"keys":[{"name":"x","serial":"S1"}]}"#).unwrap();
-        assert_eq!(minimal.keys[0].source, IdSource::Usb);
-    }
-
-    #[test]
-    fn load_missing_is_empty() {
-        let k = Keyring::load_from(Path::new("/nonexistent/keyroost/keys.json")).unwrap();
-        assert!(k.keys.is_empty());
-    }
-
-    #[test]
-    fn load_sanitizes_invalid_names_and_strips_control_chars() {
-        let dir = std::env::temp_dir().join(format!("keyroost-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("keys.json");
-
-        // A name with an ANSI escape is sanitized, not fatal: one bad
-        // hand-edited entry must never make the whole registry unloadable
-        // (an unwrap_or_default + save would wipe every other entry).
-        std::fs::write(
-            &path,
-            "{\"keys\":[{\"name\":\"evil\\u001b[31m\",\"serial\":\"S1\"},{\"name\":\"good\",\"serial\":\"S2\"}]}",
-        )
-        .unwrap();
-        let k = Keyring::load_from(&path).unwrap();
-        assert_eq!(k.keys[0].name, "evil[31m");
-        assert_eq!(k.keys[1].name, "good");
-
-        // Control chars in free-text fields are stripped, not fatal.
-        std::fs::write(
-            &path,
-            "{\"keys\":[{\"name\":\"ok\",\"serial\":\"S\\u001b[2J1\",\"note\":\"a\\u0007b\"}]}",
-        )
-        .unwrap();
-        let k = Keyring::load_from(&path).unwrap();
-        assert_eq!(k.keys[0].serial, "S[2J1");
-        assert_eq!(k.keys[0].note.as_deref(), Some("ab"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn add_sanitizes_device_supplied_fields() {
-        // A device-reported serial with control chars must be stored in the
-        // same form load_from would produce, or the entry mutates on reload.
-        let mut k = Keyring::default();
-        k.add(KeyEntry {
-            name: "weird".into(),
-            serial: "AB\u{1b}[31mCD".into(),
-            source: IdSource::Usb,
-            vendor: None,
-            aaguid: None,
-            note: Some("x\u{7}y".into()),
-        })
-        .unwrap();
-        assert_eq!(k.keys[0].serial, "AB[31mCD");
-        assert_eq!(k.keys[0].note.as_deref(), Some("xy"));
-
-        // Unicode format chars (Cf) used for display spoofing go too: RLO
-        // would render "evil-yek" as "key-live" in a terminal listing.
-        let mut k2 = Keyring::default();
-        k2.add(KeyEntry {
-            name: "bidi".into(),
-            serial: "S\u{202E}9\u{200B}9".into(),
-            source: IdSource::Usb,
-            vendor: None,
-            aaguid: None,
-            note: None,
-        })
-        .unwrap();
-        assert_eq!(k2.keys[0].serial, "S99");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn save_creates_owner_only_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("keyroost-perm-{}", std::process::id()));
-        let path = dir.join("keys.json");
-        let mut k = Keyring::default();
-        k.add(KeyEntry {
-            name: "test-key".into(),
-            serial: "S1".into(),
-            source: IdSource::Usb,
-            vendor: None,
-            aaguid: None,
-            note: None,
-        })
-        .unwrap();
-        k.save_to(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "keys.json must be owner-only");
-        // No temp file left behind.
-        assert!(!path.with_extension("json.tmp").exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

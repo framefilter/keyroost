@@ -7909,7 +7909,7 @@ impl App {
                         if let Some(id) = for_device.clone() {
                             let named = keyroost_keyring::Keyring::load_default()
                                 .ok()
-                                .and_then(|k| k.name_for(Some(&info.serial)).map(str::to_owned));
+                                .and_then(|k| k.local_name_for(&info.serial).map(str::to_owned));
                             if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
                                 dev.serial = info.serial.clone();
                                 if dev.name.is_none() {
@@ -9620,29 +9620,21 @@ impl App {
         let cleared = name.is_empty();
         let new_display = if cleared { implicit } else { name.clone() };
         let mut keyring = keyroost_keyring::Keyring::load_default().unwrap_or_default();
-        // Drop the target's prior name — by the name pinned at open, then by
-        // serial as a belt-and-braces (covers a name changed under us). This
-        // covers both rename and clear.
-        if let Some(current) = target.name_at_open.clone() {
-            keyring.remove(&current);
-        }
-        if let Some(existing) = keyring.name_for(Some(&target.serial)) {
-            let existing = existing.to_owned();
-            keyring.remove(&existing);
-        }
-        if !name.is_empty() {
-            let entry = keyroost_keyring::KeyEntry {
-                name,
-                serial: target.serial.clone(),
+        // A rename replaces this key's computer name in place; clearing drops
+        // every record of the key.
+        if cleared {
+            keyring.clear_key(&target.serial);
+        } else if let Err(e) = keyring.set_name(
+            &target.serial,
+            &name,
+            keyroost_keyring::NameStore::Computer,
+            keyroost_keyring::RecordMeta {
                 source: keyroost_keyring::IdSource::default(),
                 vendor,
-                aaguid: None,
-                note: None,
-            };
-            if let Err(e) = keyring.add(entry) {
-                self.log(Severity::Err, format!("name: {e}"));
-                return; // keep the field open; nothing was saved
-            }
+            },
+        ) {
+            self.log(Severity::Err, format!("name: {e}"));
+            return; // keep the field open; nothing was saved
         }
         match keyring.save_default() {
             // Name the before and after explicitly rather than leaning on the

@@ -502,6 +502,9 @@ fn bind_readers(
 /// key. Pure: all I/O is done by the caller ([`enumerate`], [`correlate_live`]),
 /// including the device-reported identities in `ids`. The `hids` slice may
 /// contain non-FIDO nodes; they are filtered here.
+// `name_for` is the keyring's transitional shim until the naming pass replaces
+// these per-row lookups.
+#[allow(deprecated)]
 pub fn correlate_with(
     hids: &[HidDevice],
     probes: &[ReaderProbe],
