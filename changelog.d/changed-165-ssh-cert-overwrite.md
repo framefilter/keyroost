@@ -1,2 +1,2 @@
-- **`fido ssh-cert extract --force` is now `--overwrite`.** The old name is
-  gone. ([#165])
+- **`fido ssh extract` takes `--overwrite`, not `--force`.** The old
+  `ssh-cert extract --force` is gone. ([#165])
