@@ -31,14 +31,14 @@ tool. Workspace contains:
 | `keyroost-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
 | `keyroost-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets | `pcsc`; `aes`/`des`/`cipher`/`getrandom`/`zeroize` (PIV mgmt-key auth); `hidapi` (non-Linux HID) |
 | `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs | `hidapi` (non-Linux only; Linux uses sysfs) |
-| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt, largeBlob | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`aes-gcm`), `rand_core`, `zeroize`, `miniz_oxide` (largeBlob DEFLATE); `hidapi` (non-Linux HID) |
+| `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt, largeBlob (incl. the on-key name entry, `docs/PROTOCOL-device-label.md`) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`aes-gcm`), `rand_core`, `zeroize`, `miniz_oxide` (largeBlob DEFLATE); `hidapi` (non-Linux HID) |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
 | `keyroost-piv` | Pure-Rust PIV (SP 800-73-4) byte layer; full management (status, GENERAL AUTHENTICATE, key-gen, cert import, PIN/PUK/mgmt-key, reset) + SPKI/PEM | `zeroize` |
 | `keyroost-token2otp` | Pure-Rust Token2 OTP-on-FIDO management byte layer (APDU + HID framing, ECDH+AES seed encryption) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`), `rand_core`, `zeroize` |
 | `keyroost-token2prog` | Pure-Rust Token2 2nd-gen single-profile programmable-token protocol (SM4 seed/MAC, config TLV); reuses `keyroost-proto` | `zeroize` |
-| `keyroost-keyring` | Friendly-name registry (`keys.json`); serial matching, no hardware | `serde`, `serde_json` |
-| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) | in-tree only |
+| `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints); no hardware | `serde`, `serde_json`, `getrandom` (per-computer salt); in-tree `keyroost-proto` (SHA-256) |
+| `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (on-key names, first-seen records) | in-tree only (incl. `keyroost-ctap`) |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading for OpenPGP import | `rsa`, `rand`, `zeroize` (scoped exception) |
 | `keyroost-pivtest` | Host-side verification for the PIV slot self-test (`piv test`): fixed challenges checked against the slot certificate's public key | `rsa`, `p256`/`p384`/`p521` (ECDH), `ed25519-dalek`, `x25519-dalek`, `zeroize` (scoped exception) |
 | `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`/`aes-gcm`/`base64` (behind `encrypted`, for Aegis vaults) |
