@@ -163,6 +163,7 @@ struct FileIn {
 /// A version 1 file: no `version`, one entry per name with its plain serial.
 #[derive(Deserialize)]
 struct FileV1 {
+    #[serde(default)]
     keys: Vec<EntryV1>,
 }
 
@@ -887,7 +888,8 @@ fn damaged(e: &serde_json::Error) -> KeyringError {
 }
 
 /// Tell the formats apart: `version: 2` is v2; no `version` and a `keys`
-/// array whose every entry carries a `serial` (or no entries) is v1.
+/// array whose every entry carries a `serial` (or no entries) is v1, as is
+/// an empty object `{}` (v0.12 read a missing `keys` as empty).
 fn parse(text: &str) -> Result<Format, KeyringError> {
     let value: serde_json::Value = serde_json::from_str(text).map_err(|e| damaged(&e))?;
     match value.get("version").map(serde_json::Value::as_u64) {
@@ -904,6 +906,9 @@ fn parse(text: &str) -> Result<Format, KeyringError> {
 }
 
 fn is_v1(value: &serde_json::Value) -> bool {
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return true;
+    }
     value
         .get("keys")
         .and_then(serde_json::Value::as_array)
@@ -1245,6 +1250,24 @@ mod tests {
 
     fn backup_of(path: &Path) -> PathBuf {
         path.with_file_name("keys.json.v1-backup")
+    }
+
+    #[test]
+    fn v1_without_keys_field_loads_as_empty_ring() {
+        // v0.12 accepted `{}` (its `keys` defaulted); it is an empty v1
+        // file, not a damaged one, and saving works afterwards.
+        let dir = temp_dir("v1-empty-object");
+        let path = dir.join("keys.json");
+        fs::write(&path, "{}").unwrap();
+        let mut k = Keyring::load_from(&path).unwrap();
+        assert!(k.keys.is_empty());
+        assert_eq!(k.load_report().map(|r| r.converted), Some(0));
+        k.set_name("12345678", "Work", NameStore::Computer, meta())
+            .unwrap();
+        k.save_to(&path).unwrap();
+        let again = Keyring::load_from(&path).unwrap();
+        assert!(again.holder("Work").is_some());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
