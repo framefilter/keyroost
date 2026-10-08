@@ -985,9 +985,25 @@ pub fn take_scan_warnings() -> Vec<String> {
 /// problem is reported once per process, and the returned flag is `false`
 /// so nothing learned during the scan is ever saved over it (and no name
 /// read from a key becomes selectable, since none can be recorded).
-pub fn load_keyring_for_scan() -> (Keyring, bool) {
+/// With `debug`, a load that converted a version 1 file prints one trace
+/// line with counts only.
+pub fn load_keyring_for_scan(debug: bool) -> (Keyring, bool) {
     match Keyring::load_default() {
-        Ok(k) => (k, true),
+        Ok(k) => {
+            if let (true, Some(r)) = (debug, k.load_report()) {
+                let line = format!(
+                    "converted keys.json to version 2: {}; {}",
+                    plural(r.converted, "record", "records"),
+                    if r.persisted {
+                        "saved"
+                    } else {
+                        "not saved yet (the old file is kept; the next save retries)"
+                    }
+                );
+                eprintln!("{}", format_line(Dir::Note, "names", &line));
+            }
+            (k, true)
+        }
         Err(keyroost_keyring::KeyringError::NoConfigDir) => (Keyring::default(), false),
         Err(e) => {
             warn_once(format!(
@@ -1272,7 +1288,7 @@ pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool,
 /// (`skip_key_names`), loading `keys.json` itself: for a caller that learns
 /// only after scanning that it needs names stored on keys.
 pub fn add_key_names(devices: &mut [Device], debug: bool) {
-    let (keyring, may_save) = load_keyring_for_scan();
+    let (keyring, may_save) = load_keyring_for_scan(debug);
     name_from_keys(devices, &keyring, may_save, debug);
 }
 
@@ -1280,7 +1296,7 @@ pub fn add_key_names(devices: &mut [Device], debug: bool) {
 pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
     let probes = keyroost_transport::probe_readers().unwrap_or_default();
-    let (keyring, may_save) = load_keyring_for_scan();
+    let (keyring, may_save) = load_keyring_for_scan(opts.debug);
     if opts.skip_identity_reads {
         return Ok(correlate(&hids, &probes, &keyring));
     }

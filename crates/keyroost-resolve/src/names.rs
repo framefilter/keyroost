@@ -211,16 +211,24 @@ pub fn apply_names(
             } else if !canon.is_empty() {
                 shown = Some(format!("{l} ({})", shown_tail(&serial)));
             }
-            if !canon.is_empty()
-                && keyring
-                    .records_for(&serial)
+            // Stale records may sit under either serial the row is known by.
+            let mut seen: Vec<String> = Vec::new();
+            for s in &known {
+                let c = canonical_serial(s);
+                if seen.contains(&c) {
+                    continue;
+                }
+                seen.push(c);
+                if keyring
+                    .records_for(s)
                     .iter()
                     .any(|r| r.stored == NameStore::Key && r.name != *l)
-            {
-                updates.push(NameUpdate::DropStale {
-                    serial: serial.clone(),
-                    current: l.clone(),
-                });
+                {
+                    updates.push(NameUpdate::DropStale {
+                        serial: s.to_string(),
+                        current: l.clone(),
+                    });
+                }
             }
         } else {
             if let Some(n) = known.iter().find_map(|s| keyring.local_name_for(s)) {
@@ -229,12 +237,14 @@ pub fn apply_names(
                 naming.selectable = true;
                 shown = Some(n.to_string());
             }
-            if on_key == KeyLabel::Absent && !canon.is_empty() {
-                naming.missing_on_key = keyring
-                    .records_for(&serial)
-                    .into_iter()
-                    .find(|r| r.stored == NameStore::Key)
-                    .map(|r| r.name.clone());
+            if on_key == KeyLabel::Absent {
+                naming.missing_on_key = known.iter().find_map(|s| {
+                    keyring
+                        .records_for(s)
+                        .into_iter()
+                        .find(|r| r.stored == NameStore::Key)
+                        .map(|r| r.name.clone())
+                });
             }
         }
         d.name = shown;
@@ -645,6 +655,30 @@ mod tests {
         // Not read is not absent: no restore offer.
         apply_names(&mut devs, &ring, &HashMap::new());
         assert_eq!(devs[0].naming.missing_on_key, None);
+    }
+
+    #[test]
+    fn hid_serial_records_get_restore_offer_and_stale_drop() {
+        // A `stored = key` record kept under the HID serial (from before
+        // the rows were merged) is found like holder and local lookups.
+        let mut ring = Keyring::default();
+        assert!(ring.record_first_seen(B, "Work"));
+        let mut d = key(A);
+        d.hid_serial = Some(B.into());
+        let mut devs = vec![d];
+        let l = labels(&[(&devs[0], KeyLabel::Absent)]);
+        apply_names(&mut devs, &ring, &l);
+        assert_eq!(devs[0].naming.missing_on_key.as_deref(), Some("Work"));
+
+        let l = labels(&[(&devs[0], present("New"))]);
+        let ups = apply_names(&mut devs, &ring, &l);
+        assert!(ups.contains(&NameUpdate::DropStale {
+            serial: B.into(),
+            current: "New".into()
+        }));
+        apply_updates(&mut ring, &ups);
+        assert!(ring.holder("Work").is_none());
+        assert!(ring.holder("New").is_some());
     }
 
     #[test]

@@ -6345,7 +6345,7 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
             (Vec::new(), false)
         }
     };
-    let (keyring, may_save) = keyroost_resolve::load_keyring_for_scan();
+    let (keyring, may_save) = keyroost_resolve::load_keyring_for_scan(crate::target::debug_on());
     if device.is_none() && hids_ok {
         let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
         if filtered.is_empty() {
@@ -11639,8 +11639,8 @@ fn name_set(
                 )
             });
             apply_key_label(&mut sec, src, yes, &dev, &plan, question.as_deref(), &v)?;
-            // Re-read keys.json: the re-check after the PIN may have saved
-            // what a scan learned meanwhile.
+            // Re-read keys.json: another keyroost run (or the app) may have
+            // saved to it while the PIN prompt and the write ran.
             let saved = Keyring::load_default().and_then(|mut k| {
                 keyroost_resolve::set_key_name(
                     &mut k,
@@ -11946,8 +11946,8 @@ fn name_list_lines(rows: &[NameRow]) -> Vec<String> {
                      --store key"
                 ),
                 NameStatus::Unmatched => format!(
-                    "{q} can't be matched (keys.json salt missing); clear with: \
-                     keyroostctl name clear {q}"
+                    "{q} can't be matched to a key (saved without a serial, or keys.salt \
+                     was lost); clear with: keyroostctl name clear {q}"
                 ),
                 NameStatus::OtherKey(n) => {
                     format!("connected (#{n}), a different key; select it with --device {n}")
@@ -16532,8 +16532,8 @@ mod cli_tests {
                  'Old label' --store key",
                 n = num("22222222")
             ),
-            "'Spare' can't be matched (keys.json salt missing); clear with: \
-             keyroostctl name clear 'Spare'"
+            "'Spare' can't be matched to a key (saved without a serial, or keys.salt \
+             was lost); clear with: keyroostctl name clear 'Spare'"
                 .to_string(),
             format!(
                 "connected (#{n}), a different key; select it with --device {n}",
