@@ -75,8 +75,9 @@ pub struct Naming {
     /// The shown name without any serial tail.
     pub plain: Option<String>,
     pub source: Option<NameSource>,
-    /// `--device <plain>` may select this key: this computer saw it first
-    /// with that name and holds the record of it.
+    /// `--device <plain>` may select this key: it is the first key this
+    /// computer saw with that name (recording that is best-effort; an
+    /// unrecorded first sight selects for the session).
     pub selectable: bool,
     pub on_key: KeyLabel,
     /// A `stored = key` record of this key whose name is no longer on the
@@ -137,9 +138,8 @@ fn shown_tail(serial: &str) -> String {
 /// Reset and fill `name` and `naming` on every row, in `list` order, from
 /// `keyring` and the names read from keys in `labels` (keyed by row id; a
 /// missing entry is [`KeyLabel::NotRead`]). Returns the keyring changes the
-/// pass learned; the caller applies them ([`apply_updates`]), saves, and
-/// runs the pass again over the saved ring — only then is a first-seen name
-/// selectable.
+/// pass learned; the caller applies them ([`apply_updates`]) and saves
+/// best-effort. A first-seen name is selectable at once.
 pub fn apply_names(
     devices: &mut [Device],
     keyring: &Keyring,

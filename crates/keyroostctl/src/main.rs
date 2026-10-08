@@ -11658,7 +11658,7 @@ fn name_set(
             // Re-read keys.json: the re-check after the PIN may have saved
             // what a scan learned meanwhile.
             let saved = Keyring::load_default().and_then(|mut k| {
-                k.set_name(&dev.serial, name, keyroost_keyring::NameStore::Key, meta)?;
+                set_key_name(&mut k, &dev, name, keyroost_keyring::NameStore::Key, meta)?;
                 k.save_default()
             });
             if let Err(e) = saved {
@@ -11674,6 +11674,30 @@ fn name_set(
     }
 }
 
+/// [`Keyring::set_name`] for `dev`, first dropping what it would replace
+/// under the row's other serial (a record kept under the HID serial from
+/// when the row wasn't merged), so a rename never leaves a second record.
+fn set_key_name(
+    keyring: &mut Keyring,
+    dev: &keyroost_resolve::Device,
+    name: &str,
+    store: keyroost_keyring::NameStore,
+    meta: keyroost_keyring::RecordMeta,
+) -> Result<(), keyroost_keyring::KeyringError> {
+    use keyroost_keyring::NameStore;
+    let ours = keyring.fingerprint_of(&dev.serial);
+    let others: Vec<_> = row_serials(dev)
+        .into_iter()
+        .filter_map(|s| keyring.fingerprint_of(s))
+        .filter(|fp| Some(fp) != ours.as_ref())
+        .collect();
+    keyring.keys.retain(|r| {
+        let other = r.fingerprint.as_ref().is_some_and(|fp| others.contains(fp));
+        !(other && (store == NameStore::Key || r.stored == NameStore::Computer || r.name == name))
+    });
+    keyring.set_name(&dev.serial, name, store, meta)
+}
+
 /// `name set` on this computer: record (or rename) the key's computer name.
 fn name_set_local(
     mut keyring: Keyring,
@@ -11681,8 +11705,9 @@ fn name_set_local(
     name: &str,
     meta: keyroost_keyring::RecordMeta,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    keyring.set_name(
-        &dev.serial,
+    set_key_name(
+        &mut keyring,
+        dev,
         name,
         keyroost_keyring::NameStore::Computer,
         meta,
@@ -11740,6 +11765,15 @@ fn clear_key_label(
     apply_key_label(sec, src, yes, dev, &plan, Some(&question), &v)
 }
 
+/// The note for a key whose own name couldn't be read just now: its local
+/// records are cleared anyway, and the person is told how to finish.
+fn unread_name_note(dev: &keyroost_resolve::Device) -> Option<&'static str> {
+    (dev.naming.on_key == keyroost_resolve::KeyLabel::ReadFailed).then_some(
+        "this key's own name couldn't be read just now; if it carries one, run \
+         `name clear` again with the key connected",
+    )
+}
+
 fn name_clear_by_name(
     sec: &mut Secrets,
     src: Source<'_>,
@@ -11747,15 +11781,17 @@ fn name_clear_by_name(
     name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use keyroost_resolve::KeyLabel;
+    // Scan first: a connected key carrying the name is recorded by the
+    // scan, so a name seen here for the first time is found too.
+    let devices = crate::target::enumerate()?;
     let keyring = Keyring::load_default()?;
     let shown = sanitize_terminal(name);
     let Some(rec) = keyring.holder(name).cloned() else {
         return Err(format!("no name '{shown}' on this computer").into());
     };
     let mut stays_on_key = false;
+    let mut note = None;
     if rec.stored == keyroost_keyring::NameStore::Key {
-        let devices = crate::target::enumerate()?;
-        let keyring = Keyring::load_default()?;
         let here = rec.fingerprint.as_ref().and_then(|fp| {
             devices.iter().find(|d| {
                 row_serials(d)
@@ -11769,7 +11805,7 @@ fn name_clear_by_name(
                     eprintln!("{}", crate::target::announce_line(d, Need::FidoHid));
                     clear_key_label(sec, src, yes, d, name)?;
                 }
-                _ => {}
+                _ => note = unread_name_note(d),
             },
             None => stays_on_key = true,
         }
@@ -11782,6 +11818,9 @@ fn name_clear_by_name(
         eprintln!(
             "the name stays on the key itself; plug the key in and run this again to remove it there"
         );
+    }
+    if let Some(n) = note {
+        eprintln!("{n}");
     }
     Ok(())
 }
@@ -11806,13 +11845,19 @@ fn name_clear_selected(
     for s in row_serials(&dev) {
         gone += keyring.clear_key(s).len();
     }
-    if gone == 0 && !cleared_on_key {
+    let note = unread_name_note(&dev);
+    if gone == 0 && !cleared_on_key && note.is_none() {
         return Err("this key has no name on this computer or on the key".into());
     }
     if gone > 0 {
         keyring.save_default()?;
+        println!("Removed this key's name.");
+    } else if cleared_on_key {
+        println!("Removed this key's name.");
     }
-    println!("Removed this key's name.");
+    if let Some(n) = note {
+        eprintln!("{n}");
+    }
     Ok(())
 }
 
@@ -12782,6 +12827,27 @@ fn large_blob_edit_refusal(
     }
 }
 
+/// The warning `fido blob clear` shows before asking: what it erases, and
+/// whether the key's name (`name`, already sanitized) goes or stays.
+fn large_blob_clear_warning(total: usize, opaque: usize, name: Option<&str>, keep: bool) -> String {
+    let what = if keep {
+        "`clear` erases every large-blob entry except the key's name"
+    } else {
+        "`clear` erases the ENTIRE large-blob array"
+    };
+    let name_clause = match (name, keep) {
+        (Some(n), false) => {
+            format!(" This also removes the key's name '{n}' (keep it with --keep-name).")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "{what} — ALL {total} entr{plural} ({opaque} opaque/RP-owned, e.g. stored SSH \
+         certs). This can break any service that stored data here.{name_clause}",
+        plural = if total == 1 { "y" } else { "ies" },
+    )
+}
+
 /// What `fido blob clear` writes: the empty array, or with `keep_name` and a
 /// name on the key, the name entries exactly as read. Returns the bytes and
 /// the name kept.
@@ -13155,18 +13221,12 @@ fn run_fido_large_blob_clear(
         .filter(|e| !e.is_kr_note() && !matches!(e.classify(), EntryKind::KeyName(_)))
         .count()
         + skipped;
-    let name_clause = match (&name, keep) {
-        (Some(n), false) => {
-            format!(" This also removes the key's name '{n}' (keep it with --keep-name).")
-        }
-        _ => String::new(),
-    };
     if !yes {
-        output::warn(&format!(
-            "`clear` erases the ENTIRE large-blob array — ALL {total} \
-             entr{plural} ({opaque} opaque/RP-owned, e.g. stored SSH certs). This \
-             can break any service that stored data here.{name_clause}",
-            plural = if total == 1 { "y" } else { "ies" },
+        output::warn(&large_blob_clear_warning(
+            total,
+            opaque,
+            name.as_deref(),
+            keep,
         ));
     } else {
         if opaque > 0 {
@@ -13176,8 +13236,10 @@ fn run_fido_large_blob_clear(
                 if opaque == 1 { "y" } else { "ies" }
             ));
         }
-        if !name_clause.is_empty() {
-            output::warn(name_clause.trim_start());
+        if let (Some(n), false) = (&name, keep) {
+            output::warn(&format!(
+                "This also removes the key's name '{n}' (keep it with --keep-name)."
+            ));
         }
     }
     drop(dev); // not held across the question or while the PIN is typed
@@ -13187,7 +13249,7 @@ fn run_fido_large_blob_clear(
         &mut sec,
         yes,
         if keep {
-            "clear the large-blob array except the key's name"
+            "erase every large-blob entry except the key's name"
         } else {
             "clear the whole large-blob array"
         },
@@ -16307,6 +16369,99 @@ mod cli_tests {
         // A record that can't be matched to any key still holds its name.
         k.keys[0].fingerprint = None;
         assert!(refuse_name_held_elsewhere(&k, "Work", &["12345678"]).is_err());
+    }
+
+    #[test]
+    fn a_rename_replaces_a_record_kept_under_the_other_serial() {
+        use keyroost_keyring::{NameStore, RecordMeta};
+        let mut dev = test_fido_row();
+        dev.serial = "12345678".into();
+        dev.hid_serial = Some("ABCDEF01".into());
+        // Named once under the HID serial (an unmerged row back then).
+        let mut k = Keyring::default();
+        k.set_name(
+            "ABCDEF01",
+            "Old",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        set_key_name(
+            &mut k,
+            &dev,
+            "New",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        let names: Vec<&str> = k.keys.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["New"]);
+        // Moving the old name onto the key is not a clash with itself.
+        let mut k = Keyring::default();
+        k.set_name(
+            "ABCDEF01",
+            "Old",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        set_key_name(&mut k, &dev, "Old", NameStore::Key, RecordMeta::default()).unwrap();
+        assert_eq!(k.keys.len(), 1);
+        assert_eq!(k.keys[0].stored, NameStore::Key);
+        // Another key's records are untouched.
+        k.set_name(
+            "99999999",
+            "Other",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        set_key_name(
+            &mut k,
+            &dev,
+            "Newer",
+            NameStore::Computer,
+            RecordMeta::default(),
+        )
+        .unwrap();
+        assert!(k.holder("Other").is_some());
+    }
+
+    #[test]
+    fn keep_name_warning_says_the_name_is_kept() {
+        let kept = large_blob_clear_warning(3, 1, Some("Work"), true);
+        assert!(
+            kept.starts_with("`clear` erases every large-blob entry except the key's name"),
+            "{kept}"
+        );
+        assert!(
+            !kept.contains("ENTIRE") && !kept.contains("removes the key's name"),
+            "{kept}"
+        );
+        let all = large_blob_clear_warning(3, 1, Some("Work"), false);
+        assert!(
+            all.starts_with("`clear` erases the ENTIRE large-blob array"),
+            "{all}"
+        );
+        assert!(
+            all.ends_with("This also removes the key's name 'Work' (keep it with --keep-name)."),
+            "{all}"
+        );
+        assert!(!large_blob_clear_warning(1, 0, None, false).contains("name"));
+    }
+
+    #[test]
+    fn an_unread_key_name_gets_a_note_not_a_refusal() {
+        let mut dev = test_fido_row();
+        assert_eq!(unread_name_note(&dev), None);
+        dev.naming.on_key = keyroost_resolve::KeyLabel::ReadFailed;
+        assert_eq!(
+            unread_name_note(&dev),
+            Some(
+                "this key's own name couldn't be read just now; if it carries one, run \
+                 `name clear` again with the key connected"
+            )
+        );
     }
 
     #[test]

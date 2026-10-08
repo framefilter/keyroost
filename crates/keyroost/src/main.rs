@@ -13984,7 +13984,9 @@ impl App {
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
                 // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
+                keyroost_resolve::with_key_names_forgotten(|| {
+                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                })
                     .map_err(|e| e.to_string())?;
 
                 let array =
@@ -14061,7 +14063,9 @@ impl App {
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
                 // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
+                keyroost_resolve::with_key_names_forgotten(|| {
+                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                })
                     .map_err(|e| e.to_string())?;
 
                 let array =
@@ -14192,7 +14196,9 @@ impl App {
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &live)?;
                 // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
+                keyroost_resolve::with_key_names_forgotten(|| {
+                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                })
                     .map_err(|e| e.to_string())?;
 
                 // Read back so the view reflects the authenticator's actual state.
@@ -14269,7 +14275,9 @@ impl App {
                 // Wipe every element, including any skipped (non-standard) ones.
                 let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
                 // Names read from keys before or during the write are stale.
-                keyroost_resolve::with_key_names_forgotten(|| keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized))
+                keyroost_resolve::with_key_names_forgotten(|| {
+                    keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
+                })
                     .map_err(|e| e.to_string())?;
 
                 // Read back so the view reflects the authenticator's actual state.
