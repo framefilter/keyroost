@@ -18,6 +18,12 @@
 //! (i.e. the user ran an "add a name" action). Loading and in-memory matching
 //! record nothing.
 
+// The salt file helpers are wired into load/save by the keys.json v2 change.
+#[cfg_attr(not(test), allow(dead_code))]
+mod fingerprint;
+
+pub use fingerprint::{fingerprint, Fingerprint, Salt, SALT_FILE};
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -82,6 +88,8 @@ pub enum KeyringError {
         existing_name: String,
     },
     InvalidName(String),
+    /// `keys.salt` exists but isn't 64 hex characters; it is left untouched.
+    MalformedSalt,
 }
 
 impl fmt::Display for KeyringError {
@@ -109,6 +117,11 @@ impl fmt::Display for KeyringError {
                     n
                 )
             }
+            KeyringError::MalformedSalt => write!(
+                f,
+                "{} is damaged (expected 64 hex characters); it was left as it is",
+                SALT_FILE
+            ),
         }
     }
 }
