@@ -94,6 +94,7 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
         kind: DeviceKind::Key,
         hid_path,
         reader,
+        naming: Default::default(),
     }
 }
 
@@ -329,6 +330,7 @@ mod tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw16".into()),
             reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00".into()),
+            naming: Default::default(),
         }
     }
 

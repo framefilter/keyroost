@@ -20,6 +20,7 @@ use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
 pub mod identity;
+pub mod names;
 pub mod select;
 pub use device::{
     correlate, correlate_live, correlate_with, enumerate, enumerate_with, exclude_unresettable_piv,
@@ -29,6 +30,9 @@ pub use device::{
 pub use identity::{
     plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
     IdentityReader, IDENTITY_READERS,
+};
+pub use names::{
+    apply_names, apply_updates, serial_tail, KeyLabel, NameSource, NameUpdate, Naming,
 };
 pub use select::{
     device_value, endpoint, list_number, list_order, parse_device_spec, resolve_target, row_label,

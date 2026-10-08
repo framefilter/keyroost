@@ -722,13 +722,6 @@ impl Keyring {
             .map(|r| r.name.as_str())
     }
 
-    /// Transitional alias for [`Keyring::local_name_for`] while callers move
-    /// to the record-based API.
-    #[deprecated(note = "use local_name_for")]
-    pub fn name_for(&self, serial: Option<&str>) -> Option<&str> {
-        self.local_name_for(serial?)
-    }
-
     /// Every record of the key with `serial`.
     pub fn records_for(&self, serial: &str) -> Vec<&KeyRecord> {
         let fp = self.fingerprint_of(serial);

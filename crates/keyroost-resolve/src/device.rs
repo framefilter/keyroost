@@ -9,6 +9,8 @@ use keyroost_keyring::Keyring;
 use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
 
+use crate::names::Naming;
+
 /// Capability bit-set. Hand-rolled (no `bitflags` dep). Each physical key
 /// advertises the union of the applets it answers.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -96,6 +98,9 @@ pub struct Device {
     pub kind: DeviceKind,
     pub hid_path: Option<PathBuf>,
     pub reader: Option<String>,
+    /// How the row is named (see [`crate::names::apply_names`]); `name` is
+    /// the text to show.
+    pub naming: Naming,
 }
 
 impl Device {
@@ -502,9 +507,6 @@ fn bind_readers(
 /// key. Pure: all I/O is done by the caller ([`enumerate`], [`correlate_live`]),
 /// including the device-reported identities in `ids`. The `hids` slice may
 /// contain non-FIDO nodes; they are filtered here.
-// `name_for` is the keyring's transitional shim until the naming pass replaces
-// these per-row lookups.
-#[allow(deprecated)]
 pub fn correlate_with(
     hids: &[HidDevice],
     probes: &[ReaderProbe],
@@ -600,7 +602,7 @@ pub fn correlate_with(
         caps.insert(Caps::TOTP);
         devices.push(Device {
             id: format!("molto:{}", p.reader_name),
-            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            name: None,
             vendor: "Token2".into(),
             model: "Molto2".into(),
             serial,
@@ -611,6 +613,7 @@ pub fn correlate_with(
             kind: DeviceKind::Token,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
+            naming: Naming::default(),
         });
     }
 
@@ -625,7 +628,7 @@ pub fn correlate_with(
         caps.insert(Caps::PROG);
         devices.push(Device {
             id: format!("prog:{}", p.reader_name),
-            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            name: None,
             vendor: "Token2".into(),
             model,
             serial,
@@ -636,6 +639,7 @@ pub fn correlate_with(
             kind: DeviceKind::ProgToken,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
+            naming: Naming::default(),
         });
     }
 
@@ -678,7 +682,7 @@ pub fn correlate_with(
         let model = clean_model(&p.reader_name, &vendor);
         devices.push(Device {
             id,
-            name: keyring.name_for(Some(&serial)).map(str::to_owned),
+            name: None,
             vendor,
             model,
             serial,
@@ -691,6 +695,7 @@ pub fn correlate_with(
             kind: DeviceKind::Key,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
+            naming: Naming::default(),
         });
     }
 
@@ -790,9 +795,6 @@ pub fn correlate_with(
             if dev.serial.is_empty() {
                 dev.serial = serial.clone();
             }
-            if dev.name.is_none() {
-                dev.name = keyring.name_for(Some(&serial)).map(str::to_owned);
-            }
         } else {
             let id = if !serial.is_empty() {
                 format!("serial:{serial}")
@@ -820,7 +822,7 @@ pub fn correlate_with(
             };
             devices.push(Device {
                 id,
-                name: keyring.name_for(Some(&serial)).map(str::to_owned),
+                name: None,
                 vendor,
                 model,
                 serial,
@@ -831,6 +833,7 @@ pub fn correlate_with(
                 kind: DeviceKind::Key,
                 hid_path: Some(hid.path.clone()),
                 reader: reader_name,
+                naming: Naming::default(),
             });
         }
     }
@@ -858,6 +861,9 @@ pub fn correlate_with(
             .then_with(|| a.model.cmp(&b.model))
             .then_with(|| a.id.cmp(&b.id))
     });
+    // Local names only: without names read from keys the pass learns nothing
+    // to record.
+    crate::names::apply_names(&mut devices, keyring, &std::collections::HashMap::new());
     devices
 }
 

@@ -645,6 +645,7 @@ pub fn resolve_target<'d>(
 mod tests {
     use super::*;
     use crate::device::{Caps, DeviceKind};
+    use crate::names::{NameSource, Naming};
     use std::path::PathBuf;
 
     fn row(
@@ -672,6 +673,16 @@ mod tests {
             kind,
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(str::to_owned),
+            naming: local_naming(name),
+        }
+    }
+    /// A name this computer saved for the key: shown and selectable.
+    fn local_naming(name: Option<&str>) -> Naming {
+        Naming {
+            plain: name.map(str::to_owned),
+            source: name.map(|_| NameSource::Computer),
+            selectable: name.is_some(),
+            ..Naming::default()
         }
     }
     fn yubi() -> Device {

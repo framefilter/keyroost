@@ -186,6 +186,7 @@ mod tests {
             kind,
             hid_path: None,
             reader: None,
+            naming: Default::default(),
         }
     }
 

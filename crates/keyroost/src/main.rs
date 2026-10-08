@@ -7643,6 +7643,7 @@ impl App {
                                         kind: DeviceKind::Key,
                                         hid_path: None,
                                         reader: None,
+                                        naming: Default::default(),
                                     });
                                 }
                             }
@@ -23610,6 +23611,7 @@ mod tests {
             kind: DeviceKind::Key,
             hid_path: None,
             reader: None,
+            naming: Default::default(),
         }
     }
 

@@ -6181,8 +6181,6 @@ fn run_doctor() {
     }
 }
 
-// `name_for` is the keyring's transitional shim until the naming pass lands.
-#[allow(deprecated)]
 fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // `--json`: one row per key, nothing else on stdout (announce lines, if
     // any, stay on stderr — but filter_rows below never announces).
@@ -6304,8 +6302,11 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
                     (None, Some(s)) => format!(" serial={}(ccid)", sanitize_terminal(s)),
                     (None, None) => String::new(),
                 };
-                let name = keyring
-                    .name_for(eff.as_deref())
+                // Local names only; the correlated table below shows names
+                // stored on keys too.
+                let name = eff
+                    .as_deref()
+                    .and_then(|s| keyring.local_name_for(s))
                     .map(|n| format!(" name={}", sanitize_terminal(n)))
                     .unwrap_or_default();
                 let pname = sanitize_terminal(&d.product_name);
@@ -16072,6 +16073,7 @@ mod cli_tests {
             kind: keyroost_resolve::DeviceKind::Key,
             hid_path: Some("/dev/hidraw3".into()),
             reader: None,
+            naming: Default::default(),
         }
     }
 
@@ -16169,6 +16171,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw3".into()),
             reader: Some("R 00".into()),
+            naming: Default::default(),
         };
         assert_eq!(
             fido_reset_route(&both, false),
@@ -17641,6 +17644,7 @@ mod cli_tests {
                 kind: DeviceKind::Key,
                 hid_path: hid.map(std::path::PathBuf::from),
                 reader: reader.map(str::to_owned),
+                naming: Default::default(),
             }
         }
 
@@ -17698,6 +17702,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: None,
             reader: Some("Some Reader".to_string()),
+            naming: Default::default(),
         };
         match otp_target_for(&row, OtpTransportArg::Auto) {
             Ok(OtpTarget::Reader(r)) => assert_eq!(r, "Some Reader"),
@@ -20845,6 +20850,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw16".into()),
             reader: Some("Yubico 00".into()),
+            naming: Default::default(),
         };
         let hid = keyroost_hid::HidDevice {
             path: "/dev/hidraw16".into(),
@@ -20904,6 +20910,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: None,
             reader: None,
+            naming: Default::default(),
         };
         // A normal detected row with a serial is nameable.
         assert!(nameable(&base).is_ok());
@@ -20941,6 +20948,7 @@ mod cli_tests {
                 kind,
                 hid_path: None,
                 reader: Some(reader.into()),
+                naming: Default::default(),
             }
         }
         let devs = [
@@ -21289,6 +21297,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
+            naming: Default::default(),
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -21328,6 +21337,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
+            naming: Default::default(),
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -21378,6 +21388,7 @@ mod prop_tests {
             kind: keyroost_resolve::DeviceKind::Key,
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(String::from),
+            naming: Default::default(),
         }
     }
 
