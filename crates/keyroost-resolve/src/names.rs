@@ -77,6 +77,19 @@ pub struct Naming {
     pub missing_on_key: Option<String>,
 }
 
+impl Naming {
+    /// A name this computer saved for the key (`None`: unnamed): shown and
+    /// selectable. For rows built outside a scan, such as tests.
+    pub fn local(name: Option<&str>) -> Naming {
+        Naming {
+            plain: name.map(str::to_owned),
+            source: name.map(|_| NameSource::Computer),
+            selectable: name.is_some(),
+            ..Naming::default()
+        }
+    }
+}
+
 /// A change to the keyring the naming pass asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NameUpdate {

@@ -332,7 +332,7 @@ mod tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw16".into()),
             reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00".into()),
-            naming: Default::default(),
+            naming: keyroost_resolve::Naming::local(name),
         }
     }
 

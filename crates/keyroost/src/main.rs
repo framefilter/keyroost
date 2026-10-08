@@ -23616,7 +23616,7 @@ mod tests {
             kind: DeviceKind::Key,
             hid_path: None,
             reader: None,
-            naming: Default::default(),
+            naming: keyroost_resolve::Naming::local(name),
         }
     }
 

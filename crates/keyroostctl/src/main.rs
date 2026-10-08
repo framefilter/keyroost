@@ -17645,7 +17645,7 @@ mod cli_tests {
                 kind: DeviceKind::Key,
                 hid_path: hid.map(std::path::PathBuf::from),
                 reader: reader.map(str::to_owned),
-                naming: Default::default(),
+                naming: keyroost_resolve::Naming::local(Some(name)),
             }
         }
 
@@ -20949,7 +20949,7 @@ mod cli_tests {
                 kind,
                 hid_path: None,
                 reader: Some(reader.into()),
-                naming: Default::default(),
+                naming: keyroost_resolve::Naming::local(Some(name)),
             }
         }
         let devs = [
@@ -21298,7 +21298,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
-            naming: Default::default(),
+            naming: keyroost_resolve::Naming::local(name),
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -21338,7 +21338,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
-            naming: Default::default(),
+            naming: keyroost_resolve::Naming::local(name),
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -21389,7 +21389,7 @@ mod prop_tests {
             kind: keyroost_resolve::DeviceKind::Key,
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(String::from),
-            naming: Default::default(),
+            naming: keyroost_resolve::Naming::local(name),
         }
     }
 
