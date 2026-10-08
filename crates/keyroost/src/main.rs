@@ -13942,7 +13942,9 @@ impl App {
                 .map_err(|e| e.to_string())?;
 
                 let updated = current.with_text_note(&text);
-                let serialized = updated.serialize_with_checksum();
+                let serialized = updated
+                    .serialize_with_checksum()
+                    .map_err(|e| e.to_string())?;
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14023,7 +14025,9 @@ impl App {
                 )
                 .map_err(|e| e.to_string())?;
 
-                let serialized = updated.serialize_with_checksum();
+                let serialized = updated
+                    .serialize_with_checksum()
+                    .map_err(|e| e.to_string())?;
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14156,7 +14160,9 @@ impl App {
                             .into(),
                     );
                 };
-                let serialized = updated.serialize_with_checksum();
+                let serialized = updated
+                    .serialize_with_checksum()
+                    .map_err(|e| e.to_string())?;
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 

@@ -12311,14 +12311,14 @@ fn run_fido_large_blob_add(
     // Re-read the live array immediately before writing so any concurrent or
     // pre-existing RP entries are preserved (mirror the GUI's add flow).
     let (mut dev, info, current) = open_and_read_large_blobs(path)?;
+    let updated = current.with_text_note(text);
+    let serialized = updated.serialize_with_checksum()?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
         pin,
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
-    let updated = current.with_text_note(text);
-    let serialized = updated.serialize_with_checksum();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
     println!("Note added; {} entries now.", updated.len());
     Ok(())
@@ -12337,13 +12337,13 @@ fn run_fido_large_blob_edit(
             index
         )
     })?;
+    let serialized = updated.serialize_with_checksum()?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
         pin,
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
-    let serialized = updated.serialize_with_checksum();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
     println!("Note {} updated.", index);
     Ok(())
@@ -12388,13 +12388,13 @@ fn run_fido_large_blob_delete(
     let updated = again
         .without_entry(index)
         .ok_or_else(|| large_blob_bad_index(index, again.len()))?;
+    let serialized = updated.serialize_with_checksum()?;
     let token = keyroost_ctap::client_pin::get_pin_uv_auth_token(
         &mut dev,
         &pin,
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
-    let serialized = updated.serialize_with_checksum();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
     println!("Entry deleted; {} entries now.", updated.len());
     Ok(())

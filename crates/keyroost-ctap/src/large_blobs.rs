@@ -225,6 +225,10 @@ pub struct LargeBlobArray {
     items: Vec<Item>,
     /// The serialized array WITHOUT the checksum trailer.
     raw_array: Vec<u8>,
+    /// Bytes read after the array's end (before the checksum). A rewrite
+    /// can't keep them, so [`serialize_with_checksum`](Self::serialize_with_checksum)
+    /// refuses while there are any.
+    trailing: usize,
 }
 
 impl LargeBlobArray {
@@ -235,10 +239,11 @@ impl LargeBlobArray {
     /// then nothing in it can be kept safely. A single element that isn't a
     /// conforming entry is skipped instead.
     pub fn parse(array_bytes: &[u8]) -> Result<LargeBlobArray, CtapError> {
-        let items = parse_items(array_bytes)?;
+        let (items, trailing) = parse_items(array_bytes)?;
         Ok(LargeBlobArray {
             items,
             raw_array: array_bytes.to_vec(),
+            trailing,
         })
     }
 
@@ -292,10 +297,13 @@ impl LargeBlobArray {
             .map(|(pos, _)| pos)
     }
 
-    fn changed(items: Vec<Item>) -> LargeBlobArray {
+    /// `items` as a changed copy of this array (it carries the trailing
+    /// bytes' count along, so the copy refuses to serialize too).
+    fn changed(&self, items: Vec<Item>) -> LargeBlobArray {
         LargeBlobArray {
             items,
             raw_array: Vec::new(),
+            trailing: self.trailing,
         }
     }
 
@@ -305,7 +313,24 @@ impl LargeBlobArray {
     /// Every element read from the key is emitted exactly as it was read —
     /// an entry's unknown map keys (§6.10.3 allows them) and skipped elements
     /// survive byte-for-byte. Only entries built here are encoded fresh.
-    pub fn serialize_with_checksum(&self) -> Vec<u8> {
+    ///
+    /// Refuses an array that was read with bytes after its end: a rewrite
+    /// would silently drop them, so nothing is produced to write.
+    pub fn serialize_with_checksum(&self) -> Result<Vec<u8>, CtapError> {
+        if self.trailing > 0 {
+            return Err(CtapError::InvalidResponseShape(
+                "largeBlobs: the stored array has extra bytes after its end; \
+                 refusing to rewrite it, which would drop them",
+            ));
+        }
+        let array = self.array_bytes();
+        let mut out = array.clone();
+        out.extend_from_slice(&left16_sha256(&array));
+        Ok(out)
+    }
+
+    /// The elements behind a canonical header, without the checksum.
+    fn array_bytes(&self) -> Vec<u8> {
         let mut array = cbor::array_header(self.items.len());
         for item in &self.items {
             match item {
@@ -317,16 +342,14 @@ impl LargeBlobArray {
                 Item::Entry(e) => array.extend_from_slice(&encode_entry(e)),
             }
         }
-        let mut out = array.clone();
-        out.extend_from_slice(&left16_sha256(&array));
-        out
+        array
     }
 
     /// Return a copy of this array with a new keyroost text note appended.
     pub fn with_text_note(&self, text: &str) -> LargeBlobArray {
         let mut items = self.items.clone();
         items.push(Item::Entry(LargeBlobEntry::from_text(text)));
-        Self::changed(items)
+        self.changed(items)
     }
 
     /// Return a copy of this array with the keyroost note at `idx` replaced by
@@ -340,7 +363,7 @@ impl LargeBlobArray {
         let pos = self.item_index(idx)?;
         let mut items = self.items.clone();
         items[pos] = Item::Entry(LargeBlobEntry::from_text(text));
-        Some(Self::changed(items))
+        Some(self.changed(items))
     }
 
     /// Return a copy of this array without the conforming entry at `idx`
@@ -349,13 +372,13 @@ impl LargeBlobArray {
         let pos = self.item_index(idx)?;
         let mut items = self.items.clone();
         items.remove(pos);
-        Some(Self::changed(items))
+        Some(self.changed(items))
     }
 
     /// Compute capacity from the elements as currently held (re-serialized,
     /// so it stays correct after local adds/edits that haven't been written).
     pub fn capacity(&self, info: &AuthenticatorInfo) -> BlobCapacity {
-        let used = self.serialize_with_checksum().len() as u64;
+        let used = (self.array_bytes().len() + self.trailing + CHECKSUM_LEN) as u64;
         let max = info
             .max_serialized_large_blob_array
             .unwrap_or(SPEC_MIN_SERIALIZED_ARRAY);
@@ -477,44 +500,51 @@ pub fn read(
     LargeBlobArray::parse(array_bytes)
 }
 
-fn parse_items(array_bytes: &[u8]) -> Result<Vec<Item>, CtapError> {
+/// The array's elements, and how many bytes follow the array.
+fn parse_items(array_bytes: &[u8]) -> Result<(Vec<Item>, usize), CtapError> {
     if array_bytes.first().map(|b| b >> 5) != Some(4) {
         return Err(CtapError::InvalidResponseShape("largeBlobs: not an array"));
     }
-    let (elements, _) = cbor::split_array(array_bytes)?;
+    let (elements, rest) = cbor::split_array(array_bytes)?;
     // CTAP 2.1 §6.10.4 step 6: readers skip elements that don't conform.
     // They are kept as read, so a rewrite emits them again unchanged.
-    Ok(elements
+    let items = elements
         .into_iter()
         .map(|raw| match conforming_entry(raw) {
             Some(entry) => Item::Entry(entry),
             None => Item::Skipped(raw.to_vec()),
         })
-        .collect())
+        .collect();
+    Ok((items, rest.len()))
 }
 
 /// `raw` as a large-blob entry if it is a conforming entry map (§6.10.3):
 /// key 1 a byte string, key 2 a 12-byte byte string, key 3 an unsigned
 /// integer, each exactly once; other keys are allowed and kept in `original`.
+///
+/// Only keys 1–3 and their values are decoded; any other key or value is
+/// just measured, so one the decoder refuses (a float, a tag) is tolerated.
 fn conforming_entry(raw: &[u8]) -> Option<LargeBlobEntry> {
-    let (Value::Map(map), rest) = cbor::decode(raw).ok()? else {
-        return None;
-    };
+    let (pairs, rest) = cbor::split_map(raw).ok()?;
     if !rest.is_empty() {
         return None;
     }
     let mut ciphertext = None;
     let mut nonce = None;
     let mut orig_size = None;
-    for (k, v) in map {
-        let slot_taken = match (k, v) {
-            (Value::UInt(ENTRY_CIPHERTEXT), Value::Bytes(b)) => ciphertext.replace(b).is_some(),
-            (Value::UInt(ENTRY_NONCE), Value::Bytes(b)) if b.len() == 12 => {
-                nonce.replace(b).is_some()
-            }
-            (Value::UInt(ENTRY_ORIG_SIZE), Value::UInt(n)) => orig_size.replace(n).is_some(),
-            (Value::UInt(ENTRY_CIPHERTEXT | ENTRY_NONCE | ENTRY_ORIG_SIZE), _) => return None,
-            _ => false,
+    for (k, v) in pairs {
+        let key = match cbor::decode(k) {
+            Ok((Value::UInt(n @ ENTRY_CIPHERTEXT..=ENTRY_ORIG_SIZE), [])) => n,
+            _ => continue, // another key: allowed, kept in `original`
+        };
+        let (value, []) = cbor::decode(v).ok()? else {
+            return None;
+        };
+        let slot_taken = match (key, value) {
+            (ENTRY_CIPHERTEXT, Value::Bytes(b)) => ciphertext.replace(b).is_some(),
+            (ENTRY_NONCE, Value::Bytes(b)) if b.len() == 12 => nonce.replace(b).is_some(),
+            (ENTRY_ORIG_SIZE, Value::UInt(n)) => orig_size.replace(n).is_some(),
+            _ => return None, // a required key with the wrong type
         };
         if slot_taken {
             return None; // a duplicate required key: ambiguous, never guess
@@ -787,7 +817,11 @@ mod tests {
 
     /// An array holding `entries` as built here (no bytes read from a key).
     fn array_of(entries: Vec<LargeBlobEntry>) -> LargeBlobArray {
-        LargeBlobArray::changed(entries.into_iter().map(Item::Entry).collect())
+        LargeBlobArray {
+            items: entries.into_iter().map(Item::Entry).collect(),
+            raw_array: Vec::new(),
+            trailing: 0,
+        }
     }
 
     /// The entries of `arr` with the read-back bytes forgotten, for comparing
@@ -859,6 +893,53 @@ mod tests {
         let arr = LargeBlobArray::parse(&raw_array_of(&[&dup_key, &text_ciphertext])).unwrap();
         assert_eq!((arr.len(), arr.skipped_count()), (0, 2));
         assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn extra_keys_may_hold_values_the_decoder_rejects() {
+        // §6.10.3 allows any value under other keys: a float, a tag and a
+        // simple value there (and a tag used as a key) keep the entry readable.
+        let mut tolerant = vec![0xa7, 0x01, 0x41, 0xaa, 0x02, 0x4c];
+        tolerant.extend_from_slice(&[0x22; 12]);
+        tolerant.extend_from_slice(&[0x03, 0x01]);
+        tolerant.extend_from_slice(&[0x04, 0xf9, 0x3c, 0x00]); // 4: 1.0 (half float)
+        tolerant.extend_from_slice(&[0x05, 0xc1, 0x01]); // 5: tag 1 (epoch time)
+        tolerant.extend_from_slice(&[0x06, 0xf8, 0x20]); // 6: simple(32)
+        tolerant.extend_from_slice(&[0xc1, 0x01, 0x00]); // tag-1 key: 0
+
+        // A required key holding a float is still mistyped.
+        let mut mistyped = vec![0xa3, 0x01, 0x41, 0xaa, 0x02, 0x4c];
+        mistyped.extend_from_slice(&[0x22; 12]);
+        mistyped.extend_from_slice(&[0x03, 0xf9, 0x3c, 0x00]);
+        let bytes = raw_array_of(&[&tolerant, &mistyped]);
+        let arr = LargeBlobArray::parse(&bytes).unwrap();
+        assert_eq!((arr.len(), arr.skipped_count()), (1, 1));
+        let e = arr.entry(0).unwrap();
+        assert_eq!((e.ciphertext.as_slice(), e.orig_size), (&[0xaa][..], 1));
+        let mut want = bytes.clone();
+        want.extend_from_slice(&left16_sha256(&bytes));
+        assert_eq!(arr.serialize_with_checksum().unwrap(), want);
+    }
+
+    #[test]
+    fn rewrite_refuses_bytes_after_the_array() {
+        // Bytes between the array's end and the checksum can be read past,
+        // but a rewrite would drop them, so every rewrite is refused.
+        let note = encode_entry(&LargeBlobEntry::from_text("kept"));
+        let mut bytes = raw_array_of(&[&note]);
+        bytes.push(0x00);
+        let arr = LargeBlobArray::parse(&bytes).expect("still readable");
+        assert_eq!(arr.entry(0).unwrap().as_text().as_deref(), Some("kept"));
+        assert!(arr.serialize_with_checksum().is_err());
+        assert!(arr.with_text_note("n").serialize_with_checksum().is_err());
+        assert!(arr
+            .without_entry(0)
+            .unwrap()
+            .serialize_with_checksum()
+            .is_err());
+        // Capacity still counts the stray byte as used.
+        let cap = arr.capacity(&AuthenticatorInfo::default());
+        assert_eq!(cap.used_bytes, (bytes.len() + CHECKSUM_LEN) as u64);
     }
 
     #[test]
@@ -934,14 +1015,18 @@ mod tests {
         let arr = LargeBlobArray::parse(&bytes).unwrap();
         assert_eq!((arr.len(), arr.skipped_count()), (2, 2));
 
-        let added = split_checked(&arr.with_text_note("n").serialize_with_checksum(), 2);
+        let added = split_checked(
+            &arr.with_text_note("n").serialize_with_checksum().unwrap(),
+            2,
+        );
         assert_eq!(added.len(), 5);
         assert_eq!(&added[..4], &input[..]);
 
         let edited = split_checked(
             &arr.with_replaced_note(1, "m")
                 .unwrap()
-                .serialize_with_checksum(),
+                .serialize_with_checksum()
+                .unwrap(),
             2,
         );
         assert_eq!(edited.len(), 4);
@@ -949,7 +1034,13 @@ mod tests {
         assert_ne!(edited[1], input[1]);
         assert_eq!(&edited[2..], &input[2..]);
 
-        let removed = split_checked(&arr.without_entry(1).unwrap().serialize_with_checksum(), 2);
+        let removed = split_checked(
+            &arr.without_entry(1)
+                .unwrap()
+                .serialize_with_checksum()
+                .unwrap(),
+            2,
+        );
         assert_eq!(
             removed,
             vec![input[0].clone(), input[2].clone(), input[3].clone()]
@@ -985,7 +1076,10 @@ mod tests {
             let mut want = x.clone();
             want.extend_from_slice(&left16_sha256(&x));
             assert_eq!(
-                LargeBlobArray::parse(&x).unwrap().serialize_with_checksum(),
+                LargeBlobArray::parse(&x)
+                    .unwrap()
+                    .serialize_with_checksum()
+                    .unwrap(),
                 want
             );
         }
@@ -1034,7 +1128,7 @@ mod tests {
     #[test]
     fn entries_encode_parse_roundtrip() {
         let entries = vec![sample_entry(1), sample_entry(2), sample_entry(3)];
-        let serialized = array_of(entries.clone()).serialize_with_checksum();
+        let serialized = array_of(entries.clone()).serialize_with_checksum().unwrap();
         let encoded = &serialized[..serialized.len() - CHECKSUM_LEN];
         let parsed = LargeBlobArray::parse(encoded).unwrap();
         assert_eq!(fields(&parsed), entries);
@@ -1043,7 +1137,7 @@ mod tests {
     #[test]
     fn serialize_with_checksum_is_verifiable() {
         let arr = array_of(vec![sample_entry(7), sample_entry(9)]);
-        let serialized = arr.serialize_with_checksum();
+        let serialized = arr.serialize_with_checksum().unwrap();
         let (array, trailer) = serialized.split_at(serialized.len() - CHECKSUM_LEN);
         assert_eq!(trailer, left16_sha256(array));
         // And the array round-trips back to the same entries.
@@ -1080,7 +1174,7 @@ mod tests {
         let text = "hello \u{1f511} keyroost note — 123";
         let arr = array_of(vec![LargeBlobEntry::from_text(text)]);
         // Serialize (with checksum), strip the trailer, re-parse, decode text.
-        let serialized = arr.serialize_with_checksum();
+        let serialized = arr.serialize_with_checksum().unwrap();
         let (array, _trailer) = serialized.split_at(serialized.len() - CHECKSUM_LEN);
         let parsed = LargeBlobArray::parse(array).unwrap();
         assert_eq!(parsed.len(), 1);
@@ -1213,7 +1307,10 @@ mod tests {
         };
         let cap = arr.capacity(&info);
         assert_eq!(cap.max_bytes, 4096);
-        assert_eq!(cap.used_bytes, arr.serialize_with_checksum().len() as u64);
+        assert_eq!(
+            cap.used_bytes,
+            arr.serialize_with_checksum().unwrap().len() as u64
+        );
         assert_eq!(cap.free_bytes, cap.max_bytes - cap.used_bytes);
         assert_eq!(cap.entry_count, 1);
 

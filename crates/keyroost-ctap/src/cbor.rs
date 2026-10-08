@@ -326,6 +326,30 @@ pub fn split_array(data: &[u8]) -> Result<(Vec<&[u8]>, &[u8]), CborError> {
     Ok((items, rest))
 }
 
+/// The raw bytes of every key and value of the definite-length map at the
+/// start of `data`, and the bytes after the map. Like [`split_array`], each
+/// item is only measured, so keys and values [`decode`] would refuse (tags,
+/// floats) still come back as bytes.
+pub fn split_map(data: &[u8]) -> Result<MapPairs<'_>, CborError> {
+    let (b, rest) = data.split_first().ok_or(CborError::UnexpectedEnd)?;
+    let major = b >> 5;
+    if major != MT_MAP {
+        return Err(CborError::UnsupportedType(major));
+    }
+    let (count, mut rest) = read_arg(rest, b & 0b1_1111)?;
+    let mut pairs = Vec::with_capacity(count.min(1024) as usize);
+    for _ in 0..count {
+        let (key, r) = rest.split_at(item_len_at(rest, 1)?);
+        let (value, r) = r.split_at(item_len_at(r, 1)?);
+        pairs.push((key, value));
+        rest = r;
+    }
+    Ok((pairs, rest))
+}
+
+/// [`split_map`]'s result: the raw (key, value) pairs and the bytes after.
+pub type MapPairs<'a> = (Vec<(&'a [u8], &'a [u8])>, &'a [u8]);
+
 /// Canonical (shortest) header for a definite-length array of `len` items.
 pub fn array_header(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(9);
