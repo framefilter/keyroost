@@ -39,13 +39,13 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   FIDO Metadata Service (MDS) authenticator identification in the GUI. PIN
   protocols v1 and v2. CTAP 2.1 security policy over
   `authenticatorConfig` (always-require-UV, minimum PIN length, force a PIN
-  change, enterprise attestation) and a `large-blob` store for plaintext notes
+  change, enterprise attestation) and a largeBlob store for plaintext notes (`fido blob`)
   over `authenticatorLargeBlobs`. Works over USB-HID and over a PC/SC reader —
   both NFC (CTAP-over-NFC) and a contact / ISO-7816 chip reader (T=0) — not just
   direct USB. Resident-credential metadata surfaces the fuller passkey detail
   too: the user's UPN, display name, user id, and the full credential id.
   Resident SSH credentials can be listed and their stored OpenSSH certificate
-  extracted from largeBlob to a `-cert.pub` file (`fido ssh-cert`).
+  extracted from largeBlob to a `-cert.pub` file (`fido ssh`).
 - **OATH (TOTP/HOTP)** — list, add, delete, and compute codes over PC/SC,
   including applet-password set / clear / unlock, and a factory reset of the
   applet (`oath reset`) — the recovery path for a forgotten password. In
@@ -64,9 +64,9 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   applet/firmware version, serial, PIN retries, which slots 9A/9C/9D/9E hold a
   certificate), on-card key generation (RSA, ECC P-256/384/521, Ed25519,
   X25519), certificate import / export, self-signed certs or a CSR for a CA,
-  clearing a slot's certificate (`delete-cert`) or key (`delete-key`), moving a
-  key between slots (`move-key`), writing a
-  fresh CHUID with a random GUID (`new-chuid`) so Windows re-reads a
+  clearing a slot's certificate (`piv cert delete`) or key (`piv key delete`),
+  moving a key between slots (`piv key move`), writing a
+  fresh CHUID with a random GUID (`piv chuid generate`) so Windows re-reads a
   reprovisioned card, and PIN / PUK / management-key changes and applet reset.
   A certificate too large for a slot can be stored gzip-compressed, as the PIV
   standard allows (`--compress` / `--no-compress`).
@@ -75,7 +75,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   Ed25519) and checks each result against the slot certificate's public key.
   keyroost identifies which PIV implementation a card runs (YubiKey, Token2,
   Nitrokey, Swissbit, HID Crescendo and others) and offers vendor extensions
-  such as `move-key` and `delete-key` according to a built-in list of what each
+  such as `piv key move` and `piv key delete` according to a built-in list of what each
   supports. A feature the list marks unsupported stays visible, and the GUI's
   **Enable Anyway** or the CLI's `--force` turns it on.
   Every slot-taking command addresses
@@ -102,13 +102,13 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   directly on a Token2 FIDO security key and read their codes over USB-HID, NFC,
   or CCID; configure the single HOTP-on-touch keystroke slot; read the serial;
   and enable / disable the key's USB interfaces (FIDO / keyboard-HID / CCID).
-  On R3.4+ keys the codes can be put behind an OTP PIN (`otp set-pin`,
-  `otp verify`, `otp change-pin`, `otp clear-pin`, `otp pin-status`); note
+  On R3.4+ keys the codes can be put behind an OTP PIN (`otp pin set`,
+  `otp pin verify`, `otp pin change`, `otp pin clear`, `otp pin status`); note
   there is no PIN reset — a blocked PIN is recoverable only by erasing every
   OTP entry. On Bio3 keys with a fingerprint enrolled, a fingerprint touch can
   release protected codes as an alternative to the PIN
-  (`otp fingerprint-status`, `otp fingerprint-enable`,
-  `otp fingerprint-disable`, `otp list --unlock fingerprint`, and
+  (`otp fingerprint status`, `otp fingerprint enable`,
+  `otp fingerprint disable`, `otp list --unlock fingerprint`, and
   `otp list --unlock auto`, which tries the fingerprint and falls back to
   the PIN); fingerprint
   enrollment itself is done through the key's FIDO2 fingerprint setup.
@@ -143,7 +143,7 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 | **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
 | **Nitrokey 3** | FIDO2, OATH, PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. The OpenPGP applet is detected but not yet exercised by this project. |
 | **Swissbit iShield Key 2 Pro** (and iShield Key 1) | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own iShield Key 2 Pro. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)), so a slot without a certificate reads "no certificate (a key may be present)". Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. On the iShield Key 1 and 2, keyroost reads the serial and device name from Swissbit's own management applications (and, on the Key 1, the firmware version) for `piv info` and the GUI, contributed by [@episource](https://github.com/episource) ([#163](https://github.com/framefilter/keyroost/pull/163)). Other applets not yet exercised by this project. |
-| **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, large-blob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
+| **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, largeBlob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
 
 Each listed row notes what's actually been verified on that device; the final,
 generic row describes the standards-based behavior expected on untested but
@@ -197,7 +197,7 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   rounding-out of the on-device OTP support — all validated on real PIN+
   hardware ([#29](https://github.com/framefilter/keyroost/issues/29),
   [#30](https://github.com/framefilter/keyroost/pull/30)). Also added CTAP 2.1
-  authenticator-config (security policy) and large-blob storage management,
+  authenticator-config (security policy) and largeBlob storage management,
   with a FIDO2 tab redesign
   ([#38](https://github.com/framefilter/keyroost/pull/38)); T=0 contact-reader
   fixes, the single-profile programmable-token support (`keyroost-token2prog`)
@@ -225,7 +225,7 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   flake's inputs, keeping `flake.lock` current
   ([#132](https://github.com/framefilter/keyroost/pull/132)).
 - **[@episource](https://github.com/episource)** — the project's most prolific
-  external contributor: Nitrokey 3 PIV support and `piv new-chuid`
+  external contributor: Nitrokey 3 PIV support and `piv chuid generate`
   ([#102](https://github.com/framefilter/keyroost/pull/102)), short-APDU
   chaining ([#101](https://github.com/framefilter/keyroost/pull/101)), Identiv
   uTrust mutual-auth tolerance
@@ -233,7 +233,7 @@ Beyond the maintainers, keyroost is grateful for community contributions:
   VERSION / Swissbit compat ([#110](https://github.com/framefilter/keyroost/pull/110)),
   the PIV activity log and APDU trace
   ([#114](https://github.com/framefilter/keyroost/pull/114)), `--generate-key`
-  on `self-sign` / `request-cert`
+  on `piv cert generate` / `piv cert request`
   ([#116](https://github.com/framefilter/keyroost/pull/116)), status-word
   meanings in errors ([#118](https://github.com/framefilter/keyroost/pull/118)),
   the PIV-refresh APDU deduplication
@@ -624,7 +624,7 @@ keyroostctl completions powershell | Out-String | Invoke-Expression
 ```
 
 The script asks `keyroostctl` for suggestions as you type, so
-`--device <Tab>` offers the names you saved with `key-name add` (it reads
+`--device <Tab>` offers the names you saved with `name add` (it reads
 only your saved names, never the keys). If you installed a completion file
 from v0.12.0 or earlier, generate it again to get this.
 
@@ -641,9 +641,9 @@ keyroostctl doctor
 # --- FIDO2 (YubiKey / Solo 2 / Nitrokey 3), over USB-HID or an NFC reader ---
 keyroostctl fido info
 keyroostctl fido pin retries
-keyroostctl fido credentials list --pin-stdin  # PIN read from stdin, never argv
-keyroostctl fido ssh-cert list --pin-stdin     # list SSH certs stored in resident credentials
-keyroostctl fido ssh-cert extract --credential ssh:demo --out demo-cert.pub --pin-stdin
+keyroostctl fido credential list             # asks for the PIN (nothing is shown as you type)
+keyroostctl fido ssh list                     # list SSH certs stored in resident credentials
+keyroostctl fido ssh extract --id ssh:demo --out demo-cert.pub
 
 # --- OATH over PC/SC ---
 keyroostctl oath list
@@ -651,45 +651,47 @@ keyroostctl oath code 'GitHub:me@x.com' --device my-yubikey
 
 # --- OpenPGP card ---
 keyroostctl openpgp info --device my-yubikey
-keyroostctl openpgp sign --in msg.txt --pin-stdin --device my-yubikey
-keyroostctl openpgp authenticate --in chal.bin --pin-stdin --device my-yubikey  # client/SSH auth (Auth key)
+keyroostctl openpgp sign --in msg.txt --device my-yubikey          # asks for the PIN
+keyroostctl openpgp authenticate --in chal.bin --device my-yubikey  # client/SSH auth (Auth key)
 
-# --- PIV (read-only status) ---
+# --- PIV ---
 keyroostctl piv info --device my-yubikey
+keyroostctl piv key generate --slot 9a --algorithm eccp256   # asks for the management key
 
 # bulk-provision several slots: management key + PIN from env once, loop the rest.
 # (the GUI asks per operation; the CLI is the path for many slots/keys)
 export PIV_MGMT=...   # AES-192 / 3DES management key, hex; never put it in argv
 export PIV_PIN=...
 for slot in 9a 9c 9d 9e; do
-  keyroostctl piv generate-key --slot "$slot" --algorithm eccp256 \
-      --mgmt-key-env PIV_MGMT --device my-yubikey
-  keyroostctl piv self-sign --slot "$slot" --subject "CN=$USER" \
-      --mgmt-key-env PIV_MGMT --pin-env PIV_PIN --device my-yubikey
+  keyroostctl piv key generate --slot "$slot" --algorithm eccp256 \
+      --mgmt-key env:PIV_MGMT --device my-yubikey
+  keyroostctl piv cert generate --slot "$slot" --subject "CN=$USER" \
+      --mgmt-key env:PIV_MGMT --pin env:PIV_PIN --device my-yubikey
 done
 # (in a terminal, a step that would replace a slot in use asks y/N first;
 #  add --yes to overwrite without asking)
 # on a card without GET METADATA (non-Yubico PIV, or Yubico firmware < 5.3)
 # the two steps can't share the key by slot name across invocations; fold
 # them into one so the fresh public key never needs a temp file:
-#   keyroostctl piv self-sign --slot 9a --subject "CN=$USER" --generate-key \
-#       --algorithm eccp256 --mgmt-key-env PIV_MGMT --pin-env PIV_PIN
-# (same --generate-key convenience on `piv request-cert`)
+#   keyroostctl piv cert generate --slot 9a --subject "CN=$USER" --generate-key \
+#       --algorithm eccp256 --mgmt-key env:PIV_MGMT --pin env:PIV_PIN
+# (same --generate-key convenience on `piv cert request`)
 
 # --- Token2 Molto2 (TOTP programming) ---
 keyroostctl molto info
 keyroostctl molto import --slot 0                # asks for the otpauth:// URI (hidden)
-keyroostctl molto import --slot 0 --uri-env URI # or from an environment variable
-keyroostctl molto import-file ~/Downloads/aegis.json --start 0 --dry-run   # validate first
+keyroostctl molto import --slot 0 --uri env:URI  # or from an environment variable
+keyroostctl molto import --file ~/Downloads/aegis.json --slot 0 --dry-run   # validate first
+keyroostctl molto seed --slot 5                  # asks for the seed (base32; --encoding hex for hex)
 
 # --- Token2 single-profile programmable token (OTPC / miniOTP / C30x) ---
 keyroostctl prog info                          # serial, model, and on-device clock
-keyroostctl prog seed --base32-stdin           # base32 seed from stdin, never argv
+keyroostctl prog seed                          # asks for the base32 seed (hidden)
 keyroostctl prog config --algorithm sha1 --period 30 --display-timeout 30
 
 # --- Token2 on-device OTP (PIN+ Series FIDO keys) ---
 keyroostctl otp list
-keyroostctl otp add --app GitHub --account me@x.com --seed-stdin   # seed from stdin, never argv
+keyroostctl otp add --app GitHub --account me@x.com   # asks for the seed (hidden)
 keyroostctl otp code --app GitHub --account me@x.com
 
 # --- Destructive operations (ask y/N, or type "reset", in a terminal) ---
@@ -697,8 +699,8 @@ keyroostctl factory-reset --device my-yubikey          # asks you to type "reset
 keyroostctl factory-reset --device my-yubikey --yes    # in a script
 
 # name a key to target it when several are plugged in (opt-in)
-keyroostctl key-name add my-yubikey
-keyroostctl key-name list
+keyroostctl name add my-yubikey
+keyroostctl name list
 
 # machine-readable output for scripts (status and query commands)
 keyroostctl --json list                     # {"keys": [...]}, each with its --device value
@@ -723,6 +725,10 @@ values. `--reader` (a reader name, or a unique part of one) and `--path` are
 expert overrides: they skip the capability check, and a value that matches
 no detected key is used as typed. Neither can be combined with `--device`.
 
+Five flags have a short form, with the same meaning on every command:
+`-d` (`--device`), `-y` (`--yes`), `-o` (`--out`), `-i` (`--in`) and
+`-s` (`--slot`).
+
 Commands that erase or replace something on the key (resets, deletes,
 overwriting a used slot or seed) name the key and ask y/N first
 (`factory-reset` and `otp interface` ask you to type a phrase). A script has
@@ -733,31 +739,37 @@ still the same key before acting.
 ### Giving keyroost a PIN
 
 keyroostctl never takes a PIN, password, key, seed or `otpauth://` URI on the
-command line, where it would land in shell history and `ps`. Each secret flag
-comes in two forms, and with neither, a terminal asks for it:
+command line, where it would land in shell history and `ps`. By hand, leave
+the flag out and a terminal asks for the secret without showing what you type.
+In a script, the flag's value says where the secret comes from: `env:NAME`
+reads an environment variable and `stdin` reads one line:
 
 ```bash
-keyroostctl fido credentials list                   # asks "PIN:" (nothing is shown as you type)
-keyroostctl fido credentials list --pin-env KR_PIN  # read from the KR_PIN environment variable
-pass show fido-pin | keyroostctl fido credentials list --pin-stdin   # one line from stdin
+keyroostctl fido credential list                   # asks "PIN:" (nothing is shown as you type)
+keyroostctl fido credential list --pin env:KR_PIN  # read from the KR_PIN environment variable
+pass show fido-pin | keyroostctl fido credential list --pin stdin   # one line from stdin
 ```
+
+Typing the secret itself as the value (`--pin 123456`) is refused, and the
+value is never shown. `--mgmt-key default` uses the factory-default PIV
+management key.
 
 A new PIN, password or key typed at the prompt is asked twice and must match.
 When one command reads two secrets from stdin, the current one is the first
 line and the new one the second (each flag's `--help` says which line):
 
 ```bash
-printf '%s\n%s\n' "$OLD_PIN" "$NEW_PIN" | keyroostctl piv change-pin --old-pin-stdin --new-pin-stdin
+printf '%s\n%s\n' "$OLD_PIN" "$NEW_PIN" | keyroostctl piv pin change --pin stdin --new-pin stdin
 ```
 
-`otp add` and `oath add` read the seed first, then the PIN or password. The
-Molto2 and programmable-token seed and key commands (`molto seed`, `prog seed`,
-`molto customer-key`) don't prompt: you pick the encoding by flag (`--hex-*` or
-`--base32-*`, `--hex-*` or `--ascii-*`), so one of those flags is required. A
-Molto2 customer key left out means the factory default. In a
-script with no terminal, a command with no source for a secret it needs is
-refused, naming the flags to use. In Git Bash (mintty) on Windows the prompt
-needs a real console: run `winpty keyroostctl …`, or use the `-env` flags.
+`otp add` and `oath add` read the seed first, then the PIN or password; on
+`molto`, `--customer-key stdin` is always the first line. Seeds are base32
+unless `--encoding hex`; a new Molto2 customer key is hex unless `--encoding
+ascii`, and `--customer-key-encoding` says how the current one is written. A
+Molto2 customer key left out means the factory default. In a script with no
+terminal, a command with no source for a secret it needs is refused, naming
+the flag. In Git Bash (mintty) on Windows the prompt needs a real console:
+run `winpty keyroostctl …`, or use `env:NAME`.
 
 ### Reading the output
 
@@ -767,7 +779,7 @@ redirecting saves only the result:
 
 ```bash
 keyroostctl molto slots > slots.txt     # the file gets just the table
-keyroostctl piv export-cert --slot 9a   # prints the certificate as PEM
+keyroostctl piv cert export --slot 9a   # prints the certificate as PEM
 ```
 
 With `--json` (on the commands that support it), a command prints one
@@ -784,10 +796,12 @@ Breaking changes are tracked per release on the site's
 page, with the exact before → after for scripts and library consumers.
 **v0.13.0** makes more commands ask before they erase or replace something
 (scripts pass `--yes`), refuses, in a script, to pick among several keys, and
-takes no secret on the command line (a few secret flags are renamed, and two
-commands read their stdin lines in a new order). It also reshapes `--json`
-output, moves everything but the result to stderr, and makes `piv
-export-cert` write PEM.
+takes no secret on the command line (each secret flag takes `env:NAME` or
+`stdin`, and a terminal asks when it is left out). Commands are regrouped
+(`piv pin change`, `fido credential list`), five short flags mean the same
+everywhere, and two commands read their stdin lines in a new order. It also
+reshapes `--json` output, moves everything but the result to stderr, and
+makes `piv cert export` write PEM.
 Two older ones to know about: **v0.7.5** renames the global device selector from
 `--name` to `--device`, and **v0.6.0** moved the Molto2 / FIDO commands under
 the `molto` and `fido` groups.
