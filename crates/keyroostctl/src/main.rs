@@ -6264,7 +6264,7 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
             (Vec::new(), false)
         }
     };
-    let (mut keyring, may_save) = keyroost_resolve::load_keyring_for_scan();
+    let (keyring, may_save) = keyroost_resolve::load_keyring_for_scan();
     if device.is_none() && hids_ok {
         let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
         if filtered.is_empty() {
@@ -6342,7 +6342,7 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     }
     let debug = crate::target::debug_on();
     let mut devices = keyroost_resolve::correlate_live(&hids, &probes, &keyring, debug);
-    keyroost_resolve::name_from_keys(&mut devices, &mut keyring, may_save, debug);
+    keyroost_resolve::name_from_keys(&mut devices, &keyring, may_save, debug);
     let rows = filter_rows(&devices, device)?;
     overview::print_correlated(&rows);
 
@@ -12368,6 +12368,8 @@ fn run_fido_large_blob_add(
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
+    // A name read from this key may change; never reuse an older read.
+    keyroost_resolve::forget_key_names();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
     println!("Note added; {} entries now.", updated.len());
     Ok(())
@@ -12393,6 +12395,8 @@ fn run_fido_large_blob_edit(
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
+    // A name read from this key may change; never reuse an older read.
+    keyroost_resolve::forget_key_names();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
     println!("Note {} updated.", index);
     Ok(())
@@ -12444,6 +12448,8 @@ fn run_fido_large_blob_delete(
         &info,
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
+    // A name read from this key may change; never reuse an older read.
+    keyroost_resolve::forget_key_names();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
     println!("Entry deleted; {} entries now.", updated.len());
     Ok(())
@@ -12505,6 +12511,8 @@ fn run_fido_large_blob_clear(
         keyroost_ctap::client_pin::permissions::LARGE_BLOB_WRITE,
     )?;
     let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
+    // A name read from this key may change; never reuse an older read.
+    keyroost_resolve::forget_key_names();
     keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)?;
     println!("Large-blob array cleared ({} entries wiped).", total);
     Ok(())
@@ -12835,6 +12843,8 @@ fn fido_reset_at(
     if announce_touch {
         eprintln!("Resetting {} — touch the key now…", path.display());
     }
+    // A name read from this key may change; never reuse an older read.
+    keyroost_resolve::forget_key_names();
     keyroost_ctap::reset(&mut dev)?;
     println!("Reset complete. All credentials wiped, PIN cleared.");
     Ok(())
@@ -12859,6 +12869,8 @@ fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::E
     }
     output::status("Power-cycling the card and sending the reset\u{2026}");
     let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(exact_reader)?;
+    // A name read from this key may change; never reuse an older read.
+    keyroost_resolve::forget_key_names();
     keyroost_ctap::reset(&mut dev).map_err(|e| -> Box<dyn std::error::Error> {
         let s = e.to_string();
         if s.contains("NOT_ALLOWED") || s.contains("0x30") {
@@ -16074,6 +16086,7 @@ mod cli_tests {
             kind: keyroost_resolve::DeviceKind::Key,
             hid_path: Some("/dev/hidraw3".into()),
             reader: None,
+            hid_serial: None,
             naming: Default::default(),
         }
     }
@@ -16172,6 +16185,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw3".into()),
             reader: Some("R 00".into()),
+            hid_serial: None,
             naming: Default::default(),
         };
         assert_eq!(
@@ -17645,6 +17659,7 @@ mod cli_tests {
                 kind: DeviceKind::Key,
                 hid_path: hid.map(std::path::PathBuf::from),
                 reader: reader.map(str::to_owned),
+                hid_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
             }
         }
@@ -17703,6 +17718,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: None,
             reader: Some("Some Reader".to_string()),
+            hid_serial: None,
             naming: Default::default(),
         };
         match otp_target_for(&row, OtpTransportArg::Auto) {
@@ -20851,6 +20867,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw16".into()),
             reader: Some("Yubico 00".into()),
+            hid_serial: None,
             naming: Default::default(),
         };
         let hid = keyroost_hid::HidDevice {
@@ -20911,6 +20928,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: None,
             reader: None,
+            hid_serial: None,
             naming: Default::default(),
         };
         // A normal detected row with a serial is nameable.
@@ -20949,6 +20967,7 @@ mod cli_tests {
                 kind,
                 hid_path: None,
                 reader: Some(reader.into()),
+                hid_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
             }
         }
@@ -21298,6 +21317,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
+            hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
         };
         let devs = [
@@ -21338,6 +21358,7 @@ mod cli_tests {
             kind: DeviceKind::Key,
             hid_path: Some("/dev/hidraw1".into()),
             reader: reader.map(str::to_owned),
+            hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
         };
         let devs = [
@@ -21389,6 +21410,7 @@ mod prop_tests {
             kind: keyroost_resolve::DeviceKind::Key,
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(String::from),
+            hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
         }
     }

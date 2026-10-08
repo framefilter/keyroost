@@ -375,6 +375,13 @@ pub enum SelectError {
         value: String,
         newcomers: Vec<Candidate>,
     },
+    /// `--device NAME` matched no key, but the name stored on `unread`
+    /// couldn't be read this time (busy, timeout): any of them may carry it,
+    /// so nothing is guessed.
+    NameUnreadable {
+        value: String,
+        unread: Vec<Candidate>,
+    },
     LacksCapability {
         selector: String,
         need: Need,
@@ -458,6 +465,18 @@ impl fmt::Display for SelectError {
                 shell_quote(&clean(value)),
                 matches.len(),
                 join(matches)
+            ),
+            NameUnreadable { value, unread } => write!(
+                f,
+                "can't tell which key is named '{}' right now: the name on {} couldn't be \
+                 read; try again, or choose by serial or list number: {}",
+                clean(value),
+                if unread.len() == 1 {
+                    "a connected key".to_string()
+                } else {
+                    format!("{} connected keys", unread.len())
+                },
+                join(unread)
             ),
             NameNotConnected { value, newcomers } => write!(
                 f,
@@ -581,7 +600,20 @@ pub fn resolve_target<'d>(
                     .collect()
             })
             .unwrap_or_default();
+        let unread: Vec<usize> = if named.is_some() {
+            order
+                .iter()
+                .copied()
+                .filter(|&i| devices[i].naming.on_key == crate::names::KeyLabel::ReadFailed)
+                .collect()
+        } else {
+            Vec::new()
+        };
         return match rows.as_slice() {
+            [] if !unread.is_empty() => Err(SelectError::NameUnreadable {
+                value: named.unwrap_or(v).to_string(),
+                unread: describe(&unread),
+            }),
             [] if !newcomers.is_empty() => Err(SelectError::NameNotConnected {
                 value: named.unwrap_or(v).to_string(),
                 newcomers: describe(&newcomers),
@@ -721,6 +753,7 @@ mod tests {
             kind,
             hid_path: hid.map(PathBuf::from),
             reader: reader.map(str::to_owned),
+            hid_serial: None,
             naming: Naming::local(name),
         }
     }
@@ -1407,7 +1440,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, SelectError::Ambiguous { .. }), "{e:?}");
-        assert!(device_value(&devs, 0).starts_with("list:") || device_value(&devs, 0) == "1");
+        assert_eq!(device_value(&devs, 0), "1");
+        assert_eq!(device_value(&devs, 1), "2");
+    }
+
+    #[test]
+    fn unread_name_refuses_rather_than_pointing_elsewhere() {
+        // A's name couldn't be read this time; B carries "Work" as a newcomer.
+        let mut a = on_key("12345678", "Work", true);
+        a.name = None;
+        a.naming = Naming {
+            on_key: crate::names::KeyLabel::ReadFailed,
+            ..Naming::default()
+        };
+        let b = on_key("99995678", "Work", false);
+        for devs in [vec![a.clone(), b], vec![a]] {
+            for v in ["Work", "name:Work"] {
+                let e = resolve_target(&devs, &sel(Some(v), None, None), Need::Any, &mut NoPicker)
+                    .unwrap_err();
+                assert!(matches!(e, SelectError::NameUnreadable { .. }), "{e:?}");
+                let msg = e.to_string();
+                assert!(msg.contains("--device 12345678"), "{msg}");
+                assert!(!msg.contains("is connected"), "{msg}");
+            }
+        }
     }
 
     #[test]

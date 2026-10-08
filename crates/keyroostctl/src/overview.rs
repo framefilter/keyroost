@@ -186,6 +186,7 @@ mod tests {
             kind,
             hid_path: None,
             reader: None,
+            hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
         }
     }

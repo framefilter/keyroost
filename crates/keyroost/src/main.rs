@@ -5463,6 +5463,8 @@ impl App {
                     }
                 }
                 let mut dev = dev.ok_or_else(|| "could not open key".to_string())?;
+                // A name read from this key may change; never reuse an older read.
+                keyroost_resolve::forget_key_names();
                 keyroost_ctap::reset(&mut dev).map_err(|e| e.to_string())
             })();
             Box::new(move |app: &mut App| {
@@ -5484,6 +5486,8 @@ impl App {
             let result = (|| -> Result<(), String> {
                 let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(&reader)
                     .map_err(|e| e.to_string())?;
+                // A name read from this key may change; never reuse an older read.
+                keyroost_resolve::forget_key_names();
                 keyroost_ctap::reset(&mut dev).map_err(|e| {
                     let s = e.to_string();
                     // Rewrite the refusal here, not in the shared handler: its
@@ -6852,15 +6856,15 @@ impl App {
     /// `None` for it) — the reset dispatched at arm time was live, but the
     /// touch prompt never fires because `reset_reinsert_matches` never sees
     /// two `Some`s to compare. Matches the CLI's `fido_reset_after_replug`,
-    /// which resolves the reinserted key with the identical
-    /// `keyroost_resolve::enumerate()` call for exactly this reason.
+    /// which resolves the reinserted key from the same correlated device
+    /// list for exactly this reason. Names stored on keys are not read here
+    /// (`skip_key_names`), so the poll never talks CTAP to the key being
+    /// reset.
     ///
     /// `None` when the device is gone or the identity can't be read *yet* (a
     /// just-replugged key's CCID interface takes a beat to register with
     /// pcscd) — callers retry on the next poll rather than guessing.
     fn fido_effective_serial(path: &std::path::Path) -> Option<String> {
-        // Polled while a reset is armed: no name reads, so the poll never
-        // talks CTAP to the key being reset.
         keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
             skip_key_names: true,
             ..Default::default()
@@ -7648,6 +7652,7 @@ impl App {
                                         kind: DeviceKind::Key,
                                         hid_path: None,
                                         reader: None,
+                                        hid_serial: None,
                                         naming: Default::default(),
                                     });
                                 }
@@ -7680,6 +7685,11 @@ impl App {
                     // staggered burst that follows any of them (`pending_scans`)
                     // makes "which scan did the user actually ask for" moot in
                     // practice, so all of them log at the same, muted weight.
+                    // keys.json unreadable, or names seen on keys not
+                    // recorded: each shown once per session.
+                    for w in keyroost_resolve::take_scan_warnings() {
+                        app.log_global(Severity::Warn, LogKind::User, w);
+                    }
                     app.log_global(
                         Severity::Info,
                         LogKind::Background,
@@ -13973,6 +13983,8 @@ impl App {
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
+                // A name read from this key may change; never reuse an older read.
+                keyroost_resolve::forget_key_names();
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14049,6 +14061,8 @@ impl App {
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &current)?;
+                // A name read from this key may change; never reuse an older read.
+                keyroost_resolve::forget_key_names();
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14179,6 +14193,8 @@ impl App {
                     .serialize_with_checksum()
                     .map_err(|e| e.to_string())?;
                 let token = large_blob_write_token(&mut dev, &info, &pin, &live)?;
+                // A name read from this key may change; never reuse an older read.
+                keyroost_resolve::forget_key_names();
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -14255,6 +14271,8 @@ impl App {
 
                 // Wipe every element, including any skipped (non-standard) ones.
                 let serialized = keyroost_ctap::large_blobs::empty_array_serialized();
+                // A name read from this key may change; never reuse an older read.
+                keyroost_resolve::forget_key_names();
                 keyroost_ctap::large_blobs::write(&mut dev, &info, &token, &serialized)
                     .map_err(|e| e.to_string())?;
 
@@ -23616,6 +23634,7 @@ mod tests {
             kind: DeviceKind::Key,
             hid_path: None,
             reader: None,
+            hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
         }
     }

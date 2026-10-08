@@ -40,9 +40,9 @@
 
 mod fingerprint;
 
-pub use fingerprint::{fingerprint, Fingerprint, Salt, SALT_FILE};
+pub use fingerprint::{canonical_serial, fingerprint, Fingerprint, Salt, SALT_FILE};
 
-use fingerprint::{canonical_serial, generate_salt, load_salt, persist_salt};
+use fingerprint::{generate_salt, load_salt, persist_salt};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;

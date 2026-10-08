@@ -84,7 +84,7 @@ pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 /// The serial as fingerprinted: control/spoofing characters removed (the same
 /// cleaning older `keys.json` files applied before storing a serial, so a
 /// converted record matches the live key), then trimmed and lowercased.
-pub(crate) fn canonical_serial(serial: &str) -> String {
+pub fn canonical_serial(serial: &str) -> String {
     let mut s = serial.to_string();
     strip_control_chars(&mut s);
     s.trim().to_lowercase()
