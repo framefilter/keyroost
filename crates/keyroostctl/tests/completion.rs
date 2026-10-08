@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 /// Runs the dynamic completer (fish flavor) for `words` against a keys.json
-/// holding two saved names, and returns its stdout.
+/// holding two saved names, and returns its stdout. The file is deliberately
+/// in the old version 1 format (plain serials): completion loads it, which
+/// converts it in its temp directory, and must still offer both names.
 fn complete(words: &[&str]) -> String {
     let dir = std::env::temp_dir().join(format!(
         "keyroost-completion-{}-{}",

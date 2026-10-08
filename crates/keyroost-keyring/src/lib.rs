@@ -32,6 +32,11 @@
 //! computer is saved when the user names a key. A name found on a key is
 //! recorded the first time this computer sees it ([`Keyring::record_first_seen`]),
 //! so that later a different key showing the same name can be told apart.
+//!
+//! The one write a load makes is converting an older `keys.json` that still
+//! holds plain serials: [`Keyring::load_from`] rewrites it with fingerprints
+//! (salt first, through a temporary backup that is removed afterwards), so
+//! the serials leave the disk the first time the new version reads the file.
 
 mod fingerprint;
 
@@ -106,6 +111,8 @@ pub struct Keyring {
     salt_persisted: bool,
     /// What was on disk when this ring was loaded.
     origin: Origin,
+    /// Set when this load converted a version 1 file.
+    report: Option<LoadReport>,
 }
 
 /// What `keys.json` held when a [`Keyring`] was loaded.
@@ -116,10 +123,25 @@ enum Origin {
     Fresh,
     /// A version 2 file.
     V2,
-    /// A version 1 file (plain serials), read into memory only. Saving over
-    /// it is refused until conversion writes it out properly.
-    V1,
+    /// A version 1 file (plain serials), converted in memory. While
+    /// `backup_pending`, the converted file isn't fully on disk yet: the next
+    /// save backs up the old file, writes the new one and removes the backup.
+    ConvertedFromV1 { backup_pending: bool },
 }
+
+/// What converting a version 1 `keys.json` did, for a `--debug` trace:
+/// counts only, never a name or serial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadReport {
+    /// Records converted.
+    pub converted: usize,
+    /// Whether the converted file reached disk (else the old file is
+    /// untouched and the next save retries).
+    pub persisted: bool,
+}
+
+/// The old file's backup during conversion, beside `keys.json`.
+const V1_BACKUP_SUFFIX: &str = ".v1-backup";
 
 /// `keys.json` as written.
 #[derive(Serialize)]
@@ -159,6 +181,8 @@ struct EntryV1 {
 enum Format {
     V1(FileV1),
     V2(FileIn),
+    /// Written by a newer keyroost; never read or overwritten.
+    Newer(u64),
 }
 
 /// Errors loading, saving, or mutating the registry. No variant ever carries a
@@ -178,6 +202,9 @@ pub enum KeyringError {
     /// `keys.json` is still in the old format and this ring didn't convert
     /// it; saving would overwrite every name in it.
     Unconverted,
+    /// `keys.json` was written by a newer keyroost (this format version);
+    /// it is neither read nor overwritten.
+    NewerFormat(u64),
 }
 
 impl fmt::Display for KeyringError {
@@ -211,6 +238,12 @@ impl fmt::Display for KeyringError {
                 f,
                 "keys.json is in the old format and hasn't been converted yet; \
                  not overwriting it"
+            ),
+            KeyringError::NewerFormat(v) => write!(
+                f,
+                "keys.json was written by a newer keyroost (format version {}); \
+                 not changing it",
+                v
             ),
         }
     }
@@ -370,37 +403,34 @@ impl Keyring {
 
     /// Load from a specific path; the salt is read from `keys.salt` in the
     /// same directory. A missing file yields an empty registry.
+    ///
+    /// A version 1 file (plain serials) is converted on the spot: the salt is
+    /// written first, the old file is backed up, the new one written, and the
+    /// backup removed. If any step fails the old file stays as it was, the
+    /// converted ring still works in memory, and the next save retries;
+    /// [`Keyring::load_report`] says which happened. A leftover backup from an
+    /// earlier interrupted conversion holds plain serials and is deleted.
     pub fn load_from(path: &Path) -> Result<Keyring, KeyringError> {
         let dir = salt_dir(path);
         let text = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                remove_stale_backup(path);
                 let salt = load_salt(dir)?;
                 return Ok(Keyring {
-                    keys: Vec::new(),
                     salt_persisted: salt.is_some(),
                     salt,
-                    origin: Origin::Fresh,
+                    ..Keyring::default()
                 });
             }
             Err(e) => return Err(KeyringError::Io(e)),
         };
         let file = match parse(&text)? {
             Format::V2(file) => file,
-            Format::V1(old) => {
-                let (salt, salt_persisted) = match load_salt(dir)? {
-                    Some(s) => (s, true),
-                    None => (generate_salt()?, false),
-                };
-                let keys = convert_v1(&salt, old);
-                return Ok(Keyring {
-                    keys,
-                    salt: Some(salt),
-                    salt_persisted,
-                    origin: Origin::V1,
-                });
-            }
+            Format::Newer(v) => return Err(KeyringError::NewerFormat(v)),
+            Format::V1(old) => return Self::convert(path, &text, old),
         };
+        remove_stale_backup(path);
         let mut keys = file.keys;
         // Names are validated before they ever reach disk; on the way back in
         // every field — including the name — is sanitized rather than
@@ -425,7 +455,71 @@ impl Keyring {
             salt_persisted: salt.is_some(),
             salt,
             origin: Origin::V2,
+            report: None,
         })
+    }
+
+    /// Convert a version 1 file read from `path` (`text`, already parsed as
+    /// `old`).
+    fn convert(path: &Path, text: &str, old: FileV1) -> Result<Keyring, KeyringError> {
+        let dir = salt_dir(path);
+        let mut ring = Keyring {
+            origin: Origin::ConvertedFromV1 {
+                backup_pending: true,
+            },
+            ..Keyring::default()
+        };
+        // a. The salt reaches disk before any fingerprint does.
+        let salt_on_disk = match load_salt(dir)? {
+            Some(salt) => {
+                ring.salt = Some(salt);
+                ring.salt_persisted = true;
+                true
+            }
+            None => {
+                ring.salt = Some(generate_salt()?);
+                ring.persist_salt_if_needed(dir).is_ok()
+            }
+        };
+        // b. Records.
+        let converted = old.keys.len();
+        ring.keys = convert_v1(ring.salt.as_ref().expect("set above"), old);
+        // c–e. Backup, write, remove the backup.
+        let persisted = salt_on_disk && ring.finish_conversion(path, text.as_bytes()).is_ok();
+        ring.report = Some(LoadReport {
+            converted,
+            persisted,
+        });
+        Ok(ring)
+    }
+
+    /// Steps c–e of a conversion: back up `original` (the version 1 bytes on
+    /// disk), write this ring over it, remove the backup. On failure the old
+    /// file is left (or put back) as it was.
+    fn finish_conversion(&mut self, path: &Path, original: &[u8]) -> Result<(), KeyringError> {
+        let backup = backup_path(path);
+        // c.
+        let _ = fs::remove_file(&backup);
+        write_new_private(&backup, original)?;
+        // d.
+        if let Err(e) = write_atomic(path, &self.to_json()?) {
+            if fs::read(path).ok().as_deref() != Some(original) {
+                let _ = fs::copy(&backup, path);
+            }
+            let _ = fs::remove_file(&backup);
+            return Err(e);
+        }
+        // e. The backup holds plain serials; it must not outlive the
+        // conversion. If it can't be removed now, the next load removes it.
+        fs::remove_file(&backup)?;
+        self.origin = Origin::V2;
+        Ok(())
+    }
+
+    /// What this load's conversion of a version 1 file did; `None` when no
+    /// conversion happened.
+    pub fn load_report(&self) -> Option<LoadReport> {
+        self.report
     }
 
     /// Persist to the default config path, creating parent dirs. Opt-in: only
@@ -451,9 +545,28 @@ impl Keyring {
     /// that assumption stops holding. The salt is the exception: it is created
     /// once and never replaced, and a save refuses rather than pair this
     /// ring's fingerprints with a salt another process wrote meanwhile.
+    ///
+    /// Two guards keep a ring from destroying names it never read: a file
+    /// still in version 1 is overwritten only by the ring that converted it
+    /// ([`KeyringError::Unconverted`] otherwise — e.g. an empty ring from
+    /// `load_default().unwrap_or_default()`), and a file from a newer
+    /// keyroost is never overwritten ([`KeyringError::NewerFormat`]). A
+    /// refused save writes nothing.
     pub fn save_to(&mut self, path: &Path) -> Result<(), KeyringError> {
-        if self.origin == Origin::V1 {
-            return Err(KeyringError::Unconverted);
+        let converting = matches!(self.origin, Origin::ConvertedFromV1 { .. });
+        let mut v1_on_disk = None;
+        match fs::read_to_string(path) {
+            Ok(text) => match parse(&text) {
+                Ok(Format::Newer(v)) => return Err(KeyringError::NewerFormat(v)),
+                Ok(Format::V1(_)) if !converting => return Err(KeyringError::Unconverted),
+                Ok(Format::V1(_)) => v1_on_disk = Some(text),
+                // A v2 file, or one too damaged to read: overwrite.
+                Ok(Format::V2(_)) | Err(_) => {}
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // Not text at all: as damaged as an unparseable file.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            Err(e) => return Err(KeyringError::Io(e)),
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -473,7 +586,22 @@ impl Keyring {
             }
         }
         self.persist_salt_if_needed(salt_dir(path))?;
-        write_atomic(path, &self.to_json()?)
+        if let Some(original) = v1_on_disk {
+            return self.finish_conversion(path, original.as_bytes());
+        }
+        write_atomic(path, &self.to_json()?)?;
+        if converting {
+            // The file was converted, but its backup may have outlived it.
+            fs::remove_file(backup_path(path)).or_else(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+            self.origin = Origin::V2;
+        }
+        Ok(())
     }
 
     fn to_json(&self) -> Result<String, KeyringError> {
@@ -663,6 +791,36 @@ impl Keyring {
     }
 }
 
+/// `keys.json.v1-backup` beside `path`.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(V1_BACKUP_SUFFIX);
+    path.with_file_name(name)
+}
+
+/// Delete a backup left by an interrupted conversion: it holds plain serials.
+/// Best effort; the next load tries again.
+fn remove_stale_backup(path: &Path) {
+    let _ = fs::remove_file(backup_path(path));
+}
+
+/// Create `path` owner-only (0600 on Unix) holding `bytes`; never overwrites
+/// and never follows a symlink planted there.
+fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), KeyringError> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 /// The directory holding `keys.json` (and so `keys.salt`).
 fn salt_dir(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
@@ -692,10 +850,11 @@ fn parse_error(e: &serde_json::Error) -> KeyringError {
 /// array whose every entry carries a `serial` (or no entries) is v1.
 fn parse(text: &str) -> Result<Format, KeyringError> {
     let value: serde_json::Value = serde_json::from_str(text).map_err(|e| parse_error(&e))?;
-    match value.get("version") {
-        Some(v) if v.as_u64() == Some(FORMAT_VERSION) => serde_json::from_value(value)
+    match value.get("version").map(serde_json::Value::as_u64) {
+        Some(Some(FORMAT_VERSION)) => serde_json::from_value(value)
             .map(Format::V2)
             .map_err(|e| parse_error(&e)),
+        Some(Some(v)) if v > FORMAT_VERSION => Ok(Format::Newer(v)),
         Some(_) => Err(KeyringError::Parse("unsupported version".into())),
         None if is_v1(&value) => serde_json::from_value(value)
             .map(Format::V1)
@@ -1026,21 +1185,253 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    const V1_FIXTURE: &str = r#"{
+  "keys": [
+    { "name": "yubi", "serial": "12345678", "source": "ccid", "vendor": "yubico" },
+    { "name": "solo", "serial": "ABCDEF01", "note": "desk" },
+    { "name": "blank", "serial": "" }
+  ]
+}"#;
+
+    fn backup_of(path: &Path) -> PathBuf {
+        path.with_file_name("keys.json.v1-backup")
+    }
+
     #[test]
-    fn v1_file_reads_in_memory_and_is_never_overwritten_unconverted() {
-        let dir = temp_dir("v1-read");
+    fn v1_converts_once_backup_removed_salt_0600() {
+        let dir = temp_dir("v1-convert");
         let path = dir.join("keys.json");
-        let v1 = r#"{"keys":[{"name":"yubi","serial":"12345678","source":"ccid"},{"name":"blank","serial":""}]}"#;
-        fs::write(&path, v1).unwrap();
-        let mut k = Keyring::load_from(&path).unwrap();
+        fs::write(&path, V1_FIXTURE).unwrap();
+        let k = Keyring::load_from(&path).unwrap();
+        let report = k.load_report().expect("a conversion happened");
+        assert_eq!((report.converted, report.persisted), (3, true));
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["version"], 2);
+        let keys = v["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|r| r["stored"] == "computer"));
+        assert_eq!(keys[0]["vendor"], "yubico");
+        assert_eq!(keys[1]["note"], "desk");
+        assert!(keys[2]["fingerprint"].is_null());
         assert_eq!(k.local_name_for("12345678"), Some("yubi"));
-        assert_eq!(k.keys[0].source, IdSource::Ccid);
-        assert_eq!(k.keys[1].fingerprint, None);
+        assert_eq!(k.local_name_for("abcdef01"), Some("solo"));
+        assert!(!backup_of(&path).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join(SALT_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn conversion_is_idempotent_bytes_unchanged() {
+        let dir = temp_dir("v1-idem");
+        let path = dir.join("keys.json");
+        fs::write(&path, V1_FIXTURE).unwrap();
+        Keyring::load_from(&path).unwrap();
+        let json = fs::read(&path).unwrap();
+        let salt = fs::read(dir.join(SALT_FILE)).unwrap();
+        let again = Keyring::load_from(&path).unwrap();
+        assert!(again.load_report().is_none());
+        assert_eq!(again.local_name_for("12345678"), Some("yubi"));
+        assert_eq!(fs::read(&path).unwrap(), json);
+        assert_eq!(fs::read(dir.join(SALT_FILE)).unwrap(), salt);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn converted_file_contains_no_serial() {
+        let dir = temp_dir("v1-noserial");
+        let path = dir.join("keys.json");
+        fs::write(&path, V1_FIXTURE).unwrap();
+        Keyring::load_from(&path).unwrap();
+        for f in [&path, &dir.join(SALT_FILE)] {
+            let text = fs::read_to_string(f).unwrap().to_lowercase();
+            assert!(!text.contains("12345678"), "{}", f.display());
+            assert!(!text.contains("abcdef01"), "{}", f.display());
+        }
+        // Nothing else is left in the directory.
+        let mut left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["keys.json".to_string(), SALT_FILE.to_string()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_backup_is_deleted_on_load() {
+        let dir = temp_dir("stale-backup");
+        let path = dir.join("keys.json");
+        let mut k = Keyring::default();
+        k.set_name("12345678", "a", NameStore::Computer, meta())
+            .unwrap();
+        k.save_to(&path).unwrap();
+        fs::write(backup_of(&path), V1_FIXTURE).unwrap();
+        Keyring::load_from(&path).unwrap();
+        assert!(!backup_of(&path).exists());
+        // Also when keys.json itself is gone.
+        fs::write(backup_of(&path), V1_FIXTURE).unwrap();
+        fs::remove_file(&path).unwrap();
+        Keyring::load_from(&path).unwrap();
+        assert!(!backup_of(&path).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn default_ring_cannot_overwrite_v1_file() {
+        let dir = temp_dir("v1-guard");
+        let path = dir.join("keys.json");
+        fs::write(&path, V1_FIXTURE).unwrap();
+        let mut k = Keyring::default();
         assert!(matches!(k.save_to(&path), Err(KeyringError::Unconverted)));
-        assert_eq!(fs::read_to_string(&path).unwrap(), v1);
-        // An empty old-format file is old-format too.
-        fs::write(&path, r#"{"keys":[]}"#).unwrap();
-        assert!(Keyring::load_from(&path).unwrap().keys.is_empty());
+        k.set_name("00000000", "new", NameStore::Computer, meta())
+            .unwrap();
+        assert!(matches!(k.save_to(&path), Err(KeyringError::Unconverted)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), V1_FIXTURE);
+        // A refused save writes nothing else either.
+        assert!(!dir.join(SALT_FILE).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn newer_version_is_never_overwritten() {
+        let dir = temp_dir("newer");
+        let path = dir.join("keys.json");
+        let v3 = r#"{"version":3,"keys":[{"whatever":true}]}"#;
+        fs::write(&path, v3).unwrap();
+        assert!(matches!(
+            Keyring::load_from(&path),
+            Err(KeyringError::NewerFormat(3))
+        ));
+        let mut k = Keyring::default();
+        assert!(matches!(
+            k.save_to(&path),
+            Err(KeyringError::NewerFormat(3))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), v3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_persist_keeps_original_and_works_in_memory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("v1-readonly");
+        let path = dir.join("keys.json");
+        fs::write(&path, V1_FIXTURE).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        // Root ignores directory permissions; the test means nothing there.
+        let probe = dir.join("probe");
+        if fs::write(&probe, b"").is_ok() {
+            fs::remove_file(&probe).ok();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let mut k = Keyring::load_from(&path).unwrap();
+        let report = k.load_report().unwrap();
+        assert_eq!((report.converted, report.persisted), (3, false));
+        assert_eq!(k.local_name_for("12345678"), Some("yubi"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), V1_FIXTURE);
+        assert!(!dir.join(SALT_FILE).exists());
+        assert!(!backup_of(&path).exists());
+
+        // Once the directory is writable, the next save finishes the job.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        k.save_to(&path).unwrap();
+        let again = Keyring::load_from(&path).unwrap();
+        assert!(again.load_report().is_none());
+        assert_eq!(again.local_name_for("12345678"), Some("yubi"));
+        assert!(!backup_of(&path).exists());
+        assert!(!fs::read_to_string(&path).unwrap().contains("12345678"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_salt_unmatches_v2_records() {
+        let dir = temp_dir("lost-salt");
+        let path = dir.join("keys.json");
+        let mut k = Keyring::default();
+        k.set_name("12345678", "a", NameStore::Computer, meta())
+            .unwrap();
+        k.save_to(&path).unwrap();
+        fs::remove_file(dir.join(SALT_FILE)).unwrap();
+
+        let mut k = Keyring::load_from(&path).unwrap();
+        assert_eq!(k.keys.len(), 1);
+        assert_eq!(k.keys[0].fingerprint, None);
+        assert_eq!(k.local_name_for("12345678"), None);
+        // The name is still held: a key can't silently take it over.
+        assert!(k.holder("a").is_some());
+        // The next save writes a new salt; the record stays unmatched.
+        k.save_to(&path).unwrap();
+        assert!(dir.join(SALT_FILE).exists());
+        let back = Keyring::load_from(&path).unwrap();
+        assert_eq!(back.keys[0].fingerprint, None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn errors_and_report_never_contain_serials() {
+        let dir = temp_dir("no-serial-text");
+        let path = dir.join("keys.json");
+        fs::write(&path, V1_FIXTURE).unwrap();
+        let report = Keyring::load_from(&path).unwrap().load_report().unwrap();
+        let mut shown = vec![format!("{report:?}")];
+        // Every variant, so a new one has to be added here.
+        let all = |e: &KeyringError| match e {
+            KeyringError::Io(_)
+            | KeyringError::Parse(_)
+            | KeyringError::NoConfigDir
+            | KeyringError::DuplicateName(_)
+            | KeyringError::InvalidName(_)
+            | KeyringError::MalformedSalt
+            | KeyringError::NoSerial
+            | KeyringError::Unconverted
+            | KeyringError::NewerFormat(_) => (),
+        };
+        let mut errs = vec![
+            KeyringError::NoConfigDir,
+            KeyringError::MalformedSalt,
+            KeyringError::NoSerial,
+            KeyringError::Unconverted,
+            KeyringError::NewerFormat(3),
+            KeyringError::Io(io::Error::other("disk full")),
+        ];
+        let mut k = Keyring::load_from(&path).unwrap();
+        errs.push(
+            k.set_name("ABCDEF01", "yubi", NameStore::Computer, meta())
+                .unwrap_err(),
+        );
+        errs.push(
+            k.set_name("12345678", "x\u{202E}", NameStore::Computer, meta())
+                .unwrap_err(),
+        );
+        for bad in [
+            r#"{"keys":[{"name":"x","serial":12345678}]}"#,
+            r#"{"keys":[{"name":"x","serial":"ABCDEF01"},{"name":null,"serial":"12345678"}]}"#,
+        ] {
+            fs::write(&path, bad).unwrap();
+            errs.push(Keyring::load_from(&path).unwrap_err());
+        }
+        for e in &errs {
+            all(e);
+            shown.push(e.to_string());
+            shown.push(format!("{e:?}"));
+        }
+        for text in shown {
+            let t = text.to_lowercase();
+            assert!(!t.contains("12345678") && !t.contains("abcdef01"), "{text}");
+        }
         fs::remove_dir_all(&dir).ok();
     }
 

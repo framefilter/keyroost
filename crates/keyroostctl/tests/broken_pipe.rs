@@ -32,6 +32,8 @@ fn broken_pipe_exits_without_panicking() {
         output_len > 2 * 64 * 1024,
         "output too small: {output_len} bytes"
     );
+    // Old version 1 entries on purpose: completion converts the file in this
+    // temp directory first and must still offer every name.
     let entries: Vec<String> = names
         .iter()
         .enumerate()
