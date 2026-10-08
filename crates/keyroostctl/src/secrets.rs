@@ -121,17 +121,35 @@ impl Spec {
         if let Some(h) = self.hint {
             return h.to_string();
         }
+        let [env, stdin] = self.env_and_stdin();
+        if self.default_ok {
+            format!("{env}, {stdin} or {}", self.default_flag())
+        } else {
+            format!("{env} or {stdin}")
+        }
+    }
+
+    /// "--pin env:NAME or --pin stdin": the sources other than `default`.
+    pub(crate) fn env_or_stdin_hint(&self) -> String {
+        let [env, stdin] = self.env_and_stdin();
+        format!("{env} or {stdin}")
+    }
+
+    /// "--mgmt-key default".
+    pub(crate) fn default_flag(&self) -> String {
+        if self.legacy {
+            format!("--{}-default", self.flag)
+        } else {
+            format!("--{} default", self.flag)
+        }
+    }
+
+    fn env_and_stdin(&self) -> [String; 2] {
         let f = self.flag;
         if self.legacy {
-            if self.default_ok {
-                return format!("--{f}-env VAR, --{f}-stdin or --{f}-default");
-            }
-            return format!("--{f}-env VAR or --{f}-stdin");
-        }
-        if self.default_ok {
-            format!("--{f} env:NAME, --{f} stdin or --{f} default")
+            [format!("--{f}-env VAR"), format!("--{f}-stdin")]
         } else {
-            format!("--{f} env:NAME or --{f} stdin")
+            [format!("--{f} env:NAME"), format!("--{f} stdin")]
         }
     }
 
@@ -190,9 +208,11 @@ impl<'a> Source<'a> {
 pub(crate) const SOURCE: &str = "SOURCE";
 
 /// Where a secret flag says to read its secret from.
+// `allow`, not `expect`: older compilers count this as used through the
+// items below, newer ones don't.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "no flag reads a secret source yet")
+    allow(dead_code, reason = "no flag reads a secret source yet")
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SecretSource {
@@ -228,9 +248,11 @@ pub(crate) fn parse_source_or_default(s: &str) -> Result<SecretSource, &'static 
     parse(s, true)
 }
 
+// `allow`, not `expect`: older compilers count this as used through the
+// items below, newer ones don't.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "no flag reads a secret source yet")
+    allow(dead_code, reason = "no flag reads a secret source yet")
 )]
 fn parse(s: &str, default_ok: bool) -> Result<SecretSource, &'static str> {
     match s {
@@ -639,19 +661,7 @@ fn finish(
 fn join_hints(options: &[(Spec, Source<'_>)]) -> String {
     let parts: Vec<String> = options
         .iter()
-        .flat_map(|(s, _)| {
-            if s.legacy {
-                [
-                    format!("--{}-env VAR", s.flag),
-                    format!("--{}-stdin", s.flag),
-                ]
-            } else {
-                [
-                    format!("--{} env:NAME", s.flag),
-                    format!("--{} stdin", s.flag),
-                ]
-            }
-        })
+        .flat_map(|(s, _)| s.env_and_stdin())
         .collect();
     match parts.split_last() {
         Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
@@ -1014,7 +1024,7 @@ mod tests {
         assert_eq!(s.io.lines_read, 0);
     }
 
-    /// `check` validates an `--X-env` source immediately (unset, empty, or
+    /// `check` validates an `env:NAME` source immediately (unset, empty, or
     /// not UTF-8), so a bad environment variable is caught before any key
     /// is selected — not only later, when the secret is actually read.
     #[test]
@@ -1231,6 +1241,25 @@ mod tests {
         assert_eq!(
             Spec::value("seed", "hex").hex().legacy().sources_hint(),
             "--hex-env VAR or --hex-stdin"
+        );
+    }
+
+    #[test]
+    fn source_words_are_shared_by_every_message() {
+        const M: Spec = Spec::current("management key", "mgmt-key").with_default();
+        assert_eq!(
+            M.env_or_stdin_hint(),
+            "--mgmt-key env:NAME or --mgmt-key stdin"
+        );
+        assert_eq!(M.default_flag(), "--mgmt-key default");
+        assert_eq!(
+            M.legacy().env_or_stdin_hint(),
+            "--mgmt-key-env VAR or --mgmt-key-stdin"
+        );
+        assert_eq!(M.legacy().default_flag(), "--mgmt-key-default");
+        assert_eq!(
+            M.legacy().sources_hint(),
+            "--mgmt-key-env VAR, --mgmt-key-stdin or --mgmt-key-default"
         );
     }
 

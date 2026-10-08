@@ -4315,14 +4315,18 @@ fn looks_like_flag_typo(word: &str) -> bool {
 }
 
 /// Whether `argv` has a word starting with `prefix` right after a secret
-/// source that reads stdin (`--pin stdin`, `--pin=stdin`, or an old
-/// `--X-stdin` flag). clap's `UnknownArgument` context sometimes names
-/// only a prefix of the real word (`-1` for `-123456`), so this matches by
-/// prefix.
+/// source (`--pin stdin`, `--pin env:NAME`, `--mgmt-key default`, the same
+/// with `=`, or an old `--X-stdin` flag). clap's `UnknownArgument` context
+/// sometimes names only a prefix of the real word (`-1` for `-123456`), so
+/// this matches by prefix.
 fn secret_flag_precedes(argv: &[String], prefix: &str) -> bool {
+    let is_source = |w: &str| w == "stdin" || w == "default" || w.starts_with("env:");
     argv.windows(2).any(|w| {
-        w[1].starts_with(prefix)
-            && (w[0] == "stdin" || w[0].ends_with("=stdin") || w[0].ends_with("-stdin"))
+        let value = match w[0].split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => value,
+            _ => w[0].as_str(),
+        };
+        w[1].starts_with(prefix) && (is_source(value) || w[0].ends_with("-stdin"))
     })
 }
 
@@ -4343,11 +4347,11 @@ fn is_secret_arg(a: &clap::Arg) -> bool {
 /// after `molto import -`). A `--X-stdin` flag given a value (`--hex-stdin
 /// DEADBEEF` or `--hex-stdin=DEADBEEF`, both of which clap reports as
 /// `TooManyValues` for a flag that takes none) is redacted the same way, and
-/// so is a dash-led word right after a source that reads stdin (`--pin
-/// stdin -123456`, `--old-pin-stdin -123456`) unless it's shaped like a
-/// typo'd flag name. A secret flag given something other than a source
-/// (`--pin 123456`) is refused with a fixed message naming the sources it
-/// takes, never the value. Any other error about a flag keeps clap's
+/// so is a dash-led word right after a secret source (`--pin stdin
+/// -123456`, `--pin env:KR_PIN -123456`, `--old-pin-stdin -123456`) unless
+/// it's shaped like a typo'd flag name. A secret flag (any `<SOURCE>` flag)
+/// given something other than a source (`--pin 123456`) is refused with a
+/// fixed message naming the sources it takes, never the value. Any other error about a flag keeps clap's
 /// message: clap names only the flag, never a value.
 fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
@@ -4374,7 +4378,14 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
             .next()
             .unwrap_or("")
             .trim_start_matches('-');
-        return crate::secrets::literal_refusal(long);
+        if let Some(msg) = crate::secrets::literal_refusal(long) {
+            return Some(msg);
+        }
+        // A source flag the table doesn't list is refused all the same.
+        let source = format!("<{}>", crate::secrets::SOURCE);
+        return arg
+            .contains(&source)
+            .then(|| format!("--{long} takes env:NAME or stdin — never the secret itself"));
     }
 
     // A bare flag given a value it doesn't take. For a `--X-stdin` flag the
@@ -10129,22 +10140,12 @@ fn mgmt_key_bytes(
             .default_management_key()
             .map(|k| zeroize::Zeroizing::new(k.to_vec()))
             .ok_or_else(|| {
-                let f = spec.flag;
-                let (default, others) = if spec.legacy {
-                    (
-                        format!("--{f}-default"),
-                        format!("--{f}-env VAR or --{f}-stdin"),
-                    )
-                } else {
-                    (
-                        format!("--{f} default"),
-                        format!("--{f} env:NAME or --{f} stdin"),
-                    )
-                };
                 format!(
-                    "{default}: keyroost has no known factory-default {} on record for this \
-                     device; pass {others} instead",
+                    "{}: keyroost has no known factory-default {} on record for this \
+                     device; pass {} instead",
+                    spec.default_flag(),
                     spec.label,
+                    spec.env_or_stdin_hint(),
                 )
                 .into()
             }),
@@ -12965,6 +12966,207 @@ mod cli_tests {
         assert!(cmd()
             .try_get_matches_from(["t", "--mgmt-key", "default"])
             .is_ok());
+    }
+
+    /// A `<SOURCE>` flag the refusal table doesn't know is still refused
+    /// without the value; a value error on any other flag keeps clap's text.
+    #[test]
+    fn a_source_flag_missing_from_the_table_is_still_refused() {
+        use clap::{Arg, Command};
+        let cmd = || {
+            Command::new("t")
+                .arg(
+                    Arg::new("other")
+                        .long("other-secret")
+                        .value_name("SOURCE")
+                        .allow_hyphen_values(true)
+                        .value_parser(crate::secrets::parse_source),
+                )
+                .arg(
+                    Arg::new("count")
+                        .long("count")
+                        .value_parser(clap::value_parser!(u8)),
+                )
+        };
+        for args in [
+            &["t", "--other-secret", "S3CRETVALUE"][..],
+            &["t", "--other-secret=S3CRETVALUE"],
+            &["t", "--other-secret", "-S3CRETVALUE"],
+        ] {
+            let e = cmd().try_get_matches_from(args).unwrap_err();
+            let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                redacted_parse_error(&e, &argv).as_deref(),
+                Some("--other-secret takes env:NAME or stdin — never the secret itself"),
+                "{args:?}"
+            );
+        }
+        let e = cmd()
+            .try_get_matches_from(["t", "--count", "x"])
+            .unwrap_err();
+        assert_eq!(redacted_parse_error(&e, &["t".into()]), None);
+    }
+
+    /// Problems with the `<SOURCE>` flags in `root`'s tree: a flag missing
+    /// from `SECRET_FLAGS`, a parser that isn't a source parser, a `default`
+    /// that the parser and the table disagree on, a flag that doesn't take
+    /// a dash-led value (clap would then report it as an unknown flag, not
+    /// a value error), or — once no old `--X-env`/`--X-stdin` flag is left —
+    /// a table entry no command uses.
+    fn secret_flag_problems(root: &clap::Command) -> Vec<String> {
+        use crate::secrets::SECRET_FLAGS;
+        fn walk(c: &clap::Command, path: String, out: &mut Vec<(String, clap::Command)>) {
+            out.push((path.clone(), c.clone()));
+            for s in c.get_subcommands().filter(|s| s.get_name() != "help") {
+                walk(s, format!("{path} {}", s.get_name()), out);
+            }
+        }
+        let mut root = root.clone();
+        root.build();
+        let mut cmds = Vec::new();
+        walk(&root, root.get_name().to_string(), &mut cmds);
+        // Whether `c` accepts `value` for `--long` (anything but a value
+        // error on that flag counts as accepted).
+        let accepts = |c: &clap::Command, long: &str, value: &str| {
+            use clap::error::{ContextKind, ContextValue, ErrorKind};
+            match c
+                .clone()
+                .try_get_matches_from([c.get_name(), &format!("--{long}"), value])
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    !(matches!(
+                        e.kind(),
+                        ErrorKind::ValueValidation | ErrorKind::InvalidValue
+                    ) && matches!(
+                        e.get(ContextKind::InvalidArg),
+                        Some(ContextValue::String(a)) if a.starts_with(&format!("--{long} "))
+                    ))
+                }
+            }
+        };
+        let mut problems = Vec::new();
+        let mut used = std::collections::HashSet::new();
+        let mut legacy_left = false;
+        for (path, c) in &cmds {
+            for a in c.get_arguments() {
+                if a.get_long()
+                    .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
+                {
+                    legacy_left = true;
+                }
+                if !is_secret_arg(a) {
+                    continue;
+                }
+                let Some(long) = a.get_long() else {
+                    problems.push(format!(
+                        "{path}: <SOURCE> argument {} has no long name",
+                        a.get_id()
+                    ));
+                    continue;
+                };
+                let Some(f) = SECRET_FLAGS.iter().find(|f| f.long == long) else {
+                    problems.push(format!("{path} --{long}: not in SECRET_FLAGS"));
+                    continue;
+                };
+                used.insert(long.to_string());
+                if !a.is_allow_hyphen_values_set() {
+                    problems.push(format!("{path} --{long}: does not allow a dash-led value"));
+                }
+                if !accepts(c, long, "stdin")
+                    || !accepts(c, long, "env:KR_X")
+                    || accepts(c, long, "S3CRET")
+                {
+                    problems.push(format!("{path} --{long}: not a secret-source parser"));
+                }
+                if accepts(c, long, "default") != f.default_ok {
+                    problems.push(format!(
+                        "{path} --{long}: the parser and SECRET_FLAGS disagree on `default`"
+                    ));
+                }
+            }
+        }
+        if !legacy_left {
+            for f in SECRET_FLAGS {
+                if !used.contains(f.long) {
+                    problems.push(format!("SECRET_FLAGS --{}: no command uses it", f.long));
+                }
+            }
+        }
+        problems
+    }
+
+    #[test]
+    fn every_source_flag_agrees_with_the_refusal_table() {
+        use clap::CommandFactory;
+        assert_eq!(secret_flag_problems(&Cli::command()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn secret_flag_problems_catches_each_mismatch() {
+        use clap::{Arg, Command};
+        let src = |id: &'static str, long: &'static str| {
+            Arg::new(id)
+                .long(long)
+                .value_name("SOURCE")
+                .allow_hyphen_values(true)
+                .value_parser(crate::secrets::parse_source)
+        };
+        let bad = Command::new("t").subcommand(
+            Command::new("s")
+                .arg(src("unknown", "not-in-table"))
+                .arg(src("mgmt", "mgmt-key"))
+                .arg(
+                    Arg::new("pin")
+                        .long("pin")
+                        .value_name("SOURCE")
+                        .value_parser(crate::secrets::parse_source_or_default),
+                )
+                .arg(
+                    Arg::new("puk")
+                        .long("puk")
+                        .value_name("SOURCE")
+                        .allow_hyphen_values(true),
+                ),
+        );
+        let mut want: Vec<String> = [
+            "t s --not-in-table: not in SECRET_FLAGS",
+            "t s --mgmt-key: the parser and SECRET_FLAGS disagree on `default`",
+            "t s --pin: does not allow a dash-led value",
+            "t s --pin: the parser and SECRET_FLAGS disagree on `default`",
+            "t s --puk: not a secret-source parser",
+            "t s --puk: the parser and SECRET_FLAGS disagree on `default`",
+        ]
+        .map(String::from)
+        .to_vec();
+        want.extend(
+            crate::secrets::SECRET_FLAGS
+                .iter()
+                .filter(|f| !["mgmt-key", "pin", "puk"].contains(&f.long))
+                .map(|f| format!("SECRET_FLAGS --{}: no command uses it", f.long)),
+        );
+        assert_eq!(secret_flag_problems(&bad), want);
+        // While an old `--X-env`/`--X-stdin` flag is left, unused table
+        // entries are not reported.
+        let transitional = Command::new("t").arg(src("pin", "pin")).arg(
+            Arg::new("old")
+                .long("old-pin-stdin")
+                .action(clap::ArgAction::SetTrue),
+        );
+        assert_eq!(secret_flag_problems(&transitional), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_dash_led_word_after_any_source_is_hidden() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for line in [
+            "k piv x --pin env:KR_PIN -123456",
+            "k piv x --pin=env:KR_PIN -123456",
+            "k piv x --mgmt-key default -0102",
+            "k piv x --mgmt-key=default -0102",
+        ] {
+            assert!(secret_flag_precedes(&argv(line), "-"), "{line}");
+        }
     }
 
     #[test]
