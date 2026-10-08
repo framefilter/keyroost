@@ -3930,6 +3930,15 @@ fn filter_rows<'d>(
 }
 
 /// `list --json` rows for `rows` (already numbered/filtered by [`filter_rows`]).
+/// Where the name `d` shows lives, for JSON: "key" or "computer".
+fn name_source(d: &keyroost_resolve::Device) -> Option<&'static str> {
+    d.name.as_ref()?;
+    d.naming.source.map(|s| match s {
+        keyroost_resolve::NameSource::Key => "key",
+        keyroost_resolve::NameSource::Computer => "computer",
+    })
+}
+
 fn list_json_rows(
     devices: &[keyroost_resolve::Device],
     rows: &[(usize, &keyroost_resolve::Device)],
@@ -3945,6 +3954,7 @@ fn list_json_rows(
                 number: *n,
                 device: keyroost_resolve::device_value(devices, idx),
                 name: d.name.clone(),
+                name_source: name_source(d),
                 vendor: d.vendor.clone(),
                 model: d.model.clone(),
                 serial: d.serial.clone(),
@@ -5314,6 +5324,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     vendor: d.vendor.clone(),
                     model: d.model.clone(),
                     name: d.name.clone(),
+                    name_source: name_source(d),
                     serial: d.serial.clone(),
                     transport: d.transport.clone(),
                     kind: match d.kind {
@@ -21089,6 +21100,7 @@ mod cli_tests {
             vendor: "Yubico".into(),
             model: "YubiKey 5".into(),
             name: Some("work".into()),
+            name_source: Some("computer"),
             serial: "12345678".into(),
             transport: "USB · PC/SC + FIDO HID".into(),
             kind: "key",
@@ -21100,6 +21112,7 @@ mod cli_tests {
             &[
                 "vendor",
                 "model",
+                "name_source",
                 "serial",
                 "transport",
                 "kind",
@@ -22363,6 +22376,45 @@ mod cli_tests {
     }
 
     #[test]
+    fn list_json_has_name_source() {
+        use keyroost_resolve::{KeyLabel, NameSource, Naming};
+        let mut first = test_fido_row();
+        first.serial = "11111111".into();
+        first.id = "a".into();
+        first.name = Some("Work".into());
+        first.naming = Naming {
+            plain: Some("Work".into()),
+            source: Some(NameSource::Key),
+            selectable: true,
+            on_key: KeyLabel::Present("Work".into()),
+            missing_on_key: None,
+        };
+        let mut newcomer = first.clone();
+        newcomer.serial = "22225678".into();
+        newcomer.id = "b".into();
+        newcomer.name = Some("Work (5678)".into());
+        newcomer.naming.selectable = false;
+        let devs = [first, newcomer];
+        let v = serde_json::to_value(list_json_rows(&devs, &overview::numbered(&devs))).unwrap();
+        let row = |serial: &str| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["serial"] == serial)
+                .unwrap()
+                .clone()
+        };
+        let (a, b) = (row("11111111"), row("22225678"));
+        assert_eq!(a["name"], "Work");
+        assert_eq!(a["name_source"], "key");
+        assert_eq!(a["device"], "Work");
+        // The newcomer shows its tail; `device` is still an exact selector.
+        assert_eq!(b["name"], "Work (5678)");
+        assert_eq!(b["name_source"], "key");
+        assert_eq!(b["device"], "22225678");
+    }
+
+    #[test]
     fn list_json_rows_carry_the_exact_device_value() {
         use keyroost_resolve::{Caps, Device, DeviceKind};
         let mk = |name: Option<&str>, serial: &str, reader: Option<&str>| Device {
@@ -22387,6 +22439,8 @@ mod cli_tests {
         ];
         let rows = list_json_rows(&devs, &overview::numbered(&devs));
         let v = serde_json::to_value(&rows).unwrap();
+        assert_eq!(v[1]["name_source"], "computer");
+        assert!(v[0]["name_source"].is_null());
         assert_eq!(v[0]["number"], 1);
         assert_eq!(v[0]["device"], "1");
         assert_eq!(v[1]["device"], "yubi-test");

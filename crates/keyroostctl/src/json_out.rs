@@ -22,7 +22,11 @@ pub(crate) struct AccountsJson<T: Serialize> {
 pub(crate) struct DeviceJson {
     pub vendor: String,
     pub model: String,
+    /// The name shown (a key carrying a name another key holds here has its
+    /// serial tail appended).
     pub name: Option<String>,
+    /// Where that name lives: "key" or "computer".
+    pub name_source: Option<&'static str>,
     pub serial: String,
     pub transport: String,
     /// "key" or "token".
@@ -42,7 +46,11 @@ pub(crate) struct DeviceJson {
 pub(crate) struct ListRowJson {
     pub number: usize,
     pub device: String,
+    /// The name shown (a key carrying a name another key holds here has its
+    /// serial tail appended); `device` is the exact value that selects it.
     pub name: Option<String>,
+    /// Where that name lives: "key" or "computer".
+    pub name_source: Option<&'static str>,
     pub vendor: String,
     pub model: String,
     pub serial: String,
@@ -586,6 +594,7 @@ mod tests {
             ("vendor", "string"),
             ("model", "string"),
             ("name", "string|null"),
+            ("name_source", "string|null"),
             ("serial", "string"),
             ("transport", "string"),
             ("kind", "string"),
@@ -596,6 +605,7 @@ mod tests {
             let d = DeviceJson {
                 vendor: "V".into(),
                 model: "M".into(),
+                name_source: name.as_ref().map(|_| "computer"),
                 name,
                 serial: "1".into(),
                 transport: "USB".into(),
@@ -615,6 +625,7 @@ mod tests {
             ("number", "number"),
             ("device", "string"),
             ("name", "string|null"),
+            ("name_source", "string|null"),
             ("vendor", "string"),
             ("model", "string"),
             ("serial", "string"),
@@ -628,6 +639,7 @@ mod tests {
             let r = ListRowJson {
                 number: 1,
                 device: "1".into(),
+                name_source: name.as_ref().map(|_| "key"),
                 name,
                 vendor: "V".into(),
                 model: "M".into(),
