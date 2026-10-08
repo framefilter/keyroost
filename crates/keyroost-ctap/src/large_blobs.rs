@@ -301,12 +301,20 @@ impl LargeBlobArray {
 
     /// Re-serialize the current elements and append a freshly-computed
     /// checksum, yielding bytes ready to hand to [`write()`].
+    ///
+    /// Every element read from the key is emitted exactly as it was read —
+    /// an entry's unknown map keys (§6.10.3 allows them) and skipped elements
+    /// survive byte-for-byte. Only entries built here are encoded fresh.
     pub fn serialize_with_checksum(&self) -> Vec<u8> {
         let mut array = cbor::array_header(self.items.len());
         for item in &self.items {
             match item {
+                Item::Entry(LargeBlobEntry {
+                    original: Some(raw),
+                    ..
+                })
+                | Item::Skipped(raw) => array.extend_from_slice(raw),
                 Item::Entry(e) => array.extend_from_slice(&encode_entry(e)),
-                Item::Skipped(raw) => array.extend_from_slice(raw),
             }
         }
         let mut out = array.clone();
@@ -370,15 +378,6 @@ fn encode_entry(e: &LargeBlobEntry) -> Vec<u8> {
         (Value::UInt(ENTRY_NONCE), Value::Bytes(e.nonce.clone())),
         (Value::UInt(ENTRY_ORIG_SIZE), Value::UInt(e.orig_size)),
     ]))
-}
-
-#[cfg(test)]
-fn encode_entries(entries: &[LargeBlobEntry]) -> Vec<u8> {
-    let mut out = cbor::array_header(entries.len());
-    for e in entries {
-        out.extend_from_slice(&encode_entry(e));
-    }
-    out
 }
 
 /// Effective maximum `set`/`get` fragment length for this authenticator.
@@ -888,6 +887,114 @@ mod tests {
         }
     }
 
+    /// An RP entry carrying an extra map key (4: "x") that §6.10.3 allows.
+    fn rp_entry_with_unknown_key() -> Vec<u8> {
+        let mut b = vec![0xa4, 0x01, 0x54];
+        b.extend_from_slice(&[0x11; 20]);
+        b.extend_from_slice(&[0x02, 0x4c]);
+        b.extend_from_slice(&[0x22; 12]);
+        b.extend_from_slice(&[0x03, 0x05, 0x04, 0x61, 0x78]);
+        b
+    }
+
+    /// [RP entry with key 4, keyroost note, tagged item, non-map].
+    fn mixed_fixture() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let elements = vec![
+            rp_entry_with_unknown_key(),
+            encode_entry(&LargeBlobEntry::from_text("note")),
+            vec![0xc1, 0x01],
+            vec![0x61, 0x78],
+        ];
+        let refs: Vec<&[u8]> = elements.iter().map(|e| e.as_slice()).collect();
+        let bytes = raw_array_of(&refs);
+        (elements, bytes)
+    }
+
+    /// Split a serialized array (with checksum) into its raw elements,
+    /// checking the checksum and that it parses with `skipped` skipped.
+    fn split_checked(serialized: &[u8], skipped: usize) -> Vec<Vec<u8>> {
+        let (array, trailer) = serialized.split_at(serialized.len() - CHECKSUM_LEN);
+        assert_eq!(trailer, left16_sha256(array));
+        assert_eq!(
+            LargeBlobArray::parse(array).unwrap().skipped_count(),
+            skipped
+        );
+        let (items, rest) = cbor::split_array(array).unwrap();
+        assert!(rest.is_empty());
+        items.into_iter().map(|i| i.to_vec()).collect()
+    }
+
+    #[test]
+    fn rewrite_keeps_every_other_item_byte_identical() {
+        let (input, bytes) = mixed_fixture();
+        assert_eq!(
+            hex(&input[0]),
+            "a401541111111111111111111111111111111111111111024c2222222222222222222222220305046178"
+        );
+        let arr = LargeBlobArray::parse(&bytes).unwrap();
+        assert_eq!((arr.len(), arr.skipped_count()), (2, 2));
+
+        let added = split_checked(&arr.with_text_note("n").serialize_with_checksum(), 2);
+        assert_eq!(added.len(), 5);
+        assert_eq!(&added[..4], &input[..]);
+
+        let edited = split_checked(
+            &arr.with_replaced_note(1, "m")
+                .unwrap()
+                .serialize_with_checksum(),
+            2,
+        );
+        assert_eq!(edited.len(), 4);
+        assert_eq!(edited[0], input[0]);
+        assert_ne!(edited[1], input[1]);
+        assert_eq!(&edited[2..], &input[2..]);
+
+        let removed = split_checked(&arr.without_entry(1).unwrap().serialize_with_checksum(), 2);
+        assert_eq!(
+            removed,
+            vec![input[0].clone(), input[2].clone(), input[3].clone()]
+        );
+    }
+
+    #[test]
+    fn without_entry_counts_only_conforming_entries() {
+        let (_, bytes) = mixed_fixture();
+        let arr = LargeBlobArray::parse(&bytes).unwrap();
+        let removed = arr.without_entry(1).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed.skipped_count(), 2);
+        assert!(!removed.entry(0).unwrap().is_kr_note());
+        assert!(removed.raw_array().is_empty());
+        // Index 2 would be a skipped element by position; it is out of range.
+        assert!(arr.without_entry(2).is_none());
+    }
+
+    #[test]
+    fn unmodified_array_reserializes_identically() {
+        // A non-shortest uint (`18 05`) inside an entry and a tagged element
+        // must come back exactly as stored when nothing was changed.
+        let mut odd_entry = vec![0xa3, 0x01, 0x41, 0xaa, 0x02, 0x4c];
+        odd_entry.extend_from_slice(&[0x33; 12]);
+        odd_entry.extend_from_slice(&[0x03, 0x18, 0x05]);
+        let (_, mixed) = mixed_fixture();
+        for x in [
+            mixed,
+            raw_array_of(&[&odd_entry, &[0xc1, 0x01]]),
+            vec![0x80],
+        ] {
+            let mut want = x.clone();
+            want.extend_from_slice(&left16_sha256(&x));
+            assert_eq!(
+                LargeBlobArray::parse(&x).unwrap().serialize_with_checksum(),
+                want
+            );
+        }
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
     #[test]
     fn read_skips_instead_of_failing() {
         let note = encode_entry(&LargeBlobEntry::from_text("still here"));
@@ -927,8 +1034,9 @@ mod tests {
     #[test]
     fn entries_encode_parse_roundtrip() {
         let entries = vec![sample_entry(1), sample_entry(2), sample_entry(3)];
-        let encoded = encode_entries(&entries);
-        let parsed = LargeBlobArray::parse(&encoded).unwrap();
+        let serialized = array_of(entries.clone()).serialize_with_checksum();
+        let encoded = &serialized[..serialized.len() - CHECKSUM_LEN];
+        let parsed = LargeBlobArray::parse(encoded).unwrap();
         assert_eq!(fields(&parsed), entries);
     }
 
