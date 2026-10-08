@@ -92,8 +92,8 @@
     <p><strong>Always require user verification (alwaysUv).</strong> When on, every assertion
       needs user verification (PIN or biometric), even for services that didn't ask for it.
       It can be turned on and off again. Whether it survives a key reset is vendor-specific.
-      The CLI has one command for each state, <code>enable-always-uv</code> and
-      <code>disable-always-uv</code>; each does nothing, and says so, when the key is already
+      The CLI has one command for each state, <code>fido config always-uv enable</code> and
+      <code>fido config always-uv disable</code>; each does nothing, and says so, when the key is already
       in that state.</p>
     <p><strong>Set minimum PIN length.</strong> Raises the shortest PIN the key will accept.
       It can only be increased — never lowered without a reset — and if the current PIN is now
@@ -131,8 +131,8 @@ keyroostctl fido pin min-length --length 6 --yes --pin env:KR_PIN   # in a scrip
     <h2>Cautions</h2>
     <p class="kr-muted"><strong>Minimum PIN length and enterprise attestation are one-way</strong>
       — undoing them needs a full reset, which wipes every passkey and the PIN. Test the
-      recoverable operations first (<code>fido config enable-always-uv</code>, which
-      <code>disable-always-uv</code> undoes, and force
+      recoverable operations first (<code>fido config always-uv enable</code>, which
+      <code>fido config always-uv disable</code> undoes, and force
       PIN change, which clears once a new PIN is set) on a given key before relying on the
       irreversible ones. <strong>If a command is rejected</strong>,
       the key may not support that sub-command; keyroost reports the CTAP status with a
