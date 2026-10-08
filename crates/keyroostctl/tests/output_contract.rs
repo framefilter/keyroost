@@ -177,8 +177,8 @@ fn an_existing_output_file_is_refused_before_any_key() {
         ],
         &["openpgp", "sign", "--in", f, "--out", f],
         &["openpgp", "decrypt", "--in", f, "--out", f],
-        &["fido", "large-blob", "export", "0", "--out", f],
-        &["fido", "ssh-cert", "extract", "--out", f],
+        &["fido", "blob", "export", "0", "--out", f],
+        &["fido", "ssh", "extract", "--out", f],
     ] {
         let (code, _out, err) = run(args);
         assert_eq!(code, 1, "{args:?}: {err}");
@@ -231,16 +231,8 @@ fn an_output_that_cannot_be_replaced_is_refused_before_any_key() {
             "--overwrite",
         ],
         &["openpgp", "sign", "--in", i, "--out", d, "--overwrite"],
-        &[
-            "fido",
-            "large-blob",
-            "export",
-            "0",
-            "--out",
-            d,
-            "--overwrite",
-        ],
-        &["fido", "ssh-cert", "extract", "--out", d, "--overwrite"],
+        &["fido", "blob", "export", "0", "--out", d, "--overwrite"],
+        &["fido", "ssh", "extract", "--out", d, "--overwrite"],
     ] {
         let (code, _out, err) = run(args);
         assert_eq!(code, 1, "{args:?}: {err}");

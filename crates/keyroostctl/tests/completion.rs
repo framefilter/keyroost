@@ -57,16 +57,28 @@ fn device_completes_on_a_nested_path() {
 #[test]
 fn fido_completes_the_new_groups() {
     let out = complete(&["keyroostctl", "fido", ""]);
-    for g in ["pin", "credentials", "fingerprints", "config"] {
-        assert!(
-            out.lines().any(|l| l.split_whitespace().next() == Some(g)),
-            "{g}: {out}"
-        );
+    let first = |g: &str| out.lines().any(|l| l.split_whitespace().next() == Some(g));
+    for g in ["pin", "credential", "fingerprint", "config", "blob", "ssh"] {
+        assert!(first(g), "{g}: {out}");
     }
-    assert!(
-        !out.contains("pin-set") && !out.contains("creds-list"),
-        "{out}"
-    );
+    for g in [
+        "credentials",
+        "fingerprints",
+        "large-blob",
+        "ssh-cert",
+        "pin-set",
+        "creds-list",
+    ] {
+        assert!(!first(g), "{g}: {out}");
+    }
+}
+
+#[test]
+fn name_completes_at_the_top_level() {
+    let out = complete(&["keyroostctl", ""]);
+    let first = |g: &str| out.lines().any(|l| l.split_whitespace().next() == Some(g));
+    assert!(first("name"), "{out}");
+    assert!(!first("key-name"), "{out}");
 }
 
 /// A generic `COMPLETE` left in the environment (other clap-based tools use

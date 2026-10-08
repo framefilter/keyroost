@@ -152,7 +152,7 @@ impl fmt::Display for ResolveError {
         match self {
             ResolveError::UnknownName { name, known } if known.is_empty() => write!(
                 f,
-                "no key named '{}': no named keys yet — add one with `keyroostctl key-name add`",
+                "no key named '{}': no named keys yet — add one with `keyroostctl name add`",
                 name
             ),
             ResolveError::UnknownName { name, known } => {

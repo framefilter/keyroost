@@ -335,21 +335,21 @@ pub(crate) struct OtpCodeJson {
     pub code: String,
 }
 
-/// `keyroostctl fido --json credentials metadata` — resident-credential counts.
+/// `keyroostctl fido --json credential metadata` — resident-credential counts.
 #[derive(Serialize)]
 pub(crate) struct FidoCredsMetadataJson {
     pub existing_resident_credentials: u64,
     pub max_possible_remaining: u64,
 }
 
-/// `keyroostctl fido --json credentials list` — the resident credentials grouped
+/// `keyroostctl fido --json credential list` — the resident credentials grouped
 /// by relying party.
 #[derive(Serialize)]
 pub(crate) struct FidoCredsListJson {
     pub relying_parties: Vec<FidoRelyingPartyJson>,
 }
 
-/// One relying party in the `credentials list` output.
+/// One relying party in the `credential list` output.
 #[derive(Serialize)]
 pub(crate) struct FidoRelyingPartyJson {
     pub rp_id: String,
@@ -360,7 +360,7 @@ pub(crate) struct FidoRelyingPartyJson {
 /// One resident credential under a relying party.
 #[derive(Serialize)]
 pub(crate) struct FidoCredentialJson {
-    /// Full hex credentialId (the value `credentials delete --cred-id` expects).
+    /// Full hex credentialId (the value `credential delete --id` expects).
     pub credential_id: String,
     /// The user handle, rendered as UTF-8 (lossy), as the human prints it.
     pub user_id: String,
@@ -370,7 +370,7 @@ pub(crate) struct FidoCredentialJson {
     pub algorithm_name: Option<&'static str>,
 }
 
-/// `keyroostctl fido large-blob --json list` — one entry per stored blob.
+/// `keyroostctl fido blob --json list` — one entry per stored blob.
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobListJson {
     pub entries: Vec<FidoLargeBlobEntryJson>,
@@ -421,7 +421,7 @@ pub(crate) struct FidoLargeBlobEntryJson {
     pub ssh_cert: Option<FidoLargeBlobSshCertJson>,
 }
 
-/// `keyroostctl fido large-blob --json get <INDEX>` — a single entry in full.
+/// `keyroostctl fido blob --json get <INDEX>` — a single entry in full.
 #[derive(Serialize)]
 pub(crate) struct FidoLargeBlobGetJson {
     pub index: usize,

@@ -24,68 +24,8 @@ fn run(args: &[&str]) -> (i32, String, String) {
 /// (argv, text the error must contain). Every case carries S3CRETVALUE
 /// after the retired name where the command line allows it.
 const CASES: &[(&[&str], &str)] = &[
-    (
-        &["key-name", "remove", "S3CRETVALUE"],
-        "keyroostctl key-name delete",
-    ),
     (&["--list-readers", "S3CRETVALUE"], "keyroostctl list"),
     (&["piv", "--list-readers"], "keyroostctl list"),
-    (
-        &["fido", "pin-set", "--new-pin-env", "S3CRETVALUE"],
-        "keyroostctl fido pin set",
-    ),
-    (
-        &["fido", "pin-change", "S3CRETVALUE"],
-        "keyroostctl fido pin change",
-    ),
-    (
-        &["fido", "pin-retries", "S3CRETVALUE"],
-        "keyroostctl fido pin retries",
-    ),
-    (
-        &["fido", "creds-list", "--pin-env", "S3CRETVALUE"],
-        "keyroostctl fido credentials list",
-    ),
-    (
-        &["fido", "creds-delete", "S3CRETVALUE"],
-        "keyroostctl fido credentials delete",
-    ),
-    (
-        &["fido", "creds-metadata", "S3CRETVALUE"],
-        "keyroostctl fido credentials metadata",
-    ),
-    (
-        &["fido", "fingerprint-list", "S3CRETVALUE"],
-        "keyroostctl fido fingerprints list",
-    ),
-    (
-        &["fido", "fingerprint-enroll", "S3CRETVALUE"],
-        "keyroostctl fido fingerprints add",
-    ),
-    (
-        &["fido", "fingerprint-rename", "S3CRETVALUE"],
-        "keyroostctl fido fingerprints rename",
-    ),
-    (
-        &["fido", "fingerprint-delete", "S3CRETVALUE"],
-        "keyroostctl fido fingerprints delete",
-    ),
-    (
-        &["fido", "set-min-pin", "S3CRETVALUE"],
-        "keyroostctl fido config set-min-pin-length",
-    ),
-    (
-        &["fido", "force-pin-change", "S3CRETVALUE"],
-        "keyroostctl fido config force-pin-change",
-    ),
-    (
-        &["fido", "enterprise-attestation", "S3CRETVALUE"],
-        "keyroostctl fido config enable-enterprise-attestation",
-    ),
-    (
-        &["fido", "always-uv", "--pin-env", "S3CRETVALUE"],
-        "fido config disable-always-uv",
-    ),
     (&["piv", "status", "S3CRETVALUE"], "keyroostctl piv info"),
     (
         &["openpgp", "status", "S3CRETVALUE"],
@@ -137,10 +77,6 @@ const CASES: &[(&[&str], &str)] = &[
     (
         &["otp", "list", "--pin-only", "S3CRETVALUE"],
         "--unlock pin",
-    ),
-    (
-        &["--device", "pin-set", "fido", "pin-set"],
-        "keyroostctl fido pin set",
     ),
     (
         &["molto", "seed", "-p", "99", "--hex-env", "S3CRETVALUE"],
@@ -207,7 +143,150 @@ const CASES: &[(&[&str], &str)] = &[
         "--out",
     ),
     (
+        &["fido", "pin-set", "--new-pin-env", "S3CRETVALUE"],
+        "keyroostctl fido pin set",
+    ),
+    (
+        &["fido", "pin-change", "S3CRETVALUE"],
+        "keyroostctl fido pin change",
+    ),
+    (
+        &["fido", "pin-retries", "S3CRETVALUE"],
+        "keyroostctl fido pin retries",
+    ),
+    (
+        &["fido", "creds-list", "--pin-env", "S3CRETVALUE"],
+        "keyroostctl fido credential list",
+    ),
+    (
+        &["fido", "creds-delete", "S3CRETVALUE"],
+        "keyroostctl fido credential delete",
+    ),
+    (
+        &["fido", "creds-metadata", "S3CRETVALUE"],
+        "keyroostctl fido credential metadata",
+    ),
+    (
+        &["fido", "fingerprint-list", "S3CRETVALUE"],
+        "keyroostctl fido fingerprint list",
+    ),
+    (
+        &["fido", "fingerprint-enroll", "S3CRETVALUE"],
+        "keyroostctl fido fingerprint add",
+    ),
+    (
+        &["fido", "fingerprint-rename", "S3CRETVALUE"],
+        "keyroostctl fido fingerprint rename",
+    ),
+    (
+        &["fido", "fingerprint-delete", "S3CRETVALUE"],
+        "keyroostctl fido fingerprint delete",
+    ),
+    (
+        &["fido", "always-uv", "--pin-env", "S3CRETVALUE"],
+        "keyroostctl fido config always-uv enable",
+    ),
+    (
+        &["fido", "always-uv", "S3CRETVALUE"],
+        "fido config always-uv disable",
+    ),
+    (
+        &["fido", "set-min-pin", "S3CRETVALUE"],
+        "keyroostctl fido pin min-length",
+    ),
+    (
+        &["fido", "force-pin-change", "S3CRETVALUE"],
+        "keyroostctl fido pin force-change",
+    ),
+    (
+        &["fido", "enterprise-attestation", "S3CRETVALUE"],
+        "keyroostctl fido config attestation enable",
+    ),
+    (
         &["fido", "large-blob", "export", "0", "S3CRETVALUE"],
+        "keyroostctl fido blob",
+    ),
+    (
+        &["fido", "ssh-cert", "extract", "S3CRETVALUE"],
+        "keyroostctl fido ssh",
+    ),
+    (
+        &["fido", "credentials", "list", "S3CRETVALUE"],
+        "keyroostctl fido credential",
+    ),
+    (
+        &["fido", "fingerprints", "list", "S3CRETVALUE"],
+        "keyroostctl fido fingerprint",
+    ),
+    (
+        &["fido", "config", "enable-always-uv", "S3CRETVALUE"],
+        "keyroostctl fido config always-uv enable",
+    ),
+    (
+        &["fido", "config", "disable-always-uv", "S3CRETVALUE"],
+        "keyroostctl fido config always-uv disable",
+    ),
+    (
+        &["fido", "config", "set-min-pin-length", "S3CRETVALUE"],
+        "keyroostctl fido pin min-length",
+    ),
+    (
+        &["fido", "config", "force-pin-change", "S3CRETVALUE"],
+        "keyroostctl fido pin force-change",
+    ),
+    (
+        &[
+            "fido",
+            "config",
+            "enable-enterprise-attestation",
+            "S3CRETVALUE",
+        ],
+        "keyroostctl fido config attestation enable",
+    ),
+    (&["key-name", "remove", "S3CRETVALUE"], "keyroostctl name"),
+    (
+        &["key-name", "list", "S3CRETVALUE"],
+        "`key-name remove` is now `name delete`",
+    ),
+    (
+        &["--device", "pin-set", "fido", "pin-set"],
+        "keyroostctl fido pin set",
+    ),
+    (
+        &["fido", "credential", "delete", "--cred-id", "S3CRETVALUE"],
+        "--id",
+    ),
+    (
+        &["fido", "credentials", "delete", "--cred-id", "S3CRETVALUE"],
+        "keyroostctl fido credential",
+    ),
+    (
+        &[
+            "fido",
+            "fingerprint",
+            "rename",
+            "--template-id",
+            "S3CRETVALUE",
+        ],
+        "--id",
+    ),
+    (
+        &[
+            "fido",
+            "fingerprint",
+            "delete",
+            "--template-id",
+            "S3CRETVALUE",
+        ],
+        "--id",
+    ),
+    (
+        &["fido", "ssh", "extract", "--credential", "S3CRETVALUE"],
+        "--id",
+    ),
+    (&["fido", "ssh", "extract", "--force"], "--overwrite"),
+    (
+        &["fido", "blob", "export", "0", "S3CRETVALUE"],
         "--out FILE",
     ),
 ];
