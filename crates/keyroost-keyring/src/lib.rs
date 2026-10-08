@@ -1,7 +1,8 @@
 //! Friendly-name registry for security keys.
 //!
 //! Lets a user attach a memorable label (e.g. `signing-yubikey`) to a physical
-//! key, recognized by its stable **serial number**, so commands can target a
+//! key, recognized by a salted per-computer fingerprint of its serial number
+//! (the serial itself is never stored), so commands can target a
 //! key by `--device` instead of a `/dev/hidrawN` path that changes on every
 //! replug.
 //!
