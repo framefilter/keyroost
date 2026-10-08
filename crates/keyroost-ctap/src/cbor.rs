@@ -5,6 +5,9 @@
 //! and null. Indefinite-length items, tags, and floats are intentionally
 //! unsupported — CTAP2 mandates canonical (definite-length) encoding, so
 //! anything else from a real authenticator would be a protocol violation.
+//! The one exception is [`item_len`], which only measures an item: it walks
+//! tags and floats too, so large-blob elements written by other tools can be
+//! skipped and kept byte-for-byte without being interpreted.
 //! The decoder is deliberately lenient where strictness buys nothing:
 //! non-shortest integer encodings are accepted, and a duplicate map key
 //! resolves to the first match — robustness against quirky devices matters
@@ -18,6 +21,7 @@ const MT_BYTES: u8 = 2;
 const MT_TEXT: u8 = 3;
 const MT_ARRAY: u8 = 4;
 const MT_MAP: u8 = 5;
+const MT_TAG: u8 = 6;
 const MT_SIMPLE: u8 = 7;
 
 const SIMPLE_FALSE: u8 = 20;
@@ -247,6 +251,88 @@ fn decode_at(data: &[u8], depth: usize) -> Result<(Value, &[u8]), CborError> {
     })
 }
 
+/// Byte length of the one CBOR item at the start of `data`, from its
+/// structure alone. Unlike [`decode`] it accepts tags (major 6) and floats /
+/// other simple values (major 7, additional 0..=27), so a large-blob element
+/// keyroost can't interpret can still be measured, skipped and re-emitted
+/// byte-for-byte. Indefinite lengths (additional 31) and reserved additional
+/// values (28..=30) are refused; nesting obeys DECODE_DEPTH_LIMIT.
+pub fn item_len(data: &[u8]) -> Result<usize, CborError> {
+    item_len_at(data, 0)
+}
+
+fn item_len_at(data: &[u8], depth: usize) -> Result<usize, CborError> {
+    if depth > DECODE_DEPTH_LIMIT {
+        return Err(CborError::DepthLimit);
+    }
+    let (b, rest) = data.split_first().ok_or(CborError::UnexpectedEnd)?;
+    let major = b >> 5;
+    let additional = b & 0b1_1111;
+    // read_arg consumes the 0/1/2/4/8 argument bytes after the initial byte.
+    let (arg, after) = read_arg(rest, additional)?;
+    let header = data.len() - after.len();
+    let body_from = |len: usize| -> Result<usize, CborError> {
+        let total = header.checked_add(len).ok_or(CborError::UnexpectedEnd)?;
+        if total > data.len() {
+            return Err(CborError::UnexpectedEnd);
+        }
+        Ok(total)
+    };
+    match major {
+        MT_UINT | MT_NINT => Ok(header),
+        MT_BYTES | MT_TEXT => {
+            let len = usize::try_from(arg).map_err(|_| CborError::UnexpectedEnd)?;
+            body_from(len)
+        }
+        MT_ARRAY | MT_MAP => {
+            let count = if major == MT_MAP {
+                arg.checked_mul(2).ok_or(CborError::UnexpectedEnd)?
+            } else {
+                arg
+            };
+            let mut at = header;
+            for _ in 0..count {
+                let len = item_len_at(&data[at..], depth + 1)?;
+                at = at.checked_add(len).ok_or(CborError::UnexpectedEnd)?;
+            }
+            Ok(at)
+        }
+        MT_TAG => {
+            let len = item_len_at(&data[header..], depth + 1)?;
+            body_from(len)
+        }
+        // MT_SIMPLE: additional 0..=23 is the value itself, 24 one more byte,
+        // 25/26/27 a half/single/double float — exactly read_arg's consumption.
+        _ => Ok(header),
+    }
+}
+
+/// The raw bytes of every element of the definite-length array at the
+/// start of `data`, and the bytes after the array.
+pub fn split_array(data: &[u8]) -> Result<(Vec<&[u8]>, &[u8]), CborError> {
+    let (b, rest) = data.split_first().ok_or(CborError::UnexpectedEnd)?;
+    let major = b >> 5;
+    if major != MT_ARRAY {
+        return Err(CborError::UnsupportedType(major));
+    }
+    let (count, mut rest) = read_arg(rest, b & 0b1_1111)?;
+    let mut items = Vec::with_capacity(count.min(1024) as usize);
+    for _ in 0..count {
+        let len = item_len_at(rest, 1)?;
+        let (item, r) = rest.split_at(len);
+        items.push(item);
+        rest = r;
+    }
+    Ok((items, rest))
+}
+
+/// Canonical (shortest) header for a definite-length array of `len` items.
+pub fn array_header(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9);
+    encode_header(&mut out, MT_ARRAY, len as u64);
+    out
+}
+
 fn read_arg(rest: &[u8], additional: u8) -> Result<(u64, &[u8]), CborError> {
     match additional {
         0..=23 => Ok((additional as u64, rest)),
@@ -406,5 +492,110 @@ mod tests {
         buf.push(0x00);
         let result = decode(&buf);
         assert!(matches!(result, Err(CborError::DepthLimit)));
+    }
+
+    #[test]
+    fn item_len_measures_every_major_type() {
+        let cases: &[(&[u8], usize)] = &[
+            (&[0x00], 1),
+            (&[0x18, 0xff], 2),
+            (&[0x39, 0x01, 0x00], 3),
+            (&[0x43, 0x01, 0x02, 0x03], 4),
+            (&[0x62, 0x6f, 0x6b], 3),
+            (&[0x82, 0x01, 0x02], 3),
+            (&[0xa1, 0x01, 0x02], 3),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(item_len(bytes).unwrap(), *want, "{bytes:02x?}");
+        }
+        // Trailing bytes after the item are not counted.
+        assert_eq!(item_len(&[0x01, 0xff, 0xff]).unwrap(), 1);
+    }
+
+    #[test]
+    fn item_len_accepts_tags_and_floats() {
+        let mut f64_item = vec![0xfb];
+        f64_item.extend_from_slice(&[0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18]);
+        let cases: &[(&[u8], usize)] = &[
+            (&[0xc1, 0x1a, 0x51, 0x4b, 0x67, 0xb0], 6),
+            (&[0xf9, 0x3c, 0x00], 3),
+            (&[0xfa, 0x47, 0xc3, 0x50, 0x00], 5),
+            (&f64_item, 9),
+            (&[0xf7], 1),
+            (&[0xa1, 0x01, 0xf9, 0x3c, 0x00], 5),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(item_len(bytes).unwrap(), *want, "{bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn item_len_refuses_indefinite_and_truncated() {
+        assert!(item_len(&[0x9f, 0x01, 0xff]).is_err());
+        assert!(item_len(&[0x5f, 0x41, 0x01, 0xff]).is_err());
+        assert!(matches!(
+            item_len(&[0x43, 0x01]),
+            Err(CborError::UnexpectedEnd)
+        ));
+        assert!(item_len(&[0x1c]).is_err());
+        assert!(matches!(item_len(&[]), Err(CborError::UnexpectedEnd)));
+        // Truncated inside a container and inside a tag.
+        assert!(matches!(
+            item_len(&[0x82, 0x01]),
+            Err(CborError::UnexpectedEnd)
+        ));
+        assert!(matches!(item_len(&[0xc1]), Err(CborError::UnexpectedEnd)));
+        // A huge declared length fails cleanly instead of overflowing.
+        let huge = [0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(item_len(&huge).is_err());
+    }
+
+    #[test]
+    fn item_len_obeys_depth_limit() {
+        let mut buf = vec![0x81; 17];
+        buf.push(0x00);
+        assert!(matches!(item_len(&buf), Err(CborError::DepthLimit)));
+        // Tags nest too.
+        let mut tags = vec![0xc1; 17];
+        tags.push(0x00);
+        assert!(matches!(item_len(&tags), Err(CborError::DepthLimit)));
+        // 16 levels is still fine.
+        let mut ok = vec![0x81; 16];
+        ok.push(0x00);
+        assert_eq!(item_len(&ok).unwrap(), 17);
+    }
+
+    #[test]
+    fn split_array_returns_each_element_raw() {
+        let bytes = [0x83, 0x01, 0xf9, 0x3c, 0x00, 0xa1, 0x01, 0x02, 0xff];
+        let (items, rest) = split_array(&bytes).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                &[0x01][..],
+                &[0xf9, 0x3c, 0x00][..],
+                &[0xa1, 0x01, 0x02][..]
+            ]
+        );
+        assert_eq!(rest, &[0xff]);
+    }
+
+    #[test]
+    fn split_array_rejects_non_array() {
+        assert!(split_array(&[0xa0]).is_err());
+        assert!(split_array(&[]).is_err());
+        assert!(split_array(&[0x9f, 0xff]).is_err());
+        assert!(matches!(
+            split_array(&[0x82, 0x01]),
+            Err(CborError::UnexpectedEnd)
+        ));
+    }
+
+    #[test]
+    fn array_header_is_shortest() {
+        assert_eq!(array_header(0), vec![0x80]);
+        assert_eq!(array_header(23), vec![0x97]);
+        assert_eq!(array_header(24), vec![0x98, 0x18]);
+        assert_eq!(array_header(300), vec![0x99, 0x01, 0x2c]);
     }
 }
