@@ -100,7 +100,9 @@ Being worked on right now — check with whoever holds it before starting.
 - **Investigate a CLI style guide for contributors.** A short page on how
   new keyroostctl commands and flags should look (command words, flags,
   secret input, confirmations, output, help text), so contributions match
-  the existing CLI without a review round to align them. Decide first
+  the existing CLI without a review round to align them. Link it from
+  CLAUDE.md too, so AI coding agents reuse the established words and flags
+  instead of inventing new ones. Decide first
   whether it belongs in CONTRIBUTING, the Learn site, or a doc of its own,
   and what it covers; the maintainer settles the content. (S)
 
