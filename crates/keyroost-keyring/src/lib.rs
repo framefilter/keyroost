@@ -347,7 +347,23 @@ fn strip_control_chars(s: &mut String) {
 ///
 /// * Windows: `%APPDATA%\keyroost` (falling back to `%USERPROFILE%\.config\keyroost`).
 /// * Otherwise: `$XDG_CONFIG_HOME/keyroost`, else `$HOME/.config/keyroost`.
+///
+/// In test builds (this crate's own tests, or a dependent that enables the
+/// `test-isolation` feature from its `[dev-dependencies]`) the directory is
+/// never the person's: see [`isolated_config_dir`].
 pub fn config_dir() -> Option<std::path::PathBuf> {
+    #[cfg(any(test, feature = "test-isolation"))]
+    {
+        Some(isolated_config_dir(env_config_dir()))
+    }
+    #[cfg(not(any(test, feature = "test-isolation")))]
+    {
+        env_config_dir()
+    }
+}
+
+/// [`config_dir`] as the environment gives it.
+fn env_config_dir() -> Option<std::path::PathBuf> {
     // Windows has no HOME/XDG by default; use the standard roaming AppData dir.
     #[cfg(windows)]
     {
@@ -360,6 +376,23 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
         let xdg = std::env::var_os("XDG_CONFIG_HOME");
         let home = std::env::var_os("HOME");
         config_dir_from(xdg.as_deref(), home.as_deref())
+    }
+}
+
+/// The config directory in a test build: the environment's choice only when
+/// it lies inside the system temp directory (an integration test that set
+/// `XDG_CONFIG_HOME`/`APPDATA` to a temp dir for a spawned binary), else a
+/// per-process directory under the temp directory. A test can therefore
+/// never read, convert or overwrite the real `keys.json`, `keys.salt` or
+/// `settings.json`, whatever the environment says.
+#[cfg(any(test, feature = "test-isolation"))]
+pub fn isolated_config_dir(from_env: Option<PathBuf>) -> PathBuf {
+    let tmp = std::env::temp_dir();
+    match from_env {
+        Some(d) if d.starts_with(&tmp) && d != tmp.join("keyroost") => d,
+        _ => tmp
+            .join(format!("keyroost-test-config-{}", std::process::id()))
+            .join("keyroost"),
     }
 }
 
@@ -1675,6 +1708,21 @@ mod tests {
             config_dir_from(Some(OsStr::new("")), Some(OsStr::new(""))),
             None
         );
+    }
+
+    #[test]
+    fn tests_never_resolve_the_real_config_dir() {
+        let tmp = std::env::temp_dir();
+        let dir = config_dir().expect("always set in tests");
+        assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
+        assert!(config_path().unwrap().starts_with(&tmp));
+        // An environment pointing at a real home is ignored.
+        let home = Some(PathBuf::from("/home/u/.config/keyroost"));
+        assert!(isolated_config_dir(home).starts_with(&tmp));
+        assert!(isolated_config_dir(None).starts_with(&tmp));
+        // A temp dir an integration test chose is honored.
+        let chosen = tmp.join("kr-it-1").join("keyroost");
+        assert_eq!(isolated_config_dir(Some(chosen.clone())), chosen);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! `name set | clear | list` refusals and help, each run against its own
 //! empty config directory: never the real keys.json, never a key's PIN.
+mod common;
+use common::ConfigIn;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -15,11 +17,10 @@ fn run(args: &[&str]) -> (i32, String, String) {
         NEXT_DIR.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+    let out = common::keyroostctl()
         .args(args)
         .stdin(Stdio::null())
-        .env("XDG_CONFIG_HOME", &dir)
-        .env("APPDATA", &dir)
+        .config_in(&dir)
         // pcsc-lite: no daemon reachable, so nothing can talk to a card.
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
         .output()

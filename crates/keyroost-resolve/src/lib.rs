@@ -167,6 +167,16 @@ mod tests {
     use super::*;
     use keyroost_hid::{HID_USAGE_FIDO_AUTHENTICATOR, HID_USAGE_PAGE_FIDO};
 
+    /// The `test-isolation` dev-dependency feature is on: a test here can
+    /// never resolve, read or write the person's config directory.
+    #[test]
+    fn tests_never_resolve_the_real_config_dir() {
+        let tmp = std::env::temp_dir();
+        let dir = keyroost_keyring::config_dir().expect("always set in tests");
+        assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
+        assert!(keyroost_keyring::config_path().unwrap().starts_with(&tmp));
+    }
+
     fn yubikey(path: &str, bus: Option<u8>, addr: Option<u8>) -> HidDevice {
         HidDevice {
             path: path.into(),

@@ -14387,6 +14387,16 @@ fn main() -> ExitCode {
 mod human_style_tests {
     use super::*;
 
+    /// The `test-isolation` dev-dependency feature is on: a test here can
+    /// never resolve, read or write the person's config directory.
+    #[test]
+    fn tests_never_resolve_the_real_config_dir() {
+        let tmp = std::env::temp_dir();
+        let dir = keyroost_keyring::config_dir().expect("always set in tests");
+        assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
+        assert!(keyroost_keyring::config_path().unwrap().starts_with(&tmp));
+    }
+
     /// The column each `Key: value` line's value starts at.
     fn value_columns(block: &str) -> Vec<usize> {
         block

@@ -21137,6 +21137,17 @@ fn slot_summary(attrs: &[u8], fpr: &[u8; 20]) -> String {
 mod tests {
     use super::*;
 
+    /// The `test-isolation` dev-dependency feature is on: a test here can
+    /// never resolve, read or write the person's config directory.
+    #[test]
+    fn tests_never_resolve_the_real_config_dir() {
+        let tmp = std::env::temp_dir();
+        let dir = keyroost_keyring::config_dir().expect("always set in tests");
+        assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
+        assert!(keyroost_keyring::config_path().unwrap().starts_with(&tmp));
+        assert!(settings::config_path().unwrap().starts_with(&tmp));
+    }
+
     /// A minimal `PivStatus` reporting just `fingerprint`/`version` — enough
     /// to drive `App::piv_current_default_mgmt_key`'s resolution in a test.
     /// `PivStatus` is `#[non_exhaustive]`, so this crate can't use struct-

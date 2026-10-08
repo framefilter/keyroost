@@ -1,7 +1,8 @@
 //! `--device` completes saved friendly names from keys.json via the
 //! dynamic engine, end to end, without touching hardware.
+mod common;
+use common::ConfigIn;
 
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Gives every `complete` call its own config directory, so tests running
@@ -24,10 +25,9 @@ fn complete(words: &[&str]) -> String {
         r#"{"keys":[{"name":"yubi-test","serial":"1","source":"usb"},{"name":"solo-test","serial":"2","source":"usb"}]}"#,
     )
     .unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+    let out = common::keyroostctl()
         .env("KEYROOSTCTL_COMPLETE", "fish")
-        .env("XDG_CONFIG_HOME", &dir)
-        .env("APPDATA", &dir)
+        .config_in(&dir)
         .arg("--")
         .args(words)
         .output()
@@ -87,7 +87,7 @@ fn name_completes_at_the_top_level() {
 /// that name) must not turn a normal run into a completion request.
 #[test]
 fn generic_complete_var_is_ignored() {
-    let out = Command::new(env!("CARGO_BIN_EXE_keyroostctl"))
+    let out = common::keyroostctl()
         .env("COMPLETE", "fish")
         .arg("--version")
         .output()

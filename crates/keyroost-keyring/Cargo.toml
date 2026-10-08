@@ -17,3 +17,10 @@ serde_json = "1"
 keyroost-proto = { path = "../keyroost-proto", version = "0.12.0" }
 # OS randomness for the per-computer salt; already in Cargo.lock (0.2.17).
 getrandom = "0.2"
+
+[features]
+# Test builds only: `config_dir()` resolves to a temp directory, never the
+# person's config, so no test can touch the real keys.json or settings.json.
+# Dependents enable it from `[dev-dependencies]`; never enable it in a
+# normal dependency.
+test-isolation = []
