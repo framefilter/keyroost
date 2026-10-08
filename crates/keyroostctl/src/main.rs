@@ -11603,7 +11603,7 @@ fn name_set(
     path: Option<&Path>,
     reader: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use keyroost_resolve::{KeyLabel, NameSource};
+    use keyroost_resolve::NameSource;
     keyroost_keyring::validate_name(name)?;
     let mut sec = Secrets::real();
     let src = Source::from_flag(pin);
@@ -11613,13 +11613,6 @@ fn name_set(
     let dev = crate::target::select(Need::Nameable, reader, path)?;
     nameable(&dev)?;
     let v = key_hint_value(&dev);
-    if dev.naming.on_key == KeyLabel::ReadFailed {
-        return Err(
-            "couldn't read whether this key carries a name of its own; nothing was \
-                    changed, try again"
-                .into(),
-        );
-    }
     let place = plan_name_set(dev.naming.source, store).map_err(|r| r.message(&v))?;
     let keyring = Keyring::load_default()?;
     refuse_name_held_elsewhere(&keyring, name, &row_serials(&dev))?;
@@ -11736,9 +11729,6 @@ fn clear_key_label(
     apply_key_label(sec, src, yes, dev, &plan, Some(&question), &v)
 }
 
-const NAME_READ_FAILED: &str =
-    "couldn't read the name stored on the key; nothing was changed, try again";
-
 fn name_clear_by_name(
     sec: &mut Secrets,
     src: Source<'_>,
@@ -11768,7 +11758,6 @@ fn name_clear_by_name(
                     eprintln!("{}", crate::target::announce_line(d, Need::FidoHid));
                     clear_key_label(sec, src, yes, d, name)?;
                 }
-                KeyLabel::ReadFailed => return Err(NAME_READ_FAILED.into()),
                 _ => {}
             },
             None => stays_on_key = true,
@@ -11793,12 +11782,9 @@ fn name_clear_selected(
     path: Option<&Path>,
     reader: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use keyroost_resolve::{KeyLabel, NameSource};
+    use keyroost_resolve::NameSource;
     let dev = crate::target::select(Need::Nameable, reader, path)?;
     nameable(&dev)?;
-    if dev.naming.on_key == KeyLabel::ReadFailed {
-        return Err(NAME_READ_FAILED.into());
-    }
     let mut cleared_on_key = false;
     if let (Some(NameSource::Key), Some(label)) = (dev.naming.source, &dev.naming.plain) {
         clear_key_label(sec, src, yes, &dev, label)?;

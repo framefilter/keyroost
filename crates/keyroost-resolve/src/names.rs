@@ -6,14 +6,15 @@
 //! The rules, per row in `list` order:
 //!
 //! * A valid name stored on the key is shown first. The first key this
-//!   computer saw with that name keeps the plain name; it becomes selectable
-//!   by it once `keys.json` holds that first-seen record (a sighting that
-//!   couldn't be recorded is shown but never selects). Any other key
-//!   carrying the same name shows `Name (1234)` — the last four characters
-//!   of its live serial, for display only, never stored and never
-//!   selectable.
-//! * A key with no usable serial that carries a name shows it but is never
-//!   selectable by it, and nothing is recorded for it.
+//!   computer saw with that name keeps the plain name and is selectable by
+//!   it; the sighting is recorded in `keys.json` best-effort. When it can't
+//!   be recorded (no usable serial, no config directory, a failed save) the
+//!   key is treated as seen for the first time on every scan: shown plain
+//!   and selectable, and the caller warns once. Any other key carrying the
+//!   same name shows `Name (1234)` — the last four characters of its live
+//!   serial, for display only, never stored and never selectable.
+//! * A key whose name can't be read (a failed read, a damaged or invalid
+//!   name entry, no large-blob storage) is treated as carrying no name.
 //! * Otherwise the name this computer saved for the key is shown (looked up
 //!   by the row's serial, else by its FIDO HID serial when that differs).
 //!
@@ -43,8 +44,7 @@ pub enum KeyLabel {
     #[default]
     NotRead,
     /// The key was asked but didn't answer this time (busy, timeout, I/O):
-    /// it may well carry a name, so `--device NAME` refuses rather than
-    /// guess past it.
+    /// for this scan it is treated as carrying no name.
     ReadFailed,
     /// The key has no large-blob storage.
     Unsupported,
@@ -105,6 +105,9 @@ pub enum NameUpdate {
     /// The key with `serial` now carries `current`; drop its other
     /// `stored = key` records.
     DropStale { serial: String, current: String },
+    /// First sight of `name` on a key with no usable serial: it can't be
+    /// recorded, so it works for this session only (the caller warns).
+    Unrecordable { name: String },
 }
 
 /// The last four characters of `serial` (all of it when shorter), cut on a
@@ -171,42 +174,57 @@ pub fn apply_names(
             naming.source = Some(NameSource::Key);
             naming.plain = Some(l.clone());
             shown = Some(l.clone());
-            if !canon.is_empty() {
-                let holder = keyring.holder(l);
-                let first_here = match claimed.get(l) {
-                    Some(by) => *by == canon,
-                    None => true,
-                };
-                if holder.is_none() && first_here {
-                    // Shown plain, but selectable only once recorded.
-                    if !claimed.contains_key(l) {
-                        updates.push(NameUpdate::FirstSeen {
+            // Who claims a name in this pass: the serial, or for a key
+            // without a usable one, the row itself.
+            let claim = if canon.is_empty() {
+                format!("row:{}", d.id)
+            } else {
+                canon.clone()
+            };
+            let holder = keyring.holder(l);
+            let first_here = match claimed.get(l) {
+                Some(by) => *by == claim,
+                None => true,
+            };
+            if holder.is_none() && first_here {
+                // First sight, as on any computer seeing the key for the
+                // first time: shown plain and selectable; recorded
+                // best-effort.
+                naming.selectable = true;
+                if !claimed.contains_key(l) {
+                    updates.push(if canon.is_empty() {
+                        NameUpdate::Unrecordable { name: l.clone() }
+                    } else {
+                        NameUpdate::FirstSeen {
                             serial: serial.clone(),
                             name: l.clone(),
-                        });
-                    }
-                    claimed.insert(l.clone(), canon.clone());
-                } else if holder.is_some_and(|h| {
+                        }
+                    });
+                }
+                claimed.insert(l.clone(), claim);
+            } else if !canon.is_empty()
+                && holder.is_some_and(|h| {
                     h.fingerprint.is_some()
                         && known
                             .iter()
                             .any(|s| keyring.fingerprint_of(s) == h.fingerprint)
-                }) {
-                    naming.selectable = true;
-                    claimed.entry(l.clone()).or_insert_with(|| canon.clone());
-                } else {
-                    shown = Some(format!("{l} ({})", shown_tail(&serial)));
-                }
-                if keyring
+                })
+            {
+                naming.selectable = true;
+                claimed.entry(l.clone()).or_insert_with(|| canon.clone());
+            } else if !canon.is_empty() {
+                shown = Some(format!("{l} ({})", shown_tail(&serial)));
+            }
+            if !canon.is_empty()
+                && keyring
                     .records_for(&serial)
                     .iter()
                     .any(|r| r.stored == NameStore::Key && r.name != *l)
-                {
-                    updates.push(NameUpdate::DropStale {
-                        serial: serial.clone(),
-                        current: l.clone(),
-                    });
-                }
+            {
+                updates.push(NameUpdate::DropStale {
+                    serial: serial.clone(),
+                    current: l.clone(),
+                });
             }
         } else {
             if let Some(n) = known.iter().find_map(|s| keyring.local_name_for(s)) {
@@ -243,6 +261,7 @@ pub fn apply_updates(keyring: &mut Keyring, updates: &[NameUpdate]) -> (usize, u
             NameUpdate::DropStale { serial, current } => {
                 dropped += keyring.drop_stale_key_records(serial, current);
             }
+            NameUpdate::Unrecordable { .. } => {}
         }
     }
     (recorded, dropped)
@@ -327,8 +346,8 @@ mod tests {
         );
         assert_eq!(devs[0].name.as_deref(), Some("Work"));
         assert_eq!(devs[0].naming.source, Some(NameSource::Key));
-        // Shown, but not selectable until the record exists.
-        assert!(!devs[0].naming.selectable);
+        // Like any first sight: shown and selectable, recorded best-effort.
+        assert!(devs[0].naming.selectable);
         let mut ring = ring;
         assert_eq!(apply_updates(&mut ring, &ups), (1, 0));
         assert!(apply_names(&mut devs, &ring, &l).is_empty());
@@ -337,26 +356,32 @@ mod tests {
     }
 
     #[test]
-    fn unrecorded_first_sight_never_selects() {
+    fn unrecorded_first_sight_works_for_the_session() {
         // A keys.json that can't be saved (or loaded) leaves every sighting
-        // unrecorded: shown plain, never selectable, on every scan.
+        // unrecorded: each scan sees the keys for the first time, so their
+        // names are shown plain and select them.
         let ring = Keyring::default();
         let mut devs = vec![key(A), key(B)];
         let l = labels(&[(&devs[0], present("Work")), (&devs[1], present("Home"))]);
         for _ in 0..2 {
             apply_names(&mut devs, &ring, &l);
-            assert!(devs.iter().all(|d| !d.naming.selectable));
+            assert!(devs.iter().all(|d| d.naming.selectable));
         }
     }
 
     #[test]
-    fn unusable_serial_label_shows_but_never_selects() {
+    fn unusable_serial_label_shows_selects_and_asks_for_a_warning() {
         let ring = Keyring::default();
         let mut devs = vec![key(" \u{7}\u{200B} ")];
         let l = labels(&[(&devs[0], present("Work"))]);
-        assert!(apply_names(&mut devs, &ring, &l).is_empty());
+        assert_eq!(
+            apply_names(&mut devs, &ring, &l),
+            vec![NameUpdate::Unrecordable {
+                name: "Work".into()
+            }]
+        );
         assert_eq!(devs[0].name.as_deref(), Some("Work"));
-        assert!(!devs[0].naming.selectable);
+        assert!(devs[0].naming.selectable);
     }
 
     #[test]
@@ -380,6 +405,24 @@ mod tests {
         apply_names(&mut devs, &ring, &HashMap::new());
         assert_eq!(devs[0].name.as_deref(), Some("Work"));
         assert!(devs[0].naming.selectable);
+    }
+
+    #[test]
+    fn read_failure_is_listed_like_an_unnamed_key() {
+        let ring = Keyring::default();
+        let mut failed = vec![key(A)];
+        let l = labels(&[(&failed[0], KeyLabel::ReadFailed)]);
+        assert!(apply_names(&mut failed, &ring, &l).is_empty());
+        let mut unnamed = vec![key(A)];
+        apply_names(&mut unnamed, &ring, &HashMap::new());
+        assert_eq!(failed[0].name, unnamed[0].name);
+        assert_eq!(
+            Naming {
+                on_key: KeyLabel::NotRead,
+                ..failed[0].naming.clone()
+            },
+            unnamed[0].naming
+        );
     }
 
     #[test]
@@ -449,6 +492,7 @@ mod tests {
         let a = devs.iter().find(|d| d.serial == A).unwrap();
         let b = devs.iter().find(|d| d.serial == B).unwrap();
         assert_eq!(a.name.as_deref(), Some("Work"));
+        assert!(a.naming.selectable);
         assert!(!b.naming.selectable);
         assert_eq!(b.name.as_deref(), Some("Work (EF01)"));
         let mut ring = ring;
@@ -463,14 +507,26 @@ mod tests {
     }
 
     #[test]
-    fn serial_less_label_shows_but_never_selects() {
+    fn serial_less_label_works_for_the_session_unless_recorded_elsewhere() {
         let ring = Keyring::default();
         let mut devs = vec![key("")];
         let l = labels(&[(&devs[0], present("Work"))]);
         let ups = apply_names(&mut devs, &ring, &l);
-        assert!(ups.is_empty());
+        assert_eq!(
+            ups,
+            vec![NameUpdate::Unrecordable {
+                name: "Work".into()
+            }]
+        );
         assert_eq!(devs[0].name.as_deref(), Some("Work"));
         assert_eq!(devs[0].naming.source, Some(NameSource::Key));
+        assert!(devs[0].naming.selectable);
+        // A key this computer first saw with the name keeps it.
+        let mut ring = Keyring::default();
+        assert!(ring.record_first_seen(A, "Work"));
+        let ups = apply_names(&mut devs, &ring, &l);
+        assert!(ups.is_empty());
+        assert_eq!(devs[0].name.as_deref(), Some("Work"));
         assert!(!devs[0].naming.selectable);
     }
 

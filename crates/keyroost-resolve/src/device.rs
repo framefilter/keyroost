@@ -991,7 +991,8 @@ pub fn load_keyring_for_scan() -> (Keyring, bool) {
         Err(keyroost_keyring::KeyringError::NoConfigDir) => (Keyring::default(), false),
         Err(e) => {
             warn_once(format!(
-                "{e}. Keys are shown without the names saved on this computer."
+                "{e}. Keys are shown without the names saved on this computer, and \
+                 names read from keys work for this session only."
             ));
             (Keyring::default(), false)
         }
@@ -1134,6 +1135,8 @@ struct Learned {
     save_error: Option<String>,
     /// Changes learned but not saved because nothing may be saved.
     unsaved: usize,
+    /// First-seen names on keys without a usable serial (never recorded).
+    unrecordable: usize,
 }
 
 /// Record `updates` in the `keys.json` at `path`, re-read just before
@@ -1153,8 +1156,8 @@ fn record_updates_at(
 
 /// Name every row from `keyring` and `labels`. What the pass learned is
 /// recorded in the `keys.json` at `save` (`None`: it may not be saved), and
-/// the rows are named again from the saved file, so a first-seen name is
-/// selectable only once it is durably recorded.
+/// the rows are named again from the saved file, so records another
+/// keyroost process wrote meanwhile count too.
 fn learn_names(
     devices: &mut [Device],
     keyring: &Keyring,
@@ -1162,6 +1165,14 @@ fn learn_names(
     save: Option<&std::path::Path>,
 ) -> Learned {
     let updates = crate::names::apply_names(devices, keyring, labels);
+    let unrecordable = updates
+        .iter()
+        .filter(|u| matches!(u, crate::names::NameUpdate::Unrecordable { .. }))
+        .count();
+    let updates: Vec<_> = updates
+        .into_iter()
+        .filter(|u| !matches!(u, crate::names::NameUpdate::Unrecordable { .. }))
+        .collect();
     let mut learned = Learned {
         read: labels
             .values()
@@ -1171,6 +1182,7 @@ fn learn_names(
             .values()
             .filter(|l| matches!(l, KeyLabel::Present(_) | KeyLabel::Unreadable))
             .count(),
+        unrecordable,
         ..Learned::default()
     };
     if updates.is_empty() {
@@ -1191,19 +1203,28 @@ fn learn_names(
     learned
 }
 
-/// The warning for names read from keys that couldn't be recorded.
-fn unrecorded_names_warning(why: &str) -> String {
-    format!(
-        "names read from keys couldn't be recorded in keys.json ({why}); they are \
-         shown, but --device can't select a key by them yet"
-    )
-}
+/// Whether the "couldn't record names" warning was given in this process.
+static UNRECORDED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The same warning when there is no config directory to record names in.
-/// (A keys.json that couldn't be loaded was already reported on its own.)
-fn unsaved_names_warning(learned: &Learned, has_config_dir: bool) -> Option<String> {
-    (learned.unsaved > 0 && !has_config_dir)
-        .then(|| unrecorded_names_warning(&keyroost_keyring::KeyringError::NoConfigDir.to_string()))
+/// The warning when names read from keys can't be recorded on this computer
+/// (a failed save, no config directory, a key without a usable serial).
+/// Such names still work for this session, as on a computer seeing the keys
+/// for the first time. A keys.json that couldn't be loaded was already
+/// reported by [`load_keyring_for_scan`], so it adds nothing here.
+fn unrecorded_names_warning(learned: &Learned, has_config_dir: bool) -> Option<String> {
+    let why = if let Some(e) = &learned.save_error {
+        e.clone()
+    } else if learned.unsaved > 0 && !has_config_dir {
+        keyroost_keyring::KeyringError::NoConfigDir.to_string()
+    } else if learned.unrecordable > 0 {
+        "a key reports no usable serial".to_string()
+    } else {
+        return None;
+    };
+    Some(format!(
+        "this computer couldn't record names read from keys ({why}); they work for \
+         this session only"
+    ))
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -1214,8 +1235,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// First-seen names are recorded in `keys.json` best-effort: a scan never
 /// fails over it. A failed save is reported once per process
 /// ([`take_scan_warnings`]); nothing is saved when `may_save` is false
-/// (see [`load_keyring_for_scan`]). Until recorded, a name read from a key
-/// is shown but `--device` can't select the key by it.
+/// (see [`load_keyring_for_scan`]). A name that isn't recorded still works
+/// for this session, as on a computer seeing the key for the first time.
 pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool, debug: bool) {
     let labels = read_key_labels(devices, debug);
     let path = if may_save {
@@ -1224,11 +1245,11 @@ pub fn name_from_keys(devices: &mut [Device], keyring: &Keyring, may_save: bool,
         None
     };
     let learned = learn_names(devices, keyring, &labels, path.as_deref());
-    if let Some(e) = &learned.save_error {
-        warn_once(unrecorded_names_warning(e));
-    }
-    if let Some(w) = unsaved_names_warning(&learned, keyroost_keyring::config_path().is_some()) {
-        warn_once(w);
+    if let Some(w) = unrecorded_names_warning(&learned, keyroost_keyring::config_path().is_some()) {
+        // One such warning per process, whatever the reason.
+        if !UNRECORDED_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            warn_once(w);
+        }
     }
     if debug {
         let mut line = format!(
@@ -3159,48 +3180,61 @@ mod plan_tests {
                 dropped: 0,
                 save_error: None,
                 unsaved: 0,
+                unrecordable: 0,
             }
         );
         assert!(Keyring::load_from(&path).unwrap().holder("Work").is_some());
-        // Recorded durably, so now selectable.
+        // Recorded, and selectable.
         let work = devs.iter().find(|d| d.name.as_deref() == Some("Work"));
         assert!(work.is_some_and(|d| d.naming.selectable));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn learn_names_never_saves_or_selects_without_a_savable_keyring() {
+    fn learn_names_never_saves_without_a_savable_keyring() {
         // A keys.json that failed to load: rows are still named from the
-        // keys, nothing is saved, and no sighting becomes selectable.
+        // keys and work for this session, and nothing is saved.
         let mut devs = named_scan();
         let labels = work_labels(&devs);
         let got = learn_names(&mut devs, &Keyring::default(), &labels, None);
         assert_eq!((got.recorded, got.dropped), (0, 0));
         assert_eq!(got.unsaved, 1);
         let work = devs.iter().find(|d| d.name.as_deref() == Some("Work"));
-        assert!(work.is_some_and(|d| !d.naming.selectable));
+        assert!(work.is_some_and(|d| d.naming.selectable));
     }
 
     #[test]
-    fn no_config_dir_warns_like_a_failed_save() {
-        let pending = Learned {
+    fn a_name_that_cant_be_recorded_gets_one_warning_with_the_reason() {
+        let w = |l: Learned, dir: bool| unrecorded_names_warning(&l, dir);
+        let failed = Learned {
+            save_error: Some("disk full".into()),
+            ..Learned::default()
+        };
+        assert_eq!(
+            w(failed, true).as_deref(),
+            Some(
+                "this computer couldn't record names read from keys (disk full); \
+                 they work for this session only"
+            )
+        );
+        let no_dir = Learned {
             unsaved: 1,
             ..Learned::default()
         };
-        let w = unsaved_names_warning(&pending, false).unwrap();
-        assert!(
-            w.starts_with("names read from keys couldn't be recorded in keys.json ("),
-            "{w}"
-        );
-        assert!(w.contains("could not determine config dir"), "{w}");
-        assert!(
-            w.ends_with("--device can't select a key by them yet"),
-            "{w}"
-        );
-        // With a config dir, a keys.json that couldn't be loaded was already
-        // reported; with nothing pending there is nothing to say.
-        assert_eq!(unsaved_names_warning(&pending, true), None);
-        assert_eq!(unsaved_names_warning(&Learned::default(), false), None);
+        assert!(w(no_dir.clone(), false)
+            .unwrap()
+            .contains("could not determine config dir"));
+        // With a config dir, nothing was saved because keys.json couldn't be
+        // loaded, which was already reported on its own.
+        assert_eq!(w(no_dir, true), None);
+        let serial_less = Learned {
+            unrecordable: 1,
+            ..Learned::default()
+        };
+        assert!(w(serial_less, true)
+            .unwrap()
+            .contains("a key reports no usable serial"));
+        assert_eq!(w(Learned::default(), false), None);
     }
 
     #[test]
@@ -3243,7 +3277,7 @@ mod plan_tests {
     }
 
     #[test]
-    fn learn_names_reports_a_failed_save_and_keeps_the_sighting_unselectable() {
+    fn learn_names_reports_a_failed_save_and_never_overwrites_a_damaged_file() {
         let dir = temp_dir("damaged");
         let path = dir.join("keys.json");
         std::fs::write(&path, "{ not json").unwrap();
@@ -3252,7 +3286,9 @@ mod plan_tests {
         let got = learn_names(&mut devs, &Keyring::default(), &labels, Some(&path));
         assert!(got.save_error.is_some());
         assert_eq!(got.recorded, 0);
-        assert!(devs.iter().all(|d| !d.naming.selectable));
+        // The sighting still works for this session.
+        let work = devs.iter().find(|d| d.name.as_deref() == Some("Work"));
+        assert!(work.is_some_and(|d| d.naming.selectable));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         std::fs::remove_dir_all(&dir).unwrap();
     }
