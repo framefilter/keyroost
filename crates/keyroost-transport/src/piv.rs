@@ -965,7 +965,7 @@ impl PubkeyCache {
     }
 
     /// The slot's key material is gone (`delete_key` succeeded): a stale
-    /// entry here would produce a CSR/self-signed cert for a key that no
+    /// entry here would produce a CSR or self-signed cert for a key that no
     /// longer exists. Evicting an uncached slot is a no-op. Distinct from
     /// `remember(key_ref, None)`: eviction means "we no longer know",
     /// forcing the next read to ask again; `remember(_, None)` means "we
@@ -977,8 +977,8 @@ impl PubkeyCache {
 
     /// The key itself relocated (`move_key` succeeded), not just its
     /// reference — carry a cached entry along with it rather than dropping
-    /// it, so a subsequent CSR/self-sign at `dest` still works on
-    /// metadata-less firmware, and leave nothing behind at `src`. An uncached
+    /// it, so a later `piv cert request`/`piv cert generate` at `dest` still
+    /// works on metadata-less firmware, and leave nothing behind at `src`. An uncached
     /// `src` carries nothing and, crucially, invents nothing at `dest`.
     fn migrate(&mut self, src: u8, dest: u8) {
         if let Some(cached) = self.0.remove(&src) {
@@ -4755,10 +4755,10 @@ impl<'tx> PivSession<'tx> {
     ///    [`Self::remember_pubkey`]) — either way, `PubkeyCache`. This is
     ///    what makes a freshly generated key show up immediately on
     ///    metadata-less firmware: there's no certificate yet for step 3 to
-    ///    read (self-sign/import hasn't run), and GET METADATA's silence on
-    ///    such firmware doesn't mean "empty" — it means "doesn't exist", so
-    ///    without this step a slot that was *just* populated would still
-    ///    display as empty. A caller reading status in a fresh session has
+    ///    read (`piv cert generate`/`piv cert import` hasn't run), and GET
+    ///    METADATA's silence on such firmware doesn't mean "empty" — it
+    ///    means "doesn't exist", so without this step a slot that was *just*
+    ///    populated would still display as empty. A caller reading status in a fresh session has
     ///    to `remember_pubkey` first if it wants this step to see anything.
     /// 2. HID Crescendo C2300's live substitute for GET METADATA, which that
     ///    fingerprint never answers at all — see
@@ -4769,9 +4769,9 @@ impl<'tx> PivSession<'tx> {
     ///
     /// Unlike [`Self::slot_key`] — which this does *not* replace — this never
     /// needs the actual public key bytes, only the algorithm, so the
-    /// certificate fallback is enough; `slot_key`'s callers (CSR/self-sign)
-    /// need the raw key material and always re-confirm it live instead of
-    /// trusting this cache (see `Self::confirmed_slot_key`).
+    /// certificate fallback is enough; `slot_key`'s callers (`piv cert
+    /// request`/`piv cert generate`) need the raw key material and always
+    /// re-confirm it live instead of trusting this cache (see `Self::confirmed_slot_key`).
     pub fn slot_key_algorithm(&mut self, slot: Slot) -> Option<KeyAlg> {
         if let Some((alg, _)) = self.cached_slot_key(slot) {
             return Some(alg);
@@ -4921,9 +4921,9 @@ impl<'tx> PivSession<'tx> {
     /// nothing new — self-known, from a prior [`Self::generate_key`] on
     /// `slot` in *this* session, or a caller explicitly carrying key
     /// material forward via [`Self::remember_pubkey`]. That's what lets
-    /// CSR/self-sign work right after generation on cards that don't
-    /// support GET METADATA (older YubiKeys, non-Yubico PIV tokens): the
-    /// card refuses to name the key material any other way, and this crate
+    /// `piv cert request`/`piv cert generate` work right after generation on
+    /// cards that don't support GET METADATA (older YubiKeys, non-Yubico PIV
+    /// tokens): the card refuses to name the key material any other way, and this crate
     /// keeps no on-disk or cross-process copy of it on its own (see
     /// [`Self::remember_pubkey`]).
     ///
@@ -4948,7 +4948,7 @@ impl<'tx> PivSession<'tx> {
              the key material wasn't handed to this session — run `piv key generate` \
              on this slot in this same session, or pass its previously saved \
              key material to this command, so it can be cached for \
-             CSR/self-sign",
+             `piv cert request`/`piv cert generate`",
             ))
     }
 
@@ -5043,8 +5043,8 @@ impl<'tx> PivSession<'tx> {
         ok_or_write("piv move key", sw)?;
         // The key itself relocated, not just its reference — carry both
         // cached entries along with it rather than dropping them, so a
-        // subsequent CSR/self-sign or policy display at `dest` still works
-        // (or, on metadata-full firmware, still skips the round trip)
+        // later `piv cert request`/`piv cert generate` or policy display at
+        // `dest` still works (or, on metadata-full firmware, still skips the round trip)
         // without paying to re-resolve either. `cert_cache` is deliberately
         // *not* migrated here — MOVE KEY never touches the certificate
         // object, which stays exactly where it was at `src` (see this
@@ -7152,8 +7152,8 @@ mod tests {
         cache.remember(0x9C, Some((KeyAlg::EccP384, ecc(2))));
         cache.migrate(0x9A, 0x82);
         // The key relocated: its entry follows it to dest — that's what keeps
-        // CSR/self-sign working at dest on metadata-less firmware — and src
-        // no longer holds anything to describe.
+        // `piv cert request`/`piv cert generate` working at dest on
+        // metadata-less firmware — and src no longer holds anything to describe.
         assert_eq!(cache.get(0x9A), None);
         assert_eq!(cache.get(0x82), Some(Some(&(KeyAlg::EccP256, ecc(1)))));
         // A bystander slot is untouched.

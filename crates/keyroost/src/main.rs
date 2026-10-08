@@ -2232,7 +2232,7 @@ struct PivState {
     /// Validity period, entered as three counts that sum — years applied
     /// first, then months relative to that point, then a flat day count —
     /// fed to [`keyroost_piv::add_calendar_period`]. Mirrors `keyroostctl
-    /// piv self-sign`'s combinable `--years`/`--months`/`--days` exactly.
+    /// piv cert generate`'s combinable `--years`/`--months`/`--days` exactly.
     cert_valid_years: u32,
     cert_valid_months: u32,
     cert_valid_days: u32,
@@ -10213,7 +10213,7 @@ fn card_note(ui: &mut egui::Ui, p: &Palette, t: &str) {
 
 /// The "Valid for" fields shared by the certificate and CHUID cards: three
 /// `DragValue`s — years, months, days, in that order — that sum, mirroring
-/// `keyroostctl piv self-sign`/`new-chuid`'s combinable `--years`/`--months`/
+/// `keyroostctl piv cert generate`/`chuid generate`'s combinable `--years`/`--months`/
 /// `--days` exactly (see [`keyroost_piv::add_calendar_period`]). Renders
 /// only the three fields, not the "Valid for" label itself — the two call
 /// sites lay that out differently (a plain label vs. one column-aligned with
