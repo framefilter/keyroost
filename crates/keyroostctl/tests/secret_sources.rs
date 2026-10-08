@@ -21,28 +21,41 @@ fn retired_secret_flags_name_their_replacement() {
     for (args, want) in [
         (
             &["molto", "--key", "S3CRETVALUE", "info"][..],
-            "--key-env VAR",
+            "use --customer-key env:NAME",
         ),
         (
             &["molto", "--key-ascii", "S3CRETVALUE", "info"],
-            "--key-ascii-env VAR",
+            "use --customer-key env:NAME --customer-key-encoding ascii",
         ),
         (
             &["molto", "seed", "--slot", "99", "--hex", "S3CRETVALUE"],
-            "--hex-env VAR or --hex-stdin",
+            "use --seed env:NAME --encoding hex",
         ),
         (
             &["molto", "seed", "--slot", "99", "--base32=S3CRETVALUE"],
-            "--base32-env VAR or --base32-stdin",
+            "use --seed env:NAME (base32 is the default encoding)",
         ),
         (
             &["prog", "seed", "--hex", "S3CRETVALUE"],
-            "--hex-env VAR or --hex-stdin",
+            "use --seed env:NAME --encoding hex",
         ),
         (
             &["molto", "customer-key", "--ascii", "S3CRETVALUE"],
-            "--ascii-env VAR or --ascii-stdin",
+            "use --new-customer-key env:NAME --encoding ascii",
         ),
+        (
+            &["molto", "customer-key", "--hex", "S3CRETVALUE"],
+            "use --new-customer-key env:NAME (hex is the default encoding)",
+        ),
+        (
+            &["molto", "seed", "--hex-env", "V"],
+            "--seed env:VAR --encoding hex",
+        ),
+        (
+            &["molto", "--key-env", "V", "info"],
+            "--customer-key env:VAR",
+        ),
+        (&["molto", "import", "--uri-env", "V"], "--uri env:VAR"),
         (&["oath", "add", "n", "--secret-env", "V"], "--seed env:VAR"),
         (&["oath", "add", "n", "--secret-stdin"], "--seed stdin"),
         (
@@ -86,59 +99,50 @@ fn retired_secret_flags_name_their_replacement() {
         "otpauth://totp/x?secret=S3CRETVALUE",
         "--yes",
     ]);
-    assert_ne!(code, 0);
+    assert_eq!(code, 2, "{err}");
     assert!(
-        err.contains("--uri-env VAR") && !err.contains("S3CRETVALUE"),
+        err.contains("--uri env:NAME") && !err.contains("S3CRETVALUE"),
         "{err}"
     );
 }
 
 /// A stray value on a command that takes a secret may be the secret itself
-/// (a literal otpauth URI after `-`, or a seed after `--hex-stdin`): clap's
-/// "unexpected argument" message would repeat it, so keyroostctl replaces
-/// it with one that doesn't.
+/// (a literal otpauth URI on `molto import`, or a seed after `--seed
+/// stdin`): clap's "unexpected argument" message would repeat it, so
+/// keyroostctl replaces it with one that doesn't.
 #[test]
 fn a_stray_value_on_a_secret_command_is_not_repeated() {
-    for (args, help) in [
+    for (args, want) in [
         (
             &[
                 "molto",
                 "import",
                 "--slot",
                 "99",
-                "-",
                 "otpauth://totp/x?secret=S3CRET",
             ][..],
-            "see `keyroostctl molto import --help`",
+            "takes the otpauth:// URI as --uri env:NAME or --uri stdin",
         ),
         (
-            &["molto", "seed", "--slot", "99", "--hex-stdin", "S3CRET"],
-            "see `keyroostctl molto seed --help`",
+            &["molto", "seed", "--slot", "99", "--seed", "stdin", "S3CRET"],
+            "unexpected extra argument (not shown, in case it is a secret); \
+             see `keyroostctl molto seed --help`",
         ),
     ] {
         let (code, err) = run(args);
         assert_eq!(code, 2, "{args:?}: {err}");
-        assert!(
-            err.contains("unexpected extra argument (not shown, in case it is a secret)")
-                && err.contains(help),
-            "{args:?}: {err}"
-        );
+        assert!(err.contains(want), "{args:?}: {err}");
         assert!(!err.contains("S3CRET"), "{args:?} echoed the value: {err}");
     }
 }
 
-/// `--X-stdin` takes no value: `--X-stdin=VALUE` is clap's own "unexpected
-/// value" error, which names the flag and repeats the value. The value may
-/// be the secret itself, typed where the variable name or nothing at all
-/// was expected. A retired `--X-stdin` flag gets its replacement instead.
+/// A retired `--X-stdin=VALUE` is an unknown flag: the hint names its
+/// replacement and never the value, which may be the secret itself.
 #[test]
 fn a_stdin_flag_given_a_value_is_not_repeated() {
     let (code, err) = run(&["molto", "seed", "--slot", "99", "--hex-stdin=S3CRET"]);
     assert_eq!(code, 2, "{err}");
-    assert!(
-        err.contains("takes no value") && err.contains("standard input"),
-        "{err}"
-    );
+    assert!(err.contains("--seed stdin --encoding hex"), "{err}");
     assert!(!err.contains("S3CRET"), "echoed the value: {err}");
 
     let (code, err) = run(&[
@@ -185,16 +189,13 @@ fn a_typo_still_gets_claps_similar_name_tip() {
 
 const TABLE: &str = include_str!("secret_flags.txt");
 
-/// Table entries that are still old `--X-env VAR` / `--X-stdin` pairs.
-const OLD_PAIRS: &[&str] = &["hex", "base32", "ascii"];
-
 /// A well-formed value for a secret supplied by env so a later one is
 /// reached. It never reaches a key: one secret is always missing, and every
 /// secret is checked before any device is opened.
 fn dummy(prefix: &str) -> &'static str {
     match prefix {
-        "hex" | "mgmt-key" | "new-mgmt-key" => "00",
-        "base32" | "seed" => "AAAA",
+        "mgmt-key" | "new-mgmt-key" | "customer-key" | "new-customer-key" => "00",
+        "seed" => "AAAA",
         _ => "0000",
     }
 }
@@ -260,11 +261,7 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
             for (j, prev) in required[..i].iter().enumerate() {
                 let p = prev.split('|').next().unwrap();
                 let var = format!("KR_TEST_SECRET_{j}");
-                if OLD_PAIRS.contains(&p) {
-                    cmd.arg(format!("--{p}-env")).arg(&var);
-                } else {
-                    cmd.arg(format!("--{p}")).arg(format!("env:{var}"));
-                }
+                cmd.arg(format!("--{p}")).arg(format!("env:{var}"));
                 cmd.env(&var, dummy(p));
             }
             let out = cmd.output().unwrap();
@@ -281,11 +278,7 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
                 "{line} #{i}: a key was selected before the refusal: {err}"
             );
             for p in required[i].split('|') {
-                let want = if OLD_PAIRS.contains(&p) {
-                    format!("--{p}-env VAR")
-                } else {
-                    format!("--{p} env:NAME")
-                };
+                let want = format!("--{p} env:NAME");
                 assert!(err.contains(&want), "{line} #{i}: {err}");
             }
             for flag in err
@@ -356,6 +349,12 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
         &["oath", "set-password", "--new-password", "S3CRETVALUE"],
         &["oath", "add", "n", "--seed", "S3CRETVALUE"],
         &["fido", "pin", "change", "--pin", "default"],
+        &["molto", "--customer-key", "S3CRETVALUE", "info"],
+        &["molto", "info", "--customer-key=S3CRETVALUE"],
+        &["molto", "customer-key", "--new-customer-key", "S3CRETVALUE"],
+        &["molto", "seed", "--slot", "1", "--seed", "S3CRETVALUE"],
+        &["prog", "seed", "--seed", "-S3CRETVALUE"],
+        &["molto", "import", "--slot", "1", "--uri", "S3CRETVALUE"],
     ];
     for args in cases {
         let (code, err) = run(args);
@@ -367,6 +366,10 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
             "{args:?}: a key was selected: {err}"
         );
     }
+    // The retired `-` positional of `molto import` names its replacement.
+    let (code, err) = run(&["molto", "import", "--slot", "1", "-"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("is now `molto import --uri stdin`"), "{err}");
     // A value after `--pin stdin` is a stray argument, hidden too.
     for args in [
         &["piv", "change-pin", "--pin", "stdin", "S3CRETVALUE"][..],

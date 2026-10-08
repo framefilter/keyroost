@@ -1830,8 +1830,9 @@ enum OathCmd {
     },
     /// Add (provision) a TOTP or HOTP credential.
     ///
-    /// The base32 seed comes from an environment variable, stdin or, with
-    /// neither, a hidden prompt — never argv. Piped together with the applet
+    /// The seed comes from an environment variable, stdin or, with neither,
+    /// a hidden prompt — never argv; --encoding says how it is written
+    /// (base32 unless --encoding hex). Piped together with the applet
     /// password, the seed is the first line and the password the second.
     Add {
         /// Credential name to store (e.g. "issuer:account").
@@ -1839,11 +1840,14 @@ enum OathCmd {
         /// Credential type: time-based (TOTP) or counter-based (HOTP).
         #[arg(long = "type", value_enum, default_value_t = OathTypeArg::Totp)]
         oath_type: OathTypeArg,
-        /// The base32 seed: env:NAME reads that environment variable, stdin
-        /// reads one line (first line; hidden when typed at a terminal). With
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (first line; hidden when typed at a terminal). With
         /// neither, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
         /// HMAC algorithm.
         #[arg(long, value_enum, default_value_t = OathAlgoArg::Sha1)]
         algorithm: OathAlgoArg,
@@ -1904,17 +1908,34 @@ enum OathCmd {
     },
 }
 
-/// Molto2 customer-key selection (Molto2-scoped; was global pre-0.6.0).
+/// How a seed is written: base32 (what services show) or hex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum SeedEncoding {
+    #[default]
+    Base32,
+    Hex,
+}
+
+/// How a Molto2 customer key is written: hex or ASCII text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum KeyEncoding {
+    #[default]
+    Hex,
+    Ascii,
+}
+
+/// The Molto2 customer key, usable before or after the subcommand.
 #[derive(clap::Args)]
 struct KeyArgs {
-    /// Read the hex customer key from the named environment variable.
-    /// With neither this nor --key-ascii-env, the factory-default key is used.
-    #[arg(long, global = true, value_name = "VAR")]
-    key_env: Option<String>,
-    /// Read the ASCII customer key from the named environment variable.
-    /// With neither this nor --key-env, the factory-default key is used.
-    #[arg(long, global = true, value_name = "VAR", conflicts_with = "key_env")]
-    key_ascii_env: Option<String>,
+    /// The current customer key: env:NAME reads that environment variable,
+    /// stdin reads one line (the first line, before any other secret;
+    /// hidden when typed at a terminal). Without it, the factory-default
+    /// key is used.
+    #[arg(long, global = true, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+    customer_key: Option<SecretSource>,
+    /// How --customer-key is written.
+    #[arg(long, global = true, value_enum, default_value_t = KeyEncoding::Hex)]
+    customer_key_encoding: KeyEncoding,
 }
 
 /// Token2 single-profile programmable token subcommands. These talk to the
@@ -1930,28 +1951,20 @@ enum ProgCmd {
     /// Write the TOTP seed, replacing the one on the token. Irreversible: asks
     /// first (`--yes` to skip).
     ///
-    /// The seed comes from exactly one of --hex-env / --hex-stdin /
-    /// --base32-env / --base32-stdin (never the command line). Hex or
-    /// base32: the flag says which encoding you give (the token stores raw
-    /// bytes).
-    #[command(group(clap::ArgGroup::new("seed_source")
-        .args(["hex_env", "base32_env", "hex_stdin", "base32_stdin"])
-        .multiple(false)))]
+    /// The seed comes from --seed env:NAME or --seed stdin, or a terminal
+    /// asks for it (hidden); --encoding says how it is written (base32
+    /// unless --encoding hex).
     Seed {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
-        /// Read the hex seed from the named environment variable.
-        #[arg(long, value_name = "VAR")]
-        hex_env: Option<String>,
-        /// Read the base32 seed from the named environment variable.
-        #[arg(long, value_name = "VAR")]
-        base32_env: Option<String>,
-        /// Read the hex seed from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        hex_stdin: bool,
-        /// Read the base32 seed from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        base32_stdin: bool,
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -1976,7 +1989,7 @@ enum ProgCmd {
 }
 
 /// Token2 Molto2 / Molto2v2 subcommands. These talk to the Molto2 PC/SC
-/// reader, authenticated with the customer key (see the `--key*` flags).
+/// reader, authenticated with the customer key (see --customer-key).
 #[derive(Subcommand)]
 enum MoltoCmd {
     /// Print device serial number and on-device UTC time.
@@ -1992,28 +2005,21 @@ enum MoltoCmd {
     /// Write a TOTP seed to a slot, replacing any seed already there.
     /// Irreversible: asks first (`--yes` to skip).
     ///
-    /// Asks only when the slot is occupied. The seed comes from exactly one of --hex-env / --hex-stdin /
-    /// --base32-env / --base32-stdin (never the command line). Hex or base32:
-    /// the flag says which encoding you give (the token stores raw bytes).
-    #[command(group(clap::ArgGroup::new("seed_source")
-        .args(["hex_env", "base32_env", "hex_stdin", "base32_stdin"])
-        .multiple(false)))]
+    /// Asks only when the slot is occupied. The seed comes from --seed
+    /// env:NAME or --seed stdin, or a terminal asks for it (hidden);
+    /// --encoding says how it is written (base32 unless --encoding hex).
     Seed {
         /// Slot number, 0-99 (Token2 calls these profiles).
         #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: u8,
-        /// Read the hex seed from the named environment variable.
-        #[arg(long, value_name = "VAR")]
-        hex_env: Option<String>,
-        /// Read the base32 seed from the named environment variable.
-        #[arg(long, value_name = "VAR")]
-        base32_env: Option<String>,
-        /// Read the hex seed from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        hex_stdin: bool,
-        /// Read the base32 seed from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        base32_stdin: bool,
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --customer-key stdin is also given;
+        /// hidden when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -2070,34 +2076,29 @@ enum MoltoCmd {
     /// Rotate the device's customer key (requires physical button
     /// confirmation).
     ///
-    /// The new key comes from exactly one of --hex-env /
-    /// --hex-stdin / --ascii-env / --ascii-stdin (never the command line);
-    /// typed at a terminal it is asked twice. The current key comes from
-    /// --key-env / --key-ascii-env (factory default with neither).
-    #[command(group(clap::ArgGroup::new("new_key_source")
-        .args(["hex_env", "ascii_env", "hex_stdin", "ascii_stdin"])
-        .multiple(false)))]
+    /// The new key comes from --new-customer-key env:NAME or
+    /// --new-customer-key stdin, or a terminal asks for it twice (hidden);
+    /// --encoding says how it is written (hex unless --encoding ascii). The
+    /// current key comes from --customer-key (the factory default without
+    /// it).
     CustomerKey {
-        /// Read the new hex key from the named environment variable.
-        #[arg(long, value_name = "VAR")]
-        hex_env: Option<String>,
-        /// Read the new ASCII key from the named environment variable.
-        #[arg(long, value_name = "VAR")]
-        ascii_env: Option<String>,
-        /// Read the new hex key from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        hex_stdin: bool,
-        /// Read the new ASCII key from stdin (one line; hidden when typed at a terminal).
-        #[arg(long)]
-        ascii_stdin: bool,
+        /// The new customer key: env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --customer-key stdin is
+        /// also given; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_customer_key: Option<SecretSource>,
+        /// How --new-customer-key is written.
+        #[arg(long, value_enum, default_value_t = KeyEncoding::Hex)]
+        encoding: KeyEncoding,
     },
     /// Import an otpauth:// URI to a slot: writes seed, title, and config in
     /// one go, replacing what the slot held. Irreversible: asks first (`--yes`
     /// to skip).
     ///
-    /// Asks only when the slot is occupied. The URI comes from stdin (`-`), --uri-env VAR or a QR
-    /// screenshot (--qr), never the command line; with none of them, a
-    /// terminal asks for it (hidden).
+    /// Asks only when the slot is occupied. The URI comes from --uri
+    /// env:NAME, --uri stdin or a QR screenshot (--qr IMAGE), never the
+    /// command line; with none of them, a terminal asks for it (hidden).
     Import {
         /// Slot number, 0-99 (Token2 calls these profiles).
         #[arg(long, value_name = "SLOT", value_parser = parse_molto_slot)]
@@ -2111,14 +2112,14 @@ enum MoltoCmd {
         /// Decode the otpauth:// URI from a QR code in a PNG/JPEG screenshot
         /// instead of passing it as text. For Google Authenticator export
         /// QRs (multiple accounts), use `import-file` with the image path.
-        #[arg(long, value_name = "IMAGE", conflicts_with_all = ["uri", "uri_env"])]
+        #[arg(long, value_name = "IMAGE", conflicts_with = "uri")]
         qr: Option<std::path::PathBuf>,
-        /// `-` reads the otpauth:// URI from stdin (one line; hidden when typed at a terminal).
-        #[arg(value_name = "-")]
-        uri: Option<String>,
-        /// Read the otpauth:// URI from the named environment variable.
-        #[arg(long, value_name = "VAR", conflicts_with_all = ["uri", "qr"])]
-        uri_env: Option<String>,
+        /// The otpauth:// URI: env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --customer-key stdin is
+        /// also given; hidden when typed at a terminal). With none of these
+        /// and no --qr, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        uri: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -2143,8 +2144,9 @@ enum MoltoCmd {
         #[arg(long)]
         dry_run: bool,
         /// The vault password: env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks when the file is an encrypted vault.
+        /// reads one line (second line when --customer-key stdin is also
+        /// given; hidden when typed at a terminal). With neither, a terminal
+        /// asks when the file is an encrypted vault.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         password: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
@@ -2664,8 +2666,9 @@ enum OtpCmd {
     },
     /// Add (or overwrite) an OTP entry.
     ///
-    /// The base32 seed comes from an environment variable, stdin or, with
-    /// neither, a hidden prompt — never argv. A PIN-protected (R3.4+) key also
+    /// The seed comes from an environment variable, stdin or, with neither,
+    /// a hidden prompt — never argv; --encoding says how it is written
+    /// (base32 unless --encoding hex). A PIN-protected (R3.4+) key also
     /// needs its PIN: piped together with the seed, the seed is the first line
     /// and the PIN the second.
     Add {
@@ -2690,11 +2693,14 @@ enum OtpCmd {
         /// Require a button press on the key to emit this code.
         #[arg(long)]
         touch: bool,
-        /// The base32 seed: env:NAME reads that environment variable, stdin
-        /// reads one line (first line; hidden when typed at a terminal). With
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (first line; hidden when typed at a terminal). With
         /// neither, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
         /// The OTP PIN to unlock a protected key: env:NAME reads that
         /// environment variable, stdin reads one line (second line when --seed
         /// stdin is also given; hidden when typed at a terminal). With neither,
@@ -2738,9 +2744,10 @@ enum OtpCmd {
     /// already there. Irreversible: asks first (`--yes` to skip).
     ///
     /// The key types this code when touched outside a session. Asks only when
-    /// the slot may already be configured. The base32 seed comes from an
+    /// the slot may already be configured. The seed comes from an
     /// environment variable, stdin or, with neither, a hidden prompt — never
-    /// argv.
+    /// argv; --encoding says how it is written (base32 unless --encoding
+    /// hex).
     SetButtonHotp {
         /// Code length — must be 6 or 8.
         #[arg(long, default_value_t = 6, value_parser = parse_button_digits)]
@@ -2754,11 +2761,14 @@ enum OtpCmd {
         /// Type the digits using the numeric-keypad scancodes.
         #[arg(long)]
         numpad: bool,
-        /// The base32 seed: env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (hidden when typed at a terminal). With neither, a
         /// terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -3043,110 +3053,76 @@ impl TimeoutArg {
     }
 }
 
-const MOLTO_KEY_HEX: Spec = Spec::current("customer key", "key").hex().legacy();
-const MOLTO_KEY_ASCII: Spec = Spec::current("customer key", "key-ascii").legacy();
-const SEED_HEX: Spec = Spec::value("seed", "hex").hex().legacy();
-const SEED_B32: Spec = Spec::value("seed", "base32").base32().legacy();
-const NEW_KEY_HEX: Spec = Spec::new_secret("new customer key", "hex").hex().legacy();
-const NEW_KEY_ASCII: Spec = Spec::new_secret("new customer key", "ascii").legacy();
+const SEED_HEX: Spec = Spec::value("seed", "seed").hex();
+const SEED_B32: Spec = Spec::value("seed", "seed").base32();
+/// The seed's [`Spec`] for an encoding (the prompt names the encoding).
+const fn seed_spec(e: SeedEncoding) -> &'static Spec {
+    match e {
+        SeedEncoding::Hex => &SEED_HEX,
+        SeedEncoding::Base32 => &SEED_B32,
+    }
+}
+
+const CUSTOMER_KEY_HEX: Spec = Spec::current("customer key", "customer-key").hex();
+const CUSTOMER_KEY_ASCII: Spec = Spec::current("customer key", "customer-key");
+const NEW_CUSTOMER_KEY_HEX: Spec = Spec::new_secret("new customer key", "new-customer-key").hex();
+const NEW_CUSTOMER_KEY_ASCII: Spec = Spec::new_secret("new customer key", "new-customer-key");
+/// The current (`new == false`) or new customer key's [`Spec`].
+const fn customer_key_spec(e: KeyEncoding, new: bool) -> &'static Spec {
+    match (e, new) {
+        (KeyEncoding::Hex, false) => &CUSTOMER_KEY_HEX,
+        (KeyEncoding::Ascii, false) => &CUSTOMER_KEY_ASCII,
+        (KeyEncoding::Hex, true) => &NEW_CUSTOMER_KEY_HEX,
+        (KeyEncoding::Ascii, true) => &NEW_CUSTOMER_KEY_ASCII,
+    }
+}
+
 const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
     .prompt_as("otpauth:// URI")
-    .hint("`-` to read it from stdin, --uri-env VAR or --qr IMAGE")
-    .legacy();
+    .hint("--uri env:NAME, --uri stdin or --qr IMAGE");
 const VAULT_PASSWORD: Spec = Spec::current("vault password", "password");
-const IMPORT_URI_IN_ARGV: &str = "the otpauth:// URI can't be given on the command line any more (it contains the secret, and the command line ends up in shell history and `ps`): pass `-` and pipe it on stdin, use --uri-env VAR, or --qr IMAGE";
 
-/// The Molto2 customer key: from --key-env / --key-ascii-env, or the
-/// factory default with neither. Never prompted for: an absent flag means
-/// the default key, not a question.
+/// Decode a seed; the error names the flag and the encoding, never the input.
+fn decode_seed(text: &str, e: SeedEncoding) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let r = match e {
+        SeedEncoding::Hex => hex_decode(text).map_err(|err| {
+            format!("the seed is not valid hex ({err}); pass --encoding base32 if it is base32")
+        }),
+        SeedEncoding::Base32 => base32_decode(text).map_err(|err| {
+            format!("the seed is not valid base32 ({err}); pass --encoding hex if it is hex")
+        }),
+    };
+    r.map(zeroize::Zeroizing::new)
+}
+
+/// Decode a customer key: hex, or ASCII taken as its bytes. `flag` is the
+/// flag named in the error ("--customer-key" or "--new-customer-key").
+fn decode_customer_key(
+    text: &str,
+    e: KeyEncoding,
+    flag: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    match e {
+        KeyEncoding::Hex => hex_decode(text)
+            .map(zeroize::Zeroizing::new)
+            .map_err(|err| format!("the customer key given by {flag} is not valid hex ({err})")),
+        KeyEncoding::Ascii => Ok(zeroize::Zeroizing::new(text.as_bytes().to_vec())),
+    }
+}
+
+/// The Molto2 customer key from --customer-key, or the factory default
+/// without it. Never prompted for: an absent flag means the default key,
+/// not a question.
 fn customer_key<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
     args: &KeyArgs,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
-    if let Some(var) = &args.key_env {
-        let hex = sec.read(&MOLTO_KEY_HEX, Source::env(var))?;
-        return hex_decode(&hex)
-            .map(zeroize::Zeroizing::new)
-            .map_err(|e| format!("the customer key given by --key-env is not valid hex: {e}"));
-    }
-    if let Some(var) = &args.key_ascii_env {
-        let text = sec.read(&MOLTO_KEY_ASCII, Source::env(var))?;
-        return Ok(zeroize::Zeroizing::new(text.as_bytes().to_vec()));
-    }
-    Ok(zeroize::Zeroizing::new(DEFAULT_CUSTOMER_KEY.to_vec()))
-}
-
-/// The two seed encodings `molto seed` and `prog seed` accept, hex first.
-fn seed_options<'a>(
-    hex_env: Option<&'a str>,
-    hex_stdin: bool,
-    base32_env: Option<&'a str>,
-    base32_stdin: bool,
-) -> [(Spec, Source<'a>); 2] {
-    [
-        (SEED_HEX, Source::new(hex_env, hex_stdin)),
-        (SEED_B32, Source::new(base32_env, base32_stdin)),
-    ]
-}
-
-/// The two encodings `molto customer-key` accepts for the new key, hex first.
-fn new_key_options<'a>(
-    hex_env: Option<&'a str>,
-    hex_stdin: bool,
-    ascii_env: Option<&'a str>,
-    ascii_stdin: bool,
-) -> [(Spec, Source<'a>); 2] {
-    [
-        (NEW_KEY_HEX, Source::new(hex_env, hex_stdin)),
-        (NEW_KEY_ASCII, Source::new(ascii_env, ascii_stdin)),
-    ]
-}
-
-/// Read the new customer key from the one source given in `options`
-/// ([`new_key_options`]): hex is decoded, ASCII taken as its bytes.
-fn read_new_customer_key<I: crate::secrets::SecretIo>(
-    sec: &mut Secrets<I>,
-    options: &[(Spec, Source<'_>); 2],
-) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-    let (i, text) = sec.read_one_of("new customer key", options)?;
-    let bytes = if i == 0 {
-        hex_decode(&text).map_err(|e| format!("the new customer key is not valid hex: {e}"))?
-    } else {
-        text.as_bytes().to_vec()
+    let Some(flag) = args.customer_key.as_ref() else {
+        return Ok(zeroize::Zeroizing::new(DEFAULT_CUSTOMER_KEY.to_vec()));
     };
-    Ok(zeroize::Zeroizing::new(bytes))
-}
-
-/// Read and decode the one seed source given in `options` ([`seed_options`]).
-fn read_seed<I: crate::secrets::SecretIo>(
-    sec: &mut Secrets<I>,
-    options: &[(Spec, Source<'_>); 2],
-) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
-    let (i, text) = sec.read_one_of("seed", options)?;
-    // The decode errors name the problem, never the input.
-    let bytes = if i == 0 {
-        hex_decode(&text).map_err(|e| format!("the seed is not valid hex: {e}"))?
-    } else {
-        base32_decode(&text).map_err(|e| format!("the seed is not valid base32: {e}"))?
-    };
-    Ok(zeroize::Zeroizing::new(bytes))
-}
-
-/// `molto import` takes the URI only as `-` (stdin), never literally.
-fn check_import_source(uri: Option<&str>) -> Result<(), &'static str> {
-    match uri {
-        Some("-") | None => Ok(()),
-        Some(_) => Err(IMPORT_URI_IN_ARGV),
-    }
-}
-
-fn read_import_uri<I: crate::secrets::SecretIo>(
-    sec: &mut Secrets<I>,
-    uri: Option<&str>,
-    uri_env: Option<&str>,
-) -> Result<zeroize::Zeroizing<String>, String> {
-    check_import_source(uri)?;
-    sec.read(&IMPORT_URI, Source::new(uri_env, uri == Some("-")))
+    let enc = args.customer_key_encoding;
+    let text = sec.read(customer_key_spec(enc, false), Source::from_flag(Some(flag)))?;
+    decode_customer_key(&text, enc, "--customer-key")
 }
 
 /// What a Molto2 write command was given, read before the token is
@@ -3206,52 +3182,33 @@ fn parse_guid_arg(s: &str) -> Result<String, String> {
         .ok_or_else(|| "must be 16 bytes of hex, dashes optional".to_string())
 }
 
-/// Everything that can fail without the token: source counts, a literal URI,
-/// slot/title shape. Reads nothing and does no device I/O.
+/// Everything that can fail without the token: a secret with no source
+/// and no terminal, an unusable `env:NAME`. Reads nothing and does no device
+/// I/O.
 fn molto_validate<I: crate::secrets::SecretIo>(
     cmd: &MoltoCmd,
+    key: &KeyArgs,
     sec: &Secrets<I>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if key.customer_key.is_some() {
+        sec.check(
+            customer_key_spec(key.customer_key_encoding, false),
+            Source::from_flag(key.customer_key.as_ref()),
+        )?;
+    }
     match cmd {
-        MoltoCmd::Seed {
-            hex_env,
-            base32_env,
-            hex_stdin,
-            base32_stdin,
-            ..
-        } => sec.check_one_of(
-            "seed",
-            &seed_options(
-                hex_env.as_deref(),
-                *hex_stdin,
-                base32_env.as_deref(),
-                *base32_stdin,
-            ),
-        )?,
+        MoltoCmd::Seed { seed, encoding, .. } => {
+            sec.check(seed_spec(*encoding), Source::from_flag(seed.as_ref()))?
+        }
         MoltoCmd::CustomerKey {
-            hex_env,
-            ascii_env,
-            hex_stdin,
-            ascii_stdin,
-        } => sec.check_one_of(
-            "new customer key",
-            &new_key_options(
-                hex_env.as_deref(),
-                *hex_stdin,
-                ascii_env.as_deref(),
-                *ascii_stdin,
-            ),
+            new_customer_key,
+            encoding,
+        } => sec.check(
+            customer_key_spec(*encoding, true),
+            Source::from_flag(new_customer_key.as_ref()),
         )?,
-        MoltoCmd::Import {
-            uri, uri_env, qr, ..
-        } => {
-            check_import_source(uri.as_deref())?;
-            if qr.is_none() {
-                sec.check(
-                    &IMPORT_URI,
-                    Source::new(uri_env.as_deref(), uri.as_deref() == Some("-")),
-                )?;
-            }
+        MoltoCmd::Import { uri, qr: None, .. } => {
+            sec.check(&IMPORT_URI, Source::from_flag(uri.as_ref()))?
         }
         _ => {}
     }
@@ -3265,55 +3222,32 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
     cmd: &MoltoCmd,
 ) -> Result<MoltoInput, Box<dyn std::error::Error>> {
     Ok(match cmd {
-        MoltoCmd::Seed {
-            hex_env,
-            base32_env,
-            hex_stdin,
-            base32_stdin,
-            ..
-        } => {
-            let seed = read_seed(
-                sec,
-                &seed_options(
-                    hex_env.as_deref(),
-                    *hex_stdin,
-                    base32_env.as_deref(),
-                    *base32_stdin,
-                ),
-            )?;
+        MoltoCmd::Seed { seed, encoding, .. } => {
+            let text = sec.read(seed_spec(*encoding), Source::from_flag(seed.as_ref()))?;
+            let seed = decode_seed(&text, *encoding)?;
             if seed.is_empty() || seed.len() > 63 {
                 return Err(format!("seed must be 1..=63 bytes, got {}", seed.len()).into());
             }
             MoltoInput::Seed(seed)
         }
         MoltoCmd::CustomerKey {
-            hex_env,
-            ascii_env,
-            hex_stdin,
-            ascii_stdin,
-        } => MoltoInput::NewKey(read_new_customer_key(
-            sec,
-            &new_key_options(
-                hex_env.as_deref(),
-                *hex_stdin,
-                ascii_env.as_deref(),
-                *ascii_stdin,
-            ),
-        )?),
-        MoltoCmd::Import {
-            title,
-            qr,
-            uri,
-            uri_env,
-            ..
+            new_customer_key,
+            encoding,
         } => {
+            let text = sec.read(
+                customer_key_spec(*encoding, true),
+                Source::from_flag(new_customer_key.as_ref()),
+            )?;
+            MoltoInput::NewKey(decode_customer_key(&text, *encoding, "--new-customer-key")?)
+        }
+        MoltoCmd::Import { title, qr, uri, .. } => {
             let entry = match qr {
                 Some(image_path) => molto_entry_from_qr(image_path)?,
                 None => {
                     // The URI embeds the seed in its secret= parameter; it is
                     // held in Zeroizing so our copy is scrubbed after
                     // parse_otpauth (which wipes its own copies).
-                    let uri = read_import_uri(sec, uri.as_deref(), uri_env.as_deref())?;
+                    let uri = sec.read(&IMPORT_URI, Source::from_flag(uri.as_ref()))?;
                     keyroost_import::parse_otpauth(&uri)?.into()
                 }
             };
@@ -3328,6 +3262,56 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
         }
         _ => MoltoInput::Nothing,
     })
+}
+
+/// A Molto2 customer key as read and decoded.
+type CustomerKey = zeroize::Zeroizing<Vec<u8>>;
+
+/// The customer key is stdin line 1 on every Molto2 command. Bulk import
+/// reads its vault password before the occupancy question, so its key is
+/// read before that, here; every other command gets `None` and reads the
+/// key after the question, in [`molto_key_and_input`].
+fn molto_early_key<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    key: &KeyArgs,
+    cmd: &MoltoCmd,
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
+    match cmd {
+        MoltoCmd::ImportFile { .. } => customer_key(sec, key).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// After any question, with nothing held: the customer key (unless
+/// [`molto_early_key`] already read it), then the seed, new key or URI (or
+/// the QR image).
+fn molto_key_and_input<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
+    key: &KeyArgs,
+    cmd: &MoltoCmd,
+    early_key: Option<zeroize::Zeroizing<Vec<u8>>>,
+) -> Result<(CustomerKey, MoltoInput), Box<dyn std::error::Error>> {
+    let key = match early_key {
+        Some(k) => k,
+        None => customer_key(sec, key)?,
+    };
+    // Wire confidentiality for seeds is SM4 keyed off the customer key, and
+    // the factory default is public (it ships in every unit and in this
+    // source). Programming real seeds under it means anyone holding a USB
+    // capture can decrypt them — nudge, don't block.
+    if key.as_slice() == DEFAULT_CUSTOMER_KEY
+        && matches!(
+            cmd,
+            MoltoCmd::Seed { .. } | MoltoCmd::Import { .. } | MoltoCmd::ImportFile { .. }
+        )
+    {
+        output::warn(
+            "using the factory-default customer key — seeds sent to the \
+             device are decryptable by anyone who captures the USB traffic. \
+             Rotate it first: keyroostctl molto customer-key (see --help).",
+        );
+    }
+    Ok((key, read_molto_input(sec, cmd)?))
 }
 
 /// Decode the one account in a QR screenshot, through the same hardened
@@ -3565,8 +3549,8 @@ fn molto_occupied(
 
 /// Load a bulk-import file, transparently decrypting an Aegis encrypted
 /// vault if `--password` was supplied.
-fn load_bulk_entries(
-    sec: &mut Secrets,
+fn load_bulk_entries<I: crate::secrets::SecretIo>(
+    sec: &mut Secrets<I>,
     path: &std::path::Path,
     password: Option<&SecretSource>,
 ) -> Result<Vec<keyroost_import::BulkEntry>, Box<dyn std::error::Error>> {
@@ -3764,38 +3748,98 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
     RetiredFlag {
         flag: "--key",
         words: &["molto"],
-        msg: "--key was removed: secrets on the command line end up in shell history and `ps`; use --key-env VAR",
-        now: &["--key-env"],
+        msg: "--key was removed (a secret on the command line ends up in shell history and `ps`): use --customer-key env:NAME",
+        now: &["--customer-key"],
     },
     RetiredFlag {
         flag: "--key-ascii",
         words: &["molto"],
-        msg: "--key-ascii was removed: secrets on the command line end up in shell history and `ps`; use --key-ascii-env VAR",
-        now: &["--key-ascii-env"],
+        msg: "--key-ascii was removed (a secret on the command line ends up in shell history and `ps`): use --customer-key env:NAME --customer-key-encoding ascii",
+        now: &["--customer-key", "--customer-key-encoding"],
     },
     RetiredFlag {
-        flag: "--hex",
-        words: &["seed"],
-        msg: "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
-        now: &["--hex-env", "--hex-stdin"],
+        flag: "--key-env",
+        words: &["molto"],
+        msg: "--key-env VAR is now --customer-key env:VAR",
+        now: &["--customer-key"],
     },
     RetiredFlag {
-        flag: "--base32",
-        words: &["seed"],
-        msg: "--base32 was removed: secrets on the command line end up in shell history and `ps`; use --base32-env VAR or --base32-stdin",
-        now: &["--base32-env", "--base32-stdin"],
+        flag: "--key-ascii-env",
+        words: &["molto"],
+        msg: "--key-ascii-env VAR is now --customer-key env:VAR --customer-key-encoding ascii",
+        now: &["--customer-key", "--customer-key-encoding"],
     },
     RetiredFlag {
         flag: "--hex",
         words: &["customer-key"],
-        msg: "--hex was removed: secrets on the command line end up in shell history and `ps`; use --hex-env VAR or --hex-stdin",
-        now: &["--hex-env", "--hex-stdin"],
+        msg: "--hex was removed (a secret on the command line ends up in shell history and `ps`): use --new-customer-key env:NAME (hex is the default encoding)",
+        now: &["--new-customer-key"],
     },
     RetiredFlag {
         flag: "--ascii",
         words: &["customer-key"],
-        msg: "--ascii was removed: secrets on the command line end up in shell history and `ps`; use --ascii-env VAR or --ascii-stdin",
-        now: &["--ascii-env", "--ascii-stdin"],
+        msg: "--ascii was removed (a secret on the command line ends up in shell history and `ps`): use --new-customer-key env:NAME --encoding ascii",
+        now: &["--new-customer-key", "--encoding"],
+    },
+    RetiredFlag {
+        flag: "--hex-env",
+        words: &["customer-key"],
+        msg: "--hex-env VAR is now --new-customer-key env:VAR (hex is the default encoding)",
+        now: &["--new-customer-key"],
+    },
+    RetiredFlag {
+        flag: "--hex-stdin",
+        words: &["customer-key"],
+        msg: "--hex-stdin is now --new-customer-key stdin (hex is the default encoding)",
+        now: &["--new-customer-key"],
+    },
+    RetiredFlag {
+        flag: "--ascii-env",
+        words: &["customer-key"],
+        msg: "--ascii-env VAR is now --new-customer-key env:VAR --encoding ascii",
+        now: &["--new-customer-key", "--encoding"],
+    },
+    RetiredFlag {
+        flag: "--ascii-stdin",
+        words: &["customer-key"],
+        msg: "--ascii-stdin is now --new-customer-key stdin --encoding ascii",
+        now: &["--new-customer-key", "--encoding"],
+    },
+    RetiredFlag {
+        flag: "--hex",
+        words: &["seed"],
+        msg: "--hex was removed (a secret on the command line ends up in shell history and `ps`): use --seed env:NAME --encoding hex",
+        now: &["--seed", "--encoding"],
+    },
+    RetiredFlag {
+        flag: "--base32",
+        words: &["seed"],
+        msg: "--base32 was removed (a secret on the command line ends up in shell history and `ps`): use --seed env:NAME (base32 is the default encoding)",
+        now: &["--seed"],
+    },
+    RetiredFlag {
+        flag: "--hex-env",
+        words: &["seed"],
+        msg: "--hex-env VAR is now --seed env:VAR --encoding hex",
+        now: &["--seed", "--encoding"],
+    },
+    RetiredFlag {
+        flag: "--hex-stdin",
+        words: &["seed"],
+        msg: "--hex-stdin is now --seed stdin --encoding hex",
+        now: &["--seed", "--encoding"],
+    },
+    RetiredFlag {
+        flag: "--base32-env",
+        words: &["seed"],
+        msg: "--base32-env VAR is now --seed env:VAR (base32 is the default encoding)",
+        now: &["--seed"],
+    },
+    RetiredFlag {
+        flag: "--base32-stdin",
+        words: &["seed"],
+        msg: "--base32-stdin is now --seed stdin (base32 is the default encoding)",
+        now: &["--seed"],
     },
     RetiredFlag {
         flag: "--secret-env",
@@ -4049,6 +4093,11 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
         words: &[],
         msg: "--seed-stdin is now --seed stdin",
         now: &["--seed"],
+    },    RetiredFlag {
+        flag: "--uri-env",
+        words: &[],
+        msg: "--uri-env VAR is now --uri env:VAR",
+        now: &["--uri"],
     },
 ];
 
@@ -4355,8 +4404,8 @@ fn looks_like_flag_typo(word: &str) -> bool {
 }
 
 /// Whether `argv` has a word starting with `prefix` right after a secret
-/// source (`--pin stdin`, `--pin env:NAME`, `--mgmt-key default`, the same
-/// with `=`, or an old `--X-stdin` flag). clap's `UnknownArgument` context
+/// source (`--pin stdin`, `--pin env:NAME`, `--mgmt-key default`, or the
+/// same with `=`). clap's `UnknownArgument` context
 /// sometimes names only a prefix of the real word (`-1` for `-123456`), so
 /// this matches by prefix.
 fn secret_flag_precedes(argv: &[String], prefix: &str) -> bool {
@@ -4366,7 +4415,7 @@ fn secret_flag_precedes(argv: &[String], prefix: &str) -> bool {
             Some((flag, value)) if flag.starts_with("--") => value,
             _ => w[0].as_str(),
         };
-        w[1].starts_with(prefix) && (is_source(value) || w[0].ends_with("-stdin"))
+        w[1].starts_with(prefix) && is_source(value)
     })
 }
 
@@ -4405,13 +4454,10 @@ fn is_secret_arg(a: &clap::Arg) -> bool {
 /// flag. An unexpected non-flag argument on a command that takes a secret
 /// is not repeated:
 /// clap's "unexpected argument 'X' found" would echo X, which may be the
-/// secret itself (`molto seed --hex-stdin DEADBEEF`, or an otpauth:// URI
-/// after `molto import -`). A `--X-stdin` flag given a value (`--hex-stdin
-/// DEADBEEF` or `--hex-stdin=DEADBEEF`, both of which clap reports as
-/// `TooManyValues` for a flag that takes none) is redacted the same way, and
-/// so is a dash-led word right after a secret source (`--pin stdin
-/// -123456`, `--pin env:KR_PIN -123456`, `--hex-stdin -123456`) unless
-/// it's shaped like a typo'd flag name. A secret flag (any `<SOURCE>` flag)
+/// secret itself (`molto seed --seed stdin DEADBEEF`, or an otpauth:// URI
+/// on `molto import`), and neither is a dash-led word right after a secret
+/// source (`--pin stdin -123456`, `--pin env:KR_PIN -123456`) unless it's
+/// shaped like a typo'd flag name. A secret flag (any `<SOURCE>` flag)
 /// given something other than a source (`--pin 123456`) is refused with a
 /// fixed message naming the sources it takes, never the value. Any other error about a flag keeps clap's
 /// message: clap names only the flag, never a value.
@@ -4454,21 +4500,6 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
             .then(|| format!("--{long} takes env:NAME or stdin — never the secret itself"));
     }
 
-    // A bare flag given a value it doesn't take. For a `--X-stdin` flag the
-    // value may be the secret itself, typed where the variable name or
-    // nothing at all was expected.
-    if e.kind() == ErrorKind::TooManyValues {
-        let Some(ContextValue::String(flag)) = e.get(ContextKind::InvalidArg) else {
-            return None;
-        };
-        return flag.ends_with("-stdin").then(|| {
-            format!(
-                "{flag} takes no value (value not shown, in case it is a secret); pipe the \
-                 secret on standard input"
-            )
-        });
-    }
-
     if e.kind() != ErrorKind::UnknownArgument {
         return None;
     }
@@ -4505,11 +4536,21 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
                 .to_string(),
         );
     }
-    let takes_secret = cmd.get_arguments().any(|a| {
-        is_secret_arg(a)
-            || a.get_long()
-                .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
-    });
+    if path
+        .iter()
+        .map(String::as_str)
+        .eq(["keyroostctl", "molto", "import"])
+        && !arg.starts_with("--")
+    {
+        return Some(if arg == "-" {
+            "`molto import -` is now `molto import --uri stdin`".to_string()
+        } else {
+            "`molto import` takes the otpauth:// URI as --uri env:NAME or --uri stdin \
+             (the extra argument is not shown, in case it is a secret)"
+                .to_string()
+        });
+    }
+    let takes_secret = cmd.get_arguments().any(is_secret_arg);
 
     let hidden = if arg.starts_with('-') {
         !looks_like_flag_typo(arg) && secret_flag_precedes(argv, arg)
@@ -4729,8 +4770,8 @@ fn run_molto(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sec = Secrets::real();
     // Arguments and secret sources are checked before any file is read or
-    // the token is touched (a wrong profile, a literal URI, no seed source).
-    molto_validate(cmd, &sec)?;
+    // the token is touched (no seed source, an unset variable).
+    molto_validate(cmd, key, &sec)?;
 
     // --dry-run on bulk import doesn't need the device at all.
     if let MoltoCmd::ImportFile {
@@ -4742,6 +4783,9 @@ fn run_molto(
         yes: _,
     } = cmd
     {
+        // A piped customer key is stdin line 1 even here, so the password
+        // stays on line 2.
+        molto_early_key(&mut sec, key, cmd)?;
         let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
         let last = (*start as usize).saturating_add(entries.len());
         println!(
@@ -4959,23 +5003,7 @@ fn run_molto(
         return Ok(());
     }
 
-    let key = customer_key(&mut sec, key)?;
-    // Wire confidentiality for seeds is SM4 keyed off the customer key, and
-    // the factory default is public (it ships in every unit and in this
-    // source). Programming real seeds under it means anyone holding a USB
-    // capture can decrypt them — nudge, don't block.
-    if key.as_slice() == DEFAULT_CUSTOMER_KEY
-        && matches!(
-            cmd,
-            MoltoCmd::Seed { .. } | MoltoCmd::Import { .. } | MoltoCmd::ImportFile { .. }
-        )
-    {
-        output::warn(
-            "using the factory-default customer key — seeds sent to the \
-             device are decryptable by anyone who captures the USB traffic. \
-             Rotate it first: keyroostctl molto customer-key (see --help).",
-        );
-    }
+    let early_key = molto_early_key(&mut sec, key, cmd)?;
     // Bulk import reads its file — and so any vault password, from the
     // environment, stdin or the hidden prompt — before the question, unlike
     // every other secret: which slots it writes, and so whether to ask at
@@ -5040,8 +5068,7 @@ fn run_molto(
             )?;
         }
     }
-    // The seed, new key or URI (or the QR image), read with nothing held.
-    let input = read_molto_input(&mut sec, cmd)?;
+    let (key, input) = molto_key_and_input(&mut sec, key, cmd, early_key)?;
     crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
     let mut session = open_molto_session(exact)?;
     session.set_debug(debug);
@@ -5244,20 +5271,14 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         }
         ProgCmd::Seed {
             reader,
-            hex_env,
-            base32_env,
-            hex_stdin,
-            base32_stdin,
+            seed,
+            encoding,
             yes,
         } => {
             let mut sec = Secrets::real();
-            let options = seed_options(
-                hex_env.as_deref(),
-                *hex_stdin,
-                base32_env.as_deref(),
-                *base32_stdin,
-            );
-            sec.check_one_of("seed", &options)?;
+            let spec = seed_spec(*encoding);
+            let src = Source::from_flag(seed.as_ref());
+            sec.check(spec, src)?;
             let dev = crate::target::select(Need::Prog, reader.as_deref(), None)?;
             let name = crate::target::reader_of(&dev)?;
             // Refuse to program a device whose serial does not match a known
@@ -5275,7 +5296,7 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 *yes,
                 "overwrite the programmable token's seed",
             )?;
-            let seed = prog_seed(read_seed(&mut sec, &options)?)?;
+            let seed = prog_seed(decode_seed(&sec.read(spec, src)?, *encoding)?)?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = Token2ProgSession::open_named(&name)?;
             session.set_debug(debug);
@@ -5663,7 +5684,6 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
 
 const OATH_PASSWORD: Spec = Spec::current("OATH password", "password");
 const OATH_NEW_PASSWORD: Spec = Spec::new_secret("new OATH password", "new-password");
-const OATH_SEED: Spec = Spec::value("seed", "seed").base32();
 
 /// Open the OATH applet on the announced key, unlocking it when it is
 /// password-protected. Nothing is held while a password is typed: see
@@ -6949,6 +6969,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             counter,
             touch,
             access,
+            encoding,
             ..
         } => {
             if *counter != 0 && !matches!(oath_type, OathTypeArg::Hotp) {
@@ -6960,11 +6981,8 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
             // The seed first (stdin line 1); the applet password, if it needs
             // one, second.
-            let (seed_b32, password) = pair.read_first(&mut sec)?;
-            let seed_b32 = seed_b32.text()?;
-            let secret = zeroize::Zeroizing::new(
-                base32_decode(&seed_b32).map_err(|e| format!("invalid base32 seed: {}", e))?,
-            );
+            let (seed_text, password) = pair.read_first(&mut sec)?;
+            let secret = decode_seed(&seed_text.text()?, *encoding)?;
             let mut session = open_oath_from(&mut sec, access, password.source(), debug)?;
             let params = keyroost_oath::PutParams {
                 name,
@@ -7263,7 +7281,22 @@ fn ensure_otp_feature(
 const OTP_PIN: Spec = Spec::current("OTP PIN", "pin");
 const OTP_OLD_PIN: Spec = Spec::current("current OTP PIN", "pin");
 const OTP_NEW_PIN: Spec = Spec::new_secret("new OTP PIN", "new-pin");
-const OTP_SEED: Spec = Spec::value("seed", "seed").base32();
+
+/// An OTP entry's seed: base32 through the token's own decoder (which also
+/// checks the length), or hex with the same length check.
+fn otp_seed(text: &str, e: SeedEncoding) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    match e {
+        SeedEncoding::Base32 => keyroost_token2otp::decode_base32_seed(text).map_err(|err| {
+            format!("the seed is not valid base32 ({err}); pass --encoding hex if it is hex")
+        }),
+        SeedEncoding::Hex => {
+            let seed = decode_seed(text, e)?;
+            keyroost_token2otp::validate_seed_len(seed.len())
+                .map_err(|_| format!("seed must be 1..=64 bytes, got {}", seed.len()))?;
+            Ok(seed)
+        }
+    }
+}
 
 /// The OTP PIN for a command that needs it only when the key has one set
 /// (list, add, delete). A PIN given by flag is read as is; otherwise a
@@ -7442,6 +7475,7 @@ fn run_otp(
             digits,
             period,
             touch,
+            encoding,
             ..
         } => {
             let mut sec = Secrets::real();
@@ -7450,10 +7484,8 @@ fn run_otp(
             let dev = select_otp(&sel)?;
             // The seed first (stdin line 1); the OTP PIN, if the key has one,
             // second.
-            let (seed_b32, pin) = pair.read_first(&mut sec)?;
-            let seed_b32 = seed_b32.text()?;
-            let seed = keyroost_token2otp::decode_base32_seed(&seed_b32)
-                .map_err(|e| format!("invalid base32 seed: {e}"))?;
+            let (seed_text, pin) = pair.read_first(&mut sec)?;
+            let seed = otp_seed(&seed_text.text()?, *encoding)?;
             let waited = sec.prompted();
             let pin =
                 otp_pin_if_needed(&mut sec, &dev, sel.transport, debug, pin.source(), waited)?;
@@ -7536,11 +7568,12 @@ fn run_otp(
             long_touch,
             numpad,
             seed,
+            encoding,
             yes,
         } => {
             let mut sec = Secrets::real();
             let seed_src = Source::from_flag(seed.as_ref());
-            sec.check(&OTP_SEED, seed_src)?;
+            sec.check(seed_spec(*encoding), seed_src)?;
             let dev = select_otp(&sel)?;
             // An unsupported key fails here, and an empty button slot needs
             // no question.
@@ -7550,9 +7583,7 @@ fn run_otp(
             } else {
                 false
             };
-            let seed_b32 = sec.read(&OTP_SEED, seed_src)?;
-            let seed = keyroost_token2otp::decode_base32_seed(&seed_b32)
-                .map_err(|e| format!("invalid base32 seed: {e}"))?;
+            let seed = otp_seed(&sec.read(seed_spec(*encoding), seed_src)?, *encoding)?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.set_button_hotp(*digits, &seed, !*no_enter, *long_touch, *numpad)?;
@@ -10250,16 +10281,27 @@ fn otp_secret_pair(cmd: &OtpCmd) -> Option<SecretPair<'_>> {
         OtpCmd::ChangePin { pin, new_pin } => {
             secret_pair((&OTP_OLD_PIN, pin), (&OTP_NEW_PIN, new_pin))
         }
-        OtpCmd::Add { seed, pin, .. } => secret_pair((&OTP_SEED, seed), (&OTP_PIN, pin)),
+        OtpCmd::Add {
+            seed,
+            pin,
+            encoding,
+            ..
+        } => secret_pair((seed_spec(*encoding), seed), (&OTP_PIN, pin)),
         _ => return None,
     })
 }
 
 fn oath_secret_pair(cmd: &OathCmd) -> Option<SecretPair<'_>> {
     Some(match cmd {
-        OathCmd::Add { seed, access, .. } => {
-            secret_pair((&OATH_SEED, seed), (&OATH_PASSWORD, &access.password))
-        }
+        OathCmd::Add {
+            seed,
+            access,
+            encoding,
+            ..
+        } => secret_pair(
+            (seed_spec(*encoding), seed),
+            (&OATH_PASSWORD, &access.password),
+        ),
         OathCmd::SetPassword {
             new_password,
             access,
@@ -13061,8 +13103,7 @@ mod cli_tests {
     /// from `SECRET_FLAGS`, a parser that isn't a source parser, a `default`
     /// that the parser and the table disagree on, a flag that doesn't take
     /// a dash-led value (clap would then report it as an unknown flag, not
-    /// a value error), or — once no old `--X-env`/`--X-stdin` flag is left —
-    /// a table entry no command uses.
+    /// a value error), or a table entry no command uses.
     fn secret_flag_problems(root: &clap::Command) -> Vec<String> {
         use crate::secrets::SECRET_FLAGS;
         fn walk(c: &clap::Command, path: String, out: &mut Vec<(String, clap::Command)>) {
@@ -13097,14 +13138,8 @@ mod cli_tests {
         };
         let mut problems = Vec::new();
         let mut used = std::collections::HashSet::new();
-        let mut legacy_left = false;
         for (path, c) in &cmds {
             for a in c.get_arguments() {
-                if a.get_long()
-                    .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
-                {
-                    legacy_left = true;
-                }
                 if !is_secret_arg(a) {
                     continue;
                 }
@@ -13136,11 +13171,9 @@ mod cli_tests {
                 }
             }
         }
-        if !legacy_left {
-            for f in SECRET_FLAGS {
-                if !used.contains(f.long) {
-                    problems.push(format!("SECRET_FLAGS --{}: no command uses it", f.long));
-                }
+        for f in SECRET_FLAGS {
+            if !used.contains(f.long) {
+                problems.push(format!("SECRET_FLAGS --{}: no command uses it", f.long));
             }
         }
         problems
@@ -13196,14 +13229,6 @@ mod cli_tests {
                 .map(|f| format!("SECRET_FLAGS --{}: no command uses it", f.long)),
         );
         assert_eq!(secret_flag_problems(&bad), want);
-        // While an old `--X-env`/`--X-stdin` flag is left, unused table
-        // entries are not reported.
-        let transitional = Command::new("t").arg(src("pin", "pin")).arg(
-            Arg::new("old")
-                .long("old-pin-stdin")
-                .action(clap::ArgAction::SetTrue),
-        );
-        assert_eq!(secret_flag_problems(&transitional), Vec::<String>::new());
     }
 
     #[test]
@@ -13228,10 +13253,6 @@ mod cli_tests {
         ));
         assert!(secret_flag_precedes(
             &argv("k piv x --pin=stdin -123456"),
-            "-1"
-        ));
-        assert!(secret_flag_precedes(
-            &argv("k piv x --old-pin-stdin -123456"),
             "-1"
         ));
         assert!(!secret_flag_precedes(
@@ -13573,6 +13594,17 @@ mod cli_tests {
             &["keyroostctl", "molto", "customer-key", "--hex", "00"],
             &["keyroostctl", "molto", "--key", "00", "info"],
             &["keyroostctl", "molto", "--key-ascii", "x", "info"],
+            &["keyroostctl", "molto", "--key-env", "V", "info"],
+            &["keyroostctl", "molto", "seed", "--slot", "1", "--hex-stdin"],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--slot",
+                "1",
+                "--uri-env",
+                "V",
+            ],
         ] {
             match parse(args) {
                 Err(e) => assert_eq!(
@@ -13586,223 +13618,413 @@ mod cli_tests {
     }
 
     #[test]
-    fn token2_secret_sources_are_exclusive() {
-        for args in [
-            &[
-                "keyroostctl",
-                "molto",
-                "seed",
-                "--slot",
-                "99",
-                "--hex-stdin",
-                "--base32-env",
-                "V",
-            ][..],
-            &[
-                "keyroostctl",
-                "prog",
-                "seed",
-                "--hex-env",
-                "V",
-                "--hex-stdin",
-            ],
-            &[
-                "keyroostctl",
-                "molto",
-                "customer-key",
-                "--hex-stdin",
-                "--ascii-env",
-                "V",
-            ],
-            &[
-                "keyroostctl",
-                "molto",
-                "import",
-                "--slot",
-                "1",
-                "--uri-env",
-                "V",
-                "-",
-            ],
-            &[
-                "keyroostctl",
-                "molto",
-                "import",
-                "--slot",
-                "1",
-                "--uri-env",
-                "V",
-                "--qr",
-                "f.png",
-            ],
-            &[
-                "keyroostctl",
-                "molto",
-                "--key-env",
-                "A",
-                "--key-ascii-env",
-                "B",
-                "info",
-            ],
-        ] {
-            match parse(args) {
-                Err(e) => assert_eq!(
-                    e.kind(),
-                    clap::error::ErrorKind::ArgumentConflict,
-                    "{args:?}"
-                ),
-                Ok(_) => panic!("{args:?} must not parse"),
-            }
-        }
+    fn molto_import_takes_one_uri_source() {
+        let e = parse(&[
+            "keyroostctl",
+            "molto",
+            "import",
+            "--slot",
+            "1",
+            "--uri",
+            "env:V",
+            "--qr",
+            "f.png",
+        ])
+        .err()
+        .expect("must not parse");
+        assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict);
         match parse(&[
             "keyroostctl",
             "molto",
             "import",
             "--slot",
             "1",
-            "--uri-env",
-            "V",
+            "--uri",
+            "env:V",
         ])
         .unwrap()
         .command
         {
             Some(Cmd::Molto {
-                cmd: MoltoCmd::Import { uri, uri_env, .. },
+                cmd: MoltoCmd::Import { uri, qr, .. },
                 ..
             }) => {
-                assert!(uri.is_none());
-                assert_eq!(uri_env.as_deref(), Some("V"));
+                assert_eq!(uri, Some(SecretSource::Env("V".into())));
+                assert!(qr.is_none());
             }
             _ => panic!("expected molto import"),
         }
     }
 
     #[test]
-    fn a_literal_otpauth_uri_is_refused_without_repeating_it() {
-        let e = check_import_source(Some("otpauth://totp/x?secret=JBSWY3DP")).unwrap_err();
-        assert_eq!(e, IMPORT_URI_IN_ARGV);
-        assert!(!e.contains("JBSWY3DP"));
-        assert!(check_import_source(Some("-")).is_ok());
-        assert!(check_import_source(None).is_ok());
-        // And read_import_uri refuses before reading anything.
-        use crate::secrets::fake::FakeIo;
-        let mut sec = Secrets::new(FakeIo::piped(&["otpauth://totp/y?secret=AB\n"]));
-        let e =
-            read_import_uri(&mut sec, Some("otpauth://totp/x?secret=JBSWY3DP"), None).unwrap_err();
-        assert!(!e.contains("JBSWY3DP"));
-        assert_eq!(sec.io.lines_read, 0);
-    }
-
-    #[test]
     fn import_uri_comes_from_stdin_env_or_the_prompt() {
         use crate::secrets::fake::FakeIo;
+        let read = |sec: &mut Secrets<FakeIo>, flag: Option<SecretSource>| {
+            sec.read(&IMPORT_URI, Source::from_flag(flag.as_ref()))
+        };
         let mut sec = Secrets::new(FakeIo::piped(&["otpauth://totp/y?secret=AB\n"]));
-        let uri = read_import_uri(&mut sec, Some("-"), None).unwrap();
+        let uri = read(&mut sec, Some(SecretSource::Stdin)).unwrap();
         assert_eq!(uri.as_str(), "otpauth://totp/y?secret=AB");
         let mut sec = Secrets::new(FakeIo::default().var("U", "otpauth://totp/z?secret=CD"));
-        let uri = read_import_uri(&mut sec, None, Some("U")).unwrap();
+        let uri = read(&mut sec, Some(SecretSource::Env("U".into()))).unwrap();
         assert_eq!(uri.as_str(), "otpauth://totp/z?secret=CD");
         let mut sec = Secrets::new(FakeIo::terminal().typing(&["otpauth://totp/t?secret=EF"]));
-        let uri = read_import_uri(&mut sec, None, None).unwrap();
+        let uri = read(&mut sec, None).unwrap();
         assert_eq!(uri.as_str(), "otpauth://totp/t?secret=EF");
         assert_eq!(sec.io.prompts, ["otpauth:// URI: "]);
         let mut sec = Secrets::new(FakeIo::default());
-        let e = read_import_uri(&mut sec, None, None).unwrap_err();
+        let e = read(&mut sec, None).unwrap_err();
         assert_eq!(
             e,
-            "no otpauth:// URI given: pass `-` to read it from stdin, --uri-env VAR or --qr IMAGE"
+            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin or --qr IMAGE"
         );
     }
 
     #[test]
-    fn customer_key_comes_from_env_or_is_the_factory_default() {
+    fn customer_key_comes_from_its_source_or_is_the_factory_default() {
         use crate::secrets::fake::FakeIo;
-        let args = |env: Option<&str>, ascii: Option<&str>| KeyArgs {
-            key_env: env.map(String::from),
-            key_ascii_env: ascii.map(String::from),
+        let args = |src: Option<SecretSource>, enc: KeyEncoding| KeyArgs {
+            customer_key: src,
+            customer_key_encoding: enc,
         };
+        let env = |v: &str| Some(SecretSource::Env(v.into()));
         let mut sec =
             Secrets::new(FakeIo::default().var("V", " 00112233445566778899aabbccddeeff \n"));
-        let k = customer_key(&mut sec, &args(Some("V"), None)).unwrap();
+        let k = customer_key(&mut sec, &args(env("V"), KeyEncoding::Hex)).unwrap();
         assert_eq!(k.len(), 16);
         assert_eq!(k[15], 0xff);
         let mut sec = Secrets::new(FakeIo::terminal());
-        let k = customer_key(&mut sec, &args(None, None)).unwrap();
+        let k = customer_key(&mut sec, &args(None, KeyEncoding::Hex)).unwrap();
         assert_eq!(&k[..], &DEFAULT_CUSTOMER_KEY[..]);
         assert!(
             sec.io.prompts.is_empty(),
             "the customer key is never prompted for"
         );
         let mut sec = Secrets::new(FakeIo::default());
-        let e = customer_key(&mut sec, &args(Some("V"), None)).unwrap_err();
-        assert_eq!(e, "the environment variable given to --key-env is not set");
+        let e = customer_key(&mut sec, &args(env("V"), KeyEncoding::Hex)).unwrap_err();
+        assert_eq!(
+            e,
+            "the environment variable given to --customer-key is not set"
+        );
         let mut sec = Secrets::new(FakeIo::default().var("A", "my key "));
-        let k = customer_key(&mut sec, &args(None, Some("A"))).unwrap();
+        let k = customer_key(&mut sec, &args(env("A"), KeyEncoding::Ascii)).unwrap();
         assert_eq!(&k[..], b"my key ");
         let mut sec = Secrets::new(FakeIo::default().var("V", "zz"));
-        let e = customer_key(&mut sec, &args(Some("V"), None)).unwrap_err();
-        assert!(e.contains("given by --key-env is not valid hex"), "{e}");
+        let e = customer_key(&mut sec, &args(env("V"), KeyEncoding::Hex)).unwrap_err();
+        assert!(
+            e.contains("given by --customer-key is not valid hex"),
+            "{e}"
+        );
         assert!(!e.contains("zz") && !e.contains('V'), "{e}");
     }
 
     #[test]
-    fn seeds_are_read_from_the_one_source_given() {
+    fn seeds_are_read_from_their_source_in_their_encoding() {
         use crate::secrets::fake::FakeIo;
+        let seed = |args: &[&str], sec: &mut Secrets<FakeIo>| match read_molto_input(
+            sec,
+            &molto_cmd(args),
+        )
+        .map_err(|e| e.to_string())?
+        {
+            MoltoInput::Seed(s) => Ok::<Vec<u8>, String>(s.to_vec()),
+            _ => panic!("expected a seed"),
+        };
+        let base = ["keyroostctl", "molto", "seed", "--slot", "1"];
+        let with = |extra: &[&'static str]| -> Vec<&'static str> {
+            base.iter().copied().chain(extra.iter().copied()).collect()
+        };
         let mut sec = Secrets::new(FakeIo::default());
-        let e = read_seed(&mut sec, &seed_options(None, false, None, false)).unwrap_err();
         assert_eq!(
-            e.to_string(),
-            "no seed given: pass --hex-env VAR, --hex-stdin, --base32-env VAR or --base32-stdin"
+            seed(&base, &mut sec).unwrap_err(),
+            "no seed given: pass --seed env:NAME or --seed stdin"
         );
         let mut sec = Secrets::new(FakeIo::piped(&[" 0102 \n", "never read\n"]));
-        let s = read_seed(&mut sec, &seed_options(None, true, None, false)).unwrap();
-        assert_eq!(&s[..], &[1, 2]);
+        let args = with(&["--seed", "stdin", "--encoding", "hex"]);
+        assert_eq!(seed(&args, &mut sec).unwrap(), [1, 2]);
         assert_eq!(sec.io.lines_read, 1, "one line, not all of stdin");
         let mut sec = Secrets::new(FakeIo::default().var("B", "JBSWY3DP"));
-        let s = read_seed(&mut sec, &seed_options(None, false, Some("B"), false)).unwrap();
-        assert_eq!(&s[..], b"Hello");
+        assert_eq!(
+            seed(&with(&["--seed", "env:B"]), &mut sec).unwrap(),
+            b"Hello"
+        );
         // Typed at a terminal: asked once (a seed is checked by the service).
-        let mut sec = Secrets::new(FakeIo::terminal().typing(&["JBSWY3DP"]));
-        read_seed(&mut sec, &seed_options(None, false, None, true)).unwrap();
-        assert_eq!(sec.io.prompts, ["Seed (base32): "]);
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["0a"]));
+        let args = with(&["--encoding", "hex"]);
+        assert_eq!(seed(&args, &mut sec).unwrap(), [0x0a]);
+        assert_eq!(sec.io.prompts, ["Seed (hex): "]);
     }
 
     #[test]
     fn new_customer_key_is_asked_twice_at_a_prompt() {
         use crate::secrets::fake::FakeIo;
+        let new_key = |args: &[&str], sec: &mut Secrets<FakeIo>| match read_molto_input(
+            sec,
+            &molto_cmd(args),
+        )
+        .unwrap()
+        {
+            MoltoInput::NewKey(k) => k.to_vec(),
+            _ => panic!("expected a new key"),
+        };
         let mut sec = Secrets::new(FakeIo::terminal().typing(&["0011", "0011"]));
-        let k = read_new_customer_key(&mut sec, &new_key_options(None, true, None, false)).unwrap();
-        assert_eq!(&k[..], &[0x00, 0x11]);
-        assert_eq!(sec.io.prompts.len(), 2);
+        let k = new_key(&["keyroostctl", "molto", "customer-key"], &mut sec);
+        assert_eq!(k, [0x00, 0x11]);
+        assert_eq!(
+            sec.io.prompts,
+            [
+                "New customer key (hex): ",
+                "Repeat new customer key (hex): "
+            ]
+        );
         let mut sec = Secrets::new(FakeIo::piped(&["abc\n"]));
-        let k = read_new_customer_key(&mut sec, &new_key_options(None, false, None, true)).unwrap();
-        assert_eq!(&k[..], b"abc");
+        let args = [
+            "keyroostctl",
+            "molto",
+            "customer-key",
+            "--new-customer-key",
+            "stdin",
+            "--encoding",
+            "ascii",
+        ];
+        assert_eq!(new_key(&args, &mut sec), b"abc");
     }
 
     #[test]
     fn seed_and_new_key_decode_errors_name_the_value_but_never_echo_it() {
         use crate::secrets::fake::FakeIo;
-        let mut sec = Secrets::new(FakeIo::piped(&["zzS3CRET\n"]));
-        let e = read_seed(&mut sec, &seed_options(None, true, None, false))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(e, "the seed is not valid hex: invalid character in input");
-        let mut sec = Secrets::new(FakeIo::default().var("B", "S3CRET!1"));
-        let e = read_seed(&mut sec, &seed_options(None, false, Some("B"), false))
-            .unwrap_err()
-            .to_string();
+        let err = |args: &[&str], line: &str| {
+            let mut sec = Secrets::new(FakeIo::piped(&[line]));
+            read_molto_input(&mut sec, &molto_cmd(args))
+                .err()
+                .expect("must refuse")
+                .to_string()
+        };
+        let e = err(
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "--slot",
+                "1",
+                "--seed",
+                "stdin",
+                "--encoding",
+                "hex",
+            ],
+            "zzS3CRET\n",
+        );
         assert_eq!(
             e,
-            "the seed is not valid base32: invalid character in input"
+            "the seed is not valid hex (invalid character in input); pass --encoding base32 if it is base32"
         );
-        let mut sec = Secrets::new(FakeIo::piped(&["zzS3CRET\n"]));
-        let e = read_new_customer_key(&mut sec, &new_key_options(None, true, None, false))
-            .unwrap_err()
-            .to_string();
+        let e = err(
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "--slot",
+                "1",
+                "--seed",
+                "stdin",
+            ],
+            "S3CRET!1\n",
+        );
         assert_eq!(
             e,
-            "the new customer key is not valid hex: invalid character in input"
+            "the seed is not valid base32 (invalid character in input); pass --encoding hex if it is hex"
         );
+        let e = err(
+            &[
+                "keyroostctl",
+                "molto",
+                "customer-key",
+                "--new-customer-key",
+                "stdin",
+            ],
+            "zzS3CRET\n",
+        );
+        assert_eq!(
+            e,
+            "the customer key given by --new-customer-key is not valid hex (invalid character in input)"
+        );
+    }
+
+    #[test]
+    fn molto_encodings_stay_with_their_secret() {
+        use crate::secrets::fake::FakeIo;
+        let cli = parse(&[
+            "keyroostctl",
+            "molto",
+            "--customer-key",
+            "env:K",
+            "--customer-key-encoding",
+            "ascii",
+            "seed",
+            "--slot",
+            "1",
+            "--seed",
+            "env:S",
+            "--encoding",
+            "hex",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(Cmd::Molto { key, cmd, .. }) = cli.command else {
+            panic!()
+        };
+        assert_eq!(key.customer_key_encoding, KeyEncoding::Ascii);
+        let MoltoCmd::Seed { encoding, .. } = &cmd else {
+            panic!()
+        };
+        assert_eq!(*encoding, SeedEncoding::Hex);
+        let mut sec = Secrets::new(
+            FakeIo::default()
+                .var("K", "TOKEN2MOLTO1-KEY")
+                .var("S", "0102"),
+        );
+        assert_eq!(
+            &customer_key(&mut sec, &key).unwrap()[..],
+            b"TOKEN2MOLTO1-KEY"
+        );
+        match read_molto_input(&mut sec, &cmd).unwrap() {
+            MoltoInput::Seed(s) => assert_eq!(&s[..], &[1, 2]),
+            _ => panic!(),
+        }
+        // Defaults: hex key, base32 seed.
+        let cli = parse(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--slot",
+            "1",
+            "--seed",
+            "env:S",
+        ])
+        .unwrap();
+        let Some(Cmd::Molto {
+            key,
+            cmd: MoltoCmd::Seed { encoding, .. },
+            ..
+        }) = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (key.customer_key_encoding, encoding),
+            (KeyEncoding::Hex, SeedEncoding::Base32)
+        );
+    }
+
+    #[test]
+    fn molto_customer_key_is_the_first_stdin_line() {
+        use crate::secrets::fake::FakeIo;
+        let cli = parse(&[
+            "keyroostctl",
+            "molto",
+            "--customer-key",
+            "stdin",
+            "seed",
+            "--slot",
+            "1",
+            "--seed",
+            "stdin",
+            "--encoding",
+            "hex",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(Cmd::Molto { key, cmd, .. }) = cli.command else {
+            panic!()
+        };
+        let mut sec = Secrets::new(FakeIo::piped(&[
+            "00112233445566778899aabbccddeeff\n",
+            "0a0b\n",
+        ]));
+        assert_eq!(customer_key(&mut sec, &key).unwrap()[15], 0xff);
+        match read_molto_input(&mut sec, &cmd).unwrap() {
+            MoltoInput::Seed(s) => assert_eq!(&s[..], &[0x0a, 0x0b]),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn seed_and_key_decode_errors_name_the_flag_never_the_value() {
+        let e = decode_seed("zz", SeedEncoding::Hex).unwrap_err();
+        assert!(
+            e.contains("not valid hex") && e.contains("--encoding base32") && !e.contains("zz"),
+            "{e}"
+        );
+        let e = decode_seed("0189", SeedEncoding::Base32).unwrap_err();
+        assert!(
+            e.contains("not valid base32") && e.contains("--encoding hex") && !e.contains("0189"),
+            "{e}"
+        );
+        let e = decode_customer_key("zz", KeyEncoding::Hex, "--customer-key").unwrap_err();
+        assert!(
+            e.contains("given by --customer-key is not valid hex") && !e.contains("zz"),
+            "{e}"
+        );
+        assert_eq!(
+            &decode_customer_key("my key ", KeyEncoding::Ascii, "--customer-key").unwrap()[..],
+            b"my key "
+        );
+    }
+
+    #[test]
+    fn molto_seed_prompts_at_a_terminal_now() {
+        use crate::secrets::fake::FakeIo;
+        let cli = parse(&["keyroostctl", "molto", "seed", "--slot", "1", "--yes"]).unwrap();
+        let Some(Cmd::Molto { cmd, .. }) = cli.command else {
+            panic!()
+        };
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["AEBA"]));
+        match read_molto_input(&mut sec, &cmd).unwrap() {
+            MoltoInput::Seed(s) => assert_eq!(&s[..], &[1, 2]),
+            _ => panic!(),
+        }
+        assert_eq!(sec.io.prompts, vec!["Seed (base32): ".to_string()]);
+    }
+
+    #[test]
+    fn oath_and_otp_seeds_take_an_encoding() {
+        use crate::secrets::fake::FakeIo;
+        assert_eq!(
+            &decode_seed("0a0b", SeedEncoding::Hex).unwrap()[..],
+            [10, 11]
+        );
+        assert_eq!(&otp_seed("0a0b", SeedEncoding::Hex).unwrap()[..], [10, 11]);
+        assert_eq!(
+            &otp_seed("jbswy3dp", SeedEncoding::Base32).unwrap()[..],
+            b"Hello"
+        );
+        let e = otp_seed(&"00".repeat(65), SeedEncoding::Hex).unwrap_err();
+        assert_eq!(e, "seed must be 1..=64 bytes, got 65");
+        let e = otp_seed("S3CRET!1", SeedEncoding::Base32).unwrap_err();
+        assert!(e.contains("--encoding hex") && !e.contains("S3CRET"), "{e}");
+        for argv in [
+            &["keyroostctl", "oath", "add", "n", "--encoding", "hex"][..],
+            &[
+                "keyroostctl",
+                "otp",
+                "add",
+                "--account",
+                "a",
+                "--encoding",
+                "hex",
+            ],
+            &["keyroostctl", "otp", "set-button-hotp", "--encoding", "hex"],
+            &["keyroostctl", "prog", "seed", "--encoding", "hex"],
+        ] {
+            parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+        // The pair the oath/otp handlers read prompts in the chosen encoding.
+        let cli = parse(&["keyroostctl", "oath", "add", "n", "--encoding", "hex"]).unwrap();
+        let pair = cli.command.as_ref().and_then(stdin_pair).unwrap();
+        assert_eq!(pair.first.0.form, crate::secrets::Form::Hex);
+        let mut sec = Secrets::new(FakeIo::terminal().typing(&["0a"]));
+        sec.read(pair.first.0, Source::NONE).unwrap();
+        assert_eq!(sec.io.prompts, ["Seed (hex): "]);
     }
 
     fn molto_cmd(args: &[&str]) -> MoltoCmd {
@@ -13815,18 +14037,28 @@ mod cli_tests {
         }
     }
 
+    fn molto_key_args(args: &[&str]) -> KeyArgs {
+        match parse(args)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+            .command
+        {
+            Some(Cmd::Molto { key, .. }) => key,
+            _ => panic!("expected a molto command"),
+        }
+    }
+
     #[test]
     fn molto_arguments_are_checked_without_the_token() {
         use crate::secrets::fake::FakeIo;
         let sec = Secrets::new(FakeIo::default());
         let err = |args: &[&str]| {
-            molto_validate(&molto_cmd(args), &sec)
+            molto_validate(&molto_cmd(args), &molto_key_args(args), &sec)
                 .expect_err("must refuse")
                 .to_string()
         };
         assert_eq!(
             err(&["keyroostctl", "molto", "seed", "--slot", "99"]),
-            "no seed given: pass --hex-env VAR, --hex-stdin, --base32-env VAR or --base32-stdin"
+            "no seed given: pass --seed env:NAME or --seed stdin"
         );
         // Range checks are clap value parsers now: they fail at parse time.
         let parse_err = |args: &[&str]| parse(args).err().expect("must refuse").to_string();
@@ -13836,7 +14068,8 @@ mod cli_tests {
             "seed",
             "--slot",
             "100",
-            "--hex-stdin",
+            "--seed",
+            "stdin",
         ]);
         assert!(e.contains("slot must be 0..=99"), "{e}");
         let e = parse_err(&[
@@ -13850,7 +14083,7 @@ mod cli_tests {
         assert!(e.contains("title must be 1..=12 bytes"), "{e}");
         assert_eq!(
             err(&["keyroostctl", "molto", "import", "--slot", "1"]),
-            "no otpauth:// URI given: pass `-` to read it from stdin, --uri-env VAR or --qr IMAGE"
+            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin or --qr IMAGE"
         );
         let e = parse_err(&[
             "keyroostctl",
@@ -13865,19 +14098,21 @@ mod cli_tests {
         ]);
         assert!(e.contains("title must be 1..=12 bytes"), "{e}");
         assert_eq!(
+            err(&["keyroostctl", "molto", "customer-key"]),
+            "no new customer key given: pass --new-customer-key env:NAME or --new-customer-key stdin"
+        );
+        // An unusable --customer-key is caught here too, on any command.
+        assert_eq!(
             err(&[
                 "keyroostctl",
                 "molto",
-                "import",
+                "--customer-key",
+                "env:KR_UNSET",
+                "config",
                 "--slot",
-                "1",
-                "otpauth://totp/x?secret=JBSWY3DP"
+                "1"
             ]),
-            IMPORT_URI_IN_ARGV
-        );
-        assert_eq!(
-            err(&["keyroostctl", "molto", "customer-key"]),
-            "no new customer key given: pass --hex-env VAR, --hex-stdin, --ascii-env VAR or --ascii-stdin"
+            "the environment variable given to --customer-key is not set"
         );
         // Nothing was read to find any of that out.
         assert!(sec.io.prompts.is_empty() && sec.io.lines_read == 0);
@@ -13890,10 +14125,18 @@ mod cli_tests {
                 "seed",
                 "--slot",
                 "99",
-                "--base32-env",
-                "V",
+                "--seed",
+                "stdin",
             ][..],
-            &["keyroostctl", "molto", "import", "--slot", "1", "-"],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--slot",
+                "1",
+                "--uri",
+                "stdin",
+            ],
             &[
                 "keyroostctl",
                 "molto",
@@ -13912,15 +14155,21 @@ mod cli_tests {
                 "twelve-chars",
             ],
             &["keyroostctl", "molto", "config", "--slot", "99"],
+            &["keyroostctl", "molto", "--customer-key", "stdin", "info"],
         ] {
-            molto_validate(&molto_cmd(args), &sec).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            molto_validate(&molto_cmd(args), &molto_key_args(args), &sec)
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }
+        // A terminal can ask for the seed, the new key and the URI.
         let term = Secrets::new(FakeIo::terminal());
-        molto_validate(
-            &molto_cmd(&["keyroostctl", "molto", "import", "--slot", "1"]),
-            &term,
-        )
-        .unwrap();
+        for args in [
+            &["keyroostctl", "molto", "import", "--slot", "1"][..],
+            &["keyroostctl", "molto", "seed", "--slot", "1"],
+            &["keyroostctl", "molto", "customer-key"],
+        ] {
+            molto_validate(&molto_cmd(args), &molto_key_args(args), &term)
+                .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
     }
 
     #[test]
@@ -13929,7 +14178,17 @@ mod cli_tests {
         // A seed over 63 bytes is refused once read.
         let long = format!("{}\n", "00".repeat(64));
         let mut sec = Secrets::new(FakeIo::piped(&[&long]));
-        let cmd = molto_cmd(&["keyroostctl", "molto", "seed", "--slot", "1", "--hex-stdin"]);
+        let cmd = molto_cmd(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--slot",
+            "1",
+            "--seed",
+            "stdin",
+            "--encoding",
+            "hex",
+        ]);
         let e = read_molto_input(&mut sec, &cmd).err().expect("too long");
         assert_eq!(e.to_string(), "seed must be 1..=63 bytes, got 64");
         let mut sec = Secrets::new(FakeIo::piped(&["0102\n"]));
@@ -13938,7 +14197,15 @@ mod cli_tests {
             _ => panic!("expected a seed"),
         }
         // An import's title is settled before authentication.
-        let cmd = molto_cmd(&["keyroostctl", "molto", "import", "--slot", "1", "-"]);
+        let cmd = molto_cmd(&[
+            "keyroostctl",
+            "molto",
+            "import",
+            "--slot",
+            "1",
+            "--uri",
+            "stdin",
+        ]);
         let mut sec = Secrets::new(FakeIo::piped(&["otpauth://totp/?secret=JBSWY3DP\n"]));
         let e = read_molto_input(&mut sec, &cmd).err().expect("no title");
         assert!(e.to_string().contains("must be 1..=12 bytes"), "{e}");
@@ -13982,32 +14249,67 @@ mod cli_tests {
             (
                 "--key",
                 "keyroostctl molto --key 00aa seed -p 1",
-                "use --key-env VAR",
+                "use --customer-key env:NAME",
             ),
             (
                 "--key-ascii",
                 "keyroostctl molto --key-ascii x info",
-                "use --key-ascii-env VAR",
+                "use --customer-key env:NAME --customer-key-encoding ascii",
+            ),
+            (
+                "--key-env",
+                "keyroostctl molto --key-env V info",
+                "--customer-key env:VAR",
+            ),
+            (
+                "--key-ascii-env",
+                "keyroostctl molto info --key-ascii-env V",
+                "--customer-key env:VAR --customer-key-encoding ascii",
             ),
             (
                 "--hex",
                 "keyroostctl molto seed -p 1 --hex 00",
-                "use --hex-env VAR or --hex-stdin",
+                "use --seed env:NAME --encoding hex",
             ),
             (
                 "--base32",
                 "keyroostctl prog seed --base32 AA",
-                "use --base32-env VAR or --base32-stdin",
+                "use --seed env:NAME (base32 is the default encoding)",
+            ),
+            (
+                "--hex-env",
+                "keyroostctl molto seed --slot 1 --hex-env V",
+                "--seed env:VAR --encoding hex",
+            ),
+            (
+                "--base32-stdin",
+                "keyroostctl prog seed --base32-stdin",
+                "--seed stdin (base32",
             ),
             (
                 "--hex",
                 "keyroostctl molto customer-key --hex 00",
-                "use --hex-env VAR or --hex-stdin",
+                "use --new-customer-key env:NAME (hex is the default encoding)",
             ),
             (
                 "--ascii",
                 "keyroostctl molto customer-key --ascii x",
-                "use --ascii-env VAR or --ascii-stdin",
+                "use --new-customer-key env:NAME --encoding ascii",
+            ),
+            (
+                "--hex-stdin",
+                "keyroostctl molto customer-key --hex-stdin",
+                "--new-customer-key stdin",
+            ),
+            (
+                "--ascii-env",
+                "keyroostctl molto customer-key --ascii-env V",
+                "--new-customer-key env:VAR --encoding ascii",
+            ),
+            (
+                "--uri-env",
+                "keyroostctl molto import --slot 1 --uri-env V",
+                "--uri env:VAR",
             ),
             (
                 "--secret-env",
@@ -14072,24 +14374,13 @@ mod cli_tests {
                 &[
                     "keyroostctl",
                     "molto",
-                    "import",
-                    "--slot",
-                    "99",
-                    "-",
-                    "otpauth://totp/x?secret=S3CRET",
-                ][..],
-                "keyroostctl molto import",
-            ),
-            (
-                &[
-                    "keyroostctl",
-                    "molto",
                     "seed",
                     "--slot",
                     "99",
-                    "--hex-stdin",
+                    "--seed",
+                    "stdin",
                     "S3CRET",
-                ],
+                ][..],
                 "keyroostctl molto seed",
             ),
             (
@@ -14139,6 +14430,25 @@ mod cli_tests {
         ])
         .is_none());
         assert!(redacted(&["keyroostctl", "list", "extra"]).is_none());
+        // A stray word on `molto import` (an otpauth:// URI, most likely)
+        // names --uri, and the retired `-` says what replaced it.
+        let msg = redacted(&[
+            "keyroostctl",
+            "molto",
+            "import",
+            "--slot",
+            "99",
+            "otpauth://totp/x?secret=S3CRET",
+        ])
+        .expect("redacted");
+        assert!(
+            msg.contains("--uri env:NAME or --uri stdin") && !msg.contains("S3CRET"),
+            "{msg}"
+        );
+        assert_eq!(
+            redacted(&["keyroostctl", "molto", "import", "--slot", "99", "-"]).as_deref(),
+            Some("`molto import -` is now `molto import --uri stdin`")
+        );
         // A retired flag still gets its replacement hint.
         assert!(redacted(&[
             "keyroostctl",
@@ -14149,12 +14459,11 @@ mod cli_tests {
             "--hex",
             "S3CRET"
         ])
-        .is_some_and(|m| m.contains("--hex-env VAR") && !m.contains("S3CRET")));
+        .is_some_and(|m| m.contains("--seed env:NAME --encoding hex") && !m.contains("S3CRET")));
     }
 
-    /// `--X-stdin` takes no value, so `--X-stdin=VALUE` or a following bare
-    /// word is clap's `TooManyValues`, naming the flag and repeating the
-    /// value — the value may be the secret itself.
+    /// A retired `--X-stdin=VALUE` is an unknown flag: the hint names its
+    /// replacement and never the value, which may be the secret itself.
     #[test]
     fn a_stdin_flag_given_a_value_is_never_repeated() {
         let argv: fn(&[&str]) -> Vec<String> =
@@ -14174,10 +14483,7 @@ mod cli_tests {
             "--hex-stdin=S3CRET",
         ];
         let msg = redacted(&args).unwrap_or_else(|| panic!("{args:?}: not redacted"));
-        assert!(
-            msg.contains("takes no value") && msg.contains("standard input"),
-            "{msg}"
-        );
+        assert!(msg.contains("--seed stdin --encoding hex"), "{msg}");
         assert!(!msg.contains("S3CRET"), "{msg}");
         // A retired `--X-stdin` flag gets its replacement, never the value.
         let args = [
@@ -16522,11 +16828,20 @@ mod cli_tests {
     #[test]
     fn molto_is_nested() {
         assert!(parse(&["keyroostctl", "molto", "info"]).is_ok());
-        assert!(parse(&["keyroostctl", "molto", "seed", "--slot", "0", "--hex-stdin"]).is_ok());
+        assert!(parse(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--slot",
+            "0",
+            "--seed",
+            "stdin"
+        ])
+        .is_ok());
         assert!(parse(&["keyroostctl", "molto", "reset", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "molto", "probe", "--yes"]).is_ok());
         assert!(parse(&["keyroostctl", "set-seed", "--profile", "0", "--hex-stdin"]).is_err());
-        assert!(parse(&["keyroostctl", "molto", "info", "--key-env", "K"]).is_ok());
+        assert!(parse(&["keyroostctl", "molto", "info", "--customer-key", "env:K"]).is_ok());
     }
 
     #[test]
@@ -17711,56 +18026,52 @@ mod cli_tests {
 
     const SECRET_TABLE: &str = include_str!("../tests/secret_flags.txt");
 
-    /// (path, every secret flag) for each visible subcommand, from the clap
-    /// tree: the long of each `<SOURCE>` flag, and the prefix of each old
-    /// `--X-env`/`--X-stdin` pair that is left. A global flag counts on the
-    /// command that declares it, not on every command below.
+    /// (path, every secret flag) for each visible command that runs (a
+    /// leaf), from the clap tree: the long of each `<SOURCE>` flag, its own
+    /// or a global one declared above it (`molto --customer-key`).
     fn secret_pairs() -> std::collections::BTreeMap<String, Vec<String>> {
         use clap::CommandFactory;
         fn walk(
             cmd: &clap::Command,
             path: String,
-            inherited: &[clap::Id],
+            inherited: &[String],
             out: &mut std::collections::BTreeMap<String, Vec<String>>,
         ) {
-            let own: Vec<&clap::Arg> = cmd
-                .get_arguments()
-                .filter(|a| !inherited.contains(a.get_id()))
-                .collect();
-            let longs: Vec<&str> = own
-                .iter()
-                .filter(|a| !a.is_global_set())
-                .filter_map(|a| a.get_long())
-                .collect();
-            let mut pairs: Vec<String> = longs
-                .iter()
-                .filter_map(|l| l.strip_suffix("-stdin"))
-                .filter(|p| longs.contains(&format!("{p}-env").as_str()))
-                .map(str::to_owned)
-                .collect();
-            pairs.extend(
-                own.iter()
-                    .filter(|a| is_secret_arg(a))
-                    .filter_map(|a| a.get_long())
-                    .map(str::to_owned),
-            );
-            pairs.sort();
-            if !pairs.is_empty() && !path.is_empty() {
-                out.insert(path.clone(), pairs);
+            let mut secrets: Vec<String> = inherited.to_vec();
+            for a in cmd.get_arguments().filter(|a| is_secret_arg(a)) {
+                let long = a.get_long().unwrap().to_owned();
+                if !secrets.contains(&long) {
+                    secrets.push(long);
+                }
             }
-            let mut inherited = inherited.to_vec();
-            inherited.extend(
-                own.iter()
-                    .filter(|a| a.is_global_set())
-                    .map(|a| a.get_id().clone()),
-            );
-            for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+            let subs: Vec<&clap::Command> = cmd
+                .get_subcommands()
+                .filter(|s| !s.is_hide_set() && s.get_name() != "help")
+                .collect();
+            if subs.is_empty() || !cmd.is_subcommand_required_set() {
+                let mut pairs = secrets.clone();
+                pairs.sort();
+                if !pairs.is_empty() && !path.is_empty() {
+                    out.insert(path.clone(), pairs);
+                }
+            }
+            let globals: Vec<String> = secrets
+                .iter()
+                .filter(|l| {
+                    inherited.contains(l)
+                        || cmd
+                            .get_arguments()
+                            .any(|a| a.get_long() == Some(l.as_str()) && a.is_global_set())
+                })
+                .cloned()
+                .collect();
+            for sub in subs {
                 let p = if path.is_empty() {
                     sub.get_name().to_owned()
                 } else {
                     format!("{path} {}", sub.get_name())
                 };
-                walk(sub, p, &inherited, out);
+                walk(sub, p, &globals, out);
             }
         }
         let mut root = Cli::command();
@@ -17839,26 +18150,6 @@ mod cli_tests {
                 cmd = cmd.find_subcommand(name).unwrap();
             }
             let help_of = |a: &clap::Arg| a.get_help().map(|h| h.to_string()).unwrap_or_default();
-            for a in cmd.get_arguments().filter(|a| {
-                a.get_long()
-                    .is_some_and(|l| l.ends_with("-env") || l.ends_with("-stdin"))
-            }) {
-                assert!(
-                    a.get_help().is_some(),
-                    "{path} --{} has no help",
-                    a.get_long().unwrap()
-                );
-                // Every stdin flag falls back to a hidden prompt at a
-                // terminal, and its help says so.
-                if a.get_long().is_some_and(|l| l.ends_with("-stdin")) {
-                    let help = help_of(a);
-                    assert!(
-                        help.contains("hidden when typed at a terminal"),
-                        "{path} --{}: {help}",
-                        a.get_long().unwrap()
-                    );
-                }
-            }
             // Every `<SOURCE>` flag names its sources and is in the
             // refusal table with the same `default`.
             for a in cmd.get_arguments().filter(|a| is_secret_arg(a)) {
@@ -17886,14 +18177,9 @@ mod cli_tests {
             }
             // Two stdin sources that can be combined: each states its line,
             // and column 3 lists the first-line one first.
-            let stdin_args: Vec<&clap::Arg> = cmd
-                .get_arguments()
-                .filter(|a| is_secret_arg(a) || a.get_long().is_some_and(|l| l.ends_with("-stdin")))
-                .collect();
-            let short = |a: &clap::Arg| -> String {
-                let l = a.get_long().unwrap();
-                l.strip_suffix("-stdin").unwrap_or(l).to_owned()
-            };
+            let stdin_args: Vec<&clap::Arg> =
+                cmd.get_arguments().filter(|a| is_secret_arg(a)).collect();
+            let short = |a: &clap::Arg| -> String { a.get_long().unwrap().to_owned() };
             for a in &stdin_args {
                 let combinable: Vec<&&clap::Arg> = stdin_args
                     .iter()
@@ -18155,6 +18441,11 @@ mod cli_tests {
             if cols[0] == "piv request-cert" {
                 argv.push("--generate-key"); // --mgmt-key needs it there
             }
+            if path[0] == "molto" {
+                molto_stdin_order(line, &argv, flags[1]);
+                covered.push(cols[0]);
+                continue;
+            }
             let cli = parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             let pair = cli
                 .command
@@ -18175,6 +18466,10 @@ mod cli_tests {
         assert_eq!(
             covered,
             [
+                "molto seed",
+                "molto customer-key",
+                "molto import",
+                "molto import-file",
                 "fido pin change",
                 "oath add",
                 "oath set-password",
@@ -18192,6 +18487,58 @@ mod cli_tests {
                 "otp change-pin",
             ]
         );
+    }
+
+    /// One Molto2 row of [`stdin_line_order_per_command`]: the customer key
+    /// (`--customer-key stdin`) and `second`, both piped, read through the
+    /// functions `run_molto` uses: line 1 is the key, line 2 the other.
+    fn molto_stdin_order(line: &str, argv: &[&str], second: &str) {
+        use crate::secrets::fake::FakeIo;
+        let vault = std::env::temp_dir().join(format!(
+            "keyroostctl-order-{}-vault.json",
+            std::process::id()
+        ));
+        // An encrypted Aegis vault as far as the importer can tell; its
+        // password is read, then decryption fails.
+        std::fs::write(&vault, r#"{"version":1,"db":"AAAA"}"#).unwrap();
+        let vault_arg = vault.to_str().unwrap();
+        let argv: Vec<&str> = argv
+            .iter()
+            .map(|a| if *a == "vault.json" { vault_arg } else { a })
+            .collect();
+        let cli = parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        let Some(Cmd::Molto { key, cmd, .. }) = cli.command else {
+            panic!("{line}: not a molto command")
+        };
+        let line2 = match second {
+            "uri" => "otpauth://totp/acct?secret=JBSWY3DP\n",
+            "seed" => "AEBA\n",
+            _ => "22\n",
+        };
+        let mut sec = Secrets::new(FakeIo::piped(&["11\n", line2]));
+        let early = molto_early_key(&mut sec, &key, &cmd).unwrap();
+        match (second, &cmd) {
+            ("password", MoltoCmd::ImportFile { path, password, .. }) => {
+                assert_eq!(&early.unwrap()[..], [0x11], "{line}");
+                assert!(load_bulk_entries(&mut sec, path, password.as_ref()).is_err());
+                assert_eq!(sec.io.lines_read, 2, "{line}");
+            }
+            _ => match (second, {
+                let (k, input) = molto_key_and_input(&mut sec, &key, &cmd, early).unwrap();
+                assert_eq!(&k[..], [0x11], "{line}");
+                input
+            }) {
+                ("seed", MoltoInput::Seed(s)) => {
+                    assert_eq!(&s[..], [1, 2], "{line}")
+                }
+                ("new-customer-key", MoltoInput::NewKey(k)) => assert_eq!(&k[..], [0x22], "{line}"),
+                ("uri", MoltoInput::Entry { entry, .. }) => {
+                    assert_eq!(&entry.secret[..], b"Hello", "{line}")
+                }
+                _ => panic!("{line}: read the wrong input"),
+            },
+        }
+        let _ = std::fs::remove_file(&vault);
     }
 
     #[test]
@@ -19239,11 +19586,20 @@ mod cli_tests {
                 "seed",
                 "--slot",
                 "99",
-                "--hex-stdin",
+                "--seed",
+                "stdin",
             ],
-            &["keyroostctl", "molto", "import", "--slot", "99", "-"],
+            &[
+                "keyroostctl",
+                "molto",
+                "import",
+                "--slot",
+                "99",
+                "--uri",
+                "stdin",
+            ],
             &["keyroostctl", "molto", "import-file", "f.json"],
-            &["keyroostctl", "prog", "seed", "--hex-stdin"],
+            &["keyroostctl", "prog", "seed", "--seed", "stdin"],
             &["keyroostctl", "prog", "config"],
         ] {
             let without = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));

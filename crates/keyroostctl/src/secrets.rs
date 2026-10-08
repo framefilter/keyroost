@@ -47,10 +47,7 @@ pub(crate) struct Spec {
     /// The flag also takes `default` (`--mgmt-key default`), named in the
     /// refusal.
     pub(crate) default_ok: bool,
-    /// The flag is still an old `--X-env VAR` / `--X-stdin` pair; messages
-    /// name those.
-    pub(crate) legacy: bool,
-    /// Replaces the "--X env:NAME or --X stdin" part (molto import's `-`).
+    /// Replaces the "--X env:NAME or --X stdin" part (molto import's --qr).
     pub(crate) hint: Option<&'static str>,
     /// Replaces the prompt's label, shown as written (not capitalized).
     pub(crate) prompt: Option<&'static str>,
@@ -64,7 +61,6 @@ impl Spec {
             kind,
             form: Form::Text,
             default_ok: false,
-            legacy: false,
             hint: None,
             prompt: None,
         }
@@ -93,12 +89,6 @@ impl Spec {
     pub(crate) const fn with_default(self) -> Spec {
         Spec {
             default_ok: true,
-            ..self
-        }
-    }
-    pub(crate) const fn legacy(self) -> Spec {
-        Spec {
-            legacy: true,
             ..self
         }
     }
@@ -137,20 +127,12 @@ impl Spec {
 
     /// "--mgmt-key default".
     pub(crate) fn default_flag(&self) -> String {
-        if self.legacy {
-            format!("--{}-default", self.flag)
-        } else {
-            format!("--{} default", self.flag)
-        }
+        format!("--{} default", self.flag)
     }
 
     fn env_and_stdin(&self) -> [String; 2] {
         let f = self.flag;
-        if self.legacy {
-            [format!("--{f}-env VAR"), format!("--{f}-stdin")]
-        } else {
-            [format!("--{f} env:NAME"), format!("--{f} stdin")]
-        }
+        [format!("--{f} env:NAME"), format!("--{f} stdin")]
     }
 
     fn no_source(&self) -> String {
@@ -469,18 +451,6 @@ impl<I: SecretIo> Secrets<I> {
         }
     }
 
-    pub(crate) fn check_one_of(
-        &self,
-        what: &str,
-        options: &[(Spec, Source<'_>)],
-    ) -> Result<(), String> {
-        match options.iter().filter(|(_, s)| s.given()).count() {
-            1 => Ok(()),
-            0 => Err(format!("no {what} given: pass {}", join_hints(options))),
-            _ => Err(format!("give only one {what} source")),
-        }
-    }
-
     pub(crate) fn read(
         &mut self,
         spec: &Spec,
@@ -529,20 +499,6 @@ impl<I: SecretIo> Secrets<I> {
         }
     }
 
-    pub(crate) fn read_one_of(
-        &mut self,
-        what: &str,
-        options: &[(Spec, Source<'_>)],
-    ) -> Result<(usize, Zeroizing<String>), String> {
-        self.check_one_of(what, options)?;
-        let i = options
-            .iter()
-            .position(|(_, s)| s.given())
-            .expect("checked: exactly one");
-        let (spec, src) = &options[i];
-        Ok((i, self.read(spec, *src)?))
-    }
-
     fn prompt(&mut self, spec: &Spec) -> Result<Zeroizing<String>, String> {
         let first = finish(spec, self.hidden(spec, false)?, Origin::Prompt)?;
         if spec.kind == Kind::New {
@@ -589,12 +545,6 @@ impl<I: SecretIo> Secrets<I> {
 /// from the old command line sometimes passes the secret where the name
 /// goes (`--pin env:DEADBEEF` instead of `--pin env:KR_PIN`).
 fn env_problem(spec: &Spec, problem: &str) -> String {
-    if spec.legacy {
-        return format!(
-            "the environment variable given to --{}-env {problem}",
-            spec.flag
-        );
-    }
     format!(
         "the environment variable given to --{} {problem}",
         spec.flag
@@ -628,17 +578,6 @@ fn finish(
         Origin::Stdin(n) => format!("the {} on stdin line {n} is empty", spec.label),
         Origin::Prompt => format!("no {} entered; nothing was changed", spec.label),
     })
-}
-
-fn join_hints(options: &[(Spec, Source<'_>)]) -> String {
-    let parts: Vec<String> = options
-        .iter()
-        .flat_map(|(s, _)| s.env_and_stdin())
-        .collect();
-    match parts.split_last() {
-        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
-        _ => parts.join(""),
-    }
 }
 
 #[cfg(test)]
@@ -835,8 +774,8 @@ mod tests {
                 "no management key given: pass --mgmt-key env:NAME, --mgmt-key stdin or --mgmt-key default",
             ),
             (
-                Spec::value("otpauth:// URI", "uri").hint("`-` to read it from stdin, --uri-env VAR or --qr IMAGE"),
-                "no otpauth:// URI given: pass `-` to read it from stdin, --uri-env VAR or --qr IMAGE",
+                Spec::value("otpauth:// URI", "uri").hint("--uri env:NAME, --uri stdin or --qr IMAGE"),
+                "no otpauth:// URI given: pass --uri env:NAME, --uri stdin or --qr IMAGE",
             ),
         ] {
             let s = sec(FakeIo::default());
@@ -1034,36 +973,6 @@ mod tests {
     }
 
     #[test]
-    fn exactly_one_of_two_encodings() {
-        const HEX: Spec = Spec::value("seed", "hex").hex().legacy();
-        const B32: Spec = Spec::value("seed", "base32").base32().legacy();
-        let mut s = sec(FakeIo::terminal());
-        assert_eq!(
-            s.read_one_of("seed", &[(HEX, Source::NONE), (B32, Source::NONE)])
-                .unwrap_err(),
-            "no seed given: pass --hex-env VAR, --hex-stdin, --base32-env VAR or --base32-stdin"
-        );
-        assert!(
-            s.io.prompts.is_empty(),
-            "the encoding can't be guessed, so no prompt"
-        );
-        let mut s = sec(FakeIo::default().var("A", "00").var("B", "AA"));
-        assert_eq!(
-            s.read_one_of("seed", &[(HEX, Source::env("A")), (B32, Source::env("B"))])
-                .unwrap_err(),
-            "give only one seed source"
-        );
-        let mut s = sec(FakeIo::piped(&[" JBSWY3DP\n"]));
-        let (i, v) = s
-            .read_one_of(
-                "seed",
-                &[(HEX, Source::NONE), (B32, Source::new(None, true))],
-            )
-            .unwrap();
-        assert_eq!((i, v.as_str()), (1, "JBSWY3DP"));
-    }
-
-    #[test]
     fn not_unicode_env_var_names_the_flag_never_the_variable() {
         let mut s = sec(FakeIo::terminal().not_unicode_var("KR_BAD"));
         assert_eq!(
@@ -1083,18 +992,6 @@ mod tests {
         let mut s = sec(io);
         let e = s.read(&PIN, Source::new(None, true)).unwrap_err();
         assert!(e.starts_with("could not read the PIN from stdin: "), "{e}");
-    }
-
-    #[test]
-    fn check_one_of_refuses_two_given_sources() {
-        const HEX: Spec = Spec::value("seed", "hex").hex();
-        const B32: Spec = Spec::value("seed", "base32").base32();
-        let s = sec(FakeIo::default().var("A", "00").var("B", "AA"));
-        assert_eq!(
-            s.check_one_of("seed", &[(HEX, Source::env("A")), (B32, Source::env("B"))])
-                .unwrap_err(),
-            "give only one seed source"
-        );
     }
 
     #[test]
@@ -1210,10 +1107,6 @@ mod tests {
                 .sources_hint(),
             "--mgmt-key env:NAME, --mgmt-key stdin or --mgmt-key default"
         );
-        assert_eq!(
-            Spec::value("seed", "hex").hex().legacy().sources_hint(),
-            "--hex-env VAR or --hex-stdin"
-        );
     }
 
     #[test]
@@ -1224,15 +1117,6 @@ mod tests {
             "--mgmt-key env:NAME or --mgmt-key stdin"
         );
         assert_eq!(M.default_flag(), "--mgmt-key default");
-        assert_eq!(
-            M.legacy().env_or_stdin_hint(),
-            "--mgmt-key-env VAR or --mgmt-key-stdin"
-        );
-        assert_eq!(M.legacy().default_flag(), "--mgmt-key-default");
-        assert_eq!(
-            M.legacy().sources_hint(),
-            "--mgmt-key-env VAR, --mgmt-key-stdin or --mgmt-key-default"
-        );
     }
 
     #[test]
