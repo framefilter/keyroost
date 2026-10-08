@@ -350,7 +350,7 @@ fn strip_control_chars(s: &mut String) {
 ///
 /// In test builds (this crate's own tests, or a dependent that enables the
 /// `test-isolation` feature from its `[dev-dependencies]`) the directory is
-/// never the person's: see [`isolated_config_dir`].
+/// never the person's: see `isolated_config_dir` (test builds only).
 pub fn config_dir() -> Option<std::path::PathBuf> {
     #[cfg(any(test, feature = "test-isolation"))]
     {
