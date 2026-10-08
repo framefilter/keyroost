@@ -392,3 +392,34 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
     );
     assert!(!err.contains('\u{2192}'), "{err}");
 }
+
+/// A flag-shaped word right after a secret flag (`--pin --yes`) is a
+/// missing value, said as such; it is still never repeated.
+#[test]
+fn a_flag_after_a_secret_flag_is_a_missing_value() {
+    for (args, flag) in [
+        (&["piv", "change-pin", "--pin", "--yes"][..], "--pin"),
+        (
+            &["piv", "change-pin", "--pin", "--new-pin", "stdin"],
+            "--pin",
+        ),
+        (&["oath", "list", "--password", "--json"], "--password"),
+    ] {
+        let (code, err) = run(args);
+        assert_eq!(code, 2, "{args:?}: {err}");
+        assert!(
+            err.contains(&format!("{flag} needs a value: env:NAME or stdin")),
+            "{args:?}: {err}"
+        );
+        assert!(
+            !err.contains("S3CRET") && !err.contains("--yes"),
+            "{args:?}: {err}"
+        );
+    }
+    let (code, err) = run(&["piv", "new-chuid", "--mgmt-key", "--yes"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("--mgmt-key needs a value: env:NAME, stdin or default"),
+        "{err}"
+    );
+}

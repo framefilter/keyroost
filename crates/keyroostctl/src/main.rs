@@ -1065,9 +1065,10 @@ enum PivCmd {
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (second line when --pin stdin is also given;
         /// hidden when typed at a terminal), default uses the factory-default
-        /// management key keyroost knows for this device. With none of these, a
-        /// terminal asks. Only with --generate-key, for the key-generation
-        /// step; the request itself needs just the PIN.
+        /// management key keyroost knows for this device. Needed only with
+        /// --generate-key, for the key-generation step (the request itself
+        /// needs just the PIN); then, with none of these, a terminal asks for
+        /// it.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, requires = "generate_key")]
         mgmt_key: Option<SecretSource>,
         #[command(flatten)]
@@ -1578,14 +1579,16 @@ enum OpenpgpCmd {
     /// variable, stdin (the current PIN on the first line, the new one on the
     /// second) or, with neither, a hidden prompt — never argv.
     ChangeAdminPin {
-        /// The current admin PIN (PW3): env:NAME reads that environment
-        /// variable, stdin reads one line (first line; hidden when typed at a
-        /// terminal). With neither, a terminal asks.
+        /// On this command, --pin is the current admin PIN (PW3), not the user
+        /// PIN: env:NAME reads that environment variable, stdin reads one line
+        /// (first line; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
-        /// The new admin PIN (PW3): env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --pin stdin is also given;
-        /// hidden when typed at a terminal). With neither, a terminal asks.
+        /// On this command, --new-pin is the new admin PIN (PW3), not the user
+        /// PIN: env:NAME reads that environment variable, stdin reads one line
+        /// (second line when --pin stdin is also given; hidden when typed at a
+        /// terminal). With neither, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         new_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
@@ -1791,7 +1794,8 @@ struct OathAccess {
     reader: Option<String>,
     /// The applet password: env:NAME reads that environment variable, stdin
     /// reads one line (hidden when typed at a terminal). With neither, a
-    /// terminal asks. Needed for password-protected applets (e.g. a YubiKey
+    /// terminal asks when the applet has a password. Needed for
+    /// password-protected applets (e.g. a YubiKey
     /// with an OATH password set). `set-password` reads it on the first line,
     /// before the new password; `add` reads it after the seed (second line when
     /// --seed stdin is also given).
@@ -2140,7 +2144,7 @@ enum MoltoCmd {
         dry_run: bool,
         /// The vault password: env:NAME reads that environment variable, stdin
         /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks.
+        /// terminal asks when the file is an encrypted vault.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         password: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
@@ -2694,7 +2698,7 @@ enum OtpCmd {
         /// The OTP PIN to unlock a protected key: env:NAME reads that
         /// environment variable, stdin reads one line (second line when --seed
         /// stdin is also given; hidden when typed at a terminal). With neither,
-        /// a terminal asks.
+        /// a terminal asks when the key has a PIN.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
     },
@@ -2712,7 +2716,7 @@ enum OtpCmd {
         account: String,
         /// The OTP PIN to unlock a protected key: env:NAME reads that
         /// environment variable, stdin reads one line (hidden when typed at a
-        /// terminal). With neither, a terminal asks.
+        /// terminal). With neither, a terminal asks when the key has a PIN.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
@@ -2812,8 +2816,8 @@ enum OtpCmd {
         new_pin: Option<SecretSource>,
     },
     /// Verify the OTP PIN, opening the read window for this connection (mostly
-    /// for testing; `otp list` takes `--pin-*` directly). PIN via env, stdin or,
-    /// with neither, a hidden prompt.
+    /// for testing; `otp list` takes `--pin` directly). The PIN comes from
+    /// --pin env:NAME or stdin or, with neither, a hidden prompt.
     Verify {
         /// The OTP PIN: env:NAME reads that environment variable, stdin reads
         /// one line (hidden when typed at a terminal). With neither, a terminal
@@ -4233,7 +4237,39 @@ fn retired_command_hint(invalid: &str, argv: &[String]) -> Option<String> {
     use clap::CommandFactory;
     let mut root = Cli::command();
     root.build();
-    let mut cmd = &root;
+    let (path, _) = walk_argv(&root, argv);
+    let parent = path.join(" ");
+    RETIRED_COMMANDS
+        .iter()
+        .find(|r| r.parent == parent && r.old == invalid)
+        .map(|r| {
+            let old = if r.parent.is_empty() {
+                r.old.to_string()
+            } else {
+                format!("{} {}", r.parent, r.old)
+            };
+            let note = if r.note.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", r.note)
+            };
+            format!("`keyroostctl {old}` is now `keyroostctl {}`{note}", r.new)
+        })
+}
+
+/// The deepest command `argv` names, built.
+fn command_in_argv(argv: &[String]) -> clap::Command {
+    use clap::CommandFactory;
+    let mut root = Cli::command();
+    root.build();
+    let (_, cmd) = walk_argv(&root, argv);
+    cmd.clone()
+}
+
+/// Walk `argv` down `root`'s tree: the subcommand path and the deepest
+/// command, skipping the value of every flag that takes one.
+fn walk_argv<'c>(root: &'c clap::Command, argv: &[String]) -> (Vec<&'c str>, &'c clap::Command) {
+    let mut cmd = root;
     let mut path: Vec<&str> = Vec::new();
     let mut words = argv.iter().skip(1);
     while let Some(word) = words.next() {
@@ -4260,23 +4296,7 @@ fn retired_command_hint(invalid: &str, argv: &[String]) -> Option<String> {
             None => break,
         }
     }
-    let parent = path.join(" ");
-    RETIRED_COMMANDS
-        .iter()
-        .find(|r| r.parent == parent && r.old == invalid)
-        .map(|r| {
-            let old = if r.parent.is_empty() {
-                r.old.to_string()
-            } else {
-                format!("{} {}", r.parent, r.old)
-            };
-            let note = if r.note.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", r.note)
-            };
-            format!("`keyroostctl {old}` is now `keyroostctl {}`{note}", r.new)
-        })
+    (path, cmd)
 }
 
 /// A friendly hint for a removed or renamed secret-bearing flag, or `None` if
@@ -4284,11 +4304,45 @@ fn retired_command_hint(invalid: &str, argv: &[String]) -> Option<String> {
 /// unrelated flag of the same name elsewhere isn't misdiagnosed). The rows
 /// stay inert until each flag is actually removed from its `clap` struct:
 /// clap only raises `UnknownArgument` for flags it no longer knows about.
-fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<&'static str> {
-    RETIRED_FLAGS
+///
+/// A generic row (any command) names its replacement only when the command
+/// typed has it; otherwise the message lists the secret flags it does have
+/// (`--pin-env` on `openpgp set-name` points at `--admin-pin`).
+fn retired_flag_hint(invalid: &str, argv: &[String]) -> Option<String> {
+    let r = RETIRED_FLAGS
         .iter()
-        .find(|r| r.flag == invalid && r.words.iter().all(|w| argv.iter().any(|a| a == w)))
-        .map(|r| r.msg)
+        .find(|r| r.flag == invalid && r.words.iter().all(|w| argv.iter().any(|a| a == w)))?;
+    if !r.words.is_empty() || r.now.is_empty() {
+        return Some(r.msg.to_string());
+    }
+    let cmd = command_in_argv(argv);
+    let has = |f: &str| {
+        cmd.get_arguments()
+            .any(|a| a.get_long() == Some(f.trim_start_matches('-')))
+    };
+    if r.now.iter().all(|f| has(f)) {
+        return Some(r.msg.to_string());
+    }
+    let own: Vec<String> = cmd
+        .get_arguments()
+        .filter(|a| is_secret_arg(a))
+        .filter_map(|a| a.get_long())
+        .map(|l| format!("--{l}"))
+        .collect();
+    Some(match own.as_slice() {
+        [] => format!("{invalid} was removed, and this command takes no secret"),
+        [one] => format!(
+            "{invalid} was removed, and this command has no {}: its secret flag is {one} \
+             (env:NAME or stdin)",
+            r.now.join("/")
+        ),
+        _ => format!(
+            "{invalid} was removed, and this command has no {}: its secret flags are {} \
+             (env:NAME or stdin)",
+            r.now.join("/"),
+            own.join(", ")
+        ),
+    })
 }
 
 /// A double-dash word made only of letters and dashes — a typo'd flag name
@@ -4313,6 +4367,28 @@ fn secret_flag_precedes(argv: &[String], prefix: &str) -> bool {
             _ => w[0].as_str(),
         };
         w[1].starts_with(prefix) && (is_source(value) || w[0].ends_with("-stdin"))
+    })
+}
+
+/// "--pin needs a value: env:NAME or stdin" when a secret flag in `argv` is
+/// followed by a flag-shaped word (`--pin --yes`): clap takes that word as
+/// the value (a secret flag accepts a dash-led one), so the value is most
+/// likely missing. Neither word is repeated.
+fn missing_secret_value(argv: &[String]) -> Option<String> {
+    argv.windows(2).find_map(|w| {
+        let long = w[0].strip_prefix("--")?;
+        let f = crate::secrets::SECRET_FLAGS
+            .iter()
+            .find(|f| f.long == long)?;
+        if !looks_like_flag_typo(&w[1]) {
+            return None;
+        }
+        let sources = if f.default_ok {
+            "env:NAME, stdin or default"
+        } else {
+            "env:NAME or stdin"
+        };
+        Some(format!("--{long} needs a value: {sources}"))
     })
 }
 
@@ -4348,6 +4424,10 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
             return None;
         };
         return retired_command_hint(word, argv);
+    }
+
+    if let Some(msg) = missing_secret_value(argv) {
+        return Some(msg);
     }
 
     // A secret flag given something other than a source. clap's own
@@ -4396,7 +4476,7 @@ fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
         return None;
     };
     if let Some(msg) = retired_flag_hint(arg, argv) {
-        return Some(msg.to_string());
+        return Some(msg);
     }
 
     // The deepest subcommand named in argv, and whether it takes a secret.
@@ -5593,9 +5673,36 @@ fn open_oath(
     access: &OathAccess,
     debug: bool,
 ) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
-    let (name, password) = oath_current_password(sec, access, debug)?;
+    open_oath_from(sec, access, access.source(), debug)
+}
+
+/// [`open_oath`] with the password's source given (the second secret of a
+/// [`SecretPair`]).
+fn open_oath_from(
+    sec: &mut Secrets,
+    access: &OathAccess,
+    password: Source<'_>,
+    debug: bool,
+) -> Result<keyroost_transport::OathSession, Box<dyn std::error::Error>> {
+    let (name, password) = oath_password_from(sec, access, password, debug)?;
     reverify_if_prompted(sec, Need::Oath, access.reader.as_deref())?;
     open_oath_unlocked(&name, password.as_deref().map(String::as_str), debug)
+}
+
+/// The announced OATH key's reader, its current password if it has one, and
+/// the new password still to read.
+type OathCurrentThen<'a> = (String, Option<zeroize::Zeroizing<String>>, SecondSecret<'a>);
+
+/// `oath set-password`'s current password (the first secret of its pair),
+/// then the new one's [`SecondSecret`] to read next.
+fn oath_current_then<'a>(
+    sec: &mut Secrets,
+    access: &OathAccess,
+    pair: SecretPair<'a>,
+    debug: bool,
+) -> Result<OathCurrentThen<'a>, Box<dyn std::error::Error>> {
+    let (name, current) = oath_password_from(sec, access, Source::from_flag(pair.first.1), debug)?;
+    Ok((name, current, pair.second))
 }
 
 /// The announced OATH key's exact reader and, when it needs one, its
@@ -5612,8 +5719,18 @@ fn oath_current_password(
     access: &OathAccess,
     debug: bool,
 ) -> Result<OathReaderPassword, Box<dyn std::error::Error>> {
+    oath_password_from(sec, access, access.source(), debug)
+}
+
+/// [`oath_current_password`] with the password's source given.
+fn oath_password_from(
+    sec: &mut Secrets,
+    access: &OathAccess,
+    password: Source<'_>,
+    debug: bool,
+) -> Result<OathReaderPassword, Box<dyn std::error::Error>> {
     let name = crate::target::reader_for(Need::Oath, access.reader.as_deref())?;
-    if let Some(pw) = sec.read_given(&OATH_PASSWORD, access.source())? {
+    if let Some(pw) = sec.read_given(&OATH_PASSWORD, password)? {
         return Ok((name, Some(pw)));
     }
     let required = {
@@ -6827,27 +6944,28 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         OathCmd::Add {
             name,
             oath_type,
-            seed,
             algorithm,
             digits,
             counter,
             touch,
             access,
+            ..
         } => {
             if *counter != 0 && !matches!(oath_type, OathTypeArg::Hotp) {
                 return Err("--counter only applies to --type hotp".into());
             }
             let mut sec = Secrets::real();
-            let seed_src = Source::from_flag(seed.as_ref());
-            sec.check(&OATH_SEED, seed_src)?;
+            let pair = pair_of(oath_secret_pair(cmd))?;
+            pair.check_first(&sec)?;
             crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
             // The seed first (stdin line 1); the applet password, if it needs
             // one, second.
-            let seed_b32 = sec.read(&OATH_SEED, seed_src)?;
+            let (seed_b32, password) = pair.read_first(&mut sec)?;
+            let seed_b32 = seed_b32.text()?;
             let secret = zeroize::Zeroizing::new(
                 base32_decode(&seed_b32).map_err(|e| format!("invalid base32 seed: {}", e))?,
             );
-            let mut session = open_oath(&mut sec, access, debug)?;
+            let mut session = open_oath_from(&mut sec, access, password.source(), debug)?;
             let params = keyroost_oath::PutParams {
                 name,
                 secret: &secret,
@@ -6879,18 +6997,15 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             session.delete(name)?;
             println!("Deleted OATH credential {:?}.", name);
         }
-        OathCmd::SetPassword {
-            new_password,
-            access,
-        } => {
+        OathCmd::SetPassword { access, .. } => {
             let mut sec = Secrets::real();
-            let new_src = Source::from_flag(new_password.as_ref());
-            sec.check(&OATH_NEW_PASSWORD, new_src)?;
+            let pair = pair_of(oath_secret_pair(cmd))?;
+            pair.second.check(&sec)?;
             // The current password first (stdin line 1, when the applet has
             // one), then the new one. The helper refuses an empty new
             // password; `clear-password` removes it.
-            let (name, current) = oath_current_password(&mut sec, access, debug)?;
-            let new_pw = sec.read(&OATH_NEW_PASSWORD, new_src)?;
+            let (name, current, new_pw) = oath_current_then(&mut sec, access, pair, debug)?;
+            let new_pw = new_pw.read(&mut sec)?.text()?;
             reverify_if_prompted(&sec, Need::Oath, access.reader.as_deref())?;
             let mut session =
                 open_oath_unlocked(&name, current.as_deref().map(String::as_str), debug)?;
@@ -7327,27 +7442,21 @@ fn run_otp(
             digits,
             period,
             touch,
-            seed,
-            pin,
+            ..
         } => {
             let mut sec = Secrets::real();
-            let seed_src = Source::from_flag(seed.as_ref());
-            sec.check(&OTP_SEED, seed_src)?;
+            let pair = pair_of(otp_secret_pair(cmd))?;
+            pair.check_first(&sec)?;
             let dev = select_otp(&sel)?;
             // The seed first (stdin line 1); the OTP PIN, if the key has one,
             // second.
-            let seed_b32 = sec.read(&OTP_SEED, seed_src)?;
+            let (seed_b32, pin) = pair.read_first(&mut sec)?;
+            let seed_b32 = seed_b32.text()?;
             let seed = keyroost_token2otp::decode_base32_seed(&seed_b32)
                 .map_err(|e| format!("invalid base32 seed: {e}"))?;
             let waited = sec.prompted();
-            let pin = otp_pin_if_needed(
-                &mut sec,
-                &dev,
-                sel.transport,
-                debug,
-                Source::from_flag(pin.as_ref()),
-                waited,
-            )?;
+            let pin =
+                otp_pin_if_needed(&mut sec, &dev, sel.transport, debug, pin.source(), waited)?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let entry = keyroost_token2otp::WriteEntry {
@@ -7628,18 +7737,12 @@ fn run_otp(
             session.verify_pin(pin.as_str())?;
             println!("OTP PIN verified; read window open for this connection.");
         }
-        OtpCmd::ChangePin { pin, new_pin } => {
+        OtpCmd::ChangePin { .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(pin.as_ref());
-            let second_src = Source::from_flag(new_pin.as_ref());
-            sec.check(&OTP_OLD_PIN, first_src)?;
-            sec.check(&OTP_NEW_PIN, second_src)?;
+            let pair = pair_of(otp_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let dev = select_otp(&sel)?;
-            let (current, new) = read_secret_pair(
-                &mut sec,
-                (&OTP_OLD_PIN, first_src),
-                (&OTP_NEW_PIN, second_src),
-            )?;
+            let (current, new) = pair.read_text(&mut sec)?;
             crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
@@ -8199,65 +8302,35 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 None => println!("{}", hex_encode(&sig)),
             }
         }
-        OpenpgpCmd::ChangePin {
-            reader,
-            pin,
-            new_pin,
-        } => {
+        OpenpgpCmd::ChangePin { reader, .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(pin.as_ref());
-            let second_src = Source::from_flag(new_pin.as_ref());
-            sec.check(&PGP_OLD_USER_PIN, first_src)?;
-            sec.check(&PGP_NEW_USER_PIN, second_src)?;
+            let pair = pair_of(pgp_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
-            let (old, new) = read_secret_pair(
-                &mut sec,
-                (&PGP_OLD_USER_PIN, first_src),
-                (&PGP_NEW_USER_PIN, second_src),
-            )?;
+            let (old, new) = pair.read_text(&mut sec)?;
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             // CHANGE REFERENCE DATA carries the old PIN itself — no prior VERIFY.
             let mut session = open_openpgp_at(&name, debug)?;
             session.change_user_pin(old.as_bytes(), new.as_bytes())?;
             println!("User PIN (PW1) changed.");
         }
-        OpenpgpCmd::ChangeAdminPin {
-            reader,
-            pin,
-            new_pin,
-        } => {
+        OpenpgpCmd::ChangeAdminPin { reader, .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(pin.as_ref());
-            let second_src = Source::from_flag(new_pin.as_ref());
-            sec.check(&PGP_OLD_ADMIN_PIN, first_src)?;
-            sec.check(&PGP_NEW_ADMIN_PIN, second_src)?;
+            let pair = pair_of(pgp_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
-            let (old, new) = read_secret_pair(
-                &mut sec,
-                (&PGP_OLD_ADMIN_PIN, first_src),
-                (&PGP_NEW_ADMIN_PIN, second_src),
-            )?;
+            let (old, new) = pair.read_text(&mut sec)?;
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             session.change_admin_pin(old.as_bytes(), new.as_bytes())?;
             println!("Admin PIN (PW3) changed.");
         }
-        OpenpgpCmd::UnblockPin {
-            reader,
-            admin_pin,
-            new_pin,
-        } => {
+        OpenpgpCmd::UnblockPin { reader, .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(admin_pin.as_ref());
-            let second_src = Source::from_flag(new_pin.as_ref());
-            sec.check(&PGP_ADMIN_PIN, first_src)?;
-            sec.check(&PGP_NEW_USER_PIN, second_src)?;
+            let pair = pair_of(pgp_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let name = crate::target::reader_for(Need::OpenPgp, reader.as_deref())?;
-            let (admin, new) = read_secret_pair(
-                &mut sec,
-                (&PGP_ADMIN_PIN, first_src),
-                (&PGP_NEW_USER_PIN, second_src),
-            )?;
+            let (admin, new) = pair.read_text(&mut sec)?;
             reverify_if_prompted(&sec, Need::OpenPgp, reader.as_deref())?;
             let mut session = open_openpgp_at(&name, debug)?;
             // reset_retry_counter verifies PW3 internally, then RESET RETRY
@@ -8412,22 +8485,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ChangePin {
-            reader,
-            pin,
-            new_pin,
-        } => {
+        PivCmd::ChangePin { reader, .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(pin.as_ref());
-            let second_src = Source::from_flag(new_pin.as_ref());
-            sec.check(&PIV_OLD_PIN, first_src)?;
-            sec.check(&PIV_NEW_PIN, second_src)?;
+            let pair = pair_of(piv_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
-            let (old, new) = read_secret_pair(
-                &mut sec,
-                (&PIV_OLD_PIN, first_src),
-                (&PIV_NEW_PIN, second_src),
-            )?;
+            let (old, new) = pair.read_text(&mut sec)?;
             reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8440,22 +8503,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ChangePuk {
-            reader,
-            puk,
-            new_puk,
-        } => {
+        PivCmd::ChangePuk { reader, .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(puk.as_ref());
-            let second_src = Source::from_flag(new_puk.as_ref());
-            sec.check(&PIV_OLD_PUK, first_src)?;
-            sec.check(&PIV_NEW_PUK, second_src)?;
+            let pair = pair_of(piv_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
-            let (old, new) = read_secret_pair(
-                &mut sec,
-                (&PIV_OLD_PUK, first_src),
-                (&PIV_NEW_PUK, second_src),
-            )?;
+            let (old, new) = pair.read_text(&mut sec)?;
             reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8468,19 +8521,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::UnblockPin {
-            reader,
-            puk,
-            new_pin,
-        } => {
+        PivCmd::UnblockPin { reader, .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(puk.as_ref());
-            let second_src = Source::from_flag(new_pin.as_ref());
-            sec.check(&PIV_PUK, first_src)?;
-            sec.check(&PIV_NEW_PIN, second_src)?;
+            let pair = pair_of(piv_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
-            let (puk, new) =
-                read_secret_pair(&mut sec, (&PIV_PUK, first_src), (&PIV_NEW_PIN, second_src))?;
+            let (puk, new) = pair.read_text(&mut sec)?;
             reverify_if_prompted(&sec, Need::Piv, reader.as_deref())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &name,
@@ -8497,22 +8543,21 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             pin_tries,
             puk_tries,
-            mgmt_key,
-            pin,
             yes,
+            ..
         } => {
             let mut sec = Secrets::real();
-            let pin_src = Source::from_flag(pin.as_ref());
-            sec.check(&PIV_PIN, pin_src)?;
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
+            let pair = pair_of(piv_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
                 &dev,
                 *yes,
                 "set PIV retry counts (resets the PIN and PUK to factory defaults)",
             )?;
-            let pin = sec.read(&PIV_PIN, pin_src)?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
+            let (pin, mgmt) = pair.read(&mut sec)?;
+            let pin = pin.text()?;
+            let mgmt = mgmt.mgmt(&PIV_MGMT_KEY)?;
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let name = crate::target::reader_of(&dev)?;
             keyroost_transport::PivSession::with_transaction_traced(
@@ -8534,21 +8579,20 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         PivCmd::ChangeManagementKey {
             reader,
-            mgmt_key,
-            new_mgmt_key,
             new_algorithm,
             touch,
             allow_pin_unlock,
             force,
+            ..
         } => {
             let mut sec = Secrets::real();
-            let new_src = Source::from_flag(new_mgmt_key.as_ref());
-            check_mgmt_key(&sec, &PIV_OLD_MGMT_KEY, mgmt_key.as_ref())?;
-            sec.check(&PIV_NEW_MGMT_KEY, new_src)?;
+            let pair = pair_of(piv_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
             // The current key first (stdin line 1), then the new one (line 2).
-            let old = read_mgmt_key_input(&mut sec, &PIV_OLD_MGMT_KEY, mgmt_key.as_ref())?;
-            let new = read_mgmt_key_hex(&mut sec, &PIV_NEW_MGMT_KEY, new_src)?;
+            let (old, new) = pair.read(&mut sec)?;
+            let old = old.mgmt(&PIV_OLD_MGMT_KEY)?;
+            let new = new.mgmt_hex(&PIV_NEW_MGMT_KEY)?;
             let new_alg = new_algorithm.to_alg();
             if new.len() != new_alg.key_len() {
                 return Err(format!(
@@ -8907,24 +8951,23 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             reader,
             slot,
             subject,
-            pin,
             out,
             overwrite,
             load_pubkey,
-            mgmt_key,
             keygen,
             key_usage,
             yes,
+            ..
         } => {
             let [out_mode, pub_mode] = crate::prompt::check_overwrites(
                 [out.as_deref(), keygen.save_pubkey.as_deref()],
                 *overwrite,
             )?;
             let mut sec = Secrets::real();
-            let pin_src = Source::from_flag(pin.as_ref());
-            sec.check(&PIV_PIN, pin_src)?;
+            let pair = pair_of(piv_secret_pair(cmd))?;
+            pair.check_first(&sec)?;
             if keygen.generate_key {
-                check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
+                pair.second.check(&sec)?;
             }
             // Judge `--key-usage` and whether the target key can sign before
             // the PIN or the management key is asked for: the algorithm is
@@ -8955,15 +8998,12 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     asked: false,
                 }
             };
-            let pin = sec.read(&PIV_PIN, pin_src)?;
+            let (pin, mgmt_key) = pair.read_first(&mut sec)?;
+            let pin = pin.text()?;
             // The key-generation step needs management-key auth; the CSR
             // signature that follows still only needs the PIN.
             let mgmt = if keygen.generate_key {
-                Some(read_mgmt_key_input(
-                    &mut sec,
-                    &PIV_MGMT_KEY,
-                    mgmt_key.as_ref(),
-                )?)
+                Some(mgmt_key.read(&mut sec)?.mgmt(&PIV_MGMT_KEY)?)
             } else {
                 None
             };
@@ -9021,8 +9061,6 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             days,
             months,
             years,
-            pin,
-            mgmt_key,
             out,
             overwrite,
             load_pubkey,
@@ -9030,6 +9068,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             compression,
             key_usage,
             yes,
+            ..
         } => {
             let [out_mode, pub_mode] = crate::prompt::check_overwrites(
                 [out.as_deref(), keygen.save_pubkey.as_deref()],
@@ -9038,9 +9077,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let valid_for = ValidFor::resolve(*days, *months, *years);
             valid_for.check()?;
             let mut sec = Secrets::real();
-            let pin_src = Source::from_flag(pin.as_ref());
-            sec.check(&PIV_PIN, pin_src)?;
-            check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
+            let pair = pair_of(piv_secret_pair(cmd))?;
+            pair.check(&sec)?;
             // Judge `--key-usage` and whether the target key can sign before
             // the PIN or the management key is asked for (see request-cert).
             let known_alg = early_key_alg(keygen, load_pubkey.as_deref())?;
@@ -9075,8 +9113,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             };
             // The PIN covers the signature (stdin line 1); management-key
             // auth covers the certificate import (line 2).
-            let pin = sec.read(&PIV_PIN, pin_src)?;
-            let mgmt = read_mgmt_key_input(&mut sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
+            let (pin, mgmt) = pair.read(&mut sec)?;
+            let pin = pin.text()?;
+            let mgmt = mgmt.mgmt(&PIV_MGMT_KEY)?;
             crate::prompt::reverify_if_asked(&gate.dev, gate.asked || sec.prompted())?;
             keyroost_transport::PivSession::with_transaction_traced(
                 &gate.name,
@@ -9989,8 +10028,13 @@ fn read_mgmt_key_hex<I: crate::secrets::SecretIo>(
     src: Source<'_>,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
     let hex = sec.read(spec, src)?;
-    // hex_decode's errors describe the problem, never the input.
-    let key = hex_decode(&hex).map_err(|e| format!("the {} is not valid hex: {e}", spec.label))?;
+    Ok(decode_mgmt_key_hex(spec, &hex)?)
+}
+
+/// Decode a management key given as hex. The error names the key, never
+/// the input (hex_decode's errors describe the problem only).
+fn decode_mgmt_key_hex(spec: &Spec, hex: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let key = hex_decode(hex).map_err(|e| format!("the {} is not valid hex: {e}", spec.label))?;
     Ok(zeroize::Zeroizing::new(key))
 }
 
@@ -10020,16 +10064,225 @@ fn mgmt_key_bytes(
     }
 }
 
-/// Read a current secret and then a new one, in that order (stdin lines 1
-/// and 2 when both come from stdin).
-fn read_secret_pair<I: crate::secrets::SecretIo>(
+/// The two secrets a command can read from stdin, in line order: with both
+/// on stdin, the first line is `first` and the second line `second`. Each
+/// such command builds its pair in one place from its own flags
+/// ([`piv_secret_pair`], [`pgp_secret_pair`], [`otp_secret_pair`],
+/// [`oath_secret_pair`], [`fido_pin_secret_pair`]) and reads through it; the
+/// second secret is only reachable after the first is read
+/// ([`SecretPair::read_first`]), so no handler can read them the other way
+/// round.
+#[derive(Clone, Copy)]
+struct SecretPair<'a> {
+    first: (&'static Spec, Option<&'a SecretSource>),
+    second: SecondSecret<'a>,
+}
+
+/// The second secret of a [`SecretPair`], handed out once the first is read.
+#[derive(Clone, Copy)]
+struct SecondSecret<'a> {
+    spec: &'static Spec,
+    flag: Option<&'a SecretSource>,
+}
+
+/// One secret of a [`SecretPair`] as read: a value, or `default` (a
+/// management key, resolved inside the card session).
+enum PairValue {
+    Value(zeroize::Zeroizing<String>),
+    Default,
+}
+
+fn secret_pair<'a>(
+    first: (&'static Spec, &'a Option<SecretSource>),
+    second: (&'static Spec, &'a Option<SecretSource>),
+) -> SecretPair<'a> {
+    SecretPair {
+        first: (first.0, first.1.as_ref()),
+        second: SecondSecret {
+            spec: second.0,
+            flag: second.1.as_ref(),
+        },
+    }
+}
+
+/// [`Secrets::check`] for one flag; `default` satisfies a flag that takes it.
+fn check_flag_secret<I: crate::secrets::SecretIo>(
+    sec: &Secrets<I>,
+    spec: &Spec,
+    flag: Option<&SecretSource>,
+) -> Result<(), String> {
+    if spec.default_ok && crate::secrets::wants_default(flag) {
+        Ok(())
+    } else {
+        sec.check(spec, Source::from_flag(flag))
+    }
+}
+
+fn read_flag_secret<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
-    first: (&Spec, Source<'_>),
-    second: (&Spec, Source<'_>),
-) -> Result<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>), String> {
-    let a = sec.read(first.0, first.1)?;
-    let b = sec.read(second.0, second.1)?;
-    Ok((a, b))
+    spec: &Spec,
+    flag: Option<&SecretSource>,
+) -> Result<PairValue, String> {
+    if spec.default_ok && crate::secrets::wants_default(flag) {
+        Ok(PairValue::Default)
+    } else {
+        Ok(PairValue::Value(sec.read(spec, Source::from_flag(flag))?))
+    }
+}
+
+impl<'a> SecretPair<'a> {
+    /// Check both secrets have a source (before any device I/O).
+    fn check<I: crate::secrets::SecretIo>(&self, sec: &Secrets<I>) -> Result<(), String> {
+        self.check_first(sec)?;
+        self.second.check(sec)
+    }
+    fn check_first<I: crate::secrets::SecretIo>(&self, sec: &Secrets<I>) -> Result<(), String> {
+        check_flag_secret(sec, self.first.0, self.first.1)
+    }
+    /// Read the first secret (stdin line 1); the second comes with it.
+    fn read_first<I: crate::secrets::SecretIo>(
+        self,
+        sec: &mut Secrets<I>,
+    ) -> Result<(PairValue, SecondSecret<'a>), String> {
+        Ok((
+            read_flag_secret(sec, self.first.0, self.first.1)?,
+            self.second,
+        ))
+    }
+    /// Read both, first then second.
+    fn read<I: crate::secrets::SecretIo>(
+        self,
+        sec: &mut Secrets<I>,
+    ) -> Result<(PairValue, PairValue), String> {
+        let (a, second) = self.read_first(sec)?;
+        Ok((a, second.read(sec)?))
+    }
+    /// Read both as text (no `default` on either flag).
+    fn read_text<I: crate::secrets::SecretIo>(
+        self,
+        sec: &mut Secrets<I>,
+    ) -> Result<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>), String> {
+        let (a, b) = self.read(sec)?;
+        Ok((a.text()?, b.text()?))
+    }
+}
+
+impl<'a> SecondSecret<'a> {
+    fn check<I: crate::secrets::SecretIo>(&self, sec: &Secrets<I>) -> Result<(), String> {
+        check_flag_secret(sec, self.spec, self.flag)
+    }
+    fn read<I: crate::secrets::SecretIo>(self, sec: &mut Secrets<I>) -> Result<PairValue, String> {
+        read_flag_secret(sec, self.spec, self.flag)
+    }
+    fn source(&self) -> Source<'a> {
+        Source::from_flag(self.flag)
+    }
+}
+
+impl PairValue {
+    fn text(self) -> Result<zeroize::Zeroizing<String>, String> {
+        match self {
+            PairValue::Value(v) => Ok(v),
+            PairValue::Default => Err("this secret has no default".into()),
+        }
+    }
+    /// A management key: hex, or `default`.
+    fn mgmt(self, spec: &Spec) -> Result<MgmtKeyInput, Box<dyn std::error::Error>> {
+        match self {
+            PairValue::Default => Ok(MgmtKeyInput::Default),
+            PairValue::Value(hex) => Ok(MgmtKeyInput::Key(decode_mgmt_key_hex(spec, &hex)?)),
+        }
+    }
+    /// A management key that must be given as hex.
+    fn mgmt_hex(
+        self,
+        spec: &Spec,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+        Ok(decode_mgmt_key_hex(spec, &self.text()?)?)
+    }
+}
+
+fn piv_secret_pair(cmd: &PivCmd) -> Option<SecretPair<'_>> {
+    Some(match cmd {
+        PivCmd::ChangePin { pin, new_pin, .. } => {
+            secret_pair((&PIV_OLD_PIN, pin), (&PIV_NEW_PIN, new_pin))
+        }
+        PivCmd::ChangePuk { puk, new_puk, .. } => {
+            secret_pair((&PIV_OLD_PUK, puk), (&PIV_NEW_PUK, new_puk))
+        }
+        PivCmd::UnblockPin { puk, new_pin, .. } => {
+            secret_pair((&PIV_PUK, puk), (&PIV_NEW_PIN, new_pin))
+        }
+        PivCmd::SetRetries { pin, mgmt_key, .. }
+        | PivCmd::RequestCert { pin, mgmt_key, .. }
+        | PivCmd::SelfSign { pin, mgmt_key, .. } => {
+            secret_pair((&PIV_PIN, pin), (&PIV_MGMT_KEY, mgmt_key))
+        }
+        PivCmd::ChangeManagementKey {
+            mgmt_key,
+            new_mgmt_key,
+            ..
+        } => secret_pair(
+            (&PIV_OLD_MGMT_KEY, mgmt_key),
+            (&PIV_NEW_MGMT_KEY, new_mgmt_key),
+        ),
+        _ => return None,
+    })
+}
+
+fn pgp_secret_pair(cmd: &OpenpgpCmd) -> Option<SecretPair<'_>> {
+    Some(match cmd {
+        OpenpgpCmd::ChangePin { pin, new_pin, .. } => {
+            secret_pair((&PGP_OLD_USER_PIN, pin), (&PGP_NEW_USER_PIN, new_pin))
+        }
+        OpenpgpCmd::ChangeAdminPin { pin, new_pin, .. } => {
+            secret_pair((&PGP_OLD_ADMIN_PIN, pin), (&PGP_NEW_ADMIN_PIN, new_pin))
+        }
+        OpenpgpCmd::UnblockPin {
+            admin_pin, new_pin, ..
+        } => secret_pair((&PGP_ADMIN_PIN, admin_pin), (&PGP_NEW_USER_PIN, new_pin)),
+        _ => return None,
+    })
+}
+
+fn otp_secret_pair(cmd: &OtpCmd) -> Option<SecretPair<'_>> {
+    Some(match cmd {
+        OtpCmd::ChangePin { pin, new_pin } => {
+            secret_pair((&OTP_OLD_PIN, pin), (&OTP_NEW_PIN, new_pin))
+        }
+        OtpCmd::Add { seed, pin, .. } => secret_pair((&OTP_SEED, seed), (&OTP_PIN, pin)),
+        _ => return None,
+    })
+}
+
+fn oath_secret_pair(cmd: &OathCmd) -> Option<SecretPair<'_>> {
+    Some(match cmd {
+        OathCmd::Add { seed, access, .. } => {
+            secret_pair((&OATH_SEED, seed), (&OATH_PASSWORD, &access.password))
+        }
+        OathCmd::SetPassword {
+            new_password,
+            access,
+        } => secret_pair(
+            (&OATH_PASSWORD, &access.password),
+            (&OATH_NEW_PASSWORD, new_password),
+        ),
+        _ => return None,
+    })
+}
+
+fn fido_pin_secret_pair(cmd: &FidoPinCmd) -> Option<SecretPair<'_>> {
+    Some(match cmd {
+        FidoPinCmd::Change { pin, new_pin, .. } => {
+            secret_pair((&FIDO_OLD_PIN, pin), (&FIDO_NEW_PIN, new_pin))
+        }
+        _ => return None,
+    })
+}
+
+/// The pair of a command its handler knows has one.
+fn pair_of(pair: Option<SecretPair<'_>>) -> Result<SecretPair<'_>, String> {
+    pair.ok_or_else(|| "internal error: this command has no secret pair".to_string())
 }
 
 /// Write `data` to `path` with owner-only permissions (0600) on Unix, failing
@@ -10454,18 +10707,12 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             run_fido_pin_set(path.as_deref(), &new_pin)?;
             Ok(())
         }
-        FidoPinCmd::Change { pin, new_pin, path } => {
+        FidoPinCmd::Change { path, .. } => {
             let mut sec = Secrets::real();
-            let first_src = Source::from_flag(pin.as_ref());
-            let second_src = Source::from_flag(new_pin.as_ref());
-            sec.check(&FIDO_OLD_PIN, first_src)?;
-            sec.check(&FIDO_NEW_PIN, second_src)?;
+            let pair = pair_of(fido_pin_secret_pair(cmd))?;
+            pair.check(&sec)?;
             let dev = crate::target::select_fido(path.as_deref())?;
-            let (old_pin, new_pin) = read_secret_pair(
-                &mut sec,
-                (&FIDO_OLD_PIN, first_src),
-                (&FIDO_NEW_PIN, second_src),
-            )?;
+            let (old_pin, new_pin) = pair.read_text(&mut sec)?;
             fido_reverify_if_prompted(&sec, &dev)?;
             run_fido_pin_change(path.as_deref(), &old_pin, &new_pin)?;
             Ok(())
@@ -17297,26 +17544,23 @@ mod cli_tests {
     fn piv_change_pin_reads_both_before_opening() {
         use crate::secrets::fake::FakeIo;
         let mut sec = crate::secrets::Secrets::new(FakeIo::piped(&["123456\n"]));
-        let e = read_secret_pair(
-            &mut sec,
-            (&PIV_OLD_PIN, Source::new(None, true)),
-            (&PIV_NEW_PIN, Source::new(None, true)),
-        )
-        .unwrap_err();
-        assert_eq!(e, "expected the new PIN on stdin line 2, but stdin ended");
-    }
-
-    #[test]
-    fn piv_pair_reads_current_first_then_new() {
-        use crate::secrets::fake::FakeIo;
-        let mut sec = crate::secrets::Secrets::new(FakeIo::piped(&["123456\n", "654321\n"]));
-        let (old, new) = read_secret_pair(
-            &mut sec,
-            (&PIV_OLD_PIN, Source::new(None, true)),
-            (&PIV_NEW_PIN, Source::new(None, true)),
-        )
+        let cli = parse(&[
+            "keyroostctl",
+            "piv",
+            "change-pin",
+            "--pin",
+            "stdin",
+            "--new-pin",
+            "stdin",
+        ])
         .unwrap();
-        assert_eq!((old.as_str(), new.as_str()), ("123456", "654321"));
+        let Some(Cmd::Piv { cmd }) = &cli.command else {
+            panic!("expected piv change-pin")
+        };
+        let Err(e) = piv_secret_pair(cmd).unwrap().read_text(&mut sec) else {
+            panic!("stdin ended after one line")
+        };
+        assert_eq!(e, "expected the new PIN on stdin line 2, but stdin ended");
     }
 
     #[test]
@@ -17572,6 +17816,21 @@ mod cli_tests {
             order.insert(cols[0].to_owned(), written);
         }
         assert_eq!(tree, table, "tests/secret_flags.txt is out of date");
+        // Column 4 per path: the secrets every run needs (all rows).
+        let mut needed: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for line in SECRET_TABLE
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        {
+            let cols: Vec<&str> = line.split('\t').filter(|c| !c.is_empty()).collect();
+            needed.entry(cols[0].to_owned()).or_default().extend(
+                cols[cols.len() - 1]
+                    .split([' ', '|'])
+                    .filter(|w| *w != "-")
+                    .map(str::to_owned),
+            );
+        }
         let mut root = Cli::command();
         root.build();
         for path in tree.keys() {
@@ -17616,6 +17875,14 @@ mod cli_tests {
                     !f.default_ok || help.contains("default"),
                     "{path} --{long}: the help doesn't name `default`: {help}"
                 );
+                // "a terminal asks." unqualified only where every run needs
+                // the secret; elsewhere the help says when it asks, or that
+                // it never does.
+                let required = needed[path.as_str()].iter().any(|n| n == long);
+                // (clap drops the help's final period.)
+                let asks_always =
+                    help.ends_with("a terminal asks") || help.contains("a terminal asks.");
+                assert_eq!(asks_always, required, "{path} --{long}: {help}");
             }
             // Two stdin sources that can be combined: each states its line,
             // and column 3 lists the first-line one first.
@@ -17710,25 +17977,221 @@ mod cli_tests {
         }
     }
 
+    /// `openpgp change-admin-pin --pin` is the admin PIN, not the user PIN
+    /// `--pin` means elsewhere in `openpgp`; its help says so plainly.
+    #[test]
+    fn openpgp_change_admin_pin_help_names_the_admin_pin() {
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let c = root
+            .find_subcommand("openpgp")
+            .unwrap()
+            .find_subcommand("change-admin-pin")
+            .unwrap();
+        for (long, want) in [
+            ("pin", "the current admin PIN (PW3), not the user PIN"),
+            ("new-pin", "the new admin PIN (PW3), not the user PIN"),
+        ] {
+            let help = c
+                .get_arguments()
+                .find(|a| a.get_long() == Some(long))
+                .and_then(|a| a.get_help().map(|h| h.to_string()))
+                .unwrap_or_default();
+            assert!(help.contains(want), "--{long}: {help}");
+        }
+    }
+
+    /// No help text names an old `--X-env` / `--X-stdin` / `--X-default`
+    /// spelling (or `--pin-*`) of a flag that now takes a source. The
+    /// Molto2 key, seed and URI flags keep theirs until they move.
+    #[test]
+    fn help_names_no_retired_secret_flag() {
+        let retired = RETIRED_FLAGS
+            .iter()
+            .filter(|r| r.words.is_empty() && r.flag != "--list-readers")
+            .map(|r| r.flag)
+            .chain(["--pin-*", "--old-"]);
+        let retired: Vec<&str> = retired.collect();
+        let mut bad = Vec::new();
+        for (path, cmd) in all_commands() {
+            let mut texts: Vec<String> = [cmd.get_about(), cmd.get_long_about()]
+                .into_iter()
+                .flatten()
+                .map(|t| t.to_string())
+                .collect();
+            for a in cmd.get_arguments() {
+                texts.extend(a.get_help().map(|h| h.to_string()));
+                texts.extend(a.get_long_help().map(|h| h.to_string()));
+            }
+            for t in texts {
+                for r in &retired {
+                    // Whole flags only: `--pin-env` but not `--pin-envelope`.
+                    let hit = if r.ends_with('*') || r.ends_with('-') {
+                        t.contains(r)
+                    } else {
+                        t.match_indices(r).any(|(i, _)| {
+                            !t[i + r.len()..]
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+                        })
+                    };
+                    if hit {
+                        bad.push(format!("{path}: {r} in {t:?}"));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// A retired `--X-env` / `--X-stdin` flag names the replacement this
+    /// command really has: `--pin-env` on a command whose PIN flag is
+    /// `--admin-pin` or `--new-pin` names that flag, never `--pin`.
+    #[test]
+    fn a_retired_secret_flag_names_this_commands_own_flag() {
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        for (flag, line, want, never) in [
+            (
+                "--pin-env",
+                "keyroostctl openpgp set-name x --pin-env V",
+                "--admin-pin",
+                "now --pin ",
+            ),
+            (
+                "--pin-stdin",
+                "keyroostctl fido pin set --pin-stdin",
+                "--new-pin",
+                "now --pin ",
+            ),
+            (
+                "--mgmt-key-env",
+                "keyroostctl piv change-pin --mgmt-key-env V",
+                "--pin",
+                "now --mgmt-key",
+            ),
+            // The command has the flag: the plain row.
+            (
+                "--pin-env",
+                "keyroostctl piv change-pin --pin-env V",
+                "--pin-env VAR is now --pin env:VAR",
+                "\u{0}",
+            ),
+        ] {
+            let msg = retired_flag_hint(flag, &argv(line)).unwrap_or_else(|| panic!("{line}"));
+            assert!(msg.contains(want), "{line}: {msg}");
+            assert!(!msg.contains(never), "{line}: {msg}");
+            assert!(
+                !msg.contains(" V ") && !msg.ends_with(" V"),
+                "{line}: {msg}"
+            );
+        }
+    }
+
+    /// The pair a two-secret command's handler reads through.
+    fn stdin_pair(cmd: &Cmd) -> Option<SecretPair<'_>> {
+        match cmd {
+            Cmd::Piv { cmd } => piv_secret_pair(cmd),
+            Cmd::Openpgp { cmd } => pgp_secret_pair(cmd),
+            Cmd::Otp { cmd, .. } => otp_secret_pair(cmd),
+            Cmd::Oath { cmd } => oath_secret_pair(cmd),
+            Cmd::Fido {
+                cmd: FidoCmd::Pin { cmd },
+            } => fido_pin_secret_pair(cmd),
+            _ => None,
+        }
+    }
+
+    /// Every command whose two secrets can both come from stdin (every
+    /// table row with two combinable secret flags): parsed with both on
+    /// stdin and read through the pair its handler uses, line 1 lands in
+    /// the first secret and line 2 in the second; the pair's flags are the
+    /// table's column 3 in order, and the help calls them first and second
+    /// line.
     #[test]
     fn stdin_line_order_per_command() {
         use crate::secrets::fake::FakeIo;
-        // (first spec, second spec): the first stdin line goes to the first.
-        for (a, b) in [
-            (PIV_OLD_PIN, PIV_NEW_PIN),
-            (PIV_OLD_PUK, PIV_NEW_PUK),
-            (PIV_PUK, PIV_NEW_PIN),
-            (PIV_OLD_MGMT_KEY, PIV_NEW_MGMT_KEY),
-            (OATH_SEED, OATH_PASSWORD),
-            (OATH_PASSWORD, OATH_NEW_PASSWORD),
-            (OTP_SEED, OTP_PIN),
-            (PGP_ADMIN_PIN, PGP_NEW_USER_PIN),
-        ] {
-            let mut s = Secrets::new(FakeIo::piped(&["11\n", "22\n"]));
-            let stdin = Source::from_flag(Some(&SecretSource::Stdin));
-            assert_eq!(&*s.read(&a, stdin).unwrap(), "11", "{}", a.label);
-            assert_eq!(&*s.read(&b, stdin).unwrap(), "22", "{}", b.label);
+        use clap::CommandFactory;
+        let mut root = Cli::command();
+        root.build();
+        let mut covered = Vec::new();
+        for line in SECRET_TABLE
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        {
+            let cols: Vec<&str> = line.split('\t').filter(|c| !c.is_empty()).collect();
+            let flags: Vec<&str> = cols[cols.len() - 2].split(' ').collect();
+            if flags.len() != 2 {
+                continue;
+            }
+            let path: Vec<&str> = cols[0].split(' ').collect();
+            let mut cmd = &root;
+            for name in &path {
+                cmd = cmd.find_subcommand(name).unwrap();
+            }
+            let arg = |long: &str| {
+                cmd.get_arguments()
+                    .find(|a| a.get_long() == Some(long))
+                    .unwrap_or_else(|| panic!("{line}: no --{long}"))
+            };
+            let source = |long: &str| {
+                cmd.get_arguments()
+                    .any(|a| a.get_long() == Some(long) && is_secret_arg(a))
+            };
+            if !source(flags[0]) || args_conflict(cmd, arg(flags[0]), arg(flags[1])) {
+                continue; // an old pair (Task 3), or one choice of two
+            }
+            let help = |long: &str| arg(long).get_help().unwrap().to_string();
+            assert!(help(flags[0]).contains("first line"), "{line}");
+            assert!(help(flags[1]).contains("second line"), "{line}");
+            let mut argv = vec!["keyroostctl"];
+            argv.extend(&path);
+            if cols.len() == 4 {
+                argv.extend(cols[1].split(' '));
+            }
+            let a = format!("--{}", flags[0]);
+            let b = format!("--{}", flags[1]);
+            argv.extend([a.as_str(), "stdin", b.as_str(), "stdin"]);
+            if cols[0] == "piv request-cert" {
+                argv.push("--generate-key"); // --mgmt-key needs it there
+            }
+            let cli = parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let pair = cli
+                .command
+                .as_ref()
+                .and_then(stdin_pair)
+                .unwrap_or_else(|| panic!("{line}: the handler reads no pair"));
+            assert_eq!(
+                [pair.first.0.flag, pair.second.spec.flag],
+                [flags[0], flags[1]],
+                "{line}"
+            );
+            let mut sec = Secrets::new(FakeIo::piped(&["11\n", "22\n"]));
+            let (first, second) = pair.read_text(&mut sec).unwrap();
+            assert_eq!([first.as_str(), second.as_str()], ["11", "22"], "{line}");
+            covered.push(cols[0]);
         }
+        covered.dedup();
+        assert_eq!(
+            covered,
+            [
+                "fido pin change",
+                "oath add",
+                "oath set-password",
+                "openpgp change-pin",
+                "openpgp change-admin-pin",
+                "openpgp unblock-pin",
+                "piv change-pin",
+                "piv change-puk",
+                "piv unblock-pin",
+                "piv set-retries",
+                "piv change-management-key",
+                "piv request-cert",
+                "piv self-sign",
+                "otp add",
+                "otp change-pin",
+            ]
+        );
     }
 
     #[test]
