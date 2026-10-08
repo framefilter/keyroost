@@ -9977,8 +9977,8 @@ fn piv_slot_occupancy(
 }
 
 /// The red "replace?" warning for generating a key into `slot`, or `None`
-/// when the slot is known to be empty. (Move never replaces: see
-/// [`piv_move_dest_warning`].)
+/// when the slot is known to be empty. (Move has its own notes: see
+/// [`piv_move_dest_warning`] and [`piv_move_dest_note`].)
 fn piv_replace_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
     match occupancy {
         PivOccupancy::Key => Some(format!(
@@ -9991,10 +9991,9 @@ fn piv_replace_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
     }
 }
 
-/// The red note for a Move destination. Moving onto a slot that holds a key
-/// is refused before anything is sent to the card, so a known-occupied
-/// destination cannot be used; an unknown one needs no warning because the
-/// check happens before the move.
+/// The red note for a Move destination the card reports holds a key:
+/// keyroost refuses that move before anything is sent. (A destination
+/// keyroost can't read gets [`piv_move_dest_note`] instead.)
 fn piv_move_dest_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> {
     match occupancy {
         PivOccupancy::Key => Some(format!(
@@ -10002,6 +10001,13 @@ fn piv_move_dest_warning(occupancy: PivOccupancy, slot: &str) -> Option<String> 
         )),
         PivOccupancy::MaybeKey | PivOccupancy::Empty => None,
     }
+}
+
+/// The neutral note for a Move destination keyroost can't read: the move is
+/// sent, and the card decides.
+fn piv_move_dest_note(occupancy: PivOccupancy, slot: &str) -> Option<String> {
+    matches!(occupancy, PivOccupancy::MaybeKey)
+        .then(|| format!("keyroost can't tell whether {slot} holds a key; the card decides."))
 }
 
 /// Whether a slot-emptiness-sensitive button should dim specifically because
@@ -16338,13 +16344,18 @@ impl App {
                             });
                             ui.add_space(6.0);
                             if let Some(dest) = self.piv.move_dest {
+                                let occupancy = self.piv_occupancy(dest);
                                 if let Some(warning) =
-                                    piv_move_dest_warning(self.piv_occupancy(dest), &dest.label())
+                                    piv_move_dest_warning(occupancy, &dest.label())
                                 {
                                     ui.colored_label(
                                         p.err,
                                         egui::RichText::new(warning).font(theme::f_sb(12.5)),
                                     );
+                                    ui.add_space(6.0);
+                                }
+                                if let Some(note) = piv_move_dest_note(occupancy, &dest.label()) {
+                                    card_note(ui, p, &note);
                                     ui.add_space(6.0);
                                 }
                             }
@@ -22994,6 +23005,16 @@ mod tests {
         assert!(!w.contains("OVERWRITES") && !w.contains("replaced"));
         assert_eq!(piv_move_dest_warning(PivOccupancy::MaybeKey, "9a"), None);
         assert_eq!(piv_move_dest_warning(PivOccupancy::Empty, "9a"), None);
+    }
+
+    #[test]
+    fn move_destination_of_unknown_occupancy_gets_a_neutral_note() {
+        assert_eq!(
+            piv_move_dest_note(PivOccupancy::MaybeKey, "9a").as_deref(),
+            Some("keyroost can't tell whether 9a holds a key; the card decides.")
+        );
+        assert_eq!(piv_move_dest_note(PivOccupancy::Key, "9a"), None);
+        assert_eq!(piv_move_dest_note(PivOccupancy::Empty, "9a"), None);
     }
 
     #[test]
