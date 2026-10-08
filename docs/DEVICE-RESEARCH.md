@@ -31,6 +31,9 @@ and **without undermining the key's anti-tracking design**.
 ## Principles / constraints (hard, not preferences)
 
 1. **Read-only.** No writing markers/UUIDs/largeBlob/credentials to establish identity.
+   The name a user can store on a key (`name set --store key`,
+   [PROTOCOL-device-label.md](PROTOCOL-device-label.md)) is a label they chose,
+   never an identity: selection trusts only the fingerprints this computer recorded.
 2. **Local-only storage.** Captured ID stays on this host; never transmitted, never shown to a relying party.
 3. **Respect FIDO2 anti-correlation.** FIDO2 omits a global device ID on purpose. If the only per-unit ID lives on a non-FIDO interface (e.g. a USB iSerial via OTP/CCID), using it re-introduces a correlatable hardware ID. Local-only use is the mitigation — state the trade-off, gate on the privacy review.
 4. **No PINs, no secrets** required for identity probing.
