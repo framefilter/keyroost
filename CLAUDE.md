@@ -175,7 +175,7 @@ host secrets as untouchable. A PreToolUse hook (`.claude/hooks/guard.sh`)
 enforces the rules below; **don't try to work around the guard** — if it
 blocks something, that's intended.
 
-- **Destructive FIDO ops** (`keyroostctl fido reset`, `fido credentials delete`) are
+- **Destructive FIDO ops** (`keyroostctl fido reset`, `fido credential delete`) are
   irreversible. This checkout is used only with disposable **test keys**, so
   the guard no longer blocks them — still treat them with care and never point
   them at a security key in real use.
@@ -183,10 +183,11 @@ blocks something, that's intended.
   PIN/password/token variable, don't read `.env`, `*.pem`, SSH keys, or
   NetworkManager / `wpa_supplicant` WiFi configs. (Hook-blocked.)
 - **PIN entry is the user's job.** keyroostctl takes no secret in argv; with
-  no `--pin-env` / `--pin-stdin` it asks at a hidden terminal prompt. The user
-  types it there, or sets `--pin-env` / `--pin-stdin` up in their own shell.
+  no `--pin env:NAME` / `--pin stdin` it asks at a hidden terminal prompt. The
+  user types it there, or sets `--pin env:NAME` / `--pin stdin` up in their own
+  shell.
   Don't ask for the PIN, don't place it in argv, don't read it back.
-- **Credential listings are private.** `fido credentials list` reveals which services
+- **Credential listings are private.** `fido credential list` reveals which services
   the user has accounts with. Don't run it speculatively; if the user shares
   output, don't echo usernames / RP names beyond what the task needs.
 - **Safe to run freely against any key:** `keyroostctl doctor`, `keyroostctl list`,

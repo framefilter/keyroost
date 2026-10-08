@@ -203,7 +203,7 @@ pub mod aegis {
                 #[cfg(feature = "encrypted")]
                 {
                     return Err(BulkError::Encrypted(
-                        "Aegis export is encrypted; supply a password (CLI: --password-stdin)",
+                        "Aegis export is encrypted; supply a password (CLI: --password env:NAME or --password stdin)",
                     ));
                 }
                 #[cfg(not(feature = "encrypted"))]
