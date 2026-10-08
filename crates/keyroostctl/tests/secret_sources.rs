@@ -71,11 +71,11 @@ fn retired_secret_flags_name_their_replacement() {
             "--pin stdin --new-pin stdin",
         ),
         (
-            &["piv", "change-pin", "--old-pin-env", "S3CRETVALUE"],
+            &["piv", "pin", "change", "--old-pin-env", "S3CRETVALUE"],
             "--pin env:VAR",
         ),
         (
-            &["piv", "set-retries", "--mgmt-key-default"],
+            &["piv", "retries", "set", "--mgmt-key-default"],
             "--mgmt-key default",
         ),
         (
@@ -147,7 +147,8 @@ fn a_stdin_flag_given_a_value_is_not_repeated() {
 
     let (code, err) = run(&[
         "piv",
-        "change-pin",
+        "pin",
+        "change",
         "--old-pin-stdin",
         "--new-pin-stdin=S3CRET",
     ]);
@@ -161,7 +162,7 @@ fn a_stdin_flag_given_a_value_is_not_repeated() {
 /// short-flag prefix it choked on, which isn't the whole word.
 #[test]
 fn a_dash_led_value_after_a_stdin_flag_is_not_repeated() {
-    let (code, err) = run(&["piv", "change-pin", "--pin", "stdin", "-123456"]);
+    let (code, err) = run(&["piv", "pin", "change", "--pin", "stdin", "-123456"]);
     assert_eq!(code, 2, "{err}");
     assert!(
         err.contains("unexpected extra argument (not shown, in case it is a secret)"),
@@ -179,7 +180,9 @@ fn a_typo_still_gets_claps_similar_name_tip() {
     assert_ne!(code, 0, "{err}");
     assert!(err.contains("a similar subcommand exists: 'seed'"), "{err}");
 
-    let (code, err) = run(&["piv", "change-pin", "--pin", "stdin", "--new-pn", "stdin"]);
+    let (code, err) = run(&[
+        "piv", "pin", "change", "--pin", "stdin", "--new-pn", "stdin",
+    ]);
     assert_ne!(code, 0, "{err}");
     assert!(
         err.contains("a similar argument exists: '--new-pin'"),
@@ -336,14 +339,14 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
 #[test]
 fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
     let cases: &[&[&str]] = &[
-        &["piv", "change-pin", "--pin", "S3CRETVALUE"],
-        &["piv", "change-pin", "--pin=S3CRETVALUE"],
-        &["piv", "change-pin", "--pin", "-S3CRETVALUE"],
-        &["piv", "change-pin", "--new-pin", "env:"],
-        &["piv", "change-puk", "--puk", "STDIN"],
-        &["piv", "change-puk", "--new-puk", "S3CRETVALUE"],
-        &["piv", "new-chuid", "--mgmt-key", "S3CRETVALUE"],
-        &["piv", "change-management-key", "--new-mgmt-key", "default"],
+        &["piv", "pin", "change", "--pin", "S3CRETVALUE"],
+        &["piv", "pin", "change", "--pin=S3CRETVALUE"],
+        &["piv", "pin", "change", "--pin", "-S3CRETVALUE"],
+        &["piv", "pin", "change", "--new-pin", "env:"],
+        &["piv", "puk", "change", "--puk", "STDIN"],
+        &["piv", "puk", "change", "--new-puk", "S3CRETVALUE"],
+        &["piv", "chuid", "generate", "--mgmt-key", "S3CRETVALUE"],
+        &["piv", "mgmt-key", "change", "--new-mgmt-key", "default"],
         &["openpgp", "set-name", "x", "--admin-pin", "S3CRETVALUE"],
         &["oath", "list", "--password", "S3CRETVALUE"],
         &["oath", "set-password", "--new-password", "S3CRETVALUE"],
@@ -372,8 +375,8 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
     assert!(err.contains("is now `molto import --uri stdin`"), "{err}");
     // A value after `--pin stdin` is a stray argument, hidden too.
     for args in [
-        &["piv", "change-pin", "--pin", "stdin", "S3CRETVALUE"][..],
-        &["piv", "change-pin", "--pin", "stdin", "-S3CRETVALUE"],
+        &["piv", "pin", "change", "--pin", "stdin", "S3CRETVALUE"][..],
+        &["piv", "pin", "change", "--pin", "stdin", "-S3CRETVALUE"],
     ] {
         let (code, err) = run(args);
         assert_eq!(code, 2, "{args:?}: {err}");
@@ -382,7 +385,8 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
     // env:NAME with NAME unset: the flag is named, never the NAME.
     let (code, err) = run(&[
         "piv",
-        "change-pin",
+        "pin",
+        "change",
         "--pin",
         "env:S3CRETVALUE",
         "--new-pin",
@@ -401,9 +405,9 @@ fn a_literal_secret_is_refused_with_exit_2_and_never_echoed() {
 #[test]
 fn a_flag_after_a_secret_flag_is_a_missing_value() {
     for (args, flag) in [
-        (&["piv", "change-pin", "--pin", "--yes"][..], "--pin"),
+        (&["piv", "pin", "change", "--pin", "--yes"][..], "--pin"),
         (
-            &["piv", "change-pin", "--pin", "--new-pin", "stdin"],
+            &["piv", "pin", "change", "--pin", "--new-pin", "stdin"],
             "--pin",
         ),
         (&["oath", "list", "--password", "--json"], "--password"),
@@ -419,7 +423,7 @@ fn a_flag_after_a_secret_flag_is_a_missing_value() {
             "{args:?}: {err}"
         );
     }
-    let (code, err) = run(&["piv", "new-chuid", "--mgmt-key", "--yes"]);
+    let (code, err) = run(&["piv", "chuid", "generate", "--mgmt-key", "--yes"]);
     assert_eq!(code, 2, "{err}");
     assert!(
         err.contains("--mgmt-key needs a value: env:NAME, stdin or default"),

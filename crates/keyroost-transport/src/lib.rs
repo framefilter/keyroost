@@ -528,7 +528,7 @@ impl fmt::Display for TransportError {
                 "the factory reset's throwaway PUK guess turned out to be this \
                  card's real PUK, so the card unblocked the PIN and set it to \
                  123456 instead of counting a failed attempt. Change that PIN \
-                 (`keyroostctl piv change-pin`) before running the factory reset \
+                 (`keyroostctl piv pin change`) before running the factory reset \
                  again."
             ),
             TransportError::PivDestinationOccupied(slot) => write!(

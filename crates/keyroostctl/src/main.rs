@@ -240,7 +240,7 @@ enum CertFormat {
     Der,
 }
 
-/// Encode a certificate for `piv export-cert`.
+/// Encode a certificate for `piv cert export`.
 fn encode_cert(der: &[u8], format: CertFormat) -> Vec<u8> {
     match format {
         CertFormat::Pem => keyroost_piv::x509::pem_certificate(der).into_bytes(),
@@ -356,7 +356,7 @@ impl CliPivSlot {
     }
 }
 
-/// Asymmetric key algorithm for `piv generate-key`.
+/// Asymmetric key algorithm for `piv key generate`.
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum CliPivKeyAlg {
     Rsa1024,
@@ -564,15 +564,15 @@ fn check_key_usage_args(
     Ok(())
 }
 
-/// The slot key's algorithm if `--generate-key`/`--load-pubkey` already name
+/// The slot key's algorithm if `--generate-key`/`--pubkey-in` already name
 /// it, so `--key-usage` can be checked before touching the card.
 fn early_key_alg(
     keygen: &InlineKeyGen,
-    load_pubkey: Option<&std::path::Path>,
+    pubkey_in: Option<&std::path::Path>,
 ) -> Result<Option<keyroost_piv::KeyAlg>, Box<dyn std::error::Error>> {
     if keygen.generate_key {
         Ok(Some(keygen.algorithm.to_alg()))
-    } else if let Some(path) = load_pubkey {
+    } else if let Some(path) = pubkey_in {
         Ok(Some(load_pubkey_material(path)?.0))
     } else {
         Ok(None)
@@ -650,7 +650,7 @@ fn resolve_key_usage(
     Ok(Some(keyroost_piv::x509::KeyUsageExt { usages, critical }))
 }
 
-/// Whether `piv import-cert` / `piv self-sign` store the certificate
+/// Whether `piv cert import` / `piv cert generate` store the certificate
 /// compressed. Neither flag: compress only if the card refuses the
 /// certificate as too large.
 #[derive(clap::Args)]
@@ -733,26 +733,26 @@ fn print_cert_stored(line: &str, stored: &keyroost_transport::CertImport) {
     }
 }
 
-/// The optional `--generate-key` convenience shared by `piv request-cert` and
-/// `piv self-sign`. Flattened into both: it folds a fresh `piv generate-key`
+/// The optional `--generate-key` convenience shared by `piv cert request` and
+/// `piv cert generate`. Flattened into both: it folds a fresh `piv key generate`
 /// into the signing command so that on a card without GET METADATA (firmware
 /// older than 5.3, or non-Yubico PIV) you don't have to shuttle the public key
-/// through a temporary file (`generate-key --save-pubkey` then this command's
-/// `--load-pubkey`). Every option mirrors `piv generate-key` and is inert
+/// through a temporary file (`piv key generate --out` then this command's
+/// `--pubkey-in`). Every option mirrors `piv key generate` and is inert
 /// unless `--generate-key` is passed.
 #[derive(clap::Args)]
 struct InlineKeyGen {
     /// Generate a fresh key pair in the slot on the card first, then sign
     /// against it. This replaces any key already in the slot (asks first when
     /// there is one). Convenience only: it does exactly what running `piv
-    /// generate-key` beforehand would, but keeps the freshly generated public
+    /// key generate` beforehand would, but keeps the freshly generated public
     /// key in this same session so no temporary key-material file is needed.
     /// Omit it to keep the normal behavior — sign the key already in the slot,
-    /// named via GET METADATA or `--load-pubkey`. With it, `--load-pubkey`
-    /// (and any prior `generate-key --save-pubkey`) is unnecessary, which is
+    /// named via GET METADATA or `--pubkey-in`. With it, `--pubkey-in`
+    /// (and any prior `piv key generate --out`) is unnecessary, which is
     /// the whole point on cards that don't support GET METADATA. Needs the
     /// management key.
-    #[arg(long, conflicts_with = "load_pubkey")]
+    #[arg(long, conflicts_with = "pubkey_in")]
     generate_key: bool,
     /// With `--generate-key`: algorithm of the new key pair.
     #[arg(long, value_enum, default_value = "eccp256", requires = "generate_key")]
@@ -768,10 +768,10 @@ struct InlineKeyGen {
     #[arg(long, value_enum, default_value = "default", requires = "generate_key")]
     touch_policy: CliTouchPolicy,
     /// With `--generate-key`: also write the generated public key (PEM) to
-    /// this path. Not needed for the signature itself — the key is used from
-    /// this session — just a spare copy to keep or hand to other tools.
-    #[arg(long, value_name = "PATH", requires = "generate_key")]
-    save_pubkey: Option<std::path::PathBuf>,
+    /// FILE. Not needed for the signature itself — the key is used from this
+    /// session — just a spare copy to keep or hand to other tools.
+    #[arg(long, value_name = "FILE", requires = "generate_key")]
+    pubkey_out: Option<std::path::PathBuf>,
 }
 
 /// Subcommands for the PIV smart-card applet. Secret material (PINs, PUK,
@@ -785,369 +785,40 @@ enum PivCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Change the PIV PIN. Each PIN comes from an environment variable,
-    /// stdin (the current PIN on the first line, the new one on the second)
-    /// or, with neither, a hidden prompt.
-    ChangePin {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// The current PIN: env:NAME reads that environment variable, stdin
-        /// reads one line (first line; hidden when typed at a terminal). With
-        /// neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-        /// The new PIN: env:NAME reads that environment variable, stdin reads
-        /// one line (second line when --pin stdin is also given; hidden when
-        /// typed at a terminal). With neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        new_pin: Option<SecretSource>,
+    /// Change the PIV PIN, or unblock it with the PUK.
+    Pin {
+        #[command(subcommand)]
+        cmd: PivPinCmd,
     },
-    /// Change the PUK (PIN Unblocking Key). Each PUK comes from an
-    /// environment variable, stdin (the current PUK on the first line, the
-    /// new one on the second) or, with neither, a hidden prompt.
-    ChangePuk {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// The current PUK: env:NAME reads that environment variable, stdin
-        /// reads one line (first line; hidden when typed at a terminal). With
-        /// neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        puk: Option<SecretSource>,
-        /// The new PUK: env:NAME reads that environment variable, stdin reads
-        /// one line (second line when --puk stdin is also given; hidden when
-        /// typed at a terminal). With neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        new_puk: Option<SecretSource>,
+    /// Change the PUK (the code that unblocks the PIN).
+    Puk {
+        #[command(subcommand)]
+        cmd: PivPukCmd,
     },
-    /// Unblock a blocked PIN using the PUK, setting a new PIN.
-    UnblockPin {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// The PUK: env:NAME reads that environment variable, stdin reads one
-        /// line (first line; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        puk: Option<SecretSource>,
-        /// The new PIN: env:NAME reads that environment variable, stdin reads
-        /// one line (second line when --puk stdin is also given; hidden when
-        /// typed at a terminal). With neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        new_pin: Option<SecretSource>,
+    /// Set how many wrong PIN and PUK entries are allowed.
+    Retries {
+        #[command(subcommand)]
+        cmd: PivRetriesCmd,
     },
-    /// Set the PIN and PUK retry counts (Yubico extension); this also resets
-    /// the PIN and PUK themselves to their factory defaults. Needs the
-    /// management key and the current PIN.
-    SetRetries {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// PIN retry count, at least 1: a zero count would leave the PIN
-        /// permanently blocked.
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
-        pin_tries: u8,
-        /// PUK retry count, at least 1: a zero count would leave the PUK
-        /// permanently blocked.
-        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
-        puk_tries: u8,
-        /// The management key (hex): env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --pin stdin is also given;
-        /// hidden when typed at a terminal), default uses the factory-default
-        /// management key keyroost knows for this device. With none of these, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
-        mgmt_key: Option<SecretSource>,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (first line; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
+    /// Change the management key (mgmt-key: the key that authorizes changes to keys and certificates).
+    MgmtKey {
+        #[command(subcommand)]
+        cmd: PivMgmtKeyCmd,
     },
-    /// Change the card-management (9B) key. Both keys are hex; from stdin,
-    /// the current key comes on the first line and the new one on the
-    /// second.
-    ///
-    /// Changing the management key is an extension to standard PIV (YubiKey
-    /// and other keys that implement it).
-    /// If keyroost's list marks this key as not supporting it, the command
-    /// stops unless `--force`; a key with no entry gets a warning.
-    ///
-    /// On every device except HID Crescendo (which unlocks management
-    /// directly off the PIN, with no key material to store), this also
-    /// maintains Yubico's PIN-protected management-key storage, enabling it
-    /// with `--allow-pin-unlock` or disabling it without. The same list
-    /// applies: a key with no entry gets a warning. If the list marks
-    /// this key as not supporting it, `--allow-pin-unlock` stops unless
-    /// `--force`, and without it the step is skipped, so a plain key rotation
-    /// isn't blocked.
-    ChangeManagementKey {
-        // Explicit `display_order` on every field here (10.. up, one per
-        // field, matching declaration order): clap-derive's implicit order
-        // is an auto-incrementing counter that starts fresh at 0 in *each*
-        // derive invocation, including the top-level `Cli` struct's own
-        // `global = true` args (`--debug`/`--device`/`--json`, implicitly
-        // 0..2). Left implicit, this variant's own
-        // fields also start at 0, so `--help` interleaved the two structs'
-        // args by tied order number instead of keeping this command's own
-        // args — the `--old-mgmt-key-*` trio in particular — together.
-        #[arg(long, value_name = "SUBSTR", display_order = 10, help = READER_HELP)]
-        reader: Option<String>,
-        /// The current management key (hex): env:NAME reads that environment
-        /// variable, stdin reads one line (first line; hidden when typed at a
-        /// terminal), default uses the factory-default management key keyroost
-        /// knows for this device. With none of these, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, display_order = 11)]
-        mgmt_key: Option<SecretSource>,
-        /// The new management key (hex): env:NAME reads that environment
-        /// variable, stdin reads one line (second line when --mgmt-key stdin is
-        /// also given; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, display_order = 14)]
-        new_mgmt_key: Option<SecretSource>,
-        /// Algorithm of the NEW management key.
-        #[arg(long, value_enum, default_value = "aes192", display_order = 16)]
-        new_algorithm: CliPivMgmtAlg,
-        /// Require a physical touch for every future management-key auth.
-        #[arg(long, display_order = 17)]
-        touch: bool,
-        /// Store the new management key PIN-protected, so it can later be
-        /// unlocked with the PIN alone instead of the raw key. Omit to
-        /// instead clear any existing PIN-protected storage of the old key —
-        /// except on a device confirmed unable to support this at all, where
-        /// omitting it is a no-op rather than an attempted clear. Ignored on
-        /// HID Crescendo, which already unlocks management off the PIN with
-        /// no key material of its own to store.
-        #[arg(long, display_order = 18)]
-        allow_pin_unlock: bool,
-        /// Run even if keyroost's list marks this key as not supporting it.
-        #[arg(long, display_order = 19)]
-        force: bool,
+    /// Generate, delete or move the private keys in PIV slots.
+    Key {
+        #[command(subcommand)]
+        cmd: PivKeyCmd,
     },
-    /// Generate a new key pair in a slot, replacing any key already there, and
-    /// print its public key (PEM). Irreversible: asks first (`--yes` to skip).
-    ///
-    /// Needs the management key. Asks only when the slot isn't known to be
-    /// empty.
-    GenerateKey {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
-        /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
-        slot: CliPivSlot,
-        /// Key type to generate (OpenPGP's `nistp256` is `eccp256` here).
-        #[arg(long, value_enum, default_value = "eccp256")]
-        algorithm: CliPivKeyAlg,
-        /// When the new key's private key may be used. `default` sends the
-        /// standard PIV command every card accepts; the other values are a
-        /// Yubico extension (firmware-dependent).
-        #[arg(long, value_enum, default_value = "default")]
-        pin_policy: CliPinPolicy,
-        /// Whether using the new key requires a physical touch. Same caveat:
-        /// only `default` is standard PIV, the rest are a Yubico extension
-        /// (firmware-dependent).
-        #[arg(long, value_enum, default_value = "default")]
-        touch_policy: CliTouchPolicy,
-        /// The management key (hex): env:NAME reads that environment variable,
-        /// stdin reads one line (hidden when typed at a terminal), default uses
-        /// the factory-default management key keyroost knows for this device.
-        /// With none of these, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
-        mgmt_key: Option<SecretSource>,
-        /// Also write the generated public key (PEM) to this path. Needed to
-        /// `request-cert`/`self-sign` this same key from a *later*, separate
-        /// `keyroostctl` invocation on cards that don't support GET METADATA
-        /// (firmware older than 5.3, or non-Yubico PIV): such a card has no
-        /// way to name a key this fresh on its own — there's no certificate
-        /// yet either — so nothing here is cached automatically; pass the
-        /// same path to that later command's `--load-pubkey`. To skip the
-        /// temporary file altogether, use `request-cert`/`self-sign`'s
-        /// `--generate-key` convenience option, which folds this key
-        /// generation into the signing command.
-        #[arg(long, value_name = "PATH")]
-        save_pubkey: Option<std::path::PathBuf>,
-        #[arg(long, help = OVERWRITE_HELP)]
-        overwrite: bool,
-        /// Run even if keyroost's list marks this key as not supporting the
-        /// chosen key type, PIN policy or touch policy.
-        #[arg(long)]
-        force: bool,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
+    /// Import, export, delete, request or generate the certificates in PIV slots.
+    Cert {
+        #[command(subcommand)]
+        cmd: PivCertCmd,
     },
-    /// Import a DER or PEM X.509 certificate into a slot, replacing any
-    /// certificate already there. Irreversible: asks first (`--yes` to skip).
-    ///
-    /// Needs the management key. Asks only when the slot isn't known to be
-    /// empty.
-    ///
-    /// No `--load-pubkey` here, unlike `request-cert`/`self-sign`: those
-    /// commands need the key material to build their actual output (a CSR, a
-    /// self-signed certificate), so it's load-bearing there. This command's
-    /// key-match check is only an extra, best-effort safety net — without an
-    /// independently confirmed key to compare against, there's no way to
-    /// judge whether the certificate is "correct" anyway, so it simply
-    /// trusts the certificate's own declared public key and imports it, same
-    /// as it did before that check existed. A `--load-pubkey` flag here would
-    /// only feed that same unverifiable trust back into the comparison.
-    ImportCert {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
-        /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
-        slot: CliPivSlot,
-        /// Certificate file to import (`.der` or `.pem`).
-        #[arg(long = "in", value_name = "FILE")]
-        in_file: std::path::PathBuf,
-        /// The management key (hex): env:NAME reads that environment variable,
-        /// stdin reads one line (hidden when typed at a terminal), default uses
-        /// the factory-default management key keyroost knows for this device.
-        /// With none of these, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
-        mgmt_key: Option<SecretSource>,
-        #[command(flatten)]
-        compression: CertCompressArgs,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Export a slot's certificate as PEM (default) or DER, to a file or stdout. No PIN required.
-    ExportCert {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
-        /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
-        slot: CliPivSlot,
-        /// Write the certificate to this file instead of stdout.
-        #[arg(long, value_name = "FILE")]
-        out: Option<std::path::PathBuf>,
-        #[arg(long, help = OVERWRITE_HELP)]
-        overwrite: bool,
-        /// Output encoding: PEM text (default) or raw DER.
-        #[arg(long, value_enum, default_value_t = CertFormat::Pem)]
-        format: CertFormat,
-    },
-    /// Create a PKCS#10 certificate signing request for the key in a slot,
-    /// signed on the card (PEM to stdout or --out). Hand the result to a CA;
-    /// import the certificate it issues with `import-cert`.
-    RequestCert {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
-        /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
-        slot: CliPivSlot,
-        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
-        /// (supported attributes: CN, O, OU, C, L, ST).
-        #[arg(long, value_name = "DN")]
-        subject: String,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (first line, the only one without --generate-key; hidden when
-        /// typed at a terminal). With neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-        /// Write the request (PEM) to this file instead of stdout.
-        #[arg(long, value_name = "FILE")]
-        out: Option<std::path::PathBuf>,
-        #[arg(long, help = OVERWRITE_HELP)]
-        overwrite: bool,
-        /// Path from a prior `generate-key --save-pubkey`. Needed on cards
-        /// that don't support GET METADATA (firmware older than 5.3, or
-        /// non-Yubico PIV) when the key was generated by a different
-        /// `keyroostctl` invocation — such a card has no other way to name
-        /// the slot's key material. `--generate-key` sidesteps this entirely.
-        #[arg(long, value_name = "PATH")]
-        load_pubkey: Option<std::path::PathBuf>,
-        /// The management key (hex): env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --pin stdin is also given;
-        /// hidden when typed at a terminal), default uses the factory-default
-        /// management key keyroost knows for this device. Needed only with
-        /// --generate-key, for the key-generation step (the request itself
-        /// needs just the PIN); then, with none of these, a terminal asks for
-        /// it.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, requires = "generate_key")]
-        mgmt_key: Option<SecretSource>,
-        #[command(flatten)]
-        keygen: InlineKeyGen,
-        #[command(flatten)]
-        key_usage: KeyUsageArgs,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Create a self-signed certificate for the key in a slot and store it
-    /// there, replacing any certificate already there. Irreversible: asks first
-    /// (`--yes` to skip).
-    ///
-    /// The certificate is signed on the card, so the slot then works in
-    /// PIV-aware software without an external CA. With `--generate-key` the
-    /// slot's key is replaced too. Asks only when the slot isn't known to be
-    /// empty.
-    SelfSign {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
-        /// card authentication, 82-95 retired key management.
-        #[arg(long, value_enum)]
-        slot: CliPivSlot,
-        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
-        /// (supported attributes: CN, O, OU, C, L, ST).
-        #[arg(long, value_name = "DN")]
-        subject: String,
-        /// Validity period in whole calendar years from now, applied before
-        /// `--months`/`--days` — the same month and day as today, that many
-        /// years later (a Feb 29 clamps to Feb 28 in a target year that
-        /// isn't a leap year).
-        #[arg(long, value_name = "N", value_parser = parse_valid_years)]
-        years: Option<u32>,
-        /// Validity period in whole calendar months, added on top of
-        /// `--years` (if given) before `--days` — the same day of month as
-        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
-        /// to Feb 28/29, the month's last day).
-        #[arg(long, value_name = "N", value_parser = parse_valid_months)]
-        months: Option<u32>,
-        /// Validity period in days, starting now. Combines with `--years`/
-        /// `--months` (e.g. `--years 1 --days 5` is 1 year and 5 additional
-        /// days from now); defaults to 1 year if none of the three is given.
-        #[arg(long, value_name = "N", value_parser = parse_valid_days)]
-        days: Option<u32>,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (first line; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-        /// The management key (hex): env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --pin stdin is also given;
-        /// hidden when typed at a terminal), default uses the factory-default
-        /// management key keyroost knows for this device. With none of these, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
-        mgmt_key: Option<SecretSource>,
-        /// Also write the certificate (PEM) to this file.
-        #[arg(long, value_name = "FILE")]
-        out: Option<std::path::PathBuf>,
-        #[arg(long, help = OVERWRITE_HELP)]
-        overwrite: bool,
-        /// Path from a prior `generate-key --save-pubkey`. Needed on cards
-        /// that don't support GET METADATA (firmware older than 5.3, or
-        /// non-Yubico PIV) when the key was generated by a different
-        /// `keyroostctl` invocation — such a card has no other way to name
-        /// the slot's key material. `--generate-key` sidesteps this entirely.
-        #[arg(long, value_name = "PATH")]
-        load_pubkey: Option<std::path::PathBuf>,
-        #[command(flatten)]
-        keygen: InlineKeyGen,
-        #[command(flatten)]
-        compression: CertCompressArgs,
-        #[command(flatten)]
-        key_usage: KeyUsageArgs,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long)]
-        yes: bool,
+    /// Write a new CHUID (Card Holder Unique Identifier, the card's identity record).
+    Chuid {
+        #[command(subcommand)]
+        cmd: PivChuidCmd,
     },
     /// Test a slot's private key end to end against the slot certificate's
     /// public key. Read-only — nothing on the card changes.
@@ -1171,44 +842,6 @@ enum PivCmd {
         /// for; omit it to test without a PIN.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
-    },
-    /// Write a fresh, randomly-generated CHUID (Card Holder Unique
-    /// Identifier). Needs the management key.
-    ///
-    /// Windows' PIV minidriver caches
-    /// a card's contents by its CHUID's GUID, so after writing a new
-    /// certificate or key it may keep showing stale data until the GUID
-    /// changes — this forces that.
-    NewChuid {
-        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
-        reader: Option<String>,
-        /// The management key (hex): env:NAME reads that environment variable,
-        /// stdin reads one line (hidden when typed at a terminal), default uses
-        /// the factory-default management key keyroost knows for this device.
-        /// With none of these, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
-        mgmt_key: Option<SecretSource>,
-        /// CHUID expiration, in whole calendar years from now, applied
-        /// before `--months`/`--days` — the same month and day as today,
-        /// that many years later (a Feb 29 clamps to Feb 28 in a target
-        /// year that isn't a leap year). Informational only.
-        #[arg(long, value_name = "N", value_parser = parse_valid_years)]
-        years: Option<u32>,
-        /// CHUID expiration, in whole calendar months, added on top of
-        /// `--years` (if given) before `--days` — the same day of month as
-        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
-        /// to Feb 28/29, the month's last day). Informational only.
-        #[arg(long, value_name = "N", value_parser = parse_valid_months)]
-        months: Option<u32>,
-        /// CHUID expiration, in days from now. Informational only — it has no
-        /// technical implications. Combines with `--years`/`--months` (e.g.
-        /// `--years 1 --days 5` is 1 year and 5 additional days from now);
-        /// same default as self-sign's certificate validity.
-        #[arg(long, value_name = "N", value_parser = parse_valid_days)]
-        days: Option<u32>,
-        /// GUID, hex (dashes optional). Omit to use random GUID.
-        #[arg(long, value_name = "HEX", value_parser = parse_guid_arg)]
-        guid: Option<String>,
     },
     /// Reset the PIV application to factory defaults: wipe all keys,
     /// certificates and PINs. Irreversible: asks first (`--yes` to skip).
@@ -1254,24 +887,220 @@ enum PivCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
     },
-    /// Delete a slot's certificate; the slot's private key is left in place.
-    /// Needs the management key. Irreversible: asks first (`--yes` to skip).
+}
+
+/// `piv pin` subcommands.
+#[derive(Subcommand)]
+enum PivPinCmd {
+    /// Change the PIV PIN. Each PIN comes from an environment variable,
+    /// stdin (the current PIN on the first line, the new one on the second)
+    /// or, with neither, a hidden prompt.
+    Change {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// The current PIN: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The new PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --pin stdin is also given; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
+    },
+    /// Unblock a blocked PIN using the PUK, setting a new PIN.
+    Unblock {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// The PUK: env:NAME reads that environment variable, stdin reads one
+        /// line (first line; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        puk: Option<SecretSource>,
+        /// The new PIN: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --puk stdin is also given; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_pin: Option<SecretSource>,
+    },
+}
+
+/// `piv puk` subcommands.
+#[derive(Subcommand)]
+enum PivPukCmd {
+    /// Change the PUK (PIN Unblocking Key). Each PUK comes from an
+    /// environment variable, stdin (the current PUK on the first line, the
+    /// new one on the second) or, with neither, a hidden prompt.
+    Change {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// The current PUK: env:NAME reads that environment variable, stdin
+        /// reads one line (first line; hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        puk: Option<SecretSource>,
+        /// The new PUK: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --puk stdin is also given; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_puk: Option<SecretSource>,
+    },
+}
+
+/// `piv retries` subcommands.
+#[derive(Subcommand)]
+enum PivRetriesCmd {
+    /// Set the PIN and PUK retry counts (Yubico extension); this also resets
+    /// the PIN and PUK themselves to their factory defaults. Needs the
+    /// management key and the current PIN.
+    Set {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// PIN retry count, at least 1: a zero count would leave the PIN
+        /// permanently blocked.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
+        pin_tries: u8,
+        /// PUK retry count, at least 1: a zero count would leave the PUK
+        /// permanently blocked.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..))]
+        puk_tries: u8,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal), default uses the factory-default
+        /// management key keyroost knows for this device. With none of these, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (first line; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `piv mgmt-key` subcommands.
+#[derive(Subcommand)]
+enum PivMgmtKeyCmd {
+    /// Change the card-management (9B) key. Both keys are hex; from stdin,
+    /// the current key comes on the first line and the new one on the
+    /// second.
     ///
-    /// Clears ONLY the X.509 certificate object (standard PIV; works on every
-    /// card).
-    DeleteCert {
+    /// Changing the management key is an extension to standard PIV (YubiKey
+    /// and other keys that implement it).
+    /// If keyroost's list marks this key as not supporting it, the command
+    /// stops unless `--force`; a key with no entry gets a warning.
+    ///
+    /// On every device except HID Crescendo (which unlocks management
+    /// directly off the PIN, with no key material to store), this also
+    /// maintains Yubico's PIN-protected management-key storage, enabling it
+    /// with `--allow-pin-unlock` or disabling it without. The same list
+    /// applies: a key with no entry gets a warning. If the list marks
+    /// this key as not supporting it, `--allow-pin-unlock` stops unless
+    /// `--force`, and without it the step is skipped, so a plain key rotation
+    /// isn't blocked.
+    Change {
+        // Explicit `display_order` on every field here (10.. up, one per
+        // field, matching declaration order): clap-derive's implicit order
+        // is an auto-incrementing counter that starts fresh at 0 in *each*
+        // derive invocation, including the top-level `Cli` struct's own
+        // `global = true` args (`--debug`/`--device`/`--json`, implicitly
+        // 0..2). Left implicit, this variant's own
+        // fields also start at 0, so `--help` interleaved the two structs'
+        // args by tied order number instead of keeping this command's own
+        // args — the `--old-mgmt-key-*` trio in particular — together.
+        #[arg(long, value_name = "SUBSTR", display_order = 10, help = READER_HELP)]
+        reader: Option<String>,
+        /// The current management key (hex): env:NAME reads that environment
+        /// variable, stdin reads one line (first line; hidden when typed at a
+        /// terminal), default uses the factory-default management key keyroost
+        /// knows for this device. With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, display_order = 11)]
+        mgmt_key: Option<SecretSource>,
+        /// The new management key (hex): env:NAME reads that environment
+        /// variable, stdin reads one line (second line when --mgmt-key stdin is
+        /// also given; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, display_order = 14)]
+        new_mgmt_key: Option<SecretSource>,
+        /// Algorithm of the new management key.
+        #[arg(long, value_enum, default_value = "aes192", display_order = 16)]
+        algorithm: CliPivMgmtAlg,
+        /// Require a physical touch for every future management-key auth.
+        #[arg(long, display_order = 17)]
+        touch: bool,
+        /// Store the new management key PIN-protected, so it can later be
+        /// unlocked with the PIN alone instead of the raw key. Omit to
+        /// instead clear any existing PIN-protected storage of the old key —
+        /// except on a device confirmed unable to support this at all, where
+        /// omitting it is a no-op rather than an attempted clear. Ignored on
+        /// HID Crescendo, which already unlocks management off the PIN with
+        /// no key material of its own to store.
+        #[arg(long, display_order = 18)]
+        allow_pin_unlock: bool,
+        /// Run even if keyroost's list marks this key as not supporting it.
+        #[arg(long, display_order = 19)]
+        force: bool,
+    },
+}
+
+/// `piv key` subcommands.
+#[derive(Subcommand)]
+enum PivKeyCmd {
+    /// Generate a new key pair in a slot, replacing any key already there, and
+    /// print its public key (PEM). Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Needs the management key. Asks only when the slot isn't known to be
+    /// empty.
+    Generate {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
         #[arg(long, value_enum)]
         slot: CliPivSlot,
+        /// Key type to generate (OpenPGP's `nistp256` is `eccp256` here).
+        #[arg(long, value_enum, default_value = "eccp256")]
+        algorithm: CliPivKeyAlg,
+        /// When the new key's private key may be used. `default` sends the
+        /// standard PIV command every card accepts; the other values are a
+        /// Yubico extension (firmware-dependent).
+        #[arg(long, value_enum, default_value = "default")]
+        pin_policy: CliPinPolicy,
+        /// Whether using the new key requires a physical touch. Same caveat:
+        /// only `default` is standard PIV, the rest are a Yubico extension
+        /// (firmware-dependent).
+        #[arg(long, value_enum, default_value = "default")]
+        touch_policy: CliTouchPolicy,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
         /// the factory-default management key keyroost knows for this device.
         /// With none of these, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
         mgmt_key: Option<SecretSource>,
+        /// Write the new public key (PEM) to FILE.
+        ///
+        /// Needed to `piv cert request`/`piv cert generate` this same key from
+        /// a *later*, separate `keyroostctl` invocation on cards that don't
+        /// support GET METADATA (firmware older than 5.3, or non-Yubico PIV):
+        /// such a card has no way to name a key this fresh on its own — there's
+        /// no certificate yet either — so nothing here is cached automatically;
+        /// pass the same path to that later command's `--pubkey-in`. To skip
+        /// the temporary file altogether, use `--generate-key` on `piv cert
+        /// request`/`piv cert generate`, which folds this key generation into
+        /// the signing command.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        #[arg(long, help = OVERWRITE_HELP)]
+        overwrite: bool,
+        /// Run even if keyroost's list marks this key as not supporting the
+        /// chosen key type, PIN policy or touch policy.
+        #[arg(long)]
+        force: bool,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long)]
         yes: bool,
@@ -1283,7 +1112,7 @@ enum PivCmd {
     /// standard PIV (YubiKey 5.7+ and other keys that implement it). If
     /// keyroost's list marks this key as not supporting it, the command
     /// stops unless `--force`; a key with no entry gets a warning.
-    DeleteKey {
+    Delete {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
@@ -1311,7 +1140,7 @@ enum PivCmd {
     /// and other keys that implement it).
     /// If keyroost's list marks this key as not supporting it, the command
     /// stops unless `--force`; a key with no entry gets a warning.
-    MoveKey {
+    Move {
         /// Source slot (9a/9c/9d/9e/82–95).
         #[arg(long)]
         from: CliPivSlot,
@@ -1329,6 +1158,250 @@ enum PivCmd {
         /// Run even if keyroost's list marks this key as not supporting it.
         #[arg(long)]
         force: bool,
+    },
+}
+
+/// `piv cert` subcommands.
+#[derive(Subcommand)]
+enum PivCertCmd {
+    /// Import a DER or PEM X.509 certificate into a slot, replacing any
+    /// certificate already there. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Needs the management key. Asks only when the slot isn't known to be
+    /// empty.
+    ///
+    /// No `--pubkey-in` here, unlike `cert request`/`cert generate`: those
+    /// commands need the key material to build their actual output (a CSR, a
+    /// self-signed certificate), so it's load-bearing there. This command's
+    /// key-match check is only an extra, best-effort safety net — without an
+    /// independently confirmed key to compare against, there's no way to
+    /// judge whether the certificate is "correct" anyway, so it simply
+    /// trusts the certificate's own declared public key and imports it, same
+    /// as it did before that check existed. A `--pubkey-in` flag here would
+    /// only feed that same unverifiable trust back into the comparison.
+    Import {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Certificate file to import (`.der` or `.pem`).
+        #[arg(long = "in", value_name = "FILE")]
+        in_file: std::path::PathBuf,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
+        #[command(flatten)]
+        compression: CertCompressArgs,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Export a slot's certificate as PEM (default) or DER, to a file or stdout. No PIN required.
+    Export {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Write the certificate to this file instead of stdout.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        #[arg(long, help = OVERWRITE_HELP)]
+        overwrite: bool,
+        /// Output encoding: PEM text (default) or raw DER.
+        #[arg(long, value_enum, default_value_t = CertFormat::Pem)]
+        format: CertFormat,
+    },
+    /// Create a PKCS#10 certificate signing request for the key in a slot,
+    /// signed on the card (PEM to stdout or --out). Hand the result to a CA;
+    /// import the certificate it issues with `piv cert import`.
+    Request {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
+        /// (supported attributes: CN, O, OU, C, L, ST).
+        #[arg(long, value_name = "DN")]
+        subject: String,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (first line, the only one without --generate-key; hidden when
+        /// typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// Write the request (PEM) to this file instead of stdout.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        #[arg(long, help = OVERWRITE_HELP)]
+        overwrite: bool,
+        /// The slot's public key (PEM or DER), as written by a prior `piv key
+        /// generate --out FILE`. Needed on cards that don't support GET
+        /// METADATA (firmware older than 5.3, or non-Yubico PIV) when the key
+        /// was generated by a different `keyroostctl` invocation — such a card
+        /// has no other way to name the slot's key material. `--generate-key`
+        /// sidesteps this entirely.
+        #[arg(long, value_name = "FILE")]
+        pubkey_in: Option<std::path::PathBuf>,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal), default uses the factory-default
+        /// management key keyroost knows for this device. Needed only with
+        /// --generate-key, for the key-generation step (the request itself
+        /// needs just the PIN); then, with none of these, a terminal asks for
+        /// it.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true, requires = "generate_key")]
+        mgmt_key: Option<SecretSource>,
+        #[command(flatten)]
+        keygen: InlineKeyGen,
+        #[command(flatten)]
+        key_usage: KeyUsageArgs,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Create a self-signed certificate for the key in a slot and store it
+    /// there, replacing any certificate already there. Irreversible: asks first
+    /// (`--yes` to skip).
+    ///
+    /// The certificate is signed on the card, so the slot then works in
+    /// PIV-aware software without an external CA. With `--generate-key` the
+    /// slot's key is replaced too. Asks only when the slot isn't known to be
+    /// empty.
+    Generate {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
+        /// (supported attributes: CN, O, OU, C, L, ST).
+        #[arg(long, value_name = "DN")]
+        subject: String,
+        /// Validity period in whole calendar years from now, applied before
+        /// `--months`/`--days` — the same month and day as today, that many
+        /// years later (a Feb 29 clamps to Feb 28 in a target year that
+        /// isn't a leap year).
+        #[arg(long, value_name = "N", value_parser = parse_valid_years)]
+        years: Option<u32>,
+        /// Validity period in whole calendar months, added on top of
+        /// `--years` (if given) before `--days` — the same day of month as
+        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
+        /// to Feb 28/29, the month's last day).
+        #[arg(long, value_name = "N", value_parser = parse_valid_months)]
+        months: Option<u32>,
+        /// Validity period in days, starting now. Combines with `--years`/
+        /// `--months` (e.g. `--years 1 --days 5` is 1 year and 5 additional
+        /// days from now); defaults to 1 year if none of the three is given.
+        #[arg(long, value_name = "N", value_parser = parse_valid_days)]
+        days: Option<u32>,
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (first line; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --pin stdin is also given;
+        /// hidden when typed at a terminal), default uses the factory-default
+        /// management key keyroost knows for this device. With none of these, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
+        /// Also write the certificate (PEM) to this file.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        #[arg(long, help = OVERWRITE_HELP)]
+        overwrite: bool,
+        /// The slot's public key (PEM or DER), as written by a prior `piv key
+        /// generate --out FILE`. Needed on cards that don't support GET
+        /// METADATA (firmware older than 5.3, or non-Yubico PIV) when the key
+        /// was generated by a different `keyroostctl` invocation — such a card
+        /// has no other way to name the slot's key material. `--generate-key`
+        /// sidesteps this entirely.
+        #[arg(long, value_name = "FILE")]
+        pubkey_in: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        keygen: InlineKeyGen,
+        #[command(flatten)]
+        compression: CertCompressArgs,
+        #[command(flatten)]
+        key_usage: KeyUsageArgs,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete a slot's certificate; the slot's private key is left in place.
+    /// Needs the management key. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Clears ONLY the X.509 certificate object (standard PIV; works on every
+    /// card).
+    Delete {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
+        /// card authentication, 82-95 retired key management.
+        #[arg(long, value_enum)]
+        slot: CliPivSlot,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `piv chuid` subcommands.
+#[derive(Subcommand)]
+enum PivChuidCmd {
+    /// Write a fresh, randomly-generated CHUID (Card Holder Unique
+    /// Identifier). Needs the management key.
+    ///
+    /// Windows' PIV minidriver caches
+    /// a card's contents by its CHUID's GUID, so after writing a new
+    /// certificate or key it may keep showing stale data until the GUID
+    /// changes — this forces that.
+    Generate {
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+        /// The management key (hex): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal), default uses
+        /// the factory-default management key keyroost knows for this device.
+        /// With none of these, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source_or_default, allow_hyphen_values = true)]
+        mgmt_key: Option<SecretSource>,
+        /// CHUID expiration, in whole calendar years from now, applied
+        /// before `--months`/`--days` — the same month and day as today,
+        /// that many years later (a Feb 29 clamps to Feb 28 in a target
+        /// year that isn't a leap year). Informational only.
+        #[arg(long, value_name = "N", value_parser = parse_valid_years)]
+        years: Option<u32>,
+        /// CHUID expiration, in whole calendar months, added on top of
+        /// `--years` (if given) before `--days` — the same day of month as
+        /// that point, that many months later (e.g. Jan 31 + 1 month clamps
+        /// to Feb 28/29, the month's last day). Informational only.
+        #[arg(long, value_name = "N", value_parser = parse_valid_months)]
+        months: Option<u32>,
+        /// CHUID expiration, in days from now. Informational only — it has no
+        /// technical implications. Combines with `--years`/`--months` (e.g.
+        /// `--years 1 --days 5` is 1 year and 5 additional days from now);
+        /// same default as `piv cert generate`'s certificate validity.
+        #[arg(long, value_name = "N", value_parser = parse_valid_days)]
+        days: Option<u32>,
+        /// GUID, hex (dashes optional). Omit to use random GUID.
+        #[arg(long, value_name = "HEX", value_parser = parse_guid_arg)]
+        guid: Option<String>,
     },
 }
 
@@ -3192,7 +3265,7 @@ fn parse_hex_arg(s: &str) -> Result<String, String> {
     }
 }
 
-/// Clap value parser for `piv new-chuid --guid`: 16 bytes of hex, dashes
+/// Clap value parser for `piv chuid generate --guid`: 16 bytes of hex, dashes
 /// optional. Returns the input unchanged.
 fn parse_guid_arg(s: &str) -> Result<String, String> {
     keyroost_piv::parse_guid_hex(s)
@@ -3417,7 +3490,7 @@ fn unix_now() -> u32 {
     }
 }
 
-/// Clap value parser: reject a `piv self-sign`/`piv new-chuid` `--days` value beyond what a
+/// Clap value parser: reject a `piv cert generate`/`piv chuid generate` `--days` value beyond what a
 /// certificate's validity period or a CHUID's expiration date can actually
 /// represent ([`keyroost_piv::max_valid_days`]), instead of letting it
 /// silently saturate deep in the encoder (`der_time`/`chuid_expiration_in_days`
@@ -3475,7 +3548,7 @@ fn parse_valid_months(s: &str) -> Result<u32, String> {
     Ok(months)
 }
 
-/// `piv self-sign` and `piv new-chuid` both take a `--days`/`--months`/
+/// `piv cert generate` and `piv chuid generate` both take a `--days`/`--months`/
 /// `--years` triple that freely combines and sums (e.g. `--years 1 --days 5`
 /// is 1 year and 5 additional days from now, applied in that order — see
 /// [`keyroost_piv::add_calendar_period`]); `None`/`None`/`None` — no flag
@@ -3925,27 +3998,51 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
     },
     RetiredFlag {
         flag: "--file",
-        words: &["piv", "import-cert"],
+        words: &["piv", "cert", "import"],
         msg: "--file was renamed -i/--in (the certificate file to read)",
         now: &["--in"],
     },
     RetiredFlag {
         flag: "--file",
-        words: &["piv", "export-cert"],
+        words: &["piv", "cert", "export"],
         msg: "--file was renamed -o/--out (the file to write)",
         now: &["--out"],
     },
     RetiredFlag {
         flag: "--file",
-        words: &["piv", "request-cert"],
+        words: &["piv", "cert", "request"],
         msg: "--file was renamed -o/--out (the file to write)",
         now: &["--out"],
     },
     RetiredFlag {
         flag: "--file",
-        words: &["piv", "self-sign"],
+        words: &["piv", "cert", "generate"],
         msg: "--file was renamed -o/--out (the file to write)",
         now: &["--out"],
+    },
+    RetiredFlag {
+        flag: "--save-pubkey",
+        words: &["piv", "key", "generate"],
+        msg: "--save-pubkey is now -o/--out (the public key file)",
+        now: &["--out"],
+    },
+    RetiredFlag {
+        flag: "--save-pubkey",
+        words: &["piv", "cert"],
+        msg: "--save-pubkey is now --pubkey-out (with --generate-key)",
+        now: &["--pubkey-out"],
+    },
+    RetiredFlag {
+        flag: "--load-pubkey",
+        words: &["piv", "cert"],
+        msg: "--load-pubkey is now --pubkey-in",
+        now: &["--pubkey-in"],
+    },
+    RetiredFlag {
+        flag: "--new-algorithm",
+        words: &["piv", "mgmt-key"],
+        msg: "--new-algorithm is now --algorithm (of the new management key)",
+        now: &["--algorithm"],
     },
     RetiredFlag {
         flag: "--force",
@@ -4314,6 +4411,90 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         parent: "piv",
         old: "status",
         new: "piv info",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "change-pin",
+        new: "piv pin change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "unblock-pin",
+        new: "piv pin unblock",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "change-puk",
+        new: "piv puk change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "set-retries",
+        new: "piv retries set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "change-management-key",
+        new: "piv mgmt-key change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "generate-key",
+        new: "piv key generate",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "delete-key",
+        new: "piv key delete",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "move-key",
+        new: "piv key move",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "import-cert",
+        new: "piv cert import",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "export-cert",
+        new: "piv cert export",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "delete-cert",
+        new: "piv cert delete",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "request-cert",
+        new: "piv cert request",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "self-sign",
+        new: "piv cert generate",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "piv",
+        old: "new-chuid",
+        new: "piv chuid generate",
         note: "",
     },
     RetiredCommand {
@@ -6935,7 +7116,7 @@ fn reset_one_card_applet(
                         StepOutcome::WipedWithWarning(
                             "restoring XAUTH key 1 to the factory-delivery value afterward failed \
                          \u{2014} it's left cleared instead. Set it manually \
-                         (`keyroostctl piv change-management-key`) if you need it back."
+                         (`keyroostctl piv mgmt-key change`) if you need it back."
                                 .into(),
                         )
                     }
@@ -8628,7 +8809,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ChangePin { reader, .. } => {
+        PivCmd::Pin {
+            cmd: PivPinCmd::Change { reader, .. },
+        } => {
             let mut sec = Secrets::real();
             let pair = pair_of(piv_secret_pair(cmd))?;
             pair.check(&sec)?;
@@ -8646,7 +8829,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ChangePuk { reader, .. } => {
+        PivCmd::Puk {
+            cmd: PivPukCmd::Change { reader, .. },
+        } => {
             let mut sec = Secrets::real();
             let pair = pair_of(piv_secret_pair(cmd))?;
             pair.check(&sec)?;
@@ -8664,7 +8849,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::UnblockPin { reader, .. } => {
+        PivCmd::Pin {
+            cmd: PivPinCmd::Unblock { reader, .. },
+        } => {
             let mut sec = Secrets::real();
             let pair = pair_of(piv_secret_pair(cmd))?;
             pair.check(&sec)?;
@@ -8682,12 +8869,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::SetRetries {
-            reader,
-            pin_tries,
-            puk_tries,
-            yes,
-            ..
+        PivCmd::Retries {
+            cmd:
+                PivRetriesCmd::Set {
+                    reader,
+                    pin_tries,
+                    puk_tries,
+                    yes,
+                    ..
+                },
         } => {
             let mut sec = Secrets::real();
             let pair = pair_of(piv_secret_pair(cmd))?;
@@ -8720,13 +8910,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ChangeManagementKey {
-            reader,
-            new_algorithm,
-            touch,
-            allow_pin_unlock,
-            force,
-            ..
+        PivCmd::MgmtKey {
+            cmd:
+                PivMgmtKeyCmd::Change {
+                    reader,
+                    algorithm,
+                    touch,
+                    allow_pin_unlock,
+                    force,
+                    ..
+                },
         } => {
             let mut sec = Secrets::real();
             let pair = pair_of(piv_secret_pair(cmd))?;
@@ -8736,7 +8929,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let (old, new) = pair.read(&mut sec)?;
             let old = old.mgmt(&PIV_OLD_MGMT_KEY)?;
             let new = new.mgmt_hex(&PIV_NEW_MGMT_KEY)?;
-            let new_alg = new_algorithm.to_alg();
+            let new_alg = algorithm.to_alg();
             if new.len() != new_alg.key_len() {
                 return Err(format!(
                     "new management key is {} bytes; {} needs {}",
@@ -8877,19 +9070,22 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::GenerateKey {
-            reader,
-            slot,
-            algorithm,
-            pin_policy,
-            touch_policy,
-            mgmt_key,
-            save_pubkey,
-            overwrite,
-            force,
-            yes,
+        PivCmd::Key {
+            cmd:
+                PivKeyCmd::Generate {
+                    reader,
+                    slot,
+                    algorithm,
+                    pin_policy,
+                    touch_policy,
+                    mgmt_key,
+                    out,
+                    overwrite,
+                    force,
+                    yes,
+                },
         } => {
-            let [pub_mode] = crate::prompt::check_overwrites([save_pubkey.as_deref()], *overwrite)?;
+            let [pub_mode] = crate::prompt::check_overwrites([out.as_deref()], *overwrite)?;
             let alg = algorithm.to_alg();
             // Gate the PIN/touch policy — Yubico extensions to GENERATE
             // ASYMMETRIC KEYPAIR, not SP 800-73-4 — on the applet's
@@ -8979,13 +9175,13 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         }
                     };
                     let pem = keyroost_piv::spki::to_pem(&der);
-                    if let Some(path) = save_pubkey {
+                    if let Some(path) = out {
                         pub_mode
                             .write(path, pem.as_bytes())
                             .map_err(|e| format!("write {}: {}", path.display(), e))?;
                         eprintln!(
-                    "Wrote key material for {} to {} — pass it to request-cert/self-sign's \
-                     --load-pubkey if you sign this key from a separate command.",
+                    "Wrote key material for {} to {} — pass it to `piv cert request`/`piv cert \
+                     generate`'s --pubkey-in if you sign this key from a separate command.",
                     slot.to_slot().label(),
                     path.display()
                 );
@@ -8996,13 +9192,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ImportCert {
-            reader,
-            slot,
-            in_file,
-            mgmt_key,
-            compression,
-            yes,
+        PivCmd::Cert {
+            cmd:
+                PivCertCmd::Import {
+                    reader,
+                    slot,
+                    in_file,
+                    mgmt_key,
+                    compression,
+                    yes,
+                },
         } => {
             let mut sec = Secrets::real();
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
@@ -9042,12 +9241,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::ExportCert {
-            reader,
-            slot,
-            out,
-            overwrite,
-            format,
+        PivCmd::Cert {
+            cmd:
+                PivCertCmd::Export {
+                    reader,
+                    slot,
+                    out,
+                    overwrite,
+                    format,
+                },
         } => {
             let [out_mode] = crate::prompt::check_overwrites([out.as_deref()], *overwrite)?;
             let name = crate::target::reader_for(Need::Piv, reader.as_deref())?;
@@ -9090,20 +9292,23 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::RequestCert {
-            reader,
-            slot,
-            subject,
-            out,
-            overwrite,
-            load_pubkey,
-            keygen,
-            key_usage,
-            yes,
-            ..
+        PivCmd::Cert {
+            cmd:
+                PivCertCmd::Request {
+                    reader,
+                    slot,
+                    subject,
+                    out,
+                    overwrite,
+                    pubkey_in,
+                    keygen,
+                    key_usage,
+                    yes,
+                    ..
+                },
         } => {
             let [out_mode, pub_mode] = crate::prompt::check_overwrites(
-                [out.as_deref(), keygen.save_pubkey.as_deref()],
+                [out.as_deref(), keygen.pubkey_out.as_deref()],
                 *overwrite,
             )?;
             let mut sec = Secrets::real();
@@ -9114,9 +9319,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             // Judge `--key-usage` and whether the target key can sign before
             // the PIN or the management key is asked for: the algorithm is
-            // knowable from `--algorithm`/`--load-pubkey` with no card I/O,
+            // knowable from `--algorithm`/`--pubkey-in` with no card I/O,
             // or else from a read-only look at the slot once it's selected.
-            let known_alg = early_key_alg(keygen, load_pubkey.as_deref())?;
+            let known_alg = early_key_alg(keygen, pubkey_in.as_deref())?;
             check_signing_key(&key_usage.key_usage, slot.to_slot(), known_alg)?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             if known_alg.is_none() {
@@ -9159,7 +9364,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         let mgmt = mgmt_key_bytes(mgmt, &PIV_MGMT_KEY, s)?;
                         authenticate_piv(s, &mgmt)?;
                         inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
-                    } else if let Some(path) = load_pubkey {
+                    } else if let Some(path) = pubkey_in {
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
@@ -9197,24 +9402,27 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::SelfSign {
-            reader,
-            slot,
-            subject,
-            days,
-            months,
-            years,
-            out,
-            overwrite,
-            load_pubkey,
-            keygen,
-            compression,
-            key_usage,
-            yes,
-            ..
+        PivCmd::Cert {
+            cmd:
+                PivCertCmd::Generate {
+                    reader,
+                    slot,
+                    subject,
+                    days,
+                    months,
+                    years,
+                    out,
+                    overwrite,
+                    pubkey_in,
+                    keygen,
+                    compression,
+                    key_usage,
+                    yes,
+                    ..
+                },
         } => {
             let [out_mode, pub_mode] = crate::prompt::check_overwrites(
-                [out.as_deref(), keygen.save_pubkey.as_deref()],
+                [out.as_deref(), keygen.pubkey_out.as_deref()],
                 *overwrite,
             )?;
             let valid_for = ValidFor::resolve(*days, *months, *years);
@@ -9223,8 +9431,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             let pair = pair_of(piv_secret_pair(cmd))?;
             pair.check(&sec)?;
             // Judge `--key-usage` and whether the target key can sign before
-            // the PIN or the management key is asked for (see request-cert).
-            let known_alg = early_key_alg(keygen, load_pubkey.as_deref())?;
+            // the PIN or the management key is asked for (see cert request).
+            let known_alg = early_key_alg(keygen, pubkey_in.as_deref())?;
             check_signing_key(&key_usage.key_usage, slot.to_slot(), known_alg)?;
             let dev = crate::target::select(Need::Piv, reader.as_deref(), None)?;
             if known_alg.is_none() {
@@ -9268,7 +9476,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     authenticate_piv(s, &mgmt)?;
                     if keygen.generate_key {
                         inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
-                    } else if let Some(path) = load_pubkey {
+                    } else if let Some(path) = pubkey_in {
                         let (alg, key) = load_pubkey_material(path)?;
                         s.remember_pubkey(slot.to_slot(), alg, key);
                     }
@@ -9302,7 +9510,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     );
                     if let Some(path) = out {
                         let note = format!(
-                            "the certificate is stored on the card; `piv export-cert \
+                            "the certificate is stored on the card; `piv cert export \
                              --slot {} --out FILE` writes it",
                             slot_name(*slot)
                         );
@@ -9413,13 +9621,16 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::NewChuid {
-            reader,
-            mgmt_key,
-            days,
-            months,
-            years,
-            guid,
+        PivCmd::Chuid {
+            cmd:
+                PivChuidCmd::Generate {
+                    reader,
+                    mgmt_key,
+                    days,
+                    months,
+                    years,
+                    guid,
+                },
         } => {
             let mut sec = Secrets::real();
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
@@ -9468,7 +9679,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| -> Result<Option<u128>, Box<dyn std::error::Error>> {
                     // Gate on the applet's fingerprint before reading status — the
                     // fingerprint probe re-SELECTs PIV, same ordering concern
-                    // `delete-key`/`move-key` document at their own call sites.
+                    // `key delete`/`key move` document at their own call sites.
                     guard_piv_feature(s, keyroost_piv::compat::PivExtension::Reset, *force)?;
                     Ok(s.status()?.serial)
                 },
@@ -9556,11 +9767,14 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::DeleteCert {
-            reader,
-            slot,
-            mgmt_key,
-            yes,
+        PivCmd::Cert {
+            cmd:
+                PivCertCmd::Delete {
+                    reader,
+                    slot,
+                    mgmt_key,
+                    yes,
+                },
         } => {
             let mut sec = Secrets::real();
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
@@ -9589,12 +9803,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::DeleteKey {
-            reader,
-            slot,
-            mgmt_key,
-            yes,
-            force,
+        PivCmd::Key {
+            cmd:
+                PivKeyCmd::Delete {
+                    reader,
+                    slot,
+                    mgmt_key,
+                    yes,
+                    force,
+                },
         } => {
             let mut sec = Secrets::real();
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
@@ -9626,12 +9843,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
             )?;
         }
 
-        PivCmd::MoveKey {
-            from,
-            to,
-            reader,
-            mgmt_key,
-            force,
+        PivCmd::Key {
+            cmd:
+                PivKeyCmd::Move {
+                    from,
+                    to,
+                    reader,
+                    mgmt_key,
+                    force,
+                },
         } => {
             let mut sec = Secrets::real();
             check_mgmt_key(&sec, &PIV_MGMT_KEY, mgmt_key.as_ref())?;
@@ -10041,8 +10261,8 @@ fn piv_probe_slot_alg(
     )
 }
 
-/// The `--key-usage` and signable-key checks of `request-cert` /
-/// `self-sign`, once the slot key's algorithm is known (`None`: the card
+/// The `--key-usage` and signable-key checks of `cert request` /
+/// `cert generate`, once the slot key's algorithm is known (`None`: the card
 /// can't say, and the in-session resolution judges it).
 fn check_signing_key(
     key_usage: &[CliKeyUsage],
@@ -10061,7 +10281,7 @@ fn check_signing_key(
 /// [`keyroost_piv::x509::signature_hash`]). Issuing a certificate for such a
 /// key needs a different enrollment mechanism (CRMF/CMP-style, proving
 /// possession via key agreement rather than a signature), which keyroost
-/// doesn't implement. `piv self-sign` / `piv request-cert` call this as soon
+/// doesn't implement. `piv cert generate` / `piv cert request` call this as soon
 /// as the target algorithm is known — before any PIN/management-key prompt
 /// or card write — so a doomed request fails fast instead of after a touch
 /// prompt.
@@ -10079,12 +10299,12 @@ fn guard_signable_alg(alg: keyroost_piv::KeyAlg) -> Result<(), Box<dyn std::erro
         })
 }
 
-/// The `--generate-key` convenience shared by `piv request-cert` / `piv
-/// self-sign`: generate a fresh key pair in `slot` on `s` (which must already
+/// The `--generate-key` convenience shared by `piv cert request` / `piv
+/// cert generate`: generate a fresh key pair in `slot` on `s` (which must already
 /// be management-key authenticated), and, if asked, drop a PEM copy of its
 /// public key. [`PivSession::generate_key`](keyroost_transport::PivSession::generate_key) seeds this session's in-memory
 /// pubkey cache, so the CSR / self-signed certificate that follows finds the
-/// key without any `--load-pubkey`.
+/// key without any `--pubkey-in`.
 fn inline_generate_key(
     s: &mut keyroost_transport::PivSession<'_>,
     slot: keyroost_piv::Slot,
@@ -10103,7 +10323,7 @@ fn inline_generate_key(
         keygen.pin_policy.to_policy(),
         keygen.touch_policy.to_policy(),
     )?;
-    if let Some(path) = &keygen.save_pubkey {
+    if let Some(path) = &keygen.pubkey_out {
         let der = keyroost_piv::spki::subject_public_key_info(&pubkey, alg)
             .map_err(|e| format!("key generated, but encoding its public key failed: {}", e))?;
         let pem = keyroost_piv::spki::to_pem(&der);
@@ -10347,24 +10567,31 @@ impl PairValue {
 
 fn piv_secret_pair(cmd: &PivCmd) -> Option<SecretPair<'_>> {
     Some(match cmd {
-        PivCmd::ChangePin { pin, new_pin, .. } => {
-            secret_pair((&PIV_OLD_PIN, pin), (&PIV_NEW_PIN, new_pin))
+        PivCmd::Pin {
+            cmd: PivPinCmd::Change { pin, new_pin, .. },
+        } => secret_pair((&PIV_OLD_PIN, pin), (&PIV_NEW_PIN, new_pin)),
+        PivCmd::Puk {
+            cmd: PivPukCmd::Change { puk, new_puk, .. },
+        } => secret_pair((&PIV_OLD_PUK, puk), (&PIV_NEW_PUK, new_puk)),
+        PivCmd::Pin {
+            cmd: PivPinCmd::Unblock { puk, new_pin, .. },
+        } => secret_pair((&PIV_PUK, puk), (&PIV_NEW_PIN, new_pin)),
+        PivCmd::Retries {
+            cmd: PivRetriesCmd::Set { pin, mgmt_key, .. },
         }
-        PivCmd::ChangePuk { puk, new_puk, .. } => {
-            secret_pair((&PIV_OLD_PUK, puk), (&PIV_NEW_PUK, new_puk))
+        | PivCmd::Cert {
+            cmd: PivCertCmd::Request { pin, mgmt_key, .. },
         }
-        PivCmd::UnblockPin { puk, new_pin, .. } => {
-            secret_pair((&PIV_PUK, puk), (&PIV_NEW_PIN, new_pin))
-        }
-        PivCmd::SetRetries { pin, mgmt_key, .. }
-        | PivCmd::RequestCert { pin, mgmt_key, .. }
-        | PivCmd::SelfSign { pin, mgmt_key, .. } => {
-            secret_pair((&PIV_PIN, pin), (&PIV_MGMT_KEY, mgmt_key))
-        }
-        PivCmd::ChangeManagementKey {
-            mgmt_key,
-            new_mgmt_key,
-            ..
+        | PivCmd::Cert {
+            cmd: PivCertCmd::Generate { pin, mgmt_key, .. },
+        } => secret_pair((&PIV_PIN, pin), (&PIV_MGMT_KEY, mgmt_key)),
+        PivCmd::MgmtKey {
+            cmd:
+                PivMgmtKeyCmd::Change {
+                    mgmt_key,
+                    new_mgmt_key,
+                    ..
+                },
         } => secret_pair(
             (&PIV_OLD_MGMT_KEY, mgmt_key),
             (&PIV_NEW_MGMT_KEY, new_mgmt_key),
@@ -10582,7 +10809,7 @@ fn cert_to_der(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 
 /// Accept a `SubjectPublicKeyInfo` as PEM (`-----BEGIN PUBLIC KEY-----`, what
-/// `generate-key --save-pubkey` writes) or raw DER, returning DER bytes.
+/// `piv key generate --out` writes) or raw DER, returning DER bytes.
 /// Mirrors [`cert_to_der`] for the same reason: a file a user can inspect or
 /// hand to other tools shouldn't be limited to one encoding.
 fn spki_to_der(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -10601,7 +10828,7 @@ fn spki_to_der(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(bytes.to_vec())
 }
 
-/// Load a `--load-pubkey` file (as written by `generate-key --save-pubkey`) and
+/// Load a `--pubkey-in` file (as written by `piv key generate --out`) and
 /// decode it back to `(algorithm, public key)` for
 /// [`keyroost_transport::PivSession::remember_pubkey`].
 fn load_pubkey_material(
@@ -13429,12 +13656,12 @@ mod cli_tests {
             ("openpgp generate-key", IRREVERSIBLE),
             ("openpgp import-key", IRREVERSIBLE),
             ("piv reset", IRREVERSIBLE),
-            ("piv delete-cert", IRREVERSIBLE),
-            ("piv delete-key", IRREVERSIBLE),
+            ("piv cert delete", IRREVERSIBLE),
+            ("piv key delete", IRREVERSIBLE),
             // These replace a key, seed or certificate already on the device.
-            ("piv generate-key", IRREVERSIBLE),
-            ("piv import-cert", IRREVERSIBLE),
-            ("piv self-sign", IRREVERSIBLE),
+            ("piv key generate", IRREVERSIBLE),
+            ("piv cert import", IRREVERSIBLE),
+            ("piv cert generate", IRREVERSIBLE),
             ("molto seed", IRREVERSIBLE),
             ("molto import", IRREVERSIBLE),
             ("molto import-file", IRREVERSIBLE),
@@ -13448,13 +13675,13 @@ mod cli_tests {
             .chain(ONE_WAY_SETTINGS.iter().map(|p| (*p, ONE_WAY)))
             .collect();
         // Commands that ask before a change that destroys no key, seed or
-        // certificate: settings and retry counts, plus `piv request-cert`,
+        // certificate: settings and retry counts, plus `piv cert request`,
         // which replaces a key only with the optional `--generate-key`.
         let confirms_only = [
             "prog config",
             "otp interface",
-            "piv set-retries",
-            "piv request-cert",
+            "piv retries set",
+            "piv cert request",
         ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
@@ -13655,11 +13882,14 @@ mod cli_tests {
     fn export_cert_format_parses_and_defaults_to_pem() {
         let format_of = |argv: &[&str]| match parse(argv).unwrap().command {
             Some(Cmd::Piv {
-                cmd: PivCmd::ExportCert { format, .. },
+                cmd:
+                    PivCmd::Cert {
+                        cmd: PivCertCmd::Export { format, .. },
+                    },
             }) => format,
-            _ => panic!("not export-cert"),
+            _ => panic!("not cert export"),
         };
-        let base = ["keyroostctl", "piv", "export-cert", "--slot", "9a"];
+        let base = ["keyroostctl", "piv", "cert", "export", "--slot", "9a"];
         assert_eq!(format_of(&base), CertFormat::Pem);
         let der: Vec<&str> = base.iter().copied().chain(["--format", "der"]).collect();
         assert_eq!(format_of(&der), CertFormat::Der);
@@ -14444,7 +14674,7 @@ mod cli_tests {
             ),
             (
                 "--old-mgmt-key-default",
-                "keyroostctl piv change-management-key --old-mgmt-key-default",
+                "keyroostctl piv mgmt-key change --old-mgmt-key-default",
                 "--mgmt-key default",
             ),
         ] {
@@ -14487,12 +14717,13 @@ mod cli_tests {
                 &[
                     "keyroostctl",
                     "piv",
-                    "change-pin",
+                    "pin",
+                    "change",
                     "--pin",
                     "stdin",
                     "S3CRET",
                 ],
-                "keyroostctl piv change-pin",
+                "keyroostctl piv pin change",
             ),
             (
                 &[
@@ -14589,7 +14820,8 @@ mod cli_tests {
         let args = [
             "keyroostctl",
             "piv",
-            "change-pin",
+            "pin",
+            "change",
             "--old-pin-stdin",
             "--new-pin-stdin=S3CRET",
         ];
@@ -14619,7 +14851,8 @@ mod cli_tests {
         let args = [
             "keyroostctl",
             "piv",
-            "change-pin",
+            "pin",
+            "change",
             "--pin",
             "stdin",
             "-123456",
@@ -14635,7 +14868,8 @@ mod cli_tests {
         assert!(redacted(&[
             "keyroostctl",
             "piv",
-            "change-pin",
+            "pin",
+            "change",
             "--pin",
             "stdin",
             "--new-pn"
@@ -16729,6 +16963,129 @@ mod cli_tests {
     }
 
     #[test]
+    fn piv_nests_by_topic() {
+        for a in [
+            &["keyroostctl", "piv", "pin", "change"][..],
+            &["keyroostctl", "piv", "pin", "unblock"],
+            &["keyroostctl", "piv", "puk", "change"],
+            &[
+                "keyroostctl",
+                "piv",
+                "retries",
+                "set",
+                "--pin-tries",
+                "3",
+                "--puk-tries",
+                "3",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "mgmt-key",
+                "change",
+                "--algorithm",
+                "aes192",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "key",
+                "generate",
+                "--slot",
+                "9a",
+                "--out",
+                "p.pem",
+            ],
+            &["keyroostctl", "piv", "key", "delete", "--slot", "9a"],
+            &[
+                "keyroostctl",
+                "piv",
+                "key",
+                "move",
+                "--from",
+                "9a",
+                "--to",
+                "9c",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "import",
+                "--slot",
+                "9a",
+                "--in",
+                "c.der",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "export",
+                "--slot",
+                "9a",
+                "--out",
+                "c.pem",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "request",
+                "--slot",
+                "9a",
+                "--subject",
+                "CN=x",
+                "--generate-key",
+                "--pubkey-out",
+                "p.pem",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "request",
+                "--slot",
+                "9a",
+                "--subject",
+                "CN=x",
+                "--pubkey-in",
+                "p.pem",
+            ],
+            &[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "generate",
+                "--slot",
+                "9a",
+                "--subject",
+                "CN=x",
+            ],
+            &["keyroostctl", "piv", "cert", "delete", "--slot", "9a"],
+            &["keyroostctl", "piv", "chuid", "generate"],
+        ] {
+            assert!(parse(a).is_ok(), "{a:?}");
+        }
+        assert!(
+            parse(&[
+                "keyroostctl",
+                "piv",
+                "cert",
+                "request",
+                "--slot",
+                "9a",
+                "--subject",
+                "CN=x",
+                "--pubkey-out",
+                "p.pem"
+            ])
+            .is_err(),
+            "--pubkey-out needs --generate-key"
+        );
+    }
+
+    #[test]
     fn fido_is_nested() {
         assert!(parse(&["keyroostctl", "fido", "info"]).is_ok());
         assert!(parse(&["keyroostctl", "fido", "pin", "set", "--new-pin", "stdin"]).is_ok());
@@ -17046,7 +17403,8 @@ mod cli_tests {
             &[
                 "keyroostctl",
                 "piv",
-                "set-retries",
+                "retries",
+                "set",
                 "--pin-tries",
                 "0",
                 "--puk-tries",
@@ -17061,7 +17419,7 @@ mod cli_tests {
                 "1",
                 "THIRTEEN-LONG",
             ],
-            &["keyroostctl", "piv", "new-chuid", "--guid", "zz"],
+            &["keyroostctl", "piv", "chuid", "generate", "--guid", "zz"],
             &["keyroostctl", "fido", "credential", "delete", "--id", "xyz"],
         ] {
             let e = Cli::try_parse_from(argv)
@@ -17092,14 +17450,20 @@ mod cli_tests {
         let hint = |cmd: &str| {
             retired_flag_hint(
                 "--file",
-                &argv(&["keyroostctl", "piv", cmd, "--slot", "9a", "--file", "x"]),
+                &argv(
+                    &["keyroostctl", "piv"]
+                        .into_iter()
+                        .chain(cmd.split(' '))
+                        .chain(["--slot", "9a", "--file", "x"])
+                        .collect::<Vec<_>>(),
+                ),
             )
         };
-        assert!(hint("import-cert").unwrap().contains("--in"));
-        for cmd in ["export-cert", "request-cert", "self-sign"] {
+        assert!(hint("cert import").unwrap().contains("--in"));
+        for cmd in ["cert export", "cert request", "cert generate"] {
             assert!(hint(cmd).unwrap().contains("--out"), "{cmd}");
         }
-        for cmd in ["generate-key", "test", "info"] {
+        for cmd in ["key generate", "test", "info"] {
             assert_eq!(hint(cmd), None, "{cmd}");
         }
     }
@@ -17177,7 +17541,8 @@ mod cli_tests {
         match parse(&[
             "keyroostctl",
             "piv",
-            "move-key",
+            "key",
+            "move",
             "--from",
             "9d",
             "--to",
@@ -17187,16 +17552,20 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::MoveKey {
-                    from, to, force, ..
-                },
+                cmd:
+                    PivCmd::Key {
+                        cmd:
+                            PivKeyCmd::Move {
+                                from, to, force, ..
+                            },
+                    },
             }) => {
                 assert_eq!(from.to_slot().key_ref(), 0x9D);
                 assert_eq!(to.to_slot().key_ref(), 0x82);
                 // --force is opt-in; absent here.
                 assert!(!force);
             }
-            _ => panic!("expected piv move-key"),
+            _ => panic!("expected piv key move"),
         }
     }
 
@@ -17239,7 +17608,8 @@ mod cli_tests {
         match parse(&[
             "keyroostctl",
             "piv",
-            "move-key",
+            "key",
+            "move",
             "--from",
             "9d",
             "--to",
@@ -17250,14 +17620,18 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::MoveKey { force, .. },
+                cmd:
+                    PivCmd::Key {
+                        cmd: PivKeyCmd::Move { force, .. },
+                    },
             }) => assert!(force),
-            _ => panic!("expected piv move-key"),
+            _ => panic!("expected piv key move"),
         }
         match parse(&[
             "keyroostctl",
             "piv",
-            "delete-key",
+            "key",
+            "delete",
             "--slot",
             "9a",
             "--yes",
@@ -17267,12 +17641,15 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::DeleteKey { force, yes, .. },
+                cmd:
+                    PivCmd::Key {
+                        cmd: PivKeyCmd::Delete { force, yes, .. },
+                    },
             }) => {
                 assert!(force);
                 assert!(yes);
             }
-            _ => panic!("expected piv delete-key"),
+            _ => panic!("expected piv key delete"),
         }
         match parse(&["keyroostctl", "piv", "reset", "--yes", "--force"])
             .unwrap()
@@ -17402,33 +17779,37 @@ mod cli_tests {
         // Omitting both flags must decode to Default/Default — the byte layer
         // then leaves the 0xAA/0xAB policy tags out of the APDU entirely, the
         // standard PIV command every card accepts. A drifted default would
-        // silently switch every scripted generate-key to the Yubico extended
+        // silently switch every scripted `piv key generate` to the Yubico extended
         // APDU, which non-Yubico cards reject.
-        match parse(&["keyroostctl", "piv", "generate-key", "--slot", "9a"])
+        match parse(&["keyroostctl", "piv", "key", "generate", "--slot", "9a"])
             .unwrap()
             .command
         {
             Some(Cmd::Piv {
                 cmd:
-                    PivCmd::GenerateKey {
-                        pin_policy,
-                        touch_policy,
-                        force,
-                        ..
+                    PivCmd::Key {
+                        cmd:
+                            PivKeyCmd::Generate {
+                                pin_policy,
+                                touch_policy,
+                                force,
+                                ..
+                            },
                     },
             }) => {
                 assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Default);
                 assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Default);
                 assert!(!force);
             }
-            _ => panic!("expected piv generate-key"),
+            _ => panic!("expected piv key generate"),
         }
 
         // Explicit values must land in their own fields, not each other's.
         match parse(&[
             "keyroostctl",
             "piv",
-            "generate-key",
+            "key",
+            "generate",
             "--slot",
             "9a",
             "--pin-policy",
@@ -17442,30 +17823,34 @@ mod cli_tests {
         {
             Some(Cmd::Piv {
                 cmd:
-                    PivCmd::GenerateKey {
-                        pin_policy,
-                        touch_policy,
-                        force,
-                        ..
+                    PivCmd::Key {
+                        cmd:
+                            PivKeyCmd::Generate {
+                                pin_policy,
+                                touch_policy,
+                                force,
+                                ..
+                            },
                     },
             }) => {
                 assert_eq!(pin_policy.to_policy(), keyroost_piv::PinPolicy::Once);
                 assert_eq!(touch_policy.to_policy(), keyroost_piv::TouchPolicy::Cached);
                 assert!(force);
             }
-            _ => panic!("expected piv generate-key"),
+            _ => panic!("expected piv key generate"),
         }
     }
 
     #[test]
     fn piv_self_sign_inline_generate_key_mirrors_generate_key_defaults() {
         // Omitted: the convenience is off and its options carry the same
-        // defaults `piv generate-key` uses, so a later `--generate-key` run
+        // defaults `piv key generate` uses, so a later `--generate-key` run
         // behaves identically to the two-step flow.
         match parse(&[
             "keyroostctl",
             "piv",
-            "self-sign",
+            "cert",
+            "generate",
             "--slot",
             "9a",
             "--subject",
@@ -17475,7 +17860,10 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::SelfSign { keygen, .. },
+                cmd:
+                    PivCmd::Cert {
+                        cmd: PivCertCmd::Generate { keygen, .. },
+                    },
             }) => {
                 assert!(!keygen.generate_key);
                 assert_eq!(keygen.algorithm.to_alg(), keyroost_piv::KeyAlg::EccP256);
@@ -17487,16 +17875,17 @@ mod cli_tests {
                     keygen.touch_policy.to_policy(),
                     keyroost_piv::TouchPolicy::Default
                 );
-                assert!(keygen.save_pubkey.is_none());
+                assert!(keygen.pubkey_out.is_none());
             }
-            _ => panic!("expected piv self-sign"),
+            _ => panic!("expected piv cert generate"),
         }
 
         // Passed: the flag flips on and its options are honored.
         match parse(&[
             "keyroostctl",
             "piv",
-            "self-sign",
+            "cert",
+            "generate",
             "--slot",
             "9a",
             "--subject",
@@ -17511,7 +17900,10 @@ mod cli_tests {
         .command
         {
             Some(Cmd::Piv {
-                cmd: PivCmd::SelfSign { keygen, .. },
+                cmd:
+                    PivCmd::Cert {
+                        cmd: PivCertCmd::Generate { keygen, .. },
+                    },
             }) => {
                 assert!(keygen.generate_key);
                 assert_eq!(keygen.algorithm.to_alg(), keyroost_piv::KeyAlg::Rsa2048);
@@ -17520,18 +17912,19 @@ mod cli_tests {
                     keyroost_piv::TouchPolicy::Always
                 );
             }
-            _ => panic!("expected piv self-sign"),
+            _ => panic!("expected piv cert generate"),
         }
     }
 
     #[test]
-    fn piv_inline_generate_key_options_require_the_flag_and_conflict_with_load_pubkey() {
-        // A generate-key option without `--generate-key` is a mistake, not a
-        // silent no-op.
-        for cmd in ["self-sign", "request-cert"] {
+    fn piv_inline_generate_key_options_require_the_flag_and_conflict_with_pubkey_in() {
+        // A key-generation option without `--generate-key` is a mistake, not
+        // a silent no-op.
+        for cmd in ["generate", "request"] {
             assert!(parse(&[
                 "keyroostctl",
                 "piv",
+                "cert",
                 cmd,
                 "--slot",
                 "9a",
@@ -17542,27 +17935,29 @@ mod cli_tests {
             ])
             .is_err());
         }
-        // `--generate-key` and `--load-pubkey` are two ways to name the key;
+        // `--generate-key` and `--pubkey-in` are two ways to name the key;
         // asking for both is contradictory.
         assert!(parse(&[
             "keyroostctl",
             "piv",
-            "request-cert",
+            "cert",
+            "request",
             "--slot",
             "9a",
             "--subject",
             "CN=x",
             "--generate-key",
-            "--load-pubkey",
+            "--pubkey-in",
             "some/path",
         ])
         .is_err());
-        // `request-cert --generate-key` also needs the management key wired up
+        // `cert request --generate-key` also needs the management key wired up
         // for the (new) key-generation step.
         assert!(parse(&[
             "keyroostctl",
             "piv",
-            "request-cert",
+            "cert",
+            "request",
             "--slot",
             "9a",
             "--subject",
@@ -17581,22 +17976,29 @@ mod cli_tests {
         // pin the parsed triples equal across both commands so a future
         // change to one doesn't silently drift from the other, and pin
         // `ValidFor::resolve`'s shared default to 1 year.
-        let chuid = match parse(&["keyroostctl", "piv", "new-chuid"]).unwrap().command {
+        let chuid = match parse(&["keyroostctl", "piv", "chuid", "generate"])
+            .unwrap()
+            .command
+        {
             Some(Cmd::Piv {
                 cmd:
-                    PivCmd::NewChuid {
-                        days,
-                        months,
-                        years,
-                        ..
+                    PivCmd::Chuid {
+                        cmd:
+                            PivChuidCmd::Generate {
+                                days,
+                                months,
+                                years,
+                                ..
+                            },
                     },
             }) => (days, months, years),
-            _ => panic!("expected piv new-chuid"),
+            _ => panic!("expected piv chuid generate"),
         };
         let cert = match parse(&[
             "keyroostctl",
             "piv",
-            "self-sign",
+            "cert",
+            "generate",
             "--slot",
             "9a",
             "--subject",
@@ -17607,14 +18009,17 @@ mod cli_tests {
         {
             Some(Cmd::Piv {
                 cmd:
-                    PivCmd::SelfSign {
-                        days,
-                        months,
-                        years,
-                        ..
+                    PivCmd::Cert {
+                        cmd:
+                            PivCertCmd::Generate {
+                                days,
+                                months,
+                                years,
+                                ..
+                            },
                     },
             }) => (days, months, years),
-            _ => panic!("expected piv self-sign"),
+            _ => panic!("expected piv cert generate"),
         };
         assert_eq!(chuid, cert);
         assert_eq!(chuid, (None, None, None));
@@ -17635,7 +18040,8 @@ mod cli_tests {
         let (days, months, years) = match parse(&[
             "keyroostctl",
             "piv",
-            "self-sign",
+            "cert",
+            "generate",
             "--slot",
             "9a",
             "--subject",
@@ -17650,14 +18056,17 @@ mod cli_tests {
         {
             Some(Cmd::Piv {
                 cmd:
-                    PivCmd::SelfSign {
-                        days,
-                        months,
-                        years,
-                        ..
+                    PivCmd::Cert {
+                        cmd:
+                            PivCertCmd::Generate {
+                                days,
+                                months,
+                                years,
+                                ..
+                            },
                     },
             }) => (days, months, years),
-            _ => panic!("expected piv self-sign"),
+            _ => panic!("expected piv cert generate"),
         };
         assert_eq!(
             ValidFor::resolve(days, months, years),
@@ -17731,8 +18140,8 @@ mod cli_tests {
         assert!(ValidFor::resolve(Some(0), None, None).check().is_err());
     }
 
-    /// `guard_signable_alg` is the early-exit `piv self-sign` / `piv
-    /// request-cert` call before any PIN/management-key prompt or card
+    /// `guard_signable_alg` is the early-exit `piv cert generate` / `piv
+    /// cert request` call before any PIN/management-key prompt or card
     /// write: every signing-capable algorithm passes, and X25519 — the one
     /// key-agreement-only algorithm keyroost supports — is rejected with a
     /// message naming the key type, mirroring
@@ -17881,7 +18290,8 @@ mod cli_tests {
             let mut args = vec![
                 "keyroostctl",
                 "piv",
-                "self-sign",
+                "cert",
+                "generate",
                 "--slot",
                 "9a",
                 "--subject",
@@ -17890,7 +18300,10 @@ mod cli_tests {
             args.extend_from_slice(extra);
             match parse(&args).map(|c| c.command) {
                 Ok(Some(Cmd::Piv {
-                    cmd: PivCmd::SelfSign { key_usage, .. },
+                    cmd:
+                        PivCmd::Cert {
+                            cmd: PivCertCmd::Generate { key_usage, .. },
+                        },
                 })) => Some(key_usage.key_usage.len()),
                 _ => None,
             }
@@ -17926,7 +18339,8 @@ mod cli_tests {
         let cli = parse(&[
             "keyroostctl",
             "piv",
-            "change-pin",
+            "pin",
+            "change",
             "--pin",
             "stdin",
             "--new-pin",
@@ -17934,7 +18348,7 @@ mod cli_tests {
         ])
         .unwrap();
         let Some(Cmd::Piv { cmd }) = &cli.command else {
-            panic!("expected piv change-pin")
+            panic!("expected piv pin change")
         };
         let Err(e) = piv_secret_pair(cmd).unwrap().read_text(&mut sec) else {
             panic!("stdin ended after one line")
@@ -18011,52 +18425,53 @@ mod cli_tests {
         let cmd = Cli::command();
         let piv = cmd.find_subcommand("piv").unwrap();
         for (sub, flag, line) in [
-            ("change-pin", "pin", "first line"),
+            ("pin change", "pin", "first line"),
             (
-                "change-pin",
+                "pin change",
                 "new-pin",
                 "second line when --pin stdin is also given",
             ),
-            ("change-puk", "puk", "first line"),
+            ("puk change", "puk", "first line"),
             (
-                "change-puk",
+                "puk change",
                 "new-puk",
                 "second line when --puk stdin is also given",
             ),
-            ("unblock-pin", "puk", "first line"),
+            ("pin unblock", "puk", "first line"),
             (
-                "unblock-pin",
+                "pin unblock",
                 "new-pin",
                 "second line when --puk stdin is also given",
             ),
-            ("set-retries", "pin", "first line"),
+            ("retries set", "pin", "first line"),
             (
-                "set-retries",
+                "retries set",
                 "mgmt-key",
                 "second line when --pin stdin is also given",
             ),
-            ("change-management-key", "mgmt-key", "first line"),
+            ("mgmt-key change", "mgmt-key", "first line"),
             (
-                "change-management-key",
+                "mgmt-key change",
                 "new-mgmt-key",
                 "second line when --mgmt-key stdin is also given",
             ),
-            ("self-sign", "pin", "first line"),
+            ("cert generate", "pin", "first line"),
             (
-                "self-sign",
+                "cert generate",
                 "mgmt-key",
                 "second line when --pin stdin is also given",
             ),
-            ("request-cert", "pin", "first line"),
+            ("cert request", "pin", "first line"),
             (
-                "request-cert",
+                "cert request",
                 "mgmt-key",
                 "second line when --pin stdin is also given",
             ),
         ] {
-            let arg = piv
-                .find_subcommand(sub)
-                .unwrap()
+            let leaf = sub
+                .split(' ')
+                .fold(piv, |c, w| c.find_subcommand(w).unwrap());
+            let arg = leaf
                 .get_arguments()
                 .find(|a| a.get_long() == Some(flag))
                 .unwrap_or_else(|| panic!("{sub} --{flag}"));
@@ -18070,7 +18485,15 @@ mod cli_tests {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let piv = cmd.find_subcommand("piv").unwrap();
-        for sub in piv.get_subcommands() {
+        let leaves = piv.get_subcommands().flat_map(|c| {
+            let subs: Vec<&clap::Command> = c.get_subcommands().collect();
+            if subs.is_empty() {
+                vec![c]
+            } else {
+                subs
+            }
+        });
+        for sub in leaves {
             if sub.get_name() == "reset" {
                 continue; // Task 9
             }
@@ -18416,14 +18839,14 @@ mod cli_tests {
             ),
             (
                 "--mgmt-key-env",
-                "keyroostctl piv change-pin --mgmt-key-env V",
+                "keyroostctl piv pin change --mgmt-key-env V",
                 "--pin",
                 "now --mgmt-key",
             ),
             // The command has the flag: the plain row.
             (
                 "--pin-env",
-                "keyroostctl piv change-pin --pin-env V",
+                "keyroostctl piv pin change --pin-env V",
                 "--pin-env VAR is now --pin env:VAR",
                 "\u{0}",
             ),
@@ -18502,7 +18925,7 @@ mod cli_tests {
             let a = format!("--{}", flags[0]);
             let b = format!("--{}", flags[1]);
             argv.extend([a.as_str(), "stdin", b.as_str(), "stdin"]);
-            if cols[0] == "piv request-cert" {
+            if cols[0] == "piv cert request" {
                 argv.push("--generate-key"); // --mgmt-key needs it there
             }
             if path[0] == "molto" {
@@ -18540,13 +18963,13 @@ mod cli_tests {
                 "openpgp change-pin",
                 "openpgp change-admin-pin",
                 "openpgp unblock-pin",
-                "piv change-pin",
-                "piv change-puk",
-                "piv unblock-pin",
-                "piv set-retries",
-                "piv change-management-key",
-                "piv request-cert",
-                "piv self-sign",
+                "piv pin change",
+                "piv pin unblock",
+                "piv puk change",
+                "piv retries set",
+                "piv mgmt-key change",
+                "piv cert request",
+                "piv cert generate",
                 "otp add",
                 "otp change-pin",
             ]
@@ -18839,7 +19262,8 @@ mod cli_tests {
             let mut args = vec![
                 "keyroostctl",
                 "piv",
-                "import-cert",
+                "cert",
+                "import",
                 "--slot",
                 "9d",
                 "--in",
@@ -18848,9 +19272,12 @@ mod cli_tests {
             args.extend_from_slice(extra);
             parse(&args).map(|cli| match cli.command {
                 Some(Cmd::Piv {
-                    cmd: PivCmd::ImportCert { compression, .. },
+                    cmd:
+                        PivCmd::Cert {
+                            cmd: PivCertCmd::Import { compression, .. },
+                        },
                 }) => compression.choice(),
-                _ => panic!("expected piv import-cert"),
+                _ => panic!("expected piv cert import"),
             })
         };
         assert_eq!(import(&[]).unwrap(), CertCompression::Auto);
@@ -18862,7 +19289,8 @@ mod cli_tests {
             let mut args = vec![
                 "keyroostctl",
                 "piv",
-                "self-sign",
+                "cert",
+                "generate",
                 "--slot",
                 "9a",
                 "--subject",
@@ -18871,9 +19299,12 @@ mod cli_tests {
             args.extend_from_slice(extra);
             parse(&args).map(|cli| match cli.command {
                 Some(Cmd::Piv {
-                    cmd: PivCmd::SelfSign { compression, .. },
+                    cmd:
+                        PivCmd::Cert {
+                            cmd: PivCertCmd::Generate { compression, .. },
+                        },
                 }) => compression.choice(),
-                _ => panic!("expected piv self-sign"),
+                _ => panic!("expected piv cert generate"),
             })
         };
         assert_eq!(self_sign(&[]).unwrap(), CertCompression::Auto);
@@ -19502,11 +19933,21 @@ mod cli_tests {
         let yes = match cli.command.as_ref()? {
             Cmd::Piv {
                 cmd:
-                    PivCmd::GenerateKey { yes, .. }
-                    | PivCmd::ImportCert { yes, .. }
-                    | PivCmd::SetRetries { yes, .. }
-                    | PivCmd::SelfSign { yes, .. }
-                    | PivCmd::RequestCert { yes, .. },
+                    PivCmd::Key {
+                        cmd: PivKeyCmd::Generate { yes, .. },
+                    }
+                    | PivCmd::Cert {
+                        cmd: PivCertCmd::Import { yes, .. },
+                    }
+                    | PivCmd::Retries {
+                        cmd: PivRetriesCmd::Set { yes, .. },
+                    }
+                    | PivCmd::Cert {
+                        cmd: PivCertCmd::Generate { yes, .. },
+                    }
+                    | PivCmd::Cert {
+                        cmd: PivCertCmd::Request { yes, .. },
+                    },
             } => yes,
             Cmd::Oath {
                 cmd: OathCmd::Delete { yes, .. },
@@ -19623,11 +20064,12 @@ mod cli_tests {
     #[test]
     fn newly_confirmed_commands_take_yes() {
         for args in [
-            &["keyroostctl", "piv", "generate-key", "--slot", "9a"][..],
+            &["keyroostctl", "piv", "key", "generate", "--slot", "9a"][..],
             &[
                 "keyroostctl",
                 "piv",
-                "import-cert",
+                "cert",
+                "import",
                 "--slot",
                 "9c",
                 "--in",
@@ -19636,7 +20078,8 @@ mod cli_tests {
             &[
                 "keyroostctl",
                 "piv",
-                "set-retries",
+                "retries",
+                "set",
                 "--pin-tries",
                 "3",
                 "--puk-tries",
@@ -19645,7 +20088,8 @@ mod cli_tests {
             &[
                 "keyroostctl",
                 "piv",
-                "self-sign",
+                "cert",
+                "generate",
                 "--slot",
                 "9d",
                 "--subject",
@@ -19654,7 +20098,8 @@ mod cli_tests {
             &[
                 "keyroostctl",
                 "piv",
-                "request-cert",
+                "cert",
+                "request",
                 "--slot",
                 "9e",
                 "--subject",

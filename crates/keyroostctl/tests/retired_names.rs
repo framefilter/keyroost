@@ -26,7 +26,6 @@ fn run(args: &[&str]) -> (i32, String, String) {
 const CASES: &[(&[&str], &str)] = &[
     (&["--list-readers", "S3CRETVALUE"], "keyroostctl list"),
     (&["piv", "--list-readers"], "keyroostctl list"),
-    (&["piv", "status", "S3CRETVALUE"], "keyroostctl piv info"),
     (
         &["openpgp", "status", "S3CRETVALUE"],
         "keyroostctl openpgp info",
@@ -94,54 +93,6 @@ const CASES: &[(&[&str], &str)] = &[
     (&["molto", "sync-time", "-p", "99", "S3CRETVALUE"], "--slot"),
     (&["molto", "delete", "-p", "99", "S3CRETVALUE"], "--slot"),
     (&["molto", "import", "-p", "99", "S3CRETVALUE"], "--slot"),
-    (
-        &[
-            "piv",
-            "import-cert",
-            "--slot",
-            "9a",
-            "--file",
-            "S3CRETVALUE",
-        ],
-        "--in",
-    ),
-    (
-        &[
-            "piv",
-            "export-cert",
-            "--slot",
-            "9a",
-            "--file",
-            "S3CRETVALUE",
-        ],
-        "--out",
-    ),
-    (
-        &[
-            "piv",
-            "request-cert",
-            "--slot",
-            "9a",
-            "--subject",
-            "CN=x",
-            "--file",
-            "S3CRETVALUE",
-        ],
-        "--out",
-    ),
-    (
-        &[
-            "piv",
-            "self-sign",
-            "--slot",
-            "9a",
-            "--subject",
-            "CN=x",
-            "--file",
-            "S3CRETVALUE",
-        ],
-        "--out",
-    ),
     (
         &["fido", "pin-set", "--new-pin-env", "S3CRETVALUE"],
         "keyroostctl fido pin set",
@@ -288,6 +239,198 @@ const CASES: &[(&[&str], &str)] = &[
     (
         &["fido", "blob", "export", "0", "S3CRETVALUE"],
         "--out FILE",
+    ),
+    (&["piv", "status", "S3CRETVALUE"], "keyroostctl piv info"),
+    (
+        &["piv", "change-pin", "--old-pin-env", "S3CRETVALUE"],
+        "keyroostctl piv pin change",
+    ),
+    (
+        &["piv", "unblock-pin", "S3CRETVALUE"],
+        "keyroostctl piv pin unblock",
+    ),
+    (
+        &["piv", "change-puk", "S3CRETVALUE"],
+        "keyroostctl piv puk change",
+    ),
+    (
+        &["piv", "set-retries", "S3CRETVALUE"],
+        "keyroostctl piv retries set",
+    ),
+    (
+        &[
+            "piv",
+            "change-management-key",
+            "--new-algorithm",
+            "S3CRETVALUE",
+        ],
+        "keyroostctl piv mgmt-key change",
+    ),
+    (
+        &["piv", "generate-key", "--save-pubkey", "S3CRETVALUE"],
+        "keyroostctl piv key generate",
+    ),
+    (
+        &["piv", "delete-key", "S3CRETVALUE"],
+        "keyroostctl piv key delete",
+    ),
+    (
+        &["piv", "move-key", "S3CRETVALUE"],
+        "keyroostctl piv key move",
+    ),
+    (
+        &["piv", "import-cert", "--file", "S3CRETVALUE"],
+        "keyroostctl piv cert import",
+    ),
+    (
+        &["piv", "export-cert", "--file", "S3CRETVALUE"],
+        "keyroostctl piv cert export",
+    ),
+    (
+        &["piv", "delete-cert", "S3CRETVALUE"],
+        "keyroostctl piv cert delete",
+    ),
+    (
+        &["piv", "request-cert", "--load-pubkey", "S3CRETVALUE"],
+        "keyroostctl piv cert request",
+    ),
+    (
+        &["piv", "self-sign", "S3CRETVALUE"],
+        "keyroostctl piv cert generate",
+    ),
+    (
+        &["piv", "new-chuid", "S3CRETVALUE"],
+        "keyroostctl piv chuid generate",
+    ),
+    (
+        &[
+            "piv",
+            "key",
+            "generate",
+            "--slot",
+            "9a",
+            "--save-pubkey",
+            "S3CRETVALUE",
+        ],
+        "--out",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "request",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--save-pubkey",
+            "S3CRETVALUE",
+        ],
+        "--pubkey-out",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "generate",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--save-pubkey",
+            "S3CRETVALUE",
+        ],
+        "--pubkey-out",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "generate",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--load-pubkey",
+            "S3CRETVALUE",
+        ],
+        "--pubkey-in",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "request",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--load-pubkey",
+            "S3CRETVALUE",
+        ],
+        "--pubkey-in",
+    ),
+    (
+        &[
+            "piv",
+            "mgmt-key",
+            "change",
+            "--new-algorithm",
+            "S3CRETVALUE",
+        ],
+        "--algorithm",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "import",
+            "--slot",
+            "9a",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--in",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "export",
+            "--slot",
+            "9a",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--out",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "request",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--out",
+    ),
+    (
+        &[
+            "piv",
+            "cert",
+            "generate",
+            "--slot",
+            "9a",
+            "--subject",
+            "CN=x",
+            "--file",
+            "S3CRETVALUE",
+        ],
+        "--out",
     ),
 ];
 

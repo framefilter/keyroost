@@ -4945,7 +4945,7 @@ impl<'tx> PivSession<'tx> {
         self.confirmed_slot_key(slot)
             .ok_or(TransportError::MalformedResponse(
                 "slot has no key, or GET METADATA doesn't name this slot's key and \
-             the key material wasn't handed to this session — run `piv generate-key` \
+             the key material wasn't handed to this session — run `piv key generate` \
              on this slot in this same session, or pass its previously saved \
              key material to this command, so it can be cached for \
              CSR/self-sign",
@@ -5576,9 +5576,9 @@ impl<'tx> PivSession<'tx> {
             Err(e) => return Err(e),
         }
 
-        // 2. Block the PUK (via unblock-pin, whose wrong PUK decrements the PUK
-        //    counter). Size the loop from the card's real PUK count — `piv
-        //    set-retries` can raise it past the default cap, and a loop that
+        // 2. Block the PUK (via `piv pin unblock`'s command, whose wrong PUK
+        //    decrements the PUK counter). Size the loop from the card's real PUK
+        //    count — `piv retries set` can raise it past the default cap, and a loop that
         //    stops short leaves the PIN blocked and the card un-wiped. GET
         //    METADATA is firmware 5.3+, so `None` (the conservative default)
         //    stays the fallback.
@@ -7403,7 +7403,7 @@ mod tests {
     // `slot_status` / `status_detailed`) uses to decide whether a slot holds
     // a certificate. The regression this guards: a deleted slot answering
     // SW_OK with an empty `53 00` template (Nitrokey's piv-authenticator,
-    // observed with `piv info` after `piv delete-cert`) must read as empty,
+    // observed with `piv info` after `piv cert delete`) must read as empty,
     // not "cert present (0 bytes)".
 
     #[test]
@@ -7481,7 +7481,7 @@ mod tests {
 
     // A slot whose certificate is flagged compressed but will not inflate
     // holds *something* — it must read as unreadable, never as empty, so
-    // `piv info` doesn't invite overwriting it and `export-cert` doesn't
+    // `piv info` doesn't invite overwriting it and `cert export` doesn't
     // report "no certificate" (#147 follow-up; seen on a YubiKey 5.7).
 
     #[test]
@@ -8165,7 +8165,7 @@ mod tests {
         assert_eq!(block_attempts_cap(None), 12);
         // A pathological huge count is clamped so the loop can't run away.
         assert_eq!(block_attempts_cap(Some(200)), 22);
-        // A raised PUK count (set-retries allows more than the old hardcoded 12)
+        // A raised PUK count (`piv retries set` allows more than the old hardcoded 12)
         // still outlasts the card.
         assert_eq!(block_attempts_cap(Some(15)), 17);
     }
