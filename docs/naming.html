@@ -204,7 +204,9 @@ keyroostctl name clear signing-yubikey              # remove it, wherever it is 
       version reads the file, it converts it to fingerprints. It keeps a backup of the
       old file until the conversion has succeeded, then removes it, so no serial stays on
       disk. Your names keep working. If you go back to v0.12, it can't read the converted
-      file and shows your keys unnamed.</p>
+      file and shows your keys unnamed. Don't name or rename a key with v0.12 after
+      upgrading: v0.12 saves a new <code>keys.json</code> over the converted one, and the
+      names in it are lost.</p>
   </section>
 
   <section class="kr-section">
@@ -217,8 +219,10 @@ keyroostctl name clear signing-yubikey              # remove it, wherever it is 
         --keep-name</code> keeps it.</li>
       <li><strong>Other software:</strong> the FIDO2 standard lets a browser or system tool
         remove large-blob entries that no passkey uses, which would include the name. We
-        haven't seen it happen. If it does, keyroost shows the name this computer saved for
-        the key, if any, and offers to write it back.</li>
+        haven't seen it happen. A name lives in one place, so if it disappears from the key,
+        the key shows as unnamed until the name is written back:
+        <code>keyroostctl name list</code> prints the one command that restores it, and the
+        app offers <strong>Write it back</strong>.</li>
     </ul>
     <p class="kr-muted">The format of the name on the key is published, with test vectors, in
       <a href="https://github.com/framefilter/keyroost/blob/main/docs/PROTOCOL-device-label.md">PROTOCOL-device-label.md</a>,

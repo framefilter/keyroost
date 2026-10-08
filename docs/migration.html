@@ -206,7 +206,10 @@
           an older <code>keys.json</code> it converts it, keeping a backup of
           the old file until the conversion succeeds and then removing it.
           Nothing to do. If you go back to v0.12, it can't read the converted
-          file and shows your keys unnamed. If <code>keys.salt</code> is
+          file and shows your keys unnamed; don't name or rename a key with
+          v0.12 after upgrading, since v0.12 then saves a new
+          <code>keys.json</code> over the converted one and its names are
+          lost. If <code>keys.salt</code> is
           lost, clear the names and set them again; restoring the old
           <code>keys.salt</code> doesn't bring them back.</td></tr>
       <tr><td><code>fido blob clear</code> erased the whole array</td>

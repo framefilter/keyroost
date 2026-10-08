@@ -783,8 +783,9 @@ first time this version reads it.
 - `fido blob clear` and a FIDO reset erase the name with everything else
   (`fido blob clear --keep-name` keeps it). The FIDO2 standard also lets
   other software remove large-blob entries that no passkey uses; we haven't
-  seen it happen. If a key loses its name, `name list` prints the command to
-  write it back, and the desktop app offers to.
+  seen it happen. If a key loses its name, it shows as unnamed until the name
+  is written back: `name list` prints the command to do so, and the desktop
+  app offers to.
 
 The format of the name entry, with test vectors for other tools, is in
 [`docs/PROTOCOL-device-label.md`](docs/PROTOCOL-device-label.md).

@@ -132,8 +132,10 @@ Step 3 keeps an entry another tool wrote in the meantime from being lost.
 - **Platform cleanup.** CTAP 2.1 allows a platform to remove large-blob
   entries that no credential on the key can decrypt. A label entry is such an
   entry. We have not seen Chrome, libfido2 or python-fido2 do this, but if it
-  happens the label is gone. keyroost then shows the name this computer saved
-  for the key, if any, and the desktop app offers to write the name back.
+  happens the label is gone. A name lives in one place, so keyroost then shows
+  the key as unnamed until the name is written back: `keyroostctl name list`
+  prints the one command that restores it, and the desktop app offers
+  "Write it back".
 - **Erasing the array.** `keyroostctl fido blob clear` erases the label with
   everything else unless `--keep-name` is given. A FIDO reset erases the array
   and the label with it.
