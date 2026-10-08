@@ -2,6 +2,7 @@
 //! and PC/SC reader(s), with a capability union and a Molto2-vs-key
 //! classification. Consumed by both the GUI and the CLI so they never drift.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use keyroost_hid::HidDevice;
@@ -9,7 +10,7 @@ use keyroost_keyring::Keyring;
 use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
 
-use crate::names::Naming;
+use crate::names::{KeyLabel, Naming};
 
 /// Capability bit-set. Hand-rolled (no `bitflags` dep). Each physical key
 /// advertises the union of the applets it answers.
@@ -932,23 +933,167 @@ pub struct EnumerateOptions {
     /// Match by topology, vendor and reported serials only, sending no
     /// identity reads to any key ([`correlate`]). For time-critical or
     /// re-check scans where an unanswered identity read would only cost time.
+    /// Also skips reading names stored on keys.
     pub skip_identity_reads: bool,
+    /// Don't read names stored on keys (local names only).
+    pub skip_key_names: bool,
+}
+
+/// Set once the "keys.json can't be read" warning has been printed.
+static KEYRING_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Load `keys.json` for a scan. A file that can't be read never breaks a
+/// scan: the keys are shown without the names saved on this computer, the
+/// problem is reported once per process, and the returned flag is `false`
+/// so nothing learned during the scan is ever saved over it.
+pub fn load_keyring_for_scan() -> (Keyring, bool) {
+    match Keyring::load_default() {
+        Ok(k) => (k, true),
+        Err(keyroost_keyring::KeyringError::NoConfigDir) => (Keyring::default(), false),
+        Err(e) => {
+            if !KEYRING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("warning: {e}. Keys are shown without the names saved on this computer.");
+            }
+            (Keyring::default(), false)
+        }
+    }
+}
+
+/// For every row with FIDO2 and a HID path: open it, ask getInfo, and read
+/// the name stored on the key (no PIN). A failed read is
+/// [`KeyLabel::NotRead`], traced under `debug` (never a serial).
+fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabel> {
+    use keyroost_ctap::device_label::{read_label, LabelState};
+    let mut labels = HashMap::new();
+    for d in devices.iter().filter(|d| d.caps.has(Caps::FIDO2)) {
+        let Some(path) = d.hid_path.as_deref() else {
+            continue;
+        };
+        let read = || -> Result<KeyLabel, String> {
+            let (mut dev, _) =
+                keyroost_ctap::CtapHidDevice::open(path).map_err(|e| e.to_string())?;
+            let info = keyroost_ctap::get_info(&mut dev).map_err(|e| e.to_string())?;
+            Ok(
+                match read_label(&mut dev, &info).map_err(|e| e.to_string())? {
+                    LabelState::Unsupported => KeyLabel::Unsupported,
+                    LabelState::Absent => KeyLabel::Absent,
+                    LabelState::Present(l) => KeyLabel::from_text(&l.label),
+                },
+            )
+        };
+        let label = read().unwrap_or_else(|e| {
+            if debug {
+                eprintln!(
+                    "{}",
+                    format_line(
+                        Dir::Note,
+                        "names",
+                        &format!("{}: name not read: {e}", path.display()),
+                    )
+                );
+            }
+            KeyLabel::NotRead
+        });
+        labels.insert(d.id.clone(), label);
+    }
+    labels
+}
+
+/// What one naming pass with names read from keys did: counts only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Learned {
+    /// Keys whose storage answered.
+    read: usize,
+    /// Of those, keys carrying a (valid or not) name entry.
+    with_name: usize,
+    recorded: usize,
+    dropped: usize,
+}
+
+/// Name every row from `keyring` and `labels`, and apply what the pass
+/// learned to `keyring` only when it may be saved.
+fn learn_names(
+    devices: &mut [Device],
+    keyring: &mut Keyring,
+    labels: &HashMap<DeviceId, KeyLabel>,
+    may_save: bool,
+) -> Learned {
+    let updates = crate::names::apply_names(devices, keyring, labels);
+    let (recorded, dropped) = if may_save {
+        crate::names::apply_updates(keyring, &updates)
+    } else {
+        (0, 0)
+    };
+    Learned {
+        read: labels.values().filter(|l| **l != KeyLabel::NotRead).count(),
+        with_name: labels
+            .values()
+            .filter(|l| matches!(l, KeyLabel::Present(_) | KeyLabel::Unreadable))
+            .count(),
+        recorded,
+        dropped,
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Read the names stored on the scanned keys (no PIN) and name every row.
+/// First-seen names are recorded in `keys.json` best-effort: a failed save
+/// is traced under `debug` and never fails the scan, and nothing is saved
+/// when `may_save` is false (see [`load_keyring_for_scan`]).
+pub fn name_from_keys(devices: &mut [Device], keyring: &mut Keyring, may_save: bool, debug: bool) {
+    let labels = read_key_labels(devices, debug);
+    let learned = learn_names(devices, keyring, &labels, may_save);
+    let saved = if learned.recorded + learned.dropped > 0 {
+        keyring
+            .save_default()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    };
+    if debug {
+        let mut line = format!(
+            "read {} ({} with a name on the key); recorded {}",
+            plural(learned.read, "key", "keys"),
+            learned.with_name,
+            plural(learned.recorded, "first-seen name", "first-seen names"),
+        );
+        if learned.dropped > 0 {
+            line.push_str(&format!(
+                "; dropped {}",
+                plural(learned.dropped, "stale name", "stale names")
+            ));
+        }
+        if let Err(e) = saved {
+            line.push_str(&format!("; not saved: {e}"));
+        }
+        eprintln!("{}", format_line(Dir::Note, "names", &line));
+    }
 }
 
 /// Build the unified device list (see [`enumerate`]) with options.
 pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
     let probes = keyroost_transport::probe_readers().unwrap_or_default();
-    let keyring = Keyring::load_default().unwrap_or_default();
+    let (mut keyring, may_save) = load_keyring_for_scan();
     if opts.skip_identity_reads {
         return Ok(correlate(&hids, &probes, &keyring));
     }
-    Ok(correlate_live(&hids, &probes, &keyring, opts.debug))
+    let mut devices = correlate_live(&hids, &probes, &keyring, opts.debug);
+    if !opts.skip_key_names {
+        name_from_keys(&mut devices, &mut keyring, may_save, opts.debug);
+    }
+    Ok(devices)
 }
 
 /// Build the unified device list. Blocking: enumerates FIDO HID nodes and probes
 /// PC/SC readers, then correlates, matching by device-reported identity where
-/// topology is unavailable. A HID-layer failure is a hard error; PC/SC
+/// topology is unavailable, and names every row — reading the name a FIDO
+/// key stores on itself (no PIN) and recording first-seen names best-effort
+/// ([`name_from_keys`]). A HID-layer failure is a hard error; PC/SC
 /// problems degrade to an empty probe list (FIDO-only keys still appear).
 pub fn enumerate() -> Result<Vec<Device>, String> {
     enumerate_with(&EnumerateOptions::default())
@@ -2773,5 +2918,72 @@ mod plan_tests {
         assert_eq!(ResetStep::Piv.label(), "PIV");
         assert_eq!(ResetStep::Token2Otp.label(), "OTP");
         assert_eq!(ResetStep::Fido.label(), "FIDO2");
+    }
+
+    #[test]
+    fn enumerate_options_skip_flags_default_off() {
+        let o = EnumerateOptions::default();
+        assert!(!o.debug);
+        assert!(!o.skip_identity_reads);
+        assert!(!o.skip_key_names);
+    }
+
+    fn named_scan() -> Vec<Device> {
+        let key = |path: &str, serial: &str| HidDevice {
+            path: path.into(),
+            vendor_id: 0x1209,
+            product_id: 0xbeee,
+            product_name: "Security Key".into(),
+            usage_page: keyroost_hid::HID_USAGE_PAGE_FIDO,
+            usage: keyroost_hid::HID_USAGE_FIDO_AUTHENTICATOR,
+            serial_number: Some(serial.into()),
+            usb_bus: None,
+            usb_address: None,
+        };
+        let hids = [
+            key("/dev/hidraw1", "12345678"),
+            key("/dev/hidraw2", "ABCDEF01"),
+        ];
+        correlate(&hids, &[], &Keyring::default())
+    }
+
+    #[test]
+    fn learn_names_records_first_seen_and_counts() {
+        let mut devs = named_scan();
+        let mut ring = Keyring::default();
+        let labels: HashMap<DeviceId, KeyLabel> = [
+            (devs[0].id.clone(), KeyLabel::Present("Work".into())),
+            (devs[1].id.clone(), KeyLabel::Absent),
+        ]
+        .into_iter()
+        .collect();
+        let got = learn_names(&mut devs, &mut ring, &labels, true);
+        assert_eq!(
+            got,
+            Learned {
+                read: 2,
+                with_name: 1,
+                recorded: 1,
+                dropped: 0
+            }
+        );
+        assert!(ring.holder("Work").is_some());
+        assert!(devs.iter().any(|d| d.name.as_deref() == Some("Work")));
+    }
+
+    #[test]
+    fn learn_names_never_changes_an_unsavable_keyring() {
+        // A keys.json that failed to load: rows are still named from the
+        // keys, but nothing is learned into the (empty stand-in) ring.
+        let mut devs = named_scan();
+        let mut ring = Keyring::default();
+        let labels: HashMap<DeviceId, KeyLabel> =
+            [(devs[0].id.clone(), KeyLabel::Present("Work".into()))]
+                .into_iter()
+                .collect();
+        let got = learn_names(&mut devs, &mut ring, &labels, false);
+        assert_eq!((got.recorded, got.dropped), (0, 0));
+        assert!(ring.keys.is_empty());
+        assert!(devs.iter().any(|d| d.name.as_deref() == Some("Work")));
     }
 }

@@ -24,8 +24,9 @@ pub mod names;
 pub mod select;
 pub use device::{
     correlate, correlate_live, correlate_with, enumerate, enumerate_with, exclude_unresettable_piv,
-    factory_reset_plan, CapState, Caps, Device, DeviceId, DeviceKind, EnumerateOptions,
-    MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport, PIV_GLOBAL_RESET_LABEL,
+    factory_reset_plan, load_keyring_for_scan, name_from_keys, CapState, Caps, Device, DeviceId,
+    DeviceKind, EnumerateOptions, MatchOptions, MatchStep, ResetStep, StepOutcome, StepReport,
+    PIV_GLOBAL_RESET_LABEL,
 };
 pub use identity::{
     plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,

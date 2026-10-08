@@ -32,6 +32,7 @@ pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
     Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
         debug: debug_on(),
         skip_identity_reads: false,
+        skip_key_names: false,
     })?)
 }
 
@@ -42,6 +43,7 @@ pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn 
     Ok(keyroost_resolve::enumerate_with(&EnumerateOptions {
         debug: debug_on(),
         skip_identity_reads: true,
+        skip_key_names: true,
     })?)
 }
 

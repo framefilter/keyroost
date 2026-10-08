@@ -2311,6 +2311,7 @@ dependencies = [
 name = "keyroost-resolve"
 version = "0.12.0"
 dependencies = [
+ "keyroost-ctap",
  "keyroost-hid",
  "keyroost-keyring",
  "keyroost-openpgp",

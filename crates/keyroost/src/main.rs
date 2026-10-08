@@ -6859,12 +6859,17 @@ impl App {
     /// just-replugged key's CCID interface takes a beat to register with
     /// pcscd) — callers retry on the next poll rather than guessing.
     fn fido_effective_serial(path: &std::path::Path) -> Option<String> {
-        keyroost_resolve::enumerate()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|d| d.hid_path.as_deref() == Some(path))
-            .map(|d| d.serial)
-            .filter(|s| !s.is_empty())
+        // Polled while a reset is armed: no name reads, so the poll never
+        // talks CTAP to the key being reset.
+        keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
+            skip_key_names: true,
+            ..Default::default()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .find(|d| d.hid_path.as_deref() == Some(path))
+        .map(|d| d.serial)
+        .filter(|s| !s.is_empty())
     }
 
     /// Poll the live FIDO list while a reset is armed: once the armed key has

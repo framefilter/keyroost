@@ -452,6 +452,36 @@ mod tests {
     }
 
     #[test]
+    fn apply_updates_records_first_seen_and_drops_stale() {
+        let mut ring = Keyring::default();
+        assert!(ring.record_first_seen(A, "Old"));
+        local(&mut ring, B, "Taken");
+        let ups = [
+            NameUpdate::FirstSeen {
+                serial: A.into(),
+                name: "New".into(),
+            },
+            NameUpdate::DropStale {
+                serial: A.into(),
+                current: "New".into(),
+            },
+            // A name another record holds is never recorded twice.
+            NameUpdate::FirstSeen {
+                serial: A.into(),
+                name: "Taken".into(),
+            },
+        ];
+        assert_eq!(apply_updates(&mut ring, &ups), (1, 1));
+        assert!(ring.holder("Old").is_none());
+        assert_eq!(ring.holder("New").map(|r| r.stored), Some(NameStore::Key));
+        assert_eq!(
+            ring.holder("Taken").map(|r| r.stored),
+            Some(NameStore::Computer)
+        );
+        assert_eq!(apply_updates(&mut ring, &[]), (0, 0));
+    }
+
+    #[test]
     fn rows_are_reset_every_pass() {
         let ring = Keyring::default();
         let mut devs = vec![key(A)];

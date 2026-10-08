@@ -6264,7 +6264,7 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
             (Vec::new(), false)
         }
     };
-    let keyring = Keyring::load_default().unwrap_or_default();
+    let (mut keyring, may_save) = keyroost_resolve::load_keyring_for_scan();
     if device.is_none() && hids_ok {
         let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
         if filtered.is_empty() {
@@ -6340,8 +6340,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
     if device.is_none() {
         println!();
     }
-    let devices =
-        keyroost_resolve::correlate_live(&hids, &probes, &keyring, crate::target::debug_on());
+    let debug = crate::target::debug_on();
+    let mut devices = keyroost_resolve::correlate_live(&hids, &probes, &keyring, debug);
+    keyroost_resolve::name_from_keys(&mut devices, &mut keyring, may_save, debug);
     let rows = filter_rows(&devices, device)?;
     overview::print_correlated(&rows);
 
