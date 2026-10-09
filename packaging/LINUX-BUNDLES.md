@@ -10,7 +10,7 @@
 >
 > Before a tagged release produces working bundles, do the
 > [one-time maintainer setup](#one-time-maintainer-setup) (icon, pcsc-lite
-> sha256, optional GPG key, Pages). Remaining open decisions are in
+> sha256, optional Flatpak GPG key, Pages, AppImage signing key). Remaining open decisions are in
 > [Decisions](#decisions) at the bottom — the resolved ones are marked **DECIDED**.
 
 ## One-time maintainer setup
@@ -94,6 +94,37 @@ bundles automatically.
    key to the root of `keyroost-flatpak` (`keyroost.gpg`) for reference.
 
 5. **App-id — DECIDED.** `io.github.framefilter.keyroost`. No action needed.
+
+6. **AppImage signing key (REQUIRED).** The AppImage job signs every
+   AppImage and **fails when the key is missing**, build-only probes included
+   (once releases are signed, an unsigned one is refused by AppImageUpdate,
+   so the job never falls back to unsigned). Use a key of its own, not the
+   Flatpak key, so each channel can be rotated alone. Once, from the repo
+   root:
+   - Generate an ed25519 signing-only key that never expires, with no
+     passphrase and a non-personal UID, in a throwaway GnuPG home:
+     `gpg --batch --passphrase '' --quick-generate-key "keyroost AppImage Signing Key" ed25519 sign never`.
+     A minimal key keeps the exported public key well under the 8 KiB
+     `.sig_key` section.
+   - Pipe the armored private key straight into an **environment secret**
+     on `release-publish` (released only after the approval gate), and store
+     the full fingerprint next to it:
+     `gpg --armor --export-secret-keys <FPR> | gh secret set APPIMAGE_GPG_KEY --env release-publish`
+     and `printf %s <FPR> | gh secret set APPIMAGE_GPG_KEY_ID --env release-publish`.
+   - Export the public key to `packaging/appimage/keyroost-appimage-signing.asc`
+     and commit it; put the fingerprint in SECURITY.md ("Release integrity")
+     and the README's AppImage section.
+   - Delete the throwaway GnuPG home. No other copy of the private key is
+     kept: GitHub secrets cannot be read back, so a lost secret means a new
+     key, and a new key makes AppImageUpdate refuse that one update
+     (SECURITY.md describes the rotation policy).
+
+   The workflow checks that the imported key matches both
+   `APPIMAGE_GPG_KEY_ID` and the committed `.asc`, builds the GUI binary
+   before the key is imported (dependency build scripts never see it),
+   removes the key after packaging, and runs
+   `packaging/appimage/verify-appimage-signature.sh` as a guard before the
+   AppImage is attested or uploaded.
 
 ## User install instructions
 
@@ -428,6 +459,8 @@ See `packaging/appimage/build-appimage.sh`. Outline:
 
 ```bash
 cargo build --release -p keyroost --features keyroost/qr   # GUI binary (glibc)
+# (CI runs that build as its own step, then the script with
+#  KEYROOST_APPIMAGE_SKIP_CARGO=1 LDAI_SIGN=1 LDAI_SIGN_KEY=<fingerprint>)
 # stage AppDir, copy binary + desktop + icon, let linuxdeploy bundle libs:
 linuxdeploy --appdir AppDir \
     --executable target/release/keyroost \
@@ -435,7 +468,7 @@ linuxdeploy --appdir AppDir \
     --desktop-file packaging/flatpak/io.github.framefilter.keyroost.desktop \
     --icon-file <icon.png>
 # move libpcsclite into usr/lib/pcsc-fallback/, wrap AppRun, then package:
-linuxdeploy-plugin-appimage --appdir AppDir
+linuxdeploy-plugin-appimage --appdir AppDir   # signs (if LDAI_SIGN), then writes .zsync
 ```
 
 (The desktop file + icon are **reused from the Flatpak drafts** — same app-id,
@@ -459,7 +492,12 @@ is proven for this app.
   the classic AppImage portability footgun.
 - FUSE dependency on the user's machine (see above).
 - Updates go through AppImageUpdate: the build embeds gh-releases zsync update
-  info and ships the `.zsync` file.
+  info and ships the `.zsync` file. The AppImage is GPG-signed (setup step 6),
+  and AppImageUpdate refuses an update whose key differs from the installed
+  AppImage's, or one that is unsigned once the installed one is signed. An
+  installed unsigned AppImage (v0.12.x and earlier) is refused the update to
+  a signed one too ("bad signature"), so that one update is a manual download.
+  Gear Lever compares the `.zsync` SHA-1 and does not check signatures.
 - GUI-only by design; CLI users get the musl binary or `cargo install`.
 
 ---
@@ -559,6 +597,7 @@ musl cross toolchain, then build libpcsclite there. See
 | PC/SC | bundle client lib + `--socket=pcsc` to host pcscd | host libpcsclite + pcscd; bundled client only as fallback | static musl libpcsclite (**unverified**) or FIDO-only |
 | FIDO HID | `--device=all` + `/run/udev:ro` | host hidraw + host udev rules | host hidraw + host udev rules |
 | Auto-update | yes (OSTree repo) | yes (.zsync) | no |
+| Signing | GPG, OSTree repo (Flatpak key) | GPG, embedded (dedicated AppImage key) | n/a (not shipped) |
 | Host needs pcscd | yes | yes | yes |
 | glibc portability | n/a (runtime) | build on old glibc | fully static (no glibc) |
 | Verified on hardware | **no** | **no** | **no** |
@@ -604,6 +643,10 @@ musl cross toolchain, then build libpcsclite there. See
     hardware testing shows what's actually required?
 12. **DECIDED (#47):** use the host libpcsclite; a bundled copy in
     `usr/lib/pcsc-fallback/` is used only when the host has none.
+13. **AppImage signing.** **DECIDED: signed**, with a dedicated ed25519 key
+    held as `release-publish` environment secrets; a missing key fails the
+    job (probes too); public key committed, fingerprint in SECURITY.md and
+    the README; a lost key means a new key (setup step 6).
 
 ## Claims to double-check (could not fully web-verify)
 

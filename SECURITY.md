@@ -141,7 +141,7 @@ What keyroost does **not** defend against:
 
 ## Release integrity
 
-Four mechanisms:
+Five mechanisms:
 
 - **Signed tags.** Release tags are signed by the maintainer with a hardware
   key; tag creation is restricted to the repository admin by ruleset. The
@@ -155,6 +155,25 @@ Four mechanisms:
   flatpak publish separate `.sha256` files.
 - **crates.io Trusted Publishing.** Crates are published by the release
   workflow over OIDC. No long-lived publishing token exists.
+- **AppImage signature.** `keyroost-x86_64.AppImage` carries an embedded
+  GPG signature from a dedicated signing key, fingerprint
+  `FINGERPRINT-PENDING`. The public key is committed as
+  `packaging/appimage/keyroost-appimage-signing.asc`, so the signed release
+  tag covers it. AppImageUpdate-based updaters (appimageupdatetool,
+  AppImageLauncher) compare the key in the installed AppImage with the key
+  in the update and refuse an update signed by a different key, or not
+  signed at all. That is key continuity between updates. It does not
+  authenticate a first download: anyone can embed their own key in an
+  AppImage, so a first download is checked with the attestation and the
+  `.sha256` file, or against the fingerprint above (see "Verifying the
+  AppImage" below). The private key exists only as a GitHub environment
+  secret behind the release approval gate; the release workflow refuses to
+  build an AppImage when it is missing, or when it does not match the
+  committed public key. **Rotation:** the key does not expire and is not
+  rotated on a schedule. It is replaced only if it is lost or compromised.
+  A new key makes AppImageUpdate refuse that update ("key changed"), so
+  users download the new AppImage by hand once; the release notes say so
+  and SECURITY.md and the README publish the new fingerprint.
 
 Commits on `main` are not required to be signed. Changes land through
 reviewed pull requests (`packaging/REVIEWING.md` is the review checklist);
@@ -176,6 +195,48 @@ gh attestation verify keyroost-*-linux-x86_64.tar.gz --repo framefilter/keyroost
 The release assets are named `keyroost-<tag>-linux-x86_64.tar.gz`,
 `keyroost-<tag>-macos-universal2.tar.gz` and
 `keyroost-<tag>-windows-x86_64.zip`; `SHA256SUMS` covers all three.
+
+### Verifying the AppImage
+
+```sh
+sha256sum -c keyroost-x86_64.AppImage.sha256
+gh attestation verify keyroost-x86_64.AppImage --repo framefilter/keyroost
+```
+
+The embedded signature can also be checked against the published key, with
+the fingerprint `FINGERPRINT-PENDING`. From a checkout of the release tag,
+one command checks the signature, that the embedded key is the published
+one, and the update information:
+
+```sh
+bash packaging/appimage/verify-appimage-signature.sh keyroost-x86_64.AppImage
+```
+
+Or by hand with `readelf` and `gpg`. The signed data is the SHA-256 of the
+file with the `.sha256_sig` and `.sig_key` sections zeroed, as a lowercase
+hex string:
+
+```sh
+gpg --import packaging/appimage/keyroost-appimage-signing.asc
+f=keyroost-x86_64.AppImage
+cp "$f" zeroed
+for s in .sha256_sig .sig_key; do
+  set -- $(readelf -SW "$f" | sed 's/\[ */[/' | awk -v s="$s" '$2 == s {print $5, $6}')
+  [ "$s" = .sha256_sig ] && dd if="$f" bs=1 skip=$((0x$1)) count=$((0x$2)) status=none | tr -d '\000' > sig.asc
+  dd if=/dev/zero of=zeroed bs=1 seek=$((0x$1)) count=$((0x$2)) conv=notrunc status=none
+done
+printf %s "$(sha256sum zeroed | cut -d' ' -f1)" > digest.txt
+gpg --verify sig.asc digest.txt   # "Good signature"; compare the fingerprint
+```
+
+AppImageUpdate's `validate` tool (`validate-x86_64.AppImage` from its
+releases) checks a file against the key embedded in it, so "validation
+successful" means something only once the fingerprint it prints matches the
+one above:
+
+```sh
+./validate-x86_64.AppImage keyroost-x86_64.AppImage
+```
 
 Or skip the question entirely and build from source with
 `cargo build --release --locked`.
