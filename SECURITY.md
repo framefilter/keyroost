@@ -157,7 +157,7 @@ Five mechanisms:
   workflow over OIDC. No long-lived publishing token exists.
 - **AppImage signature.** `keyroost-x86_64.AppImage` carries an embedded
   GPG signature from a dedicated signing key, fingerprint
-  `FINGERPRINT-PENDING`. The public key is committed as
+  `F9E0 4EED 9DC5 DC94 AB2E 6100 6C81 DC35 3794 478B`. The public key is committed as
   `packaging/appimage/keyroost-appimage-signing.asc`, so the signed release
   tag covers it. AppImageUpdate-based updaters (appimageupdatetool,
   AppImageLauncher) compare the key in the installed AppImage with the key
@@ -204,7 +204,7 @@ gh attestation verify keyroost-x86_64.AppImage --repo framefilter/keyroost
 ```
 
 The embedded signature can also be checked against the published key, with
-the fingerprint `FINGERPRINT-PENDING`. From a checkout of the release tag,
+the fingerprint `F9E0 4EED 9DC5 DC94 AB2E 6100 6C81 DC35 3794 478B`. From a checkout of the release tag,
 one command checks the signature, that the embedded key is the published
 one, and the update information:
 
