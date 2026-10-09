@@ -191,5 +191,5 @@ blocks something, that's intended.
   the user has accounts with. Don't run it speculatively; if the user shares
   output, don't echo usernames / RP names beyond what the task needs.
 - **Safe to run freely against any key:** `keyroostctl doctor`, `keyroostctl list`,
-  `keyroostctl fido info`, `keyroostctl fido pin retries` (read-only, no PIN, no
+  `keyroostctl fido info`, `keyroostctl fido pin status` (read-only, no PIN, no
   counter change).

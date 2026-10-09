@@ -113,16 +113,16 @@
     <h2>Command line</h2>
 <pre><code>keyroostctl fido config always-uv enable
 keyroostctl fido config always-uv disable
-keyroostctl fido pin min-length --length 6                  # asks y/N first
-keyroostctl fido pin min-length --length 8 --force-change
+keyroostctl fido pin min-length set --length 6              # asks y/N first
+keyroostctl fido pin min-length set --length 8 --force-change
 keyroostctl fido pin force-change
 keyroostctl fido config attestation enable                  # asks y/N first
-keyroostctl fido pin min-length --length 6 --yes --pin env:KR_PIN   # in a script</code></pre>
+keyroostctl fido pin min-length set --length 6 --yes --pin env:KR_PIN   # in a script</code></pre>
     <p class="kr-muted">Each command asks for the PIN at a hidden prompt; a script passes
       <code>--pin env:NAME</code> (an environment variable name) or <code>--pin
       stdin</code> instead. With several keys connected, pick one with
       <code>--device</code> (or <code>--path</code>). The two one-way commands,
-      <code>fido pin min-length</code> and <code>fido config attestation enable</code>, ask first in a
+      <code>fido pin min-length set</code> and <code>fido config attestation enable</code>, ask first in a
       terminal; in a script they need <code>--yes</code>, and without it they refuse and
       change nothing.</p>
   </section>

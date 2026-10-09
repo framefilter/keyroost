@@ -100,7 +100,7 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["otp", "delete-button-hotp", "S3CRETVALUE"],
-        "keyroostctl otp button delete",
+        "keyroostctl otp button clear",
     ),
     (
         &["otp", "pin-status", "S3CRETVALUE"],
@@ -197,7 +197,7 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["molto", "import-file", "S3CRETVALUE"],
-        "keyroostctl molto import --file",
+        "keyroostctl molto import --in",
     ),
     (
         &["molto", "import-file", "S3CRETVALUE"],
@@ -207,7 +207,7 @@ const CASES: &[(&[&str], &str)] = &[
         &[
             "molto",
             "import",
-            "--file",
+            "--in",
             "v.json",
             "--start",
             "S3CRETVALUE",
@@ -215,18 +215,34 @@ const CASES: &[(&[&str], &str)] = &[
         "--slot",
     ),
     (
-        &["molto", "seed", "-p", "99", "--hex-env", "S3CRETVALUE"],
+        &[
+            "molto",
+            "seed",
+            "set",
+            "-p",
+            "99",
+            "--hex-env",
+            "S3CRETVALUE",
+        ],
         "--slot",
     ),
     (
-        &["molto", "title", "--profile", "99", "S3CRETVALUE"],
+        &["molto", "title", "set", "--profile", "99", "S3CRETVALUE"],
         "--slot",
     ),
     (
-        &["molto", "config", "--slot", "99", "--time-step", "60"],
+        &[
+            "molto",
+            "config",
+            "set",
+            "--slot",
+            "99",
+            "--time-step",
+            "60",
+        ],
         "--period",
     ),
-    (&["prog", "config", "--time-step", "60"], "--period"),
+    (&["prog", "config", "set", "--time-step", "60"], "--period"),
     (&["molto", "sync", "-p", "99", "S3CRETVALUE"], "--slot"),
     (&["molto", "delete", "-p", "99", "S3CRETVALUE"], "--slot"),
     (&["molto", "import", "-p", "99", "S3CRETVALUE"], "--slot"),
@@ -240,7 +256,7 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["fido", "pin-retries", "S3CRETVALUE"],
-        "keyroostctl fido pin retries",
+        "keyroostctl fido pin status",
     ),
     (
         &["fido", "creds-list", "--pin-env", "S3CRETVALUE"],
@@ -252,7 +268,7 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["fido", "creds-metadata", "S3CRETVALUE"],
-        "keyroostctl fido credential metadata",
+        "keyroostctl fido credential status",
     ),
     (
         &["fido", "fingerprint-list", "S3CRETVALUE"],
@@ -280,7 +296,7 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["fido", "set-min-pin", "S3CRETVALUE"],
-        "keyroostctl fido pin min-length",
+        "keyroostctl fido pin min-length set",
     ),
     (
         &["fido", "force-pin-change", "S3CRETVALUE"],
@@ -297,6 +313,14 @@ const CASES: &[(&[&str], &str)] = &[
     (
         &["fido", "ssh-cert", "extract", "S3CRETVALUE"],
         "keyroostctl fido ssh",
+    ),
+    (
+        &["fido", "ssh-cert", "extract", "S3CRETVALUE"],
+        "`extract` is now `export`, and `--credential` is `--rp`",
+    ),
+    (
+        &["fido", "large-blob", "get", "0", "S3CRETVALUE"],
+        "`get` is now `show`",
     ),
     (
         &["fido", "credentials", "list", "S3CRETVALUE"],
@@ -316,7 +340,7 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["fido", "config", "set-min-pin-length", "S3CRETVALUE"],
-        "keyroostctl fido pin min-length",
+        "keyroostctl fido pin min-length set",
     ),
     (
         &["fido", "config", "force-pin-change", "S3CRETVALUE"],
@@ -342,7 +366,11 @@ const CASES: &[(&[&str], &str)] = &[
     ),
     (
         &["fido", "credential", "delete", "--cred-id", "S3CRETVALUE"],
-        "--id",
+        "the credential ID is an argument now",
+    ),
+    (
+        &["fido", "credential", "delete", "--id", "S3CRETVALUE"],
+        "the credential ID is an argument now (`fido credential delete ID`)",
     ),
     (
         &["fido", "credentials", "delete", "--cred-id", "S3CRETVALUE"],
@@ -356,7 +384,7 @@ const CASES: &[(&[&str], &str)] = &[
             "--template-id",
             "S3CRETVALUE",
         ],
-        "--id",
+        "the template ID is an argument now",
     ),
     (
         &[
@@ -366,13 +394,94 @@ const CASES: &[(&[&str], &str)] = &[
             "--template-id",
             "S3CRETVALUE",
         ],
-        "--id",
+        "the template ID is an argument now",
     ),
     (
-        &["fido", "ssh", "extract", "--credential", "S3CRETVALUE"],
-        "--id",
+        &["fido", "fingerprint", "rename", "--id", "S3CRETVALUE"],
+        "`fido fingerprint rename ID NAME`",
     ),
-    (&["fido", "ssh", "extract", "--force"], "--overwrite"),
+    (
+        &["fido", "fingerprint", "add", "--name", "S3CRETVALUE"],
+        "the name is an argument now (`fido fingerprint add NAME`",
+    ),
+    (
+        &["fido", "ssh", "export", "--credential", "S3CRETVALUE"],
+        "--credential is now --rp",
+    ),
+    (
+        &["fido", "ssh", "export", "--id", "S3CRETVALUE"],
+        "--id is now --rp",
+    ),
+    (
+        &["fido", "ssh", "extract", "--id", "S3CRETVALUE"],
+        "keyroostctl fido ssh export",
+    ),
+    (&["fido", "ssh", "export", "--force"], "--overwrite"),
+    (
+        &["fido", "pin", "retries", "S3CRETVALUE"],
+        "keyroostctl fido pin status",
+    ),
+    (
+        &["fido", "credential", "metadata", "S3CRETVALUE"],
+        "keyroostctl fido credential status",
+    ),
+    (
+        &["fido", "blob", "get", "0", "S3CRETVALUE"],
+        "keyroostctl fido blob show",
+    ),
+    (
+        &["otp", "button", "delete", "--yes", "S3CRETVALUE"],
+        "keyroostctl otp button clear",
+    ),
+    (
+        &["molto", "slots", "--all", "S3CRETVALUE"],
+        "keyroostctl molto list",
+    ),
+    (
+        &["molto", "seed", "-p", "5", "--hex", "S3CRETVALUE"],
+        "molto seed set`; -p/--profile was renamed -s/--slot",
+    ),
+    (
+        &["molto", "seed", "-p", "5", "--hex", "S3CRETVALUE"],
+        "--seed env:NAME --encoding hex",
+    ),
+    (
+        &["molto", "seed", "--slot", "1", "--seed", "env:S3CRETVALUE"],
+        "keyroostctl molto seed set",
+    ),
+    (
+        &["molto", "title", "--slot", "1", "S3CRETVALUE"],
+        "keyroostctl molto title set",
+    ),
+    (
+        &["molto", "config", "--slot", "1", "--period", "60"],
+        "keyroostctl molto config set",
+    ),
+    (
+        &[
+            "molto",
+            "customer-key",
+            "--new-customer-key",
+            "env:S3CRETVALUE",
+        ],
+        "keyroostctl molto customer-key change",
+    ),
+    (
+        &["prog", "seed", "--seed", "stdin", "S3CRETVALUE"],
+        "keyroostctl prog seed set",
+    ),
+    (
+        &["prog", "config", "--period", "60"],
+        "keyroostctl prog config set",
+    ),
+    (
+        &["fido", "pin", "min-length", "--length", "6", "S3CRETVALUE"],
+        "keyroostctl fido pin min-length set",
+    ),
+    (
+        &["molto", "import", "--slot", "1", "--file", "S3CRETVALUE"],
+        "--file was renamed -i/--in",
+    ),
     (
         &["fido", "blob", "export", "0", "S3CRETVALUE"],
         "--out FILE",
@@ -586,49 +695,90 @@ const CASES: &[(&[&str], &str)] = &[
         "--customer-key env:VAR --customer-key-encoding ascii",
     ),
     (
-        &["molto", "customer-key", "--hex", "S3CRETVALUE"],
+        &["molto", "customer-key", "change", "--hex", "S3CRETVALUE"],
         "--new-customer-key env:NAME (hex is the default encoding)",
     ),
     (
-        &["molto", "customer-key", "--ascii", "S3CRETVALUE"],
+        &["molto", "customer-key", "change", "--ascii", "S3CRETVALUE"],
         "--new-customer-key env:NAME --encoding ascii",
     ),
     (
-        &["molto", "customer-key", "--hex-env", "S3CRETVALUE"],
+        &[
+            "molto",
+            "customer-key",
+            "change",
+            "--hex-env",
+            "S3CRETVALUE",
+        ],
         "--new-customer-key env:VAR (hex",
     ),
     (
-        &["molto", "customer-key", "--hex-stdin", "S3CRETVALUE"],
+        &[
+            "molto",
+            "customer-key",
+            "change",
+            "--hex-stdin",
+            "S3CRETVALUE",
+        ],
         "--new-customer-key stdin (hex",
     ),
     (
-        &["molto", "customer-key", "--ascii-env", "S3CRETVALUE"],
+        &[
+            "molto",
+            "customer-key",
+            "change",
+            "--ascii-env",
+            "S3CRETVALUE",
+        ],
         "--new-customer-key env:VAR --encoding ascii",
     ),
     (
-        &["molto", "customer-key", "--ascii-stdin", "S3CRETVALUE"],
+        &[
+            "molto",
+            "customer-key",
+            "change",
+            "--ascii-stdin",
+            "S3CRETVALUE",
+        ],
         "--new-customer-key stdin --encoding ascii",
     ),
     (
-        &["molto", "seed", "--slot", "1", "--hex", "S3CRETVALUE"],
+        &[
+            "molto",
+            "seed",
+            "set",
+            "--slot",
+            "1",
+            "--hex",
+            "S3CRETVALUE",
+        ],
         "--seed env:NAME --encoding hex",
     ),
     (
-        &["prog", "seed", "--base32", "S3CRETVALUE"],
+        &["prog", "seed", "set", "--base32", "S3CRETVALUE"],
         "--seed env:NAME (base32",
     ),
     (
-        &["molto", "seed", "--slot", "1", "--hex-stdin", "S3CRETVALUE"],
+        &[
+            "molto",
+            "seed",
+            "set",
+            "--slot",
+            "1",
+            "--hex-stdin",
+            "S3CRETVALUE",
+        ],
         "--seed stdin --encoding hex",
     ),
     (
-        &["prog", "seed", "--base32-env", "S3CRETVALUE"],
+        &["prog", "seed", "set", "--base32-env", "S3CRETVALUE"],
         "--seed env:VAR (base32",
     ),
     (
         &[
             "molto",
             "seed",
+            "set",
             "--slot",
             "1",
             "--base32-stdin",
@@ -817,7 +967,7 @@ const CASES: &[(&[&str], &str)] = &[
         "--new-password stdin",
     ),
     (
-        &["prog", "seed", "--seed-stdin", "S3CRETVALUE"],
+        &["prog", "seed", "set", "--seed-stdin", "S3CRETVALUE"],
         "--seed stdin",
     ),
     (
@@ -837,17 +987,17 @@ fn retired_names_exit_2_and_name_the_replacement() {
     }
 }
 
-/// Every `RETIRED_COMMANDS` row in main.rs has a case above.
+/// Every `RETIRED_COMMANDS` and `RETIRED_LEAVES` row in main.rs has a case
+/// above.
 #[test]
 fn every_retired_command_row_has_a_case() {
     let src = include_str!("../src/main.rs");
-    let block = src
-        .split("const RETIRED_COMMANDS")
-        .nth(1)
-        .unwrap()
-        .split("];")
-        .next()
-        .unwrap();
+    let table = |name: &str| src.split(name).nth(1).unwrap().split("];").next().unwrap();
+    let block = [
+        table("const RETIRED_COMMANDS"),
+        table("const RETIRED_LEAVES"),
+    ]
+    .concat();
     for row in block.split("RetiredCommand {").skip(1) {
         let field = |name: &str| {
             row.split(&format!("{name}: \""))
