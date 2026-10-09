@@ -161,8 +161,8 @@ Five mechanisms:
   `packaging/appimage/keyroost-appimage-signing.asc`, so the signed release
   tag covers it. AppImageUpdate-based updaters (appimageupdatetool,
   AppImageLauncher) compare the key in the installed AppImage with the key
-  in the update and refuse an update signed by a different key, or not
-  signed at all. That is key continuity between updates. It does not
+  in the update and refuse an update signed by a different key, and an
+  unsigned installed AppImage is refused an update to a signed one. That is key continuity between updates. It does not
   authenticate a first download: anyone can embed their own key in an
   AppImage, so a first download is checked with the attestation and the
   `.sha256` file, or against the fingerprint above (see "Verifying the
@@ -217,6 +217,7 @@ file with the `.sha256_sig` and `.sig_key` sections zeroed, as a lowercase
 hex string:
 
 ```sh
+export GNUPGHOME="$(mktemp -d)"   # a throwaway keyring, not your own
 gpg --import packaging/appimage/keyroost-appimage-signing.asc
 f=keyroost-x86_64.AppImage
 cp "$f" zeroed
@@ -228,6 +229,10 @@ done
 printf %s "$(sha256sum zeroed | cut -d' ' -f1)" > digest.txt
 gpg --verify sig.asc digest.txt   # "Good signature"; compare the fingerprint
 ```
+
+In the release workflow's logs the fingerprint may appear as `***`: its key
+ID is stored as a secret, so GitHub masks it. The fingerprint is public and
+is the one published above and in the README.
 
 AppImageUpdate's `validate` tool (`validate-x86_64.AppImage` from its
 releases) checks a file against the key embedded in it, so "validation

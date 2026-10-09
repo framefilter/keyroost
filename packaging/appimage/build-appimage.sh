@@ -28,8 +28,7 @@
 #   KEYROOST_APPIMAGE_SKIP_CARGO=1
 #       Package only: skip `cargo build` and use the existing
 #       target/release/keyroost (fails if it is missing). CI builds the binary
-#       in its own step first, so dependency build scripts never run while the
-#       signing key is in a keyring.
+#       in its own step first, before the signing key is imported.
 #   LDAI_SIGN=1  LDAI_SIGN_KEY=<fingerprint>
 #       Read by linuxdeploy-plugin-appimage, which passes `-s --sign-key` to
 #       its bundled appimagetool. appimagetool signs with the host `gpg`
@@ -39,6 +38,13 @@
 #       this script returns. verify-appimage-signature.sh checks the result.
 
 set -euo pipefail
+
+# Hold the signing settings back from every tool except the final plugin run
+# (the only one whose appimagetool signs): linuxdeploy and the in-repo helper
+# scripts run without GNUPGHOME / LDAI_SIGN* in their environment.
+_sign_gnupghome="${GNUPGHOME-}"; _sign_set_gnupghome="${GNUPGHOME+x}"
+_sign_flag="${LDAI_SIGN-}"; _sign_key="${LDAI_SIGN_KEY-}"
+unset GNUPGHOME LDAI_SIGN LDAI_SIGN_KEY
 
 # ---------------------------------------------------------------------------
 # Config (app-id + icon path match the Flatpak manifest so metadata stays
@@ -230,7 +236,11 @@ export UPDATE_INFORMATION="gh-releases-zsync|framefilter|keyroost|latest|keyroos
 # stable `keyroost-x86_64.AppImage`. Pin the output name explicitly so the
 # version lives only in the desktop-file metadata.
 export LDAI_OUTPUT="keyroost-x86_64.AppImage"
-# Signing (see ENVIRONMENT at the top): appimagetool calls the host gpg.
+# Signing (see ENVIRONMENT at the top): appimagetool calls the host gpg. Only
+# now are the signing settings handed back, for the plugin run alone.
+[ -z "${_sign_set_gnupghome}" ] || export GNUPGHOME="${_sign_gnupghome}"
+if [ -n "${_sign_flag}" ]; then export LDAI_SIGN="${_sign_flag}"; fi
+if [ -n "${_sign_key}" ]; then export LDAI_SIGN_KEY="${_sign_key}"; fi
 if [ -n "${LDAI_SIGN:-}" ]; then
   command -v gpg >/dev/null || { echo "ERROR: LDAI_SIGN is set but gpg is not on PATH"; exit 1; }
   echo ">> signing enabled (LDAI_SIGN): appimagetool signs before writing the .zsync"

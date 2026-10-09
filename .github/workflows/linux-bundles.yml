@@ -147,9 +147,8 @@ jobs:
           toolchain: stable
 
       # The AppImage is GPG-signed with a dedicated key (SECURITY.md "Release
-      # integrity"). Once releases are signed, an unsigned one is refused by
-      # AppImageUpdate-based updaters (NO_LONGER_SIGNED), so a missing key or
-      # public key fails the run, probes included: probes exercise the same
+      # integrity"). Once releases are signed, an unsigned one must not
+      # ship, so a missing key or public key fails the run, probes included: probes exercise the same
       # signing path a release takes. The committed public key is checked
       # first, before the long compile.
       - name: Check AppImage signing public key is committed
@@ -161,9 +160,11 @@ jobs:
             exit 1
           fi
 
-      # The GUI binary is built in its own step, with no secret in the
-      # environment and no key in any keyring: `cargo build` runs dependency
-      # build scripts and proc-macros, which must never see the signing key.
+      # The GUI binary is built in its own step, before the signing key is
+      # imported: `cargo build` runs dependency build scripts and proc-macros,
+      # and at this point no secret is in their environment and no key is in
+      # any keyring. (The packaging step below, which signs, does have the
+      # key; build-appimage.sh hands it only to the final plugin run.)
       - name: Build GUI binary
         run: cargo build --release -p keyroost --features keyroost/qr
 
@@ -236,25 +237,32 @@ jobs:
           gpgconf --kill gpg-agent 2>/dev/null || true
           rm -rf "${GNUPGHOME}"
 
-      # Guard: nothing is attested or uploaded unless the signature verifies
-      # against the COMMITTED public key alone, the update information is
-      # intact, and the .zsync describes the signed bytes. No secrets here.
-      - name: Verify AppImage signature
-        run: |
-          bash packaging/appimage/verify-appimage-signature.sh --require-zsync \
-            target/appimage/keyroost-x86_64.AppImage
-
       - name: Locate AppImage
         id: find
         run: |
           set -euo pipefail
-          img="$(ls target/appimage/*.AppImage | head -n1)"
+          # Explicit name: the folder also holds the linuxdeploy tool
+          # AppImages, and the guard, Attest, checksum and upload must all
+          # use this very file.
+          img=target/appimage/keyroost-x86_64.AppImage
+          [ -f "${img}" ] || { echo "::error::${img} was not produced"; exit 1; }
           echo "path=${img}" >> "$GITHUB_OUTPUT"
           echo "found ${img}"
           # zsync sidecar for AppImageUpdate delta updates (#53), if produced.
-          zsync="$(ls target/appimage/*.AppImage.zsync 2>/dev/null | head -n1 || true)"
+          zsync=
+          [ ! -f "${img}.zsync" ] || zsync="${img}.zsync"
           echo "zsync=${zsync}" >> "$GITHUB_OUTPUT"
           echo "zsync ${zsync:-<none>}"
+
+      # Guard: nothing is attested or uploaded unless the signature verifies
+      # against the COMMITTED public key alone, the update information is
+      # intact, and the .zsync describes the signed bytes. No secrets here.
+      # (CI logs may show the fingerprint as ***: its key ID is a secret, so
+      # GitHub masks it. The fingerprint itself is published in SECURITY.md.)
+      - name: Verify AppImage signature
+        run: |
+          bash packaging/appimage/verify-appimage-signature.sh --require-zsync \
+            "${{ steps.find.outputs.path }}"
 
       # Give the AppImage the same provenance + checksum treatment the main
       # release archives get in release.yml.
@@ -275,8 +283,8 @@ jobs:
         with:
           name: keyroost-appimage
           path: |
-            target/appimage/*.AppImage
-            target/appimage/*.AppImage.zsync
+            ${{ steps.find.outputs.path }}
+            ${{ steps.find.outputs.zsync }}
 
       # Attach to the Release for $TAG (release.yml's on a tag push, an
       # existing one on a dispatch republish). Retry patiently (20×30s — v0.7.6

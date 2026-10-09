@@ -97,7 +97,7 @@ bundles automatically.
 
 6. **AppImage signing key (REQUIRED).** The AppImage job signs every
    AppImage and **fails when the key is missing**, build-only probes included
-   (once releases are signed, an unsigned one is refused by AppImageUpdate,
+   (once releases are signed, an unsigned one must not ship,
    so the job never falls back to unsigned). Use a key of its own, not the
    Flatpak key, so each channel can be rotated alone. Once, from the repo
    root:
@@ -121,8 +121,9 @@ bundles automatically.
 
    The workflow checks that the imported key matches both
    `APPIMAGE_GPG_KEY_ID` and the committed `.asc`, builds the GUI binary
-   before the key is imported (dependency build scripts never see it),
-   removes the key after packaging, and runs
+   before the key is imported (so the secret is not in the build's
+   environment; the packaging step that signs does have it, and
+   `build-appimage.sh` passes it only to the final plugin run), removes the key after packaging, and runs
    `packaging/appimage/verify-appimage-signature.sh` as a guard before the
    AppImage is attested or uploaded.
 
@@ -494,9 +495,10 @@ is proven for this app.
 - Updates go through AppImageUpdate: the build embeds gh-releases zsync update
   info and ships the `.zsync` file. The AppImage is GPG-signed (setup step 6),
   and AppImageUpdate refuses an update whose key differs from the installed
-  AppImage's, or one that is unsigned once the installed one is signed. An
-  installed unsigned AppImage (v0.12.x and earlier) is refused the update to
-  a signed one too ("bad signature"), so that one update is a manual download.
+  AppImage's. An installed unsigned AppImage (v0.12.x and earlier) is
+  refused the update to a signed one too ("bad signature"), so that one
+  update is a manual download. (Verified with AppImageUpdate: unsigned to
+  signed refused, same-key updates accepted, key change refused.)
   Gear Lever compares the `.zsync` SHA-1 and does not check signatures.
 - GUI-only by design; CLI users get the musl binary or `cargo install`.
 

@@ -55,6 +55,8 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       Packaging pulls from upstreams that drift on their own schedule — the
       v0.7.3 flatpak broke at release time because an upstream source was
       pruned. Probes catch that; release runs must not.
+      Approving a probe releases the AppImage signing key to the dispatched
+      branch's code: check which branch it is before approving.
       The AppImage job signs on probes too: its "Verify AppImage signature"
       step must be green, and the job fails outright if the
       `APPIMAGE_GPG_KEY` environment secrets or the committed

@@ -3687,6 +3687,8 @@ struct BulkDialog {
     password: String,
     /// True once the loader has seen an encrypted vault at the current path.
     needs_password: bool,
+    /// The last Authenticate attempt failed (cleared on success and on close).
+    auth_failed: bool,
 }
 
 impl ImportDialog {
@@ -3696,7 +3698,7 @@ impl ImportDialog {
     /// inside the window closure: the write-back of the stale `window_open`
     /// copy would undo it in the same frame (issue #170).
     fn settle_open(&mut self, window_open: bool, cancel_clicked: bool) {
-        if !(window_open && !cancel_clicked) {
+        if self.open && !(window_open && !cancel_clicked) {
             self.close();
         }
     }
@@ -3725,6 +3727,9 @@ impl BulkDialog {
     fn close(&mut self) {
         self.open = false;
         wipe(&mut self.password);
+        // Parsed entries carry seeds; dropping them zeroizes them.
+        self.entries.clear();
+        self.auth_failed = false;
     }
 }
 
@@ -4133,14 +4138,19 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.authenticated = true;
+                        app.bulk_dialog.auth_failed = false;
                         app.log(Severity::Ok, "authenticated");
                     }
                     // The Display impl renders the tries-remaining count (or
                     // "unknown" when the card gave none).
                     Err(e @ TransportError::AuthFailed { .. }) => {
+                        app.bulk_dialog.auth_failed = true;
                         app.log(Severity::Err, e.to_string());
                     }
-                    Err(e) => app.log(Severity::Err, format!("auth failed: {}", e)),
+                    Err(e) => {
+                        app.bulk_dialog.auth_failed = true;
+                        app.log(Severity::Err, format!("auth failed: {}", e));
+                    }
                 }
             })
         });
@@ -20910,7 +20920,7 @@ impl App {
 
     /// The Molto2 import dialogs (otpauth:// + bulk). Reused verbatim from the
     /// original Molto2 view; only the entry point changed.
-    fn molto_dialogs(&mut self, ctx: &egui::Context, _p: &Palette) {
+    fn molto_dialogs(&mut self, ctx: &egui::Context, p: &Palette) {
         if self.bulk_dialog.open {
             let mut open = self.bulk_dialog.open;
             let mut do_load = false;
@@ -21053,7 +21063,13 @@ impl App {
                             }
                         });
                         if let Some(b) = blocked {
-                            ui.colored_label(egui::Color32::from_rgb(220, 160, 80), b.message());
+                            let msg = if b == BulkBlock::NotUnlocked && self.bulk_dialog.auth_failed
+                            {
+                                "Couldn't unlock the Molto2 \u{2014} check the customer key".to_owned()
+                            } else {
+                                b.message()
+                            };
+                            ui.colored_label(p.warn, msg);
                         }
                     }
                 });
