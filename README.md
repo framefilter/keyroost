@@ -643,10 +643,10 @@ keyroostctl doctor
 
 # --- FIDO2 (YubiKey / Solo 2 / Nitrokey 3), over USB-HID or an NFC reader ---
 keyroostctl fido info
-keyroostctl fido pin retries
+keyroostctl fido pin status
 keyroostctl fido credential list             # asks for the PIN (nothing is shown as you type)
 keyroostctl fido ssh list                     # list SSH certs stored in resident credentials
-keyroostctl fido ssh extract --id ssh:demo --out demo-cert.pub
+keyroostctl fido ssh export --rp ssh:demo --out demo-cert.pub
 
 # --- OATH over PC/SC ---
 keyroostctl oath list
@@ -684,13 +684,13 @@ done
 keyroostctl molto info
 keyroostctl molto import --slot 0                # asks for the otpauth:// URI (hidden)
 keyroostctl molto import --slot 0 --uri env:URI  # or from an environment variable
-keyroostctl molto import --file ~/Downloads/aegis.json --slot 0 --dry-run   # validate first
-keyroostctl molto seed --slot 5                  # asks for the seed (base32; --encoding hex for hex)
+keyroostctl molto import --in ~/Downloads/aegis.json --slot 0 --dry-run   # validate first
+keyroostctl molto seed set --slot 5              # asks for the seed (base32; --encoding hex for hex)
 
 # --- Token2 single-profile programmable token (OTPC / miniOTP / C30x) ---
 keyroostctl prog info                          # serial, model, and on-device clock
-keyroostctl prog seed                          # asks for the base32 seed (hidden)
-keyroostctl prog config --algorithm sha1 --period 30 --display-timeout 30
+keyroostctl prog seed set                      # asks for the base32 seed (hidden)
+keyroostctl prog config set --algorithm sha1 --period 30 --display-timeout 30
 
 # --- Token2 on-device OTP (PIN+ Series FIDO keys) ---
 keyroostctl otp list
@@ -832,7 +832,7 @@ progress, notes, warnings) on stderr. You see both at a terminal, but
 redirecting saves only the result:
 
 ```bash
-keyroostctl molto slots > slots.txt     # the file gets just the table
+keyroostctl molto list > slots.txt      # the file gets just the table
 keyroostctl piv cert export --slot 9a   # prints the certificate as PEM
 ```
 

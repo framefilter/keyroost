@@ -164,11 +164,11 @@
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
       <p>From the CLI: <code>keyroostctl prog info</code> (serial, model, on-device clock),
-        <code>keyroostctl prog seed</code> (asks for the seed at a hidden prompt, or in a
+        <code>keyroostctl prog seed set</code> (asks for the seed at a hidden prompt, or in a
         script takes <code>--seed env:NAME</code> or <code>--seed stdin</code>, so it stays
         out of <code>ps</code> and shell history; base32 unless <code>--encoding hex</code>), and
-        <code>keyroostctl prog config</code> (algorithm, <code>--period</code>, display timeout).
-        <code>seed</code> and <code>config</code> ask <strong>y/N</strong> before overwriting
+        <code>keyroostctl prog config set</code> (algorithm, <code>--period</code>, display timeout).
+        Both ask <strong>y/N</strong> before overwriting
         (a script adds <code>--yes</code>), and only programmable tokens are considered when
         keyroost picks the token. The GUI offers the same on a dedicated programmable-token
         pane.</p>

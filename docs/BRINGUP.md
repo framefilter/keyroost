@@ -87,7 +87,7 @@ Factory-fresh devices use `TOKEN2MOLTO1-KEY`. With no customer-key flag,
 keyroost uses that factory default, so nothing needs to be passed:
 
 ```bash
-keyroostctl --debug molto title --slot 99 "MOLTO_TEST"
+keyroostctl --debug molto title set --slot 99 "MOLTO_TEST"
 ```
 
 This will print a `>` / `<` pair on stderr for each of `get info`, `get challenge`, `answer challenge`, then `set title`, along with the serial, the device clock and "Authenticated.", and end with "Title set on slot #99." on stdout.
@@ -97,7 +97,7 @@ This will print a `>` / `<` pair on stderr for each of `get info`, `get challeng
 2. `answer challenge` response: just `90 00` (no data).
 3. `set title` response: just `90 00`.
 
-**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, from an environment variable: `--customer-key env:VAR` (hex), adding `--customer-key-encoding ascii` for a text key, e.g. `keyroostctl --debug molto --customer-key env:MOLTO_KEY --customer-key-encoding ascii title --slot 99 "MOLTO_TEST"` after setting `MOLTO_KEY` in your own shell. The customer key is never taken on the command line. **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset` does **not** require the customer key (it's a plain CLA `0x80` command; it names the token and asks y/N first, or takes `--yes` in a script): it wipes **every one of the 100 slots** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
+**If `answer challenge` returns `63 CN`:** the customer key on your device isn't the factory default. The low nibble `N` is the number of tries left before the device locks. Try whatever key you set, from an environment variable: `--customer-key env:VAR` (hex), adding `--customer-key-encoding ascii` for a text key, e.g. `keyroostctl --debug molto --customer-key env:MOLTO_KEY --customer-key-encoding ascii title set --slot 99 "MOLTO_TEST"` after setting `MOLTO_KEY` in your own shell. The customer key is never taken on the command line. **Only if you've forgotten it** — and accepting that this is the most destructive command in this runbook — `keyroostctl molto reset` does **not** require the customer key (it's a plain CLA `0x80` command; it names the token and asks y/N first, or takes `--yes` in a script): it wipes **every one of the 100 slots** and resets the key back to `TOKEN2MOLTO1-KEY`. The device returns `SW 90 60` and displays a confirmation prompt — press the up-arrow on the device to commit the reset.
 
 **If `set title` returns anything other than `90 00`:** capture the SW bytes. That's the most likely place for a MAC computation mismatch. The SW will be specific (e.g. `69 82` = security status not satisfied, `6A 80` = wrong data) and will tell us where to look.
 
@@ -129,9 +129,9 @@ already holds a seed, keyroost asks y/N before overwriting it (a script adds
 > the factory-default customer key, which is public, so anyone who captures the
 > USB traffic can decrypt the seed. That's correct and expected during bring-up
 > with a throwaway secret — it is a nudge, not a failure, and the write
-> proceeds. Rotate the key with `keyroostctl molto customer-key` before
+> proceeds. Rotate the key with `keyroostctl molto customer-key change` before
 > programming anything real. The same warning appears in step 6 (it fires for
-> `seed` and `import` (with or without `--file`), but not for step 3's `title`).
+> `seed set` and `import` (with or without `--in`), but not for step 3's `title set`).
 
 To verify the device actually generates correct codes, paste the same URI into
 any standard authenticator (Google Authenticator, Aegis, Bitwarden) and
@@ -150,7 +150,7 @@ Drop a small plaintext Aegis or 2FAS export (1–3 entries) into `/tmp/test.json
 and:
 
 ```bash
-keyroostctl --debug molto import --file /tmp/test.json --slot 95 --dry-run
+keyroostctl --debug molto import --in /tmp/test.json --slot 95 --dry-run
 ```
 
 `--dry-run` parses and prints the plan without writing. If that looks right,
@@ -253,13 +253,13 @@ keyroostctl fido pin set --device N
 It asks for the new PIN twice at a hidden prompt (nothing is shown as you type).
 
 **Expected:** `PIN set.` Re-run `fido info`: `clientPin` should now be
-`true`. `fido pin retries` should still show the full attempt counter —
+`true`. `fido pin status` should still show the full attempt counter —
 the initial set doesn't consume a retry.
 
 ### Step F4: PIN-protected read paths
 
 ```bash
-keyroostctl fido credential metadata --device N   # asks for the PIN (hidden)
+keyroostctl fido credential status --device N     # asks for the PIN (hidden)
 keyroostctl fido credential list --device N
 ```
 
@@ -267,7 +267,7 @@ keyroostctl fido credential list --device N
 more`, and `(no resident credentials)`. The point isn't the (empty)
 contents — it's that the `pinUvAuthToken` exchange (`clientPin` 0x09 with
 `cm` permission) succeeded. A correct PIN must **not** decrement the retry
-counter; verify with `fido pin retries` afterwards.
+counter; verify with `fido pin status` afterwards.
 
 ### Step F5: Resident-credential round-trip (create → list → delete)
 
@@ -283,14 +283,14 @@ ssh-keygen -t ecdsa-sk -O resident -O application=ssh:moltotest \
 keyroostctl fido credential list --device N
 
 # Destructive: delete by full credentialId. Asks y/N, then for the PIN.
-keyroostctl fido credential delete --device N --id <full hex from id=>
+keyroostctl fido credential delete --device N <full hex from id=>
 
 # Confirm empty.
 keyroostctl fido credential list --device N
 ```
 
 The `id=` line is the value you copy — the `cred …` summary above it is
-truncated for readability and is **not** a valid `--id` value.
+truncated for readability and is **not** a valid credential ID.
 
 **Use `ecdsa-sk`, not `ed25519-sk`,** if your authenticator's firmware
 doesn't support Ed25519 in `makeCredential`. On Solo 2 firmware 2.3.196,
