@@ -29,27 +29,42 @@ fn retired_secret_flags_name_their_replacement() {
             "use --customer-key env:NAME --customer-key-encoding ascii",
         ),
         (
-            &["molto", "seed", "--slot", "99", "--hex", "S3CRETVALUE"],
+            &[
+                "molto",
+                "seed",
+                "set",
+                "--slot",
+                "99",
+                "--hex",
+                "S3CRETVALUE",
+            ],
             "use --seed env:NAME --encoding hex",
         ),
         (
-            &["molto", "seed", "--slot", "99", "--base32=S3CRETVALUE"],
+            &[
+                "molto",
+                "seed",
+                "set",
+                "--slot",
+                "99",
+                "--base32=S3CRETVALUE",
+            ],
             "use --seed env:NAME (base32 is the default encoding)",
         ),
         (
-            &["prog", "seed", "--hex", "S3CRETVALUE"],
+            &["prog", "seed", "set", "--hex", "S3CRETVALUE"],
             "use --seed env:NAME --encoding hex",
         ),
         (
-            &["molto", "customer-key", "--ascii", "S3CRETVALUE"],
+            &["molto", "customer-key", "change", "--ascii", "S3CRETVALUE"],
             "use --new-customer-key env:NAME --encoding ascii",
         ),
         (
-            &["molto", "customer-key", "--hex", "S3CRETVALUE"],
+            &["molto", "customer-key", "change", "--hex", "S3CRETVALUE"],
             "use --new-customer-key env:NAME (hex is the default encoding)",
         ),
         (
-            &["molto", "seed", "--hex-env", "V"],
+            &["molto", "seed", "set", "--hex-env", "V"],
             "--seed env:VAR --encoding hex",
         ),
         (
@@ -125,9 +140,11 @@ fn a_stray_value_on_a_secret_command_is_not_repeated() {
             "takes the otpauth:// URI as --uri env:NAME or --uri stdin",
         ),
         (
-            &["molto", "seed", "--slot", "99", "--seed", "stdin", "S3CRET"],
+            &[
+                "molto", "seed", "set", "--slot", "99", "--seed", "stdin", "S3CRET",
+            ],
             "unexpected extra argument (not shown, in case it is a secret); \
-             see `keyroostctl molto seed --help`",
+             see `keyroostctl molto seed set --help`",
         ),
     ] {
         let (code, err) = run(args);
@@ -141,7 +158,7 @@ fn a_stray_value_on_a_secret_command_is_not_repeated() {
 /// replacement and never the value, which may be the secret itself.
 #[test]
 fn a_stdin_flag_given_a_value_is_not_repeated() {
-    let (code, err) = run(&["molto", "seed", "--slot", "99", "--hex-stdin=S3CRET"]);
+    let (code, err) = run(&["molto", "seed", "set", "--slot", "99", "--hex-stdin=S3CRET"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("--seed stdin --encoding hex"), "{err}");
     assert!(!err.contains("S3CRET"), "echoed the value: {err}");
@@ -350,9 +367,23 @@ const LITERAL_CASES: &[&[&str]] = &[
     &["fido", "pin", "change", "--pin", "default"],
     &["molto", "--customer-key", "S3CRETVALUE", "info"],
     &["molto", "info", "--customer-key=S3CRETVALUE"],
-    &["molto", "customer-key", "--new-customer-key", "S3CRETVALUE"],
-    &["molto", "seed", "--slot", "1", "--seed", "S3CRETVALUE"],
-    &["prog", "seed", "--seed", "-S3CRETVALUE"],
+    &[
+        "molto",
+        "customer-key",
+        "change",
+        "--new-customer-key",
+        "S3CRETVALUE",
+    ],
+    &[
+        "molto",
+        "seed",
+        "set",
+        "--slot",
+        "1",
+        "--seed",
+        "S3CRETVALUE",
+    ],
+    &["prog", "seed", "set", "--seed", "-S3CRETVALUE"],
     &["molto", "import", "--slot", "1", "--uri", "S3CRETVALUE"],
 ];
 

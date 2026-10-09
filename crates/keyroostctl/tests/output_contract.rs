@@ -54,7 +54,7 @@ fn oath_add_digits_9_is_2_like_molto_config() {
     let (code, out, err) = run(&["oath", "add", "x", "--digits", "9"]);
     assert_eq!(code, 2, "{err}");
     assert!(out.is_empty());
-    let (code, _, _) = run(&["molto", "config", "--slot", "1", "--digits", "9"]);
+    let (code, _, _) = run(&["molto", "config", "set", "--slot", "1", "--digits", "9"]);
     assert_eq!(code, 2);
 }
 
@@ -64,11 +64,11 @@ fn value_parser_errors_name_the_value_once() {
     // reason must not repeat it.
     for (args, v) in [
         (
-            &["molto", "config", "--slot", "abc", "--digits", "6"][..],
+            &["molto", "config", "set", "--slot", "abc", "--digits", "6"][..],
             "abc",
         ),
         (
-            &["molto", "config", "--slot", "120", "--digits", "6"],
+            &["molto", "config", "set", "--slot", "120", "--digits", "6"],
             "120",
         ),
         (&["otp", "button", "set", "--digits", "7"], "7"),
@@ -190,7 +190,7 @@ fn an_existing_output_file_is_refused_before_any_key() {
         &["openpgp", "sign", "--in", f, "--out", f],
         &["openpgp", "decrypt", "--in", f, "--out", f],
         &["fido", "blob", "export", "0", "--out", f],
-        &["fido", "ssh", "extract", "--out", f],
+        &["fido", "ssh", "export", "--out", f],
     ] {
         let (code, _out, err) = run(args);
         assert_eq!(code, 1, "{args:?}: {err}");
@@ -246,7 +246,7 @@ fn an_output_that_cannot_be_replaced_is_refused_before_any_key() {
         ],
         &["openpgp", "sign", "--in", i, "--out", d, "--overwrite"],
         &["fido", "blob", "export", "0", "--out", d, "--overwrite"],
-        &["fido", "ssh", "extract", "--out", d, "--overwrite"],
+        &["fido", "ssh", "export", "--out", d, "--overwrite"],
     ] {
         let (code, _out, err) = run(args);
         assert_eq!(code, 1, "{args:?}: {err}");

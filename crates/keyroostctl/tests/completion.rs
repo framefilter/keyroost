@@ -52,7 +52,7 @@ fn device_completes_saved_names() {
 
 #[test]
 fn device_completes_on_a_nested_path() {
-    let out = complete(&["keyroostctl", "fido", "pin", "retries", "--device", ""]);
+    let out = complete(&["keyroostctl", "fido", "pin", "status", "--device", ""]);
     assert!(out.lines().any(|l| l.starts_with("yubi-test")), "{out}");
 }
 
@@ -73,6 +73,33 @@ fn fido_completes_the_new_groups() {
     ] {
         assert!(!first(g), "{g}: {out}");
     }
+}
+
+/// The renamed v0.13 paths complete, and `--device` still completes under
+/// them.
+#[test]
+fn renamed_paths_complete() {
+    let first = |out: &str, g: &str| out.lines().any(|l| l.split_whitespace().next() == Some(g));
+    for (words, want, gone) in [
+        (&["keyroostctl", "molto", ""][..], "list", "slots"),
+        (&["keyroostctl", "molto", "seed", ""], "set", ""),
+        (&["keyroostctl", "molto", "customer-key", ""], "change", ""),
+        (&["keyroostctl", "fido", "pin", ""], "status", "retries"),
+        (
+            &["keyroostctl", "fido", "credential", ""],
+            "status",
+            "metadata",
+        ),
+        (&["keyroostctl", "fido", "blob", ""], "show", "get"),
+        (&["keyroostctl", "fido", "ssh", ""], "export", "extract"),
+        (&["keyroostctl", "otp", "button", ""], "clear", "delete"),
+    ] {
+        let out = complete(words);
+        assert!(first(&out, want), "{words:?}: {out}");
+        assert!(gone.is_empty() || !first(&out, gone), "{words:?}: {out}");
+    }
+    let out = complete(&["keyroostctl", "molto", "title", "set", "--device", ""]);
+    assert!(out.lines().any(|l| l.starts_with("yubi-test")), "{out}");
 }
 
 #[test]

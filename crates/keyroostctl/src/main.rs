@@ -61,7 +61,7 @@ struct Cli {
     //
     // Named `device` (flag `--device`), not `name`: a *global* arg whose clap id
     // is `name` merges with every subcommand arg of the same id (e.g. the
-    // `oath add <NAME>` positional, `fido fingerprint --name`), so a credential
+    // `oath add <NAME>` and `fido fingerprint add [NAME]` positionals), so a credential
     // or fingerprint name was being consumed as this device selector. A distinct
     // id keeps the global selector separate from all of them.
     #[arg(
@@ -2126,13 +2126,28 @@ enum ProgCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
+    /// Write the token's TOTP seed.
+    Seed {
+        #[command(subcommand)]
+        cmd: ProgSeedCmd,
+    },
+    /// Set the token's TOTP configuration.
+    Config {
+        #[command(subcommand)]
+        cmd: ProgConfigCmd,
+    },
+}
+
+/// `prog seed`: the token's TOTP seed.
+#[derive(Subcommand)]
+enum ProgSeedCmd {
     /// Write the TOTP seed, replacing the one on the token. Irreversible: asks
     /// first (`--yes` to skip).
     ///
     /// The seed comes from --seed env:NAME or --seed stdin, or a terminal
     /// asks for it (hidden); --encoding says how it is written (base32
     /// unless --encoding hex).
-    Seed {
+    Set {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// The seed: env:NAME reads that environment variable, stdin reads
@@ -2147,8 +2162,13 @@ enum ProgCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+/// `prog config`: the token's TOTP configuration.
+#[derive(Subcommand)]
+enum ProgConfigCmd {
     /// Set the device configuration and seed the clock with the host's UTC time.
-    Config {
+    Set {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
         /// HMAC algorithm for the codes.
@@ -2175,42 +2195,27 @@ enum MoltoCmd {
     /// List the 100 slots: occupancy, title, TOTP config.
     /// Titles and occupancy are readable by anyone holding the token —
     /// no customer key is needed (or used).
-    Slots {
+    List {
         /// Show all 100 slots, including empty untitled ones.
         #[arg(long)]
         all: bool,
     },
-    /// Write a TOTP seed to a slot, replacing any seed already there.
-    /// Irreversible: asks first (`--yes` to skip).
-    ///
-    /// Asks only when the slot is occupied. The seed comes from --seed
-    /// env:NAME or --seed stdin, or a terminal asks for it (hidden);
-    /// --encoding says how it is written (base32 unless --encoding hex).
+    /// Write a slot's TOTP seed.
     Seed {
-        /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
-        slot: u8,
-        /// The seed: env:NAME reads that environment variable, stdin reads
-        /// one line (second line when --customer-key stdin is also given;
-        /// hidden when typed at a terminal). With neither, a terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        seed: Option<SecretSource>,
-        /// How --seed is written.
-        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
-        encoding: SeedEncoding,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long, short = 'y')]
-        yes: bool,
+        #[command(subcommand)]
+        cmd: MoltoSeedCmd,
     },
-    /// Write a slot title (1..=12 ASCII chars), or print the current
-    /// one when TITLE is omitted (reading needs no customer key).
+    /// Show a slot's title (and whether it holds a seed), or write one with
+    /// `molto title set`.
+    ///
+    /// Showing needs no customer key.
+    #[command(subcommand_negates_reqs = true)]
     Title {
         /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
-        slot: u8,
-        /// New title; omit to read the slot's stored title instead.
-        #[arg(value_parser = parse_molto_title)]
-        title: Option<String>,
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot, required = true)]
+        slot: Option<u8>,
+        #[command(subcommand)]
+        cmd: Option<MoltoTitleCmd>,
     },
     /// Delete one slot's seed. Irreversible: asks first (`--yes` to skip).
     ///
@@ -2224,23 +2229,10 @@ enum MoltoCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Set a slot's TOTP configuration (and seed the clock with the host's UTC time).
+    /// Set a slot's TOTP configuration.
     Config {
-        /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
-        slot: u8,
-        /// HMAC algorithm for the codes.
-        #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
-        algorithm: AlgoArg,
-        /// Code length in digits.
-        #[arg(long, value_enum, default_value_t = DigitsArg::Six)]
-        digits: DigitsArg,
-        /// TOTP period in seconds.
-        #[arg(long, value_enum, default_value_t = StepArg::S30)]
-        period: StepArg,
-        /// How long the code stays on the display, in seconds.
-        #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
-        display_timeout: TimeoutArg,
+        #[command(subcommand)]
+        cmd: MoltoConfigCmd,
     },
     /// Push the host's current UTC time to one slot (or all slots).
     Sync {
@@ -2251,28 +2243,10 @@ enum MoltoCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Replace the Molto2's customer key. Irreversible: asks first (`--yes` to skip).
-    ///
-    /// The current key stops working. If the new one is lost, only `molto
-    /// reset` (which wipes every slot) recovers the token. The token also
-    /// asks for its up-arrow button before it changes the key. The new key
-    /// comes from --new-customer-key env:NAME or stdin, or a terminal asks
-    /// for it twice (hidden); --encoding says how it is written (hex unless
-    /// --encoding ascii). The current key comes from --customer-key (the
-    /// factory default without it).
+    /// Change the Molto2's customer key.
     CustomerKey {
-        /// The new customer key: env:NAME reads that environment variable,
-        /// stdin reads one line (second line when --customer-key stdin is
-        /// also given; hidden when typed at a terminal). With neither, a
-        /// terminal asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        new_customer_key: Option<SecretSource>,
-        /// How --new-customer-key is written.
-        #[arg(long, value_enum, default_value_t = KeyEncoding::Hex)]
-        encoding: KeyEncoding,
-        /// Confirm without asking (required when not run from a terminal).
-        #[arg(long, short = 'y')]
-        yes: bool,
+        #[command(subcommand)]
+        cmd: MoltoCustomerKeyCmd,
     },
     /// Import an otpauth:// URI to a slot, or every entry of an export file
     /// to consecutive slots: writes seed, title, and config, replacing what
@@ -2280,13 +2254,13 @@ enum MoltoCmd {
     ///
     /// Asks only when a target slot is occupied. The URI comes from --uri
     /// env:NAME, --uri stdin or a QR screenshot (--qr IMAGE), never the
-    /// command line; with none of them and no --file, a terminal asks for it
-    /// (hidden). For an encrypted Aegis vault given with --file, the password
+    /// command line; with none of them and no --in, a terminal asks for it
+    /// (hidden). For an encrypted Aegis vault given with --in, the password
     /// comes from --password env:NAME or --password stdin; with neither, a
     /// terminal asks for it (hidden).
     #[command(group(clap::ArgGroup::new("import_source").args(["uri", "qr", "file"]).multiple(false)))]
     Import {
-        /// Slot number, 0-99 (Token2 calls these profiles). With --file, the
+        /// Slot number, 0-99 (Token2 calls these profiles). With --in, the
         /// first slot to fill (default 0); entries fill consecutive slots.
         #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot, required_unless_present = "file")]
         slot: Option<u8>,
@@ -2299,17 +2273,17 @@ enum MoltoCmd {
         /// The otpauth:// URI: env:NAME reads that environment variable, stdin
         /// reads one line (second line when --customer-key stdin is also given;
         /// hidden when typed at a terminal). With none of --uri, --qr and
-        /// --file, a terminal asks.
+        /// --in, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         uri: Option<SecretSource>,
         /// Decode the otpauth:// URI from a QR code in a PNG/JPEG screenshot.
-        /// For a Google Authenticator export QR (several accounts), use --file.
+        /// For a Google Authenticator export QR (several accounts), use --in.
         #[arg(long, value_name = "IMAGE")]
         qr: Option<std::path::PathBuf>,
         /// Import every entry of an export file instead: Aegis (plain or
         /// encrypted), 2FAS, a list of otpauth:// URIs, or a Google
         /// Authenticator export QR image. The format is detected.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long = "in", short = 'i', value_name = "FILE")]
         file: Option<std::path::PathBuf>,
         /// Print what would be written, but don't touch the device.
         #[arg(long, requires = "file")]
@@ -2353,6 +2327,98 @@ enum MoltoCmd {
     ///
     /// Requires physical button confirmation on the device.
     Reset {
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// `molto seed`: a slot's TOTP seed.
+#[derive(Subcommand)]
+enum MoltoSeedCmd {
+    /// Write a TOTP seed to a slot, replacing any seed already there.
+    /// Irreversible: asks first (`--yes` to skip).
+    ///
+    /// Asks only when the slot is occupied. The seed comes from --seed
+    /// env:NAME or --seed stdin, or a terminal asks for it (hidden);
+    /// --encoding says how it is written (base32 unless --encoding hex).
+    Set {
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
+        /// The seed: env:NAME reads that environment variable, stdin reads
+        /// one line (second line when --customer-key stdin is also given;
+        /// hidden when typed at a terminal). With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        seed: Option<SecretSource>,
+        /// How --seed is written.
+        #[arg(long, value_enum, default_value_t = SeedEncoding::Base32)]
+        encoding: SeedEncoding,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// `molto title set`: write a slot title.
+#[derive(Subcommand)]
+enum MoltoTitleCmd {
+    /// Write a slot title (1..=12 ASCII characters), replacing the one there.
+    Set {
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
+        /// The new title.
+        #[arg(value_parser = parse_molto_title)]
+        title: String,
+    },
+}
+
+/// `molto config`: a slot's TOTP configuration.
+#[derive(Subcommand)]
+enum MoltoConfigCmd {
+    /// Set a slot's TOTP configuration (and seed the clock with the host's UTC time).
+    Set {
+        /// Slot number, 0-99 (Token2 calls these profiles).
+        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: u8,
+        /// HMAC algorithm for the codes.
+        #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
+        algorithm: AlgoArg,
+        /// Code length in digits.
+        #[arg(long, value_enum, default_value_t = DigitsArg::Six)]
+        digits: DigitsArg,
+        /// TOTP period in seconds.
+        #[arg(long, value_enum, default_value_t = StepArg::S30)]
+        period: StepArg,
+        /// How long the code stays on the display, in seconds.
+        #[arg(long, value_enum, default_value_t = TimeoutArg::S30)]
+        display_timeout: TimeoutArg,
+    },
+}
+
+/// `molto customer-key`: the Molto2's customer key.
+#[derive(Subcommand)]
+enum MoltoCustomerKeyCmd {
+    /// Replace the Molto2's customer key. Irreversible: asks first (`--yes` to skip).
+    ///
+    /// The current key stops working. If the new one is lost, only `molto
+    /// reset` (which wipes every slot) recovers the token. The token also
+    /// asks for its up-arrow button before it changes the key. The new key
+    /// comes from --new-customer-key env:NAME or stdin, or a terminal asks
+    /// for it twice (hidden); --encoding says how it is written (hex unless
+    /// --encoding ascii). The current key comes from --customer-key (the
+    /// factory default without it).
+    Change {
+        /// The new customer key: env:NAME reads that environment variable,
+        /// stdin reads one line (second line when --customer-key stdin is
+        /// also given; hidden when typed at a terminal). With neither, a
+        /// terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        new_customer_key: Option<SecretSource>,
+        /// How --new-customer-key is written.
+        #[arg(long, value_enum, default_value_t = KeyEncoding::Hex)]
+        encoding: KeyEncoding,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
@@ -2427,7 +2493,7 @@ enum FidoCmd {
         #[command(subcommand)]
         cmd: LargeBlobCmd,
     },
-    /// List SSH credentials and extract their certificates.
+    /// List SSH credentials and export their certificates.
     ///
     /// A stored OpenSSH certificate is read from the credential's largeBlob
     /// and written to a `-cert.pub` file.
@@ -2440,8 +2506,8 @@ enum FidoCmd {
 /// `fido pin` subcommands: the FIDO2 PIN itself.
 #[derive(Subcommand)]
 enum FidoPinCmd {
-    /// Print the current PIN retry counter.
-    Retries {
+    /// Show how many PIN attempts are left.
+    Status {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
@@ -2474,12 +2540,32 @@ enum FidoPinCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
+    /// Raise the minimum PIN length.
+    MinLength {
+        #[command(subcommand)]
+        cmd: FidoMinLengthCmd,
+    },
+    /// Force a PIN change on next use, without changing the minimum length.
+    ForceChange {
+        /// The PIN: env:NAME reads that environment variable, stdin reads one
+        /// line (hidden when typed at a terminal). With neither, a terminal
+        /// asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        path: Option<std::path::PathBuf>,
+    },
+}
+
+/// `fido pin min-length`: the minimum PIN length.
+#[derive(Subcommand)]
+enum FidoMinLengthCmd {
     /// Raise the minimum PIN length. One-way: asks first (`--yes` to skip).
     ///
     /// The value can only be increased, never lowered (a FIDO2 reset is
     /// required to lower it), and may force a PIN change. To only force a PIN
     /// change, use `fido pin force-change` instead.
-    MinLength {
+    Set {
         /// New minimum PIN length (in code points). Must be >= the current one.
         #[arg(long, value_name = "N")]
         length: u32,
@@ -2489,16 +2575,6 @@ enum FidoPinCmd {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
-        /// The PIN: env:NAME reads that environment variable, stdin reads one
-        /// line (hidden when typed at a terminal). With neither, a terminal
-        /// asks.
-        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
-        pin: Option<SecretSource>,
-        #[arg(long, value_name = "PATH", help = PATH_HELP)]
-        path: Option<std::path::PathBuf>,
-    },
-    /// Force a PIN change on next use, without changing the minimum length.
-    ForceChange {
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
         /// asks.
@@ -2528,7 +2604,7 @@ enum FidoCredentialCmd {
     /// Irreversible: asks first (`--yes` to skip).
     Delete {
         /// Credential ID to delete, in hex (see `fido credential list`).
-        #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
+        #[arg(value_name = "ID", value_parser = parse_hex_arg)]
         id: String,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2543,7 +2619,7 @@ enum FidoCredentialCmd {
     },
     /// Show how many passkeys the key holds and how many more fit. Needs the
     /// PIN.
-    Metadata {
+    Status {
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
         /// asks.
@@ -2571,7 +2647,7 @@ enum FidoFingerprintCmd {
     /// capture completes.
     Add {
         /// Optional friendly name to set on the new fingerprint once enrolled.
-        #[arg(long, value_name = "NAME")]
+        #[arg(value_name = "NAME")]
         name: Option<String>,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2585,10 +2661,10 @@ enum FidoFingerprintCmd {
     /// fingerprint list`).
     Rename {
         /// Fingerprint template ID, in hex (see `fido fingerprint list`).
-        #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
+        #[arg(value_name = "ID", value_parser = parse_hex_arg)]
         id: String,
         /// New friendly name.
-        #[arg(long, value_name = "NAME")]
+        #[arg(value_name = "NAME")]
         name: String,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2602,7 +2678,7 @@ enum FidoFingerprintCmd {
     /// fingerprint list`). Irreversible: asks first (`--yes` to skip).
     Delete {
         /// Fingerprint template ID, in hex (see `fido fingerprint list`).
-        #[arg(long, value_name = "HEX", value_parser = parse_hex_arg)]
+        #[arg(value_name = "ID", value_parser = parse_hex_arg)]
         id: String,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). With neither, a terminal
@@ -2696,11 +2772,11 @@ enum SshCertCmd {
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
     },
-    /// Extract an SSH certificate from its largeBlob to a -cert.pub file.
-    Extract {
+    /// Save an SSH credential's certificate from its largeBlob to a -cert.pub file.
+    Export {
         /// RP ID of the SSH credential (e.g. ssh:demo). Needed only when several SSH credentials are present.
         #[arg(long, value_name = "RP_ID")]
-        id: Option<String>,
+        rp: Option<String>,
         /// Output file (default: <rp-id-sanitized>-cert.pub).
         #[arg(long, short = 'o', value_name = "FILE")]
         out: Option<std::path::PathBuf>,
@@ -2734,7 +2810,7 @@ enum LargeBlobCmd {
         path: Option<std::path::PathBuf>,
     },
     /// Show one entry in full by its index (from `fido blob list`).
-    Get {
+    Show {
         /// Zero-based entry index as printed by `fido blob list`.
         index: usize,
         #[arg(long, value_name = "PATH", help = PATH_HELP)]
@@ -2945,7 +3021,7 @@ enum OtpCmd {
     },
     /// Read the device serial number (over USB, or NFC where the model allows).
     Serial,
-    /// Set or delete the HOTP code the key types when its button is pressed.
+    /// Set or clear the HOTP code the key types when its button is pressed.
     Button {
         #[command(subcommand)]
         cmd: OtpButtonCmd,
@@ -3107,9 +3183,9 @@ enum OtpButtonCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Delete the HOTP-on-button keystroke slot. Irreversible: asks first
+    /// Clear the HOTP-on-button keystroke slot. Irreversible: asks first
     /// (`--yes` to skip).
-    Delete {
+    Clear {
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
@@ -3315,7 +3391,7 @@ const fn customer_key_spec(e: KeyEncoding, new: bool) -> &'static Spec {
 
 const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
     .prompt_as("otpauth:// URI")
-    .hint("--uri env:NAME, --uri stdin, --qr IMAGE or --file PATH");
+    .hint("--uri env:NAME, --uri stdin, --qr IMAGE or --in FILE");
 const VAULT_PASSWORD: Spec = Spec::current("vault password", "password");
 
 /// Decode a seed; the error names the flag and the encoding, never the input.
@@ -3429,13 +3505,16 @@ fn molto_validate<I: crate::secrets::SecretIo>(
         )?;
     }
     match cmd {
-        MoltoCmd::Seed { seed, encoding, .. } => {
-            sec.check(seed_spec(*encoding), Source::from_flag(seed.as_ref()))?
-        }
+        MoltoCmd::Seed {
+            cmd: MoltoSeedCmd::Set { seed, encoding, .. },
+        } => sec.check(seed_spec(*encoding), Source::from_flag(seed.as_ref()))?,
         MoltoCmd::CustomerKey {
-            new_customer_key,
-            encoding,
-            ..
+            cmd:
+                MoltoCustomerKeyCmd::Change {
+                    new_customer_key,
+                    encoding,
+                    ..
+                },
         } => sec.check(
             customer_key_spec(*encoding, true),
             Source::from_flag(new_customer_key.as_ref()),
@@ -3458,7 +3537,9 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
     cmd: &MoltoCmd,
 ) -> Result<MoltoInput, Box<dyn std::error::Error>> {
     Ok(match cmd {
-        MoltoCmd::Seed { seed, encoding, .. } => {
+        MoltoCmd::Seed {
+            cmd: MoltoSeedCmd::Set { seed, encoding, .. },
+        } => {
             let text = sec.read(seed_spec(*encoding), Source::from_flag(seed.as_ref()))?;
             let seed = decode_seed(&text, *encoding)?;
             if seed.is_empty() || seed.len() > 63 {
@@ -3467,9 +3548,12 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
             MoltoInput::Seed(seed)
         }
         MoltoCmd::CustomerKey {
-            new_customer_key,
-            encoding,
-            ..
+            cmd:
+                MoltoCustomerKeyCmd::Change {
+                    new_customer_key,
+                    encoding,
+                    ..
+                },
         } => {
             let text = sec.read(
                 customer_key_spec(*encoding, true),
@@ -3525,7 +3609,7 @@ fn molto_early_key<I: crate::secrets::SecretIo>(
     }
 }
 
-/// `molto import --file --dry-run` never uses the customer key. It reads and
+/// `molto import --in --dry-run` never uses the customer key. It reads and
 /// drops it only when both it and the password are piped on stdin, so the
 /// password stays on line 2 as in a real import; at a terminal each is its
 /// own prompt, so the key is not asked for.
@@ -3566,7 +3650,7 @@ fn molto_key_and_input<I: crate::secrets::SecretIo>(
         output::warn(
             "using the factory-default customer key — seeds sent to the \
              device are decryptable by anyone who captures the USB traffic. \
-             Rotate it first: keyroostctl molto customer-key (see --help).",
+             Rotate it first: keyroostctl molto customer-key change (see --help).",
         );
     }
     Ok((key, read_molto_input(sec, cmd)?))
@@ -3596,7 +3680,7 @@ fn molto_entry_from_qr(
         0 => Err("QR decoded, but no account could be imported (see skips above)".into()),
         1 => Ok(import.entries.into_iter().next().unwrap()),
         n => Err(format!(
-            "QR contains {} accounts — use `molto import --file {}` to program them \
+            "QR contains {} accounts — use `molto import --in {}` to program them \
              into consecutive slots",
             n,
             image_path.display()
@@ -4181,8 +4265,14 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
     RetiredFlag {
         flag: "--start",
         words: &["molto", "import"],
-        msg: "--start is now -s/--slot (with --file, the first slot to fill)",
+        msg: "--start is now -s/--slot (with --in, the first slot to fill)",
         now: &["--slot"],
+    },
+    RetiredFlag {
+        flag: "--file",
+        words: &["molto", "import"],
+        msg: "--file was renamed -i/--in (the export file to read)",
+        now: &["--in"],
     },
     RetiredFlag {
         flag: "--which",
@@ -4240,27 +4330,56 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
     },
     RetiredFlag {
         flag: "--force",
-        words: &["fido", "ssh", "extract"],
+        words: &["fido", "ssh", "export"],
         msg: "--force was renamed --overwrite (replace an existing file)",
         now: &["--overwrite"],
     },
     RetiredFlag {
         flag: "--cred-id",
         words: &["fido", "credential"],
-        msg: "--cred-id is now --id",
-        now: &["--id"],
+        msg: "--cred-id was removed: the credential ID is an argument now \
+              (`fido credential delete ID`)",
+        now: &[],
+    },
+    RetiredFlag {
+        flag: "--id",
+        words: &["fido", "credential"],
+        msg: "--id was removed: the credential ID is an argument now \
+              (`fido credential delete ID`)",
+        now: &[],
     },
     RetiredFlag {
         flag: "--template-id",
         words: &["fido", "fingerprint"],
-        msg: "--template-id is now --id",
-        now: &["--id"],
+        msg: "--template-id was removed: the template ID is an argument now \
+              (`fido fingerprint rename ID NAME`, `fido fingerprint delete ID`)",
+        now: &[],
+    },
+    RetiredFlag {
+        flag: "--id",
+        words: &["fido", "fingerprint"],
+        msg: "--id was removed: the template ID is an argument now \
+              (`fido fingerprint rename ID NAME`, `fido fingerprint delete ID`)",
+        now: &[],
+    },
+    RetiredFlag {
+        flag: "--name",
+        words: &["fido", "fingerprint"],
+        msg: "--name was removed: the name is an argument now \
+              (`fido fingerprint add NAME`, `fido fingerprint rename ID NAME`)",
+        now: &[],
     },
     RetiredFlag {
         flag: "--credential",
         words: &["fido", "ssh"],
-        msg: "--credential is now --id (the SSH credential's RP ID)",
-        now: &["--id"],
+        msg: "--credential is now --rp (the SSH credential's RP ID)",
+        now: &["--rp"],
+    },
+    RetiredFlag {
+        flag: "--id",
+        words: &["fido", "ssh"],
+        msg: "--id is now --rp (the SSH credential's RP ID)",
+        now: &["--rp"],
     },
     RetiredFlag {
         flag: "--list-readers",
@@ -4472,7 +4591,7 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
     RetiredCommand {
         parent: "fido",
         old: "pin-retries",
-        new: "fido pin retries",
+        new: "fido pin status",
         note: "",
     },
     RetiredCommand {
@@ -4485,12 +4604,12 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         parent: "fido",
         old: "creds-delete",
         new: "fido credential delete",
-        note: "",
+        note: "the credential ID is an argument now, not `--cred-id`",
     },
     RetiredCommand {
         parent: "fido",
         old: "creds-metadata",
-        new: "fido credential metadata",
+        new: "fido credential status",
         note: "",
     },
     RetiredCommand {
@@ -4503,19 +4622,19 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         parent: "fido",
         old: "fingerprint-enroll",
         new: "fido fingerprint add",
-        note: "",
+        note: "the name is an argument now, not `--name`",
     },
     RetiredCommand {
         parent: "fido",
         old: "fingerprint-rename",
         new: "fido fingerprint rename",
-        note: "",
+        note: "the template ID and the name are arguments now: `fido fingerprint rename ID NAME`",
     },
     RetiredCommand {
         parent: "fido",
         old: "fingerprint-delete",
         new: "fido fingerprint delete",
-        note: "",
+        note: "the template ID is an argument now, not `--template-id`",
     },
     RetiredCommand {
         parent: "fido",
@@ -4526,7 +4645,7 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
     RetiredCommand {
         parent: "fido",
         old: "set-min-pin",
-        new: "fido pin min-length",
+        new: "fido pin min-length set",
         note: "",
     },
     RetiredCommand {
@@ -4545,13 +4664,13 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         parent: "fido",
         old: "large-blob",
         new: "fido blob",
-        note: "same subcommands",
+        note: "same subcommands, except `get` is now `show`",
     },
     RetiredCommand {
         parent: "fido",
         old: "ssh-cert",
         new: "fido ssh",
-        note: "same subcommands",
+        note: "`extract` is now `export`, and `--credential` is `--rp`",
     },
     RetiredCommand {
         parent: "fido",
@@ -4580,7 +4699,7 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
     RetiredCommand {
         parent: "fido config",
         old: "set-min-pin-length",
-        new: "fido pin min-length",
+        new: "fido pin min-length set",
         note: "",
     },
     RetiredCommand {
@@ -4802,7 +4921,7 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
     RetiredCommand {
         parent: "otp",
         old: "delete-button-hotp",
-        new: "otp button delete",
+        new: "otp button clear",
         note: "",
     },
     RetiredCommand {
@@ -4898,8 +5017,92 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
     RetiredCommand {
         parent: "molto",
         old: "import-file",
-        new: "molto import --file",
-        note: "the path is the value of `--file`; `--start` is `--slot`",
+        new: "molto import --in",
+        note: "the path is the value of `--in`; `--start` is `--slot`",
+    },
+    RetiredCommand {
+        parent: "molto",
+        old: "slots",
+        new: "molto list",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido pin",
+        old: "retries",
+        new: "fido pin status",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido credential",
+        old: "metadata",
+        new: "fido credential status",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido blob",
+        old: "get",
+        new: "fido blob show",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido ssh",
+        old: "extract",
+        new: "fido ssh export",
+        note: "`--id` is now `--rp`",
+    },
+    RetiredCommand {
+        parent: "otp button",
+        old: "delete",
+        new: "otp button clear",
+        note: "",
+    },
+];
+
+/// A command that took its arguments directly and is now a group: `parent
+/// old` still parses, as the group, so these are matched by the path typed
+/// rather than by an unknown word. `new` is the command under the group.
+const RETIRED_LEAVES: &[RetiredCommand] = &[
+    RetiredCommand {
+        parent: "molto",
+        old: "seed",
+        new: "molto seed set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "molto",
+        old: "title",
+        new: "molto title set",
+        note: "`molto title --slot N` without a title only shows it",
+    },
+    RetiredCommand {
+        parent: "molto",
+        old: "config",
+        new: "molto config set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "molto",
+        old: "customer-key",
+        new: "molto customer-key change",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "prog",
+        old: "seed",
+        new: "prog seed set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "prog",
+        old: "config",
+        new: "prog config set",
+        note: "",
+    },
+    RetiredCommand {
+        parent: "fido pin",
+        old: "min-length",
+        new: "fido pin min-length set",
+        note: "",
     },
 ];
 
@@ -4917,19 +5120,46 @@ fn retired_command_hint(invalid: &str, argv: &[String]) -> Option<String> {
     RETIRED_COMMANDS
         .iter()
         .find(|r| r.parent == parent && r.old == invalid)
-        .map(|r| {
-            let old = if r.parent.is_empty() {
-                r.old.to_string()
-            } else {
-                format!("{} {}", r.parent, r.old)
-            };
-            let note = if r.note.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", r.note)
-            };
-            format!("`keyroostctl {old}` is now `keyroostctl {}`{note}", r.new)
-        })
+        .map(retired_message)
+}
+
+/// "`keyroostctl OLD` is now `keyroostctl NEW` (NOTE)", from table text only.
+fn retired_message(r: &RetiredCommand) -> String {
+    let old = if r.parent.is_empty() {
+        r.old.to_string()
+    } else {
+        format!("{} {}", r.parent, r.old)
+    };
+    let note = if r.note.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", r.note)
+    };
+    format!("`keyroostctl {old}` is now `keyroostctl {}`{note}", r.new)
+}
+
+/// The message for a parse error under a command that became a group
+/// (`molto seed --slot 1` is now `molto seed set --slot 1`), if `argv`
+/// names one of [`RETIRED_LEAVES`]. `word` is the unknown argument or
+/// subcommand clap reported, if any. A group that keeps arguments of its own
+/// (`molto title --slot N` shows the title) is only matched by a word that
+/// is no flag: a bad flag there is an ordinary mistake.
+fn retired_leaf_hint(word: Option<&str>, argv: &[String]) -> Option<String> {
+    use clap::CommandFactory;
+    let mut root = Cli::command();
+    root.build();
+    let (path, cmd) = walk_argv(&root, argv);
+    let path = path.join(" ");
+    let r = RETIRED_LEAVES
+        .iter()
+        .find(|r| format!("{} {}", r.parent, r.old).trim_start() == path)?;
+    let own_args = cmd
+        .get_arguments()
+        .any(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"));
+    if own_args && word.is_none_or(|w| w.starts_with('-')) {
+        return None;
+    }
+    Some(retired_message(r))
 }
 
 /// The deepest command `argv` names, built.
@@ -5137,7 +5367,7 @@ fn is_secret_arg(a: &clap::Arg) -> bool {
 /// flag. An unexpected non-flag argument on a command that takes a secret
 /// is not repeated:
 /// clap's "unexpected argument 'X' found" would echo X, which may be the
-/// secret itself (`molto seed --seed stdin DEADBEEF`, or an otpauth:// URI
+/// secret itself (`molto seed set --seed stdin DEADBEEF`, or an otpauth:// URI
 /// on `molto import`), and neither is a dash-led word right after a secret
 /// source (`--pin stdin -123456`, `--pin env:KR_PIN -123456`) unless it's
 /// shaped like a typo'd flag name. A secret flag (any `<SOURCE>` flag)
@@ -5150,6 +5380,24 @@ fn is_secret_arg(a: &clap::Arg) -> bool {
 fn redacted_parse_error(e: &clap::Error, argv: &[String]) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     use clap::CommandFactory;
+
+    if matches!(
+        e.kind(),
+        ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument | ErrorKind::MissingSubcommand
+    ) {
+        let word = match (
+            e.get(ContextKind::InvalidSubcommand),
+            e.get(ContextKind::InvalidArg),
+        ) {
+            (Some(ContextValue::String(w)), _) | (None, Some(ContextValue::String(w))) => {
+                Some(w.as_str())
+            }
+            _ => None,
+        };
+        if let Some(msg) = retired_leaf_hint(word, argv) {
+            return Some(msg);
+        }
+    }
 
     if e.kind() == ErrorKind::InvalidSubcommand {
         let Some(ContextValue::String(word)) = e.get(ContextKind::InvalidSubcommand) else {
@@ -5538,9 +5786,9 @@ fn run_molto(
         return Ok(());
     }
 
-    // Slots is read-only and needs no auth — the public block answers any
+    // List is read-only and needs no auth — the public block answers any
     // card holder (that's also why the output warns about title privacy).
-    if let MoltoCmd::Slots { all } = cmd {
+    if let MoltoCmd::List { all } = cmd {
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let info = session.read_info()?;
@@ -5609,8 +5857,12 @@ fn run_molto(
         return Ok(());
     }
 
-    // Title with TITLE omitted is a read — keyless, like Info/Slots.
-    if let MoltoCmd::Title { slot, title: None } = cmd {
+    // `molto title` without `set` is a read — keyless, like Info/List.
+    if let MoltoCmd::Title {
+        slot: Some(slot),
+        cmd: None,
+    } = cmd
+    {
         let mut session = open_molto_session(exact)?;
         session.set_debug(debug);
         let block = session.read_public_data(*slot)?;
@@ -5755,7 +6007,9 @@ fn run_molto(
     };
     // The seed slots this command writes, and whether it may skip asking.
     let writes: Option<(Vec<u8>, bool)> = match cmd {
-        MoltoCmd::Seed { slot, yes, .. } => Some((vec![*slot], *yes)),
+        MoltoCmd::Seed {
+            cmd: MoltoSeedCmd::Set { slot, yes, .. },
+        } => Some((vec![*slot], *yes)),
         MoltoCmd::Import {
             file: None,
             slot,
@@ -5763,7 +6017,7 @@ fn run_molto(
             ..
         } => {
             let Some(slot) = slot else {
-                unreachable!("clap requires --slot without --file")
+                unreachable!("clap requires --slot without --in")
             };
             Some((vec![*slot], *yes))
         }
@@ -5803,7 +6057,10 @@ fn run_molto(
     }
     // Replacing the customer key asks before either key is read, so a typed
     // key comes after the answer.
-    if let MoltoCmd::CustomerKey { yes, .. } = cmd {
+    if let MoltoCmd::CustomerKey {
+        cmd: MoltoCustomerKeyCmd::Change { yes, .. },
+    } = cmd
+    {
         asked = crate::prompt::confirm_then_read(&dev, *yes, "replace the Molto2 customer key")?;
     }
     let (key, input) = molto_key_and_input(&mut sec, key, cmd, early_key)?;
@@ -5824,29 +6081,34 @@ fn run_molto(
 
     match cmd {
         MoltoCmd::Info => unreachable!("handled above before auth"),
-        MoltoCmd::Slots { .. } => unreachable!("handled above before auth"),
+        MoltoCmd::List { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Delete { .. } => unreachable!("handled above before auth"),
-        MoltoCmd::Seed { slot, .. } => {
+        MoltoCmd::Seed {
+            cmd: MoltoSeedCmd::Set { slot, .. },
+        } => {
             let MoltoInput::Seed(seed) = &input else {
                 unreachable!("read before authentication")
             };
             session.set_seed(*slot, seed)?;
             println!("Seed written to slot #{}.", slot);
         }
-        MoltoCmd::Title { slot, title } => {
-            // Checked by molto_validate before the token was touched.
-            let title = title
-                .as_deref()
-                .expect("title read mode is handled before auth");
+        MoltoCmd::Title {
+            cmd: Some(MoltoTitleCmd::Set { slot, title }),
+            ..
+        } => {
             session.set_title(*slot, title)?;
             println!("Title set on slot #{}.", slot);
         }
+        MoltoCmd::Title { cmd: None, .. } => unreachable!("handled above before auth"),
         MoltoCmd::Config {
-            slot,
-            algorithm,
-            digits,
-            period,
-            display_timeout,
+            cmd:
+                MoltoConfigCmd::Set {
+                    slot,
+                    algorithm,
+                    digits,
+                    period,
+                    display_timeout,
+                },
         } => {
             let cfg = ProfileConfig {
                 display_timeout: display_timeout.to_proto(),
@@ -5890,7 +6152,7 @@ fn run_molto(
             ..
         } => {
             let Some(slot) = slot else {
-                unreachable!("clap requires --slot without --file")
+                unreachable!("clap requires --slot without --in")
             };
             let MoltoInput::Entry {
                 entry,
@@ -6014,10 +6276,13 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             }
         }
         ProgCmd::Seed {
-            reader,
-            seed,
-            encoding,
-            yes,
+            cmd:
+                ProgSeedCmd::Set {
+                    reader,
+                    seed,
+                    encoding,
+                    yes,
+                },
         } => {
             let mut sec = Secrets::real();
             let spec = seed_spec(*encoding);
@@ -6051,11 +6316,14 @@ fn run_prog(cmd: &ProgCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             println!("Seed programmed ({} bytes).", seed.len());
         }
         ProgCmd::Config {
-            reader,
-            algorithm,
-            period,
-            display_timeout,
-            yes,
+            cmd:
+                ProgConfigCmd::Set {
+                    reader,
+                    algorithm,
+                    period,
+                    display_timeout,
+                    yes,
+                },
         } => {
             let dev = crate::target::select(Need::Prog, reader.as_deref(), None)?;
             let name = crate::target::reader_of(&dev)?;
@@ -8345,14 +8613,14 @@ fn run_otp(
             println!("Configured the HOTP-on-button keystroke slot.");
         }
         OtpCmd::Button {
-            cmd: OtpButtonCmd::Delete { yes },
+            cmd: OtpButtonCmd::Clear { yes },
         } => {
             let dev = select_otp(&sel)?;
             otp_precheck(&dev, sel.transport, debug, OtpFeature::ButtonHotp)?;
-            crate::prompt::confirm_on(&dev, *yes, "delete the HOTP-on-button seed")?;
+            crate::prompt::confirm_on(&dev, *yes, "clear the HOTP-on-button seed")?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
             session.delete_button_hotp()?;
-            println!("Deleted the HOTP-on-button keystroke slot.");
+            println!("Cleared the HOTP-on-button keystroke slot.");
         }
         OtpCmd::Info => {
             let mut session = open_otp(&sel, debug)?;
@@ -8637,7 +8905,7 @@ fn otp_algo_str_t2(a: keyroost_token2otp::Algorithm) -> &'static str {
     }
 }
 
-/// JSON spelling: lowercase, the same as `molto slots`.
+/// JSON spelling: lowercase, the same as `molto list`.
 fn otp_algo_json_t2(a: keyroost_token2otp::Algorithm) -> &'static str {
     match a {
         keyroost_token2otp::Algorithm::Sha1 => "sha1",
@@ -8645,7 +8913,7 @@ fn otp_algo_json_t2(a: keyroost_token2otp::Algorithm) -> &'static str {
     }
 }
 
-/// JSON spelling: lowercase, the same as `molto slots`.
+/// JSON spelling: lowercase, the same as `molto list`.
 fn oath_algo_json(a: keyroost_oath::Algorithm) -> &'static str {
     match a {
         keyroost_oath::Algorithm::Sha1 => "sha1",
@@ -12168,7 +12436,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoPinCmd::Retries { path } => {
+        FidoPinCmd::Status { path } => {
             run_fido_pin_retries(path.as_deref())?;
             Ok(())
         }
@@ -12193,11 +12461,14 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         FidoPinCmd::MinLength {
-            length,
-            force_change,
-            yes,
-            pin,
-            path,
+            cmd:
+                FidoMinLengthCmd::Set {
+                    length,
+                    force_change,
+                    yes,
+                    pin,
+                    path,
+                },
         } => {
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
@@ -12249,7 +12520,7 @@ fn run_fido_credentials(cmd: &FidoCredentialCmd) -> Result<(), Box<dyn std::erro
         }
         FidoCredentialCmd::Delete { id, pin, path, yes } => {
             let cred_id_bytes =
-                hex_decode(id).map_err(|e| format!("--id is not valid hex: {}", e))?;
+                hex_decode(id).map_err(|e| format!("the credential ID is not valid hex: {}", e))?;
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
@@ -12264,7 +12535,7 @@ fn run_fido_credentials(cmd: &FidoCredentialCmd) -> Result<(), Box<dyn std::erro
             run_fido_creds_delete(path.as_deref(), &pin, &cred_id_bytes)?;
             Ok(())
         }
-        FidoCredentialCmd::Metadata { pin, path } => {
+        FidoCredentialCmd::Status { pin, path } => {
             let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_creds_metadata(path.as_deref(), &pin)?;
             Ok(())
@@ -12290,13 +12561,15 @@ fn run_fido_fingerprints(cmd: &FidoFingerprintCmd) -> Result<(), Box<dyn std::er
             pin,
             path,
         } => {
-            let id = hex_decode(id).map_err(|e| format!("--id is not valid hex: {}", e))?;
+            let id =
+                hex_decode(id).map_err(|e| format!("the template ID is not valid hex: {}", e))?;
             let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_fingerprint_rename(path.as_deref(), &pin, &id, name)?;
             Ok(())
         }
         FidoFingerprintCmd::Delete { id, pin, path, yes } => {
-            let id = hex_decode(id).map_err(|e| format!("--id is not valid hex: {}", e))?;
+            let id =
+                hex_decode(id).map_err(|e| format!("the template ID is not valid hex: {}", e))?;
             let mut sec = Secrets::real();
             let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
@@ -12429,7 +12702,7 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
 fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         LargeBlobCmd::List { path } => run_fido_large_blob_list(path.as_deref()),
-        LargeBlobCmd::Get { index, path } => run_fido_large_blob_get(path.as_deref(), *index),
+        LargeBlobCmd::Show { index, path } => run_fido_large_blob_get(path.as_deref(), *index),
         LargeBlobCmd::Add { text, pin, path } => {
             let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_large_blob_add(path.as_deref(), &pin, text)
@@ -12490,15 +12763,15 @@ fn run_fido_large_blob(cmd: &LargeBlobCmd) -> Result<(), Box<dyn std::error::Err
     }
 }
 
-/// Dispatch for `fido ssh` — list SSH credentials or extract a cert.
+/// Dispatch for `fido ssh` — list SSH credentials or export a cert.
 fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         SshCertCmd::List { pin, path } => {
             let pin = fido_pin(path.as_deref(), pin.as_ref())?;
             run_fido_ssh_cert_list(path.as_deref(), &pin)
         }
-        SshCertCmd::Extract {
-            id,
+        SshCertCmd::Export {
+            rp,
             out,
             overwrite,
             pin,
@@ -12509,7 +12782,7 @@ fn run_fido_ssh_cert(cmd: &SshCertCmd) -> Result<(), Box<dyn std::error::Error>>
             run_fido_ssh_cert_extract(
                 path.as_deref(),
                 &pin,
-                id.as_deref(),
+                rp.as_deref(),
                 out.as_deref(),
                 out_mode,
                 *overwrite,
@@ -12647,7 +12920,7 @@ fn run_fido_ssh_cert_extract(
         None => {
             if creds.len() != 1 {
                 return Err(format!(
-                    "several SSH credentials present; pass --id <rp-id> (one of: {})",
+                    "several SSH credentials present; pass --rp RP_ID (one of: {})",
                     choices()
                 )
                 .into());
@@ -13748,7 +14021,7 @@ fn run_fido_creds_list(
                     display_field,
                 );
                 // Full credentialId on its own line: this is the exact value
-                // `fido credential delete --id` expects (the `cred …` summary
+                // `fido credential delete ID` expects (the `cred …` summary
                 // above is truncated for readability and can't be copied).
                 println!("       id={}", hex_encode(&c.credential_id));
                 if let Some(alg) = c.algorithm {
@@ -13790,10 +14063,10 @@ fn run_fido_fingerprint_list(
                 .as_deref()
                 .map(sanitize_terminal)
                 .unwrap_or_else(|| "(unnamed)".to_string());
-            // The hex template ID is what --id takes for rename/delete.
+            // The hex template ID is what rename/delete take.
             println!("  id {}   {}", hex_encode(&e.template_id), name);
         }
-        output::note("use the ID with --id to rename or delete");
+        output::note("rename or delete one with `fido fingerprint rename ID NAME` or `fido fingerprint delete ID`");
         Ok(())
     })
 }
@@ -14165,7 +14438,7 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
     println!("Any ✓ line is an instruction the firmware recognized and completed.");
 }
 
-/// `molto import --file`'s result line: how many entries were written (entries
+/// `molto import --in`'s result line: how many entries were written (entries
 /// skipped for having no title are not counted) and the slot range covered.
 fn import_file_ack(written: usize, first: u8, last: usize) -> String {
     format!(
@@ -14808,7 +15081,7 @@ mod cli_tests {
     fn an_attached_short_after_a_source_is_refused() {
         let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
         for line in [
-            "k molto seed --seed stdin -s3cret",
+            "k molto seed set --seed stdin -s3cret",
             "k piv pin change --pin stdin --new-pin stdin -d3cret",
             "k piv key move --mgmt-key=default -s3cret",
             "k piv key generate --mgmt-key env:K -o3cret",
@@ -14817,8 +15090,8 @@ mod cli_tests {
             assert!(short_glued_after_source(&argv(line)), "{line}");
         }
         for line in [
-            "k molto seed --seed stdin -s 1 -y",
-            "k molto seed -s1 --seed stdin -y",
+            "k molto seed set --seed stdin -s 1 -y",
+            "k molto seed set -s1 --seed stdin -y",
             "k piv pin change --pin stdin -d k",
             "k piv x --pin stdin --slot 9a",
             "k piv x --pin stdin -123456",
@@ -14919,7 +15192,7 @@ mod cli_tests {
     #[test]
     fn destructive_marker_styles() {
         const ONE_WAY_SETTINGS: [&str; 2] =
-            ["fido pin min-length", "fido config attestation enable"];
+            ["fido pin min-length set", "fido config attestation enable"];
         let irreversible: &[(&str, &str)] = &[
             ("fido reset", IRREVERSIBLE),
             ("fido credential delete", IRREVERSIBLE),
@@ -14932,7 +15205,7 @@ mod cli_tests {
             ("oath reset", IRREVERSIBLE),
             ("otp delete", IRREVERSIBLE),
             ("otp reset", IRREVERSIBLE),
-            ("otp button delete", IRREVERSIBLE),
+            ("otp button clear", IRREVERSIBLE),
             ("openpgp reset", IRREVERSIBLE),
             ("openpgp key generate", IRREVERSIBLE),
             ("openpgp key import", IRREVERSIBLE),
@@ -14943,12 +15216,12 @@ mod cli_tests {
             ("piv key generate", IRREVERSIBLE),
             ("piv cert import", IRREVERSIBLE),
             ("piv cert generate", IRREVERSIBLE),
-            ("molto seed", IRREVERSIBLE),
+            ("molto seed set", IRREVERSIBLE),
             ("molto import", IRREVERSIBLE),
-            ("prog seed", IRREVERSIBLE),
+            ("prog seed set", IRREVERSIBLE),
             ("otp button set", IRREVERSIBLE),
             ("piv retries set", IRREVERSIBLE),
-            ("molto customer-key", IRREVERSIBLE),
+            ("molto customer-key change", IRREVERSIBLE),
             ("factory-reset", IRREVERSIBLE_TYPED),
             ("otp interface", IRREVERSIBLE_TYPED),
         ];
@@ -14960,7 +15233,12 @@ mod cli_tests {
         // Commands that ask before a change that destroys no key, seed or
         // certificate: a token setting, `piv cert request`, which replaces a
         // key only with the optional `--generate-key`, and a key's name.
-        let confirms_only = ["prog config", "piv cert request", "name set", "name clear"];
+        let confirms_only = [
+            "prog config set",
+            "piv cert request",
+            "name set",
+            "name clear",
+        ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
             assert!(tree.iter().any(|(t, _)| t == p), "{p:?} is not a command");
@@ -15085,7 +15363,7 @@ mod cli_tests {
             ]
         );
         // `Cli` isn't Debug, so `.err().unwrap()` rather than `unwrap_err()`.
-        let help = Cli::try_parse_from(["keyroostctl", "molto", "config", "--help"])
+        let help = Cli::try_parse_from(["keyroostctl", "molto", "config", "set", "--help"])
             .err()
             .unwrap()
             .to_string();
@@ -15182,6 +15460,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--slot",
                 "99",
                 "--hex",
@@ -15191,19 +15470,42 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--slot",
                 "99",
                 "--base32",
                 "X",
             ],
-            &["keyroostctl", "prog", "seed", "--hex", "00"],
-            &["keyroostctl", "prog", "seed", "--base32", "X"],
-            &["keyroostctl", "molto", "customer-key", "--ascii", "x"],
-            &["keyroostctl", "molto", "customer-key", "--hex", "00"],
+            &["keyroostctl", "prog", "seed", "set", "--hex", "00"],
+            &["keyroostctl", "prog", "seed", "set", "--base32", "X"],
+            &[
+                "keyroostctl",
+                "molto",
+                "customer-key",
+                "change",
+                "--ascii",
+                "x",
+            ],
+            &[
+                "keyroostctl",
+                "molto",
+                "customer-key",
+                "change",
+                "--hex",
+                "00",
+            ],
             &["keyroostctl", "molto", "--key", "00", "info"],
             &["keyroostctl", "molto", "--key-ascii", "x", "info"],
             &["keyroostctl", "molto", "--key-env", "V", "info"],
-            &["keyroostctl", "molto", "seed", "--slot", "1", "--hex-stdin"],
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "set",
+                "--slot",
+                "1",
+                "--hex-stdin",
+            ],
             &[
                 "keyroostctl",
                 "molto",
@@ -15284,7 +15586,7 @@ mod cli_tests {
         let e = read(&mut sec, None).unwrap_err();
         assert_eq!(
             e,
-            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin, --qr IMAGE or --file PATH"
+            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin, --qr IMAGE or --in FILE"
         );
     }
 
@@ -15338,7 +15640,7 @@ mod cli_tests {
             MoltoInput::Seed(s) => Ok::<Vec<u8>, String>(s.to_vec()),
             _ => panic!("expected a seed"),
         };
-        let base = ["keyroostctl", "molto", "seed", "--slot", "1"];
+        let base = ["keyroostctl", "molto", "seed", "set", "--slot", "1"];
         let with = |extra: &[&'static str]| -> Vec<&'static str> {
             base.iter().copied().chain(extra.iter().copied()).collect()
         };
@@ -15376,7 +15678,10 @@ mod cli_tests {
             _ => panic!("expected a new key"),
         };
         let mut sec = Secrets::new(FakeIo::terminal().typing(&["0011", "0011"]));
-        let k = new_key(&["keyroostctl", "molto", "customer-key"], &mut sec);
+        let k = new_key(
+            &["keyroostctl", "molto", "customer-key", "change"],
+            &mut sec,
+        );
         assert_eq!(k, [0x00, 0x11]);
         assert_eq!(
             sec.io.prompts,
@@ -15390,6 +15695,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "customer-key",
+            "change",
             "--new-customer-key",
             "stdin",
             "--encoding",
@@ -15413,6 +15719,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--slot",
                 "1",
                 "--seed",
@@ -15431,6 +15738,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--slot",
                 "1",
                 "--seed",
@@ -15447,6 +15755,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "customer-key",
+                "change",
                 "--new-customer-key",
                 "stdin",
             ],
@@ -15469,6 +15778,7 @@ mod cli_tests {
             "--customer-key-encoding",
             "ascii",
             "seed",
+            "set",
             "--slot",
             "1",
             "--seed",
@@ -15482,7 +15792,10 @@ mod cli_tests {
             panic!()
         };
         assert_eq!(key.customer_key_encoding, KeyEncoding::Ascii);
-        let MoltoCmd::Seed { encoding, .. } = &cmd else {
+        let MoltoCmd::Seed {
+            cmd: MoltoSeedCmd::Set { encoding, .. },
+        } = &cmd
+        else {
             panic!()
         };
         assert_eq!(*encoding, SeedEncoding::Hex);
@@ -15504,6 +15817,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "seed",
+            "set",
             "--slot",
             "1",
             "--seed",
@@ -15512,7 +15826,10 @@ mod cli_tests {
         .unwrap();
         let Some(Cmd::Molto {
             key,
-            cmd: MoltoCmd::Seed { encoding, .. },
+            cmd:
+                MoltoCmd::Seed {
+                    cmd: MoltoSeedCmd::Set { encoding, .. },
+                },
             ..
         }) = cli.command
         else {
@@ -15533,6 +15850,7 @@ mod cli_tests {
             "--customer-key",
             "stdin",
             "seed",
+            "set",
             "--slot",
             "1",
             "--seed",
@@ -15582,7 +15900,16 @@ mod cli_tests {
     #[test]
     fn molto_seed_prompts_at_a_terminal_now() {
         use crate::secrets::fake::FakeIo;
-        let cli = parse(&["keyroostctl", "molto", "seed", "--slot", "1", "--yes"]).unwrap();
+        let cli = parse(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "set",
+            "--slot",
+            "1",
+            "--yes",
+        ])
+        .unwrap();
         let Some(Cmd::Molto { cmd, .. }) = cli.command else {
             panic!()
         };
@@ -15622,7 +15949,7 @@ mod cli_tests {
                 "hex",
             ],
             &["keyroostctl", "otp", "button", "set", "--encoding", "hex"],
-            &["keyroostctl", "prog", "seed", "--encoding", "hex"],
+            &["keyroostctl", "prog", "seed", "set", "--encoding", "hex"],
         ] {
             parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
@@ -15665,7 +15992,7 @@ mod cli_tests {
                 .to_string()
         };
         assert_eq!(
-            err(&["keyroostctl", "molto", "seed", "--slot", "99"]),
+            err(&["keyroostctl", "molto", "seed", "set", "--slot", "99"]),
             "no seed given: pass --seed env:NAME or --seed stdin"
         );
         // Range checks are clap value parsers now: they fail at parse time.
@@ -15674,6 +16001,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "seed",
+            "set",
             "--slot",
             "100",
             "--seed",
@@ -15684,6 +16012,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "title",
+            "set",
             "--slot",
             "1",
             "thirteen-chars",
@@ -15691,7 +16020,7 @@ mod cli_tests {
         assert!(e.contains("title must be 1..=12 bytes"), "{e}");
         assert_eq!(
             err(&["keyroostctl", "molto", "import", "--slot", "1"]),
-            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin, --qr IMAGE or --file PATH"
+            "no otpauth:// URI given: pass --uri env:NAME, --uri stdin, --qr IMAGE or --in FILE"
         );
         let e = parse_err(&[
             "keyroostctl",
@@ -15706,7 +16035,7 @@ mod cli_tests {
         ]);
         assert!(e.contains("title must be 1..=12 bytes"), "{e}");
         assert_eq!(
-            err(&["keyroostctl", "molto", "customer-key"]),
+            err(&["keyroostctl", "molto", "customer-key", "change"]),
             "no new customer key given: pass --new-customer-key env:NAME or --new-customer-key stdin"
         );
         // An unusable --customer-key is caught here too, on any command.
@@ -15717,6 +16046,7 @@ mod cli_tests {
                 "--customer-key",
                 "env:KR_UNSET",
                 "config",
+                "set",
                 "--slot",
                 "1"
             ]),
@@ -15731,6 +16061,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--slot",
                 "99",
                 "--seed",
@@ -15758,11 +16089,12 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "title",
+                "set",
                 "--slot",
                 "1",
                 "twelve-chars",
             ],
-            &["keyroostctl", "molto", "config", "--slot", "99"],
+            &["keyroostctl", "molto", "config", "set", "--slot", "99"],
             &["keyroostctl", "molto", "--customer-key", "stdin", "info"],
         ] {
             molto_validate(&molto_cmd(args), &molto_key_args(args), &sec)
@@ -15772,8 +16104,8 @@ mod cli_tests {
         let term = Secrets::new(FakeIo::terminal());
         for args in [
             &["keyroostctl", "molto", "import", "--slot", "1"][..],
-            &["keyroostctl", "molto", "seed", "--slot", "1"],
-            &["keyroostctl", "molto", "customer-key"],
+            &["keyroostctl", "molto", "seed", "set", "--slot", "1"],
+            &["keyroostctl", "molto", "customer-key", "change"],
         ] {
             molto_validate(&molto_cmd(args), &molto_key_args(args), &term)
                 .unwrap_or_else(|e| panic!("{args:?}: {e}"));
@@ -15790,6 +16122,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "seed",
+            "set",
             "--slot",
             "1",
             "--seed",
@@ -15827,7 +16160,7 @@ mod cli_tests {
         }
         // Commands with no secret read nothing.
         let mut sec = Secrets::new(FakeIo::terminal());
-        let cmd = molto_cmd(&["keyroostctl", "molto", "config", "--slot", "1"]);
+        let cmd = molto_cmd(&["keyroostctl", "molto", "config", "set", "--slot", "1"]);
         assert!(matches!(
             read_molto_input(&mut sec, &cmd).unwrap(),
             MoltoInput::Nothing
@@ -15876,42 +16209,42 @@ mod cli_tests {
             ),
             (
                 "--hex",
-                "keyroostctl molto seed -p 1 --hex 00",
+                "keyroostctl molto seed set -p 1 --hex 00",
                 "use --seed env:NAME --encoding hex",
             ),
             (
                 "--base32",
-                "keyroostctl prog seed --base32 AA",
+                "keyroostctl prog seed set --base32 AA",
                 "use --seed env:NAME (base32 is the default encoding)",
             ),
             (
                 "--hex-env",
-                "keyroostctl molto seed --slot 1 --hex-env V",
+                "keyroostctl molto seed set --slot 1 --hex-env V",
                 "--seed env:VAR --encoding hex",
             ),
             (
                 "--base32-stdin",
-                "keyroostctl prog seed --base32-stdin",
+                "keyroostctl prog seed set --base32-stdin",
                 "--seed stdin (base32",
             ),
             (
                 "--hex",
-                "keyroostctl molto customer-key --hex 00",
+                "keyroostctl molto customer-key change --hex 00",
                 "use --new-customer-key env:NAME (hex is the default encoding)",
             ),
             (
                 "--ascii",
-                "keyroostctl molto customer-key --ascii x",
+                "keyroostctl molto customer-key change --ascii x",
                 "use --new-customer-key env:NAME --encoding ascii",
             ),
             (
                 "--hex-stdin",
-                "keyroostctl molto customer-key --hex-stdin",
+                "keyroostctl molto customer-key change --hex-stdin",
                 "--new-customer-key stdin",
             ),
             (
                 "--ascii-env",
-                "keyroostctl molto customer-key --ascii-env V",
+                "keyroostctl molto customer-key change --ascii-env V",
                 "--new-customer-key env:VAR --encoding ascii",
             ),
             (
@@ -15983,13 +16316,14 @@ mod cli_tests {
                     "keyroostctl",
                     "molto",
                     "seed",
+                    "set",
                     "--slot",
                     "99",
                     "--seed",
                     "stdin",
                     "S3CRET",
                 ][..],
-                "keyroostctl molto seed",
+                "keyroostctl molto seed set",
             ),
             (
                 &[
@@ -16033,6 +16367,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "seed",
+            "set",
             "--slot",
             "99",
             "--hexx-stdin"
@@ -16063,6 +16398,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "seed",
+            "set",
             "--slot",
             "99",
             "--hex",
@@ -16087,6 +16423,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "seed",
+            "set",
             "--slot",
             "99",
             "--hex-stdin=S3CRET",
@@ -16160,6 +16497,7 @@ mod cli_tests {
                     "keyroostctl",
                     "molto",
                     "seed",
+                    "set",
                     "--slot",
                     "99",
                     "--seed123456",
@@ -16197,6 +16535,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--seed",
                 "stdin",
                 "-s",
@@ -16206,6 +16545,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--seed=env:X",
                 "--slot",
                 "S3CRET",
@@ -16216,7 +16556,7 @@ mod cli_tests {
             assert!(!msg.contains("S3CRET"), "{msg}");
         }
         // Anywhere else, clap's own message (which shows the value) stays.
-        assert!(redacted(&["keyroostctl", "molto", "seed", "-s", "S3CRET"]).is_none());
+        assert!(redacted(&["keyroostctl", "molto", "seed", "set", "-s", "S3CRET"]).is_none());
     }
 
     /// `openpgp pin change --admin` takes the admin PIN through --pin.
@@ -16653,8 +16993,8 @@ mod cli_tests {
             "keyroostctl",
             "fido",
             "ssh",
-            "extract",
-            "--id",
+            "export",
+            "--rp",
             "ssh:demo",
             "--out",
             "id-cert.pub",
@@ -16669,8 +17009,8 @@ mod cli_tests {
                 cmd:
                     FidoCmd::Ssh {
                         cmd:
-                            SshCertCmd::Extract {
-                                id,
+                            SshCertCmd::Export {
+                                rp,
                                 out,
                                 overwrite,
                                 pin,
@@ -16678,11 +17018,11 @@ mod cli_tests {
                             },
                     },
             }) => {
-                assert_eq!(id.as_deref(), Some("ssh:demo"));
+                assert_eq!(rp.as_deref(), Some("ssh:demo"));
                 assert_eq!(out.as_deref(), Some(std::path::Path::new("id-cert.pub")));
                 assert!(overwrite && pin == Some(SecretSource::Stdin));
             }
-            _ => panic!("expected fido ssh extract"),
+            _ => panic!("expected fido ssh export"),
         }
     }
 
@@ -16693,25 +17033,25 @@ mod cli_tests {
     // The old spelling must be rejected, not silently accepted.
     #[test]
     fn ssh_cert_extract_overwrite_flag() {
-        match parse(&["keyroostctl", "fido", "ssh", "extract", "--overwrite"])
+        match parse(&["keyroostctl", "fido", "ssh", "export", "--overwrite"])
             .unwrap()
             .command
         {
             Some(Cmd::Fido {
                 cmd:
                     FidoCmd::Ssh {
-                        cmd: SshCertCmd::Extract { overwrite, .. },
+                        cmd: SshCertCmd::Export { overwrite, .. },
                     },
             }) => assert!(overwrite),
-            _ => panic!("expected fido ssh extract"),
+            _ => panic!("expected fido ssh export"),
         }
-        assert!(parse(&["keyroostctl", "fido", "ssh", "extract", "--force"]).is_err());
+        assert!(parse(&["keyroostctl", "fido", "ssh", "export", "--force"]).is_err());
         let help = <Cli as clap::CommandFactory>::command()
             .find_subcommand_mut("fido")
             .unwrap()
             .find_subcommand_mut("ssh")
             .unwrap()
-            .find_subcommand_mut("extract")
+            .find_subcommand_mut("export")
             .unwrap()
             .render_help()
             .to_string();
@@ -16796,6 +17136,7 @@ mod cli_tests {
             "fido",
             "pin",
             "min-length",
+            "set",
             "--length",
             "8",
             "--yes",
@@ -16806,19 +17147,33 @@ mod cli_tests {
             Some(Cmd::Fido {
                 cmd:
                     FidoCmd::Pin {
-                        cmd: FidoPinCmd::MinLength { yes, length, .. },
+                        cmd:
+                            FidoPinCmd::MinLength {
+                                cmd: FidoMinLengthCmd::Set { yes, length, .. },
+                            },
                     },
             }) => assert!(yes && length == 8),
             _ => panic!("expected fido pin min-length"),
         }
-        match parse(&["keyroostctl", "fido", "pin", "min-length", "--length", "8"])
-            .unwrap()
-            .command
+        match parse(&[
+            "keyroostctl",
+            "fido",
+            "pin",
+            "min-length",
+            "set",
+            "--length",
+            "8",
+        ])
+        .unwrap()
+        .command
         {
             Some(Cmd::Fido {
                 cmd:
                     FidoCmd::Pin {
-                        cmd: FidoPinCmd::MinLength { yes, .. },
+                        cmd:
+                            FidoPinCmd::MinLength {
+                                cmd: FidoMinLengthCmd::Set { yes, .. },
+                            },
                     },
             }) => assert!(!yes),
             _ => panic!("expected fido pin min-length"),
@@ -18410,7 +18765,7 @@ mod cli_tests {
 
     #[test]
     fn broken_pipe_panic_detection() {
-        // std println! Display shape (what `molto slots … | head` panics with).
+        // std println! Display shape (what `molto list … | head` panics with).
         assert!(is_broken_pipe_panic(
             "failed printing to stdout: Broken pipe (os error 32)"
         ));
@@ -18535,6 +18890,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "-s",
                 "1",
                 "--seed",
@@ -18807,34 +19163,33 @@ mod cli_tests {
     #[test]
     fn fido_nests_by_topic() {
         for a in [
-            &["keyroostctl", "fido", "pin", "retries"][..],
+            &["keyroostctl", "fido", "pin", "status"][..],
             &["keyroostctl", "fido", "pin", "set"],
             &["keyroostctl", "fido", "pin", "change"],
-            &["keyroostctl", "fido", "pin", "min-length", "--length", "8"],
-            &["keyroostctl", "fido", "pin", "force-change"],
-            &["keyroostctl", "fido", "credential", "list"],
-            &["keyroostctl", "fido", "credential", "metadata"],
-            &["keyroostctl", "fido", "credential", "delete", "--id", "00"],
-            &["keyroostctl", "fido", "fingerprint", "list"],
-            &["keyroostctl", "fido", "fingerprint", "add"],
             &[
                 "keyroostctl",
                 "fido",
-                "fingerprint",
-                "rename",
-                "--id",
-                "00",
-                "--name",
-                "x",
+                "pin",
+                "min-length",
+                "set",
+                "--length",
+                "8",
             ],
-            &["keyroostctl", "fido", "fingerprint", "delete", "--id", "00"],
+            &["keyroostctl", "fido", "pin", "force-change"],
+            &["keyroostctl", "fido", "credential", "list"],
+            &["keyroostctl", "fido", "credential", "status"],
+            &["keyroostctl", "fido", "credential", "delete", "00"],
+            &["keyroostctl", "fido", "fingerprint", "list"],
+            &["keyroostctl", "fido", "fingerprint", "add"],
+            &["keyroostctl", "fido", "fingerprint", "rename", "00", "x"],
+            &["keyroostctl", "fido", "fingerprint", "delete", "00"],
             &["keyroostctl", "fido", "config", "always-uv", "enable"],
             &["keyroostctl", "fido", "config", "always-uv", "disable"],
             &["keyroostctl", "fido", "config", "attestation", "enable"],
             &["keyroostctl", "fido", "blob", "list"],
             &["keyroostctl", "fido", "blob", "export", "0", "--out", "f"],
             &["keyroostctl", "fido", "ssh", "list"],
-            &["keyroostctl", "fido", "ssh", "extract", "--id", "ssh:demo"],
+            &["keyroostctl", "fido", "ssh", "export", "--rp", "ssh:demo"],
             &["keyroostctl", "name", "list"],
             &["keyroostctl", "name", "clear", "x"],
             &["keyroostctl", "name", "set", "x", "--store", "key"],
@@ -18916,7 +19271,7 @@ mod cli_tests {
             &["keyroostctl", "otp", "fingerprint", "enable"],
             &["keyroostctl", "otp", "fingerprint", "disable"],
             &["keyroostctl", "otp", "button", "set"],
-            &["keyroostctl", "otp", "button", "delete"],
+            &["keyroostctl", "otp", "button", "clear"],
             &["keyroostctl", "molto", "sync", "--slot", "1"],
             &[
                 "keyroostctl",
@@ -18927,12 +19282,12 @@ mod cli_tests {
                 "--uri",
                 "stdin",
             ],
-            &["keyroostctl", "molto", "import", "--file", "v.json"],
+            &["keyroostctl", "molto", "import", "--in", "v.json"],
             &[
                 "keyroostctl",
                 "molto",
                 "import",
-                "--file",
+                "--in",
                 "v.json",
                 "--slot",
                 "5",
@@ -18944,7 +19299,7 @@ mod cli_tests {
             assert!(parse(a).is_ok(), "{a:?}");
         }
         for bad in [
-            // --slot is required without --file
+            // --slot is required without --in
             &["keyroostctl", "molto", "import", "--uri", "stdin"][..],
             &[
                 "keyroostctl",
@@ -18954,12 +19309,12 @@ mod cli_tests {
                 "1",
                 "--uri",
                 "stdin",
-                "--file",
+                "--in",
                 "v.json",
             ],
-            // --dry-run needs --file
+            // --dry-run needs --in
             &["keyroostctl", "molto", "import", "--slot", "1", "--dry-run"],
-            // --password is for an encrypted --file; --qr is one URI
+            // --password is for an encrypted --in; --qr is one URI
             &[
                 "keyroostctl",
                 "molto",
@@ -18973,7 +19328,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "import",
-                "--file",
+                "--in",
                 "v.json",
                 "--qr",
                 "x.png",
@@ -18982,7 +19337,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "import",
-                "--file",
+                "--in",
                 "v.json",
                 "--title",
                 "x",
@@ -19308,6 +19663,7 @@ mod cli_tests {
             "keyroostctl",
             "molto",
             "seed",
+            "set",
             "--slot",
             "0",
             "--seed",
@@ -19457,12 +19813,13 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "title",
+                "set",
                 "--slot",
                 "1",
                 "THIRTEEN-LONG",
             ],
             &["keyroostctl", "piv", "chuid", "generate", "--guid", "zz"],
-            &["keyroostctl", "fido", "credential", "delete", "--id", "xyz"],
+            &["keyroostctl", "fido", "credential", "delete", "xyz"],
         ] {
             let e = Cli::try_parse_from(argv)
                 .err()
@@ -19576,6 +19933,81 @@ mod cli_tests {
                 }
             }
         }
+        // A retired leaf is a group now, and its row names the command
+        // under it.
+        for r in RETIRED_LEAVES {
+            let parent =
+                descend(r.parent).unwrap_or_else(|| panic!("parent `{}` is gone", r.parent));
+            let group = parent
+                .find_subcommand(r.old)
+                .unwrap_or_else(|| panic!("`{} {}` is gone", r.parent, r.old));
+            assert!(
+                group.get_subcommands().next().is_some(),
+                "`{} {}` is no group",
+                r.parent,
+                r.old
+            );
+            let old = format!("{} {}", r.parent, r.old);
+            let under = r
+                .new
+                .strip_prefix(old.trim_start())
+                .and_then(|rest| rest.strip_prefix(' '))
+                .unwrap_or_else(|| panic!("`{}` is not under `{old}`", r.new));
+            assert!(
+                group.find_subcommand(under).is_some(),
+                "`{}`: no `{under}`",
+                r.new
+            );
+        }
+    }
+
+    /// A command that became a group names its replacement for its old
+    /// arguments, never repeating them; the group's own use and help stay.
+    #[test]
+    fn retired_leaf_hint_names_the_command_under_the_group() {
+        let hint = |a: &[&str]| {
+            let e = parse(a).err().unwrap_or_else(|| panic!("{a:?} parsed"));
+            redacted_parse_error(&e, &argv(a))
+        };
+        for (a, want) in [
+            (
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "seed",
+                    "--slot",
+                    "1",
+                    "--seed",
+                    "stdin",
+                ][..],
+                "`keyroostctl molto seed` is now `keyroostctl molto seed set`",
+            ),
+            (
+                &["keyroostctl", "molto", "title", "--slot", "1", "S3CRET"],
+                "`keyroostctl molto title` is now `keyroostctl molto title set`",
+            ),
+            (
+                &["keyroostctl", "molto", "customer-key", "--yes"],
+                "`keyroostctl molto customer-key` is now `keyroostctl molto customer-key change`",
+            ),
+            (
+                &["keyroostctl", "fido", "pin", "min-length", "--length", "6"],
+                "`keyroostctl fido pin min-length` is now `keyroostctl fido pin min-length set`",
+            ),
+        ] {
+            let msg = hint(a).unwrap_or_else(|| panic!("{a:?}: no hint"));
+            assert!(msg.starts_with(want), "{a:?}: {msg}");
+            assert!(!msg.contains("S3CRET"), "{msg}");
+        }
+        // `molto title --slot N` alone still shows the title, and a typo'd
+        // flag there keeps clap's own message.
+        assert!(parse(&["keyroostctl", "molto", "title", "--slot", "1"]).is_ok());
+        assert!(hint(&["keyroostctl", "molto", "title", "--slott", "1"]).is_none());
+        // Help on the group is still help.
+        let e = parse(&["keyroostctl", "molto", "seed", "--help"])
+            .err()
+            .expect("help");
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     #[test]
@@ -20929,7 +21361,7 @@ mod cli_tests {
             let mut flags: Vec<&str> = cols[cols.len() - 2].split(' ').collect();
             let path: Vec<&str> = cols[0].split(' ').collect();
             if flags.len() > 2 {
-                // One command, several modes (`molto import --file` takes
+                // One command, several modes (`molto import --in` takes
                 // --password, `--slot` takes --uri): a row's pair is the
                 // flags its own extra args leave usable.
                 let mut base = vec!["keyroostctl"];
@@ -21003,8 +21435,8 @@ mod cli_tests {
         assert_eq!(
             covered,
             [
-                "molto seed",
-                "molto customer-key",
+                "molto seed set",
+                "molto customer-key change",
                 "molto import",
                 "fido pin change",
                 "oath add",
@@ -21090,7 +21522,7 @@ mod cli_tests {
         }
     }
 
-    /// `molto import --file --dry-run` never uses the customer key: it reads
+    /// `molto import --in --dry-run` never uses the customer key: it reads
     /// (and drops) it only to keep a piped password on stdin line 2, and
     /// never asks for it at a terminal.
     #[test]
@@ -21101,7 +21533,7 @@ mod cli_tests {
                 "keyroostctl",
                 "molto",
                 "import",
-                "--file",
+                "--in",
                 "v.json",
                 "--dry-run",
             ];
@@ -21929,7 +22361,7 @@ mod cli_tests {
     #[test]
     fn large_blob_subcommands_parse() {
         assert!(parse(&["keyroostctl", "fido", "blob", "list"]).is_ok());
-        assert!(parse(&["keyroostctl", "fido", "blob", "get", "0"]).is_ok());
+        assert!(parse(&["keyroostctl", "fido", "blob", "show", "0"]).is_ok());
         assert!(parse(&["keyroostctl", "fido", "blob", "add", "hi"]).is_ok());
         assert!(parse(&["keyroostctl", "fido", "blob", "edit", "1", "new"]).is_ok());
         assert!(parse(&["keyroostctl", "fido", "blob", "delete", "2", "--yes"]).is_ok());
@@ -22127,7 +22559,7 @@ mod cli_tests {
                 cmd:
                     OtpCmd::Delete { yes, .. }
                     | OtpCmd::Button {
-                        cmd: OtpButtonCmd::Set { yes, .. } | OtpButtonCmd::Delete { yes },
+                        cmd: OtpButtonCmd::Set { yes, .. } | OtpButtonCmd::Clear { yes },
                     },
                 ..
             } => yes,
@@ -22142,13 +22574,23 @@ mod cli_tests {
             } => yes,
             Cmd::Molto {
                 cmd:
-                    MoltoCmd::Seed { yes, .. }
+                    MoltoCmd::Seed {
+                        cmd: MoltoSeedCmd::Set { yes, .. },
+                    }
                     | MoltoCmd::Import { yes, .. }
-                    | MoltoCmd::CustomerKey { yes, .. },
+                    | MoltoCmd::CustomerKey {
+                        cmd: MoltoCustomerKeyCmd::Change { yes, .. },
+                    },
                 ..
             } => yes,
             Cmd::Prog {
-                cmd: ProgCmd::Seed { yes, .. } | ProgCmd::Config { yes, .. },
+                cmd:
+                    ProgCmd::Seed {
+                        cmd: ProgSeedCmd::Set { yes, .. },
+                    }
+                    | ProgCmd::Config {
+                        cmd: ProgConfigCmd::Set { yes, .. },
+                    },
             } => yes,
             _ => return None,
         };
@@ -22158,8 +22600,14 @@ mod cli_tests {
     #[test]
     fn customer_key_has_yes() {
         for (a, want) in [
-            (&["keyroostctl", "molto", "customer-key"][..], false),
-            (&["keyroostctl", "molto", "customer-key", "--yes"], true),
+            (
+                &["keyroostctl", "molto", "customer-key", "change"][..],
+                false,
+            ),
+            (
+                &["keyroostctl", "molto", "customer-key", "change", "--yes"],
+                true,
+            ),
         ] {
             let cli = parse(a).unwrap();
             assert_eq!(confirm_yes(&cli), Some(want), "{a:?}");
@@ -22342,13 +22790,14 @@ mod cli_tests {
             &["keyroostctl", "oath", "delete", "x"],
             &["keyroostctl", "otp", "delete", "--account", "a"],
             &["keyroostctl", "otp", "button", "set", "--seed", "stdin"],
-            &["keyroostctl", "otp", "button", "delete"],
-            &["keyroostctl", "fido", "credential", "delete", "--id", "00"],
-            &["keyroostctl", "fido", "fingerprint", "delete", "--id", "00"],
+            &["keyroostctl", "otp", "button", "clear"],
+            &["keyroostctl", "fido", "credential", "delete", "00"],
+            &["keyroostctl", "fido", "fingerprint", "delete", "00"],
             &[
                 "keyroostctl",
                 "molto",
                 "seed",
+                "set",
                 "--slot",
                 "99",
                 "--seed",
@@ -22363,9 +22812,9 @@ mod cli_tests {
                 "--uri",
                 "stdin",
             ],
-            &["keyroostctl", "molto", "import", "--file", "f.json"],
-            &["keyroostctl", "prog", "seed", "--seed", "stdin"],
-            &["keyroostctl", "prog", "config"],
+            &["keyroostctl", "molto", "import", "--in", "f.json"],
+            &["keyroostctl", "prog", "seed", "set", "--seed", "stdin"],
+            &["keyroostctl", "prog", "config", "set"],
         ] {
             let without = parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
             assert_eq!(confirm_yes(&without), Some(false), "{args:?}");
@@ -22388,15 +22837,12 @@ mod cli_tests {
                     "molto",
                     "import",
                     "--dry-run",
-                    "--file",
+                    "--in",
                     "x.json",
                 ],
                 Some("molto import --dry-run"),
             ),
-            (
-                &["keyroostctl", "molto", "import", "--file", "x.json"],
-                None,
-            ),
+            (&["keyroostctl", "molto", "import", "--in", "x.json"], None),
             (&["keyroostctl", "list"], None),
             (&["keyroostctl", "name", "set", "x"], None),
             (&["keyroostctl", "name", "clear"], None),
