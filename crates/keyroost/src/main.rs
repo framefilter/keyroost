@@ -21075,7 +21075,7 @@ impl App {
             let mut open = self.import_dialog.open;
             let mut should_apply = false;
             let mut cancel_clicked = false;
-            egui::Window::new(format!("Import to profile #{:02}", self.slot))
+            egui::Window::new(format!("Import to slot #{:02}", self.slot))
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
@@ -21314,7 +21314,7 @@ mod tests {
         assert_eq!(d.password, "hunter2");
     }
 
-    /// Issue #170, same bug: Cancel in the "Import to profile" dialog.
+    /// Issue #170, same bug: Cancel in the "Import to slot" dialog.
     #[test]
     fn import_dialog_cancel_and_x_close_and_wipe_uri() {
         for (window_open, cancel) in [(true, true), (false, false)] {
