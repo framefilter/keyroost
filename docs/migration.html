@@ -521,7 +521,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
       <tr><td><code>keyroostctl fido large-blob</code></td><td><code>keyroostctl fido blob</code>; same subcommands, except <code>get</code></td></tr>
       <tr><td><code>keyroostctl fido large-blob get INDEX</code></td><td><code>keyroostctl fido blob show INDEX</code></td></tr>
       <tr><td><code>keyroostctl fido ssh-cert list</code></td><td><code>keyroostctl fido ssh list</code></td></tr>
-      <tr><td><code>keyroostctl fido ssh-cert extract</code></td><td><code>keyroostctl fido ssh export</code></tr>
+      <tr><td><code>keyroostctl fido ssh-cert extract</code></td><td><code>keyroostctl fido ssh export</code></td></tr>
       <tr><td><code>keyroostctl piv status</code></td><td><code>keyroostctl piv info</code></td></tr>
       <tr><td><code>keyroostctl piv change-pin</code></td><td><code>keyroostctl piv pin change</code></td></tr>
       <tr><td><code>keyroostctl piv unblock-pin</code></td><td><code>keyroostctl piv pin unblock</code></td></tr>
@@ -1093,10 +1093,13 @@ keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
       alias would recreate the exact collision the rename fixes.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Watch out</div>
-      <p>Under the fingerprint subcommands, <code>--name</code> still parses — it means the
-        fingerprint's <em>label</em>, not the device. A script that passes the old global
-        spelling there won't error; it will name the fingerprint instead. Everywhere else
-        the old spelling fails loudly with an "unexpected argument" error.</p>
+      <p>From v0.7.5 to v0.12.x, <code>--name</code> under the fingerprint subcommands
+        still parsed — it meant the fingerprint's <em>label</em>, not the device, so a
+        script that passed the old global spelling there didn't error; it named the
+        fingerprint instead. Since v0.13.0 <code>--name</code> is refused there too (the
+        fingerprint's name is an argument: <code>fido fingerprint add NAME</code>).
+        Everywhere else the old spelling fails loudly with an "unexpected argument"
+        error.</p>
     </div>
 
     <h3>OATH: partial listings are now reported</h3>
