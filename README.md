@@ -501,6 +501,9 @@ chmod +x keyroost-x86_64.AppImage
 ./keyroost-x86_64.AppImage --appimage-extract-and-run
 ```
 
+The AppImage is GPG-signed (key fingerprint `F9E0 4EED 9DC5 DC94 AB2E 6100 6C81 DC35 3794 478B`); see
+[SECURITY.md → Verifying the AppImage](SECURITY.md#verifying-the-appimage).
+
 > **Uses the host's pcsc-lite.** The AppImage always prefers the host's
 > pcsc-lite client library, so the smart-card client matches the host's `pcscd`
 > daemon; smart cards need `pcscd` installed (see

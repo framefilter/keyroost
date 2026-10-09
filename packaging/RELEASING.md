@@ -55,6 +55,12 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       Packaging pulls from upstreams that drift on their own schedule — the
       v0.7.3 flatpak broke at release time because an upstream source was
       pruned. Probes catch that; release runs must not.
+      Approving a probe releases the AppImage signing key to the dispatched
+      branch's code: check which branch it is before approving.
+      The AppImage job signs on probes too: its "Verify AppImage signature"
+      step must be green, and the job fails outright if the
+      `APPIMAGE_GPG_KEY` environment secrets or the committed
+      `packaging/appimage/keyroost-appimage-signing.asc` are missing.
 - [ ] **Packaged-crate asset check** (one command):
       `packaging/check-packaged-assets.sh`
       Every file a crate *references* (`include_str!`, `include_bytes!`,
@@ -188,6 +194,15 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       `SHA256SUMS`, `keyroost-x86_64.AppImage` (+ `.sha256`, `.zsync`),
       `keyroost.flatpak` (+ `.sha256`). Check:
       `gh release view vX.Y.Z --json assets --jq '[.assets[].name]'`
+- [ ] The AppImage job's "Verify AppImage signature" step is green (it
+      runs before the attestation, so a red guard means nothing was
+      attached).
+- [ ] **First signed release only** (the first release after the switch
+      from unsigned AppImages): the release notes tell AppImageUpdate /
+      AppImageLauncher users to download this AppImage by hand once, since
+      an unsigned installed AppImage refuses the update to a signed one.
+      The same line is needed after any signing-key change (SECURITY.md,
+      rotation).
 
 ## 4. Fanout (publish.yml)
 
@@ -290,6 +305,11 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       must print `X-AppImage-Version=X.Y.Z`. This is what AppImage managers
       (Gear Lever et al.) display; it comes from the `VERSION` export in
       `build-appimage.sh` (#98).
+- [ ] The downloaded AppImage verifies against the published key: from a
+      checkout of the tag,
+      `bash packaging/appimage/verify-appimage-signature.sh keyroost-x86_64.AppImage`
+      prints `OK` with the fingerprint in SECURITY.md (AppImageUpdate's
+      `validate-x86_64.AppImage` must print the same fingerprint).
 - [ ] Close/comment the issues the release fixes (drafts usually prepared
       during the work); announcement if any.
 - [ ] Out-of-band corrections later (metadata fixes, asset re-attach): use the

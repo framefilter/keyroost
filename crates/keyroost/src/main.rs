@@ -3687,6 +3687,118 @@ struct BulkDialog {
     password: String,
     /// True once the loader has seen an encrypted vault at the current path.
     needs_password: bool,
+    /// The last Authenticate attempt failed (cleared on success and on close).
+    auth_failed: bool,
+}
+
+impl ImportDialog {
+    /// Settle the dialog's open state after its window was drawn this frame.
+    /// `window_open` is the copy egui's `[X]` close wrote to; `cancel_clicked` is the
+    /// in-window Cancel button. A button must never write `open` directly from
+    /// inside the window closure: the write-back of the stale `window_open`
+    /// copy would undo it in the same frame (issue #170).
+    fn settle_open(&mut self, window_open: bool, cancel_clicked: bool) {
+        if self.open && !(window_open && !cancel_clicked) {
+            self.close();
+        }
+    }
+
+    /// Close the dialog and wipe the pasted URI, which carries the seed.
+    fn close(&mut self) {
+        self.open = false;
+        wipe(&mut self.uri);
+    }
+}
+
+impl BulkDialog {
+    /// Settle the dialog's open state after its window was drawn this frame.
+    /// `window_open` is the copy egui's `[X]` close wrote to; `close_clicked` is the
+    /// in-window Close button, recorded as a flag because a direct write from
+    /// inside the window closure is undone by the write-back of the stale
+    /// `window_open` copy (issue #170).
+    fn settle_open(&mut self, window_open: bool, close_clicked: bool) {
+        if self.open && !(window_open && !close_clicked) {
+            self.close();
+        }
+    }
+
+    /// Close the dialog by any route and wipe the typed vault password, which
+    /// may have been kept live after a decrypt error to allow a retry.
+    fn close(&mut self) {
+        self.open = false;
+        wipe(&mut self.password);
+        // Parsed entries carry seeds; dropping them zeroizes them.
+        self.entries.clear();
+        self.auth_failed = false;
+    }
+}
+
+/// Why "Program all" in the bulk import dialog is disabled, if it is. The
+/// dialog shows exactly one of these so the button is never gray without a
+/// reason (issue #170).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkBlock {
+    /// The import file is still being read or decrypted.
+    Loading,
+    /// No Molto2 is connected and selected.
+    NoMolto,
+    /// The Molto2 has not been unlocked with its customer key.
+    NotUnlocked,
+    /// The entries run past slot #99; `fit` of `count` fit from `start`.
+    TooMany { start: u8, count: usize, fit: usize },
+}
+
+impl BulkBlock {
+    /// The first reason "Program all" can't run, in the order the user has
+    /// to fix them, or `None` when it can.
+    fn find(
+        loading: bool,
+        molto_selected: bool,
+        unlocked: bool,
+        start: u8,
+        count: usize,
+    ) -> Option<Self> {
+        let fit = (PROFILES as usize).saturating_sub(start as usize);
+        if loading {
+            Some(Self::Loading)
+        } else if !molto_selected {
+            Some(Self::NoMolto)
+        } else if !unlocked {
+            Some(Self::NotUnlocked)
+        } else if count > fit {
+            Some(Self::TooMany { start, count, fit })
+        } else {
+            None
+        }
+    }
+
+    /// The one plain line shown under the buttons and as the disabled
+    /// button's hover text.
+    fn message(self) -> String {
+        match self {
+            Self::Loading => "Still reading the file.".to_owned(),
+            Self::NoMolto => {
+                "No Molto2 selected. Connect one and select it in the list on the left.".to_owned()
+            }
+            Self::NotUnlocked => "The Molto2 is not unlocked yet. Click Authenticate \
+                 (uses the customer key from the Molto2 view; blank = factory default)."
+                .to_owned(),
+            Self::TooMany { start, count, fit } => {
+                let verb = if fit == 1 { "fits" } else { "fit" };
+                let hint = if count <= PROFILES as usize {
+                    format!(
+                        "Start at slot #{:02} or earlier.",
+                        PROFILES as usize - count
+                    )
+                } else {
+                    format!("A Molto2 has {PROFILES} slots.")
+                };
+                format!(
+                    "Only {fit} of {count} entries {verb} between slot #{start:02} and #99. {hint}"
+                )
+            }
+        }
+    }
 }
 
 struct LogLine {
@@ -4026,14 +4138,19 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.authenticated = true;
+                        app.bulk_dialog.auth_failed = false;
                         app.log(Severity::Ok, "authenticated");
                     }
                     // The Display impl renders the tries-remaining count (or
                     // "unknown" when the card gave none).
                     Err(e @ TransportError::AuthFailed { .. }) => {
+                        app.bulk_dialog.auth_failed = true;
                         app.log(Severity::Err, e.to_string());
                     }
-                    Err(e) => app.log(Severity::Err, format!("auth failed: {}", e)),
+                    Err(e) => {
+                        app.bulk_dialog.auth_failed = true;
+                        app.log(Severity::Err, format!("auth failed: {}", e));
+                    }
                 }
             })
         });
@@ -4295,8 +4412,7 @@ impl App {
                 self.slot
             ),
         );
-        self.import_dialog.open = false;
-        self.import_dialog.uri.clear();
+        self.import_dialog.close();
     }
 
     fn factory_reset(&mut self) {
@@ -4579,7 +4695,7 @@ impl App {
                     app.slot_meta = Some(m);
                 }
                 if fail == 0 {
-                    app.bulk_dialog.open = false;
+                    app.bulk_dialog.close();
                 }
             })
         });
@@ -20804,11 +20920,13 @@ impl App {
 
     /// The Molto2 import dialogs (otpauth:// + bulk). Reused verbatim from the
     /// original Molto2 view; only the entry point changed.
-    fn molto_dialogs(&mut self, ctx: &egui::Context, _p: &Palette) {
+    fn molto_dialogs(&mut self, ctx: &egui::Context, p: &Palette) {
         if self.bulk_dialog.open {
             let mut open = self.bulk_dialog.open;
             let mut do_load = false;
             let mut do_apply = false;
+            let mut do_auth = false;
+            let mut close_clicked = false;
             egui::Window::new("Bulk import")
                 .open(&mut open)
                 .collapsible(false)
@@ -20844,7 +20962,7 @@ impl App {
                                 ui.label(label.as_str());
                             }
                         }
-                        ui.label("Start at profile:");
+                        ui.label("Start at slot:");
                         ui.add(
                             egui::DragValue::new(&mut self.bulk_dialog.start)
                                 .clamp_existing_to_range(true)
@@ -20912,30 +21030,54 @@ impl App {
                                     ));
                                 }
                             });
+                        // Block programming while a load is in flight so a
+                        // stale entry list can't be written mid-replace, and
+                        // name the one reason whenever the button is gray.
+                        let blocked = BulkBlock::find(
+                            self.import_busy(),
+                            self.molto_session_usable(),
+                            self.authenticated,
+                            self.bulk_dialog.start,
+                            self.bulk_dialog.entries.len(),
+                        );
                         ui.horizontal(|ui| {
-                            // Block programming while a load is in flight so a
-                            // stale entry list can't be written mid-replace.
-                            let can_apply = self.authenticated && !self.import_busy();
-                            if ui
-                                .add_enabled(can_apply, egui::Button::new("Program all"))
-                                .on_hover_text("Write seed, title, and config for every entry")
-                                .clicked()
-                            {
+                            let resp = ui
+                                .add_enabled(blocked.is_none(), egui::Button::new("Program all"))
+                                .on_hover_text("Write seed, title, and config for every entry");
+                            let resp = match blocked {
+                                Some(b) => resp.on_disabled_hover_text(b.message()),
+                                None => resp,
+                            };
+                            if resp.clicked() {
                                 do_apply = true;
                             }
                             if ui.button("Close").clicked() {
-                                self.bulk_dialog.open = false;
+                                close_clicked = true;
+                            }
+                            if blocked == Some(BulkBlock::NotUnlocked)
+                                && ui
+                                    .add_enabled(!self.busy(), egui::Button::new("Authenticate"))
+                                    .clicked()
+                            {
+                                do_auth = true;
                             }
                         });
+                        if let Some(b) = blocked {
+                            let msg = if b == BulkBlock::NotUnlocked && self.bulk_dialog.auth_failed
+                            {
+                                "Couldn't unlock the Molto2 \u{2014} check the customer key".to_owned()
+                            } else {
+                                b.message()
+                            };
+                            ui.colored_label(p.warn, msg);
+                        }
                     }
                 });
-            let was_open = self.bulk_dialog.open;
-            self.bulk_dialog.open = open;
-            // Scrub the typed vault password when the dialog closes (X button or
-            // programmatic close), so a password that survived a decrypt error
-            // — kept live to allow a retry — never lingers past the dialog.
-            if was_open && !open {
-                wipe(&mut self.bulk_dialog.password);
+            // Apply Close and [X] only now, after the window is drawn; either
+            // route wipes the typed vault password.
+            self.bulk_dialog.settle_open(open, close_clicked);
+            if do_auth {
+                self.authenticate();
             }
             if do_load {
                 self.bulk_load();
@@ -20948,7 +21090,8 @@ impl App {
         if self.import_dialog.open {
             let mut open = self.import_dialog.open;
             let mut should_apply = false;
-            egui::Window::new(format!("Import to profile #{:02}", self.slot))
+            let mut cancel_clicked = false;
+            egui::Window::new(format!("Import to slot #{:02}", self.slot))
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
@@ -20967,12 +21110,13 @@ impl App {
                             should_apply = true;
                         }
                         if ui.button("Cancel").clicked() {
-                            self.import_dialog.open = false;
-                            self.import_dialog.uri.clear();
+                            cancel_clicked = true;
                         }
                     });
                 });
-            self.import_dialog.open = open;
+            // Apply Cancel and [X] only now, after the window is drawn; either
+            // route wipes the pasted URI.
+            self.import_dialog.settle_open(open, cancel_clicked);
             if should_apply {
                 self.import_otpauth();
             }
@@ -21146,6 +21290,108 @@ mod tests {
         assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
         assert!(keyroost_keyring::config_path().unwrap().starts_with(&tmp));
         assert!(settings::config_path().unwrap().starts_with(&tmp));
+    }
+
+    /// Issue #170: the in-window Close button closes the bulk dialog even
+    /// though egui's [X] copy still says open, and wipes the vault password.
+    #[test]
+    fn bulk_dialog_close_button_wins_over_stale_open_copy() {
+        let mut d = BulkDialog {
+            open: true,
+            password: "hunter2".to_owned(),
+            ..Default::default()
+        };
+        d.settle_open(true, true);
+        assert!(!d.open);
+        assert!(d.password.is_empty());
+    }
+
+    #[test]
+    fn bulk_dialog_x_closes_and_wipes_password() {
+        let mut d = BulkDialog {
+            open: true,
+            password: "hunter2".to_owned(),
+            ..Default::default()
+        };
+        d.settle_open(false, false);
+        assert!(!d.open);
+        assert!(d.password.is_empty());
+    }
+
+    #[test]
+    fn bulk_dialog_stays_open_and_keeps_password_without_a_close() {
+        let mut d = BulkDialog {
+            open: true,
+            password: "hunter2".to_owned(),
+            ..Default::default()
+        };
+        d.settle_open(true, false);
+        assert!(d.open);
+        assert_eq!(d.password, "hunter2");
+    }
+
+    /// Issue #170, same bug: Cancel in the "Import to slot" dialog.
+    #[test]
+    fn import_dialog_cancel_and_x_close_and_wipe_uri() {
+        for (window_open, cancel) in [(true, true), (false, false)] {
+            let mut d = ImportDialog {
+                open: true,
+                uri: "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".to_owned(),
+            };
+            d.settle_open(window_open, cancel);
+            assert!(!d.open);
+            assert!(d.uri.is_empty());
+        }
+        let mut d = ImportDialog {
+            open: true,
+            uri: "otpauth://totp/x".to_owned(),
+        };
+        d.settle_open(true, false);
+        assert!(d.open);
+        assert!(!d.uri.is_empty());
+    }
+
+    #[test]
+    fn bulk_block_reports_reasons_in_fix_order() {
+        assert_eq!(
+            BulkBlock::find(true, false, false, 0, 1),
+            Some(BulkBlock::Loading)
+        );
+        assert_eq!(
+            BulkBlock::find(false, false, false, 0, 1),
+            Some(BulkBlock::NoMolto)
+        );
+        assert_eq!(
+            BulkBlock::find(false, true, false, 0, 1),
+            Some(BulkBlock::NotUnlocked)
+        );
+        assert_eq!(BulkBlock::find(false, true, true, 0, 1), None);
+    }
+
+    #[test]
+    fn bulk_block_too_many_counts_what_fits_before_slot_99() {
+        // #90..#99 is ten slots: ten entries fit, eleven do not.
+        assert_eq!(BulkBlock::find(false, true, true, 90, 10), None);
+        let b = BulkBlock::find(false, true, true, 90, 11).unwrap();
+        assert_eq!(
+            b,
+            BulkBlock::TooMany {
+                start: 90,
+                count: 11,
+                fit: 10
+            }
+        );
+        assert_eq!(
+            b.message(),
+            "Only 10 of 11 entries fit between slot #90 and #99. Start at slot #89 or earlier."
+        );
+        let one = BulkBlock::find(false, true, true, 99, 2).unwrap();
+        assert!(one.message().starts_with("Only 1 of 2 entries fits"));
+        let huge = BulkBlock::find(false, true, true, 0, 120).unwrap();
+        assert_eq!(
+            huge.message(),
+            "Only 100 of 120 entries fit between slot #00 and #99. A Molto2 has 100 slots."
+        );
     }
 
     /// A minimal `PivStatus` reporting just `fingerprint`/`version` — enough
