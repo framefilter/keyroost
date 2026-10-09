@@ -2202,6 +2202,10 @@ enum MoltoCmd {
     },
     /// Write a slot's TOTP seed.
     Seed {
+        /// Slot number, 0-99 (Token2 calls these profiles). Before or after
+        /// the action word (`-s 5 set` or `set -s 5`).
+        #[arg(long, short = 's', global = true, value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: Option<u8>,
         #[command(subcommand)]
         cmd: MoltoSeedCmd,
     },
@@ -2209,10 +2213,10 @@ enum MoltoCmd {
     /// `molto title set`.
     ///
     /// Showing needs no customer key.
-    #[command(subcommand_negates_reqs = true)]
     Title {
-        /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot, required = true)]
+        /// Slot number, 0-99 (Token2 calls these profiles). Before or after
+        /// the action word (`-s 5 set` or `set -s 5`).
+        #[arg(long, short = 's', global = true, value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: Option<u8>,
         #[command(subcommand)]
         cmd: Option<MoltoTitleCmd>,
@@ -2231,6 +2235,10 @@ enum MoltoCmd {
     },
     /// Set a slot's TOTP configuration.
     Config {
+        /// Slot number, 0-99 (Token2 calls these profiles). Before or after
+        /// the action word (`-s 5 set` or `set -s 5`).
+        #[arg(long, short = 's', global = true, value_name = "SLOT", value_parser = parse_molto_slot)]
+        slot: Option<u8>,
         #[command(subcommand)]
         cmd: MoltoConfigCmd,
     },
@@ -2343,9 +2351,6 @@ enum MoltoSeedCmd {
     /// env:NAME or --seed stdin, or a terminal asks for it (hidden);
     /// --encoding says how it is written (base32 unless --encoding hex).
     Set {
-        /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
-        slot: u8,
         /// The seed: env:NAME reads that environment variable, stdin reads
         /// one line (second line when --customer-key stdin is also given;
         /// hidden when typed at a terminal). With neither, a terminal asks.
@@ -2365,9 +2370,6 @@ enum MoltoSeedCmd {
 enum MoltoTitleCmd {
     /// Write a slot title (1..=12 ASCII characters), replacing the one there.
     Set {
-        /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
-        slot: u8,
         /// The new title.
         #[arg(value_parser = parse_molto_title)]
         title: String,
@@ -2379,9 +2381,6 @@ enum MoltoTitleCmd {
 enum MoltoConfigCmd {
     /// Set a slot's TOTP configuration (and seed the clock with the host's UTC time).
     Set {
-        /// Slot number, 0-99 (Token2 calls these profiles).
-        #[arg(long, short = 's', value_name = "SLOT", value_parser = parse_molto_slot)]
-        slot: u8,
         /// HMAC algorithm for the codes.
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
         algorithm: AlgoArg,
@@ -2646,7 +2645,8 @@ enum FidoFingerprintCmd {
     /// Enroll a new fingerprint. Touch the sensor repeatedly when prompted until
     /// capture completes.
     Add {
-        /// Optional friendly name to set on the new fingerprint once enrolled.
+        /// Optional friendly name to set on the new fingerprint once enrolled
+        /// (put `--` before a name that starts with `-`).
         #[arg(value_name = "NAME")]
         name: Option<String>,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
@@ -2663,7 +2663,7 @@ enum FidoFingerprintCmd {
         /// Fingerprint template ID, in hex (see `fido fingerprint list`).
         #[arg(value_name = "ID", value_parser = parse_hex_arg)]
         id: String,
-        /// New friendly name.
+        /// New friendly name (put `--` before a name that starts with `-`).
         #[arg(value_name = "NAME")]
         name: String,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
@@ -3507,6 +3507,7 @@ fn molto_validate<I: crate::secrets::SecretIo>(
     match cmd {
         MoltoCmd::Seed {
             cmd: MoltoSeedCmd::Set { seed, encoding, .. },
+            ..
         } => sec.check(seed_spec(*encoding), Source::from_flag(seed.as_ref()))?,
         MoltoCmd::CustomerKey {
             cmd:
@@ -3539,6 +3540,7 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
     Ok(match cmd {
         MoltoCmd::Seed {
             cmd: MoltoSeedCmd::Set { seed, encoding, .. },
+            ..
         } => {
             let text = sec.read(seed_spec(*encoding), Source::from_flag(seed.as_ref()))?;
             let seed = decode_seed(&text, *encoding)?;
@@ -3958,6 +3960,23 @@ fn otp_unlock_conflict(cmd: Option<&Cmd>) -> Option<&'static str> {
         }) if pin.is_some() => Some(
             "`--unlock fingerprint` takes no PIN; drop --pin, or use --unlock auto for a PIN fallback",
         ),
+        _ => None,
+    }
+}
+
+/// The usage mistake of a `molto seed`, `title` or `config` command
+/// without a slot. `--slot` is global to those groups (so it goes before or
+/// after the action word), and clap can't require a global flag, so it is
+/// checked straight after parsing, like [`otp_unlock_conflict`], and exits 2.
+fn molto_slot_missing(cmd: Option<&Cmd>) -> Option<&'static str> {
+    match cmd {
+        Some(Cmd::Molto {
+            cmd:
+                MoltoCmd::Seed { slot: None, .. }
+                | MoltoCmd::Title { slot: None, .. }
+                | MoltoCmd::Config { slot: None, .. },
+            ..
+        }) => Some("this command needs -s/--slot SLOT (0-99)"),
         _ => None,
     }
 }
@@ -5141,7 +5160,7 @@ fn retired_message(r: &RetiredCommand) -> String {
 /// The message for a parse error under a command that became a group
 /// (`molto seed --slot 1` is now `molto seed set --slot 1`), if `argv`
 /// names one of [`RETIRED_LEAVES`]. `word` is the unknown argument or
-/// subcommand clap reported, if any. A group that keeps arguments of its own
+/// subcommand clap reported, if any. A group that still works on its own
 /// (`molto title --slot N` shows the title) is only matched by a word that
 /// is no flag: a bad flag there is an ordinary mistake.
 fn retired_leaf_hint(word: Option<&str>, argv: &[String]) -> Option<String> {
@@ -5153,10 +5172,8 @@ fn retired_leaf_hint(word: Option<&str>, argv: &[String]) -> Option<String> {
     let r = RETIRED_LEAVES
         .iter()
         .find(|r| format!("{} {}", r.parent, r.old).trim_start() == path)?;
-    let own_args = cmd
-        .get_arguments()
-        .any(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"));
-    if own_args && word.is_none_or(|w| w.starts_with('-')) {
+    let works_alone = !cmd.is_subcommand_required_set();
+    if works_alone && word.is_none_or(|w| w.starts_with('-')) {
         return None;
     }
     Some(retired_message(r))
@@ -5538,6 +5555,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if let Some(msg) = otp_unlock_conflict(cli.command.as_ref())
+        .or_else(|| molto_slot_missing(cli.command.as_ref()))
         .or_else(|| name_clear_conflict(cli.command.as_ref(), cli.device.as_deref()))
     {
         eprintln!("error: {msg}");
@@ -5734,6 +5752,14 @@ fn run_molto(
     // Arguments and secret sources are checked before any file is read or
     // the token is touched (no seed source, an unset variable).
     molto_validate(cmd, key, &sec)?;
+    if matches!(
+        cmd,
+        MoltoCmd::Seed { slot: None, .. }
+            | MoltoCmd::Title { slot: None, .. }
+            | MoltoCmd::Config { slot: None, .. }
+    ) {
+        return Err("this command needs -s/--slot SLOT (0-99)".into());
+    }
 
     // --dry-run on bulk import doesn't need the device at all.
     if let MoltoCmd::Import {
@@ -6008,7 +6034,8 @@ fn run_molto(
     // The seed slots this command writes, and whether it may skip asking.
     let writes: Option<(Vec<u8>, bool)> = match cmd {
         MoltoCmd::Seed {
-            cmd: MoltoSeedCmd::Set { slot, yes, .. },
+            slot: Some(slot),
+            cmd: MoltoSeedCmd::Set { yes, .. },
         } => Some((vec![*slot], *yes)),
         MoltoCmd::Import {
             file: None,
@@ -6084,7 +6111,8 @@ fn run_molto(
         MoltoCmd::List { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Delete { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Seed {
-            cmd: MoltoSeedCmd::Set { slot, .. },
+            slot: Some(slot),
+            cmd: MoltoSeedCmd::Set { .. },
         } => {
             let MoltoInput::Seed(seed) = &input else {
                 unreachable!("read before authentication")
@@ -6093,17 +6121,22 @@ fn run_molto(
             println!("Seed written to slot #{}.", slot);
         }
         MoltoCmd::Title {
-            cmd: Some(MoltoTitleCmd::Set { slot, title }),
-            ..
+            slot: Some(slot),
+            cmd: Some(MoltoTitleCmd::Set { title }),
         } => {
             session.set_title(*slot, title)?;
             println!("Title set on slot #{}.", slot);
         }
+        MoltoCmd::Seed { slot: None, .. }
+        | MoltoCmd::Title { slot: None, .. }
+        | MoltoCmd::Config { slot: None, .. } => {
+            unreachable!("refused at the top of run_molto")
+        }
         MoltoCmd::Title { cmd: None, .. } => unreachable!("handled above before auth"),
         MoltoCmd::Config {
+            slot: Some(slot),
             cmd:
                 MoltoConfigCmd::Set {
-                    slot,
                     algorithm,
                     digits,
                     period,
@@ -15794,6 +15827,7 @@ mod cli_tests {
         assert_eq!(key.customer_key_encoding, KeyEncoding::Ascii);
         let MoltoCmd::Seed {
             cmd: MoltoSeedCmd::Set { encoding, .. },
+            ..
         } = &cmd
         else {
             panic!()
@@ -15829,6 +15863,7 @@ mod cli_tests {
             cmd:
                 MoltoCmd::Seed {
                     cmd: MoltoSeedCmd::Set { encoding, .. },
+                    ..
                 },
             ..
         }) = cli.command
@@ -19961,6 +19996,117 @@ mod cli_tests {
         }
     }
 
+    /// `--slot` on `molto seed|title|config` is one global flag: it goes
+    /// before or after the action word and lands in the same field, and
+    /// it's listed once in each help.
+    #[test]
+    fn molto_slot_goes_before_or_after_the_action_word() {
+        let slot_of = |a: &[&str]| -> Option<u8> {
+            let cli = parse(a).unwrap_or_else(|e| panic!("{a:?}: {e}"));
+            match cli.command {
+                Some(Cmd::Molto {
+                    cmd:
+                        MoltoCmd::Seed { slot, .. }
+                        | MoltoCmd::Title { slot, .. }
+                        | MoltoCmd::Config { slot, .. },
+                    ..
+                }) => slot,
+                _ => panic!("{a:?}: not a slot command"),
+            }
+        };
+        for (before, after) in [
+            (
+                &["keyroostctl", "molto", "title", "-s", "5", "set", "NAME"][..],
+                &["keyroostctl", "molto", "title", "set", "-s", "5", "NAME"][..],
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "seed",
+                    "--slot",
+                    "5",
+                    "set",
+                    "--yes",
+                ],
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "seed",
+                    "set",
+                    "--slot",
+                    "5",
+                    "--yes",
+                ],
+            ),
+            (
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "config",
+                    "-s",
+                    "5",
+                    "set",
+                    "--period",
+                    "60",
+                ],
+                &[
+                    "keyroostctl",
+                    "molto",
+                    "config",
+                    "set",
+                    "--period",
+                    "60",
+                    "-s",
+                    "5",
+                ],
+            ),
+        ] {
+            assert_eq!(slot_of(before), Some(5), "{before:?}");
+            assert_eq!(slot_of(after), Some(5), "{after:?}");
+        }
+        match parse(&["keyroostctl", "molto", "title", "-s", "5", "set", "NAME"])
+            .unwrap()
+            .command
+        {
+            Some(Cmd::Molto {
+                cmd:
+                    MoltoCmd::Title {
+                        cmd: Some(MoltoTitleCmd::Set { title }),
+                        ..
+                    },
+                ..
+            }) => assert_eq!(title, "NAME"),
+            _ => panic!("expected molto title set"),
+        }
+        // Showing: the slot on the group alone.
+        assert_eq!(
+            slot_of(&["keyroostctl", "molto", "title", "-s", "7"]),
+            Some(7)
+        );
+        // Without a slot, parsing succeeds and the post-parse check refuses.
+        for a in [
+            &["keyroostctl", "molto", "title"][..],
+            &["keyroostctl", "molto", "title", "set", "NAME"],
+            &["keyroostctl", "molto", "seed", "set"],
+            &["keyroostctl", "molto", "config", "set"],
+        ] {
+            let cli = parse(a).unwrap_or_else(|e| panic!("{a:?}: {e}"));
+            assert!(molto_slot_missing(cli.command.as_ref()).is_some(), "{a:?}");
+        }
+        let cli = parse(&["keyroostctl", "molto", "seed", "set", "-s", "1"]).unwrap();
+        assert!(molto_slot_missing(cli.command.as_ref()).is_none());
+        // One help line for --slot on the action word, not two.
+        for path in [
+            ["molto", "seed", "set"],
+            ["molto", "title", "set"],
+            ["molto", "config", "set"],
+        ] {
+            let help = find(&path).render_help().to_string();
+            assert_eq!(help.matches("--slot <SLOT>").count(), 1, "{path:?}: {help}");
+        }
+    }
+
     /// A command that became a group names its replacement for its old
     /// arguments, never repeating them; the group's own use and help stay.
     #[test]
@@ -22576,6 +22722,7 @@ mod cli_tests {
                 cmd:
                     MoltoCmd::Seed {
                         cmd: MoltoSeedCmd::Set { yes, .. },
+                        ..
                     }
                     | MoltoCmd::Import { yes, .. }
                     | MoltoCmd::CustomerKey {
