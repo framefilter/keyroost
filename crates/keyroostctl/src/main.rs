@@ -2202,8 +2202,8 @@ enum MoltoCmd {
     },
     /// Write a slot's TOTP seed.
     Seed {
-        /// Slot number, 0-99 (Token2 calls these profiles). Before or after
-        /// the action word (`-s 5 set` or `set -s 5`).
+        /// Slot number, 0-99 (Token2 calls these profiles). Required. Goes
+        /// before or after the action word (`-s 5 set` or `set -s 5`).
         #[arg(long, short = 's', global = true, value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: Option<u8>,
         #[command(subcommand)]
@@ -2213,9 +2213,13 @@ enum MoltoCmd {
     /// `molto title set`.
     ///
     /// Showing needs no customer key.
+    #[command(
+        override_usage = "keyroostctl molto title -s <SLOT> [OPTIONS]\n       \
+                                keyroostctl molto title set -s <SLOT> [OPTIONS] <TITLE>"
+    )]
     Title {
-        /// Slot number, 0-99 (Token2 calls these profiles). Before or after
-        /// the action word (`-s 5 set` or `set -s 5`).
+        /// Slot number, 0-99 (Token2 calls these profiles). Required. Goes
+        /// before or after the action word (`-s 5 set` or `set -s 5`).
         #[arg(long, short = 's', global = true, value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: Option<u8>,
         #[command(subcommand)]
@@ -2235,8 +2239,8 @@ enum MoltoCmd {
     },
     /// Set a slot's TOTP configuration.
     Config {
-        /// Slot number, 0-99 (Token2 calls these profiles). Before or after
-        /// the action word (`-s 5 set` or `set -s 5`).
+        /// Slot number, 0-99 (Token2 calls these profiles). Required. Goes
+        /// before or after the action word (`-s 5 set` or `set -s 5`).
         #[arg(long, short = 's', global = true, value_name = "SLOT", value_parser = parse_molto_slot)]
         slot: Option<u8>,
         #[command(subcommand)]
@@ -2350,6 +2354,7 @@ enum MoltoSeedCmd {
     /// Asks only when the slot is occupied. The seed comes from --seed
     /// env:NAME or --seed stdin, or a terminal asks for it (hidden);
     /// --encoding says how it is written (base32 unless --encoding hex).
+    #[command(override_usage = "keyroostctl molto seed set -s <SLOT> [OPTIONS]")]
     Set {
         /// The seed: env:NAME reads that environment variable, stdin reads
         /// one line (second line when --customer-key stdin is also given;
@@ -2369,6 +2374,7 @@ enum MoltoSeedCmd {
 #[derive(Subcommand)]
 enum MoltoTitleCmd {
     /// Write a slot title (1..=12 ASCII characters), replacing the one there.
+    #[command(override_usage = "keyroostctl molto title set -s <SLOT> [OPTIONS] <TITLE>")]
     Set {
         /// The new title.
         #[arg(value_parser = parse_molto_title)]
@@ -2380,6 +2386,7 @@ enum MoltoTitleCmd {
 #[derive(Subcommand)]
 enum MoltoConfigCmd {
     /// Set a slot's TOTP configuration (and seed the clock with the host's UTC time).
+    #[command(override_usage = "keyroostctl molto config set -s <SLOT> [OPTIONS]")]
     Set {
         /// HMAC algorithm for the codes.
         #[arg(long, value_enum, default_value_t = AlgoArg::Sha1)]
@@ -3970,15 +3977,20 @@ fn otp_unlock_conflict(cmd: Option<&Cmd>) -> Option<&'static str> {
 /// checked straight after parsing, like [`otp_unlock_conflict`], and exits 2.
 fn molto_slot_missing(cmd: Option<&Cmd>) -> Option<&'static str> {
     match cmd {
-        Some(Cmd::Molto {
-            cmd:
-                MoltoCmd::Seed { slot: None, .. }
-                | MoltoCmd::Title { slot: None, .. }
-                | MoltoCmd::Config { slot: None, .. },
-            ..
-        }) => Some("this command needs -s/--slot SLOT (0-99)"),
+        Some(Cmd::Molto { cmd, .. }) => molto_cmd_slot_missing(cmd),
         _ => None,
     }
+}
+
+/// [`molto_slot_missing`] for a `molto` subcommand.
+fn molto_cmd_slot_missing(cmd: &MoltoCmd) -> Option<&'static str> {
+    matches!(
+        cmd,
+        MoltoCmd::Seed { slot: None, .. }
+            | MoltoCmd::Title { slot: None, .. }
+            | MoltoCmd::Config { slot: None, .. }
+    )
+    .then_some("this command needs -s/--slot SLOT (0-99)")
 }
 
 /// The usage mistake in `-d KEY name clear NAME`: the name and the key
@@ -5163,11 +5175,16 @@ fn retired_message(r: &RetiredCommand) -> String {
 /// subcommand clap reported, if any. A group that still works on its own
 /// (`molto title --slot N` shows the title) is only matched by a word that
 /// is no flag: a bad flag there is an ordinary mistake.
+///
+/// A v0.12 line often has retired flags too (`molto seed -p 5 --hex-env
+/// V`): their hints, for the command under the group, follow in the same
+/// message, so one run shows every change. Only table text and flag names
+/// from the table are used.
 fn retired_leaf_hint(word: Option<&str>, argv: &[String]) -> Option<String> {
     use clap::CommandFactory;
     let mut root = Cli::command();
     root.build();
-    let (path, cmd) = walk_argv(&root, argv);
+    let (path, cmd, end) = walk_argv_at(&root, argv);
     let path = path.join(" ");
     let r = RETIRED_LEAVES
         .iter()
@@ -5176,7 +5193,42 @@ fn retired_leaf_hint(word: Option<&str>, argv: &[String]) -> Option<String> {
     if works_alone && word.is_none_or(|w| w.starts_with('-')) {
         return None;
     }
-    Some(retired_message(r))
+    // argv as it would be under the new command: the action word(s)
+    // inserted right after the old path.
+    let extra = r
+        .new
+        .strip_prefix(path.as_str())
+        .unwrap_or_default()
+        .trim_start();
+    let mut new_argv: Vec<String> = argv[..end].to_vec();
+    new_argv.extend(extra.split(' ').filter(|w| !w.is_empty()).map(String::from));
+    new_argv.extend_from_slice(&argv[end..]);
+    let target = command_in_argv(&new_argv);
+    let mut msgs = vec![retired_message(r)];
+    for w in &argv[end..] {
+        if w == "--" {
+            break;
+        }
+        let flag = w.split('=').next().unwrap_or_default();
+        if !flag.starts_with('-') || flag.len() < 2 {
+            continue;
+        }
+        let known = target
+            .get_arguments()
+            .any(|a| match flag.strip_prefix("--") {
+                Some(long) => a.get_long() == Some(long),
+                None => flag.len() == 2 && a.get_short() == flag.chars().nth(1),
+            });
+        if known {
+            continue;
+        }
+        if let Some(m) = retired_flag_hint(flag, &new_argv) {
+            if !msgs.contains(&m) {
+                msgs.push(m);
+            }
+        }
+    }
+    Some(msgs.join("; "))
 }
 
 /// The deepest command `argv` names, built.
@@ -5191,10 +5243,21 @@ fn command_in_argv(argv: &[String]) -> clap::Command {
 /// Walk `argv` down `root`'s tree: the subcommand path and the deepest
 /// command, skipping the value of every flag that takes one.
 fn walk_argv<'c>(root: &'c clap::Command, argv: &[String]) -> (Vec<&'c str>, &'c clap::Command) {
+    let (path, cmd, _) = walk_argv_at(root, argv);
+    (path, cmd)
+}
+
+/// [`walk_argv`], plus the index in `argv` just after the last subcommand
+/// word.
+fn walk_argv_at<'c>(
+    root: &'c clap::Command,
+    argv: &[String],
+) -> (Vec<&'c str>, &'c clap::Command, usize) {
     let mut cmd = root;
     let mut path: Vec<&str> = Vec::new();
-    let mut words = argv.iter().skip(1);
-    while let Some(word) = words.next() {
+    let mut end = argv.len().min(1);
+    let mut words = argv.iter().enumerate().skip(1);
+    while let Some((i, word)) = words.next() {
         if word == "--" {
             break;
         }
@@ -5207,6 +5270,19 @@ fn walk_argv<'c>(root: &'c clap::Command, argv: &[String]) -> (Vec<&'c str>, &'c
             }
             continue;
         }
+        if let Some(short) = word
+            .strip_prefix('-')
+            .and_then(|s| s.chars().next().filter(|_| s.chars().count() == 1))
+        {
+            // `-s 5`: the value is the next word. A glued `-s5` has none.
+            let takes_value = cmd
+                .get_arguments()
+                .any(|a| a.get_short() == Some(short) && a.get_action().takes_values());
+            if takes_value {
+                words.next();
+            }
+            continue;
+        }
         if word.starts_with('-') {
             continue;
         }
@@ -5214,11 +5290,12 @@ fn walk_argv<'c>(root: &'c clap::Command, argv: &[String]) -> (Vec<&'c str>, &'c
             Some(sub) => {
                 path.push(sub.get_name());
                 cmd = sub;
+                end = i + 1;
             }
             None => break,
         }
     }
-    (path, cmd)
+    (path, cmd, end)
 }
 
 /// A friendly hint for a removed or renamed secret-bearing flag, or `None` if
@@ -5752,13 +5829,8 @@ fn run_molto(
     // Arguments and secret sources are checked before any file is read or
     // the token is touched (no seed source, an unset variable).
     molto_validate(cmd, key, &sec)?;
-    if matches!(
-        cmd,
-        MoltoCmd::Seed { slot: None, .. }
-            | MoltoCmd::Title { slot: None, .. }
-            | MoltoCmd::Config { slot: None, .. }
-    ) {
-        return Err("this command needs -s/--slot SLOT (0-99)".into());
+    if let Some(msg) = molto_cmd_slot_missing(cmd) {
+        return Err(msg.into());
     }
 
     // --dry-run on bulk import doesn't need the device at all.
@@ -20154,6 +20226,113 @@ mod cli_tests {
             .err()
             .expect("help");
         assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp);
+        // A valid new command with `-s N` before the action word and a typo
+        // gets clap's own error (its tip names the real flag), not the
+        // old-name hint: the walk skips a short flag's value.
+        for a in [
+            &[
+                "keyroostctl",
+                "molto",
+                "seed",
+                "-s",
+                "5",
+                "set",
+                "--encodng",
+                "hex",
+            ][..],
+            &[
+                "keyroostctl",
+                "molto",
+                "config",
+                "-s",
+                "5",
+                "set",
+                "--perod",
+                "60",
+            ],
+            &[
+                "keyroostctl",
+                "molto",
+                "title",
+                "-s",
+                "5",
+                "set",
+                "--bogus",
+                "NAME",
+            ],
+        ] {
+            assert_eq!(hint(a), None, "{a:?}");
+        }
+        // A global short flag's value before the group is skipped too, so the
+        // old form still gets the hint.
+        let msg = hint(&[
+            "keyroostctl",
+            "-d",
+            "k",
+            "molto",
+            "seed",
+            "--slot",
+            "1",
+            "--seed",
+            "stdin",
+        ])
+        .expect("hint");
+        assert!(msg.starts_with("`keyroostctl molto seed` is now"), "{msg}");
+    }
+
+    /// A v0.12 line with several renames gets them all in one message:
+    /// the command's, then each retired flag's, for the command under the
+    /// group. Nothing typed is repeated.
+    #[test]
+    fn retired_leaf_hint_also_names_retired_flags() {
+        let hint = |a: &[&str]| {
+            let e = parse(a).err().unwrap_or_else(|| panic!("{a:?} parsed"));
+            redacted_parse_error(&e, &argv(a)).unwrap_or_else(|| panic!("{a:?}: no hint"))
+        };
+        let msg = hint(&["keyroostctl", "molto", "seed", "-p", "5", "--hex", "S3CRET"]);
+        for want in [
+            "`keyroostctl molto seed` is now `keyroostctl molto seed set`",
+            "-p/--profile was renamed -s/--slot",
+            "--seed env:NAME --encoding hex",
+        ] {
+            assert!(msg.contains(want), "{want}: {msg}");
+        }
+        assert!(!msg.contains("S3CRET"), "{msg}");
+        let msg = hint(&[
+            "keyroostctl",
+            "molto",
+            "config",
+            "-p",
+            "5",
+            "--time-step",
+            "60",
+        ]);
+        assert!(
+            msg.contains("molto config set")
+                && msg.contains("--period")
+                && msg.contains("-s/--slot"),
+            "{msg}"
+        );
+        let msg = hint(&["keyroostctl", "molto", "customer-key", "--hex-stdin=S3CRET"]);
+        assert!(
+            msg.contains("molto customer-key change") && msg.contains("--new-customer-key stdin"),
+            "{msg}"
+        );
+        assert!(!msg.contains("S3CRET"), "{msg}");
+        // A flag the new command has is not reported.
+        let msg = hint(&[
+            "keyroostctl",
+            "molto",
+            "seed",
+            "--slot",
+            "1",
+            "--seed",
+            "stdin",
+        ]);
+        assert_eq!(
+            msg,
+            "`keyroostctl molto seed` is now `keyroostctl molto seed set`"
+        );
     }
 
     #[test]

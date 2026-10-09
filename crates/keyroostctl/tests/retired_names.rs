@@ -438,6 +438,14 @@ const CASES: &[(&[&str], &str)] = &[
         "keyroostctl molto list",
     ),
     (
+        &["molto", "seed", "-p", "5", "--hex", "S3CRETVALUE"],
+        "molto seed set`; -p/--profile was renamed -s/--slot",
+    ),
+    (
+        &["molto", "seed", "-p", "5", "--hex", "S3CRETVALUE"],
+        "--seed env:NAME --encoding hex",
+    ),
+    (
         &["molto", "seed", "--slot", "1", "--seed", "env:S3CRETVALUE"],
         "keyroostctl molto seed set",
     ),
