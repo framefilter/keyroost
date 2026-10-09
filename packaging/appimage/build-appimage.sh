@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build-appimage.sh — DRAFT. Build a keyroost (GUI) AppImage. NOT wired into CI.
+# build-appimage.sh — build a keyroost (GUI) AppImage; linux-bundles.yml runs it.
 # See ../LINUX-BUNDLES.md for the full design, caveats, and open decisions.
 #
 # What this produces: a single self-contained `keyroost-x86_64.AppImage` bundling
@@ -22,6 +22,21 @@
 #     or can run with:  ./keyroost-x86_64.AppImage --appimage-extract-and-run
 #     (TODO(maintainer): pin the appimagetool/runtime version and state the
 #      exact FUSE2-vs-FUSE3 story for it — this changed recently.)
+#
+# ENVIRONMENT (all optional; a plain `bash build-appimage.sh` builds an
+# unsigned AppImage exactly as before):
+#   KEYROOST_APPIMAGE_SKIP_CARGO=1
+#       Package only: skip `cargo build` and use the existing
+#       target/release/keyroost (fails if it is missing). CI builds the binary
+#       in its own step first, so dependency build scripts never run while the
+#       signing key is in a keyring.
+#   LDAI_SIGN=1  LDAI_SIGN_KEY=<fingerprint>
+#       Read by linuxdeploy-plugin-appimage, which passes `-s --sign-key` to
+#       its bundled appimagetool. appimagetool signs with the host `gpg`
+#       (honoring GNUPGHOME), embeds the signature and public key in the
+#       .sha256_sig / .sig_key sections, and only then writes the .zsync, so
+#       the .zsync describes the signed bytes. Never modify the AppImage after
+#       this script returns. verify-appimage-signature.sh checks the result.
 
 set -euo pipefail
 
@@ -56,10 +71,16 @@ export VERSION
 # ---------------------------------------------------------------------------
 # 1. Build the GUI binary (glibc, release). The CLI is intentionally NOT shipped
 #    as an AppImage — use the musl static CLI (../musl/) or the release tarball.
+#    With KEYROOST_APPIMAGE_SKIP_CARGO=1 the binary must already exist (built
+#    with the same command, as linux-bundles.yml does in a separate step).
 # ---------------------------------------------------------------------------
-echo ">> building keyroost (GUI) release binary"
-( cd "${REPO_ROOT}" && cargo build --release -p keyroost --features keyroost/qr )
 BIN="${REPO_ROOT}/target/release/keyroost"
+if [ "${KEYROOST_APPIMAGE_SKIP_CARGO:-}" = "1" ]; then
+  echo ">> KEYROOST_APPIMAGE_SKIP_CARGO=1: packaging the existing ${BIN}"
+else
+  echo ">> building keyroost (GUI) release binary"
+  ( cd "${REPO_ROOT}" && cargo build --release -p keyroost --features keyroost/qr )
+fi
 [ -x "${BIN}" ] || { echo "ERROR: ${BIN} not built"; exit 1; }
 
 # ---------------------------------------------------------------------------
@@ -209,6 +230,11 @@ export UPDATE_INFORMATION="gh-releases-zsync|framefilter|keyroost|latest|keyroos
 # stable `keyroost-x86_64.AppImage`. Pin the output name explicitly so the
 # version lives only in the desktop-file metadata.
 export LDAI_OUTPUT="keyroost-x86_64.AppImage"
+# Signing (see ENVIRONMENT at the top): appimagetool calls the host gpg.
+if [ -n "${LDAI_SIGN:-}" ]; then
+  command -v gpg >/dev/null || { echo "ERROR: LDAI_SIGN is set but gpg is not on PATH"; exit 1; }
+  echo ">> signing enabled (LDAI_SIGN): appimagetool signs before writing the .zsync"
+fi
 ./linuxdeploy-plugin-appimage.AppImage --appdir "${APPDIR}"
 
 # ---------------------------------------------------------------------------

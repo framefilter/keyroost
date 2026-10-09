@@ -51,6 +51,11 @@ name: Linux bundles (AppImage + Flatpak)
 #      see SECURITY.md "Release integrity"), so a CI bot can't push to it; this
 #      keeps the Learn site (this repo's docs/) untouched. When the token is unset, the
 #      OSTree publish skips cleanly (the .flatpak bundle still attaches).
+#   5. (REQUIRED) AppImage signing key: environment secrets APPIMAGE_GPG_KEY (the
+#      ASCII-armored PRIVATE key) and APPIMAGE_GPG_KEY_ID (its full fingerprint)
+#      on release-publish, plus the committed public key
+#      packaging/appimage/keyroost-appimage-signing.asc. Unlike the Flatpak key,
+#      a missing key FAILS the AppImage job (probes too).
 
 on:
   push:
@@ -141,14 +146,103 @@ jobs:
         with:
           toolchain: stable
 
-      # build-appimage.sh builds `keyroost` (release), fetches linuxdeploy +
-      # its appimage plugin, stages the AppDir, and emits keyroost-x86_64.AppImage
-      # into target/appimage/. APPIMAGE_EXTRACT_AND_RUN avoids needing FUSE for the
-      # tools themselves inside CI.
+      # The AppImage is GPG-signed with a dedicated key (SECURITY.md "Release
+      # integrity"). Once releases are signed, an unsigned one is refused by
+      # AppImageUpdate-based updaters (NO_LONGER_SIGNED), so a missing key or
+      # public key fails the run, probes included: probes exercise the same
+      # signing path a release takes. The committed public key is checked
+      # first, before the long compile.
+      - name: Check AppImage signing public key is committed
+        run: |
+          set -euo pipefail
+          pub=packaging/appimage/keyroost-appimage-signing.asc
+          if [ ! -s "${pub}" ]; then
+            echo "::error::${pub} is missing. The AppImage is signed and verified against this committed public key; see packaging/LINUX-BUNDLES.md (one-time setup, AppImage signing key)."
+            exit 1
+          fi
+
+      # The GUI binary is built in its own step, with no secret in the
+      # environment and no key in any keyring: `cargo build` runs dependency
+      # build scripts and proc-macros, which must never see the signing key.
+      - name: Build GUI binary
+        run: cargo build --release -p keyroost --features keyroost/qr
+
+      # Signing key = environment secrets on release-publish (this job's
+      # environment), exposed ONLY to this step through env:. GNUPGHOME is a
+      # per-run temp dir, set per step (not via GITHUB_ENV) so no later step
+      # inherits it. The imported key must be exactly the committed public
+      # key: a wrong secret fails here rather than shipping a key change.
+      - name: Import AppImage signing key
+        env:
+          APPIMAGE_GPG_KEY: ${{ secrets.APPIMAGE_GPG_KEY }}
+          APPIMAGE_GPG_KEY_ID: ${{ secrets.APPIMAGE_GPG_KEY_ID }}
+          GNUPGHOME: ${{ runner.temp }}/gnupg-appimage
+        run: |
+          set -euo pipefail
+          if [ -z "${APPIMAGE_GPG_KEY:-}" ] || [ -z "${APPIMAGE_GPG_KEY_ID:-}" ]; then
+            echo "::error::APPIMAGE_GPG_KEY / APPIMAGE_GPG_KEY_ID are not set on the release-publish environment. The AppImage must be signed (an unsigned release is refused by updaters once signed ones exist); see packaging/LINUX-BUNDLES.md (one-time setup)."
+            exit 1
+          fi
+          norm() { tr -d ' \n' | tr 'a-f' 'A-F'; }
+          want="$(printf '%s' "${APPIMAGE_GPG_KEY_ID}" | norm)"
+          pub=packaging/appimage/keyroost-appimage-signing.asc
+          [ -s "${pub}" ] || { echo "::error::${pub} is missing"; exit 1; }
+          rm -rf "${GNUPGHOME}"
+          mkdir -m 700 "${GNUPGHOME}"
+          committed="$(gpg --batch --with-colons --show-keys "${pub}" \
+            | awk -F: '$1 == "fpr" {print $10}')"
+          if [ "$(printf '%s\n' "${committed}" | grep -c .)" != "1" ]; then
+            echo "::error::${pub} must hold exactly one key with no subkeys"
+            exit 1
+          fi
+          printf '%s\n' "${APPIMAGE_GPG_KEY}" | gpg --batch --quiet --import
+          secret="$(gpg --batch --with-colons --list-secret-keys \
+            | awk -F: '$1 == "fpr" {print $10}')"
+          if [ "$(printf '%s\n' "${secret}" | grep -c .)" != "1" ]; then
+            echo "::error::APPIMAGE_GPG_KEY must hold exactly one secret key with no subkeys"
+            exit 1
+          fi
+          if [ "$(printf '%s' "${secret}" | norm)" != "${want}" ]; then
+            echo "::error::the key in APPIMAGE_GPG_KEY does not match APPIMAGE_GPG_KEY_ID"
+            exit 1
+          fi
+          if [ "$(printf '%s' "${committed}" | norm)" != "${want}" ]; then
+            echo "::error::the signing key does not match the committed ${pub}; a different key would be refused by updaters (KEY_CHANGED). See SECURITY.md before rotating."
+            exit 1
+          fi
+          echo "signing key imported and matches ${pub}"
+
+      # Packaging only (KEYROOST_APPIMAGE_SKIP_CARGO): fetches the pinned
+      # linuxdeploy + appimage plugin, stages the AppDir, and emits
+      # keyroost-x86_64.AppImage (+ .zsync) into target/appimage/. LDAI_SIGN /
+      # LDAI_SIGN_KEY make the plugin's appimagetool sign, which happens before
+      # it writes the .zsync. APPIMAGE_EXTRACT_AND_RUN avoids needing FUSE for
+      # the tools themselves inside CI. The key ID is passed through env: like
+      # any secret; the key itself is only in the temp keyring.
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
+          KEYROOST_APPIMAGE_SKIP_CARGO: '1'
+          LDAI_SIGN: '1'
+          LDAI_SIGN_KEY: ${{ secrets.APPIMAGE_GPG_KEY_ID }}
+          GNUPGHOME: ${{ runner.temp }}/gnupg-appimage
         run: bash packaging/appimage/build-appimage.sh
+
+      - name: Remove AppImage signing key
+        if: always()
+        env:
+          GNUPGHOME: ${{ runner.temp }}/gnupg-appimage
+        run: |
+          gpgconf --kill gpg-agent 2>/dev/null || true
+          rm -rf "${GNUPGHOME}"
+
+      # Guard: nothing is attested or uploaded unless the signature verifies
+      # against the COMMITTED public key alone, the update information is
+      # intact, and the .zsync describes the signed bytes. No secrets here.
+      - name: Verify AppImage signature
+        run: |
+          bash packaging/appimage/verify-appimage-signature.sh --require-zsync \
+            target/appimage/keyroost-x86_64.AppImage
 
       - name: Locate AppImage
         id: find
