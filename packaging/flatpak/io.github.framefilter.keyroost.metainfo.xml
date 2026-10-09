@@ -53,11 +53,11 @@
 
   <!-- Software centers and AppImage catalogs show these. Each <image> is a
        URL to a picture hosted on the Pages site (AppStream allows PNG, JPEG,
-       WebP or JXL; PNG is preferred). Refresh them with the v0.13.0 GUI
-       design pass. -->
+       WebP or JXL; PNG is preferred and what every software center reads).
+       Refresh them with the GUI design pass. -->
   <screenshots>
     <screenshot type="default">
-      <image>https://framefilter.github.io/keyroost/assets/screenshots/overview.webp</image>
+      <image>https://framefilter.github.io/keyroost/assets/screenshots/overview.png</image>
       <caption>The keyroost device view</caption>
     </screenshot>
   </screenshots>
