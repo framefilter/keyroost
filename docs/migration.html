@@ -84,6 +84,10 @@
       <a href="#v0-13-0-names">command and flag names</a> below).
       A key can now carry its own name, and <code>keys.json</code> no longer
       holds serials (see <a href="#v0-13-0-key-names">names</a> below).
+      Authenticator exports can now be imported into OATH keys and Token2
+      OTP storage as well as a Molto2, and <code>molto import --in</code>
+      follows the same rules (see <a href="#v0-13-0-import">importing
+      codes</a> below).
       Library consumers: <code>keyroost-resolve</code> drops its HID-only
       name resolver for the shared device model, and
       <code>keyroost-ctap</code>, <code>keyroost-keyring</code> and
@@ -168,8 +172,10 @@
       <tr><td><code>--device</code> was ignored by commands that touch no
           key</td>
         <td>Refused on <code>doctor</code>, <code>name list</code>,
-          <code>completions</code>, <code>manpage</code> and <code>molto
-          import --in … --dry-run</code>. Remove it. <code>name clear</code>
+          <code>completions</code> and <code>manpage</code>. Remove it.
+          (<code>molto import --in … --dry-run</code> now reads slot use
+          from the Molto2 it names; see <a href="#v0-13-0-import">importing
+          codes</a>.) <code>name clear</code>
           takes a NAME or <code>-d</code>, not both.</td></tr>
       <tr><td><code>completions &lt;shell&gt;</code> printed a full static
           script</td>
@@ -334,9 +340,15 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
       <tr><td><code>--new-mgmt-key-env VAR</code> / <code>--new-mgmt-key-stdin</code></td>
         <td><code>--new-mgmt-key env:VAR</code> / <code>--new-mgmt-key
           stdin</code></td></tr>
+      <tr><td><code>keyroostctl molto import-file FILE --password-env VAR</code> / <code>--password-stdin</code> (an encrypted Aegis export)</td>
+        <td><code>keyroostctl molto import --in FILE --file-password
+          env:VAR</code> / <code>--file-password stdin</code> (with
+          <code>--customer-key stdin</code> too, the customer key is line 1
+          and the export's password line 2)</td></tr>
       <tr><td><code>--password-env VAR</code> / <code>--password-stdin</code></td>
         <td><code>--password env:VAR</code> / <code>--password
-          stdin</code></td></tr>
+          stdin</code> (the key's password; an export file's password is
+          <code>--file-password</code>)</td></tr>
       <tr><td><code>--new-password-env VAR</code> / <code>--new-password-stdin</code></td>
         <td><code>--new-password env:VAR</code> / <code>--new-password
           stdin</code></td></tr>
@@ -566,7 +578,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
       <tr><td><code>keyroostctl otp fp-list</code></td><td><code>keyroostctl otp list --unlock fingerprint</code></td></tr>
       <tr><td><code>keyroostctl otp unlock-list</code></td><td><code>keyroostctl otp list --unlock auto</code>; <code>--pin-only</code> is <code>--unlock pin</code>, the default</td></tr>
       <tr><td><code>keyroostctl molto sync-time</code></td><td><code>keyroostctl molto sync</code></td></tr>
-      <tr><td><code>keyroostctl molto import-file</code></td><td><code>keyroostctl molto import --in FILE</code>; <code>--start</code> is <code>--slot</code> (the first slot to fill)</td></tr>
+      <tr><td><code>keyroostctl molto import-file</code></td><td><code>keyroostctl molto import --in FILE</code>; <code>--start</code> is <code>--slot</code> (the first slot to fill), and the export's password is <code>--file-password</code></td></tr>
       <tr><td><code>keyroostctl molto slots</code></td><td><code>keyroostctl molto list</code></td></tr>
       <tr><td><code>keyroostctl molto seed …</code></td><td><code>keyroostctl molto seed set …</code></td></tr>
       <tr><td><code>keyroostctl molto config …</code></td><td><code>keyroostctl molto config set …</code></td></tr>
@@ -588,7 +600,8 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
           values)</td></tr>
       <tr><td><code>keyroostctl molto import-file export.json --start 10</code></td>
         <td><code>keyroostctl molto import --in export.json --slot
-          10</code> (or <code>-i export.json</code>)</td></tr>
+          10</code> (or <code>-i export.json</code>; an encrypted export
+          adds <code>--file-password env:VAR</code>)</td></tr>
       <tr><td><code>keyroostctl piv import-cert --slot 9a --file cert.pem</code></td>
         <td><code>keyroostctl piv cert import --slot 9a --in cert.pem</code>
           (or <code>-i cert.pem</code>)</td></tr>
@@ -680,6 +693,63 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
         <td><code>keyroostctl openpgp info</code> (and its JSON
           <code>serial</code>) shows the full serial, read from the key's
           OTP applet like <code>piv info</code> does.</td></tr>
+    </table>
+    </div>
+    <h3 id="v0-13-0-import">Importing codes</h3>
+    <p>New: <code>oath import</code> and <code>otp import</code> add every
+      code in an authenticator export to a key, and the desktop app does
+      the same for every key that stores codes. <code>molto import
+      --in</code> now follows the same rules: it reads the key first, shows
+      what each entry becomes, skips what the key can't store, and asks once
+      before writing.</p>
+<pre><code>keyroostctl molto import -i export.json --slot 90 --dry-run   # check the new preview first</code></pre>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td>The Molto2 view's <strong>Bulk import…</strong> button opened
+          a Molto2-only dialog</td>
+        <td><strong>Import file…</strong> (or dropping a file on the
+          window) opens the <strong>Import authenticator codes</strong>
+          dialog, the same one used for every key that stores codes. A
+          certificate or key file gets a note saying where to import it
+          instead.</td></tr>
+      <tr><td><code>molto import --in</code> refused the whole file when one
+          entry couldn't be stored on a Molto2 (for example a SHA-512 code),
+          or when the entries didn't all fit before slot #99</td>
+        <td>That entry is skipped with the reason, the rest are written, and
+          entries past slot #99 are skipped.</td></tr>
+      <tr><td>An entry with no issuer or account left its slot empty</td>
+        <td>It is skipped without using up a slot, so the next entry takes
+          that slot. Check slot numbers in a script that relied on the
+          gap.</td></tr>
+      <tr><td><code>molto import --in</code> asked only when a target slot
+          was in use</td>
+        <td>It asks once whenever it will write anything. A script adds
+          <code>--yes</code>, as before.</td></tr>
+      <tr><td><code>molto import --in … --dry-run</code> printed
+          <code>Found N entries; would fill slots …</code>, touched no key,
+          and refused <code>--device</code></td>
+        <td>It prints the same preview as <code>oath import</code>, reads
+          which slots are in use from a connected Molto2 (no customer key
+          needed; it still works with none connected), and takes
+          <code>--device</code> / <code>--reader</code>.</td></tr>
+      <tr><td><code>oath code NAME</code> computed a code at 30 seconds
+          unless <code>--period</code> was given, so a code stored as
+          <code>60/Issuer:account</code> was wrong (also in the app)</td>
+        <td><code>--period</code> defaults to the name's
+          <code>period/</code> prefix, else 30. <code>--period 0</code> is
+          refused (exit 2).</td></tr>
+      <tr><td><code>--device serial:…</code> with a Molto2's serial found no
+          key</td>
+        <td>A Molto2 answers to either serial keyroost shows for it: the one
+          in <code>keyroostctl list</code> or the one <code>molto
+          info</code> prints.</td></tr>
+      <tr><td><code>oath add</code> sent any name to a Solo 2</td>
+        <td>A Solo 2 name over 127 bytes is refused before anything is sent
+          (a 128-byte name made the key stop responding until it was
+          unplugged). On YubiKey 4 firmware 4.0 to 4.3.4, a name that is the
+          start of another name on the key is refused, following the same
+          rule as Yubico's <code>ykman</code>.</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>

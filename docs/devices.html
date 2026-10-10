@@ -68,9 +68,10 @@
     <table class="kr-table">
       <tr><th>Device</th><th>Capabilities</th><th>Notes</th></tr>
       <tr><td><strong>Token2 Molto2 / Molto2v2</strong></td>
-        <td>TOTP slot programming, bulk import</td>
-        <td>Programmed over the vendor-specific SM4-MAC protocol; bulk import from
-          Aegis / 2FAS / otpauth lists, clock sync, customer-key rotation. See
+        <td>TOTP slot programming, code import</td>
+        <td>Programmed over the vendor-specific SM4-MAC protocol; imports Aegis /
+          2FAS / otpauth-list exports and QR screenshots, clock sync, customer-key
+          rotation. See
           <a href="molto2.html">the Molto2 page</a>.</td></tr>
       <tr><td><strong>Token2 single-profile tokens</strong> (OTPC-P1-i / P2-i,
           miniOTP-2-i / 3-i, C301-i, C302-i)</td>
@@ -79,7 +80,7 @@
           key; writes the seed, HMAC algorithm, period and display timeout. The model
           is recognized from the device serial.</td></tr>
       <tr><td><strong>Token2 PIN+ Series</strong></td>
-        <td>FIDO2 (+ bio), OTP, OpenPGP, PIV</td>
+        <td>FIDO2 (+ bio), OTP (incl. import), OpenPGP, PIV</td>
         <td>FIDO2 with fingerprint enrollment and MDS display, plus on-device OTP
           (TOTP/HOTP) over CCID / NFC / USB-HID — validated on PIN+ hardware,
           contributed by Token2. HID-HOTP applies to the models that carry it; recent
@@ -90,16 +91,16 @@
           OpenPGP / PIV applets are handled by the standard byte layers but not yet
           exercised on PIN+ hardware by this project (experimental).</td></tr>
       <tr><td><strong>YubiKey</strong> (5 series)</td>
-        <td>FIDO2, OATH, OpenPGP, PIV</td>
+        <td>FIDO2, OATH (incl. import), OpenPGP, PIV</td>
         <td>Built and verified against a YubiKey 5.7.</td></tr>
       <tr><td><strong>SoloKeys Solo 2</strong></td>
-        <td>FIDO2, OATH</td>
+        <td>FIDO2, OATH (incl. import)</td>
         <td>Trussed firmware; no OpenPGP applet. HOTP caveat: the last-shipped Solo 2
           firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226
           specifies 8, so its HOTP codes won't verify against standards-compliant
           servers. TOTP is unaffected.</td></tr>
       <tr><td><strong>Nitrokey 3</strong></td>
-        <td>FIDO2, OATH, PIV; OpenPGP detected</td>
+        <td>FIDO2, OATH (incl. import), PIV; OpenPGP detected</td>
         <td>Built around the same Trussed firmware core as Solo 2, but the final
           firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2
           does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3),

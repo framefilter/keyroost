@@ -85,10 +85,17 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   two; for **provisioning many slots or keys, the CLI is the intended path** — the
   management key and PIN come from env/stdin once, so a shell loop does the batch
   (see the [PIV guide](https://framefilter.github.io/keyroost/piv.html)).
-- **Token2 Molto2 / Molto2v2** — program a slot from an `otpauth://` URI;
-  bulk-import from Aegis (plaintext or encrypted), 2FAS, a list of `otpauth://`
-  URIs, or a QR code scanned from a PNG/JPEG screenshot or the live screen; sync
-  the host clock; rotate the customer key; factory reset.
+- **Token2 Molto2 / Molto2v2** — program a slot from an `otpauth://` URI or
+  a QR code scanned from a PNG/JPEG screenshot or the live screen; import a
+  whole authenticator export into consecutive slots; sync the host clock;
+  rotate the customer key; factory reset.
+- **Importing authenticator codes** — import an authenticator export (Aegis,
+  plain or encrypted; 2FAS; a list of `otpauth://` URIs; a QR screenshot,
+  including a Google Authenticator export) into a YubiKey, Solo 2 or
+  Nitrokey 3 (OATH), a Token2 key's OTP storage, or a Molto2. keyroost shows
+  what each code becomes before it writes anything (`oath import`,
+  `otp import`, `molto import --in`, or drop the file on the GUI); see
+  [Importing codes](#importing-codes).
 - **Token2 single-profile programmable TOTP token** — program the seed and TOTP
   configuration onto Token2's single-account card/fob tokens (OTPC-P1-i / P2-i,
   miniOTP-2-i / 3-i, C301-i, C302-i) over a PC/SC reader. These authenticate
@@ -139,12 +146,12 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 
 | Device | Capabilities | Notes |
 |---|---|---|
-| **Token2 Molto2 / Molto2v2** | TOTP slot programming, bulk import | Hardware-verified. Programmed over the vendor-specific SM4-MAC protocol ([docs/PROTOCOL.md](docs/PROTOCOL.md)); supports bulk import from Aegis / 2FAS / otpauth-list, clock sync, and customer-key rotation. |
+| **Token2 Molto2 / Molto2v2** | TOTP slot programming, code import | Hardware-verified. Programmed over the vendor-specific SM4-MAC protocol ([docs/PROTOCOL.md](docs/PROTOCOL.md)); supports importing Aegis / 2FAS / otpauth-list exports and QR screenshots, clock sync, and customer-key rotation. |
 | **Token2 single-profile tokens** (OTPC-P1-i / P2-i, miniOTP-2-i / 3-i, C301-i, C302-i) | Single-account TOTP seed + config programming | Programmed over the vendor-specific SM4-MAC protocol with a fixed device key ([docs/PROTOCOL-token2prog.md](docs/PROTOCOL-token2prog.md)); writes the seed and the TOTP algorithm / time-step / display-timeout over a contact or contactless PC/SC reader. The model is recognized from the device serial. |
-| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP, OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys without it answer the capability probe with "no such command" and are unaffected. Contributed by [@token2](https://github.com/token2). PIV management was exercised on Token2 hardware by [@episource](https://github.com/episource) ([#128](https://github.com/framefilter/keyroost/pull/128)), and keyroost decodes the BCD-coded serial Token2's PIV and OpenPGP applets report; `piv info` and `openpgp info` show the key's full serial, read from its OTP applet. The OATH / OpenPGP smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
-| **YubiKey** (5 series) | FIDO2, OATH, OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
-| **SoloKeys Solo 2** | FIDO2, OATH | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
-| **Nitrokey 3** | FIDO2, OATH, PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. The OpenPGP applet is detected but not yet exercised by this project. |
+| **Token2 PIN+ Series** | FIDO2 (+ bio), OTP (incl. import), OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. Importing an authenticator export into OTP storage follows Token2's published OTP specification (see [Importing codes](#importing-codes)). HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys without it answer the capability probe with "no such command" and are unaffected. Contributed by [@token2](https://github.com/token2). PIV management was exercised on Token2 hardware by [@episource](https://github.com/episource) ([#128](https://github.com/framefilter/keyroost/pull/128)), and keyroost decodes the BCD-coded serial Token2's PIV and OpenPGP applets report; `piv info` and `openpgp info` show the key's full serial, read from its OTP applet. The OATH / OpenPGP smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
+| **YubiKey** (5 series) | FIDO2, OATH (incl. import), OpenPGP, PIV | Built and verified against a YubiKey 5.7. |
+| **SoloKeys Solo 2** | FIDO2, OATH (incl. import) | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.3.x) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
+| **Nitrokey 3** | FIDO2, OATH (incl. import), PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. Importing codes into its OATH storage follows Nitrokey's published secrets-app source (see [Importing codes](#importing-codes)). The OpenPGP applet is detected but not yet exercised by this project. |
 | **Swissbit iShield Key 2 Pro** (and iShield Key 1) | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own iShield Key 2 Pro. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)), so a slot without a certificate reads "no certificate (a key may be present)". Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. On the iShield Key 1 and 2, keyroost reads the serial and device name from Swissbit's own management applications (and, on the Key 1, the firmware version) for `piv info` and the GUI, contributed by [@episource](https://github.com/episource) ([#163](https://github.com/framefilter/keyroost/pull/163)). Other applets not yet exercised by this project. |
 | **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, largeBlob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
 
@@ -654,6 +661,7 @@ keyroostctl fido ssh export --rp ssh:demo --out demo-cert.pub
 # --- OATH over PC/SC ---
 keyroostctl oath list
 keyroostctl oath code 'GitHub:me@x.com' --device my-yubikey
+keyroostctl oath import -i export.json --dry-run   # show what an export would add; writes nothing
 
 # --- OpenPGP card ---
 keyroostctl openpgp info --device my-yubikey
@@ -688,6 +696,7 @@ keyroostctl molto info
 keyroostctl molto import --slot 0                # asks for the otpauth:// URI (hidden)
 keyroostctl molto import --slot 0 --uri env:URI  # or from an environment variable
 keyroostctl molto import --in ~/Downloads/aegis.json --slot 0 --dry-run   # validate first
+keyroostctl molto import --in ~/Downloads/aegis.json --slot 0 --file-password env:PW  # encrypted export
 keyroostctl molto seed set --slot 5              # asks for the seed (base32; --encoding hex for hex)
 
 # --- Token2 single-profile programmable token (OTPC / miniOTP / C30x) ---
@@ -699,6 +708,7 @@ keyroostctl prog config set --algorithm sha1 --period 30 --display-timeout 30
 keyroostctl otp list
 keyroostctl otp add --app GitHub --account me@x.com   # asks for the seed (hidden)
 keyroostctl otp code --app GitHub --account me@x.com
+keyroostctl otp import -i export.json                  # add every code in an export (asks first)
 
 # --- Destructive operations (ask y/N, or type "reset", in a terminal) ---
 keyroostctl factory-reset --device my-yubikey          # asks you to type "reset"
@@ -728,9 +738,11 @@ a terminal shows a numbered list to pick from; a script is refused with the
 exact `--device` value for each key. `--device` takes a saved name, a serial,
 or the number `keyroostctl list` shows (prefix `name:`, `serial:` or `list:`
 to say which you mean); `keyroostctl --json list` gives scripts the same
-values. `--reader` (a reader name, or a unique part of one) and `--path` are
-expert overrides: they skip the capability check, and a value that matches
-no detected key is used as typed. Neither can be combined with `--device`.
+values. A Molto2 answers to either serial keyroost shows for it: the one in
+`keyroostctl list` or the one `molto info` prints. `--reader` (a reader
+name, or a unique part of one) and `--path` are expert overrides: they skip
+the capability check, and a value that matches no detected key is used as
+typed. Neither can be combined with `--device`.
 
 Five flags have a short form, with the same meaning on every command:
 `-d` (`--device`), `-y` (`--yes`), `-o` (`--out`), `-i` (`--in`) and
@@ -828,6 +840,89 @@ terminal, a command with no source for a secret it needs is refused, naming
 the flag. In Git Bash (mintty) on Windows the prompt needs a real console:
 run `winpty keyroostctl …`, or use `env:NAME`.
 
+### Importing codes
+
+Move the codes from an authenticator app onto a key in one step. keyroost
+reads Aegis exports (plain or encrypted), 2FAS exports, a text file with one
+`otpauth://` URI per line, and QR screenshots (PNG or JPEG), including a
+Google Authenticator export.
+
+```bash
+keyroostctl oath import -i export.json --dry-run    # show what would happen; writes nothing
+keyroostctl oath import -i export.json              # YubiKey, Solo 2, Nitrokey 3: asks once, then adds
+keyroostctl otp import -i export.json               # a Token2 key's OTP storage
+keyroostctl molto import -i export.json --slot 90   # a Molto2, from slot #90 on
+keyroostctl oath import -i export.json --file-password env:EXPORT_PW   # an encrypted Aegis export
+```
+
+In the GUI, drop the file on the window, or click **Import file…** in a
+key's Authenticator, On-device OTP or Molto2 view. The **Import
+authenticator codes** dialog lists the entries, lets you pick the key under
+**Add to**, and shows what each entry will become before anything is
+written. An encrypted export asks for its password in the dialog. A
+certificate or key file dropped on the window gets a note saying where it
+can be imported instead.
+
+Before writing, keyroost reads what is already on the key and marks each
+entry:
+
+- **add**: it goes onto the key.
+- **exists**: a code with the same name is already on the key, so it is
+  left as is. `--replace` (in the GUI, "Replace codes already on the key
+  that have the same name") replaces it instead. Some keys refuse a second
+  code with the same name; there, replacing removes the old code first, and
+  if adding the new one then fails, the old code is gone.
+- **skip**: the key can't store it, and the preview says why (for example
+  "Solo 2 doesn't take SHA-512 codes"). keyroost never changes an entry to
+  make it fit. Steam codes are skipped on every key.
+
+On a Molto2, entries fill consecutive slots from `--slot`. A slot already in
+use is replaced (**replace**), and an entry with no issuer or account is
+skipped without using up a slot. `molto import` skips entries past slot
+#99; the GUI instead says how many fit and which slot to start at.
+
+keyroost asks once before writing (a script adds `-y`). It writes one code
+at a time and stops at the first error, saying what was added and what was
+not. Running the same import again is safe: codes it already added now
+show as **exists**. `--dry-run` writes nothing; for `oath import` and `otp
+import` the key must be connected, because the preview depends on what is
+on it. `molto import --dry-run` reads slot use from a connected Molto2, and
+works without one too. `--json` prints the plan and, after writing, what
+happened to each entry.
+
+An encrypted export's password comes from `--file-password env:NAME` or
+`--file-password stdin`, or a terminal asks for it. When the export's
+password and the key's password or PIN are both piped in, the export's
+password is the first line. On `molto import`, `--customer-key stdin` is
+the first line and the export's password the second.
+
+What each key can store:
+
+| Key | Holds | Limits |
+|---|---|---|
+| YubiKey | 32 codes, or 64 from firmware 5.7 | names up to 64 bytes; SHA-512 from firmware 4.3.1; 6 to 8 digits |
+| Solo 2 | not reported (writing stops if it fills up) | names up to 127 bytes; no SHA-512; secrets up to 64 bytes |
+| Nitrokey 3 | 50 codes | names up to 128 bytes; 30-second codes only (the key doesn't store the period); no SHA-512 |
+| Token2 OTP storage | 50 codes | app and account up to 64 bytes each, plain ASCII only; no SHA-512; HOTP only with a counter of 0 (the key always starts at 0) |
+| Molto2 | 100 slots (#00 to #99) | TOTP only, 30 or 60 seconds; SHA-1 or SHA-256; 4, 6, 8 or 10 digits; titles shortened to 12 bytes |
+
+On a YubiKey or Solo 2, a TOTP code with a period other than 30 seconds is
+stored under a name that starts with its period, such as `60/GitHub:alice`
+(the naming Yubico's own tools use). `oath code` and the GUI compute
+those codes with that period.
+
+A Solo 2 name longer than 127 bytes is refused by `oath import`, `oath add`
+and the GUI before anything is sent: on Solo 2 firmware 2.3.196, a 128-byte
+name made the key stop responding until it was unplugged. On YubiKey 4
+firmware 4.0 to 4.3.4, a name that is the start of another name already on
+the key is skipped (and `oath add` refuses it), following the same rule as
+Yubico's `ykman`.
+
+Importing into a Token2 key's OTP storage and into a Nitrokey 3 is built
+from the published specifications (Token2's OTP specification and
+Nitrokey's secrets-app source). If you use one of these keys, reports in the
+[issue tracker](https://github.com/framefilter/keyroost/issues) are welcome.
+
 ### Reading the output
 
 A command prints its result on stdout and everything else (prompts,
@@ -873,7 +968,7 @@ old script.
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows |
 | `keyroost-hid` | USB HID enumeration of FIDO devices | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
@@ -885,7 +980,7 @@ old script.
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints) | `serde`, `serde_json`, `getrandom` (the per-computer salt); in-tree SHA-256 from `keyroost-proto` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (names on the key and on this computer) | none (in-tree only, including `keyroost-ctap`) |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand`, `zeroize` |
-| `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
+| `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers, file classification, and the per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` (Windows only) |

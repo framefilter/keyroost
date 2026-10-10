@@ -78,6 +78,36 @@
       touch the key to reveal the code.</p>
   </section>
 
+  <section class="kr-section" id="import">
+    <h2>Importing codes from an authenticator app</h2>
+    <p>keyroost can add every code in an authenticator export to the key's OTP storage in
+      one step: an Aegis export (plain or encrypted), a 2FAS export, a text file with one
+      <code>otpauth://</code> URI per line, or a QR screenshot, including a Google
+      Authenticator export. In the <strong>On-device OTP</strong> tab, click
+      <strong>Import file…</strong> (or drop the file on the window); the <strong>Import
+      authenticator codes</strong> dialog shows what each entry will become before anything
+      is written. On the command line:</p>
+<pre><code>keyroostctl otp import -i export.json --dry-run   # show what would happen; writes nothing
+keyroostctl otp import -i export.json             # asks once, then adds the codes</code></pre>
+    <p>An entry whose app and account are already on the key is left as is
+      (<strong>exists</strong>); <code>--replace</code> replaces it. An entry the key can't
+      store is <strong>skipped</strong>, with the reason. keyroost asks once, writes one
+      code at a time, and stops at the first error, saying what was added and what wasn't.
+      What the OTP storage takes:</p>
+    <ul>
+      <li>up to 50 codes;</li>
+      <li>app and account names of up to 64 bytes each, in plain ASCII characters;</li>
+      <li>SHA-1 or SHA-256 (no SHA-512), 4 to 10 digits;</li>
+      <li>HOTP codes only with a counter of 0, because the key always starts the counter
+        at 0.</li>
+    </ul>
+    <p>When both the export's password and the OTP PIN are piped in, the export's password
+      (<code>--file-password stdin</code>) is the first line and the PIN the second. Import
+      into OTP storage is built from Token2's published OTP specification; reports from
+      people using it are welcome in the
+      <a href="https://github.com/framefilter/keyroost/issues">issue tracker</a>.</p>
+  </section>
+
   <section class="kr-section" id="hid-hotp">
     <h2>HID-HOTP (HOTP-on-touch)</h2>
     <p>HID-HOTP is a single dedicated slot that makes the key act like a keyboard: touch it
@@ -168,6 +198,7 @@ keyroostctl otp list --unlock auto        # try the fingerprint, fall back to th
 <pre><code>keyroostctl otp list                  # stored entries
 keyroostctl otp code --account &lt;name&gt;  # read a live code
 keyroostctl otp info                   # interface states &amp; slot status
+keyroostctl otp import -i export.json  # add every code in an authenticator export
 keyroostctl otp button set --digits 6                    # provision HID-HOTP (asks for the base32 seed, hidden)
 keyroostctl otp interface --fido --ccid --keyboard        # enable interfaces (re-plug after)</code></pre>
     <p class="kr-muted">Every <code>otp</code> subcommand accepts

@@ -109,7 +109,8 @@
     </div>
 <pre><code>keyroostctl oath list
 keyroostctl oath code &lt;name&gt; --device my-yubikey
-keyroostctl oath delete &lt;name&gt;      # asks y/N first; a script adds --yes</code></pre>
+keyroostctl oath delete &lt;name&gt;      # asks y/N first; a script adds --yes
+keyroostctl oath import -i export.json  # add every code in an authenticator export</code></pre>
     <p class="kr-muted">In the desktop app, credentials can be added from an
       <code>otpauth://</code> URI (the same format behind setup QR codes); on the CLI the
       seed is typed at a hidden prompt by <code>oath add</code>, or in a script given as
@@ -120,6 +121,62 @@ keyroostctl oath delete &lt;name&gt;      # asks y/N first; a script adds --yes<
       shows a numbered list and a script names one with <code>--device</code> (a saved name,
       a serial, or the number <code>keyroostctl list</code> shows). Deleting a credential
       and <code>oath reset</code> ask <strong>y/N</strong> first, naming the key.</p>
+  </section>
+
+  <section class="kr-section" id="import">
+    <h2>Importing codes from an authenticator app</h2>
+    <p>keyroost can add every code in an authenticator export to a YubiKey, Solo&nbsp;2 or
+      Nitrokey&nbsp;3 in one step. It reads Aegis exports (plain or encrypted), 2FAS
+      exports, a text file with one <code>otpauth://</code> URI per line, and QR
+      screenshots, including a Google Authenticator export.</p>
+    <p>In the desktop app, drop the file on the window, or click <strong>Import
+      file…</strong> in the key's Authenticator view. The <strong>Import authenticator
+      codes</strong> dialog lists the entries (an encrypted export asks for its password
+      first), lets you pick the key under <strong>Add to</strong>, and shows what each entry
+      will become before anything is written. On the command line:</p>
+<pre><code>keyroostctl oath import -i export.json --dry-run   # show what would happen; writes nothing
+keyroostctl oath import -i export.json             # asks once, then adds the codes
+keyroostctl oath import -i export.json --file-password env:EXPORT_PW   # encrypted Aegis export</code></pre>
+    <p>Before writing, keyroost reads what is already on the key and marks each entry:</p>
+    <ul>
+      <li><strong>add</strong>: it goes onto the key.</li>
+      <li><strong>exists</strong>: a code with the same name is already on the key, so it is
+        left as is. <code>--replace</code> (in the app, <em>Replace codes already on the key
+        that have the same name</em>) replaces it instead. Some keys refuse a second code
+        with the same name; there, replacing removes the old code first, and if adding the
+        new one then fails, the old code is gone.</li>
+      <li><strong>skip</strong>: the key can't store it, and the preview says why. keyroost
+        never changes an entry to make it fit.</li>
+    </ul>
+    <p>keyroost asks once before writing (a script adds <code>--yes</code>), writes one
+      code at a time, and stops at the first error, saying what was added and what wasn't.
+      Running the same import again is safe: codes already added show as
+      <strong>exists</strong>. A dry run needs the key connected, because the preview
+      depends on what is on it.</p>
+    <h3>What each key can store</h3>
+    <ul>
+      <li><strong>YubiKey:</strong> 32 codes, or 64 from firmware 5.7. Names up to 64 bytes
+        (the period prefix included). SHA-512 from firmware 4.3.1. On firmware 4.0 to 4.3.4,
+        a name that is the start of another name already on the key is skipped, and
+        <code>oath add</code> refuses it, following the same rule as Yubico's
+        <code>ykman</code>.</li>
+      <li><strong>Solo&nbsp;2:</strong> doesn't report how many codes it holds, so writing
+        stops if it fills up. Names up to 127 bytes: a longer name is refused by the import,
+        <code>oath add</code> and the app before anything is sent, because on firmware
+        2.3.196 a 128-byte name made the key stop responding until it was unplugged. No
+        SHA-512 codes.</li>
+      <li><strong>Nitrokey&nbsp;3:</strong> 50 codes. Only 30-second codes, because the key
+        doesn't store the period. No SHA-512 codes. Import into a Nitrokey&nbsp;3 is built
+        from Nitrokey's published secrets-app source; reports from people using one are
+        welcome in the <a href="https://github.com/framefilter/keyroost/issues">issue
+        tracker</a>.</li>
+    </ul>
+    <h3>Codes with a period other than 30 seconds</h3>
+    <p>A YubiKey or Solo&nbsp;2 doesn't store a TOTP code's period. Instead, the name
+      starts with it, such as <code>60/GitHub:alice</code> (the naming Yubico's own tools
+      use), and an import names codes that way. keyroost reads the prefix:
+      <code>oath code</code> uses it as the period unless <code>--period</code> says
+      otherwise, and the app shows those codes with their period.</p>
   </section>
 
   <section class="kr-section kr-res-section">

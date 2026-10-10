@@ -4,18 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Token2 Molto2 — programmable TOTP token — keyroost</title>
-<meta name="description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and bulk import work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
+<meta name="description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and importing work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyroost">
 <meta property="og:title" content="Token2 Molto2 — programmable TOTP token — keyroost">
-<meta property="og:description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and bulk import work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
+<meta property="og:description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and importing work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
 <meta property="og:url" content="https://framefilter.github.io/keyroost/molto2.html">
 <meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Token2 Molto2 — programmable TOTP token — keyroost">
-<meta name="twitter:description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and bulk import work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
+<meta name="twitter:description" content="What the Token2 Molto2 / Molto2v2 programmable TOTP hardware token is, how slots and importing work, the customer key, clock sync, and what keyroost does — plus the single-profile siblings (OTPC, miniOTP, C30x).">
 <meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 
 <link rel="icon" type="image/png" href="assets/keyroost-logo.png">
@@ -82,7 +82,7 @@
   </section>
 
   <section class="kr-section">
-    <h2>Programming &amp; bulk import</h2>
+    <h2>Programming &amp; importing</h2>
     <p>Load a single slot from an <code>otpauth://</code> URI, or migrate a whole set of
       accounts at once:</p>
     <ul>
@@ -92,6 +92,29 @@
       <li>a QR code in a PNG/JPEG screenshot, including a Google Authenticator export
         (most desktop builds can also capture one from the screen)</li>
     </ul>
+    <p>In the desktop app, click <strong>Import file…</strong> in the Molto2 view (it was
+      <em>Bulk import…</em>), or drop the file on the window. The same <strong>Import
+      authenticator codes</strong> dialog is used for every key that stores codes: it lists
+      the entries, lets you pick the Molto2 under <strong>Add to</strong> and the first slot
+      to fill, and shows what each slot will get before anything is written. If the Molto2
+      isn't unlocked yet, the dialog has an <strong>Authenticate</strong> button.</p>
+    <p>Entries fill consecutive slots from the first one. A slot already in use is
+      replaced, and the preview marks it. An entry the Molto2 can't store (for example a
+      SHA-512 code, a 45-second period, or a counter-based HOTP code) is skipped with the
+      reason, and the rest are still written. An entry with no issuer or account is
+      skipped without using up a slot. When the entries don't all fit before slot #99,
+      the app says how many fit and which slot to start at; <code>molto import</code>
+      skips the ones past #99. keyroost writes one slot at a time and stops at the first
+      error, saying what was written.</p>
+<pre><code>keyroostctl molto import -i export.json --slot 90 --dry-run   # preview; writes nothing
+keyroostctl molto import -i export.json --slot 90             # asks once, then writes
+keyroostctl molto import -i export.json --file-password env:EXPORT_PW   # encrypted Aegis export</code></pre>
+    <p class="kr-muted">The dry run reads which slots are in use from a connected Molto2 (no
+      customer key needed) and also works with none connected. An encrypted export's
+      password comes from <code>--file-password env:NAME</code> or
+      <code>--file-password stdin</code>, or a terminal asks for it; with
+      <code>--customer-key stdin</code> too, the customer key is the first line and the
+      export's password the second.</p>
     <p>keyroost can also <strong>sync the device clock</strong> to the host — important,
       because TOTP depends on accurate time, and a drifted clock shows wrong codes.</p>
   </section>
@@ -123,17 +146,19 @@
     <div class="kr-tool">
       <span class="kr-mark mono">k</span>
       <p>Read slot occupancy and titles; program a slot from an <code>otpauth://</code> URI;
-        set a slot's title or delete its seed (the title stays); bulk-import from Aegis / 2FAS / an
+        set a slot's title or delete its seed (the title stays); import from Aegis / 2FAS / an
         <code>otpauth://</code> list or a QR screenshot; sync the host clock; rotate the customer key; and
         factory-reset — over a pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC)
         with no external crypto dependencies.</p>
     </div>
-    <p>On the command line, writing to a slot that already holds a seed, deleting a seed
-      and <code>molto reset</code> name the token and ask <strong>y/N</strong> first. A
+    <p>On the command line, writing to a slot that already holds a seed, importing a file
+      (<code>molto import --in</code>), deleting a seed and <code>molto reset</code> name the
+      token and ask <strong>y/N</strong> first. A
       script, or a command whose seed is piped in, adds <code>--yes</code>. With several
       Molto2 tokens connected, a terminal shows a numbered list to pick from and a script
-      names one with <code>--device</code> (the number <code>keyroostctl list</code> shows)
-      or <code>--reader</code>; keyroost never uses the first one it finds. Molto2 tokens
+      names one with <code>--device</code> (the number <code>keyroostctl list</code> shows,
+      or either serial keyroost shows for the token: the one in <code>keyroostctl
+      list</code> or the one <code>molto info</code> prints) or <code>--reader</code>; keyroost never uses the first one it finds. Molto2 tokens
       can't be given a friendly name yet.</p>
   </section>
 
