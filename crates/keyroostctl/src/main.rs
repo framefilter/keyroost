@@ -24,6 +24,7 @@ use std::sync::OnceLock;
 use keyroost_keyring::Keyring;
 use keyroost_resolve::{ccid_readers_if_needed, ccid_serials_for, Need};
 
+mod code_import;
 mod json_out;
 mod output;
 mod overview;
@@ -1966,7 +1967,8 @@ struct OathAccess {
     /// password-protected applets (e.g. a YubiKey
     /// with an OATH password set). `oath password set` reads it on the first line,
     /// before the new password; `add` reads it after the seed (second line when
-    /// --seed stdin is also given).
+    /// --seed stdin is also given) and `import` after the file password (second
+    /// line when --file-password stdin is also given).
     #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
     password: Option<SecretSource>,
 }
@@ -2030,6 +2032,38 @@ enum OathCmd {
         touch: bool,
         #[command(flatten)]
         access: OathAccess,
+    },
+    /// Add every code in an authenticator export to this key's OATH storage.
+    ///
+    /// FILE is an Aegis export (plain or encrypted), a 2FAS export, a list of
+    /// otpauth:// URIs, or a QR screenshot (including a Google Authenticator
+    /// export). keyroost reads the key first and shows what each code becomes:
+    /// codes already on the key with the same name are skipped unless
+    /// --replace, and codes the key can't store are listed with the reason.
+    /// Asks once before writing (`--yes` to skip); with --dry-run nothing is
+    /// written.
+    Import {
+        /// The export to read.
+        #[arg(long = "in", short = 'i', value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// The password of an encrypted Aegis export: env:NAME or stdin (first
+        /// line, before the applet password; hidden when typed at a terminal).
+        /// With neither, a terminal asks when the file needs one.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        file_password: Option<SecretSource>,
+        /// Replace codes already on the key that have the same name. On keys
+        /// that refuse duplicates the old code is removed first; if adding the
+        /// new one then fails, the old one is gone.
+        #[arg(long)]
+        replace: bool,
+        /// Show what would be added, replaced or skipped; nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        access: OathAccess,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Delete a credential by name. Irreversible: asks first (`--yes` to
     /// skip).
@@ -2996,6 +3030,41 @@ enum OtpCmd {
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         pin: Option<SecretSource>,
     },
+    /// Add every code in an authenticator export to this key's OTP storage.
+    ///
+    /// FILE is an Aegis export (plain or encrypted), a 2FAS export, a list of
+    /// otpauth:// URIs, or a QR screenshot (including a Google Authenticator
+    /// export). keyroost reads the key first and shows what each code becomes:
+    /// codes already on the key with the same app and account are skipped
+    /// unless --replace, and codes the key can't store are listed with the
+    /// reason. Asks once before writing (`--yes` to skip); with --dry-run
+    /// nothing is written.
+    Import {
+        /// The export to read.
+        #[arg(long = "in", short = 'i', value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// The password of an encrypted Aegis export: env:NAME or stdin (first
+        /// line, before the OTP PIN; hidden when typed at a terminal). With
+        /// neither, a terminal asks when the file needs one.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        file_password: Option<SecretSource>,
+        /// Replace codes already on the key that have the same app and
+        /// account.
+        #[arg(long)]
+        replace: bool,
+        /// Show what would be added, replaced or skipped; nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        /// The OTP PIN to unlock a protected key: env:NAME reads that
+        /// environment variable, stdin reads one line (second line when
+        /// --file-password stdin is also given; hidden when typed at a
+        /// terminal). With neither, a terminal asks when the key has a PIN.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        pin: Option<SecretSource>,
+        /// Confirm without asking (required when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Delete one OTP entry by app and account. Irreversible: asks first
     /// (`--yes` to skip).
     ///
@@ -3400,6 +3469,8 @@ const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
     .prompt_as("otpauth:// URI")
     .hint("--uri env:NAME, --uri stdin, --qr IMAGE or --in FILE");
 const VAULT_PASSWORD: Spec = Spec::current("vault password", "password");
+/// The password of an encrypted export file (`oath import`, `otp import`).
+const FILE_PASSWORD: Spec = Spec::current("file password", "file-password");
 
 /// Decode a seed; the error names the flag and the encoding, never the input.
 fn decode_seed(text: &str, e: SeedEncoding) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
@@ -8126,6 +8197,24 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 name
             );
         }
+        OathCmd::Import {
+            file,
+            file_password,
+            replace,
+            dry_run,
+            access,
+            yes,
+        } => {
+            return code_import::run_code_import(
+                code_import::CodeDest::Oath(access),
+                file,
+                file_password.as_ref(),
+                *replace,
+                *dry_run,
+                *yes,
+                debug,
+            )
+        }
         OathCmd::Delete { name, access, yes } => {
             let dev = crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
             let asked = crate::prompt::confirm_then_read(
@@ -8650,6 +8739,24 @@ fn run_otp(
                 format!("{app}:{account}")
             };
             println!("Added OTP entry {label:?}.");
+        }
+        OtpCmd::Import {
+            file,
+            file_password,
+            replace,
+            dry_run,
+            pin,
+            yes,
+        } => {
+            return code_import::run_code_import(
+                code_import::CodeDest::Otp(&sel, pin.as_ref()),
+                file,
+                file_password.as_ref(),
+                *replace,
+                *dry_run,
+                *yes,
+                debug,
+            )
         }
         OtpCmd::Delete {
             app,
@@ -11542,6 +11649,9 @@ fn otp_secret_pair(cmd: &OtpCmd) -> Option<SecretPair<'_>> {
             encoding,
             ..
         } => secret_pair((seed_spec(*encoding), seed), (&OTP_PIN, pin)),
+        OtpCmd::Import {
+            file_password, pin, ..
+        } => secret_pair((&FILE_PASSWORD, file_password), (&OTP_PIN, pin)),
         _ => return None,
     })
 }
@@ -11566,6 +11676,14 @@ fn oath_secret_pair(cmd: &OathCmd) -> Option<SecretPair<'_>> {
         } => secret_pair(
             (&OATH_PASSWORD, &access.password),
             (&OATH_NEW_PASSWORD, new_password),
+        ),
+        OathCmd::Import {
+            file_password,
+            access,
+            ..
+        } => secret_pair(
+            (&FILE_PASSWORD, file_password),
+            (&OATH_PASSWORD, &access.password),
         ),
         _ => return None,
     })
@@ -15354,12 +15472,15 @@ mod cli_tests {
             .collect();
         // Commands that ask before a change that destroys no key, seed or
         // certificate: a token setting, `piv cert request`, which replaces a
-        // key only with the optional `--generate-key`, and a key's name.
+        // key only with the optional `--generate-key`, a key's name, and the
+        // code imports, which replace a code only with `--replace`.
         let confirms_only = [
             "prog config set",
             "piv cert request",
             "name set",
             "name clear",
+            "oath import",
+            "otp import",
         ];
         let tree = all_commands();
         for p in marked.iter().map(|(p, _)| *p).chain(confirms_only) {
@@ -19443,6 +19564,38 @@ mod cli_tests {
                 "stdin",
             ],
             &["keyroostctl", "molto", "import", "--in", "v.json"],
+            &["keyroostctl", "oath", "import", "--in", "v.json"],
+            &[
+                "keyroostctl",
+                "oath",
+                "import",
+                "-i",
+                "v.json",
+                "--replace",
+                "--dry-run",
+                "--file-password",
+                "stdin",
+                "--password",
+                "stdin",
+                "-y",
+            ],
+            &["keyroostctl", "otp", "import", "--in", "v.json"],
+            &[
+                "keyroostctl",
+                "otp",
+                "--transport",
+                "hid",
+                "import",
+                "-i",
+                "v.json",
+                "--replace",
+                "--dry-run",
+                "--file-password",
+                "env:P",
+                "--pin",
+                "stdin",
+                "-y",
+            ],
             &[
                 "keyroostctl",
                 "molto",
@@ -21818,6 +21971,7 @@ mod cli_tests {
                 "molto import",
                 "fido pin change",
                 "oath add",
+                "oath import",
                 "oath password set",
                 "openpgp pin change",
                 "openpgp pin unblock",
@@ -21829,6 +21983,7 @@ mod cli_tests {
                 "piv cert request",
                 "piv cert generate",
                 "otp add",
+                "otp import",
                 "otp pin change",
             ]
         );
@@ -22930,12 +23085,13 @@ mod cli_tests {
                     },
             } => yes,
             Cmd::Oath {
-                cmd: OathCmd::Delete { yes, .. },
+                cmd: OathCmd::Delete { yes, .. } | OathCmd::Import { yes, .. },
                 ..
             } => yes,
             Cmd::Otp {
                 cmd:
                     OtpCmd::Delete { yes, .. }
+                    | OtpCmd::Import { yes, .. }
                     | OtpCmd::Button {
                         cmd: OtpButtonCmd::Set { yes, .. } | OtpButtonCmd::Clear { yes },
                     },
@@ -23167,7 +23323,9 @@ mod cli_tests {
                 "--generate-key",
             ],
             &["keyroostctl", "oath", "delete", "x"],
+            &["keyroostctl", "oath", "import", "--in", "f.json"],
             &["keyroostctl", "otp", "delete", "--account", "a"],
+            &["keyroostctl", "otp", "import", "--in", "f.json"],
             &["keyroostctl", "otp", "button", "set", "--seed", "stdin"],
             &["keyroostctl", "otp", "button", "clear"],
             &["keyroostctl", "fido", "credential", "delete", "00"],

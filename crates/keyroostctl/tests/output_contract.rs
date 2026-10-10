@@ -289,3 +289,74 @@ fn oath_add_long_name_without_a_key_fails_on_the_key() {
     assert!(err.contains("no key with OATH is connected"), "{err}");
     assert!(!err.contains("Solo 2 stores names"), "{err}");
 }
+
+/// A fresh directory under the temp dir for one test's input files.
+fn input_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("kr-import-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+const PLAIN_AEGIS: &str = r#"{"version":1,"header":{"slots":null,"params":null},"db":{"version":2,"entries":[{"type":"totp","name":"alice","issuer":"Example","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"period":30}}]}}"#;
+
+/// The file is read and sorted before any key is looked at: a certificate
+/// gets the pointer to where certificates go, a missing file its read
+/// error, and an export with no key connected the usual refusal.
+#[test]
+fn oath_import_reads_the_file_before_any_key() {
+    let dir = input_dir("oath");
+    let cert = dir.join("certificate.txt");
+    std::fs::write(
+        &cert,
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["oath", "import", "--in", cert.to_str().unwrap(), "--yes"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("This looks like a certificate"), "{err}");
+    assert!(err.contains("piv cert import"), "{err}");
+    assert!(!err.contains('\u{2192}'), "a key was selected first: {err}");
+
+    let missing = dir.join("missing.json");
+    let (code, _, err) = run(&["oath", "import", "--in", missing.to_str().unwrap()]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("read "), "{err}");
+    assert!(!err.contains('\u{2192}'), "{err}");
+
+    let plain = dir.join("plain.json");
+    std::fs::write(&plain, PLAIN_AEGIS).unwrap();
+    for cmd in [
+        &["oath", "import"][..],
+        &["otp", "--transport", "ccid", "import"],
+    ] {
+        let mut args = cmd.to_vec();
+        args.extend(["--in", plain.to_str().unwrap(), "--dry-run"]);
+        let (code, out, err) = run(&args);
+        assert_eq!(code, 1, "{args:?}: {err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("is connected"), "{args:?}: {err}");
+        assert!(!err.contains("JBSWY3DPEHPK3PXP"), "{err}");
+    }
+    let (_, _, err) = run(&["oath", "import", "--in", plain.to_str().unwrap()]);
+    assert!(err.contains("no key with OATH is connected"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn import_help_names_the_shared_flags() {
+    for cmd in [&["oath", "import"][..], &["otp", "import"]] {
+        let mut args = cmd.to_vec();
+        args.push("--help");
+        let (code, out, err) = run(&args);
+        assert_eq!(code, 0, "{err}");
+        for flag in ["--in", "--file-password", "--dry-run", "--yes"] {
+            assert!(out.contains(flag), "{cmd:?} {flag}: {out}");
+        }
+        assert!(out.contains("--replace"), "{cmd:?}: {out}");
+        assert!(!out.contains("--overwrite"), "{cmd:?}: {out}");
+        assert!(out.contains("skipped unless --replace"), "{cmd:?}: {out}");
+        assert!(out.contains("nothing is written"), "{cmd:?}: {out}");
+    }
+}

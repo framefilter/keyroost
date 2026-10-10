@@ -229,6 +229,11 @@ fn fixture_dir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     for (name, body) in [
         ("message.txt", &b"keyroost test message\n"[..]),
+        // A plain Aegis export: the import rows need no file password.
+        (
+            "vault.json",
+            &br#"{"version":1,"header":{"slots":null,"params":null},"db":{"version":2,"entries":[{"type":"totp","name":"alice","issuer":"Example","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"period":30}}]}}"#[..],
+        ),
         (
             "cert.der",
             include_bytes!("../../keyroost-piv/tests/fixtures/rsa_piv.der"),
@@ -364,6 +369,15 @@ const LITERAL_CASES: &[&[&str]] = &[
     &["oath", "list", "--password", "S3CRETVALUE"],
     &["oath", "password", "set", "--new-password", "S3CRETVALUE"],
     &["oath", "add", "n", "--seed", "S3CRETVALUE"],
+    &[
+        "oath",
+        "import",
+        "--in",
+        "f",
+        "--file-password",
+        "S3CRETVALUE",
+    ],
+    &["otp", "import", "--in", "f", "--file-password=S3CRETVALUE"],
     &["fido", "pin", "change", "--pin", "default"],
     &["molto", "--customer-key", "S3CRETVALUE", "info"],
     &["molto", "info", "--customer-key=S3CRETVALUE"],

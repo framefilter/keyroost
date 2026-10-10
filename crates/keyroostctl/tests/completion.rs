@@ -102,6 +102,20 @@ fn renamed_paths_complete() {
     assert!(out.lines().any(|l| l.starts_with("yubi-test")), "{out}");
 }
 
+/// `oath import` and `otp import` complete, and so do their flags.
+#[test]
+fn import_commands_complete() {
+    let first = |out: &str, g: &str| out.lines().any(|l| l.split_whitespace().next() == Some(g));
+    for group in ["oath", "otp"] {
+        let out = complete(&["keyroostctl", group, ""]);
+        assert!(first(&out, "import"), "{group}: {out}");
+        let out = complete(&["keyroostctl", group, "import", "--"]);
+        for flag in ["--file-password", "--replace", "--dry-run", "--in"] {
+            assert!(first(&out, flag), "{group} {flag}: {out}");
+        }
+    }
+}
+
 #[test]
 fn name_completes_at_the_top_level() {
     let out = complete(&["keyroostctl", ""]);

@@ -476,6 +476,43 @@ pub(crate) struct ProgInfoJson {
     pub utc_time: u32,
 }
 
+/// `keyroostctl --json oath import` / `otp import`: the plan, plus each
+/// write's outcome after a real run (a dry run has no outcomes). Names
+/// only, never a seed.
+#[derive(Serialize)]
+pub(crate) struct ImportJson {
+    /// "oath" or "otp".
+    pub destination: &'static str,
+    pub dry_run: bool,
+    /// How many codes the key holds in all, when known.
+    pub capacity: Option<usize>,
+    /// Codes already on the key.
+    pub on_key: usize,
+    pub entries: Vec<ImportRowJson>,
+    /// Why the run stopped early, if it did.
+    pub stopped: Option<String>,
+}
+
+/// One entry of the file in [`ImportJson`].
+#[derive(Serialize)]
+pub(crate) struct ImportRowJson {
+    /// Position in the file, counting from 0.
+    pub index: usize,
+    /// The entry as the file names it.
+    pub label: String,
+    /// The name it is stored under on the key, when it has one.
+    pub name: Option<String>,
+    /// "add", "replace", "exists" or "skip".
+    pub plan: &'static str,
+    /// Why it is skipped or left as is.
+    pub reason: Option<String>,
+    /// After a run: "added", "replaced", "already-there",
+    /// "removed-not-added", "failed", "no-room" or "not-tried".
+    pub outcome: Option<&'static str>,
+    /// The key's error for "failed" and "removed-not-added".
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
