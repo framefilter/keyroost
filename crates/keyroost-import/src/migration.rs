@@ -31,7 +31,7 @@
 use crate::bulk::{BulkEntry, BulkError};
 use crate::entry::{
     check_secret, finish, name_label, Format, HashAlg, ImportEntry, ImportFile, ImportItem,
-    OtpKind, Unusable,
+    OtpKind, Unusable, MAX_ENTRIES,
 };
 use keyroost_proto::codec::base64_decode;
 use keyroost_proto::commands::{HmacAlgo, OtpDigits, TimeStep};
@@ -100,7 +100,8 @@ fn decode_uri(uri: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, BulkError> {
 /// Every account of an `otpauth-migration://offline?data=…` URI, in
 /// payload order, in the wide model: HOTP keeps its counter (field 7) and
 /// SHA-512 is carried; MD5, unknown enums and out-of-range secrets become
-/// unusable items. Whole-file errors are the same as [`parse`]'s.
+/// unusable items. Whole-file errors are the same as [`parse`]'s, plus more
+/// than [`MAX_ENTRIES`] accounts.
 pub fn parse_wide(uri: &str) -> Result<ImportFile, BulkError> {
     parse_payload_wide(&decode_uri(uri)?)
 }
@@ -114,6 +115,9 @@ pub fn parse_payload_wide(buf: &[u8]) -> Result<ImportFile, BulkError> {
         match (field, wire) {
             (1, 2) => {
                 let index = items.len();
+                if index >= MAX_ENTRIES {
+                    return Err(BulkError::TooManyEntries);
+                }
                 let (label, entry) = convert_wide(r.bytes()?)?;
                 items.push(ImportItem {
                     index,
@@ -527,6 +531,23 @@ pub(crate) mod tests {
         // Whole-file problems stay whole-file errors.
         assert!(parse_wide("otpauth-migration://offline?data=!!!").is_err());
         assert!(parse_wide(&uri_for(&payload(&[]))).is_err());
+    }
+
+    #[test]
+    fn migration_wide_refuses_more_than_max_entries() {
+        use crate::entry::MAX_ENTRIES;
+        // Two million empty accounts (`0a 00`) in 4 MB: refused at the cap
+        // rather than becoming two million items.
+        let huge = [0x0a, 0x00].repeat(2_000_000);
+        assert!(matches!(
+            parse_payload_wide(&huge),
+            Err(BulkError::TooManyEntries)
+        ));
+        let at_cap = [0x0a, 0x00].repeat(MAX_ENTRIES);
+        assert_eq!(
+            parse_payload_wide(&at_cap).unwrap().items.len(),
+            MAX_ENTRIES
+        );
     }
 
     #[test]

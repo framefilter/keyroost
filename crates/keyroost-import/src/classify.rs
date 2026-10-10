@@ -182,7 +182,11 @@ pub fn classify(bytes: &[u8], file_name: Option<&str>) -> FileKind {
 #[cfg(feature = "bulk")]
 fn classify_json(text: &str) -> FileKind {
     match crate::bulk::aegis::is_encrypted(text) {
-        Ok(true) => return FileKind::Authenticator(AuthFormat::AegisEncrypted),
+        // A string `db` is a vault only with Aegis's header around it.
+        Ok(true) if crate::bulk::aegis::has_vault_shape(text) => {
+            return FileKind::Authenticator(AuthFormat::AegisEncrypted)
+        }
+        Ok(true) => return FileKind::Unknown,
         Ok(false) => return FileKind::Authenticator(AuthFormat::Aegis),
         Err(_) => {}
     }
@@ -268,9 +272,17 @@ mod tests {
                 Auth(A::Aegis),
             ),
             (
-                br#"  {"header":{},"db":"ZW5jcnlwdGVk"}"#.to_vec(),
+                br#"  {"version":1,"header":{"slots":[{"type":1}],"params":{"nonce":"","tag":""}},"db":"ZW5jcnlwdGVk"}"#.to_vec(),
                 None,
                 Auth(A::AegisEncrypted),
+            ),
+            // A string `db` alone isn't a vault: it needs Aegis's header.
+            (br#"{"db":"postgres://localhost/app"}"#.to_vec(), Some("config.json"), Unknown),
+            (br#"{"header":{},"db":"ZW5jcnlwdGVk"}"#.to_vec(), None, Unknown),
+            (
+                br#"{"version":1,"header":{"slots":null,"params":null},"db":"ZW5j"}"#.to_vec(),
+                None,
+                Unknown,
             ),
             (
                 br#"{"services":[{"name":"x","secret":"JBSWY3DP"}]}"#.to_vec(),

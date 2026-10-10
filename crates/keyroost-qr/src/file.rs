@@ -61,11 +61,7 @@ pub fn open_file(
     password: Option<&[u8]>,
 ) -> Result<Opened, OpenError> {
     if bytes.len() > MAX_FILE_BYTES {
-        return Err(OpenError::NotImportable(
-            "This file is larger than 16 MiB, too large for an authenticator export or a \
-             screenshot. Nothing was read."
-                .to_owned(),
-        ));
+        return Err(too_large());
     }
     let format = match classify(bytes, file_name) {
         FileKind::Authenticator(format) => format,
@@ -80,46 +76,87 @@ pub fn open_file(
     // Every other authenticator format was classified from valid UTF-8.
     let text = std::str::from_utf8(bytes)
         .map_err(|_| OpenError::NotImportable(UNKNOWN_FILE.to_owned()))?;
-    let file = match format {
-        AuthFormat::Aegis => aegis::parse_wide(text),
+    let (file, layout) = match format {
+        AuthFormat::Aegis => (aegis::parse_wide(text), "an Aegis export"),
         AuthFormat::AegisEncrypted => {
             let Some(password) = password else {
                 return Ok(Opened::NeedsPassword);
             };
             // Wipe-on-drop: the plaintext is every seed in the vault.
             let plain = aegis::decrypt(text, password).map_err(decrypt_error)?;
-            aegis::parse_wide(&plain).map(|mut f| {
+            let file = aegis::parse_wide(&plain).map(|mut f| {
                 f.format = Format::AegisEncrypted;
                 f
-            })
+            });
+            (file, "an Aegis export")
         }
-        AuthFormat::TwoFas => twofas::parse_wide(text),
+        AuthFormat::TwoFas => (twofas::parse_wide(text), "a 2FAS export"),
         AuthFormat::TwoFasEncrypted => {
             return Err(OpenError::Unreadable(TWOFAS_ENCRYPTED.to_owned()))
         }
-        AuthFormat::OtpauthList => keyroost_import::parse_list_wide(text),
+        AuthFormat::OtpauthList => (keyroost_import::parse_list_wide(text), "an otpauth list"),
         AuthFormat::Image => unreachable!("handled above"),
     };
-    file.map(Opened::Entries).map_err(read_error)
+    file.map(Opened::Entries)
+        .map_err(|e| read_error(&e, layout))
 }
 
-/// A recognized export that didn't read.
-fn read_error(e: BulkError) -> OpenError {
+/// Read a file for [`open_file`], never holding more than
+/// [`MAX_FILE_BYTES`] + 1 bytes: an oversized (or endless) source is refused
+/// while reading, before it is all in memory.
+pub fn read_bounded<R: std::io::Read>(reader: R) -> Result<Vec<u8>, OpenError> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| {
+            OpenError::NotImportable(format!("The file couldn't be read ({}).", e.kind()))
+        })?;
+    if buf.len() > MAX_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(buf)
+}
+
+/// [`open_file`] on a path: a bounded read (see [`read_bounded`]), with the
+/// file's name passed along for classification.
+pub fn open_path(path: &std::path::Path, password: Option<&[u8]>) -> Result<Opened, OpenError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        OpenError::NotImportable(format!("The file couldn't be opened ({}).", e.kind()))
+    })?;
+    // Wipe-on-drop: a plaintext export is every seed in clear.
+    let bytes = zeroize::Zeroizing::new(read_bounded(file)?);
+    let name = path.file_name().and_then(|n| n.to_str());
+    open_file(&bytes, name, password)
+}
+
+fn too_large() -> OpenError {
+    OpenError::NotImportable(
+        "This file is larger than 16 MiB, too large for an authenticator export or a \
+         screenshot. Nothing was read."
+            .to_owned(),
+    )
+}
+
+/// A recognized export that didn't read, described without quoting any
+/// value from the file.
+fn read_error(e: &BulkError, layout: &str) -> OpenError {
     let msg = match e {
         BulkError::EmptyFile => "The file has no entries.".to_owned(),
-        BulkError::Json(e) => format!("The file isn't valid JSON ({}).", e),
-        other => other.to_string(),
+        other => other.describe(layout),
     };
     OpenError::Unreadable(msg)
 }
 
-/// A vault that didn't decrypt: a wrong password, almost always.
+/// A vault that didn't decrypt: told apart by the decryptor's typed error.
 fn decrypt_error(e: BulkError) -> OpenError {
-    let msg = e.to_string();
-    if msg.contains("wrong password") {
-        OpenError::Unreadable("The password didn't open this Aegis vault.".to_owned())
-    } else {
-        OpenError::Unreadable(format!("The Aegis vault couldn't be opened: {}.", msg))
+    match e {
+        BulkError::WrongPassword => {
+            OpenError::Unreadable("The password didn't open this Aegis vault.".to_owned())
+        }
+        e @ BulkError::Json(_) => OpenError::Unreadable(e.describe("an encrypted Aegis vault")),
+        other => OpenError::Unreadable(format!("The Aegis vault couldn't be opened: {}.", other)),
     }
 }
 
@@ -251,6 +288,93 @@ mod tests {
             open_file(br#"{"db":{"entries":[]}}"#, None, None),
             Err(OpenError::Unreadable(_))
         ));
+    }
+
+    /// Generated once by keyroost-import's `print_qr_fixture` test (its
+    /// doc comment says how to regenerate it); password "keyroost-fixture".
+    const ENCRYPTED_FIXTURE: &str = include_str!("../tests/fixtures/aegis-encrypted.json");
+
+    #[test]
+    fn open_file_decrypts_a_vault_with_the_right_password() {
+        let bytes = ENCRYPTED_FIXTURE.trim_end().as_bytes();
+        assert!(matches!(
+            open_file(bytes, Some("aegis-export.json"), None),
+            Ok(Opened::NeedsPassword)
+        ));
+        let file = match open_file(bytes, None, Some(b"keyroost-fixture")) {
+            Ok(Opened::Entries(f)) => f,
+            other => panic!("expected entries, got {other:?}"),
+        };
+        assert_eq!(file.format, Format::AegisEncrypted);
+        let labels: Vec<_> = file.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Acme:alice", "Bank:bob"]);
+        let e = |i: usize| file.items[i].entry.as_ref().unwrap();
+        assert_eq!(e(0).kind, keyroost_import::OtpKind::Totp { period: 45 });
+        assert_eq!(e(0).hash, keyroost_import::HashAlg::Sha512);
+        assert_eq!(&e(0).secret[..], b"Hello!\xde\xad\xbe\xef");
+        assert_eq!(e(1).kind, keyroost_import::OtpKind::Hotp { counter: 7 });
+        assert!(matches!(
+            open_file(bytes, None, Some(b"keyroost-fixturE")),
+            Err(OpenError::Unreadable(_))
+        ));
+    }
+
+    #[test]
+    fn read_bounded_stops_at_the_cap_while_reading() {
+        // An endless source: only a bounded read can return at all.
+        match read_bounded(std::io::repeat(b'x')) {
+            Err(OpenError::NotImportable(msg)) => assert!(msg.contains("16 MiB"), "{msg}"),
+            other => panic!("expected NotImportable, got {other:?}"),
+        }
+        assert_eq!(read_bounded(&b"abc"[..]).unwrap(), b"abc");
+        let at_cap = std::io::Read::take(std::io::repeat(b'\n'), MAX_FILE_BYTES as u64);
+        assert_eq!(read_bounded(at_cap).unwrap().len(), MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn open_path_reads_a_file_by_name() {
+        let dir =
+            std::env::temp_dir().join(format!("keyroost-qr-open-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export.txt");
+        std::fs::write(&path, "otpauth://hotp/A?secret=JBSWY3DP&counter=3\n").unwrap();
+        let opened = open_path(&path, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+        match opened {
+            Ok(Opened::Entries(f)) => assert_eq!(f.usable(), 1),
+            other => panic!("expected entries, got {other:?}"),
+        }
+        assert!(matches!(
+            open_path(&dir.join("missing.json"), None),
+            Err(OpenError::NotImportable(_))
+        ));
+    }
+
+    #[test]
+    fn errors_never_quote_file_values() {
+        let unread = |bytes: &[u8]| match open_file(bytes, None, None) {
+            Err(OpenError::Unreadable(msg)) => msg,
+            other => panic!("expected Unreadable, got {other:?}"),
+        };
+        // A wrong-typed value: serde would quote it ("invalid type: string").
+        let msg = unread(
+            br#"{"db":{"entries":[{"type":"totp","name":"a","info":{"secret":"JBSWY3DP","digits":"SENTINEL-VALUE"}}]}}"#,
+        );
+        assert!(!msg.contains("SENTINEL"), "{msg}");
+        assert!(
+            msg.starts_with("The file doesn't match the layout of an Aegis export"),
+            "{msg}"
+        );
+        assert!(msg.contains("line 1, column"), "{msg}");
+        // A missing field names the field (from the schema) and where.
+        let msg = unread(br#"{"db":{"entries":[{"type":"totp","name":"SENTINEL","info":{}}]}}"#);
+        assert!(!msg.contains("SENTINEL"), "{msg}");
+        assert!(msg.contains("missing field `secret`"), "{msg}");
+        // Broken JSON isn't recognized as an export at all.
+        match open_file(b"{\"services\": [ {\"name\": \"SENTINEL\"", None, None) {
+            Err(OpenError::NotImportable(msg)) => assert!(!msg.contains("SENTINEL"), "{msg}"),
+            other => panic!("expected NotImportable, got {other:?}"),
+        }
     }
 
     #[test]

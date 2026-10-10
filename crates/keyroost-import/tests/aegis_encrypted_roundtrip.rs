@@ -110,6 +110,8 @@ fn round_trip_decrypts_to_known_plaintext() {
 fn wrong_password_fails_cleanly() {
     let vault = make_vault("the right one", r#"{"entries":[]}"#);
     let err = keyroost_import::aegis::decrypt(&vault, b"the wrong one").unwrap_err();
+    // Typed, so callers never match on the message.
+    assert!(matches!(err, keyroost_import::BulkError::WrongPassword));
     let msg = err.to_string();
     assert!(
         msg.contains("wrong password") || msg.contains("did not decrypt"),
@@ -177,4 +179,34 @@ fn is_encrypted_detects_correctly() {
     let vault = make_vault("p", r#"{"entries":[]}"#);
     assert!(!keyroost_import::aegis::is_encrypted(plaintext).unwrap());
     assert!(keyroost_import::aegis::is_encrypted(&vault).unwrap());
+}
+
+/// The plaintext of the encrypted-vault fixture keyroost-qr's `open_file`
+/// tests read (`crates/keyroost-qr/tests/fixtures/aegis-encrypted.json`).
+const QR_FIXTURE_DB: &str = r#"{"entries":[{"type":"totp","name":"alice","issuer":"Acme","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA512","digits":8,"period":45}},{"type":"hotp","name":"bob","issuer":"Bank","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"counter":7}}]}"#;
+/// The fixture's password. A test value, not a secret.
+const QR_FIXTURE_PASSWORD: &str = "keyroost-fixture";
+
+#[test]
+fn decrypted_vault_reads_wide() {
+    let vault = make_vault(QR_FIXTURE_PASSWORD, QR_FIXTURE_DB);
+    let plain =
+        keyroost_import::aegis::decrypt(&vault, QR_FIXTURE_PASSWORD.as_bytes()).expect("decrypt");
+    let file = keyroost_import::aegis::parse_wide(&plain).expect("parse_wide");
+    assert_eq!(file.usable(), 2);
+    let e = file.items[1].entry.as_ref().unwrap();
+    assert_eq!(e.kind, keyroost_import::OtpKind::Hotp { counter: 7 });
+}
+
+/// Regenerates keyroost-qr's encrypted-vault fixture (deterministic: fixed
+/// salt, nonces and master key). Run with
+/// `cargo test -p keyroost-import --test aegis_encrypted_roundtrip -- --ignored --nocapture print_qr_fixture`
+/// and save the line between the markers as
+/// `crates/keyroost-qr/tests/fixtures/aegis-encrypted.json`.
+#[test]
+#[ignore]
+fn print_qr_fixture() {
+    println!("--- fixture ---");
+    println!("{}", make_vault(QR_FIXTURE_PASSWORD, QR_FIXTURE_DB));
+    println!("--- end ---");
 }

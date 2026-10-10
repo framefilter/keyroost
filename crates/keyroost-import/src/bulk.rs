@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::entry::{
     decode_secret, finish, hash_from_name, name_label, type_from_name, Format, ImportEntry,
-    ImportFile, ImportItem, OtpKind, TypeName, Unusable,
+    ImportFile, ImportItem, OtpKind, TypeName, Unusable, MAX_ENTRIES,
 };
 use crate::otpauth::{parse as parse_otpauth, OtpAuth, OtpAuthError};
 
@@ -99,8 +99,17 @@ pub enum BulkError {
     Json(serde_json::Error),
     Encrypted(&'static str),
     UnsupportedFormat(&'static str),
-    EntryRejected { index: usize, reason: OtpAuthError },
+    EntryRejected {
+        index: usize,
+        reason: OtpAuthError,
+    },
     EmptyFile,
+    /// More than [`MAX_ENTRIES`] entries (wide
+    /// readers only): not an authenticator export.
+    TooManyEntries,
+    /// An encrypted Aegis vault that no password slot opened with the
+    /// password given.
+    WrongPassword,
 }
 
 impl core::fmt::Display for BulkError {
@@ -113,11 +122,65 @@ impl core::fmt::Display for BulkError {
                 write!(f, "entry #{}: {}", index, reason)
             }
             BulkError::EmptyFile => write!(f, "no entries found"),
+            BulkError::TooManyEntries => write!(
+                f,
+                "more than {} entries; this isn't an authenticator export",
+                crate::entry::MAX_ENTRIES
+            ),
+            // Same text the decryptor reported before this had its own
+            // variant, so CLI output is unchanged.
+            BulkError::WrongPassword => {
+                write!(
+                    f,
+                    "unsupported format: wrong password (slot did not decrypt)"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for BulkError {}
+
+impl BulkError {
+    /// A sentence for a person, naming `layout` (e.g. "an Aegis export")
+    /// when the file's JSON doesn't fit it. Never quotes a value from the
+    /// file: serde's own messages can (`invalid type: string "…"`), so a
+    /// JSON problem is told by position, keeping only a missing or repeated
+    /// field's name, which comes from keyroost's schema.
+    pub fn describe(&self, layout: &str) -> String {
+        use serde_json::error::Category;
+        let BulkError::Json(j) = self else {
+            let text = self.to_string();
+            let mut c = text.chars();
+            return match c.next() {
+                Some(first) => format!("{}{}.", first.to_uppercase(), c.as_str()),
+                None => String::new(),
+            };
+        };
+        let at = format!("line {}, column {}", j.line(), j.column());
+        match j.classify() {
+            Category::Syntax | Category::Eof => format!("The file isn't valid JSON ({}).", at),
+            Category::Io => "The file couldn't be read.".to_owned(),
+            Category::Data => {
+                let text = j.to_string();
+                let field = ["missing field `", "duplicate field `"]
+                    .iter()
+                    .find_map(|prefix| {
+                        let name = text.strip_prefix(prefix)?.split('`').next()?;
+                        let schema_like = !name.is_empty()
+                            && name.len() <= 32
+                            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                        schema_like.then(|| format!(": {}`{}`", prefix.trim_end_matches('`'), name))
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "The file doesn't match the layout of {}{} ({}).",
+                    layout, field, at
+                )
+            }
+        }
+    }
+}
 
 impl From<serde_json::Error> for BulkError {
     fn from(e: serde_json::Error) -> Self {
@@ -130,9 +193,12 @@ impl From<serde_json::Error> for BulkError {
 pub mod aegis {
     use super::*;
 
+    // The JSON shape is shared by the narrow (Molto2) and wide mappings; only
+    // the per-entry `info` differs (`EntryInfo` vs `WideInfo`), so that the
+    // narrow path deserializes exactly the fields it always did.
     #[derive(Deserialize)]
-    struct Root {
-        db: DbField,
+    struct Root<I> {
+        db: DbField<I>,
     }
 
     /// The `db` field: a plaintext object (parsed straight into [`Db`]) or, for
@@ -142,56 +208,53 @@ pub mod aegis {
     /// token type directly — the plaintext entries land in the zeroize-on-drop
     /// `Db`/`EntryInfo` without ever transiting a `serde_json::Value` tree
     /// (whose `String` seeds would otherwise drop unscrubbed).
-    enum DbField {
-        Plain(Db),
+    enum DbField<I> {
+        Plain(Db<I>),
         Encrypted,
     }
 
-    impl<'de> serde::Deserialize<'de> for DbField {
+    impl<'de, I: Deserialize<'de>> serde::Deserialize<'de> for DbField<I> {
         fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
             use serde::de::{self, MapAccess, Visitor};
-            struct V;
-            impl<'de> Visitor<'de> for V {
-                type Value = DbField;
+            struct V<I>(std::marker::PhantomData<I>);
+            impl<'de, I: Deserialize<'de>> Visitor<'de> for V<I> {
+                type Value = DbField<I>;
                 fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                     f.write_str("an Aegis db object or an encrypted base64 string")
                 }
-                fn visit_str<E: de::Error>(self, _v: &str) -> Result<DbField, E> {
+                fn visit_str<E: de::Error>(self, _v: &str) -> Result<DbField<I>, E> {
                     // The encrypted blob is not a secret and is not retained.
                     Ok(DbField::Encrypted)
                 }
-                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<DbField, A::Error> {
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<DbField<I>, A::Error> {
                     Db::deserialize(de::value::MapAccessDeserializer::new(map)).map(DbField::Plain)
                 }
             }
-            d.deserialize_any(V)
+            d.deserialize_any(V(std::marker::PhantomData))
         }
     }
 
     #[derive(Deserialize)]
-    struct Db {
-        entries: Vec<Entry>,
+    struct Db<I> {
+        entries: Vec<Entry<I>>,
     }
 
     #[derive(Deserialize)]
-    struct Entry {
+    struct Entry<I> {
         #[serde(rename = "type")]
         typ: String,
         name: Option<String>,
         issuer: Option<String>,
-        info: EntryInfo,
+        info: I,
     }
 
+    /// What the Molto2 path reads of an entry's `info`.
     #[derive(Deserialize)]
     struct EntryInfo {
         secret: String,
         algo: Option<String>,
         digits: Option<u32>,
         period: Option<u32>,
-        /// HOTP counter; read only by the wide mapping. Lenient so a value
-        /// of an unexpected shape never fails a file the Molto2 path reads.
-        #[serde(default, deserialize_with = "super::lenient_u64")]
-        counter: Option<u64>,
     }
 
     // `build_entry` copies the seed into a zeroize-on-drop `BulkEntry`; wipe
@@ -203,10 +266,44 @@ pub mod aegis {
         }
     }
 
+    /// What the wide mapping reads: the same plus the HOTP counter.
+    #[derive(Deserialize)]
+    struct WideInfo {
+        secret: String,
+        algo: Option<String>,
+        digits: Option<u32>,
+        period: Option<u32>,
+        /// Lenient: a counter of an unexpected shape reads as absent.
+        #[serde(default, deserialize_with = "super::lenient_u64")]
+        counter: Option<u64>,
+    }
+
+    impl Drop for WideInfo {
+        fn drop(&mut self) {
+            use zeroize::Zeroize;
+            self.secret.zeroize();
+        }
+    }
+
+    /// How many entries a plaintext export holds, counted without
+    /// materializing any of them; `None` when the shape isn't a plaintext
+    /// Aegis export (the full parse then reports why).
+    fn count_entries(json: &str) -> Option<usize> {
+        #[derive(Deserialize)]
+        struct P {
+            db: PDb,
+        }
+        #[derive(Deserialize)]
+        struct PDb {
+            entries: super::Count,
+        }
+        serde_json::from_str::<P>(json).ok().map(|p| p.db.entries.0)
+    }
+
     /// Read the plaintext `db`, or the encrypted-vault error. Shared by the
     /// narrow (Molto2) and wide mappings.
-    fn read_db(json: &str) -> Result<Db, BulkError> {
-        let root: Root = serde_json::from_str(json)?;
+    fn read_db<I: serde::de::DeserializeOwned>(json: &str) -> Result<Db<I>, BulkError> {
+        let root: Root<I> = serde_json::from_str(json)?;
         match root.db {
             DbField::Plain(db) => Ok(db),
             DbField::Encrypted => {
@@ -220,7 +317,7 @@ pub mod aegis {
     }
 
     pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
-        let db = read_db(json)?;
+        let db = read_db::<EntryInfo>(json)?;
         let mut out = Vec::with_capacity(db.entries.len());
         for (i, e) in db.entries.into_iter().enumerate() {
             if !e.typ.eq_ignore_ascii_case("totp") {
@@ -247,7 +344,10 @@ pub mod aegis {
     /// usable by some key or marked with why not. Whole-file errors: bad
     /// JSON, an encrypted vault (decrypt first), or no entries at all.
     pub fn parse_wide(json: &str) -> Result<ImportFile, BulkError> {
-        let db = read_db(json)?;
+        if count_entries(json).is_some_and(|n| n > MAX_ENTRIES) {
+            return Err(BulkError::TooManyEntries);
+        }
+        let db = read_db::<WideInfo>(json)?;
         let items: Vec<ImportItem> = db
             .entries
             .into_iter()
@@ -321,6 +421,34 @@ pub mod aegis {
         Ok(matches!(root.db, DbProbe::Encrypted))
     }
 
+    /// Whether `json` has the full shape of an encrypted Aegis vault: a
+    /// `version`, a `header` with a `slots` array and a `params` object, and
+    /// a string `db`. Stricter than [`is_encrypted`], which only looks at
+    /// `db`, so an unrelated JSON file with a string `db` isn't taken for a
+    /// vault. Nothing is materialized.
+    pub(crate) fn has_vault_shape(json: &str) -> bool {
+        use serde::de::IgnoredAny;
+        /// Accepts any JSON object (fields ignored); refuses null and
+        /// non-objects.
+        #[derive(Deserialize)]
+        struct AnyObject {}
+        #[derive(Deserialize)]
+        struct Header {
+            #[allow(dead_code)]
+            slots: super::Count,
+            #[allow(dead_code)]
+            params: AnyObject,
+        }
+        #[derive(Deserialize)]
+        struct Vault {
+            #[allow(dead_code)]
+            version: IgnoredAny,
+            #[allow(dead_code)]
+            header: Header,
+        }
+        serde_json::from_str::<Vault>(json).is_ok() && matches!(is_encrypted(json), Ok(true))
+    }
+
     /// Decrypt an Aegis encrypted vault and return the inner plaintext JSON,
     /// which can then be passed back to `parse()`. The returned buffer wipes
     /// itself on drop. Requires the `encrypted` crate feature.
@@ -335,24 +463,27 @@ pub mod aegis {
 pub mod twofas {
     use super::*;
 
+    // As for Aegis, the shape is shared and only `otp` differs between the
+    // narrow (`Otp`) and wide (`WideOtp`) mappings.
     #[derive(Deserialize)]
-    struct Root {
-        #[serde(default)]
-        services: Vec<Service>,
+    #[serde(bound(deserialize = "O: Deserialize<'de> + Default"))]
+    struct Root<O> {
+        #[serde(default = "Vec::new")]
+        services: Vec<Service<O>>,
         #[serde(rename = "servicesEncrypted", default)]
         services_encrypted: Option<String>,
     }
 
     #[derive(Deserialize)]
-    struct Service {
+    struct Service<O> {
         name: Option<String>,
         secret: String,
         #[serde(default)]
-        otp: Otp,
+        otp: O,
     }
 
     // Same hygiene as the Aegis `EntryInfo`: wipe the serde-owned seed copy.
-    impl Drop for Service {
+    impl<O> Drop for Service<O> {
         fn drop(&mut self) {
             use zeroize::Zeroize;
             self.secret.zeroize();
@@ -368,8 +499,19 @@ pub mod twofas {
         algorithm: Option<String>,
         #[serde(rename = "tokenType")]
         token_type: Option<String>,
-        /// HOTP counter; read only by the wide mapping (lenient, as for
-        /// Aegis).
+    }
+
+    /// The wide mapping's `otp`: the same plus the HOTP counter.
+    #[derive(Deserialize, Default)]
+    struct WideOtp {
+        account: Option<String>,
+        issuer: Option<String>,
+        digits: Option<u32>,
+        period: Option<u32>,
+        algorithm: Option<String>,
+        #[serde(rename = "tokenType")]
+        token_type: Option<String>,
+        /// Lenient: a counter of an unexpected shape reads as absent.
         #[serde(default, deserialize_with = "super::lenient_u64")]
         counter: Option<u64>,
     }
@@ -379,31 +521,10 @@ pub mod twofas {
     /// `servicesEncrypted` blob and no plaintext services), `Some(false)`
     /// for a plaintext one, `None` when it is neither (or not a JSON object).
     pub(crate) fn probe(json: &str) -> Option<bool> {
-        use serde::de::{IgnoredAny, SeqAccess, Visitor};
-        /// Number of elements in a JSON array, drained without allocating.
-        struct Count(usize);
-        impl<'de> Deserialize<'de> for Count {
-            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                struct V;
-                impl<'de> Visitor<'de> for V {
-                    type Value = Count;
-                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        f.write_str("a JSON array")
-                    }
-                    fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Count, A::Error> {
-                        let mut n = 0;
-                        while a.next_element::<IgnoredAny>()?.is_some() {
-                            n += 1;
-                        }
-                        Ok(Count(n))
-                    }
-                }
-                d.deserialize_seq(V)
-            }
-        }
+        use serde::de::IgnoredAny;
         #[derive(Deserialize)]
         struct ProbeRoot {
-            services: Option<Count>,
+            services: Option<super::Count>,
             #[serde(rename = "servicesEncrypted")]
             services_encrypted: Option<IgnoredAny>,
         }
@@ -417,9 +538,21 @@ pub mod twofas {
         }
     }
 
+    /// How many services the export lists, counted without materializing
+    /// any; `None` when it has no `services` array.
+    fn count_services(json: &str) -> Option<usize> {
+        #[derive(Deserialize)]
+        struct P {
+            services: super::Count,
+        }
+        serde_json::from_str::<P>(json).ok().map(|p| p.services.0)
+    }
+
     /// Read the plaintext `services`, or the encrypted-export error.
-    fn read_root(json: &str) -> Result<Root, BulkError> {
-        let root: Root = serde_json::from_str(json)?;
+    fn read_root<O: serde::de::DeserializeOwned + Default>(
+        json: &str,
+    ) -> Result<Root<O>, BulkError> {
+        let root: Root<O> = serde_json::from_str(json)?;
         if root.services_encrypted.is_some() && root.services.is_empty() {
             return Err(BulkError::Encrypted(
                 "2FAS export is encrypted; re-export without a password",
@@ -429,7 +562,7 @@ pub mod twofas {
     }
 
     pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
-        let root = read_root(json)?;
+        let root = read_root::<Otp>(json)?;
         let mut out = Vec::with_capacity(root.services.len());
         for (i, mut s) in root.services.into_iter().enumerate() {
             // 2FAS includes Steam etc; skip non-TOTP.
@@ -460,7 +593,10 @@ pub mod twofas {
     /// Every service of a plaintext 2FAS export, in file order (see
     /// [`aegis::parse_wide`] for the contract).
     pub fn parse_wide(json: &str) -> Result<ImportFile, BulkError> {
-        let root = read_root(json)?;
+        if count_services(json).is_some_and(|n| n > MAX_ENTRIES) {
+            return Err(BulkError::TooManyEntries);
+        }
+        let root = read_root::<WideOtp>(json)?;
         let items: Vec<ImportItem> = root
             .services
             .iter()
@@ -499,6 +635,31 @@ pub mod twofas {
     }
 }
 
+/// Number of elements in a JSON array, drained without allocating (the
+/// elements are skipped with `IgnoredAny`; nothing is materialized).
+pub(crate) struct Count(pub(crate) usize);
+
+impl<'de> Deserialize<'de> for Count {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, SeqAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Count;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON array")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Count, A::Error> {
+                let mut n = 0;
+                while a.next_element::<IgnoredAny>()?.is_some() {
+                    n += 1;
+                }
+                Ok(Count(n))
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
 /// One otpauth:// URI per line; blank lines and `#` comments allowed. Useful
 /// for Authy exports done with third-party scripts that emit URI lists.
 pub fn parse_otpauth_list(text: &str) -> Result<Vec<BulkEntry>, BulkError> {
@@ -522,7 +683,8 @@ pub fn parse_otpauth_list(text: &str) -> Result<Vec<BulkEntry>, BulkError> {
 /// holds fails the file: each non-blank, non-`#` line becomes an item (index
 /// = line index), unusable lines carrying their reason. A Google
 /// Authenticator `otpauth-migration://` line contributes all of its entries
-/// under that line's index. Only an empty list is a whole-file error.
+/// under that line's index. Whole-file errors: an empty list, or more than
+/// [`MAX_ENTRIES`] entries.
 pub fn parse_list_wide(text: &str) -> Result<ImportFile, BulkError> {
     let mut items = Vec::new();
     let mut batch = None;
@@ -531,9 +693,18 @@ pub fn parse_list_wide(text: &str) -> Result<ImportFile, BulkError> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // Refuse before building the next item, so a giant file never
+        // grows the list past the cap.
+        if items.len() >= MAX_ENTRIES {
+            return Err(BulkError::TooManyEntries);
+        }
         if crate::migration::is_migration_uri(line) {
             match crate::migration::parse_wide(line) {
+                Err(e @ BulkError::TooManyEntries) => return Err(e),
                 Ok(file) => {
+                    if items.len() + file.items.len() > MAX_ENTRIES {
+                        return Err(BulkError::TooManyEntries);
+                    }
                     batch = batch.or(file.batch);
                     items.extend(file.items.into_iter().map(|mut item| {
                         item.index = i;
@@ -1023,5 +1194,102 @@ mod tests {
             parse_any_wide(r#"{"db":"ZW5j"}"#),
             Err(BulkError::Encrypted(_))
         ));
+    }
+
+    #[test]
+    fn describe_never_quotes_file_values() {
+        let err = |json: &str| {
+            serde_json::from_str::<Vec<u32>>(json)
+                .map(|_| ())
+                .unwrap_err()
+        };
+        let syntax = BulkError::Json(err(r#"[1, "SENTINEL"#)).describe("a list");
+        assert!(!syntax.contains("SENTINEL"), "{syntax}");
+        assert!(
+            syntax.starts_with("The file isn't valid JSON (line 1, column"),
+            "{syntax}"
+        );
+        let data = BulkError::Json(err(r#"[1, "SENTINEL"]"#)).describe("a list");
+        assert!(!data.contains("SENTINEL"), "{data}");
+        assert_eq!(
+            data,
+            "The file doesn't match the layout of a list (line 1, column 14)."
+        );
+        assert_eq!(
+            BulkError::TooManyEntries.describe("x"),
+            "More than 1000 entries; this isn't an authenticator export."
+        );
+    }
+
+    #[test]
+    fn wide_readers_refuse_more_than_max_entries() {
+        use crate::entry::MAX_ENTRIES;
+        // A list: one otpauth line makes the file a list; millions of junk
+        // lines after it must stop at the cap, not become millions of items.
+        let mut huge = String::from("otpauth://totp/A?secret=JBSWY3DP\n");
+        huge.push_str(&"x\n".repeat(5_000_000));
+        assert!(matches!(
+            parse_list_wide(&huge),
+            Err(BulkError::TooManyEntries)
+        ));
+        assert!(matches!(
+            parse_any_wide(&huge),
+            Err(BulkError::TooManyEntries)
+        ));
+        // Exactly at the cap is fine; one more is refused.
+        let line = "otpauth://totp/A?secret=JBSWY3DP\n";
+        assert_eq!(
+            parse_list_wide(&line.repeat(MAX_ENTRIES))
+                .unwrap()
+                .items
+                .len(),
+            MAX_ENTRIES
+        );
+        assert!(matches!(
+            parse_list_wide(&line.repeat(MAX_ENTRIES + 1)),
+            Err(BulkError::TooManyEntries)
+        ));
+        // Migration lines count every entry they carry.
+        let one = crate::migration::tests::otp_params(b"k", "a", "", 1, 1, 2);
+        let six_hundred =
+            crate::migration::tests::uri_for(&crate::migration::tests::payload(&vec![one; 600]));
+        assert!(matches!(
+            parse_list_wide(&format!("{six_hundred}\n{six_hundred}\n")),
+            Err(BulkError::TooManyEntries)
+        ));
+
+        // JSON: counted before any entry is built.
+        let aegis_entry = r#"{"type":"totp","name":"a","issuer":"","info":{"secret":"JBSWY3DP"}}"#;
+        let aegis = |n: usize| {
+            format!(
+                r#"{{"db":{{"entries":[{}]}}}}"#,
+                vec![aegis_entry; n].join(",")
+            )
+        };
+        assert_eq!(
+            aegis::parse_wide(&aegis(MAX_ENTRIES)).unwrap().items.len(),
+            MAX_ENTRIES
+        );
+        assert!(matches!(
+            aegis::parse_wide(&aegis(MAX_ENTRIES + 1)),
+            Err(BulkError::TooManyEntries)
+        ));
+        let service = r#"{"name":"X","secret":"JBSWY3DP"}"#;
+        let twofas = |n: usize| format!(r#"{{"services":[{}]}}"#, vec![service; n].join(","));
+        assert_eq!(
+            twofas::parse_wide(&twofas(MAX_ENTRIES))
+                .unwrap()
+                .items
+                .len(),
+            MAX_ENTRIES
+        );
+        assert!(matches!(
+            twofas::parse_wide(&twofas(MAX_ENTRIES + 1)),
+            Err(BulkError::TooManyEntries)
+        ));
+        assert_eq!(
+            BulkError::TooManyEntries.to_string(),
+            "more than 1000 entries; this isn't an authenticator export"
+        );
     }
 }

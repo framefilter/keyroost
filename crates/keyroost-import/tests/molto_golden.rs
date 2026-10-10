@@ -6,16 +6,64 @@
 //! file pins every result the Molto2 path produces today — the exact `Debug`
 //! of each accepted entry and the exact text of each error — so any change to
 //! what a Molto2 import accepts, skips or reports shows up here first.
+//!
+//! `Debug` shows a seed only as its length, so each accepted result also
+//! carries a SHA-256 fingerprint of its decoded seeds (`seeds=…`): a change
+//! to the decoded bytes fails here without any seed ever being printed.
 
-#![cfg(feature = "bulk")]
+// The suite must never compile to zero tests: the crate's dev-dependency on
+// itself turns `bulk` on for `cargo test`, and losing that should be loud.
+#[cfg(not(feature = "bulk"))]
+compile_error!("molto_golden needs keyroost-import's `bulk` feature (see [dev-dependencies])");
 
-use keyroost_import::{aegis, migration, otpauth, parse_bulk_any, parse_otpauth_list, twofas};
+use keyroost_import::migration::Migration;
+use keyroost_import::{
+    aegis, migration, otpauth, parse_bulk_any, parse_otpauth_list, twofas, BulkEntry, OtpAuth,
+};
 
-/// Render a parse result: `Ok` as the `Debug` of the value, `Err` as the
-/// error's `Display` text, prefixed so the two can't be confused.
-fn render<T: std::fmt::Debug, E: std::fmt::Display>(r: Result<T, E>) -> String {
+/// The decoded seeds a parse result carries, in order.
+trait Seeds {
+    fn seeds(&self) -> Vec<&[u8]>;
+}
+
+impl Seeds for Vec<BulkEntry> {
+    fn seeds(&self) -> Vec<&[u8]> {
+        self.iter().map(|e| &e.secret[..]).collect()
+    }
+}
+
+impl Seeds for Migration {
+    fn seeds(&self) -> Vec<&[u8]> {
+        self.entries.seeds()
+    }
+}
+
+impl Seeds for OtpAuth {
+    fn seeds(&self) -> Vec<&[u8]> {
+        vec![&self.secret[..]]
+    }
+}
+
+/// First 8 bytes of SHA-256 over the length-prefixed seeds, as hex. Enough
+/// to catch any change; never enough to recover a seed.
+fn fingerprint(seeds: &[&[u8]]) -> String {
+    let mut buf = Vec::new();
+    for s in seeds {
+        buf.extend((s.len() as u32).to_be_bytes());
+        buf.extend(*s);
+    }
+    keyroost_proto::sha256::sha256(&buf)[..8]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// Render a parse result: `Ok` as the `Debug` of the value plus its seed
+/// fingerprint, `Err` as the error's `Display` text, prefixed so the two
+/// can't be confused.
+fn render<T: std::fmt::Debug + Seeds, E: std::fmt::Display>(r: Result<T, E>) -> String {
     match r {
-        Ok(v) => format!("Ok {:?}", v),
+        Ok(v) => format!("Ok {:?} seeds={}", v, fingerprint(&v.seeds())),
         Err(e) => format!("Err {}", e),
     }
 }
@@ -38,6 +86,9 @@ const AEGIS_BAD_B32: &str = r#"{"type":"totp","name":"bad","issuer":"Bad","info"
 // 103 base32 'A's decode to 64 bytes: one past the Molto2's 63-byte cap.
 const AEGIS_SECRET64: &str = r#"{"type":"totp","name":"long","issuer":"Long","info":{"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","algo":"SHA1","digits":6,"period":30}}"#;
 const AEGIS_EMPTY_ISSUER: &str = r#"{"type":"totp","name":"bob","issuer":"","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA256","digits":8,"period":60}}"#;
+
+// A repeated `counter` key: ignored by the Molto2 path, which never reads it.
+const AEGIS_DUP_COUNTER: &str = r#"{"type":"totp","name":"dup","issuer":"Dup","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"period":30,"counter":1,"counter":2}}"#;
 
 fn aegis_doc(entries: &[&str]) -> String {
     format!(
@@ -71,7 +122,7 @@ fn aegis_golden() {
         ),
         (
             aegis_doc(&[AEGIS_TOTP]),
-            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }] seeds=28a80c694c646832"#,
         ),
         (aegis_doc(&[AEGIS_HOTP]), r#"Err no entries found"#),
         (aegis_doc(&[AEGIS_STEAM]), r#"Err no entries found"#),
@@ -101,11 +152,15 @@ fn aegis_golden() {
         ),
         (
             aegis_doc(&[AEGIS_EMPTY_ISSUER]),
-            r#"Ok [BulkEntry { issuer: None, account: Some("bob"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }]"#,
+            r#"Ok [BulkEntry { issuer: None, account: Some("bob"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }] seeds=28a80c694c646832"#,
         ),
         (
             aegis_doc(&[AEGIS_TOTP, AEGIS_HOTP, AEGIS_STEAM, AEGIS_EMPTY_ISSUER]),
-            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: None, account: Some("bob"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: None, account: Some("bob"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }] seeds=e9c6ce20dfd4da62"#,
+        ),
+        (
+            aegis_doc(&[AEGIS_DUP_COUNTER]),
+            r#"Ok [BulkEntry { issuer: Some("Dup"), account: Some("dup"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }] seeds=28a80c694c646832"#,
         ),
         (
             r#"{"db":"ZW5jcnlwdGVk","header":{}}"#.to_owned(),
@@ -127,6 +182,7 @@ fn aegis_golden() {
 const TWOFAS_PLAIN: &str = r#"{"services":[{"name":"Stripe","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"ops@example.com","issuer":"Stripe","digits":8,"period":60,"algorithm":"SHA256","tokenType":"TOTP"}},{"name":"NoIssuer","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me"}}]}"#;
 const TWOFAS_ENCRYPTED: &str = r#"{"servicesEncrypted":"c2VjcmV0","services":[]}"#;
 const TWOFAS_HOTP: &str = r#"{"services":[{"name":"Bank","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me","issuer":"Bank","digits":6,"counter":3,"algorithm":"SHA1","tokenType":"HOTP"}}]}"#;
+const TWOFAS_DUP_COUNTER: &str = r#"{"services":[{"name":"Dup","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me","counter":1,"counter":2,"tokenType":"TOTP"}}]}"#;
 const TWOFAS_MIXED: &str = r#"{"services":[{"name":"Bank","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me","issuer":"Bank","counter":3,"tokenType":"HOTP"}},{"name":"Mail","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"you","tokenType":"TOTP"}}]}"#;
 
 #[test]
@@ -134,7 +190,7 @@ fn twofas_golden() {
     let cases: &[(&str, &str)] = &[
         (
             TWOFAS_PLAIN,
-            r#"Ok [BulkEntry { issuer: Some("Stripe"), account: Some("ops@example.com"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }, BulkEntry { issuer: Some("NoIssuer"), account: Some("me"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("Stripe"), account: Some("ops@example.com"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }, BulkEntry { issuer: Some("NoIssuer"), account: Some("me"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }] seeds=e9c6ce20dfd4da62"#,
         ),
         (
             TWOFAS_ENCRYPTED,
@@ -143,7 +199,11 @@ fn twofas_golden() {
         (TWOFAS_HOTP, r#"Err no entries found"#),
         (
             TWOFAS_MIXED,
-            r#"Ok [BulkEntry { issuer: Some("Mail"), account: Some("you"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("Mail"), account: Some("you"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }] seeds=28a80c694c646832"#,
+        ),
+        (
+            TWOFAS_DUP_COUNTER,
+            r#"Ok [BulkEntry { issuer: Some("Dup"), account: Some("me"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }] seeds=28a80c694c646832"#,
         ),
     ];
     let mut mismatches = Vec::new();
@@ -169,7 +229,7 @@ fn otpauth_list_golden() {
     let cases: &[(&str, &str)] = &[
         (
             LIST_OK,
-            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("me@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: None, account: Some("GitLab"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("me@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: None, account: Some("GitLab"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }] seeds=e9c6ce20dfd4da62"#,
         ),
         (
             LIST_HOTP,
@@ -199,12 +259,12 @@ fn parse_any_golden() {
     let cases: &[(String, &str)] = &[
         (
             aegis_doc(&[AEGIS_TOTP, AEGIS_HOTP]),
-            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }] seeds=28a80c694c646832"#,
         ),
         (aegis_corpus(), r#"Err no entries found"#),
         (
             TWOFAS_PLAIN.to_owned(),
-            r#"Ok [BulkEntry { issuer: Some("Stripe"), account: Some("ops@example.com"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }, BulkEntry { issuer: Some("NoIssuer"), account: Some("me"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("Stripe"), account: Some("ops@example.com"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }, BulkEntry { issuer: Some("NoIssuer"), account: Some("me"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }] seeds=e9c6ce20dfd4da62"#,
         ),
         (
             TWOFAS_ENCRYPTED.to_owned(),
@@ -218,7 +278,7 @@ fn parse_any_golden() {
         (r#"{"neither":true}"#.to_owned(), r#"Err no entries found"#),
         (
             LIST_OK.to_owned(),
-            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("me@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: None, account: Some("GitLab"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }]"#,
+            r#"Ok [BulkEntry { issuer: Some("GitHub"), account: Some("me@example.com"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: None, account: Some("GitLab"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }] seeds=e9c6ce20dfd4da62"#,
         ),
         (
             LIST_PERIOD45.to_owned(),
@@ -290,11 +350,11 @@ fn migration_golden() {
     let cases: &[(Vec<u8>, &str)] = &[
         (
             migration_corpus(),
-            r#"Ok Migration { entries: [BulkEntry { issuer: Some("Acme"), account: Some("alice"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: Some("Eight"), account: Some("bob"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds30 }], skipped: [Skipped { label: "Legacy", reason: "HOTP is not supported by the Molto2" }, Skipped { label: "Wide:wide", reason: "only SHA-1 / SHA-256 are supported" }, Skipped { label: "Old:old", reason: "only SHA-1 / SHA-256 are supported" }, Skipped { label: "long", reason: "secret must be 1..=63 bytes" }], batch: Some((1, 3)) }"#,
+            r#"Ok Migration { entries: [BulkEntry { issuer: Some("Acme"), account: Some("alice"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }, BulkEntry { issuer: Some("Eight"), account: Some("bob"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds30 }], skipped: [Skipped { label: "Legacy", reason: "HOTP is not supported by the Molto2" }, Skipped { label: "Wide:wide", reason: "only SHA-1 / SHA-256 are supported" }, Skipped { label: "Old:old", reason: "only SHA-1 / SHA-256 are supported" }, Skipped { label: "long", reason: "secret must be 1..=63 bytes" }], batch: Some((1, 3)) } seeds=706a029dcd81bd50"#,
         ),
         (
             payload(&[otp_params(b"counterkey", "Legacy", "", 1, 1, 1, 7)], None),
-            r#"Ok Migration { entries: [], skipped: [Skipped { label: "Legacy", reason: "HOTP is not supported by the Molto2" }], batch: None }"#,
+            r#"Ok Migration { entries: [], skipped: [Skipped { label: "Legacy", reason: "HOTP is not supported by the Molto2" }], batch: None } seeds=e3b0c44298fc1c14"#,
         ),
         (
             payload(&[], None),
@@ -320,9 +380,9 @@ fn migration_golden() {
 #[test]
 fn otpauth_golden() {
     let cases: &[(&str, &str)] = &[
-        ("otpauth://totp/Acme:alice%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme+Co&algorithm=SHA256&digits=8&period=60", r#"Ok OtpAuth { issuer: Some("Acme Co"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 }"#),
-        ("otpauth://totp/plain?secret=JBSWY3DPEHPK3PXP", r#"Ok OtpAuth { issuer: None, account: Some("plain"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }"#),
-        ("otpauth://totp/:?secret=JBSWY3DPEHPK3PXP&issuer=", r#"Ok OtpAuth { issuer: None, account: None, secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 }"#),
+        ("otpauth://totp/Acme:alice%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme+Co&algorithm=SHA256&digits=8&period=60", r#"Ok OtpAuth { issuer: Some("Acme Co"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 } seeds=28a80c694c646832"#),
+        ("otpauth://totp/plain?secret=JBSWY3DPEHPK3PXP", r#"Ok OtpAuth { issuer: None, account: Some("plain"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
+        ("otpauth://totp/:?secret=JBSWY3DPEHPK3PXP&issuer=", r#"Ok OtpAuth { issuer: None, account: None, secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
         ("otpauth://hotp/X:a?secret=JBSWY3DPEHPK3PXP&counter=5", r#"Err unsupported OTP type "hotp" (only totp is supported)"#),
         ("otpauth://steam/X?secret=JBSWY3DPEHPK3PXP", r#"Err unsupported OTP type "steam" (only totp is supported)"#),
         ("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP&period=45", r#"Err period=45s not supported by Molto2 (30 or 60)"#),
@@ -335,6 +395,18 @@ fn otpauth_golden() {
         ("otpauth://totp/X", r#"Err URI is missing the `secret` parameter"#),
         ("otpauth://totp?secret=JBSWY3DPEHPK3PXP", r#"Err malformed URI: missing label"#),
         ("otpauth://totp/%ZZ?secret=JBSWY3DPEHPK3PXP", r#"Err malformed URI: label percent-encoding"#),
+        ("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP&&issuer=%ZZ", r#"Err malformed URI: query value percent-encoding"#),
+        ("otpauth://totp/X?secret&secret=JBSWY3DPEHPK3PXP", r#"Ok OtpAuth { issuer: None, account: Some("X"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
+        ("otpauth://totp/X?secret=AAAAAAAA&secret=JBSWY3DPEHPK3PXP", r#"Ok OtpAuth { issuer: None, account: Some("X"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
+        ("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP&secret=AAAAAAAA", r#"Ok OtpAuth { issuer: None, account: Some("X"), secret: [5 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=0c66ac2aebbddaf9"#),
+        ("otpauth://totp/X?issuer=A+B%20C&secret=JBSWY3DPEHPK3PXP&image=x&counter=zz", r#"Ok OtpAuth { issuer: Some("A B C"), account: Some("X"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
+        ("otpauth://totp/a/b:c?secret=JBSWY3DPEHPK3PXP", r#"Ok OtpAuth { issuer: Some("a/b"), account: Some("c"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
+        ("otpauth://totp/X?algorithm=SHA512&digits=7&secret=JBSWY3DPEHPK3PXP", r#"Err algorithm "SHA512" not supported by Molto2 (SHA1 or SHA256 only)"#),
+        ("otpauth://totp/X?digits=7&algorithm=SHA512&secret=JBSWY3DPEHPK3PXP", r#"Err digits=7 not supported by Molto2 (4, 6, 8, or 10)"#),
+        ("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP&period=60&period=45", r#"Err period=45s not supported by Molto2 (30 or 60)"#),
+        ("otpauth://TOTP/X?SECRET=JBSWY3DPEHPK3PXP", r#"Err URI is missing the `secret` parameter"#),
+        ("otpauth://totp/X?secret=jbswy3dpehpk3pxp&issuer=", r#"Ok OtpAuth { issuer: None, account: Some("X"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
+        ("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP#frag", r#"Err `secret` is not valid base32"#),
         ("https://example.com", r#"Err not an otpauth:// URI"#),
     ];
     let mut mismatches = Vec::new();

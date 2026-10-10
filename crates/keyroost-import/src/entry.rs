@@ -8,6 +8,12 @@ use zeroize::Zeroizing;
 /// limits are applied later, against the destination, not here.
 pub(crate) const MAX_SECRET_BYTES: usize = 255;
 
+/// Most entries a wide reader takes from one file. Far above any real
+/// authenticator export (a few hundred at most); a file past it is refused
+/// as a whole before more items are built, which bounds the memory a
+/// hostile file can make the readers allocate.
+pub const MAX_ENTRIES: usize = 1000;
+
 /// HMAC hash named by the entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlg {
@@ -77,16 +83,15 @@ impl core::fmt::Display for Unusable {
             Unusable::BadSecret => {
                 write!(f, "the secret is missing, too long or isn't valid base32")
             }
-            Unusable::Type(t) => {
-                let name = match t.to_ascii_lowercase().as_str() {
-                    "steam" => "Steam".to_owned(),
-                    "motp" => "mOTP".to_owned(),
-                    "yandex" => "Yandex".to_owned(),
-                    _ => t.clone(),
-                };
-                write!(f, "{} codes aren't supported", name)
-            }
-            Unusable::Hash(h) => write!(f, "{} isn't supported", h),
+            Unusable::Type(t) => match t.to_ascii_lowercase().as_str() {
+                "steam" => write!(f, "Steam codes aren't supported"),
+                "motp" => write!(f, "mOTP codes aren't supported"),
+                "yandex" => write!(f, "Yandex codes aren't supported"),
+                _ if is_plain_name(t) => write!(f, "{} codes aren't supported", t),
+                _ => write!(f, "codes of this type aren't supported"),
+            },
+            Unusable::Hash(h) if is_plain_name(h) => write!(f, "{} isn't supported", h),
+            Unusable::Hash(_) => write!(f, "this hash algorithm isn't supported"),
             Unusable::Digits(d) => write!(f, "{}-digit codes aren't supported", d),
             Unusable::Period(p) => write!(f, "a {}-second period isn't supported", p),
             Unusable::Malformed(what) => write!(f, "{}", what),
@@ -95,6 +100,16 @@ impl core::fmt::Display for Unusable {
 }
 
 impl std::error::Error for Unusable {}
+
+/// A type or hash name short and plain enough to repeat back in a message
+/// (letters, digits, '-', '_', ' '; at most 16 bytes). Anything else in a
+/// file isn't echoed.
+fn is_plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 16
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b' '))
+}
 
 /// One entry of a file, in file order.
 #[derive(Debug)]
@@ -294,6 +309,20 @@ mod tests {
         assert_eq!(
             Unusable::Hash("MD5".into()).to_string(),
             "MD5 isn't supported"
+        );
+        // File values that aren't plain short names are never echoed.
+        let odd = "<b>x</b>\u{1b}[31mAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(
+            Unusable::Type(odd.into()).to_string(),
+            "codes of this type aren't supported"
+        );
+        assert_eq!(
+            Unusable::Hash(odd.into()).to_string(),
+            "this hash algorithm isn't supported"
+        );
+        assert_eq!(
+            Unusable::Type("type 3".into()).to_string(),
+            "type 3 codes aren't supported"
         );
         assert_eq!(
             Unusable::Digits(7).to_string(),

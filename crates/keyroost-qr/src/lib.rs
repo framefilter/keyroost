@@ -19,7 +19,7 @@ pub mod file;
 pub use file::{open_file, OpenError, Opened};
 
 use keyroost_import::migration;
-use keyroost_import::{BulkEntry, Format, ImportFile, ImportItem, OtpAuth, Unusable};
+use keyroost_import::{BulkEntry, BulkError, Format, ImportFile, ImportItem, OtpAuth, Unusable};
 
 /// Refuse images larger than this many pixels before allocating the
 /// grayscale buffer. 16 MP comfortably covers any screenshot (a 4K display
@@ -41,6 +41,10 @@ pub enum QrError {
     NotOtpauth,
     /// The payload parsed as otpauth/migration but was invalid.
     Payload(String),
+    /// The codes in the image carry more than
+    /// [`MAX_ENTRIES`](keyroost_import::entry::MAX_ENTRIES) accounts (wide
+    /// reading only).
+    TooManyEntries,
 }
 
 impl std::fmt::Display for QrError {
@@ -68,6 +72,7 @@ impl std::fmt::Display for QrError {
                  Google Authenticator export"
             ),
             QrError::Payload(e) => write!(f, "QR payload invalid: {}", e),
+            QrError::TooManyEntries => write!(f, "{}", keyroost_import::BulkError::TooManyEntries),
         }
     }
 }
@@ -236,12 +241,20 @@ fn file_from_texts(texts: &[String]) -> Result<ImportFile, QrError> {
     let mut any_parsed = false;
     let mut payload_err: Option<String> = None;
     for text in texts {
+        // Refuse before building the next item (see `MAX_ENTRIES`).
+        if items.len() >= keyroost_import::entry::MAX_ENTRIES {
+            return Err(QrError::TooManyEntries);
+        }
         let text = text.trim();
         if migration::is_migration_uri(text) {
             any_otpauth = true;
             any_migration = true;
             match migration::parse_wide(text) {
+                Err(BulkError::TooManyEntries) => return Err(QrError::TooManyEntries),
                 Ok(file) => {
+                    if items.len() + file.items.len() > keyroost_import::entry::MAX_ENTRIES {
+                        return Err(QrError::TooManyEntries);
+                    }
                     any_parsed = true;
                     batch = batch.or(file.batch);
                     items.extend(file.items);
@@ -424,6 +437,18 @@ mod tests {
                 (2, "Game", Some(Unusable::Type("steam".into()))),
             ]
         );
+    }
+
+    #[test]
+    fn wide_refuses_more_than_max_entries() {
+        let code = "otpauth://totp/X?secret=JBSWY3DP".to_string();
+        let at_cap = vec![code.clone(); keyroost_import::entry::MAX_ENTRIES];
+        assert_eq!(file_from_texts(&at_cap).unwrap().items.len(), at_cap.len());
+        let over = vec![code; keyroost_import::entry::MAX_ENTRIES + 1];
+        assert!(matches!(
+            file_from_texts(&over),
+            Err(QrError::TooManyEntries)
+        ));
     }
 
     #[test]

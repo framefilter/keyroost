@@ -151,7 +151,7 @@ fn try_unlock_slot(
     let slot_ct = hex_decode(&slot.key, "slot key ciphertext")?;
     let master_key = Zeroizing::new(
         gcm_decrypt(kek.as_ref(), &slot_nonce, &slot_ct, &slot_tag)
-            .map_err(|()| BulkError::UnsupportedFormat("wrong password (slot did not decrypt)"))?,
+            .map_err(|()| BulkError::WrongPassword)?,
     );
     if master_key.len() != 32 {
         return Err(BulkError::UnsupportedFormat(

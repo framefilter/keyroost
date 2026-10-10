@@ -123,17 +123,14 @@ impl OtpAuth {
 /// Parse an otpauth:// URI into a normalized form. Returns specific errors for
 /// each kind of mismatch with what Molto2 can program.
 pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
-    const PREFIX: &str = "otpauth://";
-    let rest = uri.strip_prefix(PREFIX).ok_or(OtpAuthError::NotOtpAuth)?;
-
-    // TYPE/LABEL?QUERY
-    let (typ_label, query) = match rest.split_once('?') {
-        Some((a, b)) => (a, b),
-        None => (rest, ""),
-    };
-    let (typ, label_raw) = typ_label
-        .split_once('/')
-        .ok_or(OtpAuthError::Malformed("missing label"))?;
+    let UriParts {
+        typ,
+        label_raw,
+        query,
+    } = split_uri(uri).map_err(|e| match e {
+        SplitError::NotOtpAuth => OtpAuthError::NotOtpAuth,
+        SplitError::NoLabel => OtpAuthError::Malformed("missing label"),
+    })?;
     if !typ.eq_ignore_ascii_case("totp") {
         return Err(OtpAuthError::UnsupportedType(typ.to_owned()));
     }
@@ -152,13 +149,11 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
     let mut digits = OtpDigits::Six;
     let mut period: u32 = 30;
 
-    for kv in query.split('&').filter(|s| !s.is_empty()) {
-        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-        let v = percent_decode(v)
-            .map_err(|_| OtpAuthError::Malformed("query value percent-encoding"))?;
+    for (k, v) in query_params(query) {
+        let v = v.map_err(|_| OtpAuthError::Malformed("query value percent-encoding"))?;
         match k {
-            "secret" => secret_b32 = Some(zeroize::Zeroizing::new(v)),
-            "issuer" => issuer_param = Some(v),
+            "secret" => secret_b32 = Some(v),
+            "issuer" => issuer_param = Some(v.to_string()),
             "algorithm" => match v.to_ascii_uppercase().as_str() {
                 "SHA1" => algorithm = HmacAlgo::Sha1,
                 "SHA256" => algorithm = HmacAlgo::Sha256,
@@ -232,14 +227,18 @@ pub fn parse_entry(uri: &str) -> Result<ImportEntry, Unusable> {
 /// whichever half it has), even when the entry itself is unusable — so a
 /// list or a QR screenshot can say which account failed.
 pub fn parse_entry_labeled(uri: &str) -> (Option<String>, Result<ImportEntry, Unusable>) {
-    let rest = match uri.strip_prefix("otpauth://") {
-        Some(r) => r,
-        None => return (None, Err(Unusable::Malformed("not an otpauth:// URI"))),
-    };
-    let (typ_label, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let (typ, label_raw) = match typ_label.split_once('/') {
-        Some(parts) => parts,
-        None => return (None, Err(Unusable::Malformed("the URI has no label"))),
+    let UriParts {
+        typ,
+        label_raw,
+        query,
+    } = match split_uri(uri) {
+        Ok(parts) => parts,
+        Err(SplitError::NotOtpAuth) => {
+            return (None, Err(Unusable::Malformed("not an otpauth:// URI")))
+        }
+        Err(SplitError::NoLabel) => {
+            return (None, Err(Unusable::Malformed("the URI has no label")))
+        }
     };
     // Same label rule as `parse`: a path segment keeps a literal '+'.
     let label = match percent_decode_keep_plus(label_raw) {
@@ -265,10 +264,9 @@ pub fn parse_entry_labeled(uri: &str) -> (Option<String>, Result<ImportEntry, Un
     let mut period: u32 = 30;
     let mut counter: u64 = 0;
     let mut malformed: Option<&'static str> = None;
-    for kv in query.split('&').filter(|s| !s.is_empty()) {
-        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-        let v = match percent_decode(v) {
-            Ok(v) => zeroize::Zeroizing::new(v),
+    for (k, v) in query_params(query) {
+        let v = match v {
+            Ok(v) => v,
             Err(()) => {
                 malformed.get_or_insert("a parameter's percent-encoding is invalid");
                 continue;
@@ -319,6 +317,46 @@ pub fn parse_entry_labeled(uri: &str) -> (Option<String>, Result<ImportEntry, Un
         crate::entry::finish(issuer, account, secret, hash, digits, kind)
     })();
     (name, entry)
+}
+
+/// The three parts of `otpauth://TYPE/LABEL?QUERY`, undecoded.
+struct UriParts<'a> {
+    typ: &'a str,
+    label_raw: &'a str,
+    query: &'a str,
+}
+
+enum SplitError {
+    NotOtpAuth,
+    NoLabel,
+}
+
+/// The one URI splitter both otpauth parsers ([`parse`], [`parse_entry`])
+/// use, so they can't disagree on what the type, label and query are.
+fn split_uri(uri: &str) -> Result<UriParts<'_>, SplitError> {
+    let rest = uri
+        .strip_prefix("otpauth://")
+        .ok_or(SplitError::NotOtpAuth)?;
+    let (typ_label, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (typ, label_raw) = typ_label.split_once('/').ok_or(SplitError::NoLabel)?;
+    Ok(UriParts {
+        typ,
+        label_raw,
+        query,
+    })
+}
+
+/// The query's `key=value` pairs in order, each value form-decoded ('+' is
+/// a space) into a wipe-on-drop buffer, or `Err` for bad percent-encoding.
+/// A pair without '=' has an empty value; empty pairs are skipped. Shared by
+/// both otpauth parsers; each applies its own rules to the values.
+fn query_params(
+    query: &str,
+) -> impl Iterator<Item = (&str, Result<zeroize::Zeroizing<String>, ()>)> {
+    query.split('&').filter(|s| !s.is_empty()).map(|kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (k, percent_decode(v).map(zeroize::Zeroizing::new))
+    })
 }
 
 /// Split an `Issuer:account` label on its first colon (both halves trimmed);
