@@ -38,9 +38,10 @@ pub use names::{
     set_key_name, KeyLabel, NameSource, NameUpdate, Naming,
 };
 pub use select::{
-    device_value, endpoint, list_number, list_order, parse_device_spec, resolve_target, row_label,
-    rows_matching, selection_needs_key_names, shell_quote, Candidate, Choice, DeviceSpec, Need,
-    NoPicker, Picker, SelectError, SelectedBy, Selector, Target,
+    device_value, endpoint, list_number, list_order, molto_reader_serial, parse_device_spec,
+    resolve_target, resolve_target_reading, row_label, rows_matching, selection_needs_key_names,
+    shell_quote, Candidate, Choice, DeviceSpec, Need, NoPicker, Picker, SelectError, SelectedBy,
+    Selector, Target,
 };
 
 /// USB vendor ID for Yubico keys, which expose no USB `iSerialNumber`.

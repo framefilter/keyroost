@@ -145,6 +145,27 @@ pub fn list_number(devices: &[Device], index: usize) -> Option<usize> {
         .map(|p| p + 1)
 }
 
+/// The USB serial a Molto2's reader name carries in parentheses
+/// (`TOKEN2 Molto2 (5C7D6241EF67245B) 02 00` → `5C7D6241EF67245B`), as
+/// `list` shows it. The row's own serial stays empty: the token's card
+/// serial is read only on demand (see [`resolve_target_reading`]).
+pub fn molto_reader_serial(reader: &str) -> Option<&str> {
+    let (_, rest) = reader.split_once('(')?;
+    let (serial, _) = rest.split_once(')')?;
+    (!serial.is_empty()).then_some(serial)
+}
+
+/// Whether `d` answers to serial `s` (case-insensitive): its own serial,
+/// or for a Molto2 the serial in its reader name.
+fn has_serial(d: &Device, s: &str) -> bool {
+    d.serial.eq_ignore_ascii_case(s)
+        || (d.kind == DeviceKind::Token
+            && d.reader
+                .as_deref()
+                .and_then(molto_reader_serial)
+                .is_some_and(|r| r.eq_ignore_ascii_case(s)))
+}
+
 /// Every row `spec` names, in list order, each once.
 pub fn rows_matching(devices: &[Device], spec: DeviceSpec<'_>) -> Vec<usize> {
     let order = list_order(devices);
@@ -161,7 +182,7 @@ pub fn rows_matching(devices: &[Device], spec: DeviceSpec<'_>) -> Vec<usize> {
         order
             .iter()
             .copied()
-            .filter(|&i| !s.is_empty() && devices[i].serial.eq_ignore_ascii_case(s))
+            .filter(|&i| !s.is_empty() && has_serial(&devices[i], s))
             .collect()
     };
     let by_number = |k: usize| -> Vec<usize> {
@@ -207,7 +228,7 @@ pub fn selection_needs_key_names(devices: &[Device], sel: &Selector<'_>, need: N
         Some(DeviceSpec::Serial(_) | DeviceSpec::Number(_) | DeviceSpec::BadNumber(_)) => false,
         Some(DeviceSpec::Name(_)) => true,
         Some(DeviceSpec::Any(v)) => {
-            let serial = !v.is_empty() && devices.iter().any(|d| d.serial.eq_ignore_ascii_case(v));
+            let serial = !v.is_empty() && devices.iter().any(|d| has_serial(d, v));
             let number = parse_number(v).is_some_and(|k| (1..=devices.len()).contains(&k));
             !(serial || number)
         }
@@ -559,6 +580,35 @@ pub fn resolve_target<'d>(
     need: Need,
     picker: &mut dyn Picker,
 ) -> Result<Target<'d>, SelectError> {
+    resolve(devices, sel, need, picker, None)
+}
+
+/// [`resolve_target`], plus one more way to match `--device`: when the
+/// value (bare or `serial:`) matches no row, each connected Molto2's card
+/// serial is read with `card_serial` (the serial `molto info` and the GUI
+/// show) and compared. The card is contacted only then, and only for
+/// Molto2 rows: a Molto2 is slow to start a session, so no other lookup
+/// waits on it. `card_serial` returns `None` for a card it couldn't read.
+pub fn resolve_target_reading<'d>(
+    devices: &'d [Device],
+    sel: &Selector<'_>,
+    need: Need,
+    picker: &mut dyn Picker,
+    card_serial: &mut dyn FnMut(&Device) -> Option<String>,
+) -> Result<Target<'d>, SelectError> {
+    resolve(devices, sel, need, picker, Some(card_serial))
+}
+
+/// Reads a Molto2's card serial (see [`resolve_target_reading`]).
+type CardSerial<'a> = dyn FnMut(&Device) -> Option<String> + 'a;
+
+fn resolve<'d>(
+    devices: &'d [Device],
+    sel: &Selector<'_>,
+    need: Need,
+    picker: &mut dyn Picker,
+    card_serial: Option<&mut CardSerial<'_>>,
+) -> Result<Target<'d>, SelectError> {
     let given = usize::from(sel.device.is_some())
         + usize::from(sel.reader.is_some())
         + usize::from(sel.path.is_some());
@@ -588,7 +638,7 @@ pub fn resolve_target<'d>(
 
     if let Some(v) = sel.device {
         let spec = parse_device_spec(v);
-        let rows = rows_matching(devices, spec);
+        let mut rows = rows_matching(devices, spec);
         // No key this computer first saw with that name, but other keys carry
         // it: say so and name each by a value that selects it.
         let named = match spec {
@@ -607,6 +657,20 @@ pub fn resolve_target<'d>(
                     .collect()
             })
             .unwrap_or_default();
+        if let (true, true, Some(read), DeviceSpec::Any(s) | DeviceSpec::Serial(s)) =
+            (rows.is_empty(), newcomers.is_empty(), card_serial, spec)
+        {
+            if !s.is_empty() {
+                rows = order
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        devices[i].kind == DeviceKind::Token && devices[i].reader.is_some()
+                    })
+                    .filter(|&i| read(&devices[i]).is_some_and(|c| c.eq_ignore_ascii_case(s)))
+                    .collect();
+            }
+        }
         return match rows.as_slice() {
             [] if !newcomers.is_empty() => Err(SelectError::NameNotConnected {
                 value: named.unwrap_or(v).to_string(),
@@ -1019,6 +1083,161 @@ mod tests {
         assert!(matches!(
             resolve_target(&devs, &sel(Some("9"), None, None), Need::Any, &mut NoPicker),
             Err(SelectError::NotFound { .. })
+        ));
+    }
+
+    /// A Molto2 as PC/SC lists it: its USB serial in the reader name, no
+    /// serial on the row (the card's own serial is read only on demand).
+    fn molto_named() -> Device {
+        row(
+            None,
+            "",
+            &[Caps::TOTP],
+            None,
+            Some("TOKEN2 Molto2 (5C7D6241EF67245B) 02 00"),
+            DeviceKind::Token,
+        )
+    }
+
+    #[test]
+    fn molto2_selects_by_the_serial_in_its_reader_name() {
+        let devs = [yubi(), solo(), molto_named()];
+        for v in [
+            "5C7D6241EF67245B",
+            "5c7d6241ef67245b",
+            "serial:5C7D6241EF67245B",
+        ] {
+            let t = resolve_target(
+                &devs,
+                &sel(Some(v), None, None),
+                Need::Molto2,
+                &mut NoPicker,
+            )
+            .unwrap_or_else(|e| panic!("{v}: {e}"));
+            assert_eq!(t.device.kind, DeviceKind::Token, "{v}");
+            // Matched without reading any names stored on keys.
+            assert!(
+                !selection_needs_key_names(&devs, &sel(Some(v), None, None), Need::Molto2),
+                "{v}"
+            );
+        }
+        // Only a Molto2's reader name is read for a serial: the same text in
+        // another key's reader name selects nothing.
+        let mut other = solo();
+        other.reader = Some("Some Reader (ABCDEF12) 00 00".into());
+        let devs = [yubi(), other];
+        assert!(matches!(
+            resolve_target(
+                &devs,
+                &sel(Some("serial:ABCDEF12"), None, None),
+                Need::Any,
+                &mut NoPicker
+            ),
+            Err(SelectError::NotFound { .. })
+        ));
+        assert_eq!(molto_reader_serial("TOKEN2 Molto2 02 00"), None);
+        assert_eq!(molto_reader_serial("TOKEN2 Molto2 () 02 00"), None);
+    }
+
+    #[test]
+    fn molto2_selects_by_its_card_serial_only_when_nothing_cheaper_matches() {
+        let devs = [yubi(), solo(), molto_named()];
+        let mut asked: Vec<String> = Vec::new();
+        let mut read = |d: &Device| {
+            asked.push(d.reader.clone().unwrap_or_default());
+            Some("826658711763730".to_owned())
+        };
+        for v in ["826658711763730", "serial:826658711763730"] {
+            let t = resolve_target_reading(
+                &devs,
+                &sel(Some(v), None, None),
+                Need::Molto2,
+                &mut NoPicker,
+                &mut read,
+            )
+            .unwrap_or_else(|e| panic!("{v}: {e}"));
+            assert_eq!(t.device.kind, DeviceKind::Token, "{v}");
+            assert_eq!(t.how, SelectedBy::Device, "{v}");
+        }
+        // Only the Molto2 was read, once per lookup.
+        assert_eq!(
+            asked,
+            vec!["TOKEN2 Molto2 (5C7D6241EF67245B) 02 00".to_owned(); 2]
+        );
+        // A value that matches without the card never reads it.
+        asked.clear();
+        let mut read = |d: &Device| {
+            asked.push(d.reader.clone().unwrap_or_default());
+            Some("826658711763730".to_owned())
+        };
+        for v in ["11111111", "5C7D6241EF67245B", "3"] {
+            resolve_target_reading(
+                &devs,
+                &sel(Some(v), None, None),
+                Need::Any,
+                &mut NoPicker,
+                &mut read,
+            )
+            .unwrap_or_else(|e| panic!("{v}: {e}"));
+        }
+        assert!(asked.is_empty(), "{asked:?}");
+    }
+
+    #[test]
+    fn unknown_serial_still_fails_after_reading_the_molto2() {
+        let devs = [yubi(), molto_named()];
+        let mut reads = 0;
+        let mut read = |_: &Device| {
+            reads += 1;
+            Some("826658711763730".to_owned())
+        };
+        for v in ["999", "serial:999"] {
+            assert!(matches!(
+                resolve_target_reading(
+                    &devs,
+                    &sel(Some(v), None, None),
+                    Need::Molto2,
+                    &mut NoPicker,
+                    &mut read,
+                ),
+                Err(SelectError::NotFound { .. })
+            ));
+        }
+        assert_eq!(reads, 2);
+        // A card that can't be read matches nothing.
+        let mut unreadable = |_: &Device| None;
+        assert!(matches!(
+            resolve_target_reading(
+                &devs,
+                &sel(Some("826658711763730"), None, None),
+                Need::Molto2,
+                &mut NoPicker,
+                &mut unreadable,
+            ),
+            Err(SelectError::NotFound { .. })
+        ));
+        // With no Molto2 connected, nothing is read.
+        let mut never = |_: &Device| -> Option<String> { panic!("no Molto2 to read") };
+        assert!(resolve_target_reading(
+            &[yubi(), solo()],
+            &sel(Some("826658711763730"), None, None),
+            Need::Any,
+            &mut NoPicker,
+            &mut never,
+        )
+        .is_err());
+        // The card serial selects for a command that needs something else:
+        // the usual capability refusal.
+        let mut read = |_: &Device| Some("826658711763730".to_owned());
+        assert!(matches!(
+            resolve_target_reading(
+                &devs,
+                &sel(Some("826658711763730"), None, None),
+                Need::Oath,
+                &mut NoPicker,
+                &mut read,
+            ),
+            Err(SelectError::LacksCapability { .. })
         ));
     }
 

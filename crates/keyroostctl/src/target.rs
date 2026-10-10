@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use keyroost_resolve::{
-    endpoint, resolve_target, Caps, Device, DeviceKind, EnumerateOptions, Need, Picker,
+    endpoint, resolve_target_reading, Caps, Device, DeviceKind, EnumerateOptions, Need, Picker,
     SelectError, Selector,
 };
 
@@ -112,6 +112,21 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
     }
 }
 
+/// A Molto2's card serial (what `molto info` shows), read in a short
+/// session of its own; `None` when the token doesn't answer. Selection
+/// calls it only when `--device` matched nothing without it.
+pub(crate) fn molto_card_serial(d: &Device) -> Option<String> {
+    let reader = d.reader.as_deref()?;
+    let mut session = keyroost_transport::Session::open_named(reader).ok()?;
+    session.set_debug(debug_on());
+    let info = session.read_info().ok()?;
+    Some(
+        info.serial
+            .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+            .to_owned(),
+    )
+}
+
 /// Pick the row and its announce line. An unmatched `--reader` / `--path`
 /// passes through as typed; every other selection error is returned.
 fn choose(
@@ -120,7 +135,7 @@ fn choose(
     need: Need,
     picker: &mut dyn Picker,
 ) -> Result<(Device, String), SelectError> {
-    match resolve_target(devices, sel, need, picker) {
+    match resolve_target_reading(devices, sel, need, picker, &mut molto_card_serial) {
         Ok(t) => Ok((t.device.clone(), announce_line(t.device, need))),
         Err(SelectError::ReaderNotFound { reader }) => Ok((
             typed_device(Some(reader.clone()), None, &reader),

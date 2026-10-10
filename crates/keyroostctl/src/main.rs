@@ -4107,7 +4107,7 @@ fn inert_device_flag(cmd: Option<&Cmd>) -> Option<&'static str> {
 
 /// Rows to show for `list` / the bare overview: every row numbered in `list`
 /// order with no `--device`, or the one row it names (an unknown value is an
-/// error naming the fix, via [`keyroost_resolve::resolve_target`]).
+/// error naming the fix, via [`keyroost_resolve::resolve_target_reading`]).
 fn filter_rows<'d>(
     devices: &'d [keyroost_resolve::Device],
     device: Option<&str>,
@@ -4119,11 +4119,12 @@ fn filter_rows<'d>(
                 device: Some(v),
                 ..Default::default()
             };
-            let t = keyroost_resolve::resolve_target(
+            let t = keyroost_resolve::resolve_target_reading(
                 devices,
                 &s,
                 Need::Any,
                 &mut keyroost_resolve::NoPicker,
+                &mut crate::target::molto_card_serial,
             )?;
             Ok(vec![(t.number, t.device)])
         }
