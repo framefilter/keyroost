@@ -105,6 +105,33 @@ impl OathFamily {
     }
 }
 
+impl OathFamily {
+    /// YubiKey 4 firmware after 4.0.0 and before 4.3.5, where ykman refuses
+    /// to add a name that starts a different name already on the key [S1][S6].
+    /// Unverified on hardware here; refused up front like the Solo 2 cap.
+    pub fn prefix_issue(self) -> bool {
+        matches!(self, OathFamily::YubiKey { version: Some(v) } if (4, 0, 0) < v && v < (4, 3, 5))
+    }
+
+    /// Why `name` must not be added next to `others` (names on the key, or
+    /// planned before it): ykman's rule on [`prefix_issue`](Self::prefix_issue)
+    /// firmware — another name starts with `name` and isn't `name` itself.
+    /// The one check `oath add` (CLI and GUI) and the import plan share.
+    pub fn prefix_refusal<'a>(
+        self,
+        name: &str,
+        others: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
+        (self.prefix_issue() && others.into_iter().any(|o| starts_other(name, o)))
+            .then(|| Skip::StartsAnotherName.reason(Store::Oath(self)))
+    }
+}
+
+/// `other` begins with `name` and is a different name.
+fn starts_other(name: &str, other: &str) -> bool {
+    other != name && other.starts_with(name)
+}
+
 /// Longest OATH name a Solo 2 takes (measured; see [`OathFamily::name_limit`]).
 const SOLO2_NAME_MAX: usize = 127;
 
@@ -212,6 +239,9 @@ pub enum Skip {
     },
     /// Molto2: past slot #99.
     PastLastSlot,
+    /// YubiKey 4 firmware 4.0–4.3.4: the name starts a different name on
+    /// the key or planned before it (see [`OathFamily::prefix_issue`]).
+    StartsAnotherName,
 }
 
 impl Skip {
@@ -283,6 +313,11 @@ fn reason(skip: &Skip, device: &str, token2: bool) -> String {
             format!("no room left ({} holds {} codes)", device, capacity)
         }
         Skip::PastLastSlot => "no slot left after #99".to_owned(),
+        Skip::StartsAnotherName => format!(
+            "{} firmware 4.0\u{2013}4.3.4 can't safely store a name that starts \
+             another name on the key",
+            device
+        ),
     }
 }
 
@@ -754,6 +789,8 @@ pub fn plan(file: &ImportFile, target: &Target) -> Plan {
                     Ok(n) => {
                         let v = if let Some((_, first)) = seen.iter().find(|(s, _)| *s == n) {
                             Verdict::Skip(Skip::SameNameInFile { first: *first })
+                        } else if starts_another_name(store, &n, existing, &seen) {
+                            Verdict::Skip(Skip::StartsAnotherName)
                         } else {
                             seen.push((n.clone(), item.index));
                             if existing.names.contains(&n) {
@@ -804,6 +841,28 @@ pub fn plan(file: &ImportFile, target: &Target) -> Plan {
         replace: target.replace,
         notes,
     }
+}
+
+/// [`OathFamily::prefix_refusal`] over the names on the key and the names
+/// planned before this one.
+fn starts_another_name(
+    store: Store,
+    name: &StoredName,
+    existing: &Existing,
+    seen: &[(StoredName, usize)],
+) -> bool {
+    let (Store::Oath(family), StoredName::Oath(name)) = (store, name) else {
+        return false;
+    };
+    let others = existing
+        .names
+        .iter()
+        .chain(seen.iter().map(|(n, _)| n))
+        .filter_map(|n| match n {
+            StoredName::Oath(s) => Some(s.as_str()),
+            _ => None,
+        });
+    family.prefix_refusal(name, others).is_some()
 }
 
 fn notes_for(
@@ -875,6 +934,68 @@ mod tests {
         );
         assert_eq!(OathFamily::Nitrokey3.name_refusal(&long), None);
         assert_eq!(OathFamily::Other.name_refusal(&long), None);
+    }
+
+    #[test]
+    fn yubikey_4_prefix_rule_is_ykmans() {
+        let yk = |v| OathFamily::YubiKey { version: Some(v) };
+        let on_key = ["GitHub:alice", "Bank"];
+        // Inside 4.0.0 < v < 4.3.5: a new name that starts a different name
+        // on the key is refused; the reverse direction and equal names are not.
+        let want = "YubiKey firmware 4.0\u{2013}4.3.4 can't safely store a name that starts \
+                    another name on the key";
+        assert_eq!(
+            yk((4, 3, 4)).prefix_refusal("GitHub", on_key).as_deref(),
+            Some(want)
+        );
+        assert_eq!(
+            yk((4, 0, 1)).prefix_refusal("GitHub", on_key).as_deref(),
+            Some(want)
+        );
+        assert_eq!(yk((4, 3, 4)).prefix_refusal("GitHub:alice", on_key), None);
+        assert_eq!(yk((4, 3, 4)).prefix_refusal("Bank:x", on_key), None);
+        assert_eq!(yk((4, 3, 4)).prefix_refusal("Other", on_key), None);
+        // Outside the range, and on other families: never.
+        for f in [
+            yk((4, 0, 0)),
+            yk((4, 3, 5)),
+            yk((5, 7, 1)),
+            OathFamily::YubiKey { version: None },
+            OathFamily::Solo2,
+            OathFamily::Nitrokey3,
+            OathFamily::Other,
+        ] {
+            assert_eq!(f.prefix_refusal("GitHub", on_key), None, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn yubikey_4_prefix_names_are_skipped_in_plan() {
+        let yk43 = Store::Oath(OathFamily::YubiKey {
+            version: Some((4, 3, 1)),
+        });
+        let f = file(vec![
+            // Starts "GitHub:alice" on the key.
+            entry(None, Some("GitHub"), 20, HashAlg::Sha1, 6, TOTP30),
+            // Planned first, then a shorter name that starts it.
+            simple("Bank", "bob"),
+            entry(Some("Bank"), None, 20, HashAlg::Sha1, 6, TOTP30),
+            // Longer than a name on the key: allowed (ykman's direction).
+            simple("GitHub", "alice2"),
+        ]);
+        let p = plan(&f, &target(yk43, vec![oath("GitHub:alice")], true));
+        assert_eq!(
+            verdicts(&p),
+            vec![
+                Verdict::Skip(Skip::StartsAnotherName),
+                Verdict::Add,
+                Verdict::Skip(Skip::StartsAnotherName),
+                Verdict::Add,
+            ]
+        );
+        // The same file on a 5.x key plans every row.
+        let p = plan(&f, &target(YK57, vec![oath("GitHub:alice")], true));
+        assert_eq!(p.counts().add, 4);
     }
 
     const YK57: Store = Store::Oath(OathFamily::YubiKey {
@@ -1711,6 +1832,7 @@ mod tests {
             Skip::SameNameInFile { first: 2 },
             Skip::NoRoom { capacity: 32 },
             Skip::PastLastSlot,
+            Skip::StartsAnotherName,
         ]
     }
 

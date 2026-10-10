@@ -8210,6 +8210,16 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let (seed_text, password) = pair.read_first(&mut sec)?;
             let secret = decode_seed(&seed_text.text()?, *encoding)?;
             let mut session = open_oath_from(&mut sec, access, password.source(), debug)?;
+            // YubiKey 4 firmware 4.0–4.3.4: a name that starts another one
+            // on the key is refused before it is sent (as ykman does).
+            let version = session.version();
+            if keyroost_import::plan::OathFamily::from_vendor(&dev.vendor, version).prefix_issue() {
+                let listing = session.list()?;
+                let names = listing.credentials.iter().map(|c| c.name.as_str());
+                if let Some(refusal) = oath_prefix_refusal(&dev.vendor, version, name, names) {
+                    return Err(refusal.into());
+                }
+            }
             let params = keyroost_oath::PutParams {
                 name,
                 secret: &secret,
@@ -8309,6 +8319,17 @@ fn oath_code_period(flag: Option<u32>, name: &str) -> u32 {
 /// has a length it must never be given past (Solo 2).
 fn oath_name_refusal(vendor: &str, name: &str) -> Option<String> {
     keyroost_import::plan::OathFamily::from_vendor(vendor, None).name_refusal(name)
+}
+
+/// Why `oath add` won't add `name` next to the key's `names`: YubiKey 4
+/// firmware 4.0–4.3.4, ykman's rule (the same check the import plan makes).
+fn oath_prefix_refusal<'a>(
+    vendor: &str,
+    version: Option<(u8, u8, u8)>,
+    name: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    keyroost_import::plan::OathFamily::from_vendor(vendor, version).prefix_refusal(name, names)
 }
 
 fn oath_type_str(t: keyroost_oath::OathType) -> &'static str {
@@ -15726,6 +15747,25 @@ mod cli_tests {
         assert_eq!(oath_name_refusal("SoloKeys", &"n".repeat(127)), None);
         assert_eq!(oath_name_refusal("Yubico", &long), None);
         assert_eq!(oath_name_refusal("Nitrokey", &long), None);
+    }
+
+    #[test]
+    fn oath_add_refuses_a_prefix_name_on_yubikey_4_3_4() {
+        let names = ["GitHub:alice"];
+        let msg = oath_prefix_refusal("Yubico", Some((4, 3, 4)), "GitHub", names).expect("refused");
+        assert_eq!(
+            msg,
+            "YubiKey firmware 4.0\u{2013}4.3.4 can't safely store a name that starts \
+             another name on the key"
+        );
+        assert_eq!(
+            oath_prefix_refusal("Yubico", Some((5, 7, 1)), "GitHub", names),
+            None
+        );
+        assert_eq!(
+            oath_prefix_refusal("Yubico", Some((4, 3, 4)), "GitHub:bob", names),
+            None
+        );
     }
 
     #[test]

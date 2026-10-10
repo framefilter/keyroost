@@ -5749,9 +5749,29 @@ impl App {
         // The form stays open showing the spinner; it is wiped/closed on the
         // modal's Done (success) or Cancel/✕/Esc. Do not reset it here.
         let for_device = self.selected_device.clone();
+        let vendor = self
+            .selected_device()
+            .map(|d| d.vendor.clone())
+            .unwrap_or_default();
         self.spawn_job("Adding credential\u{2026}", move || {
+            // Set when YubiKey 4 firmware 4.0–4.3.4 must not get this name
+            // (the same check as `oath add` and the import plan).
+            let mut refused: Option<String> = None;
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&name, &password)?;
+                let family =
+                    keyroost_import::plan::OathFamily::from_vendor(&vendor, session.version());
+                if family.prefix_issue() {
+                    let listing = session.list()?;
+                    refused = family.prefix_refusal(
+                        &cred_name,
+                        listing.credentials.iter().map(|c| c.name.as_str()),
+                    );
+                    if refused.is_some() {
+                        // Nothing sent; the list is refreshed as usual.
+                        return Self::oath_list_rows(&mut session);
+                    }
+                }
                 session.put(&keyroost_oath::PutParams {
                     name: &cred_name,
                     secret: &secret,
@@ -5766,6 +5786,9 @@ impl App {
             Box::new(move |app: &mut App| {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     Self::apply_oath_rows(app, result, password);
+                    if let Some(why) = refused.filter(|_| app.oath.add.open) {
+                        app.oath.add.result = Some(Err(why));
+                    }
                 }
             })
         });
