@@ -104,15 +104,43 @@ pub fn open_file(
 /// Read a file for [`open_file`], never holding more than
 /// [`MAX_FILE_BYTES`] + 1 bytes: an oversized (or endless) source is refused
 /// while reading, before it is all in memory.
-pub fn read_bounded<R: std::io::Read>(reader: R) -> Result<Vec<u8>, OpenError> {
-    use std::io::Read;
-    let mut buf = Vec::new();
-    reader
-        .take(MAX_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| {
-            OpenError::NotImportable(format!("The file couldn't be read ({}).", e.kind()))
-        })?;
+///
+/// A plaintext export is every seed in clear, so no copy of it is left
+/// behind unwiped: the bytes go into a wipe-on-drop buffer that grows by
+/// copying into a new wipe-on-drop buffer (the old one is wiped when it is
+/// dropped), never by a plain reallocation.
+pub fn read_bounded<R: std::io::Read>(
+    mut reader: R,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, OpenError> {
+    use zeroize::Zeroizing;
+    const FIRST: usize = 64 * 1024;
+    let limit = MAX_FILE_BYTES + 1;
+    let mut buf = Zeroizing::new(Vec::with_capacity(FIRST));
+    let mut chunk = Zeroizing::new([0u8; 8192]);
+    loop {
+        let want = chunk.len().min(limit - buf.len());
+        if want == 0 {
+            break;
+        }
+        let n = match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(OpenError::NotImportable(format!(
+                    "The file couldn't be read ({}).",
+                    e.kind()
+                )))
+            }
+        };
+        if buf.len() + n > buf.capacity() {
+            let cap = (buf.capacity() * 2).max(buf.len() + n).min(limit);
+            let mut grown = Zeroizing::new(Vec::with_capacity(cap));
+            grown.extend_from_slice(&buf);
+            buf = grown;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
     if buf.len() > MAX_FILE_BYTES {
         return Err(too_large());
     }
@@ -126,7 +154,7 @@ pub fn open_path(path: &std::path::Path, password: Option<&[u8]>) -> Result<Open
         OpenError::NotImportable(format!("The file couldn't be opened ({}).", e.kind()))
     })?;
     // Wipe-on-drop: a plaintext export is every seed in clear.
-    let bytes = zeroize::Zeroizing::new(read_bounded(file)?);
+    let bytes = read_bounded(file)?;
     let name = path.file_name().and_then(|n| n.to_str());
     open_file(&bytes, name, password)
 }
@@ -149,14 +177,14 @@ fn read_error(e: &BulkError, layout: &str) -> OpenError {
     OpenError::Unreadable(msg)
 }
 
-/// A vault that didn't decrypt: told apart by the decryptor's typed error.
+/// An export that didn't decrypt: told apart by the decryptor's typed error.
 fn decrypt_error(e: BulkError) -> OpenError {
     match e {
         BulkError::WrongPassword => {
-            OpenError::Unreadable("The password didn't open this Aegis vault.".to_owned())
+            OpenError::Unreadable("The password didn't open this Aegis export.".to_owned())
         }
-        e @ BulkError::Json(_) => OpenError::Unreadable(e.describe("an encrypted Aegis vault")),
-        other => OpenError::Unreadable(format!("The Aegis vault couldn't be opened: {}.", other)),
+        e @ BulkError::Json(_) => OpenError::Unreadable(e.describe("an encrypted Aegis export")),
+        other => OpenError::Unreadable(format!("The Aegis export couldn't be opened: {}.", other)),
     }
 }
 
@@ -228,7 +256,7 @@ mod tests {
     fn open_file_wrong_password_is_unreadable() {
         match open_file(locked_vault().as_bytes(), None, Some(b"not it")) {
             Err(OpenError::Unreadable(msg)) => {
-                assert_eq!(msg, "The password didn't open this Aegis vault.")
+                assert_eq!(msg, "The password didn't open this Aegis export.")
             }
             other => panic!("expected Unreadable, got {other:?}"),
         }
@@ -326,9 +354,18 @@ mod tests {
             Err(OpenError::NotImportable(msg)) => assert!(msg.contains("16 MiB"), "{msg}"),
             other => panic!("expected NotImportable, got {other:?}"),
         }
-        assert_eq!(read_bounded(&b"abc"[..]).unwrap(), b"abc");
+        assert_eq!(read_bounded(&b"abc"[..]).unwrap().as_slice(), b"abc");
         let at_cap = std::io::Read::take(std::io::repeat(b'\n'), MAX_FILE_BYTES as u64);
         assert_eq!(read_bounded(at_cap).unwrap().len(), MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn read_bounded_keeps_every_byte_across_growth_in_a_wiped_buffer() {
+        // Several times the first allocation, with a pattern so a lost or
+        // reordered chunk shows; the buffer type wipes on drop.
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let got: zeroize::Zeroizing<Vec<u8>> = read_bounded(&data[..]).unwrap();
+        assert_eq!(got.as_slice(), data.as_slice());
     }
 
     #[test]

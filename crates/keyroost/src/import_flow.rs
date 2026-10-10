@@ -2163,7 +2163,7 @@ mod tests {
             &mut app,
             7,
             true,
-            Read::Failed("The password didn't open this Aegis vault.".into()),
+            Read::Failed("The password didn't open this Aegis export.".into()),
         );
         assert!(app.import_flow.dialog.is_none());
         assert!(app.import_flow.notice.is_none());

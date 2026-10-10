@@ -116,9 +116,8 @@ pub(crate) fn read_import_file<I: SecretIo>(
         .into());
     }
     // Wipe-on-drop: a plain export is every seed in clear.
-    let bytes = zeroize::Zeroizing::new(
-        keyroost_qr::file::read_bounded(f).map_err(|e| format!("{}: {e}", path.display()))?,
-    );
+    let bytes =
+        keyroost_qr::file::read_bounded(f).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = path.file_name().and_then(|n| n.to_str());
     let open = |pw: Option<&[u8]>| {
         keyroost_qr::open_file(&bytes, name, pw).map_err(|e: OpenError| e.to_string())
