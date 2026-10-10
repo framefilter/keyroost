@@ -86,9 +86,9 @@ impl OathSession {
     /// successful [`unlock`](Self::unlock). Returns `Ok(false)`, sending
     /// nothing, when no key is kept (no password was given), and `Ok(true)`
     /// once the applet is unlocked again. For applets that clear
-    /// authorization after each command — the Solo 2's released OATH app
-    /// does, per the firmware source (not verified on hardware) — so a
-    /// refused command can be retried without asking for the password again.
+    /// authorization after each command — a Solo 2 on firmware 2.3.196 does,
+    /// answering the next write with `6985` — so a refused command can be
+    /// retried without asking for the password again.
     pub fn reauthenticate(&mut self) -> Result<bool, TransportError> {
         let Some(key) = self.access_key.clone() else {
             return Ok(false);

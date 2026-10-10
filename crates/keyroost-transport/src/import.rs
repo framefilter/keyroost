@@ -30,7 +30,9 @@ enum OathAnswer {
 }
 
 /// PUT: `9000` stored, `6983` the name exists (applets that refuse
-/// duplicates), `6A84` no space, `6982` the password is needed.
+/// duplicates), `6A84` no space, `6982` or `6985` the password is needed
+/// (a password-protected Solo 2 answers `6985` once its one-command unlock
+/// has lapsed).
 fn oath_put_answer(sw: u16) -> OathAnswer {
     match sw {
         0x6983 => OathAnswer::Exists,
@@ -43,7 +45,7 @@ fn oath_delete_answer(sw: u16) -> OathAnswer {
     match sw {
         oath::SW_OK => OathAnswer::Ok,
         0x6A84 => OathAnswer::Full,
-        0x6982 => OathAnswer::NeedsAuth,
+        0x6982 | 0x6985 => OathAnswer::NeedsAuth,
         other => OathAnswer::Other(other),
     }
 }
@@ -660,6 +662,14 @@ mod tests {
     }
 
     #[test]
+    fn oath_6985_needs_auth() {
+        // A password-protected Solo 2 (fw 2.3.196) answers a PUT sent after its
+        // one-command unlock lapsed with 6985, not 6982 (seen on hardware).
+        assert_eq!(oath_put_answer(0x6985), OathAnswer::NeedsAuth);
+        assert_eq!(oath_delete_answer(0x6985), OathAnswer::NeedsAuth);
+    }
+
+    #[test]
     fn oath_delete_6983_is_not_exists() {
         assert_eq!(oath_delete_answer(0x6983), OathAnswer::Other(0x6983));
         assert_eq!(oath_delete_answer(0x9000), OathAnswer::Ok);
@@ -781,6 +791,14 @@ mod tests {
 
         let mut io = ScriptedOath {
             put: [0x6982, 0x9000].into(),
+            has_key: true,
+            ..Default::default()
+        };
+        assert_eq!(oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e), Ok(()));
+        assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
+
+        let mut io = ScriptedOath {
+            put: [0x6985, 0x9000].into(),
             has_key: true,
             ..Default::default()
         };
