@@ -853,18 +853,22 @@ pub fn plan(file: &ImportFile, target: &Target) -> Plan {
                     Ok(n) => {
                         let v = if let Some((_, first)) = seen.iter().find(|(s, _)| *s == n) {
                             Verdict::Skip(Skip::SameNameInFile { first: *first })
-                        } else if starts_another_name(store, &n, existing, &seen) {
-                            Verdict::Skip(Skip::StartsAnotherName)
                         } else {
-                            seen.push((n.clone(), item.index));
-                            if existing.names.contains(&n) {
-                                if target.replace {
+                            let on_key = existing.names.contains(&n);
+                            // Exists comes first: nothing is written, so the
+                            // prefix rule (a write rule) doesn't apply.
+                            if on_key && !target.replace {
+                                seen.push((n.clone(), item.index));
+                                Verdict::Exists
+                            } else if starts_another_name(store, &n, existing, &seen) {
+                                Verdict::Skip(Skip::StartsAnotherName)
+                            } else {
+                                seen.push((n.clone(), item.index));
+                                if on_key {
                                     Verdict::Replace
                                 } else {
-                                    Verdict::Exists
+                                    Verdict::Add
                                 }
-                            } else {
-                                Verdict::Add
                             }
                         };
                         (Some(n), v)
@@ -1031,6 +1035,29 @@ mod tests {
         ] {
             assert_eq!(f.prefix_refusal("GitHub", on_key), None, "{f:?}");
         }
+    }
+
+    #[test]
+    fn yubikey_4_exact_name_on_the_key_is_exists_before_the_prefix_rule() {
+        let yk43 = Store::Oath(OathFamily::YubiKey {
+            version: Some((4, 3, 1)),
+        });
+        // "GitHub" is on the key, and so is "GitHub:alice", which it starts.
+        let on_key = || vec![oath("GitHub"), oath("GitHub:alice")];
+        let f = file(vec![entry(
+            None,
+            Some("GitHub"),
+            20,
+            HashAlg::Sha1,
+            6,
+            TOTP30,
+        )]);
+        // Without replace: already on the key, left as is.
+        let p = plan(&f, &target(yk43, on_key(), false));
+        assert_eq!(verdicts(&p), vec![Verdict::Exists]);
+        // Replacing it would be the write ykman refuses: skipped.
+        let p = plan(&f, &target(yk43, on_key(), true));
+        assert_eq!(verdicts(&p), vec![Verdict::Skip(Skip::StartsAnotherName)]);
     }
 
     #[test]

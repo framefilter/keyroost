@@ -570,6 +570,9 @@ pub struct ImportDialog {
     /// The destination just became a Molto2: select that Molto2 in the app
     /// (as clicking it in the list would), which opens its session.
     pub select_molto: bool,
+    /// The selection when that wish was armed; a different selection later
+    /// (the person clicked another key while a job ran) drops the wish.
+    pub molto_armed_on: Option<Option<DeviceId>>,
 }
 
 impl Drop for ImportDialog {
@@ -610,6 +613,8 @@ impl ImportDialog {
         self.report = None;
         self.report_line.clear();
         self.auth_failed = false;
+        self.select_molto = false;
+        self.molto_armed_on = None;
     }
 
     /// Choose `dest` (`picked` when the person clicked it). A different
@@ -627,14 +632,36 @@ impl ImportDialog {
         self.report = None;
         self.preview_wanted = dest.as_ref().is_some_and(|d| d.store != StoreKind::Molto2);
         self.select_molto = dest.as_ref().is_some_and(|d| d.store == StoreKind::Molto2);
+        self.molto_armed_on = None;
         self.dest = dest;
+    }
+
+    /// Called every frame with the app's selection: remembers the selection
+    /// a pending Molto2 selection was armed under, and drops the pending
+    /// selection when the person has selected something else since.
+    pub fn arm_molto_select(&mut self, selected: Option<&DeviceId>) {
+        if !self.select_molto {
+            return;
+        }
+        match &self.molto_armed_on {
+            None => self.molto_armed_on = Some(selected.cloned()),
+            Some(armed) if armed.as_ref() != selected => {
+                self.select_molto = false;
+                self.molto_armed_on = None;
+            }
+            Some(_) => {}
+        }
     }
 
     /// The Molto2 to select now, once per choice: the chosen Molto2 when
     /// another device (or none) is selected. The dialog's destination is
     /// the choice; the list on the left follows it.
     pub fn take_molto_select(&mut self, selected: Option<&DeviceId>) -> Option<DeviceId> {
+        let armed = self.molto_armed_on.take();
         if !std::mem::take(&mut self.select_molto) {
+            return None;
+        }
+        if armed.is_some_and(|a| a.as_ref() != selected) {
             return None;
         }
         self.dest
@@ -1458,8 +1485,11 @@ impl App {
         }
         // A Molto2 destination works on its own: select it (once per choice)
         // as soon as no device job runs, which opens its session.
+        let selected = self.selected_device.clone();
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            d.arm_molto_select(selected.as_ref());
+        }
         if !self.busy() {
-            let selected = self.selected_device.clone();
             let to_select = self
                 .import_flow
                 .dialog
@@ -2500,16 +2530,46 @@ mod tests {
         d.set_dest(Some(m.clone()), true);
         let sel: DeviceId = "a".into();
         // Another key is selected: select the Molto2, once.
+        d.arm_molto_select(Some(&sel));
         assert_eq!(d.take_molto_select(Some(&sel)), Some(m.device.clone()));
         assert_eq!(d.take_molto_select(Some(&sel)), None);
         // Already selected: nothing to do.
         d.set_dest(Some(a), true);
         d.set_dest(Some(m.clone()), true);
+        d.arm_molto_select(Some(&m.device));
         assert_eq!(d.take_molto_select(Some(&m.device)), None);
         // An OATH destination never selects anything.
         let mut d = open_dialog();
         d.set_dest(Some(dk("b", StoreKind::Oath)), true);
+        d.arm_molto_select(None);
         assert_eq!(d.take_molto_select(None), None);
+    }
+
+    #[test]
+    fn a_pending_molto2_selection_yields_to_a_later_choice() {
+        let m = dk("m", StoreKind::Molto2);
+        let a: DeviceId = "a".into();
+        let b: DeviceId = "b".into();
+        // Armed while "a" was selected (a device job running); the person
+        // then clicks "b" in the list: the pending selection is dropped.
+        let mut d = open_dialog();
+        d.set_dest(Some(m.clone()), true);
+        d.arm_molto_select(Some(&a));
+        d.arm_molto_select(Some(&b));
+        assert_eq!(d.take_molto_select(Some(&b)), None);
+        assert_eq!(d.take_molto_select(Some(&a)), None);
+        // The destination changed meanwhile: dropped.
+        let mut d = open_dialog();
+        d.set_dest(Some(m.clone()), true);
+        d.arm_molto_select(Some(&a));
+        d.set_dest(Some(dk("x", StoreKind::Oath)), true);
+        assert_eq!(d.take_molto_select(Some(&a)), None);
+        // Closed meanwhile: dropped.
+        let mut d = open_dialog();
+        d.set_dest(Some(m), true);
+        d.arm_molto_select(Some(&a));
+        d.close();
+        assert_eq!(d.take_molto_select(Some(&a)), None);
     }
 
     #[test]

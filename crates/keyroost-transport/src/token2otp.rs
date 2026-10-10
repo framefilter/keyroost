@@ -848,6 +848,10 @@ pub struct Token2OtpSession {
     /// Whether a successful `VERIFY_OTP_PIN` has opened the device read window on
     /// this connection.
     pin_verified: bool,
+    /// Whether a typed PIN was verified (`VERIFY_OTP_PIN`) on this
+    /// connection. A fingerprint unlock opens the same window but proves no
+    /// PIN, so only this flag lets a caller re-send its typed PIN.
+    typed_pin_verified: bool,
     /// What the most recent flag read on this connection said: `Some(true)` a
     /// PIN is set, `Some(false)` the feature is there and no PIN is set, `None`
     /// nothing has asked yet or the key does not offer the feature.
@@ -1009,6 +1013,7 @@ impl Token2OtpSession {
                         is_pcsc: false,
                         pin_session: None,
                         pin_verified: false,
+                        typed_pin_verified: false,
                         pin_present: None,
                         fp_present: None,
                     }),
@@ -1022,6 +1027,7 @@ impl Token2OtpSession {
                                 is_pcsc: true,
                                 pin_session: None,
                                 pin_verified: false,
+                                typed_pin_verified: false,
                                 pin_present: None,
                                 fp_present: None,
                             }),
@@ -1040,6 +1046,7 @@ impl Token2OtpSession {
                     is_pcsc: true,
                     pin_session: None,
                     pin_verified: false,
+                    typed_pin_verified: false,
                     pin_present: None,
                     fp_present: None,
                 })
@@ -1059,6 +1066,7 @@ impl Token2OtpSession {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         })
@@ -1072,6 +1080,7 @@ impl Token2OtpSession {
             is_pcsc: true,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         })
@@ -1088,6 +1097,7 @@ impl Token2OtpSession {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         })
@@ -1102,6 +1112,7 @@ impl Token2OtpSession {
             is_pcsc: true,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         })
@@ -1114,6 +1125,7 @@ impl Token2OtpSession {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         }
@@ -1126,6 +1138,7 @@ impl Token2OtpSession {
             is_pcsc: true,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         }
@@ -1301,6 +1314,7 @@ impl Token2OtpSession {
         let keys = agreement.establish_session(dev_xy)?;
         self.pin_session = Some(keys);
         self.pin_verified = false;
+        self.typed_pin_verified = false;
         Ok(())
     }
 
@@ -1361,6 +1375,7 @@ impl Token2OtpSession {
         let (_, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check_pin(sw)?;
         self.pin_verified = true;
+        self.typed_pin_verified = true;
         Ok(())
     }
 
@@ -1408,6 +1423,7 @@ impl Token2OtpSession {
         let (_, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check_pin(sw)?;
         self.pin_verified = false;
+        self.typed_pin_verified = false;
         Ok(())
     }
 
@@ -1418,6 +1434,7 @@ impl Token2OtpSession {
         let (_, sw) = self.transport.transmit(&apdu, false)?;
         OtpError::check(sw)?;
         self.pin_verified = false;
+        self.typed_pin_verified = false;
         Ok(())
     }
 
@@ -1562,6 +1579,7 @@ impl Token2OtpSession {
         }
         OtpError::check_pin(sw)?;
         self.pin_verified = true;
+        self.typed_pin_verified = true;
         Ok(())
     }
 
@@ -1582,10 +1600,35 @@ impl Token2OtpSession {
     /// `pin` must be supplied (it is verified to open the read window). When a PIN
     /// is set but `pin` is `None`, returns [`OtpTransportError::PinRequired`] so a
     /// caller (CLI/GUI) can prompt for it.
-    /// Whether a PIN was verified on this connection (the device's PIN
-    /// window was opened here).
-    pub(crate) fn pin_window_open(&self) -> bool {
-        self.pin_verified
+    /// Whether a typed PIN was verified on this connection (not a
+    /// fingerprint unlock, which opens the window without proving a PIN).
+    pub(crate) fn typed_pin_verified(&self) -> bool {
+        self.typed_pin_verified
+    }
+
+    /// A session in a given unlock state with no device behind it, for
+    /// tests of callers that only read that state.
+    #[cfg(test)]
+    pub(crate) fn unlocked_for_test(pin_verified: bool, typed_pin_verified: bool) -> Self {
+        struct NoDevice;
+        impl OtpTransport for NoDevice {
+            fn transmit(
+                &mut self,
+                _apdu: &[u8],
+                _detect_button_wait: bool,
+            ) -> Result<(Vec<u8>, u16), OtpTransportError> {
+                Err(OtpTransportError::TokenNotDetected)
+            }
+        }
+        Self {
+            transport: Box::new(NoDevice),
+            is_pcsc: false,
+            pin_session: None,
+            pin_verified,
+            typed_pin_verified,
+            pin_present: None,
+            fp_present: None,
+        }
     }
 
     pub fn enumerate_pinned(
@@ -2198,6 +2241,7 @@ mod enumerate_bounds_tests {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         };
@@ -2240,6 +2284,7 @@ mod enumerate_bounds_tests {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         };
@@ -2472,6 +2517,7 @@ mod pre_r34_keys_are_unaffected {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         };
@@ -2587,6 +2633,7 @@ mod pre_r34_keys_are_unaffected {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         };
@@ -2613,6 +2660,7 @@ mod pre_r34_keys_are_unaffected {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         };
@@ -2646,6 +2694,7 @@ mod pre_r34_keys_are_unaffected {
             is_pcsc: false,
             pin_session: None,
             pin_verified: false,
+            typed_pin_verified: false,
             pin_present: None,
             fp_present: None,
         };

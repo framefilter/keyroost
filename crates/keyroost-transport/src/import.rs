@@ -308,12 +308,12 @@ pub struct Token2ImportStore<'a> {
 }
 
 impl<'a> Token2ImportStore<'a> {
-    /// A PIN already verified on this session (by
+    /// A typed PIN already verified on this session (by
     /// [`read_token2_existing`] with the same PIN, just before) counts as
-    /// proven, so a PIN window the key closes before the first write is
+    /// proven; a fingerprint unlock proves no PIN and doesn't count, so a PIN window the key closes before the first write is
     /// reopened with it instead of being reported as a refusal.
     pub fn new(session: &'a mut Token2OtpSession, pin: Option<zeroize::Zeroizing<String>>) -> Self {
-        let pin_proven = pin.is_some() && session.pin_window_open();
+        let pin_proven = pin.is_some() && session.typed_pin_verified();
         Self {
             session,
             pin,
@@ -1138,6 +1138,31 @@ mod tests {
                 "the key's OTP PIN is blocked".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn token2_fingerprint_unlock_never_proves_the_typed_pin() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        let pin = || Some(Zeroizing::new("0000".to_owned()));
+        // Window opened by a fingerprint: the typed PIN was never checked.
+        let mut fp = Token2OtpSession::unlocked_for_test(true, false);
+        let mut store = Token2ImportStore::new(&mut fp, pin());
+        assert!(!store.pin_proven);
+        // The key closes its window: the PIN isn't sent, the report is plain.
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::PinConditionsNotSatisfied)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            token2_add(&mut io, Some("0000"), &mut store.pin_proven, &t2name(), &e),
+            Err(StoreError::Failed(TOKEN2_PIN_WINDOW_CLOSED.to_owned()))
+        );
+        assert_eq!(io.calls, vec!["write a"]);
+        // A typed PIN verified on the session is proven; no PIN, never.
+        let mut typed = Token2OtpSession::unlocked_for_test(true, true);
+        assert!(Token2ImportStore::new(&mut typed, pin()).pin_proven);
+        let mut typed = Token2OtpSession::unlocked_for_test(true, true);
+        assert!(!Token2ImportStore::new(&mut typed, None).pin_proven);
     }
 
     #[test]
