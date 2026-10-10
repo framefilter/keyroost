@@ -57,7 +57,7 @@ pub enum OtpTarget {
 impl OtpTarget {
     /// Open a Token2 OTP session bound to exactly this endpoint (or endpoint
     /// pair — see [`OtpTarget::HidThenReader`]).
-    fn open(&self) -> Result<Token2OtpSession, OtpTransportError> {
+    pub(crate) fn open(&self) -> Result<Token2OtpSession, OtpTransportError> {
         // Honor KEYROOST_OTP_DEBUG so a stuck/empty list can be traced from the
         // GUI (matches the KEYROOST_CTAP_DEBUG convention; the CLI has --debug).
         let debug = std::env::var_os("KEYROOST_OTP_DEBUG").is_some();
@@ -82,7 +82,7 @@ impl OtpTarget {
 /// unsatisfiable — an explicit HID/CCID pick with no matching interface, or an
 /// `Auto` pick on a device that resolved to neither — so the pane surfaces an
 /// error instead of silently opening the first key on the bus. Pure + testable.
-fn otp_target_for(
+pub(crate) fn otp_target_for(
     sel: OtpTransportSel,
     hid_path: Option<&Path>,
     reader: Option<&str>,

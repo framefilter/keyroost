@@ -7,18 +7,26 @@
 //!
 //! The state logic (queue, destinations, preselection, the reason the Add
 //! button is disabled, every close route) is pure and tested below; the
-//! `impl App` block at the end wires it to the frame loop, the import thread
-//! and the device worker, the same way `otp_pane` extends `App`.
+//! `impl App` block wires it to the frame loop, the import thread and the
+//! device worker, the same way `otp_pane` extends `App`.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use keyroost_import::plan::{Existing, OathFamily, Plan, Store, StoredName, Target, Verdict};
+use keyroost_import::run::{Outcome, Report};
 use keyroost_import::{Format, HashAlg, ImportFile, OtpKind};
+use keyroost_proto::commands::ProfilePublicData;
 
-use crate::ui::device::{Caps, Device, DeviceId};
+use crate::otp_pane::{otp_target_for, OtpTransportSel};
+use crate::ui::device::{CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
 use crate::ui::theme::{self, BtnKind, Palette};
-use crate::{guard_secret_field, wipe, App};
+use crate::{
+    clear_edit_undo, completion_still_valid, guard_secret_field, wipe, App, LogKind, Severity,
+    TimeoutChoice, PROFILES,
+};
 
 /// Which storage on a key the codes go to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,9 +44,10 @@ pub struct DestKey {
 }
 
 /// Where the flow was started, for preselection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Origin {
     /// Dropped on the window: no view asked for it.
+    #[default]
     Dropped,
     /// "Import file…" in a key's view: that key's store.
     View(DestKey),
@@ -51,7 +60,7 @@ pub struct ImportFlow {
     pub dialog: Option<ImportDialog>,
     pub notice: Option<FileNotice>,
     /// Hands each dialog its own id, so a late result from the import
-    /// thread can never land in a dialog opened after it was started.
+    /// thread or the worker can never land in a dialog opened after it.
     next_id: u64,
 }
 
@@ -146,6 +155,107 @@ pub fn waiting_line(n: usize) -> Option<String> {
     }
 }
 
+/// Preselection: the store named by the view the flow started from; else
+/// the viewed key's only store, or the store matching the open tab when
+/// it has two (C14); else the only capable key's only store; else none.
+pub fn preselect(
+    dests: &[DestKey],
+    origin: &Origin,
+    viewed: Option<(&DeviceId, Option<StoreKind>)>,
+) -> Option<DestKey> {
+    if let Origin::View(d) = origin {
+        if dests.contains(d) {
+            return Some(d.clone());
+        }
+    }
+    if let Some((id, tab)) = viewed {
+        let mine: Vec<&DestKey> = dests.iter().filter(|d| d.device == *id).collect();
+        match mine.as_slice() {
+            [] => {}
+            [only] => return Some((*only).clone()),
+            several => {
+                return tab
+                    .and_then(|t| several.iter().find(|d| d.store == t).map(|d| (*d).clone()))
+            }
+        }
+    }
+    match dests {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// The plan's store for a destination: an OATH key's family comes from its
+/// vendor and, once read, the applet's version.
+pub fn store_of(kind: StoreKind, vendor: &str, version: Option<(u8, u8, u8)>) -> Store {
+    match kind {
+        StoreKind::Molto2 => Store::Molto2,
+        StoreKind::Oath => Store::Oath(OathFamily::from_vendor(vendor, version)),
+        StoreKind::Token2Otp => Store::Token2Otp,
+    }
+}
+
+/// Plan `file` into `store` over what the key holds.
+pub fn plan_for(
+    file: &ImportFile,
+    store: Store,
+    first_slot: u8,
+    existing: Existing,
+    replace: bool,
+) -> Plan {
+    keyroost_import::plan::plan(
+        file,
+        &Target {
+            store,
+            first_slot,
+            existing,
+            replace,
+        },
+    )
+}
+
+/// How many entries the store's rules accept (nothing read from the key):
+/// the "N of M can be stored" count next to each destination.
+pub fn fit_count(file: &ImportFile, store: Store, first_slot: u8) -> usize {
+    plan_for(file, store, first_slot, Existing::default(), false)
+        .writes()
+        .count()
+}
+
+/// The Molto2's used slots from the slot sweep: a slot with a title.
+pub fn molto_existing(meta: &[ProfilePublicData]) -> Existing {
+    Existing {
+        names: meta
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, m)| {
+                let title = m.title.as_deref().unwrap_or("");
+                (!title.is_empty()).then(|| StoredName::Molto2 {
+                    slot: slot as u8,
+                    title: title.to_owned(),
+                })
+            })
+            .collect(),
+        hidden: 0,
+    }
+}
+
+/// Entries that need a Molto2 slot: everything the rules accept, including
+/// the ones that run past #99.
+pub fn molto_slot_count(plan: &Plan) -> usize {
+    plan.rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.verdict,
+                Verdict::Add
+                    | Verdict::Replace
+                    | Verdict::Skip(keyroost_import::plan::Skip::PastLastSlot)
+            )
+        })
+        .count()
+}
+
 /// The export's layout, as the dialog's file line names it.
 pub fn format_name(f: Format) -> &'static str {
     match f {
@@ -168,7 +278,8 @@ fn hash_name(h: HashAlg) -> &'static str {
 }
 
 /// One entry row: `label · TOTP 30 s · SHA-1 · 6 digits` (or `· HOTP ·`),
-/// or `label — reason` for an entry no key can take.
+/// or `label — reason` for an entry no key can take. The flag is false for
+/// the latter (drawn dimmed).
 pub fn entry_line(item: &keyroost_import::ImportItem) -> (String, bool) {
     match &item.entry {
         Ok(e) => {
@@ -191,6 +302,264 @@ pub fn entry_line(item: &keyroost_import::ImportItem) -> (String, bool) {
     }
 }
 
+/// `<display name> — Authenticator (OATH)` / `— OTP storage` / `— Molto2 slots`.
+pub fn dest_label(device_name: &str, store: StoreKind) -> String {
+    let what = match store {
+        StoreKind::Oath => "Authenticator (OATH)",
+        StoreKind::Token2Otp => "OTP storage",
+        StoreKind::Molto2 => "Molto2 slots",
+    };
+    format!("{device_name} \u{2014} {what}")
+}
+
+/// `Add 9 codes to <display name>`.
+pub fn add_button_text(n: usize, device_name: &str) -> String {
+    if n == 1 {
+        format!("Add 1 code to {device_name}")
+    } else {
+        format!("Add {n} codes to {device_name}")
+    }
+}
+
+/// The preview's first line: what the key holds and has room for.
+pub fn holds_line(plan: &Plan, first_slot: u8) -> String {
+    match (plan.store, plan.capacity) {
+        (Store::Molto2, Some(cap)) => format!(
+            "{cap} slots from #{first_slot:02} to #99; {} slots in use on the Molto2.",
+            plan.on_key
+        ),
+        (_, Some(cap)) => format!("Holds {cap} codes; {} on the key.", plan.on_key),
+        (_, None) => format!("{} on the key.", plan.on_key),
+    }
+}
+
+/// One preview row: `label — will be added` (Molto2: `#95 label — …`).
+pub fn plan_row_line(row: &keyroost_import::plan::PlanRow, store: Store) -> String {
+    let what = match &row.verdict {
+        Verdict::Add => "will be added".to_owned(),
+        Verdict::Replace => match store {
+            Store::Molto2 => "will replace what is in this slot".to_owned(),
+            _ => "will replace the one on the key".to_owned(),
+        },
+        Verdict::Exists => "already on the key".to_owned(),
+        Verdict::Skip(s) => format!("skipped: {}", s.reason(store)),
+    };
+    match &row.name {
+        Some(StoredName::Molto2 { slot, .. }) => {
+            format!("#{slot:02} {} \u{2014} {what}", row.label)
+        }
+        _ => format!("{} \u{2014} {what}", row.label),
+    }
+}
+
+/// One report row: `label — added` / `— not added: reason`.
+pub fn outcome_line(label: &str, o: &Outcome) -> String {
+    let what = match o {
+        Outcome::Added => "added".to_owned(),
+        Outcome::Replaced => "replaced".to_owned(),
+        Outcome::AlreadyThere => "already there".to_owned(),
+        Outcome::RemovedNotAdded(e) => format!("removed, not added: {e}"),
+        Outcome::Failed(e) => format!("not added: {e}"),
+        Outcome::NoRoom => "not added: the key is full".to_owned(),
+        Outcome::NotTried => "not added: stopped before this one".to_owned(),
+    };
+    format!("{label} \u{2014} {what}")
+}
+
+/// The report's summary line.
+pub fn report_summary(r: &Report) -> String {
+    let added = r.count(|o| matches!(o, Outcome::Added));
+    let replaced = r.count(|o| matches!(o, Outcome::Replaced));
+    let there = r.count(|o| matches!(o, Outcome::AlreadyThere));
+    let not = r.rows.len() - added - replaced - there;
+    let mut s = format!("Added {added}");
+    if replaced > 0 {
+        s.push_str(&format!(", replaced {replaced}"));
+    }
+    if there > 0 {
+        s.push_str(&format!(", already there {there}"));
+    }
+    if not > 0 {
+        s.push_str(&format!(", not added {not}"));
+    }
+    s.push('.');
+    s
+}
+
+/// Shown when no connected key can store authenticator codes.
+pub const NO_CAPABLE_KEY: &str = "Connect a key that can store authenticator codes \
+     (for example a YubiKey, Solo 2, Nitrokey 3, Token2 key or Molto2).";
+
+/// Shown for a Molto2 destination whose slot use hasn't been read.
+pub const MOLTO_SLOTS_UNREAD: &str = "Slot use is read when the Molto2 is unlocked";
+
+/// Why "Add" is disabled, first reason in fix order (generalizes #171's
+/// bulk-dialog reasons; the Molto2 ones keep #171's words).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportBlock {
+    /// The file is still being read or decrypted.
+    Loading,
+    /// An encrypted file, no password given yet.
+    NeedsFilePassword,
+    /// The file holds nothing any key could take.
+    NoEntries,
+    /// No connected key stores codes.
+    NoCapableKey,
+    /// Nothing picked under "Add to".
+    NoDestination,
+    /// The preview is reading the key.
+    Reading,
+    /// The preview couldn't read the key.
+    KeyNotRead,
+    /// The OATH password / OTP PIN is needed.
+    Locked(StoreKind),
+    /// #171: the Molto2 isn't the selected device (or not connected).
+    NoMoltoSession,
+    /// #171: the Molto2 isn't unlocked (Authenticate button).
+    MoltoNotUnlocked,
+    /// #171: more entries than slots from `start` to #99.
+    MoltoTooMany { start: u8, count: usize, fit: usize },
+    /// Every entry is already on the key or skipped.
+    NothingToAdd,
+    /// The import is writing.
+    Running,
+    /// Another device operation runs.
+    Busy,
+}
+
+/// What [`ImportBlock::find`] looks at.
+#[derive(Debug, Clone, Default)]
+pub struct BlockInput {
+    pub loading: bool,
+    pub needs_password: bool,
+    /// Entries some key could take.
+    pub usable: usize,
+    pub capable_key: bool,
+    pub dest: Option<StoreKind>,
+    pub reading: bool,
+    pub key_not_read: bool,
+    pub locked: bool,
+    pub molto_session: bool,
+    pub molto_unlocked: bool,
+    pub molto_start: u8,
+    /// Entries that need a Molto2 slot.
+    pub molto_count: usize,
+    /// Planned writes (add + replace).
+    pub writes: usize,
+    pub running: bool,
+    pub device_busy: bool,
+}
+
+impl ImportBlock {
+    /// The first reason "Add" can't run, in the order the person fixes
+    /// them, or `None` when it can.
+    pub fn find(i: &BlockInput) -> Option<Self> {
+        if i.loading {
+            return Some(Self::Loading);
+        }
+        if i.needs_password {
+            return Some(Self::NeedsFilePassword);
+        }
+        if i.usable == 0 {
+            return Some(Self::NoEntries);
+        }
+        if !i.capable_key {
+            return Some(Self::NoCapableKey);
+        }
+        let Some(kind) = i.dest else {
+            return Some(Self::NoDestination);
+        };
+        if i.reading {
+            return Some(Self::Reading);
+        }
+        if i.locked {
+            return Some(Self::Locked(kind));
+        }
+        if i.key_not_read {
+            return Some(Self::KeyNotRead);
+        }
+        if kind == StoreKind::Molto2 {
+            let fit = usize::from(PROFILES).saturating_sub(usize::from(i.molto_start));
+            if !i.molto_session {
+                return Some(Self::NoMoltoSession);
+            }
+            if !i.molto_unlocked {
+                return Some(Self::MoltoNotUnlocked);
+            }
+            if i.molto_count > fit {
+                return Some(Self::MoltoTooMany {
+                    start: i.molto_start,
+                    count: i.molto_count,
+                    fit,
+                });
+            }
+        }
+        if i.writes == 0 {
+            return Some(Self::NothingToAdd);
+        }
+        if i.running {
+            return Some(Self::Running);
+        }
+        if i.device_busy {
+            return Some(Self::Busy);
+        }
+        None
+    }
+
+    /// The one plain line under the buttons, also the disabled button's
+    /// hover text.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Loading => "Still reading the file.".to_owned(),
+            Self::NeedsFilePassword => "Enter the file password, then click Open.".to_owned(),
+            Self::NoEntries => "None of the entries in this file can be imported.".to_owned(),
+            Self::NoCapableKey => NO_CAPABLE_KEY.to_owned(),
+            Self::NoDestination => {
+                "Choose where to add the codes under \u{201C}Add to\u{201D}.".to_owned()
+            }
+            Self::Reading => "Reading what the key holds\u{2026}".to_owned(),
+            Self::KeyNotRead => "keyroost couldn't read this key. Check that it's connected, \
+                 then click Try again."
+                .to_owned(),
+            Self::Locked(StoreKind::Token2Otp) => {
+                "This key's codes are protected by a PIN. Enter its OTP PIN and click Unlock."
+                    .to_owned()
+            }
+            Self::Locked(_) => "This key's codes are protected by a password. Enter its OATH \
+                 password and click Unlock."
+                .to_owned(),
+            Self::NoMoltoSession => {
+                "No Molto2 selected. Connect one and select it in the list on the left.".to_owned()
+            }
+            Self::MoltoNotUnlocked => "The Molto2 is not unlocked yet. Click Authenticate \
+                 (uses the customer key from the Molto2 view; blank = factory default)."
+                .to_owned(),
+            Self::MoltoTooMany { start, count, fit } => {
+                let verb = if *fit == 1 { "fits" } else { "fit" };
+                let hint = if *count <= usize::from(PROFILES) {
+                    format!(
+                        "Start at slot #{:02} or earlier.",
+                        usize::from(PROFILES) - count
+                    )
+                } else {
+                    format!("A Molto2 has {PROFILES} slots.")
+                };
+                format!(
+                    "Only {fit} of {count} entries {verb} between slot #{start:02} and #99. {hint}"
+                )
+            }
+            Self::NothingToAdd => "Nothing to add: each entry is already on the key or can't \
+                 be stored there."
+                .to_owned(),
+            Self::Running => "Adding codes\u{2026}".to_owned(),
+            Self::Busy => "Waiting for another key operation to finish.".to_owned(),
+        }
+    }
+}
+
+/// What the chosen key holds, read by the preview job.
+pub type KeyContents = (DestKey, Existing, Option<(u8, u8, u8)>);
+
 /// The dialog for one file.
 #[derive(Default)]
 pub struct ImportDialog {
@@ -201,13 +570,40 @@ pub struct ImportDialog {
     pub path: PathBuf,
     pub file_name: String,
     pub format: Option<Format>,
-    /// Parsed entries; dropping them wipes the seeds.
-    pub file: Option<ImportFile>,
+    /// Parsed entries; dropping the last reference wipes the seeds. Shared
+    /// with a running Add job, which holds its own reference until it ends.
+    pub file: Option<Arc<ImportFile>>,
     pub needs_password: bool,
     /// Wiped on every close route.
     pub file_password: String,
+    /// About the file (wrong password, unreadable).
     pub error: Option<String>,
-    pub origin: Option<Origin>,
+    pub origin: Origin,
+    pub dest: Option<DestKey>,
+    /// Whether the person has picked (preselection never overrides a pick).
+    pub dest_picked: bool,
+    /// "Replace existing entries with the same name" (OATH / Token2 OTP).
+    pub replace: bool,
+    /// What the chosen key holds, read by the preview job; reused when only
+    /// `replace` changes.
+    pub existing: Option<KeyContents>,
+    /// The preview job is reading the key.
+    pub reading: bool,
+    /// A preview should be read as soon as no device job runs.
+    pub preview_wanted: bool,
+    /// About the chosen key (couldn't read it, wrong password, changed).
+    pub dest_error: Option<String>,
+    /// OATH password / OTP PIN for a destination that needs one (wiped on
+    /// close and whenever the destination changes).
+    pub dest_secret: String,
+    pub dest_locked: bool,
+    pub molto_start: u8,
+    pub molto_timeout: TimeoutChoice,
+    /// `(done, total)` while the Add job writes.
+    pub running: Option<Arc<Mutex<(usize, usize)>>>,
+    pub report: Option<Report>,
+    /// The last Molto2 Authenticate failed (#171).
+    pub auth_failed: bool,
 }
 
 impl Drop for ImportDialog {
@@ -224,39 +620,113 @@ impl ImportDialog {
         d.id = id;
         d.path = path;
         d.file_name = file_name;
-        d.origin = Some(origin);
+        d.origin = origin;
         d
     }
 
-    /// Settle the open state after the window was drawn this frame:
-    /// `window_open` is the copy egui's `[X]` wrote to, `close_clicked` the
-    /// in-window Close. A button never writes `open` inside the window
-    /// closure; the write-back of the stale copy would undo it (#171).
+    /// Same rule as #171's bulk dialog: a button never writes `open` inside
+    /// the window closure (the write-back of egui's stale `[X]` copy would
+    /// undo it); `window_open` is that copy, `close_clicked` the Close button.
     pub fn settle_open(&mut self, window_open: bool, close_clicked: bool) {
         if self.open && !(window_open && !close_clicked) {
             self.close();
         }
     }
 
-    /// Close by any route: wipe the typed password and drop the entries.
+    /// Close by any route: wipe both typed secrets, drop the entries, what
+    /// the key holds and the report.
     pub fn close(&mut self) {
         self.open = false;
         wipe(&mut self.file_password);
+        wipe(&mut self.dest_secret);
         self.file = None;
+        self.existing = None;
+        self.report = None;
+        self.auth_failed = false;
+    }
+
+    /// Choose `dest` (`picked` when the person clicked it). A different
+    /// destination drops what was read from the old one, and its secret.
+    pub fn set_dest(&mut self, dest: Option<DestKey>, picked: bool) {
+        self.dest_picked = picked && dest.is_some();
+        if self.dest == dest {
+            return;
+        }
+        wipe(&mut self.dest_secret);
+        self.existing = None;
+        self.dest_locked = false;
+        self.reading = false;
+        self.dest_error = None;
+        self.report = None;
+        self.preview_wanted = dest.as_ref().is_some_and(|d| d.store != StoreKind::Molto2);
+        self.dest = dest;
+    }
+
+    /// Follow the connected keys: a destination that went away is cleared
+    /// (with its preview), and until the person picks, the preselection
+    /// follows the selection and hotplug. Nothing changes while writing or
+    /// while a report is showing.
+    pub fn follow_devices(&mut self, dests: &[DestKey], pre: Option<DestKey>) {
+        if self.running.is_some() || self.report.is_some() {
+            return;
+        }
+        if self.dest.as_ref().is_some_and(|d| !dests.contains(d)) {
+            self.set_dest(None, false);
+        }
+        if !self.dest_picked && self.dest != pre {
+            self.set_dest(pre, false);
+        }
+    }
+
+    /// The `existing` read for the current destination, if any.
+    fn contents(&self) -> Option<&KeyContents> {
+        self.existing
+            .as_ref()
+            .filter(|(d, _, _)| Some(d) == self.dest.as_ref())
     }
 }
 
-/// Shown when no connected key can store authenticator codes.
-pub const NO_CAPABLE_KEY: &str = "Connect a key that can store authenticator codes \
-     (for example a YubiKey, Solo 2, Nitrokey 3, Token2 key or Molto2).";
-
 /// Ids of the dialog's masked fields, for scrubbing egui's undo history.
 pub const FILE_PASSWORD_ID: &str = "import-file-password";
+pub const DEST_SECRET_ID: &str = "import-dest-secret";
 
 /// What the import thread read from a file.
 enum Read {
     Opened(keyroost_qr::file::Opened),
     Failed(String),
+}
+
+/// What the preview job read.
+enum Preview {
+    Read(Existing, Option<(u8, u8, u8)>),
+    /// The key needs its password / PIN.
+    Locked,
+    /// A password / PIN was sent and refused (or the read failed after it).
+    Refused(String),
+    Failed(String),
+}
+
+/// What the Add job did.
+enum Added {
+    Done(Report),
+    /// The key's codes changed since the preview; nothing was written.
+    Changed(Existing, Option<(u8, u8, u8)>),
+    Locked,
+    Failed(String),
+}
+
+/// How the Add job's report asks for the applet password if the key wants
+/// one nobody gave.
+const OATH_PASSWORD_HINT: &str = "enter its OATH password in the import dialog";
+
+/// Everything one frame of the dialog shows, gathered before drawing.
+struct View {
+    dests: Vec<(DestKey, String, usize)>,
+    total: usize,
+    plan: Option<Plan>,
+    molto_unread: bool,
+    block: Option<ImportBlock>,
+    dest_name: String,
 }
 
 impl App {
@@ -334,7 +804,7 @@ impl App {
                     d.needs_password = false;
                     d.error = None;
                     d.format = Some(file.format);
-                    d.file = Some(file);
+                    d.file = Some(Arc::new(file));
                 }
                 Read::Opened(Opened::NeedsPassword) => {
                     d.error = Some("Enter the file password.".to_owned());
@@ -347,10 +817,11 @@ impl App {
             return;
         }
         let mut dialog = ImportDialog::new(id, path, name.clone(), origin);
+        dialog.molto_start = self.slot;
         match read {
             Read::Opened(Opened::Entries(file)) => {
                 dialog.format = Some(file.format);
-                dialog.file = Some(file);
+                dialog.file = Some(Arc::new(file));
             }
             Read::Opened(Opened::NeedsPassword) => {
                 dialog.format = Some(Format::AegisEncrypted);
@@ -384,6 +855,13 @@ impl App {
         }
     }
 
+    /// The Molto2 Authenticate result, for the dialog's reason line (#171).
+    pub(crate) fn import_auth_result(&mut self, ok: bool) {
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            d.auth_failed = !ok;
+        }
+    }
+
     /// "Import file…": pick a file; it joins the queue.
     pub(crate) fn import_pick_file(&mut self, origin: Origin) {
         self.spawn_file_dialog(
@@ -398,6 +876,509 @@ impl App {
             ],
             None,
         );
+    }
+
+    /// Close the dialog by a route outside its window (a finished Molto2
+    /// import): wipe, scrub the fields' undo history, and let the queue go on.
+    fn import_close_dialog(&mut self) {
+        if let Some(mut d) = self.import_flow.dialog.take() {
+            d.close();
+        }
+        if let Some(ctx) = self.egui_ctx.clone() {
+            clear_edit_undo(&ctx, egui::Id::new(FILE_PASSWORD_ID));
+            clear_edit_undo(&ctx, egui::Id::new(DEST_SECRET_ID));
+        }
+    }
+
+    /// The selected key and the store its open view shows, for preselection.
+    fn import_viewed(&self) -> Option<(DeviceId, Option<StoreKind>)> {
+        let dev = self.selected_device()?;
+        let tab = if dev.kind == DeviceKind::Token {
+            Some(StoreKind::Molto2)
+        } else {
+            match self.cap_tab {
+                CapTab::Oath => Some(StoreKind::Oath),
+                CapTab::Otp => Some(StoreKind::Token2Otp),
+                _ => None,
+            }
+        };
+        Some((dev.id.clone(), tab))
+    }
+
+    fn import_device(&self, id: &DeviceId) -> Option<&Device> {
+        self.devices.iter().find(|d| d.id == *id)
+    }
+
+    /// The Molto2 session belongs to this destination's key and to the
+    /// current selection.
+    fn import_molto_ready(&self, dest: &DestKey) -> bool {
+        self.molto_session_usable() && self.molto_session_device.as_ref() == Some(&dest.device)
+    }
+
+    /// The OATH password to send to `dest`: the one typed in the dialog,
+    /// else the one the OATH pane already unlocked this key with.
+    fn import_oath_password(
+        &self,
+        d: &ImportDialog,
+        dest: &DestKey,
+    ) -> Option<zeroize::Zeroizing<String>> {
+        if !d.dest_secret.is_empty() {
+            return Some(zeroize::Zeroizing::new(d.dest_secret.clone()));
+        }
+        if self.selected_device.as_ref() == Some(&dest.device) {
+            return self.oath.unlocked_password.clone();
+        }
+        None
+    }
+
+    /// The OTP PIN to send to `dest`: typed in the dialog, else the one the
+    /// OTP pane verified for this key.
+    fn import_otp_pin(
+        &self,
+        d: &ImportDialog,
+        dest: &DestKey,
+    ) -> Option<zeroize::Zeroizing<String>> {
+        if !d.dest_secret.is_empty() {
+            return Some(zeroize::Zeroizing::new(d.dest_secret.clone()));
+        }
+        if self.selected_device.as_ref() == Some(&dest.device) {
+            return self.otp.pin.clone();
+        }
+        None
+    }
+
+    /// The OTP endpoint of `dev`: the pane's transport choice when it is the
+    /// selected key, else Auto.
+    fn import_otp_target(&self, dev: &Device) -> Result<crate::otp_pane::OtpTarget, String> {
+        let sel = if self.selected_device.as_ref() == Some(&dev.id) {
+            self.otp.transport
+        } else {
+            OtpTransportSel::Auto
+        };
+        otp_target_for(sel, dev.hid_path.as_deref(), dev.reader.as_deref())
+    }
+
+    /// Read what the chosen key holds (OATH / Token2 OTP), off the frame
+    /// loop. The session closes when the job returns: nothing is held while
+    /// the person types.
+    fn import_preview(&mut self) {
+        let Some(d) = self.import_flow.dialog.as_ref() else {
+            return;
+        };
+        let Some(dest) = d.dest.clone() else {
+            return;
+        };
+        let id = d.id;
+        let Some(dev) = self.import_device(&dest.device).cloned() else {
+            return;
+        };
+        let oath_pw = self.import_oath_password(d, &dest);
+        let otp_pin = self.import_otp_pin(d, &dest);
+        let job: Box<dyn FnOnce() -> Preview + Send> = match dest.store {
+            StoreKind::Molto2 => return,
+            StoreKind::Oath => {
+                let Some(reader) = dev.reader.clone() else {
+                    self.import_set_preview(
+                        id,
+                        &dest,
+                        Preview::Failed(
+                            "This key has no smart-card interface to reach its OATH codes.".into(),
+                        ),
+                    );
+                    return;
+                };
+                let pw = oath_pw;
+                Box::new(move || {
+                    let mut s = match keyroost_transport::OathSession::open(&reader) {
+                        Ok(s) => s,
+                        Err(e) => return Preview::Failed(e.to_string()),
+                    };
+                    if s.password_required() {
+                        let Some(pw) = pw else {
+                            return Preview::Locked;
+                        };
+                        if let Err(e) = s.unlock(&pw) {
+                            return Preview::Refused(e.to_string());
+                        }
+                    }
+                    match keyroost_transport::import::read_oath_existing(&mut s) {
+                        Ok(ex) => Preview::Read(ex, s.version()),
+                        Err(e) => Preview::Failed(e.to_string()),
+                    }
+                })
+            }
+            StoreKind::Token2Otp => {
+                let target = match self.import_otp_target(&dev) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.import_set_preview(id, &dest, Preview::Failed(e));
+                        return;
+                    }
+                };
+                let pin = otp_pin;
+                Box::new(move || {
+                    let mut s = match target.open() {
+                        Ok(s) => s,
+                        Err(e) => return Preview::Failed(e.to_string()),
+                    };
+                    let had_pin = pin.is_some();
+                    match keyroost_transport::import::read_token2_existing(
+                        &mut s,
+                        pin.as_deref().map(String::as_str),
+                    ) {
+                        Ok(ex) => Preview::Read(ex, None),
+                        Err(keyroost_transport::OtpTransportError::PinRequired) => Preview::Locked,
+                        Err(e) if had_pin => Preview::Refused(e.to_string()),
+                        Err(e) => Preview::Failed(e.to_string()),
+                    }
+                })
+            }
+        };
+        let queued = self.spawn_job("Reading the key\u{2026}", move || {
+            let preview = job();
+            Box::new(move |app: &mut App| app.import_set_preview(id, &dest, preview))
+        });
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            if queued {
+                d.preview_wanted = false;
+                d.reading = true;
+            }
+        }
+    }
+
+    /// Apply a preview to the dialog it was read for.
+    fn import_set_preview(&mut self, id: u64, dest: &DestKey, preview: Preview) {
+        let Some(d) = self.import_flow.dialog.as_mut() else {
+            return;
+        };
+        if d.id != id || d.dest.as_ref() != Some(dest) {
+            return;
+        }
+        d.reading = false;
+        d.preview_wanted = false;
+        match preview {
+            Preview::Read(ex, version) => {
+                d.existing = Some((dest.clone(), ex, version));
+                d.dest_locked = false;
+                d.dest_error = None;
+            }
+            Preview::Locked => {
+                d.existing = None;
+                d.dest_locked = true;
+                d.dest_error = None;
+            }
+            Preview::Refused(e) => {
+                d.existing = None;
+                d.dest_locked = true;
+                wipe(&mut d.dest_secret);
+                d.dest_error = Some(format!("The key didn't accept that: {e}"));
+            }
+            Preview::Failed(e) => {
+                d.existing = None;
+                d.dest_error = Some(e);
+            }
+        }
+    }
+
+    /// The plan the dialog shows for its destination, when it can be made.
+    fn import_plan(&self, d: &ImportDialog) -> (Option<Plan>, bool) {
+        let (Some(file), Some(dest)) = (d.file.as_ref(), d.dest.as_ref()) else {
+            return (None, false);
+        };
+        let Some(dev) = self.import_device(&dest.device) else {
+            return (None, false);
+        };
+        match dest.store {
+            StoreKind::Molto2 => {
+                let meta = self
+                    .slot_meta
+                    .as_deref()
+                    .filter(|_| self.molto_session_device.as_ref() == Some(&dest.device));
+                let existing = meta.map(molto_existing).unwrap_or_default();
+                let plan = plan_for(file, Store::Molto2, d.molto_start, existing, false);
+                (Some(plan), meta.is_none())
+            }
+            _ => match d.contents() {
+                Some((_, ex, version)) => {
+                    let store = store_of(dest.store, &dev.vendor, *version);
+                    (Some(plan_for(file, store, 0, ex.clone(), d.replace)), false)
+                }
+                None => (None, false),
+            },
+        }
+    }
+
+    /// Gather what this frame of the dialog shows.
+    fn import_view(&self, d: &ImportDialog, dests: &[DestKey]) -> View {
+        let (plan, molto_unread) = self.import_plan(d);
+        let dest_rows = dests
+            .iter()
+            .filter_map(|k| {
+                let dev = self.import_device(&k.device)?;
+                let fit = d.file.as_ref().map_or(0, |f| {
+                    let version = d
+                        .existing
+                        .as_ref()
+                        .filter(|(dk, _, _)| dk == k)
+                        .and_then(|(_, _, v)| *v);
+                    fit_count(f, store_of(k.store, &dev.vendor, version), d.molto_start)
+                });
+                Some((k.clone(), dest_label(dev.title(), k.store), fit))
+            })
+            .collect();
+        let dest_name = d
+            .dest
+            .as_ref()
+            .and_then(|k| self.import_device(&k.device))
+            .map(|dev| dev.title().to_owned())
+            .unwrap_or_default();
+        let molto = d.dest.as_ref().filter(|k| k.store == StoreKind::Molto2);
+        let input = BlockInput {
+            loading: self.import_busy(),
+            needs_password: d.needs_password && d.file.is_none(),
+            usable: d.file.as_ref().map_or(0, |f| f.usable()),
+            capable_key: !dests.is_empty(),
+            dest: d.dest.as_ref().map(|k| k.store),
+            reading: d.reading || d.preview_wanted,
+            key_not_read: plan.is_none() && d.dest.is_some(),
+            locked: d.dest_locked,
+            molto_session: molto.is_some_and(|k| self.import_molto_ready(k)),
+            molto_unlocked: self.authenticated,
+            molto_start: d.molto_start,
+            molto_count: plan.as_ref().map_or(0, molto_slot_count),
+            writes: plan.as_ref().map_or(0, |p| p.writes().count()),
+            running: d.running.is_some(),
+            device_busy: self.busy(),
+        };
+        View {
+            dests: dest_rows,
+            total: d.file.as_ref().map_or(0, |f| f.items.len()),
+            plan,
+            molto_unread,
+            block: ImportBlock::find(&input),
+            dest_name,
+        }
+    }
+
+    /// "Add": write the planned codes to the chosen destination.
+    fn import_add(&mut self, shown: Plan) {
+        let Some(d) = self.import_flow.dialog.as_ref() else {
+            return;
+        };
+        let (Some(file), Some(dest)) = (d.file.clone(), d.dest.clone()) else {
+            return;
+        };
+        let Some(dev) = self.import_device(&dest.device).cloned() else {
+            return;
+        };
+        let id = d.id;
+        let replace = d.replace;
+        let timeout = d.molto_timeout.to_proto();
+        let oath_pw = self.import_oath_password(d, &dest);
+        let otp_pin = self.import_otp_pin(d, &dest);
+        let progress = Arc::new(Mutex::new((0usize, shown.writes().count())));
+        let counter = progress.clone();
+        let on_progress = move |done: usize, total: usize, _label: &str| {
+            if let Ok(mut g) = counter.lock() {
+                *g = (done, total);
+            }
+        };
+        let label = format!("Adding codes to {}\u{2026}", dev.title());
+        let queued = match dest.store {
+            StoreKind::Molto2 => {
+                if !self.ensure_auth() {
+                    return;
+                }
+                let for_device = self.selected_device.clone();
+                let Some(mut s) = self.take_molto_session() else {
+                    return;
+                };
+                self.spawn_job(label, move || {
+                    let mut on_progress = on_progress;
+                    let report = {
+                        let mut store =
+                            keyroost_transport::import::MoltoImportStore::new(&mut s, timeout);
+                        keyroost_import::run::run(&file, &shown, &mut store, &mut on_progress)
+                    };
+                    drop(file);
+                    // Public-block sweep, as after every Molto2 write: a
+                    // failed sweep keeps the old slot list.
+                    let meta = (0..PROFILES)
+                        .map(|p| s.read_public_data(p))
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok();
+                    Box::new(move |app: &mut App| {
+                        app.session = Some(s);
+                        if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref())
+                        {
+                            if let Some(m) = meta {
+                                app.slot_meta = Some(m);
+                            }
+                        }
+                        app.import_finish(id, &dest, Store::Molto2, Added::Done(report));
+                    })
+                })
+            }
+            StoreKind::Oath => {
+                let Some(reader) = dev.reader.clone() else {
+                    return;
+                };
+                let pw = oath_pw;
+                let vendor = dev.vendor.clone();
+                self.spawn_job(label, move || {
+                    let mut on_progress = on_progress;
+                    let (store, added) = (|| {
+                        let fallback = store_of(StoreKind::Oath, &vendor, None);
+                        let mut s = match keyroost_transport::OathSession::open(&reader) {
+                            Ok(s) => s,
+                            Err(e) => return (fallback, Added::Failed(e.to_string())),
+                        };
+                        if s.password_required() {
+                            let Some(pw) = pw.as_ref() else {
+                                return (fallback, Added::Locked);
+                            };
+                            if let Err(e) = s.unlock(pw) {
+                                return (fallback, Added::Failed(e.to_string()));
+                            }
+                        }
+                        let version = s.version();
+                        let store = store_of(StoreKind::Oath, &vendor, version);
+                        let ex = match keyroost_transport::import::read_oath_existing(&mut s) {
+                            Ok(ex) => ex,
+                            Err(e) => return (store, Added::Failed(e.to_string())),
+                        };
+                        let again = plan_for(&file, store, 0, ex.clone(), replace);
+                        if again.rows != shown.rows {
+                            return (store, Added::Changed(ex, version));
+                        }
+                        let mut w = keyroost_transport::import::OathImportStore::new(&mut s)
+                            .password_hint(OATH_PASSWORD_HINT);
+                        let report =
+                            keyroost_import::run::run(&file, &again, &mut w, &mut on_progress);
+                        (store, Added::Done(report))
+                    })();
+                    drop(file);
+                    drop(pw);
+                    Box::new(move |app: &mut App| app.import_finish(id, &dest, store, added))
+                })
+            }
+            StoreKind::Token2Otp => {
+                let target = match self.import_otp_target(&dev) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if let Some(d) = self.import_flow.dialog.as_mut() {
+                            d.dest_error = Some(e);
+                        }
+                        return;
+                    }
+                };
+                let pin = otp_pin;
+                self.spawn_job(label, move || {
+                    let mut on_progress = on_progress;
+                    let added = (|| {
+                        let mut s = match target.open() {
+                            Ok(s) => s,
+                            Err(e) => return Added::Failed(e.to_string()),
+                        };
+                        let ex = match keyroost_transport::import::read_token2_existing(
+                            &mut s,
+                            pin.as_deref().map(String::as_str),
+                        ) {
+                            Ok(ex) => ex,
+                            Err(keyroost_transport::OtpTransportError::PinRequired) => {
+                                return Added::Locked
+                            }
+                            Err(e) => return Added::Failed(e.to_string()),
+                        };
+                        let again = plan_for(&file, Store::Token2Otp, 0, ex.clone(), replace);
+                        if again.rows != shown.rows {
+                            return Added::Changed(ex, None);
+                        }
+                        let mut w =
+                            keyroost_transport::import::Token2ImportStore::new(&mut s, pin.clone());
+                        Added::Done(keyroost_import::run::run(
+                            &file,
+                            &again,
+                            &mut w,
+                            &mut on_progress,
+                        ))
+                    })();
+                    drop(file);
+                    drop(pin);
+                    Box::new(move |app: &mut App| {
+                        app.import_finish(id, &dest, Store::Token2Otp, added)
+                    })
+                })
+            }
+        };
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            if queued {
+                d.running = Some(progress);
+                d.dest_error = None;
+            } else {
+                d.dest_error =
+                    Some("Another key operation is running; try again in a moment.".into());
+            }
+        }
+    }
+
+    /// Apply the Add job's result to the dialog it ran for.
+    fn import_finish(&mut self, id: u64, dest: &DestKey, store: Store, added: Added) {
+        let name = self
+            .import_device(&dest.device)
+            .map(|d| d.title().to_owned())
+            .unwrap_or_default();
+        let selected = self.selected_device.as_ref() == Some(&dest.device);
+        if let Added::Done(report) = &added {
+            let sev = if report.ok() && report.stopped.is_none() {
+                Severity::Ok
+            } else {
+                Severity::Warn
+            };
+            self.log_global(
+                sev,
+                LogKind::User,
+                format!("{name}: import: {}", report_summary(report)),
+            );
+            // The matching pane shows the new codes.
+            if selected {
+                match dest.store {
+                    StoreKind::Oath => self.load_oath_creds(),
+                    StoreKind::Token2Otp => self.load_otp_entries(),
+                    StoreKind::Molto2 => {}
+                }
+            }
+        }
+        let Some(d) = self.import_flow.dialog.as_mut() else {
+            return;
+        };
+        if d.id != id {
+            return;
+        }
+        d.running = None;
+        match added {
+            Added::Done(report) => {
+                // A Molto2 import that wrote everything closes the dialog,
+                // as the bulk dialog did; otherwise the report stays up.
+                let all_done = report.ok() && report.stopped.is_none();
+                if store == Store::Molto2 && all_done {
+                    self.import_close_dialog();
+                    return;
+                }
+                d.report = Some(report);
+            }
+            Added::Changed(ex, version) => {
+                d.existing = Some((dest.clone(), ex, version));
+                d.dest_error = Some(
+                    "The codes on the key changed; check the preview and try again.".to_owned(),
+                );
+            }
+            Added::Locked => {
+                d.existing = None;
+                d.dest_locked = true;
+            }
+            Added::Failed(e) => d.dest_error = Some(format!("Nothing was written: {e}")),
+        }
     }
 
     /// Draw the notice and the dialog, when one is showing.
@@ -437,23 +1418,72 @@ impl App {
     }
 
     fn render_import_dialog(&mut self, ctx: &egui::Context, p: &Palette, waiting: Option<String>) {
+        if self.import_flow.dialog.is_none() {
+            return;
+        }
+        // Follow the connected keys and the selection before drawing.
+        let dests = destinations(&self.devices);
+        let viewed = self.import_viewed();
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            let pre = preselect(
+                &dests,
+                &d.origin,
+                viewed.as_ref().map(|(id, tab)| (id, *tab)),
+            );
+            d.follow_devices(&dests, pre);
+        }
+        let want_preview = self
+            .import_flow
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.preview_wanted && d.running.is_none());
+        if want_preview && !self.busy() && !self.import_busy() {
+            self.import_preview();
+        }
         let importing = self.import_busy();
         let import_label = self.import_label.clone();
-        let no_capable_key = destinations(&self.devices).is_empty();
+        let busy = self.busy();
+        let Some(d) = self.import_flow.dialog.as_ref() else {
+            return;
+        };
+        let view = self.import_view(d, &dests);
         let Some(d) = self.import_flow.dialog.as_mut() else {
             return;
         };
+
         let mut open = d.open;
         let mut close_clicked = false;
         let mut do_open = false;
+        let mut do_add = false;
+        let mut do_auth = false;
+        let mut do_unlock = false;
+        let mut picked: Option<DestKey> = None;
         egui::Window::new("Import authenticator codes")
             .open(&mut open)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(560.0)
+            .default_width(580.0)
             .show(ctx, |ui| {
+                // The file.
                 ui.label(egui::RichText::new(file_line(d)).color(p.txt));
-                if d.needs_password {
+                if let Some(file) = d.file.as_ref() {
+                    if let Some((i, n)) = file.batch {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "QR {} of {n} \u{2014} import the others too.",
+                                i + 1
+                            ))
+                            .color(p.txt2),
+                        );
+                    }
+                    if matches!(file.format, Format::QrImage | Format::GoogleExport) {
+                        ui.label(
+                            egui::RichText::new("Delete the screenshot after a successful import.")
+                                .color(p.txt2),
+                        );
+                    }
+                }
+                if d.needs_password && d.file.is_none() {
                     ui.add_space(6.0);
                     ui.label("File password:");
                     ui.horizontal(|ui| {
@@ -466,13 +1496,9 @@ impl App {
                         guard_secret_field(ui.ctx(), &resp);
                         let enter =
                             resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if ui
-                            .add_enabled(
-                                !importing && !d.file_password.is_empty(),
-                                egui::Button::new("Open"),
-                            )
-                            .clicked()
-                            || (enter && !importing && !d.file_password.is_empty())
+                        let can = !importing && !d.file_password.is_empty();
+                        if ui.add_enabled(can, egui::Button::new("Open")).clicked()
+                            || (enter && can)
                         {
                             do_open = true;
                         }
@@ -489,7 +1515,9 @@ impl App {
                 if let Some(err) = &d.error {
                     ui.colored_label(p.err, err);
                 }
-                if let Some(file) = &d.file {
+
+                // The entries.
+                if let Some(file) = d.file.as_ref() {
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
                         .id_salt("import-entries")
@@ -502,13 +1530,212 @@ impl App {
                             }
                         });
                 }
-                if no_capable_key {
-                    ui.add_space(6.0);
-                    ui.colored_label(p.warn, NO_CAPABLE_KEY);
+
+                // Where they go.
+                if d.file.is_some() && d.report.is_none() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Add to")
+                            .font(theme::f_sb(13.0))
+                            .color(p.txt),
+                    );
+                    if view.dests.is_empty() {
+                        ui.colored_label(p.warn, NO_CAPABLE_KEY);
+                    }
+                    let locked_choice = d.running.is_some();
+                    for (k, label, fit) in &view.dests {
+                        ui.horizontal(|ui| {
+                            let chosen = d.dest.as_ref() == Some(k);
+                            if ui
+                                .add_enabled(!locked_choice, egui::RadioButton::new(chosen, label))
+                                .clicked()
+                                && !chosen
+                            {
+                                picked = Some(k.clone());
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{fit} of {} can be stored",
+                                    view.total
+                                ))
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                            );
+                        });
+                    }
+                    match d.dest.as_ref().map(|k| k.store) {
+                        Some(StoreKind::Oath | StoreKind::Token2Otp) => {
+                            ui.checkbox(
+                                &mut d.replace,
+                                "Replace existing entries with the same name",
+                            );
+                        }
+                        Some(StoreKind::Molto2) => {
+                            ui.horizontal(|ui| {
+                                ui.label("Start at slot:");
+                                ui.add(
+                                    egui::DragValue::new(&mut d.molto_start)
+                                        .clamp_existing_to_range(true)
+                                        .range(0..=99u8),
+                                );
+                                ui.label("Display timeout:");
+                                timeout_combo(ui, &mut d.molto_timeout);
+                            });
+                        }
+                        None => {}
+                    }
+                    if d.dest_locked {
+                        let what = match d.dest.as_ref().map(|k| k.store) {
+                            Some(StoreKind::Token2Otp) => "OTP PIN:",
+                            _ => "OATH password:",
+                        };
+                        ui.add_space(6.0);
+                        ui.label(what);
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut d.dest_secret)
+                                    .id(egui::Id::new(DEST_SECRET_ID))
+                                    .password(true)
+                                    .desired_width(260.0),
+                            );
+                            guard_secret_field(ui.ctx(), &resp);
+                            let enter =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let can = !busy && !d.dest_secret.is_empty();
+                            if ui.add_enabled(can, egui::Button::new("Unlock")).clicked()
+                                || (enter && can)
+                            {
+                                do_unlock = true;
+                            }
+                        });
+                    }
+                    if let Some(err) = &d.dest_error {
+                        ui.colored_label(p.err, err);
+                    }
+
+                    // The preview.
+                    if let Some(plan) = &view.plan {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(holds_line(plan, d.molto_start)).color(p.txt2),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("import-preview")
+                            .max_height(8.0 * 20.0)
+                            .show(ui, |ui| {
+                                for row in &plan.rows {
+                                    let color = match row.verdict {
+                                        Verdict::Add | Verdict::Replace => p.txt2,
+                                        _ => p.txt3,
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(plan_row_line(row, plan.store))
+                                            .color(color),
+                                    );
+                                }
+                            });
+                        for note in &plan.notes {
+                            ui.label(
+                                egui::RichText::new(note.to_string())
+                                    .font(theme::f_reg(11.5))
+                                    .color(p.txt3),
+                            );
+                        }
+                        if view.molto_unread {
+                            ui.label(
+                                egui::RichText::new(MOLTO_SLOTS_UNREAD)
+                                    .font(theme::f_reg(11.5))
+                                    .color(p.txt3),
+                            );
+                        }
+                    }
                 }
+
+                // The report.
+                if let Some(report) = &d.report {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(report_summary(report)).color(p.txt));
+                    egui::ScrollArea::vertical()
+                        .id_salt("import-report")
+                        .max_height(8.0 * 20.0)
+                        .show(ui, |ui| {
+                            for (_, label, outcome) in &report.rows {
+                                let color = match outcome {
+                                    Outcome::Added | Outcome::Replaced | Outcome::AlreadyThere => {
+                                        p.txt2
+                                    }
+                                    _ => p.err,
+                                };
+                                ui.label(
+                                    egui::RichText::new(outcome_line(label, outcome)).color(color),
+                                );
+                            }
+                        });
+                    if let Some(why) = &report.stopped {
+                        ui.colored_label(p.err, format!("Stopped: {why}"));
+                    }
+                }
+
+                // The buttons.
                 ui.add_space(10.0);
-                if ui.button("Close").clicked() {
-                    close_clicked = true;
+                if let Some(progress) = &d.running {
+                    let (done, total) = progress.lock().map(|g| *g).unwrap_or((0, 0));
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!(
+                            "Adding {} of {total}\u{2026}",
+                            (done + 1).min(total.max(1))
+                        ));
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if d.report.is_none() && d.file.is_some() {
+                            let writes = view.plan.as_ref().map_or(0, |p| p.writes().count());
+                            let text = if d.dest.is_some() {
+                                add_button_text(writes, &view.dest_name)
+                            } else {
+                                "Add codes".to_owned()
+                            };
+                            let resp =
+                                ui.add_enabled(view.block.is_none(), egui::Button::new(text));
+                            let resp = match &view.block {
+                                Some(b) => resp.on_disabled_hover_text(b.message()),
+                                None => resp,
+                            };
+                            if resp.clicked() {
+                                do_add = true;
+                            }
+                        }
+                        if ui.button("Close").clicked() {
+                            close_clicked = true;
+                        }
+                        if d.report.is_none()
+                            && view.block == Some(ImportBlock::MoltoNotUnlocked)
+                            && ui
+                                .add_enabled(!busy, egui::Button::new("Authenticate"))
+                                .clicked()
+                        {
+                            do_auth = true;
+                        }
+                        if d.report.is_none()
+                            && view.block == Some(ImportBlock::KeyNotRead)
+                            && ui
+                                .add_enabled(!busy, egui::Button::new("Try again"))
+                                .clicked()
+                        {
+                            do_unlock = true;
+                        }
+                    });
+                }
+                if d.report.is_none() && d.running.is_none() {
+                    if let Some(b) = &view.block {
+                        let msg = if *b == ImportBlock::MoltoNotUnlocked && d.auth_failed {
+                            "Couldn't unlock the Molto2 \u{2014} check the customer key".to_owned()
+                        } else {
+                            b.message()
+                        };
+                        ui.colored_label(p.warn, msg);
+                    }
                 }
                 if let Some(w) = &waiting {
                     ui.add_space(6.0);
@@ -519,20 +1746,67 @@ impl App {
                     );
                 }
             });
+
+        // Apply Close and [X] only now, after the window is drawn; every
+        // route wipes both secrets and drops the entries. A running import
+        // can't be closed from under its report.
+        if d.running.is_some() {
+            close_clicked = false;
+            open = true;
+        }
         d.settle_open(open, close_clicked);
         if !d.open {
             self.import_flow.dialog = None;
-            crate::clear_edit_undo(ctx, egui::Id::new(FILE_PASSWORD_ID));
+            clear_edit_undo(ctx, egui::Id::new(FILE_PASSWORD_ID));
+            clear_edit_undo(ctx, egui::Id::new(DEST_SECRET_ID));
             return;
+        }
+        if let Some(k) = picked {
+            d.set_dest(Some(k), true);
+            clear_edit_undo(ctx, egui::Id::new(DEST_SECRET_ID));
+        }
+        if do_unlock {
+            d.preview_wanted = true;
+            d.dest_error = None;
         }
         if do_open {
             let (id, path, name) = (d.id, d.path.clone(), d.file_name.clone());
-            let origin = d.origin.clone().unwrap_or(Origin::Dropped);
+            let origin = d.origin.clone();
             let pw = zeroize::Zeroizing::new(d.file_password.clone());
             d.error = None;
             self.import_read(id, path, name, origin, Some(pw));
         }
+        if do_auth {
+            self.authenticate();
+        }
+        if do_add {
+            if let Some(plan) = view.plan {
+                self.import_add(plan);
+            }
+        }
     }
+}
+
+/// The Molto2 display-timeout picker.
+fn timeout_combo(ui: &mut egui::Ui, value: &mut TimeoutChoice) {
+    let label = |t: TimeoutChoice| match t {
+        TimeoutChoice::S15 => "15s",
+        TimeoutChoice::S30 => "30s",
+        TimeoutChoice::S60 => "60s",
+        TimeoutChoice::S120 => "120s",
+    };
+    egui::ComboBox::from_id_salt("import-molto-timeout")
+        .selected_text(label(*value))
+        .show_ui(ui, |ui| {
+            for t in [
+                TimeoutChoice::S15,
+                TimeoutChoice::S30,
+                TimeoutChoice::S60,
+                TimeoutChoice::S120,
+            ] {
+                ui.selectable_value(value, t, label(t));
+            }
+        });
 }
 
 /// `vault.json — Aegis (encrypted) · 12 entries`.
@@ -555,7 +1829,7 @@ pub fn file_line(d: &ImportDialog) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::device::DeviceKind;
+    use keyroost_import::{ImportEntry, ImportItem};
 
     fn dev(id: &str, caps: &[Caps]) -> Device {
         let mut c = Caps::default();
@@ -587,6 +1861,61 @@ mod tests {
         }
     }
 
+    fn entry(issuer: &str, hash: HashAlg, period: u32) -> ImportEntry {
+        ImportEntry {
+            issuer: Some(issuer.into()),
+            account: Some("alice".into()),
+            secret: zeroize::Zeroizing::new(vec![7u8; 20]),
+            hash,
+            digits: 6,
+            kind: OtpKind::Totp { period },
+        }
+    }
+
+    fn file_of(entries: Vec<ImportEntry>) -> ImportFile {
+        ImportFile {
+            format: Format::Aegis,
+            items: entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, e)| ImportItem {
+                    index,
+                    label: format!("{}:alice", e.issuer.as_deref().unwrap_or("")),
+                    entry: Ok(e),
+                })
+                .collect(),
+            batch: None,
+        }
+    }
+
+    fn open_dialog() -> ImportDialog {
+        let mut d = ImportDialog::new(
+            1,
+            PathBuf::from("/x/v.json"),
+            "v.json".into(),
+            Origin::Dropped,
+        );
+        d.file = Some(Arc::new(file_of(vec![entry("GitHub", HashAlg::Sha1, 30)])));
+        d.file_password = "hunter2".into();
+        d.dest = Some(dk("a", StoreKind::Oath));
+        d.dest_secret = "oathpw".into();
+        d.existing = Some((dk("a", StoreKind::Oath), Existing::default(), None));
+        d.report = Some(Report {
+            rows: Vec::new(),
+            stopped: None,
+        });
+        d
+    }
+
+    fn assert_wiped(d: &ImportDialog) {
+        assert!(!d.open);
+        assert!(d.file_password.is_empty());
+        assert!(d.dest_secret.is_empty());
+        assert!(d.file.is_none());
+        assert!(d.existing.is_none());
+        assert!(d.report.is_none());
+    }
+
     #[test]
     fn destinations_order_and_labels() {
         let devices = vec![
@@ -602,6 +1931,18 @@ mod tests {
                 dk("both", StoreKind::Token2Otp),
                 dk("molto", StoreKind::Molto2),
             ]
+        );
+        assert_eq!(
+            dest_label("YubiKey", StoreKind::Oath),
+            "YubiKey \u{2014} Authenticator (OATH)"
+        );
+        assert_eq!(
+            dest_label("Token2", StoreKind::Token2Otp),
+            "Token2 \u{2014} OTP storage"
+        );
+        assert_eq!(
+            dest_label("Molto2", StoreKind::Molto2),
+            "Molto2 \u{2014} Molto2 slots"
         );
     }
 
@@ -667,5 +2008,383 @@ mod tests {
         assert_eq!(waiting_line(0), None);
         assert_eq!(waiting_line(1).as_deref(), Some("1 more file waiting."));
         assert_eq!(waiting_line(3).as_deref(), Some("3 more files waiting."));
+    }
+
+    #[test]
+    fn import_dialog_close_button_wins_over_stale_open_copy() {
+        let mut d = open_dialog();
+        d.settle_open(true, true);
+        assert_wiped(&d);
+    }
+
+    #[test]
+    fn import_dialog_x_closes() {
+        let mut d = open_dialog();
+        d.settle_open(false, false);
+        assert_wiped(&d);
+    }
+
+    #[test]
+    fn import_dialog_stays_open_without_a_close() {
+        let mut d = open_dialog();
+        d.settle_open(true, false);
+        assert!(d.open);
+        assert_eq!(d.file_password, "hunter2");
+        assert_eq!(d.dest_secret, "oathpw");
+        assert!(d.file.is_some());
+    }
+
+    #[test]
+    fn import_dialog_every_close_route_wipes() {
+        // Close, [X], and close() as a finished Molto2 import uses it.
+        for route in 0..3 {
+            let mut d = open_dialog();
+            match route {
+                0 => d.settle_open(true, true),
+                1 => d.settle_open(false, false),
+                _ => d.close(),
+            }
+            assert_wiped(&d);
+        }
+        // The destination going away wipes what belongs to it.
+        let mut d = open_dialog();
+        d.report = None;
+        d.follow_devices(&[], None);
+        assert!(d.dest_secret.is_empty());
+        assert!(d.existing.is_none());
+        // The next file only starts once the dialog is gone; dropping the
+        // flow (app exit) closes what is showing.
+        let mut flow = ImportFlow::default();
+        flow.dialog = Some(open_dialog());
+        let file = flow.dialog.as_ref().unwrap().file.clone().unwrap();
+        drop(flow);
+        // Only the test's own reference is left: the dialog let go of the
+        // entries.
+        assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    #[test]
+    fn import_block_reports_reasons_in_fix_order() {
+        let ready = BlockInput {
+            usable: 3,
+            capable_key: true,
+            dest: Some(StoreKind::Oath),
+            writes: 3,
+            ..BlockInput::default()
+        };
+        assert_eq!(ImportBlock::find(&ready), None);
+        let with = |f: &dyn Fn(&mut BlockInput)| {
+            let mut i = ready.clone();
+            f(&mut i);
+            ImportBlock::find(&i)
+        };
+        assert_eq!(
+            with(&|i| {
+                i.loading = true;
+                i.needs_password = true;
+            }),
+            Some(ImportBlock::Loading)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.needs_password = true;
+                i.usable = 0;
+            }),
+            Some(ImportBlock::NeedsFilePassword)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.usable = 0;
+                i.capable_key = false;
+            }),
+            Some(ImportBlock::NoEntries)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.capable_key = false;
+                i.dest = None;
+            }),
+            Some(ImportBlock::NoCapableKey)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.dest = None;
+                i.reading = true;
+            }),
+            Some(ImportBlock::NoDestination)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.reading = true;
+                i.locked = true;
+            }),
+            Some(ImportBlock::Reading)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.locked = true;
+                i.key_not_read = true;
+            }),
+            Some(ImportBlock::Locked(StoreKind::Oath))
+        );
+        assert_eq!(
+            with(&|i| {
+                i.key_not_read = true;
+                i.writes = 0;
+            }),
+            Some(ImportBlock::KeyNotRead)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.writes = 0;
+                i.running = true;
+            }),
+            Some(ImportBlock::NothingToAdd)
+        );
+        assert_eq!(
+            with(&|i| {
+                i.running = true;
+                i.device_busy = true;
+            }),
+            Some(ImportBlock::Running)
+        );
+        assert_eq!(with(&|i| i.device_busy = true), Some(ImportBlock::Busy));
+        // Molto2: session, then unlock, then room, before anything else.
+        let molto = |f: &dyn Fn(&mut BlockInput)| {
+            let mut i = ready.clone();
+            i.dest = Some(StoreKind::Molto2);
+            i.molto_session = true;
+            i.molto_unlocked = true;
+            i.molto_count = 3;
+            f(&mut i);
+            ImportBlock::find(&i)
+        };
+        assert_eq!(molto(&|_| {}), None);
+        assert_eq!(
+            molto(&|i| {
+                i.molto_session = false;
+                i.molto_unlocked = false;
+            }),
+            Some(ImportBlock::NoMoltoSession)
+        );
+        assert_eq!(
+            molto(&|i| {
+                i.molto_unlocked = false;
+                i.molto_start = 99;
+            }),
+            Some(ImportBlock::MoltoNotUnlocked)
+        );
+        assert_eq!(
+            molto(&|i| {
+                i.molto_start = 98;
+                i.writes = 0;
+            }),
+            Some(ImportBlock::MoltoTooMany {
+                start: 98,
+                count: 3,
+                fit: 2
+            })
+        );
+    }
+
+    #[test]
+    fn import_block_molto_messages_match_171() {
+        assert_eq!(ImportBlock::Loading.message(), "Still reading the file.");
+        assert_eq!(
+            ImportBlock::NoMoltoSession.message(),
+            "No Molto2 selected. Connect one and select it in the list on the left."
+        );
+        assert_eq!(
+            ImportBlock::MoltoNotUnlocked.message(),
+            "The Molto2 is not unlocked yet. Click Authenticate \
+             (uses the customer key from the Molto2 view; blank = factory default)."
+        );
+        assert_eq!(
+            ImportBlock::MoltoTooMany {
+                start: 90,
+                count: 11,
+                fit: 10
+            }
+            .message(),
+            "Only 10 of 11 entries fit between slot #90 and #99. Start at slot #89 or earlier."
+        );
+        assert!(ImportBlock::MoltoTooMany {
+            start: 99,
+            count: 2,
+            fit: 1
+        }
+        .message()
+        .starts_with("Only 1 of 2 entries fits"));
+        assert_eq!(
+            ImportBlock::MoltoTooMany {
+                start: 0,
+                count: 120,
+                fit: 100
+            }
+            .message(),
+            "Only 100 of 120 entries fit between slot #00 and #99. A Molto2 has 100 slots."
+        );
+    }
+
+    #[test]
+    fn preselect_table() {
+        let a_oath = dk("a", StoreKind::Oath);
+        let a_otp = dk("a", StoreKind::Token2Otp);
+        let b_oath = dk("b", StoreKind::Oath);
+        let m = dk("m", StoreKind::Molto2);
+        let a: DeviceId = "a".into();
+        let b: DeviceId = "b".into();
+        let all = vec![a_oath.clone(), a_otp.clone(), b_oath.clone(), m.clone()];
+
+        // Started from a view: that store, whatever else is connected.
+        assert_eq!(
+            preselect(&all, &Origin::View(a_otp.clone()), None),
+            Some(a_otp.clone())
+        );
+        // …unless it went away.
+        assert_eq!(
+            preselect(
+                &[b_oath.clone(), m.clone()],
+                &Origin::View(a_otp.clone()),
+                None
+            ),
+            None
+        );
+        // Viewed key with one store.
+        assert_eq!(
+            preselect(&all, &Origin::Dropped, Some((&b, None))),
+            Some(b_oath.clone())
+        );
+        // Viewed key with two stores: the open tab decides, else none (C14).
+        assert_eq!(
+            preselect(&all, &Origin::Dropped, Some((&a, Some(StoreKind::Oath)))),
+            Some(a_oath.clone())
+        );
+        assert_eq!(
+            preselect(
+                &all,
+                &Origin::Dropped,
+                Some((&a, Some(StoreKind::Token2Otp)))
+            ),
+            Some(a_otp.clone())
+        );
+        assert_eq!(preselect(&all, &Origin::Dropped, Some((&a, None))), None);
+        // One capable key with one store; with two stores: none.
+        assert_eq!(
+            preselect(std::slice::from_ref(&m), &Origin::Dropped, None),
+            Some(m.clone())
+        );
+        assert_eq!(
+            preselect(&[a_oath.clone(), a_otp.clone()], &Origin::Dropped, None),
+            None
+        );
+        // Two keys, nothing viewed: none. No key: none.
+        assert_eq!(
+            preselect(&[b_oath.clone(), m.clone()], &Origin::Dropped, None),
+            None
+        );
+        assert_eq!(preselect(&[], &Origin::Dropped, None), None);
+        // A viewed key that stores nothing falls through to the rest.
+        let x: DeviceId = "x".into();
+        assert_eq!(
+            preselect(std::slice::from_ref(&m), &Origin::Dropped, Some((&x, None))),
+            Some(m)
+        );
+    }
+
+    #[test]
+    fn destination_disappearing_clears_preview() {
+        let mut d = open_dialog();
+        d.report = None;
+        d.dest_picked = true;
+        let a = dk("a", StoreKind::Oath);
+        // Still connected: nothing changes.
+        d.follow_devices(std::slice::from_ref(&a), None);
+        assert_eq!(d.dest, Some(a.clone()));
+        assert!(d.existing.is_some());
+        assert_eq!(d.dest_secret, "oathpw");
+        // Gone: the destination, what was read from it and its password go.
+        d.follow_devices(&[], None);
+        assert_eq!(d.dest, None);
+        assert!(d.existing.is_none());
+        assert!(d.dest_secret.is_empty());
+        assert!(!d.dest_picked);
+        // The entries stay; plugging a key in preselects it again.
+        assert!(d.file.is_some());
+        d.follow_devices(std::slice::from_ref(&a), Some(a.clone()));
+        assert_eq!(d.dest, Some(a));
+        assert!(d.preview_wanted);
+    }
+
+    #[test]
+    fn preselection_never_overrides_a_pick() {
+        let mut d = open_dialog();
+        let a = dk("a", StoreKind::Oath);
+        let m = dk("m", StoreKind::Molto2);
+        d.set_dest(Some(m.clone()), true);
+        d.follow_devices(&[a.clone(), m.clone()], Some(a));
+        assert_eq!(d.dest, Some(m));
+    }
+
+    #[test]
+    fn fit_count_uses_rules_only() {
+        let file = file_of(vec![
+            entry("A", HashAlg::Sha1, 30),
+            entry("B", HashAlg::Sha512, 30),
+            entry("C", HashAlg::Sha1, 60),
+        ]);
+        let yubi = store_of(StoreKind::Oath, "Yubico", Some((5, 7, 0)));
+        let solo = store_of(StoreKind::Oath, "SoloKeys", None);
+        let nk3 = store_of(StoreKind::Oath, "Nitrokey", None);
+        assert_eq!(fit_count(&file, yubi, 0), 3);
+        // Solo 2 doesn't take SHA-512.
+        assert_eq!(fit_count(&file, solo, 0), 2);
+        // Nitrokey 3: no SHA-512, only 30 s.
+        assert_eq!(fit_count(&file, nk3, 0), 1);
+        // Molto2: room from the start slot.
+        assert_eq!(fit_count(&file, Store::Molto2, 99), 1);
+    }
+
+    #[test]
+    fn molto_existing_counts_titled_slots() {
+        let slot = |title: Option<&str>| ProfilePublicData {
+            flag: 0,
+            title: title.map(str::to_owned),
+            time_a: 0,
+            time_b: 0,
+            algorithm: 0,
+            time_step: 0,
+            digits: 0,
+            seed_present: false,
+        };
+        let meta = vec![slot(None), slot(Some("GitHub")), slot(Some(""))];
+        let ex = molto_existing(&meta);
+        assert_eq!(
+            ex.names,
+            vec![StoredName::Molto2 {
+                slot: 1,
+                title: "GitHub".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn report_and_button_wording() {
+        assert_eq!(add_button_text(9, "yubi"), "Add 9 codes to yubi");
+        assert_eq!(add_button_text(1, "yubi"), "Add 1 code to yubi");
+        let r = Report {
+            rows: vec![
+                (0, "a".into(), Outcome::Added),
+                (1, "b".into(), Outcome::Replaced),
+                (2, "c".into(), Outcome::Failed("x".into())),
+                (3, "d".into(), Outcome::NotTried),
+            ],
+            stopped: Some("x".into()),
+        };
+        assert_eq!(report_summary(&r), "Added 1, replaced 1, not added 2.");
+        assert_eq!(
+            outcome_line("c", &Outcome::Failed("x".into())),
+            "c \u{2014} not added: x"
+        );
     }
 }

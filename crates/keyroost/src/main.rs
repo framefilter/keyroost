@@ -3161,8 +3161,6 @@ struct App {
     pending_trace: Option<Vec<String>>,
     /// otpauth:// import dialog state.
     import_dialog: ImportDialog,
-    /// Bulk-import dialog state.
-    bulk_dialog: BulkDialog,
     /// Files waiting to be read, and the import dialog or notice showing.
     import_flow: import_flow::ImportFlow,
     /// Unified device list (physical keys + Molto2 tokens), most recent scan.
@@ -3710,26 +3708,6 @@ struct ImportDialog {
     uri: String,
 }
 
-#[derive(Default)]
-struct BulkDialog {
-    open: bool,
-    path: String,
-    /// Successfully parsed entries (cleared on each load).
-    entries: Vec<keyroost_import::BulkEntry>,
-    /// Last load error message, if any.
-    error: Option<String>,
-    /// Starting slot for programming.
-    start: u8,
-    /// Display timeout applied to every entry.
-    display_timeout: TimeoutChoice,
-    /// Password for encrypted Aegis vaults (revealed when the loader detects one).
-    password: String,
-    /// True once the loader has seen an encrypted vault at the current path.
-    needs_password: bool,
-    /// The last Authenticate attempt failed (cleared on success and on close).
-    auth_failed: bool,
-}
-
 impl ImportDialog {
     /// Settle the dialog's open state after its window was drawn this frame.
     /// `window_open` is the copy egui's `[X]` close wrote to; `cancel_clicked` is the
@@ -3746,97 +3724,6 @@ impl ImportDialog {
     fn close(&mut self) {
         self.open = false;
         wipe(&mut self.uri);
-    }
-}
-
-impl BulkDialog {
-    /// Settle the dialog's open state after its window was drawn this frame.
-    /// `window_open` is the copy egui's `[X]` close wrote to; `close_clicked` is the
-    /// in-window Close button, recorded as a flag because a direct write from
-    /// inside the window closure is undone by the write-back of the stale
-    /// `window_open` copy (issue #170).
-    fn settle_open(&mut self, window_open: bool, close_clicked: bool) {
-        if self.open && !(window_open && !close_clicked) {
-            self.close();
-        }
-    }
-
-    /// Close the dialog by any route and wipe the typed vault password, which
-    /// may have been kept live after a decrypt error to allow a retry.
-    fn close(&mut self) {
-        self.open = false;
-        wipe(&mut self.password);
-        // Parsed entries carry seeds; dropping them zeroizes them.
-        self.entries.clear();
-        self.auth_failed = false;
-    }
-}
-
-/// Why "Program all" in the bulk import dialog is disabled, if it is. The
-/// dialog shows exactly one of these so the button is never gray without a
-/// reason (issue #170).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BulkBlock {
-    /// The import file is still being read or decrypted.
-    Loading,
-    /// No Molto2 is connected and selected.
-    NoMolto,
-    /// The Molto2 has not been unlocked with its customer key.
-    NotUnlocked,
-    /// The entries run past slot #99; `fit` of `count` fit from `start`.
-    TooMany { start: u8, count: usize, fit: usize },
-}
-
-impl BulkBlock {
-    /// The first reason "Program all" can't run, in the order the user has
-    /// to fix them, or `None` when it can.
-    fn find(
-        loading: bool,
-        molto_selected: bool,
-        unlocked: bool,
-        start: u8,
-        count: usize,
-    ) -> Option<Self> {
-        let fit = (PROFILES as usize).saturating_sub(start as usize);
-        if loading {
-            Some(Self::Loading)
-        } else if !molto_selected {
-            Some(Self::NoMolto)
-        } else if !unlocked {
-            Some(Self::NotUnlocked)
-        } else if count > fit {
-            Some(Self::TooMany { start, count, fit })
-        } else {
-            None
-        }
-    }
-
-    /// The one plain line shown under the buttons and as the disabled
-    /// button's hover text.
-    fn message(self) -> String {
-        match self {
-            Self::Loading => "Still reading the file.".to_owned(),
-            Self::NoMolto => {
-                "No Molto2 selected. Connect one and select it in the list on the left.".to_owned()
-            }
-            Self::NotUnlocked => "The Molto2 is not unlocked yet. Click Authenticate \
-                 (uses the customer key from the Molto2 view; blank = factory default)."
-                .to_owned(),
-            Self::TooMany { start, count, fit } => {
-                let verb = if fit == 1 { "fits" } else { "fit" };
-                let hint = if count <= PROFILES as usize {
-                    format!(
-                        "Start at slot #{:02} or earlier.",
-                        PROFILES as usize - count
-                    )
-                } else {
-                    format!("A Molto2 has {PROFILES} slots.")
-                };
-                format!(
-                    "Only {fit} of {count} entries {verb} between slot #{start:02} and #99. {hint}"
-                )
-            }
-        }
     }
 }
 
@@ -4177,17 +4064,17 @@ impl App {
                 match result {
                     Ok(()) => {
                         app.authenticated = true;
-                        app.bulk_dialog.auth_failed = false;
+                        app.import_auth_result(true);
                         app.log(Severity::Ok, "authenticated");
                     }
                     // The Display impl renders the tries-remaining count (or
                     // "unknown" when the card gave none).
                     Err(e @ TransportError::AuthFailed { .. }) => {
-                        app.bulk_dialog.auth_failed = true;
+                        app.import_auth_result(false);
                         app.log(Severity::Err, e.to_string());
                     }
                     Err(e) => {
-                        app.bulk_dialog.auth_failed = true;
+                        app.import_auth_result(false);
                         app.log(Severity::Err, format!("auth failed: {}", e));
                     }
                 }
@@ -4504,237 +4391,6 @@ impl App {
                         app.slot_meta = Some(m);
                     }
                     Err(e) => app.log_kind(Severity::Warn, kind, format!("slot refresh: {e}")),
-                }
-            })
-        });
-    }
-
-    fn bulk_load(&mut self) {
-        if self.import_busy() {
-            return;
-        }
-        let path = self.bulk_dialog.path.trim().to_owned();
-        if path.is_empty() {
-            self.bulk_dialog.error = Some("enter a file path first".into());
-            return;
-        }
-        let password = zeroize::Zeroizing::new(self.bulk_dialog.password.clone());
-        // Everything below — including the file read (slow media, network
-        // mounts) and the format branching — runs on the import thread; the
-        // frame loop only ever sees the finished apply step.
-        self.run_import("Loading import file\u{2026}", move || {
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    let msg = format!("read failed: {}", e);
-                    return Box::new(move |app: &mut App| app.bulk_dialog.error = Some(msg));
-                }
-            };
-
-            // Screenshot import: a PNG/JPEG (by magic bytes) goes through QR
-            // decode — handles both standard otpauth:// enrollment codes and
-            // Google Authenticator export batches.
-            if keyroost_qr::looks_like_image(&bytes) {
-                let result = keyroost_qr::entries_from_image(&bytes);
-                return Box::new(move |app: &mut App| app.bulk_qr_loaded(result));
-            }
-
-            // Plaintext exports carry the seeds in clear — wipe-on-drop, same
-            // as the decrypted variant.
-            let text = match String::from_utf8(bytes) {
-                Ok(t) => zeroize::Zeroizing::new(t),
-                Err(_) => {
-                    return Box::new(move |app: &mut App| {
-                        app.bulk_dialog.error =
-                            Some("file is neither a text export nor a PNG/JPEG image".into());
-                    })
-                }
-            };
-
-            // An encrypted Aegis vault needs the password; the scrypt KDF is
-            // seconds of CPU at stock parameters — exactly why this thread
-            // exists.
-            let is_encrypted_aegis = keyroost_import::aegis::is_encrypted(&text).unwrap_or(false);
-            if is_encrypted_aegis {
-                if password.is_empty() {
-                    return Box::new(move |app: &mut App| {
-                        app.bulk_dialog.needs_password = true;
-                        app.bulk_dialog.entries.clear();
-                        app.bulk_dialog.error = Some(
-                            "encrypted Aegis vault — enter password and click Load again".into(),
-                        );
-                    });
-                }
-                let result = match keyroost_import::aegis::decrypt(&text, password.as_bytes()) {
-                    Ok(plaintext) => {
-                        keyroost_import::parse_bulk_any(&plaintext).map_err(|e| e.to_string())
-                    }
-                    Err(e) => Err(format!("decrypt: {}", e)),
-                };
-                return Box::new(move |app: &mut App| {
-                    app.bulk_dialog.needs_password = true;
-                    app.bulk_text_loaded(result, path);
-                });
-            }
-
-            let result = keyroost_import::parse_bulk_any(&text).map_err(|e| e.to_string());
-            Box::new(move |app: &mut App| {
-                app.bulk_dialog.needs_password = false;
-                app.bulk_text_loaded(result, path);
-            })
-        });
-    }
-
-    /// Apply a finished QR-image decode to the bulk dialog.
-    fn bulk_qr_loaded(&mut self, result: Result<keyroost_qr::QrImport, keyroost_qr::QrError>) {
-        match result {
-            Ok(import) => {
-                self.bulk_dialog.error = None;
-                self.bulk_dialog.needs_password = false;
-                for s in &import.skipped {
-                    self.log(
-                        Severity::Err,
-                        format!("skipped {:?}: {}", s.label, s.reason),
-                    );
-                }
-                if let Some((i, n)) = import.batch {
-                    self.log(
-                        Severity::Info,
-                        format!(
-                            "this is QR {} of {} in the export — load the others too",
-                            i + 1,
-                            n
-                        ),
-                    );
-                }
-                self.log(
-                    Severity::Info,
-                    format!(
-                        "loaded {} entries from QR image — delete the screenshot after a \
-                         successful import",
-                        import.entries.len()
-                    ),
-                );
-                self.bulk_dialog.entries = import.entries;
-            }
-            Err(e) => {
-                self.bulk_dialog.entries.clear();
-                self.bulk_dialog.error = Some(e.to_string());
-            }
-        }
-    }
-
-    /// Apply a finished text-export parse (with or without vault decryption)
-    /// to the bulk dialog.
-    fn bulk_text_loaded(
-        &mut self,
-        result: Result<Vec<keyroost_import::BulkEntry>, String>,
-        path: String,
-    ) {
-        match result {
-            Ok(entries) => {
-                self.bulk_dialog.entries = entries;
-                self.bulk_dialog.error = None;
-                wipe(&mut self.bulk_dialog.password);
-                self.log(
-                    Severity::Info,
-                    format!(
-                        "loaded {} entries from {}",
-                        self.bulk_dialog.entries.len(),
-                        path
-                    ),
-                );
-            }
-            Err(e) => {
-                self.bulk_dialog.entries.clear();
-                self.bulk_dialog.error = Some(e);
-            }
-        }
-    }
-
-    fn bulk_apply(&mut self) {
-        if !self.ensure_auth() {
-            return;
-        }
-        if self.bulk_dialog.entries.is_empty() {
-            self.log(Severity::Warn, "no entries loaded");
-            return;
-        }
-        let start = self.bulk_dialog.start;
-        let n = self.bulk_dialog.entries.len();
-        let last = (start as usize).saturating_add(n);
-        if last > PROFILES as usize {
-            self.log(
-                Severity::Err,
-                format!(
-                    "{} entries starting at #{} would overflow slot 99 (would need #{})",
-                    n,
-                    start,
-                    last - 1
-                ),
-            );
-            return;
-        }
-        let timeout = self.bulk_dialog.display_timeout.to_proto();
-        let entries = self.bulk_dialog.entries.clone();
-        let Some(mut s) = self.take_molto_session() else {
-            return;
-        };
-        // Up to 100 × 3 card writes — runs on the worker, log lines are
-        // collected and replayed in the apply step.
-        self.spawn_job(format!("Programming {n} profiles\u{2026}"), move || {
-            let mut ok = 0;
-            let mut fail = 0;
-            let mut lines: Vec<(Severity, String)> = Vec::new();
-            for (i, entry) in entries.into_iter().enumerate() {
-                let p = start + i as u8;
-                let title = entry.suggested_title();
-                if title.is_empty() {
-                    lines.push((Severity::Warn, format!("#{}: no title; skipping", p)));
-                    fail += 1;
-                    continue;
-                }
-                if let Err(e) = s.set_seed(p, &entry.secret) {
-                    lines.push((Severity::Err, format!("#{} set_seed: {}", p, e)));
-                    fail += 1;
-                    continue;
-                }
-                if let Err(e) = s.set_title(p, &title) {
-                    lines.push((Severity::Err, format!("#{} set_title: {}", p, e)));
-                    fail += 1;
-                    continue;
-                }
-                if let Err(e) = s.set_config(p, &entry.to_profile_config(unix_now(), timeout)) {
-                    lines.push((Severity::Err, format!("#{} set_config: {}", p, e)));
-                    fail += 1;
-                    continue;
-                }
-                ok += 1;
-            }
-            // Public-block sweep, one APDU per slot (~1-2 s) — same soft
-            // pattern as open_molto. A failed sweep must not affect the
-            // import's reported success/failure, nor clobber existing
-            // metadata; it just skips the refresh.
-            let meta = (0..PROFILES)
-                .map(|p| s.read_public_data(p))
-                .collect::<Result<Vec<_>, _>>()
-                .ok();
-            Box::new(move |app: &mut App| {
-                app.session = Some(s);
-                for (sev, line) in lines {
-                    app.log(sev, line);
-                }
-                let sev = if fail == 0 {
-                    Severity::Ok
-                } else {
-                    Severity::Warn
-                };
-                app.log(sev, format!("bulk import: {} ok, {} failed", ok, fail));
-                if let Some(m) = meta {
-                    app.slot_meta = Some(m);
-                }
-                if fail == 0 {
-                    app.bulk_dialog.close();
                 }
             })
         });
@@ -12143,7 +11799,7 @@ impl eframe::App for App {
         self.render_openpgp_cred_modal(ctx, &p);
         self.render_piv_confirms(ctx);
         self.render_piv_cred_modal(ctx, &p);
-        self.molto_dialogs(ctx, &p);
+        self.molto_dialogs(ctx);
         self.render_import(ctx, &p);
 
         // Help popover, painted last so it sits above everything.
@@ -20946,175 +20602,9 @@ impl App {
         }
     }
 
-    /// The Molto2 import dialogs (otpauth:// + bulk). Reused verbatim from the
-    /// original Molto2 view; only the entry point changed.
-    fn molto_dialogs(&mut self, ctx: &egui::Context, p: &Palette) {
-        if self.bulk_dialog.open {
-            let mut open = self.bulk_dialog.open;
-            let mut do_load = false;
-            let mut do_apply = false;
-            let mut do_auth = false;
-            let mut close_clicked = false;
-            egui::Window::new("Bulk import")
-                .open(&mut open)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .default_width(560.0)
-                .show(ctx, |ui| {
-                    ui.label("Export file path (Aegis JSON [plain or encrypted], 2FAS JSON, or otpauth:// list):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.bulk_dialog.path)
-                            .desired_width(540.0)
-                            .hint_text("/path/to/export.json"),
-                    );
-                    if self.bulk_dialog.needs_password {
-                        ui.label("Aegis vault password:");
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.bulk_dialog.password)
-                                .password(true)
-                                .desired_width(360.0),
-                        );
-                        guard_secret_field(ui.ctx(), &resp);
-                    }
-                    ui.horizontal(|ui| {
-                        let importing = self.import_busy();
-                        if ui
-                            .add_enabled(!importing, egui::Button::new("Load"))
-                            .clicked()
-                        {
-                            do_load = true;
-                        }
-                        if importing {
-                            ui.spinner();
-                            if let Some(label) = &self.import_label {
-                                ui.label(label.as_str());
-                            }
-                        }
-                        ui.label("Start at slot:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.bulk_dialog.start)
-                                .clamp_existing_to_range(true)
-                                .range(0..=99u8),
-                        );
-                        ui.label("Display timeout:");
-                        egui::ComboBox::from_id_salt("bulk-timeout")
-                            .selected_text(match self.bulk_dialog.display_timeout {
-                                TimeoutChoice::S15 => "15s",
-                                TimeoutChoice::S30 => "30s",
-                                TimeoutChoice::S60 => "60s",
-                                TimeoutChoice::S120 => "120s",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.bulk_dialog.display_timeout,
-                                    TimeoutChoice::S15,
-                                    "15s",
-                                );
-                                ui.selectable_value(
-                                    &mut self.bulk_dialog.display_timeout,
-                                    TimeoutChoice::S30,
-                                    "30s",
-                                );
-                                ui.selectable_value(
-                                    &mut self.bulk_dialog.display_timeout,
-                                    TimeoutChoice::S60,
-                                    "60s",
-                                );
-                                ui.selectable_value(
-                                    &mut self.bulk_dialog.display_timeout,
-                                    TimeoutChoice::S120,
-                                    "120s",
-                                );
-                            });
-                    });
-
-                    if let Some(err) = &self.bulk_dialog.error {
-                        ui.colored_label(egui::Color32::from_rgb(220, 100, 100), err);
-                    }
-
-                    if !self.bulk_dialog.entries.is_empty() {
-                        ui.separator();
-                        ui.label(format!(
-                            "{} entries — will fill slots #{:02}..#{:02}",
-                            self.bulk_dialog.entries.len(),
-                            self.bulk_dialog.start,
-                            self.bulk_dialog.start as usize + self.bulk_dialog.entries.len() - 1,
-                        ));
-                        egui::ScrollArea::vertical()
-                            .max_height(220.0)
-                            .show(ui, |ui| {
-                                for (i, e) in self.bulk_dialog.entries.iter().enumerate() {
-                                    let slot = self.bulk_dialog.start as usize + i;
-                                    ui.label(format!(
-                                        "#{:02}  {}  ({}/{:?}/{}d)",
-                                        slot,
-                                        e.suggested_title(),
-                                        match e.algorithm {
-                                            HmacAlgo::Sha1 => "SHA1",
-                                            HmacAlgo::Sha256 => "SHA256",
-                                        },
-                                        e.time_step,
-                                        e.digits as u8
-                                    ));
-                                }
-                            });
-                        // Block programming while a load is in flight so a
-                        // stale entry list can't be written mid-replace, and
-                        // name the one reason whenever the button is gray.
-                        let blocked = BulkBlock::find(
-                            self.import_busy(),
-                            self.molto_session_usable(),
-                            self.authenticated,
-                            self.bulk_dialog.start,
-                            self.bulk_dialog.entries.len(),
-                        );
-                        ui.horizontal(|ui| {
-                            let resp = ui
-                                .add_enabled(blocked.is_none(), egui::Button::new("Program all"))
-                                .on_hover_text("Write seed, title, and config for every entry");
-                            let resp = match blocked {
-                                Some(b) => resp.on_disabled_hover_text(b.message()),
-                                None => resp,
-                            };
-                            if resp.clicked() {
-                                do_apply = true;
-                            }
-                            if ui.button("Close").clicked() {
-                                close_clicked = true;
-                            }
-                            if blocked == Some(BulkBlock::NotUnlocked)
-                                && ui
-                                    .add_enabled(!self.busy(), egui::Button::new("Authenticate"))
-                                    .clicked()
-                            {
-                                do_auth = true;
-                            }
-                        });
-                        if let Some(b) = blocked {
-                            let msg = if b == BulkBlock::NotUnlocked && self.bulk_dialog.auth_failed
-                            {
-                                "Couldn't unlock the Molto2 \u{2014} check the customer key".to_owned()
-                            } else {
-                                b.message()
-                            };
-                            ui.colored_label(p.warn, msg);
-                        }
-                    }
-                });
-            // Apply Close and [X] only now, after the window is drawn; either
-            // route wipes the typed vault password.
-            self.bulk_dialog.settle_open(open, close_clicked);
-            if do_auth {
-                self.authenticate();
-            }
-            if do_load {
-                self.bulk_load();
-            }
-            if do_apply {
-                self.bulk_apply();
-            }
-        }
-
+    /// The Molto2 "Import to slot" dialog (one otpauth:// URI). Files go
+    /// through the shared import dialog in `import_flow`.
+    fn molto_dialogs(&mut self, ctx: &egui::Context) {
         if self.import_dialog.open {
             let mut open = self.import_dialog.open;
             let mut should_apply = false;
@@ -21152,6 +20642,22 @@ impl App {
     }
 }
 
+/// A stored OATH name as the row shows it: the issuer (or the whole name
+/// when there is none), the account, and the `period/` prefix apart, so
+/// `60/GitHub:alice` reads "GitHub", "alice", 60 s rather than "60/GitHub".
+fn oath_display_name(name: &str, hotp: bool) -> (String, String, Option<u32>) {
+    let oath_type = if hotp {
+        keyroost_oath::OathType::Hotp
+    } else {
+        keyroost_oath::OathType::Totp
+    };
+    let parts = keyroost_oath::parse_name(name, oath_type);
+    match parts.issuer {
+        Some(issuer) => (issuer.to_owned(), parts.account.to_owned(), parts.period),
+        None => (parts.account.to_owned(), String::new(), parts.period),
+    }
+}
+
 /// Paint one OATH credential row: issuer/account · code · countdown ring ·
 /// seconds · copy (· delete). Returns `(Some(code) if copy clicked, delete?)`.
 fn oath_row(
@@ -21162,10 +20668,7 @@ fn oath_row(
     with_delete: bool,
 ) -> (Option<String>, bool, bool) {
     let (name, code, hotp) = (row.name.as_str(), row.code.as_deref(), row.hotp);
-    let (issuer, account) = match name.split_once(':') {
-        Some((a, b)) => (a.to_string(), b.to_string()),
-        None => (name.to_string(), String::new()),
-    };
+    let (issuer, account, period) = oath_display_name(name, hotp);
     let (secs, pct) = theme::totp_window(u64::from(row.period.max(1)));
     let code_color = if hotp {
         // HOTP codes don't expire — no about-to-roll warning color.
@@ -21188,6 +20691,9 @@ fn oath_row(
                 );
                 if hotp {
                     theme::pill(ui, "HOTP", p.txt2, p.line_soft);
+                }
+                if let Some(period) = period {
+                    theme::pill(ui, &format!("{period} s"), p.txt2, p.line_soft);
                 }
             });
             if !account.is_empty() {
@@ -21319,42 +20825,30 @@ mod tests {
         assert!(settings::config_path().unwrap().starts_with(&tmp));
     }
 
-    /// Issue #170: the in-window Close button closes the bulk dialog even
-    /// though egui's [X] copy still says open, and wipes the vault password.
+    /// A `period/` prefix is shown as the period, not as part of the issuer.
     #[test]
-    fn bulk_dialog_close_button_wins_over_stale_open_copy() {
-        let mut d = BulkDialog {
-            open: true,
-            password: "hunter2".to_owned(),
-            ..Default::default()
-        };
-        d.settle_open(true, true);
-        assert!(!d.open);
-        assert!(d.password.is_empty());
-    }
-
-    #[test]
-    fn bulk_dialog_x_closes_and_wipes_password() {
-        let mut d = BulkDialog {
-            open: true,
-            password: "hunter2".to_owned(),
-            ..Default::default()
-        };
-        d.settle_open(false, false);
-        assert!(!d.open);
-        assert!(d.password.is_empty());
-    }
-
-    #[test]
-    fn bulk_dialog_stays_open_and_keeps_password_without_a_close() {
-        let mut d = BulkDialog {
-            open: true,
-            password: "hunter2".to_owned(),
-            ..Default::default()
-        };
-        d.settle_open(true, false);
-        assert!(d.open);
-        assert_eq!(d.password, "hunter2");
+    fn oath_display_name_splits_the_period_prefix() {
+        assert_eq!(
+            oath_display_name("60/GitHub:alice", false),
+            ("GitHub".into(), "alice".into(), Some(60))
+        );
+        assert_eq!(
+            oath_display_name("GitHub:alice", false),
+            ("GitHub".into(), "alice".into(), None)
+        );
+        assert_eq!(
+            oath_display_name("60/alice", false),
+            ("alice".into(), String::new(), Some(60))
+        );
+        assert_eq!(
+            oath_display_name("plain", false),
+            ("plain".into(), String::new(), None)
+        );
+        // HOTP names carry no period prefix.
+        assert_eq!(
+            oath_display_name("60/GitHub:alice", true),
+            ("60/GitHub".into(), "alice".into(), None)
+        );
     }
 
     /// Issue #170, same bug: Cancel in the "Import to slot" dialog.
@@ -21376,49 +20870,6 @@ mod tests {
         d.settle_open(true, false);
         assert!(d.open);
         assert!(!d.uri.is_empty());
-    }
-
-    #[test]
-    fn bulk_block_reports_reasons_in_fix_order() {
-        assert_eq!(
-            BulkBlock::find(true, false, false, 0, 1),
-            Some(BulkBlock::Loading)
-        );
-        assert_eq!(
-            BulkBlock::find(false, false, false, 0, 1),
-            Some(BulkBlock::NoMolto)
-        );
-        assert_eq!(
-            BulkBlock::find(false, true, false, 0, 1),
-            Some(BulkBlock::NotUnlocked)
-        );
-        assert_eq!(BulkBlock::find(false, true, true, 0, 1), None);
-    }
-
-    #[test]
-    fn bulk_block_too_many_counts_what_fits_before_slot_99() {
-        // #90..#99 is ten slots: ten entries fit, eleven do not.
-        assert_eq!(BulkBlock::find(false, true, true, 90, 10), None);
-        let b = BulkBlock::find(false, true, true, 90, 11).unwrap();
-        assert_eq!(
-            b,
-            BulkBlock::TooMany {
-                start: 90,
-                count: 11,
-                fit: 10
-            }
-        );
-        assert_eq!(
-            b.message(),
-            "Only 10 of 11 entries fit between slot #90 and #99. Start at slot #89 or earlier."
-        );
-        let one = BulkBlock::find(false, true, true, 99, 2).unwrap();
-        assert!(one.message().starts_with("Only 1 of 2 entries fits"));
-        let huge = BulkBlock::find(false, true, true, 0, 120).unwrap();
-        assert_eq!(
-            huge.message(),
-            "Only 100 of 120 entries fit between slot #00 and #99. A Molto2 has 100 slots."
-        );
     }
 
     /// A minimal `PivStatus` reporting just `fingerprint`/`version` — enough
