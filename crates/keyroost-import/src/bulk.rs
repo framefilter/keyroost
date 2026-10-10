@@ -280,7 +280,7 @@ pub mod aegis {
             DbField::Plain(db) => Ok(db),
             DbField::Encrypted => {
                 #[cfg(feature = "encrypted")]
-                let msg = "Aegis export is encrypted; supply a password (CLI: --password env:NAME or --password stdin)";
+                let msg = "Aegis export is encrypted; supply a password (CLI: --file-password env:NAME or --file-password stdin)";
                 #[cfg(not(feature = "encrypted"))]
                 let msg = "Aegis export is encrypted; build with --features encrypted or re-export plaintext";
                 Err(BulkError::Encrypted(msg))

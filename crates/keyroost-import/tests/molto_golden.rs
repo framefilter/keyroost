@@ -164,7 +164,7 @@ fn aegis_golden() {
         ),
         (
             r#"{"db":"ZW5jcnlwdGVk","header":{}}"#.to_owned(),
-            r#"Err encrypted vault: Aegis export is encrypted; supply a password (CLI: --password env:NAME or --password stdin)"#,
+            r#"Err encrypted vault: Aegis export is encrypted; supply a password (CLI: --file-password env:NAME or --file-password stdin)"#,
         ),
     ];
     let mut mismatches = Vec::new();
@@ -273,7 +273,7 @@ fn parse_any_golden() {
         (TWOFAS_HOTP.to_owned(), r#"Err no entries found"#),
         (
             r#"{"db":"ZW5jcnlwdGVk","header":{}}"#.to_owned(),
-            r#"Err encrypted vault: Aegis export is encrypted; supply a password (CLI: --password env:NAME or --password stdin)"#,
+            r#"Err encrypted vault: Aegis export is encrypted; supply a password (CLI: --file-password env:NAME or --file-password stdin)"#,
         ),
         (r#"{"neither":true}"#.to_owned(), r#"Err no entries found"#),
         (

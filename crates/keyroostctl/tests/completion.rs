@@ -114,6 +114,9 @@ fn import_commands_complete() {
             assert!(first(&out, flag), "{group} {flag}: {out}");
         }
     }
+    let out = complete(&["keyroostctl", "molto", "import", "--"]);
+    assert!(first(&out, "--file-password"), "{out}");
+    assert!(!first(&out, "--password"), "{out}");
 }
 
 #[test]

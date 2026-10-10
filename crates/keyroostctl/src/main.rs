@@ -2302,7 +2302,7 @@ enum MoltoCmd {
     /// env:NAME, --uri stdin or a QR screenshot (--qr IMAGE), never the
     /// command line; with none of them and no --in, a terminal asks for it
     /// (hidden). For an encrypted Aegis vault given with --in, the password
-    /// comes from --password env:NAME or --password stdin; with neither, a
+    /// comes from --file-password env:NAME or --file-password stdin; with neither, a
     /// terminal asks for it (hidden).
     #[command(group(clap::ArgGroup::new("import_source").args(["uri", "qr", "file"]).multiple(false)))]
     Import {
@@ -2334,11 +2334,11 @@ enum MoltoCmd {
         /// Print what would be written, but don't touch the device.
         #[arg(long, requires = "file")]
         dry_run: bool,
-        /// The password of an encrypted Aegis vault: env:NAME or stdin (second
+        /// The password of an encrypted Aegis export: env:NAME or stdin (second
         /// line when --customer-key stdin is also given; hidden when typed at a
         /// terminal). With neither, a terminal asks when the vault needs one.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, requires = "file")]
-        password: Option<SecretSource>,
+        file_password: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
@@ -3468,8 +3468,8 @@ const fn customer_key_spec(e: KeyEncoding, new: bool) -> &'static Spec {
 const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
     .prompt_as("otpauth:// URI")
     .hint("--uri env:NAME, --uri stdin, --qr IMAGE or --in FILE");
-const VAULT_PASSWORD: Spec = Spec::current("vault password", "password");
-/// The password of an encrypted export file (`oath import`, `otp import`).
+/// The password of an encrypted export file (`molto import`, `oath import`,
+/// `otp import`).
 const FILE_PASSWORD: Spec = Spec::current("file password", "file-password");
 
 /// Decode a seed; the error names the flag and the encoding, never the input.
@@ -3970,7 +3970,7 @@ fn molto_occupied(
 }
 
 /// Load a bulk-import file, transparently decrypting an Aegis encrypted
-/// vault if `--password` was supplied.
+/// vault if `--file-password` was supplied.
 fn load_bulk_entries<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
     path: &std::path::Path,
@@ -3997,6 +3997,18 @@ fn load_bulk_entries<I: crate::secrets::SecretIo>(
         return Ok(import.entries);
     }
 
+    // Only a file that is neither text nor an image is classified, so every
+    // authenticator export keeps this reader's results and errors; binary
+    // key material (a DER certificate, a PKCS #12 bundle, ...) gets a
+    // pointer to where it belongs instead.
+    if std::str::from_utf8(&bytes).is_err() {
+        let name = path.file_name().and_then(|n| n.to_str());
+        if let keyroost_import::classify::FileKind::KeyMaterial(k) =
+            keyroost_import::classify::classify(&bytes, name)
+        {
+            return Err(k.cli_pointer().into());
+        }
+    }
     let text = String::from_utf8(bytes).map_err(|_| {
         format!(
             "{}: neither a text export nor a PNG/JPEG image",
@@ -4009,7 +4021,7 @@ fn load_bulk_entries<I: crate::secrets::SecretIo>(
     let aegis_encrypted = keyroost_import::aegis::is_encrypted(&text).unwrap_or(false);
 
     if aegis_encrypted {
-        let password = sec.read(&VAULT_PASSWORD, Source::from_flag(password))?;
+        let password = sec.read(&FILE_PASSWORD, Source::from_flag(password))?;
         let plaintext = keyroost_import::aegis::decrypt(&text, password.as_bytes())?;
         return Ok(keyroost_import::aegis::parse(&plaintext)?);
     }
@@ -4488,6 +4500,20 @@ const RETIRED_FLAGS: &[RetiredFlag] = &[
         words: &[],
         msg: "--list-readers was removed; `keyroostctl list` shows the smart-card readers",
         now: &[],
+    },
+    // `molto import`'s export password is --file-password, not the generic
+    // --password the rows below point at.
+    RetiredFlag {
+        flag: "--password-env",
+        words: &["molto", "import"],
+        msg: "--password-env VAR is now --file-password env:VAR",
+        now: &["--file-password"],
+    },
+    RetiredFlag {
+        flag: "--password-stdin",
+        words: &["molto", "import"],
+        msg: "--password-stdin is now --file-password stdin",
+        now: &["--file-password"],
     },
     // Generic: a retired flag family, on any command. Keep these last.
     RetiredFlag {
@@ -5120,7 +5146,7 @@ const RETIRED_COMMANDS: &[RetiredCommand] = &[
         parent: "molto",
         old: "import-file",
         new: "molto import --in",
-        note: "the path is the value of `--in`; `--start` is `--slot`",
+        note: "the path is the value of `--in`; `--start` is `--slot`; the vault password is `--file-password`",
     },
     RetiredCommand {
         parent: "molto",
@@ -5909,13 +5935,13 @@ fn run_molto(
         file: Some(path),
         slot,
         dry_run: true,
-        password,
+        file_password,
         ..
     } = cmd
     {
         let start = slot.unwrap_or(0);
-        molto_dry_run_key(&mut sec, key, password.as_ref())?;
-        let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
+        molto_dry_run_key(&mut sec, key, file_password.as_ref())?;
+        let entries = load_bulk_entries(&mut sec, path, file_password.as_ref())?;
         let last = (start as usize).saturating_add(entries.len());
         println!(
             "Found {} entries; would fill slots #{}..#{} (dry run).",
@@ -6154,11 +6180,11 @@ fn run_molto(
         MoltoCmd::Import {
             file: Some(path),
             slot,
-            password,
+            file_password,
             ..
         } => {
             let start = slot.unwrap_or(0);
-            let entries = load_bulk_entries(&mut sec, path, password.as_ref())?;
+            let entries = load_bulk_entries(&mut sec, path, file_password.as_ref())?;
             let n = entries.len();
             let last = (start as usize).saturating_add(n);
             if last > 100 {
@@ -19605,7 +19631,7 @@ mod cli_tests {
                 "--slot",
                 "5",
                 "--dry-run",
-                "--password",
+                "--file-password",
                 "stdin",
             ],
         ] {
@@ -19627,14 +19653,14 @@ mod cli_tests {
             ],
             // --dry-run needs --in
             &["keyroostctl", "molto", "import", "--slot", "1", "--dry-run"],
-            // --password is for an encrypted --in; --qr is one URI
+            // --file-password is for an encrypted --in; --qr is one URI
             &[
                 "keyroostctl",
                 "molto",
                 "import",
                 "--slot",
                 "1",
-                "--password",
+                "--file-password",
                 "stdin",
             ],
             &[
@@ -21893,7 +21919,7 @@ mod cli_tests {
             let path: Vec<&str> = cols[0].split(' ').collect();
             if flags.len() > 2 {
                 // One command, several modes (`molto import --in` takes
-                // --password, `--slot` takes --uri): a row's pair is the
+                // --file-password, `--slot` takes --uri): a row's pair is the
                 // flags its own extra args leave usable.
                 let mut base = vec!["keyroostctl"];
                 base.extend(&path);
@@ -22027,15 +22053,15 @@ mod cli_tests {
         let early = molto_early_key(&mut sec, &key, &cmd).unwrap();
         match (second, &cmd) {
             (
-                "password",
+                "file-password",
                 MoltoCmd::Import {
                     file: Some(path),
-                    password,
+                    file_password,
                     ..
                 },
             ) => {
                 assert_eq!(&early.unwrap()[..], [0x11], "{line}");
-                assert!(load_bulk_entries(&mut sec, path, password.as_ref()).is_err());
+                assert!(load_bulk_entries(&mut sec, path, file_password.as_ref()).is_err());
                 assert_eq!(sec.io.lines_read, 2, "{line}");
             }
             _ => match (second, {
@@ -22074,13 +22100,13 @@ mod cli_tests {
             match parse(&full).unwrap().command {
                 Some(Cmd::Molto {
                     key,
-                    cmd: MoltoCmd::Import { password, .. },
+                    cmd: MoltoCmd::Import { file_password, .. },
                     ..
-                }) => (key, password),
+                }) => (key, file_password),
                 _ => unreachable!(),
             }
         };
-        let both = ["--customer-key", "stdin", "--password", "stdin"];
+        let both = ["--customer-key", "stdin", "--file-password", "stdin"];
 
         // Piped, both on stdin: line 1 (the key) is consumed.
         let (key, pw) = parts(&both);
@@ -22094,7 +22120,7 @@ mod cli_tests {
         assert!(sec.io.prompts.is_empty(), "{:?}", sec.io.prompts);
 
         // Piped, but the password comes from elsewhere: nothing is read.
-        let (key, pw) = parts(&["--customer-key", "stdin", "--password", "env:P"]);
+        let (key, pw) = parts(&["--customer-key", "stdin", "--file-password", "env:P"]);
         let mut sec = Secrets::new(FakeIo::piped(&["11\n"]));
         molto_dry_run_key(&mut sec, &key, pw.as_ref()).unwrap();
         assert_eq!(sec.io.lines_read, 0);

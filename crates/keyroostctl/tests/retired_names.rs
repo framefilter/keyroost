@@ -974,6 +974,30 @@ const CASES: &[(&[&str], &str)] = &[
         &["molto", "import", "--slot", "1", "--uri-env", "S3CRETVALUE"],
         "--uri env:VAR",
     ),
+    // On `molto import` the export's password is --file-password, not the
+    // generic --password.
+    (
+        &[
+            "molto",
+            "import",
+            "--in",
+            "x",
+            "--password-env",
+            "S3CRETVALUE",
+        ],
+        "--file-password env:VAR",
+    ),
+    (
+        &[
+            "molto",
+            "import",
+            "--in",
+            "x",
+            "--password-stdin",
+            "S3CRETVALUE",
+        ],
+        "--file-password stdin",
+    ),
 ];
 
 #[test]

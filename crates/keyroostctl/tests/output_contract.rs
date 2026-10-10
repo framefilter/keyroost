@@ -360,3 +360,52 @@ fn import_help_names_the_shared_flags() {
         assert!(out.contains("nothing is written"), "{cmd:?}: {out}");
     }
 }
+
+/// `molto import` names the export's password the way the other imports
+/// do; the old `--password` is gone.
+#[test]
+fn molto_import_help_names_file_password() {
+    let (code, out, err) = run(&["molto", "import", "--help"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("--file-password"), "{out}");
+    assert!(!out.contains("--password "), "{out}");
+    assert!(!out.contains("--password env"), "{out}");
+}
+
+/// `molto import --in` keeps its own reader; only a binary file that is
+/// recognized key material gets the pointer instead of "neither a text
+/// export nor a PNG/JPEG image".
+#[test]
+fn molto_import_points_binary_key_material_elsewhere() {
+    let dir = input_dir("molto");
+    let der = dir.join("cert.der");
+    std::fs::write(
+        &der,
+        include_bytes!("../../keyroost-piv/tests/fixtures/rsa_piv.der"),
+    )
+    .unwrap();
+    let (code, _, err) = run(&[
+        "molto",
+        "import",
+        "--in",
+        der.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("This looks like a certificate"), "{err}");
+    let junk = dir.join("junk.bin");
+    std::fs::write(&junk, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    let (code, _, err) = run(&[
+        "molto",
+        "import",
+        "--in",
+        junk.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("neither a text export nor a PNG/JPEG image"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
