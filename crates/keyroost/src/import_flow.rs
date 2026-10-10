@@ -64,11 +64,25 @@ pub struct ImportFlow {
     next_id: u64,
 }
 
-impl Drop for ImportFlow {
-    fn drop(&mut self) {
-        if let Some(d) = self.dialog.as_mut() {
-            d.close();
-        }
+/// Where a result from the import thread goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadRoute {
+    /// A password retry for the dialog still showing.
+    ToDialog,
+    /// A queued file, nothing showing: open its dialog or notice.
+    NewWindow,
+    /// The dialog it was for is gone (closed while decrypting) or another is
+    /// showing: drop it, entries and all.
+    Drop,
+}
+
+/// Route a read for dialog `id`: a retry only ever lands in the dialog that
+/// asked for it, and never reopens one the person closed meanwhile.
+pub fn route_read(showing: Option<u64>, id: u64, retry: bool) -> ReadRoute {
+    match (showing, retry) {
+        (Some(d), true) if d == id => ReadRoute::ToDialog,
+        (None, false) => ReadRoute::NewWindow,
+        _ => ReadRoute::Drop,
     }
 }
 
@@ -393,6 +407,14 @@ pub const NO_CAPABLE_KEY: &str = "Connect a key that can store authenticator cod
 /// Shown for a Molto2 destination whose slot use hasn't been read.
 pub const MOLTO_SLOTS_UNREAD: &str = "Slot use is read when the Molto2 is unlocked";
 
+/// Shown for an unlocked Molto2 whose slot sweep failed.
+pub const MOLTO_SLOTS_FAILED: &str =
+    "Slot use couldn't be read; click Refresh slots in the Molto2 view.";
+
+/// Shown for a Token2 key supplied without the on-device OTP function.
+pub const NO_OTP_FUNCTION: &str = "This key was supplied without the on-device OTP \
+     function, so it can't store codes.";
+
 /// Why "Add" is disabled, first reason in fix order (generalizes #171's
 /// bulk-dialog reasons; the Molto2 ones keep #171's words).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -712,6 +734,8 @@ enum Added {
     /// The key's codes changed since the preview; nothing was written.
     Changed(Existing, Option<(u8, u8, u8)>),
     Locked,
+    /// The password was sent and refused; nothing was written.
+    Refused(String),
     Failed(String),
 }
 
@@ -724,7 +748,7 @@ struct View {
     dests: Vec<(DestKey, String, usize)>,
     total: usize,
     plan: Option<Plan>,
-    molto_unread: bool,
+    molto_note: Option<&'static str>,
     block: Option<ImportBlock>,
     dest_name: String,
 }
@@ -770,6 +794,7 @@ impl App {
         password: Option<zeroize::Zeroizing<String>>,
     ) {
         let label = format!("Reading {name}\u{2026}");
+        let retry = password.is_some();
         self.run_import(label, move || {
             let read = match keyroost_qr::file::open_path(
                 &path,
@@ -779,7 +804,9 @@ impl App {
                 Err(e) => Read::Failed(e.to_string()),
             };
             drop(password);
-            Box::new(move |app: &mut App| app.import_apply_read(id, path, name, origin, read))
+            Box::new(move |app: &mut App| {
+                app.import_apply_read(id, retry, path, name, origin, read)
+            })
         });
     }
 
@@ -787,17 +814,26 @@ impl App {
     fn import_apply_read(
         &mut self,
         id: u64,
+        retry: bool,
         path: PathBuf,
         name: String,
         origin: Origin,
         read: Read,
     ) {
         use keyroost_qr::file::Opened;
+        let showing = self.import_flow.dialog.as_ref().map(|d| d.id);
+        match route_read(showing, id, retry) {
+            // Dropping `read` wipes any entries it decrypted.
+            ReadRoute::Drop => return,
+            ReadRoute::NewWindow => {}
+            ReadRoute::ToDialog => {
+                if matches!(read, Read::Opened(Opened::Entries(_))) {
+                    self.import_scrub(FILE_PASSWORD_ID);
+                }
+            }
+        }
         // A retry with a password lands in the dialog that asked for it.
         if let Some(d) = self.import_flow.dialog.as_mut() {
-            if d.id != id {
-                return;
-            }
             match read {
                 Read::Opened(Opened::Entries(file)) => {
                     wipe(&mut d.file_password);
@@ -840,6 +876,13 @@ impl App {
             }
         }
         self.import_flow.dialog = Some(dialog);
+    }
+
+    /// Scrub the undo history of one of the dialog's masked fields.
+    fn import_scrub(&self, id: &str) {
+        if let Some(ctx) = self.egui_ctx.as_ref() {
+            clear_edit_undo(ctx, egui::Id::new(id));
+        }
     }
 
     /// The import thread stopped without a result.
@@ -1028,6 +1071,15 @@ impl App {
                     ) {
                         Ok(ex) => Preview::Read(ex, None),
                         Err(keyroost_transport::OtpTransportError::PinRequired) => Preview::Locked,
+                        // Like the OTP pane and the CLI: a key supplied
+                        // without the OTP function says so plainly.
+                        Err(_)
+                            if crate::otp_pane::totp_capability(
+                                s.read_device_info().ok().as_ref(),
+                            ) == Some(false) =>
+                        {
+                            Preview::Failed(NO_OTP_FUNCTION.to_owned())
+                        }
                         Err(e) if had_pin => Preview::Refused(e.to_string()),
                         Err(e) => Preview::Failed(e.to_string()),
                     }
@@ -1072,6 +1124,7 @@ impl App {
                 d.dest_locked = true;
                 wipe(&mut d.dest_secret);
                 d.dest_error = Some(format!("The key didn't accept that: {e}"));
+                self.import_scrub(DEST_SECRET_ID);
             }
             Preview::Failed(e) => {
                 d.existing = None;
@@ -1111,6 +1164,13 @@ impl App {
     /// Gather what this frame of the dialog shows.
     fn import_view(&self, d: &ImportDialog, dests: &[DestKey]) -> View {
         let (plan, molto_unread) = self.import_plan(d);
+        let unlocked_here =
+            self.authenticated && d.dest.as_ref().is_some_and(|k| self.import_molto_ready(k));
+        let molto_note = molto_unread.then_some(if unlocked_here {
+            MOLTO_SLOTS_FAILED
+        } else {
+            MOLTO_SLOTS_UNREAD
+        });
         let dest_rows = dests
             .iter()
             .filter_map(|k| {
@@ -1154,7 +1214,7 @@ impl App {
             dests: dest_rows,
             total: d.file.as_ref().map_or(0, |f| f.items.len()),
             plan,
-            molto_unread,
+            molto_note,
             block: ImportBlock::find(&input),
             dest_name,
         }
@@ -1238,7 +1298,7 @@ impl App {
                                 return (fallback, Added::Locked);
                             };
                             if let Err(e) = s.unlock(pw) {
-                                return (fallback, Added::Failed(e.to_string()));
+                                return (fallback, Added::Refused(e.to_string()));
                             }
                         }
                         let version = s.version();
@@ -1377,6 +1437,13 @@ impl App {
                 d.existing = None;
                 d.dest_locked = true;
             }
+            Added::Refused(e) => {
+                d.existing = None;
+                d.dest_locked = true;
+                wipe(&mut d.dest_secret);
+                d.dest_error = Some(format!("The key didn't accept that: {e}"));
+                self.import_scrub(DEST_SECRET_ID);
+            }
             Added::Failed(e) => d.dest_error = Some(format!("Nothing was written: {e}")),
         }
     }
@@ -1430,7 +1497,11 @@ impl App {
                 &d.origin,
                 viewed.as_ref().map(|(id, tab)| (id, *tab)),
             );
+            let before = d.dest.clone();
             d.follow_devices(&dests, pre);
+            if d.dest != before {
+                clear_edit_undo(ctx, egui::Id::new(DEST_SECRET_ID));
+            }
         }
         let want_preview = self
             .import_flow
@@ -1641,9 +1712,9 @@ impl App {
                                     .color(p.txt3),
                             );
                         }
-                        if view.molto_unread {
+                        if let Some(note) = view.molto_note {
                             ui.label(
-                                egui::RichText::new(MOLTO_SLOTS_UNREAD)
+                                egui::RichText::new(note)
                                     .font(theme::f_reg(11.5))
                                     .color(p.txt3),
                             );
@@ -2054,13 +2125,148 @@ mod tests {
         assert!(d.existing.is_none());
         // The next file only starts once the dialog is gone; dropping the
         // flow (app exit) closes what is showing.
-        let mut flow = ImportFlow::default();
-        flow.dialog = Some(open_dialog());
+        let flow = ImportFlow {
+            dialog: Some(open_dialog()),
+            ..ImportFlow::default()
+        };
         let file = flow.dialog.as_ref().unwrap().file.clone().unwrap();
         drop(flow);
         // Only the test's own reference is left: the dialog let go of the
         // entries.
         assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    #[test]
+    fn read_results_route_by_dialog_and_retry() {
+        // A queued file with nothing showing opens its window.
+        assert_eq!(route_read(None, 3, false), ReadRoute::NewWindow);
+        // A retry lands in the dialog that asked for it.
+        assert_eq!(route_read(Some(3), 3, true), ReadRoute::ToDialog);
+        // The dialog was closed while decrypting: dropped, never reopened.
+        assert_eq!(route_read(None, 3, true), ReadRoute::Drop);
+        // A result for another dialog is dropped.
+        assert_eq!(route_read(Some(4), 3, true), ReadRoute::Drop);
+        assert_eq!(route_read(Some(4), 3, false), ReadRoute::Drop);
+    }
+
+    /// The app with one dialog waiting for its file password.
+    fn app_with_password_dialog() -> App {
+        let mut app = App::default();
+        let mut d = ImportDialog::new(
+            7,
+            PathBuf::from("/x/v.json"),
+            "v.json".into(),
+            Origin::Dropped,
+        );
+        d.needs_password = true;
+        d.format = Some(Format::AegisEncrypted);
+        d.file_password = "hunter2".into();
+        app.import_flow.dialog = Some(d);
+        app
+    }
+
+    fn apply(app: &mut App, id: u64, retry: bool, read: Read) {
+        app.import_apply_read(
+            id,
+            retry,
+            PathBuf::from("/x/v.json"),
+            "v.json".into(),
+            Origin::Dropped,
+            read,
+        );
+    }
+
+    #[test]
+    fn closed_while_decrypting_stays_closed() {
+        use keyroost_qr::file::Opened;
+        // The decrypted entries arrive after Close: nothing reopens, and
+        // the entries are dropped (their seeds wiped) with the result.
+        let mut app = app_with_password_dialog();
+        app.import_flow
+            .dialog
+            .as_mut()
+            .unwrap()
+            .settle_open(true, true);
+        app.import_flow.dialog = None;
+        let file = file_of(vec![entry("GitHub", HashAlg::Sha1, 30)]);
+        apply(&mut app, 7, true, Read::Opened(Opened::Entries(file)));
+        assert!(app.import_flow.dialog.is_none());
+        assert!(app.import_flow.notice.is_none());
+        // A wrong password after Close shows nothing either.
+        let mut app = app_with_password_dialog();
+        app.import_flow.dialog = None;
+        apply(
+            &mut app,
+            7,
+            true,
+            Read::Failed("The password didn't open this Aegis vault.".into()),
+        );
+        assert!(app.import_flow.dialog.is_none());
+        assert!(app.import_flow.notice.is_none());
+    }
+
+    #[test]
+    fn password_retry_lands_in_its_dialog() {
+        use keyroost_qr::file::Opened;
+        let mut app = app_with_password_dialog();
+        apply(&mut app, 7, true, Read::Failed("wrong".into()));
+        let d = app.import_flow.dialog.as_ref().unwrap();
+        assert_eq!(d.error.as_deref(), Some("wrong"));
+        assert_eq!(
+            d.file_password, "hunter2",
+            "a wrong password keeps the field"
+        );
+        let file = file_of(vec![entry("GitHub", HashAlg::Sha1, 30)]);
+        apply(&mut app, 7, true, Read::Opened(Opened::Entries(file)));
+        let d = app.import_flow.dialog.as_ref().unwrap();
+        assert!(d.file.is_some());
+        assert!(!d.needs_password);
+        assert!(d.file_password.is_empty());
+        assert!(app.import_flow.notice.is_none());
+    }
+
+    #[test]
+    fn first_read_routes_to_dialog_or_notice() {
+        use keyroost_import::classify::KeyMaterial;
+        use keyroost_qr::file::Opened;
+        // Entries → the dialog.
+        let mut app = App::default();
+        let file = file_of(vec![entry("GitHub", HashAlg::Sha1, 30)]);
+        apply(&mut app, 1, false, Read::Opened(Opened::Entries(file)));
+        assert!(app.import_flow.dialog.as_ref().unwrap().file.is_some());
+        assert!(app.import_flow.notice.is_none());
+        // An encrypted vault → the dialog, asking for its password.
+        let mut app = App::default();
+        apply(&mut app, 1, false, Read::Opened(Opened::NeedsPassword));
+        let d = app.import_flow.dialog.as_ref().unwrap();
+        assert!(d.needs_password && d.file.is_none());
+        assert_eq!(d.format, Some(Format::AegisEncrypted));
+        // Key material → the notice with its pointer; no dialog.
+        let mut app = App::default();
+        apply(
+            &mut app,
+            1,
+            false,
+            Read::Opened(Opened::KeyMaterial(KeyMaterial::Certificate)),
+        );
+        assert!(app.import_flow.dialog.is_none());
+        assert_eq!(
+            app.import_flow.notice,
+            Some(key_material_notice("v.json", KeyMaterial::Certificate))
+        );
+        // Unreadable → the notice with the reason; no dialog.
+        let mut app = App::default();
+        apply(
+            &mut app,
+            1,
+            false,
+            Read::Failed("keyroost can't import this file.".into()),
+        );
+        assert!(app.import_flow.dialog.is_none());
+        assert_eq!(
+            app.import_flow.notice.as_ref().map(|n| n.text.as_str()),
+            Some("keyroost can't import this file.")
+        );
     }
 
     #[test]

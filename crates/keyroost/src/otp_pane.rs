@@ -434,7 +434,7 @@ fn unix_now() -> u64 {
 /// This only helps when the config read SUCCEEDS. A key whose config exchange
 /// itself fails never yields a capability byte, and that failure is reported
 /// unchanged.
-fn totp_capability(info: Option<&keyroost_token2otp::DeviceInfo>) -> Option<bool> {
+pub(crate) fn totp_capability(info: Option<&keyroost_token2otp::DeviceInfo>) -> Option<bool> {
     let info = info?;
     // The capability bits live in byte 9. Some firmware answers READ_CONFIG with
     // only the leading interface-state byte(s); the parser zero-fills the rest,
