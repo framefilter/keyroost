@@ -236,7 +236,8 @@ pub fn fit_count(file: &ImportFile, store: Store, first_slot: u8) -> usize {
         .count()
 }
 
-/// The Molto2's used slots from the slot sweep: a slot with a title.
+/// The Molto2's used slots from the slot sweep: a slot with a seed or a
+/// title, the same rule as `molto import` and the Molto2 slot list.
 pub fn molto_existing(meta: &[ProfilePublicData]) -> Existing {
     Existing {
         names: meta
@@ -244,7 +245,7 @@ pub fn molto_existing(meta: &[ProfilePublicData]) -> Existing {
             .enumerate()
             .filter_map(|(slot, m)| {
                 let title = m.title.as_deref().unwrap_or("");
-                (!title.is_empty()).then(|| StoredName::Molto2 {
+                (m.seed_present || !title.is_empty()).then(|| StoredName::Molto2 {
                     slot: slot as u8,
                     title: title.to_owned(),
                 })
@@ -2552,8 +2553,8 @@ mod tests {
     }
 
     #[test]
-    fn molto_existing_counts_titled_slots() {
-        let slot = |title: Option<&str>| ProfilePublicData {
+    fn molto_existing_counts_seeded_or_titled_slots() {
+        let slot = |title: Option<&str>, seed_present: bool| ProfilePublicData {
             flag: 0,
             title: title.map(str::to_owned),
             time_a: 0,
@@ -2561,16 +2562,33 @@ mod tests {
             algorithm: 0,
             time_step: 0,
             digits: 0,
-            seed_present: false,
+            seed_present,
         };
-        let meta = vec![slot(None), slot(Some("GitHub")), slot(Some(""))];
+        // In use: a seed or a title (as the CLI and the slot list read it).
+        let meta = vec![
+            slot(None, false),
+            slot(Some("GitHub"), false),
+            slot(Some(""), false),
+            slot(None, true),
+            slot(Some("Bank"), true),
+        ];
         let ex = molto_existing(&meta);
         assert_eq!(
             ex.names,
-            vec![StoredName::Molto2 {
-                slot: 1,
-                title: "GitHub".into()
-            }]
+            vec![
+                StoredName::Molto2 {
+                    slot: 1,
+                    title: "GitHub".into()
+                },
+                StoredName::Molto2 {
+                    slot: 3,
+                    title: String::new()
+                },
+                StoredName::Molto2 {
+                    slot: 4,
+                    title: "Bank".into()
+                },
+            ]
         );
     }
 
