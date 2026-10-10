@@ -377,9 +377,9 @@ fn migration_golden() {
 
 // ---- otpauth:// ------------------------------------------------------------
 
-#[test]
-fn otpauth_golden() {
-    let cases: &[(&str, &str)] = &[
+/// Single URIs and what `otpauth::parse` returns for each.
+#[rustfmt::skip]
+const OTPAUTH_CASES: &[(&str, &str)] = &[
         ("otpauth://totp/Acme:alice%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme+Co&algorithm=SHA256&digits=8&period=60", r#"Ok OtpAuth { issuer: Some("Acme Co"), account: Some("alice@example.com"), secret: [10 bytes], algorithm: Sha256, digits: Eight, time_step: Seconds60 } seeds=28a80c694c646832"#),
         ("otpauth://totp/plain?secret=JBSWY3DPEHPK3PXP", r#"Ok OtpAuth { issuer: None, account: Some("plain"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
         ("otpauth://totp/:?secret=JBSWY3DPEHPK3PXP&issuer=", r#"Ok OtpAuth { issuer: None, account: None, secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
@@ -408,13 +408,106 @@ fn otpauth_golden() {
         ("otpauth://totp/X?secret=jbswy3dpehpk3pxp&issuer=", r#"Ok OtpAuth { issuer: None, account: Some("X"), secret: [10 bytes], algorithm: Sha1, digits: Six, time_step: Seconds30 } seeds=28a80c694c646832"#),
         ("otpauth://totp/X?secret=JBSWY3DPEHPK3PXP#frag", r#"Err `secret` is not valid base32"#),
         ("https://example.com", r#"Err not an otpauth:// URI"#),
-    ];
+];
+
+#[test]
+fn otpauth_golden() {
     let mut mismatches = Vec::new();
-    for (uri, want) in cases {
+    for (uri, want) in OTPAUTH_CASES {
         let got = render(otpauth::parse(uri));
         if got != *want {
             mismatches.push(format!("otpauth::parse({uri}) -> {got:?}"));
         }
+    }
+    assert_no_mismatches(&mismatches);
+}
+
+// ---- the import plan's Molto2 rules ----------------------------------------
+
+/// The plan's Molto2 verdict for a one-entry file read by a wide reader:
+/// `true` when it would be written.
+fn molto_plan_writes(
+    file: Result<keyroost_import::ImportFile, keyroost_import::BulkError>,
+) -> bool {
+    use keyroost_import::plan::{plan, Existing, Store, Target, Verdict};
+    let Ok(file) = file else { return false };
+    assert!(file.items.len() <= 1, "{file:?}");
+    let target = Target {
+        store: Store::Molto2,
+        first_slot: 0,
+        existing: Existing::default(),
+        replace: false,
+    };
+    plan(&file, &target)
+        .rows
+        .first()
+        .is_some_and(|r| matches!(r.verdict, Verdict::Add | Verdict::Replace))
+}
+
+/// What the Molto2 path writes from a one-entry file: the narrow parser
+/// accepts it and the slot writer has a title for it (untitled entries are
+/// skipped at write time).
+fn molto_narrow_writes(r: Result<Vec<BulkEntry>, keyroost_import::BulkError>) -> bool {
+    matches!(r, Ok(v) if v.len() == 1 && !v[0].suggested_title().is_empty())
+}
+
+#[test]
+fn molto_rules_match_narrow_acceptance() {
+    let mut mismatches = Vec::new();
+    let mut check = |what: &str, narrow: bool, wide: bool| {
+        if narrow != wide {
+            mismatches.push(format!(
+                "{what}: narrow writes {narrow}, plan writes {wide}"
+            ));
+        }
+    };
+    for e in [
+        AEGIS_TOTP,
+        AEGIS_HOTP,
+        AEGIS_STEAM,
+        AEGIS_DIGITS7,
+        AEGIS_PERIOD45,
+        AEGIS_SHA512,
+        AEGIS_BAD_B32,
+        AEGIS_SECRET64,
+        AEGIS_EMPTY_ISSUER,
+        AEGIS_DUP_COUNTER,
+    ] {
+        let doc = aegis_doc(&[e]);
+        check(
+            e,
+            molto_narrow_writes(aegis::parse(&doc)),
+            molto_plan_writes(aegis::parse_wide(&doc)),
+        );
+    }
+    // Each 2FAS service of the golden corpus, one per file.
+    for svc in [
+        r#"{"name":"Stripe","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"ops@example.com","issuer":"Stripe","digits":8,"period":60,"algorithm":"SHA256","tokenType":"TOTP"}}"#,
+        r#"{"name":"NoIssuer","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me"}}"#,
+        r#"{"name":"Bank","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me","issuer":"Bank","digits":6,"counter":3,"algorithm":"SHA1","tokenType":"HOTP"}}"#,
+        r#"{"name":"Dup","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me","counter":1,"counter":2,"tokenType":"TOTP"}}"#,
+        r#"{"name":"Mail","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"you","tokenType":"TOTP"}}"#,
+    ] {
+        let doc = format!(r#"{{"services":[{svc}]}}"#);
+        check(
+            svc,
+            molto_narrow_writes(twofas::parse(&doc)),
+            molto_plan_writes(twofas::parse_wide(&doc)),
+        );
+    }
+    // Every URI line of the list corpus and every single-URI case.
+    let lines = [LIST_OK, LIST_HOTP, LIST_PERIOD45]
+        .iter()
+        .flat_map(|t| t.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .chain(OTPAUTH_CASES.iter().map(|(uri, _)| *uri));
+    for line in lines {
+        check(
+            line,
+            molto_narrow_writes(parse_otpauth_list(line)),
+            molto_plan_writes(keyroost_import::parse_list_wide(line)),
+        );
     }
     assert_no_mismatches(&mismatches);
 }
