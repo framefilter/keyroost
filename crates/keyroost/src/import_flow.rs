@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use keyroost_import::plan::{plan_for, Existing, OathFamily, Plan, PlanRow, Store, Verdict};
+use keyroost_import::plan::{
+    molto_plan, plan_for, Existing, OathFamily, Plan, PlanRow, Store, Verdict,
+};
 use keyroost_import::run::{Outcome, Report};
 use keyroost_import::{Format, ImportFile, OtpKind};
 use keyroost_transport::import::molto_existing;
@@ -1107,7 +1109,7 @@ impl App {
                     .as_deref()
                     .filter(|_| self.molto_session_device.as_ref() == Some(&dest.device));
                 let existing = meta.map(molto_existing).unwrap_or_default();
-                let plan = plan_for(file, Store::Molto2, d.molto_start, existing, false);
+                let plan = molto_plan(file, d.molto_start, existing);
                 (Some(plan), meta.is_none())
             }
             _ => match d.contents() {

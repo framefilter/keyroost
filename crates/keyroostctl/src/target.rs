@@ -113,17 +113,37 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
 }
 
 /// A Molto2's card serial (what `molto info` shows), read in a short
-/// session of its own; `None` when the token doesn't answer. Selection
-/// calls it only when `--device` matched nothing without it.
+/// session of its own; `None` when the token doesn't answer, after a note
+/// saying so (the refusal that follows would otherwise read as if no
+/// Molto2 were there). Selection calls it only when `--device` matched
+/// nothing without it.
 pub(crate) fn molto_card_serial(d: &Device) -> Option<String> {
     let reader = d.reader.as_deref()?;
-    let mut session = keyroost_transport::Session::open_named(reader).ok()?;
-    session.set_debug(debug_on());
-    let info = session.read_info().ok()?;
-    Some(
-        info.serial
-            .trim_matches(|c: char| c == '\0' || c.is_whitespace())
-            .to_owned(),
+    let read = || -> Result<String, keyroost_transport::TransportError> {
+        let mut session = keyroost_transport::Session::open_named(reader)?;
+        session.set_debug(debug_on());
+        Ok(session.read_info()?.serial)
+    };
+    match read() {
+        Ok(serial) => Some(
+            serial
+                .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                .to_owned(),
+        ),
+        Err(e) => {
+            crate::output::note(&unanswered_molto(reader, &e.to_string()));
+            None
+        }
+    }
+}
+
+/// The note for a Molto2 whose card serial couldn't be read.
+fn unanswered_molto(reader: &str, err: &str) -> String {
+    format!(
+        "a Molto2 is connected ({}) but didn't answer when its serial was read ({}), \
+         so --device couldn't be compared with it",
+        sanitize_terminal(reader),
+        sanitize_terminal(err)
     )
 }
 
@@ -647,6 +667,15 @@ mod tests {
                 first
             );
         }
+    }
+
+    #[test]
+    fn unanswered_molto_note_names_the_reader() {
+        assert_eq!(
+            unanswered_molto("TOKEN2 Molto2 (5C7D) 02 00", "timed out"),
+            "a Molto2 is connected (TOKEN2 Molto2 (5C7D) 02 00) but didn't answer when \
+             its serial was read (timed out), so --device couldn't be compared with it"
+        );
     }
 
     #[test]

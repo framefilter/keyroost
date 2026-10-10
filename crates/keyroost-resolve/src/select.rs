@@ -252,6 +252,13 @@ pub fn device_value(devices: &[Device], index: usize) -> String {
     if !d.serial.is_empty() {
         tries.push(d.serial.clone());
     }
+    // A Molto2's reader-name serial stays put when keys come and go; a
+    // list number doesn't.
+    if d.serial.is_empty() && d.kind == DeviceKind::Token {
+        if let Some(rs) = d.reader.as_deref().and_then(molto_reader_serial) {
+            tries.push(format!("serial:{rs}"));
+        }
+    }
     tries.push(number.to_string());
     if let Some(n) = name {
         tries.push(format!("name:{n}"));
@@ -586,7 +593,8 @@ pub fn resolve_target<'d>(
 /// [`resolve_target`], plus one more way to match `--device`: when the
 /// value (bare or `serial:`) matches no row, each connected Molto2's card
 /// serial is read with `card_serial` (the serial `molto info` and the GUI
-/// show) and compared. The card is contacted only then, and only for
+/// show) and compared, when the command can act on a Molto2 (`need`
+/// admits it). The card is contacted only then, and only for
 /// Molto2 rows: a Molto2 is slow to start a session, so no other lookup
 /// waits on it. `card_serial` returns `None` for a card it couldn't read.
 pub fn resolve_target_reading<'d>(
@@ -665,7 +673,9 @@ fn resolve<'d>(
                     .iter()
                     .copied()
                     .filter(|&i| {
-                        devices[i].kind == DeviceKind::Token && devices[i].reader.is_some()
+                        devices[i].kind == DeviceKind::Token
+                            && devices[i].reader.is_some()
+                            && need.admits(&devices[i])
                     })
                     .filter(|&i| read(&devices[i]).is_some_and(|c| c.eq_ignore_ascii_case(s)))
                     .collect();
@@ -1135,6 +1145,11 @@ mod tests {
             ),
             Err(SelectError::NotFound { .. })
         ));
+        // Refusals and `list --json` offer the reader-name serial, which
+        // stays put when keys come and go (a list number doesn't).
+        let devs = [yubi(), solo(), molto_named()];
+        assert_eq!(device_value(&devs, 2), "serial:5C7D6241EF67245B");
+        assert_eq!(device_value(&[yubi(), molto()], 1), "2");
         assert_eq!(molto_reader_serial("TOKEN2 Molto2 02 00"), None);
         assert_eq!(molto_reader_serial("TOKEN2 Molto2 () 02 00"), None);
     }
@@ -1226,18 +1241,18 @@ mod tests {
             &mut never,
         )
         .is_err());
-        // The card serial selects for a command that needs something else:
-        // the usual capability refusal.
-        let mut read = |_: &Device| Some("826658711763730".to_owned());
+        // A command that can't act on a Molto2 never reads one: the value
+        // simply matches nothing.
+        let mut never = |_: &Device| -> Option<String> { panic!("Oath can't use a Molto2") };
         assert!(matches!(
             resolve_target_reading(
                 &devs,
                 &sel(Some("826658711763730"), None, None),
                 Need::Oath,
                 &mut NoPicker,
-                &mut read,
+                &mut never,
             ),
-            Err(SelectError::LacksCapability { .. })
+            Err(SelectError::NotFound { .. })
         ));
     }
 

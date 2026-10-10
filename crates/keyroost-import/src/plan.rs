@@ -800,6 +800,13 @@ pub fn plan_for(
     )
 }
 
+/// The Molto2 plan from `first_slot`: entries fill consecutive slots and
+/// slots in use are replaced (there is no replace-by-name choice). The one
+/// call the CLI and the GUI both make for a Molto2.
+pub fn molto_plan(file: &ImportFile, first_slot: u8, existing: Existing) -> Plan {
+    plan_for(file, Store::Molto2, first_slot, existing, false)
+}
+
 /// Plan an import of `file` into `target`.
 pub fn plan(file: &ImportFile, target: &Target) -> Plan {
     let store = target.store;
@@ -1731,6 +1738,33 @@ mod tests {
             })
         );
         assert_eq!(p.capacity, Some(2));
+    }
+
+    /// The one Molto2 plan the CLI and the GUI both make: `plan` for the
+    /// Molto2 from `first_slot`, never asking to replace by name (slots in
+    /// use are always replaced).
+    #[test]
+    fn molto_plan_is_the_molto2_target() {
+        let totp = |issuer: &str, period: u32| {
+            entry(
+                Some(issuer),
+                Some("a"),
+                20,
+                HashAlg::Sha1,
+                6,
+                OtpKind::Totp { period },
+            )
+        };
+        let f = file(vec![totp("A", 30), totp("B", 60), totp("C", 45)]);
+        for replace in [false, true] {
+            let mut t = molto_target(98, &[99], replace);
+            let got = molto_plan(&f, 98, t.existing.clone());
+            t.replace = false;
+            assert_eq!(got, plan(&f, &t));
+        }
+        let p = molto_plan(&f, 98, molto_target(98, &[99], false).existing);
+        let verdicts: Vec<&str> = p.rows.iter().map(|r| r.verdict.word()).collect();
+        assert_eq!(verdicts, ["add", "replace", "skip"]);
     }
 
     #[test]

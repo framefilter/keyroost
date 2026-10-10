@@ -1471,18 +1471,37 @@ mod tests {
         assert_eq!(asked, 4);
     }
 
+    /// The CLI reads slot use one slot at a time (`read_molto_existing`);
+    /// the GUI keeps its slot sweep and calls `molto_existing` on it. The
+    /// same token gives both the same slot use and so, through the shared
+    /// `molto_plan`, the same plan for the same file and start slot.
+    #[test]
+    fn cli_and_gui_make_the_same_molto2_plan() {
+        let meta: Vec<ProfilePublicData> = (0..=99u8)
+            .map(|s| match s {
+                95 => public(Some("Old"), true),
+                97 => public(Some("Title"), false),
+                98 => public(None, true),
+                _ => public(None, false),
+            })
+            .collect();
+        let cli = molto_existing_by(|s| Ok(meta[usize::from(s)].clone())).unwrap();
+        let gui = molto_existing(&meta);
+        assert_eq!(cli.names, gui.names);
+        let f = file(6);
+        let cli_plan = keyroost_import::plan::molto_plan(&f, 95, cli);
+        let gui_plan = keyroost_import::plan::molto_plan(&f, 95, gui);
+        assert_eq!(cli_plan, gui_plan);
+        let words: Vec<&str> = cli_plan.rows.iter().map(|r| r.verdict.word()).collect();
+        assert_eq!(
+            words,
+            ["replace", "add", "replace", "replace", "add", "skip"]
+        );
+    }
+
     #[test]
     fn molto_existing_counts_seeded_or_titled_slots() {
-        let slot = |title: Option<&str>, seed_present: bool| ProfilePublicData {
-            flag: 0,
-            title: title.map(str::to_owned),
-            time_a: 0,
-            time_b: 0,
-            algorithm: 0,
-            time_step: 0,
-            digits: 0,
-            seed_present,
-        };
+        let slot = public;
         // In use: a seed or a title (as the CLI and the slot list read it).
         let meta = vec![
             slot(None, false),
