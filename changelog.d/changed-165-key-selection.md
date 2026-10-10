@@ -3,7 +3,9 @@
   from (now on every platform); a script gets a refusal that lists the
   `--device` value for each key. No command takes "the first key found"
   any more. `--device` takes a name, a serial or a `list` number
-  (`name:`, `serial:` or `list:` forces which). `--device` with `--reader`
-  or `--path` is refused, and so is `--device` on commands that touch no
-  key. `--reader` and `--path` skip the capability check, and a value that
-  matches no detected key is used as typed. ([#165])
+  (`name:`, `serial:` or `list:` forces which); a Molto2 answers to either
+  serial keyroost shows for it, the one in `list` or the one `molto info`
+  prints. `--device` with `--reader` or `--path` is refused, and so is
+  `--device` on commands that touch no key. `--reader` and `--path` skip
+  the capability check, and a value that matches no detected key is used
+  as typed. ([#165])

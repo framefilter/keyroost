@@ -168,7 +168,10 @@
       <tr><td><code>--device</code> took a friendly name</td>
         <td>A name, a serial or a <code>list</code> number. Prefix
           <code>name:</code>, <code>serial:</code> or <code>list:</code> to
-          force which. A value that matches several keys is refused.</td></tr>
+          force which. A value that matches several keys is refused. A
+          Molto2 answers to either serial keyroost shows for it: the one in
+          <code>keyroostctl list</code> or the one <code>molto info</code>
+          prints.</td></tr>
       <tr><td><code>--device</code> was ignored by commands that touch no
           key</td>
         <td>Refused on <code>doctor</code>, <code>name list</code>,
@@ -727,8 +730,8 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
         <td>It asks once whenever it will write anything. A script adds
           <code>--yes</code>, as before.</td></tr>
       <tr><td><code>molto import --in … --dry-run</code> printed
-          <code>Found N entries; would fill slots …</code>, touched no key,
-          and refused <code>--device</code></td>
+          <code>Found N entries; would fill slots …</code> and touched no
+          key</td>
         <td>It prints the same preview as <code>oath import</code>, reads
           which slots are in use from a connected Molto2 (no customer key
           needed; it still works with none connected), and takes
@@ -739,11 +742,6 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
         <td><code>--period</code> defaults to the name's
           <code>period/</code> prefix, else 30. <code>--period 0</code> is
           refused (exit 2).</td></tr>
-      <tr><td><code>--device serial:…</code> with a Molto2's serial found no
-          key</td>
-        <td>A Molto2 answers to either serial keyroost shows for it: the one
-          in <code>keyroostctl list</code> or the one <code>molto
-          info</code> prints.</td></tr>
       <tr><td><code>oath add</code> sent any name to a Solo 2</td>
         <td>A Solo 2 name over 127 bytes is refused before anything is sent
           (a 128-byte name made the key stop responding until it was
