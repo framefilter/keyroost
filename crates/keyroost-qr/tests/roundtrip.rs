@@ -33,3 +33,32 @@ fn google_authenticator_migration_png_round_trips() {
     assert!(import.skipped.is_empty());
     assert_eq!(import.batch, None);
 }
+
+#[test]
+fn wide_enrollment_png_reads_one_item() {
+    let img = include_bytes!("fixtures/enroll.png");
+    let file = keyroost_qr::entries_from_image_wide(img).expect("decode png");
+    assert_eq!(file.format, keyroost_import::Format::QrImage);
+    assert_eq!(file.items.len(), 1);
+    assert_eq!(file.items[0].label, "Acme:alice");
+    let e = file.items[0].entry.as_ref().expect("usable");
+    assert_eq!(&e.secret[..], b"Hello!\xde\xad\xbe\xef");
+    assert_eq!(file.batch, None);
+}
+
+#[test]
+fn wide_migration_png_is_a_google_export() {
+    let img = include_bytes!("fixtures/migration.png");
+    let file = keyroost_qr::entries_from_image_wide(img).expect("decode migration");
+    assert_eq!(file.format, keyroost_import::Format::GoogleExport);
+    assert_eq!(file.usable(), 1);
+    assert_eq!(file.items[0].label, "Acme:alice");
+}
+
+#[test]
+fn wide_keeps_the_narrow_errors() {
+    assert!(matches!(
+        keyroost_qr::entries_from_image_wide(b"not an image"),
+        Err(keyroost_qr::QrError::UnsupportedImage)
+    ));
+}

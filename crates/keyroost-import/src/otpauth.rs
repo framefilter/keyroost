@@ -10,6 +10,8 @@
 use keyroost_proto::codec::base32_decode;
 use keyroost_proto::commands::{DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep};
 
+use crate::entry::{ImportEntry, Unusable};
+
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum OtpAuthError {
@@ -202,11 +204,7 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
     }
 
     // Label may be "Issuer:account" — split on the first colon if present.
-    let (label_issuer, account) = match label.split_once(':') {
-        Some((i, a)) => (Some(i.trim().to_owned()), Some(a.trim().to_owned())),
-        None if label.is_empty() => (None, None),
-        None => (None, Some(label.trim().to_owned())),
-    };
+    let (label_issuer, account) = split_label(&label);
 
     // Prefer the explicit issuer= query param over the label prefix.
     let issuer = issuer_param.or(label_issuer).filter(|s| !s.is_empty());
@@ -220,6 +218,117 @@ pub fn parse(uri: &str) -> Result<OtpAuth, OtpAuthError> {
         digits,
         time_step,
     })
+}
+
+/// Parse an otpauth:// URI into a format-neutral [`ImportEntry`]: HOTP with
+/// its counter, any TOTP period, SHA-1/256/512, 1–10 digits and seeds up to
+/// 255 bytes. Same percent-decoding and label rules as [`parse`]; problems
+/// are reported secret first, then hash, digits and period.
+pub fn parse_entry(uri: &str) -> Result<ImportEntry, Unusable> {
+    parse_entry_labeled(uri).1
+}
+
+/// [`parse_entry`] plus the name the URI carries (`issuer:account`, or
+/// whichever half it has), even when the entry itself is unusable — so a
+/// list or a QR screenshot can say which account failed.
+pub fn parse_entry_labeled(uri: &str) -> (Option<String>, Result<ImportEntry, Unusable>) {
+    let rest = match uri.strip_prefix("otpauth://") {
+        Some(r) => r,
+        None => return (None, Err(Unusable::Malformed("not an otpauth:// URI"))),
+    };
+    let (typ_label, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (typ, label_raw) = match typ_label.split_once('/') {
+        Some(parts) => parts,
+        None => return (None, Err(Unusable::Malformed("the URI has no label"))),
+    };
+    // Same label rule as `parse`: a path segment keeps a literal '+'.
+    let label = match percent_decode_keep_plus(label_raw) {
+        Ok(l) => l,
+        Err(()) => {
+            return (
+                None,
+                Err(Unusable::Malformed(
+                    "the label's percent-encoding is invalid",
+                )),
+            )
+        }
+    };
+    let (label_issuer, account) = split_label(&label);
+
+    // Collect the parameters first, then validate in a fixed order. The
+    // decoded base32 text is the seed in another spelling: Zeroizing, so it
+    // is wiped on every exit (including a duplicate `secret=`).
+    let mut secret_b32: Option<zeroize::Zeroizing<String>> = None;
+    let mut issuer_param: Option<String> = None;
+    let mut algorithm: Option<String> = None;
+    let mut digits: u32 = 6;
+    let mut period: u32 = 30;
+    let mut counter: u64 = 0;
+    let mut malformed: Option<&'static str> = None;
+    for kv in query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        let v = match percent_decode(v) {
+            Ok(v) => zeroize::Zeroizing::new(v),
+            Err(()) => {
+                malformed.get_or_insert("a parameter's percent-encoding is invalid");
+                continue;
+            }
+        };
+        match k {
+            "secret" => secret_b32 = Some(v),
+            "issuer" => issuer_param = Some(v.to_string()),
+            "algorithm" => algorithm = Some(v.to_string()),
+            "digits" => match v.parse() {
+                Ok(n) => digits = n,
+                Err(_) => {
+                    malformed.get_or_insert("the digits value isn't a number");
+                }
+            },
+            "period" => match v.parse() {
+                Ok(n) => period = n,
+                Err(_) => {
+                    malformed.get_or_insert("the period value isn't a number");
+                }
+            },
+            "counter" => match v.parse() {
+                Ok(n) => counter = n,
+                Err(_) => {
+                    malformed.get_or_insert("the counter value isn't a number");
+                }
+            },
+            _ => {} // image, color, ... carry nothing a key stores
+        }
+    }
+
+    // Prefer the explicit issuer= query param over the label prefix.
+    let issuer = issuer_param.or(label_issuer).filter(|s| !s.is_empty());
+    let account = account.filter(|s| !s.is_empty());
+    let name = crate::entry::name_label(issuer.as_deref(), account.as_deref());
+
+    let entry = (|| {
+        let kind = crate::entry::type_from_name(typ)?;
+        if let Some(what) = malformed {
+            return Err(Unusable::Malformed(what));
+        }
+        let secret = crate::entry::decode_secret(secret_b32.as_deref().map_or("", |s| s))?;
+        let hash = crate::entry::hash_from_name(algorithm.as_deref().unwrap_or("SHA1"))?;
+        let kind = match kind {
+            crate::entry::TypeName::Totp => crate::entry::OtpKind::Totp { period },
+            crate::entry::TypeName::Hotp => crate::entry::OtpKind::Hotp { counter },
+        };
+        crate::entry::finish(issuer, account, secret, hash, digits, kind)
+    })();
+    (name, entry)
+}
+
+/// Split an `Issuer:account` label on its first colon (both halves trimmed);
+/// a label without a colon is the account.
+pub(crate) fn split_label(label: &str) -> (Option<String>, Option<String>) {
+    match label.split_once(':') {
+        Some((i, a)) => (Some(i.trim().to_owned()), Some(a.trim().to_owned())),
+        None if label.is_empty() => (None, None),
+        None => (None, Some(label.trim().to_owned())),
+    }
 }
 
 /// Percent-decode a query value: `+` decodes to a space (form-encoding).
@@ -286,6 +395,7 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::{HashAlg, OtpKind};
 
     #[test]
     fn rejects_non_otpauth() {
@@ -390,6 +500,84 @@ mod tests {
     fn suggested_title_prefers_issuer_and_truncates() {
         let p = parse("otpauth://totp/x?secret=JBSWY3DP&issuer=ABCDEFGHIJKLMNOP").unwrap();
         assert_eq!(p.suggested_title(), "ABCDEFGHIJKL"); // 12 bytes
+    }
+
+    #[test]
+    fn parse_entry_accepts_hotp_with_counter() {
+        let e = parse_entry("otpauth://hotp/X:a?secret=JBSWY3DPEHPK3PXP&counter=5").unwrap();
+        assert_eq!(e.kind, OtpKind::Hotp { counter: 5 });
+        assert_eq!(e.issuer.as_deref(), Some("X"));
+        assert_eq!(e.account.as_deref(), Some("a"));
+        assert_eq!(&e.secret[..], b"Hello!\xde\xad\xbe\xef");
+        assert_eq!(e.hash, HashAlg::Sha1);
+        assert_eq!(e.digits, 6);
+        // No counter in the URI starts at 0.
+        let e = parse_entry("otpauth://HOTP/X?secret=JBSWY3DPEHPK3PXP").unwrap();
+        assert_eq!(e.kind, OtpKind::Hotp { counter: 0 });
+    }
+
+    #[test]
+    fn parse_entry_accepts_any_period_and_sha512() {
+        let e = parse_entry(
+            "otpauth://totp/Co%20Inc:alice%2Bwork?secret=JBSWY3DPEHPK3PXP&period=45&algorithm=SHA512&digits=7",
+        )
+        .unwrap();
+        assert_eq!(e.kind, OtpKind::Totp { period: 45 });
+        assert_eq!(e.hash, HashAlg::Sha512);
+        assert_eq!(e.digits, 7);
+        // Same label rules as `parse`: '+' in the label is literal.
+        assert_eq!(e.issuer.as_deref(), Some("Co Inc"));
+        assert_eq!(e.account.as_deref(), Some("alice+work"));
+        // The issuer= query param wins and form-decodes '+'.
+        let e =
+            parse_entry("otpauth://totp/Old:bob?secret=JBSWY3DPEHPK3PXP&issuer=Acme+Co").unwrap();
+        assert_eq!(e.issuer.as_deref(), Some("Acme Co"));
+        assert_eq!(e.kind, OtpKind::Totp { period: 30 });
+        // A 64-byte secret (too long for a Molto2) is fine here.
+        let e = parse_entry(&format!("otpauth://totp/x?secret={}", "A".repeat(103))).unwrap();
+        assert_eq!(e.secret.len(), 64);
+    }
+
+    #[test]
+    fn parse_entry_unusable_reasons() {
+        let p = |q: &str| parse_entry(&format!("otpauth://totp/x?{}", q)).unwrap_err();
+        assert_eq!(p("secret=JBSWY3DP&period=0"), Unusable::Period(0));
+        assert_eq!(p("secret=JBSWY3DP&digits=11"), Unusable::Digits(11));
+        assert_eq!(p("secret=JBSWY3DP&digits=0"), Unusable::Digits(0));
+        assert_eq!(
+            p("secret=JBSWY3DP&algorithm=MD5"),
+            Unusable::Hash("MD5".into())
+        );
+        assert_eq!(p("secret=NOT_BASE32!!"), Unusable::BadSecret);
+        assert_eq!(p("issuer=x"), Unusable::BadSecret);
+        assert_eq!(p("secret="), Unusable::BadSecret);
+        assert!(matches!(
+            p("secret=JBSWY3DP&digits=x"),
+            Unusable::Malformed(_)
+        ));
+        assert!(matches!(
+            p("secret=JBSWY3DP&period=-1"),
+            Unusable::Malformed(_)
+        ));
+        assert_eq!(
+            parse_entry("otpauth://steam/x?secret=JBSWY3DP").unwrap_err(),
+            Unusable::Type("steam".into())
+        );
+        assert!(matches!(
+            parse_entry("https://example.com").unwrap_err(),
+            Unusable::Malformed(_)
+        ));
+        assert!(matches!(
+            parse_entry("otpauth://totp?secret=JBSWY3DP").unwrap_err(),
+            Unusable::Malformed(_)
+        ));
+        // Secret problems are reported before hash and digit problems,
+        // matching the Molto2 path's order.
+        assert_eq!(p("secret=!!&algorithm=MD5&digits=11"), Unusable::BadSecret);
+        assert_eq!(
+            p("secret=JBSWY3DP&digits=11&algorithm=MD5"),
+            Unusable::Hash("MD5".into())
+        );
     }
 
     #[test]

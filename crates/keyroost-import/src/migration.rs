@@ -29,6 +29,10 @@
 //! accounts shouldn't lose 19 because one is HOTP.
 
 use crate::bulk::{BulkEntry, BulkError};
+use crate::entry::{
+    check_secret, finish, name_label, Format, HashAlg, ImportEntry, ImportFile, ImportItem,
+    OtpKind, Unusable,
+};
 use keyroost_proto::codec::base64_decode;
 use keyroost_proto::commands::{HmacAlgo, OtpDigits, TimeStep};
 
@@ -57,6 +61,11 @@ pub fn is_migration_uri(uri: &str) -> bool {
 
 /// Parse an `otpauth-migration://offline?data=…` URI.
 pub fn parse(uri: &str) -> Result<Migration, BulkError> {
+    parse_payload(&decode_uri(uri)?)
+}
+
+/// The raw protobuf payload of a migration URI, in a wipe-on-drop buffer.
+fn decode_uri(uri: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, BulkError> {
     let uri = uri.trim();
     let rest =
         uri.strip_prefix("otpauth-migration://offline")
@@ -85,7 +94,117 @@ pub fn parse(uri: &str) -> Result<Migration, BulkError> {
         base64_decode(&data)
             .map_err(|_| BulkError::UnsupportedFormat("migration data is not valid base64"))?,
     );
-    parse_payload(&payload)
+    Ok(payload)
+}
+
+/// Every account of an `otpauth-migration://offline?data=…` URI, in
+/// payload order, in the wide model: HOTP keeps its counter (field 7) and
+/// SHA-512 is carried; MD5, unknown enums and out-of-range secrets become
+/// unusable items. Whole-file errors are the same as [`parse`]'s.
+pub fn parse_wide(uri: &str) -> Result<ImportFile, BulkError> {
+    parse_payload_wide(&decode_uri(uri)?)
+}
+
+/// [`parse_wide`] over the raw protobuf `MigrationPayload`.
+pub fn parse_payload_wide(buf: &[u8]) -> Result<ImportFile, BulkError> {
+    let mut items = Vec::new();
+    let (mut batch_size, mut batch_index) = (None, None);
+    let mut r = Reader(buf);
+    while let Some((field, wire)) = r.key()? {
+        match (field, wire) {
+            (1, 2) => {
+                let index = items.len();
+                let (label, entry) = convert_wide(r.bytes()?)?;
+                items.push(ImportItem {
+                    index,
+                    label: label.unwrap_or_else(|| format!("entry {}", index + 1)),
+                    entry,
+                });
+            }
+            (3, 0) => batch_size = Some(r.varint()? as u32),
+            (4, 0) => batch_index = Some(r.varint()? as u32),
+            _ => r.skip(wire)?,
+        }
+    }
+    if items.is_empty() {
+        return Err(BulkError::UnsupportedFormat(
+            "migration payload contains no accounts",
+        ));
+    }
+    Ok(ImportFile {
+        format: Format::GoogleExport,
+        items,
+        batch: batch_of(batch_index, batch_size),
+    })
+}
+
+fn batch_of(index: Option<u32>, size: Option<u32>) -> Option<(u32, u32)> {
+    match (index, size) {
+        (Some(i), Some(n)) if n > 1 => Some((i, n)),
+        _ => None,
+    }
+}
+
+/// One `OtpParameters` message in the wide model, with its display name.
+#[allow(clippy::type_complexity)]
+fn convert_wide(buf: &[u8]) -> Result<(Option<String>, Result<ImportEntry, Unusable>), BulkError> {
+    let mut secret: &[u8] = &[];
+    let mut name = String::new();
+    let mut issuer = String::new();
+    let (mut algorithm, mut digits, mut typ, mut counter) = (0u64, 0u64, 0u64, 0u64);
+    let mut r = Reader(buf);
+    while let Some((field, wire)) = r.key()? {
+        match (field, wire) {
+            (1, 2) => secret = r.bytes()?,
+            (2, 2) => name = String::from_utf8_lossy(r.bytes()?).into_owned(),
+            (3, 2) => issuer = String::from_utf8_lossy(r.bytes()?).into_owned(),
+            (4, 0) => algorithm = r.varint()?,
+            (5, 0) => digits = r.varint()?,
+            (6, 0) => typ = r.varint()?,
+            (7, 0) => counter = r.varint()?,
+            _ => r.skip(wire)?,
+        }
+    }
+
+    // "Issuer:account" names: prefer the explicit issuer field.
+    let (label_issuer, account) = crate::otpauth::split_label(&name);
+    let issuer = if issuer.is_empty() {
+        label_issuer
+    } else {
+        Some(issuer)
+    }
+    .filter(|s| !s.is_empty());
+    let account = account.filter(|s| !s.is_empty());
+    let label = name_label(issuer.as_deref(), account.as_deref());
+
+    let entry = (|| {
+        // type: 0 (unspecified) is TOTP, matching other importers.
+        let kind = match typ {
+            0 | 2 => OtpKind::Totp { period: 30 }, // GA exports are always 30 s
+            1 => OtpKind::Hotp { counter },
+            other => return Err(Unusable::Type(format!("type {}", other))),
+        };
+        let secret = check_secret(zeroize::Zeroizing::new(secret.to_vec()))?;
+        let hash = match algorithm {
+            0 | 1 => HashAlg::Sha1, // unspecified defaults to SHA-1
+            2 => HashAlg::Sha256,
+            3 => HashAlg::Sha512,
+            4 => return Err(Unusable::Hash("MD5".to_owned())),
+            other => return Err(Unusable::Hash(format!("algorithm {}", other))),
+        };
+        // An enum, not a count: 1 = six, 2 = eight.
+        let digits = match digits {
+            0 | 1 => 6,
+            2 => 8,
+            _ => {
+                return Err(Unusable::Malformed(
+                    "the digit count isn't one keyroost knows",
+                ))
+            }
+        };
+        finish(issuer, account, secret, hash, digits, kind)
+    })();
+    Ok((label, entry))
 }
 
 /// Parse the raw protobuf `MigrationPayload`.
@@ -110,10 +229,7 @@ pub fn parse_payload(buf: &[u8]) -> Result<Migration, BulkError> {
         }
     }
 
-    let batch = match (batch_index, batch_size) {
-        (Some(i), Some(n)) if n > 1 => Some((i, n)),
-        _ => None,
-    };
+    let batch = batch_of(batch_index, batch_size);
     if entries.is_empty() && skipped.is_empty() {
         return Err(BulkError::UnsupportedFormat(
             "migration payload contains no accounts",
@@ -267,12 +383,12 @@ fn percent_decode_keep_plus(s: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Hand-built protobuf: the test constructs the bytes field-by-field so
     /// the expected layout is visible (and independent of any encoder).
-    fn otp_params(
+    pub(crate) fn otp_params(
         secret: &[u8],
         name: &str,
         issuer: &str,
@@ -293,7 +409,7 @@ mod tests {
         m
     }
 
-    fn payload(params: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn payload(params: &[Vec<u8>]) -> Vec<u8> {
         let mut p = Vec::new();
         for m in params {
             p.extend([0x0a, m.len() as u8]);
@@ -305,35 +421,121 @@ mod tests {
         p
     }
 
+    /// `otpauth-migration://offline?data=…` for a payload, base64 encoded
+    /// and percent-encoded the way a QR-embedded URI would be.
+    pub(crate) fn uri_for(p: &[u8]) -> String {
+        // tiny local encoder for the tests
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for c in p.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+            for i in 0..=c.len() {
+                s.push(A[(n >> (18 - 6 * i) & 0x3f) as usize] as char);
+            }
+            for _ in c.len()..3 {
+                s.push('=');
+            }
+        }
+        format!(
+            "otpauth-migration://offline?data={}",
+            s.replace('+', "%2B")
+                .replace('/', "%2F")
+                .replace('=', "%3D")
+        )
+    }
+
+    /// One `OtpParameters` with a HOTP counter (field 7) appended.
+    fn otp_params_counter(
+        secret: &[u8],
+        name: &str,
+        issuer: &str,
+        algo: u8,
+        typ: u8,
+        counter: u8,
+    ) -> Vec<u8> {
+        let mut m = otp_params(secret, name, issuer, algo, 1, typ);
+        m.extend([0x38, counter]); // field 7, wire 0
+        m
+    }
+
+    #[test]
+    fn migration_wide_keeps_hotp_and_sha512() {
+        let p = payload(&[
+            otp_params(b"0123456789", "Acme:alice", "Acme", 1, 1, 2),
+            otp_params_counter(b"counterkey", "Legacy", "", 1, 1, 7),
+            otp_params(b"0123456789", "wide", "Wide", 3, 2, 2),
+            otp_params(&[0x41; 64], "long", "", 2, 1, 0),
+            otp_params(b"", "", "", 1, 1, 2),
+        ]);
+        let f = parse_wide(&uri_for(&p)).unwrap();
+        assert_eq!(f.format, Format::GoogleExport);
+        assert_eq!(f.batch, None);
+        let labels: Vec<_> = f
+            .items
+            .iter()
+            .map(|i| (i.index, i.label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                (0, "Acme:alice"),
+                (1, "Legacy"),
+                (2, "Wide:wide"),
+                (3, "long"),
+                (4, "entry 5")
+            ]
+        );
+        let e = |i: usize| f.items[i].entry.as_ref().unwrap();
+        assert_eq!(e(0).kind, OtpKind::Totp { period: 30 });
+        assert_eq!(&e(0).secret[..], b"0123456789");
+        assert_eq!(e(0).issuer.as_deref(), Some("Acme"));
+        assert_eq!(e(0).account.as_deref(), Some("alice"));
+        assert_eq!(e(1).kind, OtpKind::Hotp { counter: 7 });
+        assert_eq!(e(1).issuer, None);
+        assert_eq!(e(1).account.as_deref(), Some("Legacy"));
+        assert_eq!(e(2).hash, HashAlg::Sha512);
+        assert_eq!(e(2).digits, 8);
+        assert_eq!(e(3).secret.len(), 64);
+        assert_eq!(e(3).hash, HashAlg::Sha256);
+        assert_eq!(f.items[4].entry.as_ref().unwrap_err(), &Unusable::BadSecret);
+    }
+
+    #[test]
+    fn migration_wide_md5_is_unusable() {
+        let mut p = payload(&[
+            otp_params(b"0123456789", "old", "Old", 4, 1, 2),
+            otp_params(b"0123456789", "odd", "", 9, 1, 2),
+            otp_params(b"0123456789", "typ", "", 1, 1, 5),
+        ]);
+        p.extend([0x18, 3, 0x20, 1]); // batch 1 of 3 (overrides the 1-of-1)
+        let f = parse_wide(&uri_for(&p)).unwrap();
+        assert_eq!(f.batch, Some((1, 3)));
+        assert_eq!(
+            f.items[0].entry.as_ref().unwrap_err(),
+            &Unusable::Hash("MD5".into())
+        );
+        assert!(matches!(
+            f.items[1].entry.as_ref().unwrap_err(),
+            Unusable::Hash(_)
+        ));
+        assert!(matches!(
+            f.items[2].entry.as_ref().unwrap_err(),
+            Unusable::Type(_)
+        ));
+        assert_eq!(f.usable(), 0);
+        // Whole-file problems stay whole-file errors.
+        assert!(parse_wide("otpauth-migration://offline?data=!!!").is_err());
+        assert!(parse_wide(&uri_for(&payload(&[]))).is_err());
+    }
+
     #[test]
     fn migration_round_trip() {
         let p = payload(&[
             otp_params(b"0123456789", "Acme:alice", "Acme", 1, 1, 2),
             otp_params(b"counterkey", "Legacy", "", 1, 1, 1), // HOTP → skipped
         ]);
-        let b64 = {
-            // tiny local encoder for the test
-            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut s = String::new();
-            for c in p.chunks(3) {
-                let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-                let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
-                for i in 0..=c.len() {
-                    s.push(A[(n >> (18 - 6 * i) & 0x3f) as usize] as char);
-                }
-                for _ in c.len()..3 {
-                    s.push('=');
-                }
-            }
-            s
-        };
-        // percent-encode the padding the way a QR-embedded URI would.
-        let uri = format!(
-            "otpauth-migration://offline?data={}",
-            b64.replace('+', "%2B")
-                .replace('/', "%2F")
-                .replace('=', "%3D")
-        );
+        let uri = uri_for(&p);
 
         let m = parse(&uri).expect("parse");
         assert_eq!(m.entries.len(), 1);

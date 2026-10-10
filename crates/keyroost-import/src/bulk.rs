@@ -6,6 +6,10 @@
 use keyroost_proto::commands::{DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep};
 use serde::Deserialize;
 
+use crate::entry::{
+    decode_secret, finish, hash_from_name, name_label, type_from_name, Format, ImportEntry,
+    ImportFile, ImportItem, OtpKind, TypeName, Unusable,
+};
 use crate::otpauth::{parse as parse_otpauth, OtpAuth, OtpAuthError};
 
 /// One normalized entry ready to be programmed into a Molto2 profile slot.
@@ -184,6 +188,10 @@ pub mod aegis {
         algo: Option<String>,
         digits: Option<u32>,
         period: Option<u32>,
+        /// HOTP counter; read only by the wide mapping. Lenient so a value
+        /// of an unexpected shape never fails a file the Molto2 path reads.
+        #[serde(default, deserialize_with = "super::lenient_u64")]
+        counter: Option<u64>,
     }
 
     // `build_entry` copies the seed into a zeroize-on-drop `BulkEntry`; wipe
@@ -195,25 +203,24 @@ pub mod aegis {
         }
     }
 
-    pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
+    /// Read the plaintext `db`, or the encrypted-vault error. Shared by the
+    /// narrow (Molto2) and wide mappings.
+    fn read_db(json: &str) -> Result<Db, BulkError> {
         let root: Root = serde_json::from_str(json)?;
-        let db: Db = match root.db {
-            DbField::Plain(db) => db,
+        match root.db {
+            DbField::Plain(db) => Ok(db),
             DbField::Encrypted => {
                 #[cfg(feature = "encrypted")]
-                {
-                    return Err(BulkError::Encrypted(
-                        "Aegis export is encrypted; supply a password (CLI: --password env:NAME or --password stdin)",
-                    ));
-                }
+                let msg = "Aegis export is encrypted; supply a password (CLI: --password env:NAME or --password stdin)";
                 #[cfg(not(feature = "encrypted"))]
-                {
-                    return Err(BulkError::Encrypted(
-                        "Aegis export is encrypted; build with --features encrypted or re-export plaintext",
-                    ));
-                }
+                let msg = "Aegis export is encrypted; build with --features encrypted or re-export plaintext";
+                Err(BulkError::Encrypted(msg))
             }
-        };
+        }
+    }
+
+    pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
+        let db = read_db(json)?;
         let mut out = Vec::with_capacity(db.entries.len());
         for (i, e) in db.entries.into_iter().enumerate() {
             if !e.typ.eq_ignore_ascii_case("totp") {
@@ -234,6 +241,45 @@ pub mod aegis {
             return Err(BulkError::EmptyFile);
         }
         Ok(out)
+    }
+
+    /// Every entry of a plaintext Aegis export, in file order, each either
+    /// usable by some key or marked with why not. Whole-file errors: bad
+    /// JSON, an encrypted vault (decrypt first), or no entries at all.
+    pub fn parse_wide(json: &str) -> Result<ImportFile, BulkError> {
+        let db = read_db(json)?;
+        let items: Vec<ImportItem> = db
+            .entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let label = name_label(e.issuer.as_deref(), e.name.as_deref())
+                    .unwrap_or_else(|| format!("entry {}", i + 1));
+                let entry = wide_entry(
+                    &e.typ,
+                    e.issuer.clone(),
+                    e.name.clone(),
+                    &e.info.secret,
+                    e.info.algo.as_deref(),
+                    e.info.digits.unwrap_or(6),
+                    e.info.period.unwrap_or(30),
+                    e.info.counter.unwrap_or(0),
+                );
+                ImportItem {
+                    index: i,
+                    label,
+                    entry,
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            return Err(BulkError::EmptyFile);
+        }
+        Ok(ImportFile {
+            format: Format::Aegis,
+            items,
+            batch: None,
+        })
     }
 
     /// Detect an encrypted Aegis vault without parsing the whole structure.
@@ -322,15 +368,25 @@ pub mod twofas {
         algorithm: Option<String>,
         #[serde(rename = "tokenType")]
         token_type: Option<String>,
+        /// HOTP counter; read only by the wide mapping (lenient, as for
+        /// Aegis).
+        #[serde(default, deserialize_with = "super::lenient_u64")]
+        counter: Option<u64>,
     }
 
-    pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
+    /// Read the plaintext `services`, or the encrypted-export error.
+    fn read_root(json: &str) -> Result<Root, BulkError> {
         let root: Root = serde_json::from_str(json)?;
         if root.services_encrypted.is_some() && root.services.is_empty() {
             return Err(BulkError::Encrypted(
                 "2FAS export is encrypted; re-export without a password",
             ));
         }
+        Ok(root)
+    }
+
+    pub fn parse(json: &str) -> Result<Vec<BulkEntry>, BulkError> {
+        let root = read_root(json)?;
         let mut out = Vec::with_capacity(root.services.len());
         for (i, mut s) in root.services.into_iter().enumerate() {
             // 2FAS includes Steam etc; skip non-TOTP.
@@ -357,6 +413,47 @@ pub mod twofas {
         }
         Ok(out)
     }
+
+    /// Every service of a plaintext 2FAS export, in file order (see
+    /// [`aegis::parse_wide`] for the contract).
+    pub fn parse_wide(json: &str) -> Result<ImportFile, BulkError> {
+        let root = read_root(json)?;
+        let items: Vec<ImportItem> = root
+            .services
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                // Same issuer rule as the narrow mapping: the otp issuer,
+                // else the service name.
+                let issuer = s.otp.issuer.clone().or_else(|| s.name.clone());
+                let label = name_label(issuer.as_deref(), s.otp.account.as_deref())
+                    .unwrap_or_else(|| format!("entry {}", i + 1));
+                let entry = wide_entry(
+                    s.otp.token_type.as_deref().unwrap_or("TOTP"),
+                    issuer,
+                    s.otp.account.clone(),
+                    &s.secret,
+                    s.otp.algorithm.as_deref(),
+                    s.otp.digits.unwrap_or(6),
+                    s.otp.period.unwrap_or(30),
+                    s.otp.counter.unwrap_or(0),
+                );
+                ImportItem {
+                    index: i,
+                    label,
+                    entry,
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            return Err(BulkError::EmptyFile);
+        }
+        Ok(ImportFile {
+            format: Format::TwoFas,
+            items,
+            batch: None,
+        })
+    }
 }
 
 /// One otpauth:// URI per line; blank lines and `#` comments allowed. Useful
@@ -376,6 +473,146 @@ pub fn parse_otpauth_list(text: &str) -> Result<Vec<BulkEntry>, BulkError> {
         return Err(BulkError::EmptyFile);
     }
     Ok(out)
+}
+
+/// One entry per line, like [`parse_otpauth_list`], but nothing a line
+/// holds fails the file: each non-blank, non-`#` line becomes an item (index
+/// = line index), unusable lines carrying their reason. A Google
+/// Authenticator `otpauth-migration://` line contributes all of its entries
+/// under that line's index. Only an empty list is a whole-file error.
+pub fn parse_list_wide(text: &str) -> Result<ImportFile, BulkError> {
+    let mut items = Vec::new();
+    let mut batch = None;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if crate::migration::is_migration_uri(line) {
+            match crate::migration::parse_wide(line) {
+                Ok(file) => {
+                    batch = batch.or(file.batch);
+                    items.extend(file.items.into_iter().map(|mut item| {
+                        item.index = i;
+                        item
+                    }));
+                }
+                Err(_) => items.push(ImportItem {
+                    index: i,
+                    label: format!("line {}", i + 1),
+                    entry: Err(Unusable::Malformed(
+                        "the Google Authenticator export couldn't be read",
+                    )),
+                }),
+            }
+            continue;
+        }
+        let (name, entry) = crate::otpauth::parse_entry_labeled(line);
+        items.push(ImportItem {
+            index: i,
+            label: name.unwrap_or_else(|| format!("line {}", i + 1)),
+            entry,
+        });
+    }
+    if items.is_empty() {
+        return Err(BulkError::EmptyFile);
+    }
+    Ok(ImportFile {
+        format: Format::OtpauthList,
+        items,
+        batch,
+    })
+}
+
+/// The wide counterpart of [`parse_any`]: JSON goes to Aegis (an encrypted
+/// vault is reported as such), then 2FAS; anything else is read as a list.
+pub fn parse_any_wide(text: &str) -> Result<ImportFile, BulkError> {
+    if text.trim_start().starts_with('{') {
+        match aegis::parse_wide(text) {
+            Ok(f) => return Ok(f),
+            Err(e @ BulkError::Encrypted(_)) => return Err(e),
+            Err(_) => {}
+        }
+        return twofas::parse_wide(text);
+    }
+    parse_list_wide(text)
+}
+
+/// Map one JSON-export entry to the wide model. Checks run type, secret,
+/// hash, digits, period — the Molto2 path's order with the type first.
+#[allow(clippy::too_many_arguments)]
+fn wide_entry(
+    typ: &str,
+    issuer: Option<String>,
+    account: Option<String>,
+    secret_b32: &str,
+    algo: Option<&str>,
+    digits: u32,
+    period: u32,
+    counter: u64,
+) -> Result<ImportEntry, Unusable> {
+    let kind = type_from_name(typ)?;
+    let secret = decode_secret(secret_b32)?;
+    let hash = hash_from_name(algo.unwrap_or("SHA1"))?;
+    let kind = match kind {
+        TypeName::Totp => OtpKind::Totp { period },
+        TypeName::Hotp => OtpKind::Hotp { counter },
+    };
+    finish(issuer, account, secret, hash, digits, kind)
+}
+
+/// `Option<u64>` from any JSON value: a non-negative integer becomes `Some`,
+/// anything else (string, float, null, ...) `None` — never an error.
+fn lenient_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Option<u64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("any JSON value")
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(u64::try_from(v).ok())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(self)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut a: A,
+        ) -> Result<Self::Value, A::Error> {
+            while a.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut a: A,
+        ) -> Result<Self::Value, A::Error> {
+            while a
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(None)
+        }
+    }
+    d.deserialize_any(V)
 }
 
 /// Try each known format on `bytes` and return the first that parses.
@@ -561,5 +798,187 @@ mod tests {
         assert_eq!(parse_any(aegis_like).unwrap().len(), 1);
         assert_eq!(parse_any(twofas_like).unwrap().len(), 1);
         assert_eq!(parse_any(list).unwrap().len(), 1);
+    }
+
+    // ---- wide parsers ----------------------------------------------------
+
+    use crate::entry::HashAlg;
+
+    /// The same corpus as `tests/molto_golden.rs`, in the same order.
+    const WIDE_AEGIS: &str = r#"{"version":1,"header":{"slots":null,"params":null},"db":{"version":2,"entries":[
+        {"type":"totp","name":"alice@example.com","issuer":"GitHub","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"period":30}},
+        {"type":"hotp","name":"counter","issuer":"Bank","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"counter":5}},
+        {"type":"steam","name":"gamer","issuer":"Steam","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":5,"period":30}},
+        {"type":"totp","name":"seven","issuer":"Odd","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":7,"period":30}},
+        {"type":"totp","name":"slow","issuer":"Slow","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"period":45}},
+        {"type":"totp","name":"wide","issuer":"Wide","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA512","digits":6,"period":30}},
+        {"type":"totp","name":"bad","issuer":"Bad","info":{"secret":"NOT_BASE32!!","algo":"SHA1","digits":6,"period":30}},
+        {"type":"totp","name":"long","issuer":"Long","info":{"secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","algo":"SHA1","digits":6,"period":30}},
+        {"type":"totp","name":"bob","issuer":"","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA256","digits":8,"period":60}}
+    ]}}"#;
+
+    /// `(index, label, kind or unusable reason)` per item, for compact asserts.
+    fn shape(file: &crate::entry::ImportFile) -> Vec<(usize, String, Result<OtpKind, Unusable>)> {
+        file.items
+            .iter()
+            .map(|i| {
+                (
+                    i.index,
+                    i.label.clone(),
+                    i.entry.as_ref().map(|e| e.kind).map_err(Clone::clone),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn aegis_wide_keeps_every_entry_in_order() {
+        let f = aegis::parse_wide(WIDE_AEGIS).unwrap();
+        assert_eq!(f.format, Format::Aegis);
+        assert_eq!(f.batch, None);
+        let totp30 = Ok(OtpKind::Totp { period: 30 });
+        assert_eq!(
+            shape(&f),
+            vec![
+                (0, "GitHub:alice@example.com".into(), totp30.clone()),
+                (1, "Bank:counter".into(), Ok(OtpKind::Hotp { counter: 5 })),
+                (2, "Steam:gamer".into(), Err(Unusable::Type("steam".into()))),
+                (3, "Odd:seven".into(), totp30.clone()),
+                (4, "Slow:slow".into(), Ok(OtpKind::Totp { period: 45 })),
+                (5, "Wide:wide".into(), totp30.clone()),
+                (6, "Bad:bad".into(), Err(Unusable::BadSecret)),
+                (7, "Long:long".into(), totp30),
+                (8, "bob".into(), Ok(OtpKind::Totp { period: 60 })),
+            ]
+        );
+        let e = |i: usize| f.items[i].entry.as_ref().unwrap();
+        assert_eq!(e(3).digits, 7);
+        assert_eq!(e(5).hash, HashAlg::Sha512);
+        assert_eq!(e(7).secret.len(), 64);
+        assert_eq!(e(8).issuer, None);
+        assert_eq!(e(8).hash, HashAlg::Sha256);
+        assert_eq!(e(8).digits, 8);
+        assert_eq!(f.usable(), 7);
+    }
+
+    #[test]
+    fn aegis_wide_file_errors() {
+        assert!(matches!(
+            aegis::parse_wide(r#"{"db":"ZW5jcnlwdGVk","header":{}}"#),
+            Err(BulkError::Encrypted(_))
+        ));
+        assert!(matches!(
+            aegis::parse_wide(r#"{"db":{"entries":[]}}"#),
+            Err(BulkError::EmptyFile)
+        ));
+        assert!(matches!(aegis::parse_wide("{"), Err(BulkError::Json(_))));
+        // A file of only unusable entries is still a file of items.
+        let f = aegis::parse_wide(
+            r#"{"db":{"entries":[{"type":"motp","name":"","issuer":"","info":{"secret":"JBSWY3DP"}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(f.usable(), 0);
+        assert_eq!(
+            shape(&f),
+            vec![(0, "entry 1".into(), Err(Unusable::Type("motp".into())))]
+        );
+    }
+
+    #[test]
+    fn twofas_wide_reads_hotp_counter() {
+        let json = r#"{"services":[
+            {"name":"Bank","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"me","issuer":"Bank","digits":6,"counter":3,"algorithm":"SHA1","tokenType":"HOTP"}},
+            {"name":"Mail","secret":"JBSWY3DPEHPK3PXP","otp":{"account":"you","period":20,"algorithm":"SHA512"}},
+            {"name":"Steam","secret":"JBSWY3DPEHPK3PXP","otp":{"tokenType":"STEAM"}}
+        ]}"#;
+        let f = twofas::parse_wide(json).unwrap();
+        assert_eq!(f.format, Format::TwoFas);
+        assert_eq!(
+            shape(&f),
+            vec![
+                (0, "Bank:me".into(), Ok(OtpKind::Hotp { counter: 3 })),
+                (1, "Mail:you".into(), Ok(OtpKind::Totp { period: 20 })),
+                (2, "Steam".into(), Err(Unusable::Type("STEAM".into()))),
+            ]
+        );
+        assert_eq!(f.items[1].entry.as_ref().unwrap().hash, HashAlg::Sha512);
+        assert!(matches!(
+            twofas::parse_wide(r#"{"servicesEncrypted":"x","services":[]}"#),
+            Err(BulkError::Encrypted(_))
+        ));
+        assert!(matches!(
+            twofas::parse_wide(r#"{"services":[]}"#),
+            Err(BulkError::EmptyFile)
+        ));
+    }
+
+    #[test]
+    fn list_wide_line_errors_are_items_not_file_errors() {
+        let text = "# header\n\notpauth://totp/A:x?secret=JBSWY3DPEHPK3PXP&period=45\n  \notpauth://hotp/B?secret=JBSWY3DPEHPK3PXP&counter=2\nhello there\notpauth://totp/C:y?secret=JBSWY3DP&digits=11\n";
+        let f = parse_list_wide(text).unwrap();
+        assert_eq!(f.format, Format::OtpauthList);
+        assert_eq!(
+            shape(&f),
+            vec![
+                (2, "A:x".into(), Ok(OtpKind::Totp { period: 45 })),
+                (4, "B".into(), Ok(OtpKind::Hotp { counter: 2 })),
+                (
+                    5,
+                    "line 6".into(),
+                    Err(Unusable::Malformed("not an otpauth:// URI"))
+                ),
+                (6, "C:y".into(), Err(Unusable::Digits(11))),
+            ]
+        );
+        assert!(matches!(
+            parse_list_wide("# nothing\n\n"),
+            Err(BulkError::EmptyFile)
+        ));
+    }
+
+    #[test]
+    fn list_wide_accepts_migration_lines() {
+        let migration = crate::migration::tests::uri_for(&crate::migration::tests::payload(&[
+            crate::migration::tests::otp_params(b"0123456789", "Acme:alice", "Acme", 1, 1, 2),
+            crate::migration::tests::otp_params(b"counterkey", "Legacy", "", 1, 1, 1),
+        ]));
+        let text = format!(
+            "otpauth://totp/A?secret=JBSWY3DPEHPK3PXP\n{}\notpauth-migration://offline?data=!!!\n",
+            migration
+        );
+        let f = parse_list_wide(&text).unwrap();
+        assert_eq!(
+            shape(&f),
+            vec![
+                (0, "A".into(), Ok(OtpKind::Totp { period: 30 })),
+                (1, "Acme:alice".into(), Ok(OtpKind::Totp { period: 30 })),
+                (1, "Legacy".into(), Ok(OtpKind::Hotp { counter: 0 })),
+                (
+                    2,
+                    "line 3".into(),
+                    Err(Unusable::Malformed(
+                        "the Google Authenticator export couldn't be read"
+                    ))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_any_wide_routes_by_shape() {
+        let aegis_like = r#"{"db": {"entries":[{"type":"hotp","name":"a","issuer":"X","info":{"secret":"JBSWY3DP","counter":1}}]}}"#;
+        let twofas_like = r#"{"services":[{"name":"X","secret":"JBSWY3DP","otp":{}}]}"#;
+        assert_eq!(parse_any_wide(aegis_like).unwrap().format, Format::Aegis);
+        assert_eq!(parse_any_wide(twofas_like).unwrap().format, Format::TwoFas);
+        assert_eq!(
+            parse_any_wide("otpauth://hotp/X?secret=JBSWY3DP")
+                .unwrap()
+                .format,
+            Format::OtpauthList
+        );
+        assert!(matches!(
+            parse_any_wide(r#"{"db":"ZW5j"}"#),
+            Err(BulkError::Encrypted(_))
+        ));
     }
 }
