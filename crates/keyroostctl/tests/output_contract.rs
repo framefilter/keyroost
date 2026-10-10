@@ -276,3 +276,16 @@ fn an_output_that_cannot_be_replaced_is_refused_before_any_key() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The Solo 2 name cap needs the key's vendor, so it runs after the key is
+/// chosen and before any secret is read: with no key connected, a too-long
+/// name still fails on the missing key, not on the cap.
+#[test]
+fn oath_add_long_name_without_a_key_fails_on_the_key() {
+    let long = "n".repeat(128);
+    let (code, out, err) = run(&["oath", "add", &long, "--seed", "stdin"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("no key with OATH is connected"), "{err}");
+    assert!(!err.contains("Solo 2 stores names"), "{err}");
+}

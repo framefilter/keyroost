@@ -1990,9 +1990,9 @@ enum OathCmd {
     Code {
         /// Credential name as stored on the key (e.g. "issuer:account").
         name: String,
-        /// TOTP period in seconds.
-        #[arg(long, default_value_t = 30)]
-        period: u32,
+        /// TOTP period in seconds (default: the name's `period/` prefix, else 30).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        period: Option<u32>,
         #[command(flatten)]
         access: OathAccess,
     },
@@ -8071,7 +8071,7 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                     .duration_since(UNIX_EPOCH)
                     .map_err(|e| e.to_string())?
                     .as_secs();
-                session.calculate_totp(name, now, *period)?
+                session.calculate_totp(name, now, oath_code_period(*period, name))?
             };
             if json_output() {
                 emit_json(&json_out::OathCodeJson {
@@ -8099,7 +8099,12 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             let mut sec = Secrets::real();
             let pair = pair_of(oath_secret_pair(cmd))?;
             pair.check_first(&sec)?;
-            crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
+            let dev = crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
+            // Refused before any secret is read: past this length the key
+            // stops responding until it is unplugged.
+            if let Some(refusal) = oath_name_refusal(&dev.vendor, name) {
+                return Err(refusal.into());
+            }
             // The seed first (stdin line 1); the applet password, if it needs
             // one, second.
             let (seed_text, password) = pair.read_first(&mut sec)?;
@@ -8174,6 +8179,25 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         }
     }
     Ok(())
+}
+
+/// The period `oath code` computes with: `--period` when given, else the
+/// name's `period/` prefix, else 30.
+fn oath_code_period(flag: Option<u32>, name: &str) -> u32 {
+    flag.unwrap_or_else(|| keyroost_oath::totp_period(name))
+}
+
+/// Why `oath add` won't send `name` to a key from `vendor`, when the key
+/// has a length it must never be given past (Solo 2).
+fn oath_name_refusal(vendor: &str, name: &str) -> Option<String> {
+    let max = keyroost_import::plan::OathFamily::from_vendor(vendor, None).hard_name_limit()?;
+    (name.len() > max).then(|| {
+        format!(
+            "the name is {} bytes; a Solo 2 stores names up to {max} bytes \
+             (a longer one makes the key stop responding until it is unplugged)",
+            name.len()
+        )
+    })
 }
 
 fn oath_type_str(t: keyroost_oath::OathType) -> &'static str {
@@ -15524,6 +15548,42 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn oath_code_period_defaults_from_name() {
+        let period = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Cmd::Oath {
+                cmd: OathCmd::Code { period, .. },
+            }) => period,
+            _ => panic!("not oath code"),
+        };
+        assert_eq!(
+            period(&["keyroostctl", "oath", "code", "60/GitHub:alice"]),
+            None
+        );
+        assert_eq!(
+            period(&["keyroostctl", "oath", "code", "x", "--period", "45"]),
+            Some(45)
+        );
+        assert!(parse(&["keyroostctl", "oath", "code", "x", "--period", "0"]).is_err());
+        assert_eq!(oath_code_period(None, "60/GitHub:alice"), 60);
+        assert_eq!(oath_code_period(None, "GitHub:alice"), 30);
+        assert_eq!(oath_code_period(Some(15), "60/GitHub:alice"), 15);
+    }
+
+    #[test]
+    fn oath_add_refuses_long_name_on_solo2_before_secrets() {
+        let long = "n".repeat(128);
+        let msg = oath_name_refusal("SoloKeys", &long).expect("refused");
+        assert_eq!(
+            msg,
+            "the name is 128 bytes; a Solo 2 stores names up to 127 bytes \
+             (a longer one makes the key stop responding until it is unplugged)"
+        );
+        assert_eq!(oath_name_refusal("SoloKeys", &"n".repeat(127)), None);
+        assert_eq!(oath_name_refusal("Yubico", &long), None);
+        assert_eq!(oath_name_refusal("Nitrokey", &long), None);
     }
 
     #[test]

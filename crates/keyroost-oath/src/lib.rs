@@ -620,6 +620,59 @@ pub fn totp_challenge(unix_seconds: u64, period: u32) -> [u8; 8] {
 }
 
 // ---------------------------------------------------------------------------
+// Credential names
+// ---------------------------------------------------------------------------
+
+/// A stored name split per the ykman convention `[period/][issuer:]account`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameParts<'a> {
+    /// The TOTP period from a `<digits>/` prefix (1..=`u32::MAX`).
+    pub period: Option<u32>,
+    pub issuer: Option<&'a str>,
+    pub account: &'a str,
+}
+
+/// Split a stored credential name into period, issuer and account, the way
+/// ykman reads it (`^((\d+)/)?(([^:]+):)?(.+)$`). The period prefix is read
+/// for TOTP only (HOTP names are never prefixed); `0/` is not a period.
+#[must_use]
+pub fn parse_name(name: &str, oath_type: OathType) -> NameParts<'_> {
+    let (period, rest) = match oath_type {
+        OathType::Totp => match name.split_once('/') {
+            Some((head, rest))
+                if !head.is_empty()
+                    && head.bytes().all(|b| b.is_ascii_digit())
+                    && !rest.is_empty() =>
+            {
+                match head.parse::<u32>() {
+                    Ok(p) if p != 0 => (Some(p), rest),
+                    _ => (None, name),
+                }
+            }
+            _ => (None, name),
+        },
+        OathType::Hotp => (None, name),
+    };
+    let (issuer, account) = match rest.split_once(':') {
+        Some((issuer, account)) if !issuer.is_empty() && !account.is_empty() => {
+            (Some(issuer), account)
+        }
+        _ => (None, rest),
+    };
+    NameParts {
+        period,
+        issuer,
+        account,
+    }
+}
+
+/// The TOTP period a stored name implies: its `period/` prefix, else 30.
+#[must_use]
+pub fn totp_period(name: &str) -> u32 {
+    parse_name(name, OathType::Totp).period.unwrap_or(30)
+}
+
+// ---------------------------------------------------------------------------
 // TLV parsing
 // ---------------------------------------------------------------------------
 
@@ -824,6 +877,46 @@ pub fn parse_calculate(buf: &[u8]) -> Result<OtpCode, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_name_table() {
+        let t = OathType::Totp;
+        let p = |period, issuer, account| NameParts {
+            period,
+            issuer,
+            account,
+        };
+        assert_eq!(
+            parse_name("60/GitHub:alice", t),
+            p(Some(60), Some("GitHub"), "alice")
+        );
+        assert_eq!(
+            parse_name("GitHub:alice", t),
+            p(None, Some("GitHub"), "alice")
+        );
+        assert_eq!(parse_name("alice", t), p(None, None, "alice"));
+        // 0 is not a period: the whole name is the account.
+        assert_eq!(parse_name("0/x", t), p(None, None, "0/x"));
+        assert_eq!(parse_name("15/a:b:c", t), p(Some(15), Some("a"), "b:c"));
+        // HOTP names are never prefixed.
+        assert_eq!(parse_name("60/x", OathType::Hotp), p(None, None, "60/x"));
+        // Past u32, or nothing after the slash: not a period.
+        assert_eq!(parse_name("4294967296/x", t), p(None, None, "4294967296/x"));
+        assert_eq!(parse_name("60/", t), p(None, None, "60/"));
+        assert_eq!(parse_name("4294967295/x", t), p(Some(u32::MAX), None, "x"));
+        // An issuer needs a non-empty account after it, and is non-empty.
+        assert_eq!(parse_name("a:", t), p(None, None, "a:"));
+        assert_eq!(parse_name(":b", t), p(None, None, ":b"));
+        assert_eq!(parse_name("6x/a", t), p(None, None, "6x/a"));
+    }
+
+    #[test]
+    fn totp_period_defaults_to_30() {
+        assert_eq!(totp_period("GitHub:alice"), 30);
+        assert_eq!(totp_period("0/x"), 30);
+        assert_eq!(totp_period("60/GitHub:alice"), 60);
+        assert_eq!(totp_period("15/x"), 15);
+    }
 
     /// RESET is the Yubico/Trussed `00 04 DE AD` case-1 APDU — deliberately
     /// password-less (it wipes credentials AND the access password; that is

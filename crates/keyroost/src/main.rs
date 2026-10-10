@@ -723,6 +723,28 @@ struct OathRow {
     /// (each computation advances the card's counter — a passive listing must
     /// not burn counter steps), and they don't expire, so no countdown ring.
     hotp: bool,
+    /// The TOTP period the name implies (its `period/` prefix, else 30): the
+    /// code is computed with it and the countdown ring runs on it.
+    period: u32,
+}
+
+impl OathRow {
+    fn new(name: String, code: Option<String>, hotp: bool) -> Self {
+        let oath_type = if hotp {
+            keyroost_oath::OathType::Hotp
+        } else {
+            keyroost_oath::OathType::Totp
+        };
+        let period = keyroost_oath::parse_name(&name, oath_type)
+            .period
+            .unwrap_or(30);
+        OathRow {
+            name,
+            code,
+            hotp,
+            period,
+        }
+    }
 }
 
 /// "Add credential" modal state for the OATH pane. Open iff `open` is true; the
@@ -765,10 +787,24 @@ impl OathAddDialog {
     /// Client-side validation of the entered fields, mirroring the guards in
     /// `provision_oath` so the modal can reject bad input before dispatching.
     /// Returns the trimmed name + decoded secret on success, or an error message.
-    fn validate(&self) -> Result<(String, Vec<u8>), String> {
+    fn validate(
+        &self,
+        family: keyroost_import::plan::OathFamily,
+    ) -> Result<(String, Vec<u8>), String> {
         let name = self.name.trim().to_owned();
         if name.is_empty() {
             return Err("credential name is required".into());
+        }
+        // Past this length the key stops responding until it is unplugged,
+        // so the name never reaches it (same check as `oath add`).
+        if let Some(max) = family.hard_name_limit() {
+            if name.len() > max {
+                return Err(format!(
+                    "the name is {} bytes; a Solo 2 stores names up to {max} bytes \
+                     (a longer one makes the key stop responding until it is unplugged)",
+                    name.len()
+                ));
+            }
         }
         match keyroost_proto::codec::base32_decode(self.secret.trim()) {
             Ok(s) if !s.is_empty() => Ok((name, s)),
@@ -5879,20 +5915,15 @@ impl App {
             // challenge is ignored), so a passive refresh would silently walk
             // the card out of the server's look-ahead window. The row shows a
             // "Read code" button instead.
-            let code = if hotp {
-                None
-            } else {
+            let mut row = OathRow::new(c.name, None, hotp);
+            if !hotp {
                 // A touch-required credential blocks until touched; fine off-thread.
-                session
-                    .calculate_totp(&c.name, now, 30)
+                row.code = session
+                    .calculate_totp(&row.name, now, row.period)
                     .ok()
-                    .map(|otp| otp.code)
-            };
-            rows.push(OathRow {
-                name: c.name,
-                code,
-                hotp,
-            });
+                    .map(|otp| otp.code);
+            }
+            rows.push(row);
         }
         // Group without headers: live TOTP codes first, on-demand HOTP rows
         // after (stable — card order preserved within each group).
@@ -6037,7 +6068,12 @@ impl App {
             return;
         };
         // Validate before dispatch; the modal surfaces the reason on failure.
-        let (cred_name, secret) = match self.oath.add.validate() {
+        let family = self
+            .selected_device()
+            .map_or(keyroost_import::plan::OathFamily::Other, |d| {
+                keyroost_import::plan::OathFamily::from_vendor(&d.vendor, None)
+            });
+        let (cred_name, secret) = match self.oath.add.validate(family) {
             Ok((n, s)) => (n, zeroize::Zeroizing::new(s)),
             Err(e) => {
                 self.oath.error = Some(e);
@@ -13648,15 +13684,7 @@ impl App {
                         for row in self.oath.creds.iter().take(2) {
                             let is_copied =
                                 self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
-                            if let (Some(code), _, _) = oath_row(
-                                ui,
-                                p,
-                                &row.name,
-                                row.code.as_deref(),
-                                row.hotp,
-                                is_copied,
-                                false,
-                            ) {
+                            if let (Some(code), _, _) = oath_row(ui, p, row, is_copied, false) {
                                 copy = Some((row.name.clone(), code));
                             }
                             ui.add_space(6.0);
@@ -17909,15 +17937,7 @@ impl App {
             let n = self.oath.creds.len();
             for (i, row) in self.oath.creds.iter().enumerate() {
                 let is_copied = self.copied.as_ref().is_some_and(|(nm, _)| nm == &row.name);
-                let (c, d, r) = oath_row(
-                    ui,
-                    p,
-                    &row.name,
-                    row.code.as_deref(),
-                    row.hotp,
-                    is_copied,
-                    true,
-                );
+                let (c, d, r) = oath_row(ui, p, row, is_copied, true);
                 if let Some(code) = c {
                     copy = Some((row.name.clone(), code));
                 }
@@ -21129,17 +21149,16 @@ impl App {
 fn oath_row(
     ui: &mut egui::Ui,
     p: &Palette,
-    name: &str,
-    code: Option<&str>,
-    hotp: bool,
+    row: &OathRow,
     is_copied: bool,
     with_delete: bool,
 ) -> (Option<String>, bool, bool) {
+    let (name, code, hotp) = (row.name.as_str(), row.code.as_deref(), row.hotp);
     let (issuer, account) = match name.split_once(':') {
         Some((a, b)) => (a.to_string(), b.to_string()),
         None => (name.to_string(), String::new()),
     };
-    let (secs, pct) = theme::totp_window(30);
+    let (secs, pct) = theme::totp_window(u64::from(row.period.max(1)));
     let code_color = if hotp {
         // HOTP codes don't expire — no about-to-roll warning color.
         p.accent
@@ -24229,29 +24248,67 @@ mod tests {
     /// secret, and rejects an empty/invalid secret — the same guards the modal's
     /// Submit relies on before dispatching `provision_oath`.
     #[test]
+    fn gui_oath_add_validate_caps_solo2() {
+        use keyroost_import::plan::OathFamily;
+        let mut d = OathAddDialog::opened();
+        d.secret = "JBSWY3DPEHPK3PXP".into();
+        d.name = "n".repeat(128);
+        assert_eq!(
+            d.validate(OathFamily::Solo2).unwrap_err(),
+            "the name is 128 bytes; a Solo 2 stores names up to 127 bytes \
+             (a longer one makes the key stop responding until it is unplugged)"
+        );
+        assert!(d.validate(OathFamily::YubiKey { version: None }).is_ok());
+        assert!(d.validate(OathFamily::Nitrokey3).is_ok());
+        d.name = "n".repeat(127);
+        assert!(d.validate(OathFamily::Solo2).is_ok());
+    }
+
+    #[test]
+    fn oath_row_period_from_prefix() {
+        assert_eq!(
+            OathRow::new("60/GitHub:alice".into(), None, false).period,
+            60
+        );
+        assert_eq!(OathRow::new("GitHub:alice".into(), None, false).period, 30);
+        // HOTP names carry no period.
+        assert_eq!(OathRow::new("60/x".into(), None, true).period, 30);
+    }
+
+    #[test]
     fn oath_add_dialog_validate() {
         // Empty name → error, regardless of the secret.
         let mut d = OathAddDialog::opened();
         d.name = "  ".into();
         d.secret = "JBSWY3DPEHPK3PXP".into();
-        assert_eq!(d.validate().unwrap_err(), "credential name is required");
+        assert_eq!(
+            d.validate(keyroost_import::plan::OathFamily::Other)
+                .unwrap_err(),
+            "credential name is required"
+        );
 
         // Empty secret → error.
         d.name = "acme:alice".into();
         d.secret = String::new();
-        assert_eq!(d.validate().unwrap_err(), "secret is empty");
+        assert_eq!(
+            d.validate(keyroost_import::plan::OathFamily::Other)
+                .unwrap_err(),
+            "secret is empty"
+        );
 
         // Non-base32 secret → "invalid base32 secret: …".
         d.secret = "not base32!!".into();
         assert!(d
-            .validate()
+            .validate(keyroost_import::plan::OathFamily::Other)
             .unwrap_err()
             .starts_with("invalid base32 secret"));
 
         // Valid input → trimmed name + decoded secret bytes.
         d.name = "  acme:alice  ".into();
         d.secret = "JBSWY3DPEHPK3PXP".into();
-        let (name, secret) = d.validate().expect("valid");
+        let (name, secret) = d
+            .validate(keyroost_import::plan::OathFamily::Other)
+            .expect("valid");
         assert_eq!(name, "acme:alice");
         assert_eq!(
             secret,
@@ -24271,14 +24328,7 @@ mod tests {
         app.oath.add.busy = true;
         App::apply_oath_rows(
             &mut app,
-            Ok((
-                vec![OathRow {
-                    name: "x".into(),
-                    code: None,
-                    hotp: false,
-                }],
-                0,
-            )),
+            Ok((vec![OathRow::new("x".into(), None, false)], 0)),
             zeroize::Zeroizing::new(String::new()),
         );
         assert!(!app.oath.add.busy);
