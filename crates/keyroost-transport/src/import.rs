@@ -1497,6 +1497,22 @@ mod tests {
             words,
             ["replace", "add", "replace", "replace", "add", "skip"]
         );
+        // The sixth entry runs past #99: both front ends skip it with the
+        // same reason and still write the five that fit.
+        let last = cli_plan.rows.last().unwrap();
+        assert_eq!(
+            last.verdict
+                .reason(keyroost_import::plan::Store::Molto2)
+                .as_deref(),
+            Some("no slot left after #99")
+        );
+        assert_eq!(cli_plan.writes().count(), 5);
+        // From #99 one slot is left: one write, the rest skipped alike.
+        let cli_full = molto_existing_by(|s| Ok(meta[usize::from(s)].clone())).unwrap();
+        let none_fit_cli = keyroost_import::plan::molto_plan(&file(3), 99, cli_full);
+        let none_fit_gui = keyroost_import::plan::molto_plan(&file(3), 99, molto_existing(&meta));
+        assert_eq!(none_fit_cli, none_fit_gui);
+        assert_eq!(none_fit_cli.writes().count(), 1);
     }
 
     #[test]

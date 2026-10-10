@@ -219,22 +219,6 @@ pub fn fit_count(file: &ImportFile, store: Store, first_slot: u8) -> usize {
         .count()
 }
 
-/// Entries that need a Molto2 slot: everything the rules accept, including
-/// the ones that run past #99.
-pub fn molto_slot_count(plan: &Plan) -> usize {
-    plan.rows
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.verdict,
-                Verdict::Add
-                    | Verdict::Replace
-                    | Verdict::Skip(keyroost_import::plan::Skip::PastLastSlot)
-            )
-        })
-        .count()
-}
-
 /// One entry row: `label · TOTP 30 s · SHA-1 · 6 digits` (or `· HOTP ·`),
 /// or `label — reason` for an entry no key can take. The flag is false for
 /// the latter (drawn dimmed).
@@ -357,8 +341,6 @@ pub enum ImportBlock {
     NoMoltoSession,
     /// #171: the Molto2 isn't unlocked (Authenticate button).
     MoltoNotUnlocked,
-    /// #171: more entries than slots from `start` to #99.
-    MoltoTooMany { start: u8, count: usize, fit: usize },
     /// Every entry is already on the key or skipped.
     NothingToAdd,
     /// The import is writing.
@@ -381,9 +363,6 @@ pub struct BlockInput {
     pub locked: bool,
     pub molto_session: bool,
     pub molto_unlocked: bool,
-    pub molto_start: u8,
-    /// Entries that need a Molto2 slot.
-    pub molto_count: usize,
     /// Planned writes (add + replace).
     pub writes: usize,
     pub running: bool,
@@ -419,19 +398,11 @@ impl ImportBlock {
             return Some(Self::KeyNotRead);
         }
         if kind == StoreKind::Molto2 {
-            let fit = usize::from(PROFILES).saturating_sub(usize::from(i.molto_start));
             if !i.molto_session {
                 return Some(Self::NoMoltoSession);
             }
             if !i.molto_unlocked {
                 return Some(Self::MoltoNotUnlocked);
-            }
-            if i.molto_count > fit {
-                return Some(Self::MoltoTooMany {
-                    start: i.molto_start,
-                    count: i.molto_count,
-                    fit,
-                });
             }
         }
         if i.writes == 0 {
@@ -475,20 +446,6 @@ impl ImportBlock {
                  (uses the factory-default customer key unless another one is entered \
                  in the Molto2 view)."
                 .to_owned(),
-            Self::MoltoTooMany { start, count, fit } => {
-                let verb = if *fit == 1 { "fits" } else { "fit" };
-                let hint = if *count <= usize::from(PROFILES) {
-                    format!(
-                        "Start at slot #{:02} or earlier.",
-                        usize::from(PROFILES) - count
-                    )
-                } else {
-                    format!("A Molto2 has {PROFILES} slots.")
-                };
-                format!(
-                    "Only {fit} of {count} entries {verb} between slot #{start:02} and #99. {hint}"
-                )
-            }
             Self::NothingToAdd => "Nothing to add: each entry is already on the key or can't \
                  be stored there."
                 .to_owned(),
@@ -1165,8 +1122,6 @@ impl App {
             locked: d.dest_locked,
             molto_session: molto.is_some_and(|k| self.import_molto_ready(k)),
             molto_unlocked: self.authenticated,
-            molto_start: d.molto_start,
-            molto_count: plan.as_ref().map_or(0, molto_slot_count),
             writes: plan.as_ref().map_or(0, |p| p.writes().count()),
             running: d.running.is_some(),
             device_busy: self.busy(),
@@ -2334,13 +2289,12 @@ mod tests {
             Some(ImportBlock::Running)
         );
         assert_eq!(with(&|i| i.device_busy = true), Some(ImportBlock::Busy));
-        // Molto2: session, then unlock, then room, before anything else.
+        // Molto2: session, then unlock, before anything else.
         let molto = |f: &dyn Fn(&mut BlockInput)| {
             let mut i = ready.clone();
             i.dest = Some(StoreKind::Molto2);
             i.molto_session = true;
             i.molto_unlocked = true;
-            i.molto_count = 3;
             f(&mut i);
             ImportBlock::find(&i)
         };
@@ -2353,23 +2307,27 @@ mod tests {
             Some(ImportBlock::NoMoltoSession)
         );
         assert_eq!(
-            molto(&|i| {
-                i.molto_unlocked = false;
-                i.molto_start = 99;
-            }),
+            molto(&|i| i.molto_unlocked = false),
             Some(ImportBlock::MoltoNotUnlocked)
         );
+        // A file that runs past #99: the plan skips what doesn't fit (as
+        // `molto import` does) and Add writes the rest; overflow never
+        // blocks it.
+        let three = file_of(vec![
+            entry("A", HashAlg::Sha1, 30),
+            entry("B", HashAlg::Sha1, 30),
+            entry("C", HashAlg::Sha1, 30),
+        ]);
+        let plan = molto_plan(&three, 98, Existing::default());
+        let words: Vec<&str> = plan.rows.iter().map(|r| r.verdict.word()).collect();
+        assert_eq!(words, ["add", "add", "skip"]);
         assert_eq!(
-            molto(&|i| {
-                i.molto_start = 98;
-                i.writes = 0;
-            }),
-            Some(ImportBlock::MoltoTooMany {
-                start: 98,
-                count: 3,
-                fit: 2
-            })
+            plan.rows[2].verdict.reason(Store::Molto2).as_deref(),
+            Some("no slot left after #99")
         );
+        let writes = plan.writes().count();
+        assert_eq!(molto(&|i| i.writes = writes), None);
+        assert_eq!(molto(&|i| i.writes = 0), Some(ImportBlock::NothingToAdd));
     }
 
     #[test]
@@ -2386,31 +2344,6 @@ mod tests {
             "The Molto2 is not unlocked yet. Click Authenticate \
              (uses the factory-default customer key unless another one is entered \
              in the Molto2 view)."
-        );
-        assert_eq!(
-            ImportBlock::MoltoTooMany {
-                start: 90,
-                count: 11,
-                fit: 10
-            }
-            .message(),
-            "Only 10 of 11 entries fit between slot #90 and #99. Start at slot #89 or earlier."
-        );
-        assert!(ImportBlock::MoltoTooMany {
-            start: 99,
-            count: 2,
-            fit: 1
-        }
-        .message()
-        .starts_with("Only 1 of 2 entries fits"));
-        assert_eq!(
-            ImportBlock::MoltoTooMany {
-                start: 0,
-                count: 120,
-                fit: 100
-            }
-            .message(),
-            "Only 100 of 120 entries fit between slot #00 and #99. A Molto2 has 100 slots."
         );
     }
 

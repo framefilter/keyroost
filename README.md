@@ -877,9 +877,8 @@ entry:
   make it fit. Steam codes are skipped on every key.
 
 On a Molto2, entries fill consecutive slots from `--slot`. A slot already in
-use is replaced (**replace**), and an entry with no issuer or account is
-skipped without using up a slot. `molto import` skips entries past slot
-#99; the GUI instead says how many fit and which slot to start at.
+use is replaced (**replace**), an entry with no issuer or account is
+skipped without using up a slot, and entries past slot #99 are skipped.
 
 keyroost asks once before writing (a script adds `-y`). It writes one code
 at a time and stops at the first error, saying what was added and what was
