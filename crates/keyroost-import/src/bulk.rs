@@ -374,6 +374,49 @@ pub mod twofas {
         counter: Option<u64>,
     }
 
+    /// Whether `json` looks like a 2FAS export, without materializing any
+    /// service (or seed): `Some(true)` for an encrypted export (the
+    /// `servicesEncrypted` blob and no plaintext services), `Some(false)`
+    /// for a plaintext one, `None` when it is neither (or not a JSON object).
+    pub(crate) fn probe(json: &str) -> Option<bool> {
+        use serde::de::{IgnoredAny, SeqAccess, Visitor};
+        /// Number of elements in a JSON array, drained without allocating.
+        struct Count(usize);
+        impl<'de> Deserialize<'de> for Count {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> Visitor<'de> for V {
+                    type Value = Count;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a JSON array")
+                    }
+                    fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Count, A::Error> {
+                        let mut n = 0;
+                        while a.next_element::<IgnoredAny>()?.is_some() {
+                            n += 1;
+                        }
+                        Ok(Count(n))
+                    }
+                }
+                d.deserialize_seq(V)
+            }
+        }
+        #[derive(Deserialize)]
+        struct ProbeRoot {
+            services: Option<Count>,
+            #[serde(rename = "servicesEncrypted")]
+            services_encrypted: Option<IgnoredAny>,
+        }
+        let root: ProbeRoot = serde_json::from_str(json).ok()?;
+        let services = root.services.map(|c| c.0);
+        match (services, root.services_encrypted.is_some()) {
+            (None, false) => None,
+            (Some(n), true) if n > 0 => Some(false),
+            (_, true) => Some(true),
+            (Some(_), false) => Some(false),
+        }
+    }
+
     /// Read the plaintext `services`, or the encrypted-export error.
     fn read_root(json: &str) -> Result<Root, BulkError> {
         let root: Root = serde_json::from_str(json)?;

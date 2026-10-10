@@ -14,6 +14,10 @@
 //! entries with the same hygiene as any other seed source and remind users
 //! to delete the screenshot afterwards.
 
+pub mod file;
+
+pub use file::{open_file, OpenError, Opened};
+
 use keyroost_import::migration;
 use keyroost_import::{BulkEntry, Format, ImportFile, ImportItem, OtpAuth, Unusable};
 

@@ -10,6 +10,7 @@
 //! period, SHA-512 — each marked usable or with the reason it isn't, for
 //! keys whose limits are checked later.
 
+pub mod classify;
 pub mod entry;
 pub mod otpauth;
 
