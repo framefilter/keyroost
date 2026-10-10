@@ -274,7 +274,8 @@ fn to_oath(
         let mut session = open_oath_unlocked(&reader, pw, debug)?;
         (read_oath_existing(&mut session)?, session.version())
     }; // closed before the question
-    let store = Store::Oath(OathFamily::from_vendor(&dev.vendor, version));
+    let family = OathFamily::from_vendor(&dev.vendor, version);
+    let store = Store::Oath(family);
     let first = plan_for(file, store, existing, replace);
     let Some(asked) = preview_and_ask(&dev, shown, &first)? else {
         return Ok(());
@@ -283,7 +284,7 @@ fn to_oath(
     let mut session = open_oath_unlocked(&reader, pw, debug)?;
     let again = plan_for(file, store, read_oath_existing(&mut session)?, replace);
     recheck(&first, &again)?;
-    let mut writer = OathImportStore::new(&mut session).password_hint(OATH_PASSWORD_HINT);
+    let mut writer = OathImportStore::new(&mut session, family).password_hint(OATH_PASSWORD_HINT);
     write_and_report(file, &again, &mut writer)
 }
 

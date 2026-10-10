@@ -1582,6 +1582,12 @@ impl Token2OtpSession {
     /// `pin` must be supplied (it is verified to open the read window). When a PIN
     /// is set but `pin` is `None`, returns [`OtpTransportError::PinRequired`] so a
     /// caller (CLI/GUI) can prompt for it.
+    /// Whether a PIN was verified on this connection (the device's PIN
+    /// window was opened here).
+    pub(crate) fn pin_window_open(&self) -> bool {
+        self.pin_verified
+    }
+
     pub fn enumerate_pinned(
         &mut self,
         timestamp: u64,

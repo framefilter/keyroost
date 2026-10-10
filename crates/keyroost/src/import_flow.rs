@@ -1273,8 +1273,11 @@ impl App {
                         if !again.same_rows(&shown) {
                             return Added::Changed(ex, version);
                         }
-                        let mut w = keyroost_transport::import::OathImportStore::new(&mut s)
-                            .password_hint(OATH_PASSWORD_HINT);
+                        let mut w = keyroost_transport::import::OathImportStore::new(
+                            &mut s,
+                            OathFamily::from_vendor(&vendor, version),
+                        )
+                        .password_hint(OATH_PASSWORD_HINT);
                         let report =
                             keyroost_import::run::run(&file, &again, &mut w, &mut on_progress);
                         let line = report.summary(&again);

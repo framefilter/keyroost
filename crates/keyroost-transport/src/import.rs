@@ -9,7 +9,7 @@
 
 use crate::{OathSession, OtpTransportError, Session, Token2OtpSession, TransportError};
 use keyroost_import::entry::{HashAlg, ImportEntry, OtpKind};
-use keyroost_import::plan::{Existing, StoredName};
+use keyroost_import::plan::{Existing, OathFamily, StoredName};
 use keyroost_import::run::{CodeStore, StoreError};
 use keyroost_oath as oath;
 use keyroost_proto::commands::{DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep};
@@ -76,6 +76,7 @@ impl OathIo for OathSession {
 /// and, when the applet has a password, unlocked.
 pub struct OathImportStore<'a> {
     session: &'a mut OathSession,
+    family: OathFamily,
     password_hint: &'static str,
 }
 
@@ -84,9 +85,14 @@ pub struct OathImportStore<'a> {
 const DEFAULT_PASSWORD_HINT: &str = "unlock it with its password first";
 
 impl<'a> OathImportStore<'a> {
-    pub fn new(session: &'a mut OathSession) -> Self {
+    /// `family` is the one the plan was made for. Whatever the plan let
+    /// through, a name past the family's
+    /// [`hard_name_limit`](OathFamily::hard_name_limit) (Solo 2: 127 bytes,
+    /// past which the key stops responding) is refused here, unsent.
+    pub fn new(session: &'a mut OathSession, family: OathFamily) -> Self {
         Self {
             session,
+            family,
             password_hint: DEFAULT_PASSWORD_HINT,
         }
     }
@@ -102,7 +108,7 @@ impl<'a> OathImportStore<'a> {
 
 impl CodeStore for OathImportStore<'_> {
     fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
-        oath_add(self.session, self.password_hint, name, entry)
+        oath_add(self.session, self.family, self.password_hint, name, entry)
     }
     fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
         oath_delete(self.session, self.password_hint, name)
@@ -204,11 +210,16 @@ fn oath_with_reauth<I: OathIo + ?Sized>(
 
 fn oath_add<I: OathIo + ?Sized>(
     io: &mut I,
+    family: OathFamily,
     hint: &str,
     name: &StoredName,
     entry: &ImportEntry,
 ) -> Result<(), StoreError> {
-    let params = put_params(oath_stored_name(name)?, entry)?;
+    let n = oath_stored_name(name)?;
+    if let Some(refusal) = family.name_refusal(n) {
+        return Err(StoreError::Failed(refusal));
+    }
+    let params = put_params(n, entry)?;
     oath_with_reauth(io, hint, &mut |io| io.put(&params), oath_put_answer)
 }
 
@@ -297,11 +308,16 @@ pub struct Token2ImportStore<'a> {
 }
 
 impl<'a> Token2ImportStore<'a> {
+    /// A PIN already verified on this session (by
+    /// [`read_token2_existing`] with the same PIN, just before) counts as
+    /// proven, so a PIN window the key closes before the first write is
+    /// reopened with it instead of being reported as a refusal.
     pub fn new(session: &'a mut Token2OtpSession, pin: Option<zeroize::Zeroizing<String>>) -> Self {
+        let pin_proven = pin.is_some() && session.pin_window_open();
         Self {
             session,
             pin,
-            pin_proven: false,
+            pin_proven,
         }
     }
 }
@@ -401,6 +417,12 @@ fn token2_classify(r: Result<(), OtpTransportError>) -> Result<Token2Answer, Sto
 
 const TOKEN2_PIN_BLOCKED: &str = "the key's OTP PIN is blocked";
 
+/// The key closed its PIN window before this import's PIN was proven on the
+/// session: said as it is (the PIN isn't known to be wrong), with no attempt
+/// spent.
+const TOKEN2_PIN_WINDOW_CLOSED: &str = "the key closed its OTP PIN window; nothing more was \
+     sent, so no PIN attempt was used. Run the import again.";
+
 /// Send one command; when the PIN window is closed and a PIN is held,
 /// verify it and retry once.
 fn token2_with_pin<I: Token2Io + ?Sized>(
@@ -435,9 +457,7 @@ fn token2_with_pin<I: Token2Io + ?Sized>(
         // Re-verify only a PIN that already worked in this import, so no
         // attempt is ever spent on a wrong one.
         if !*proven {
-            return Err(StoreError::Failed(
-                "the key didn't accept the OTP PIN".to_owned(),
-            ));
+            return Err(StoreError::Failed(TOKEN2_PIN_WINDOW_CLOSED.to_owned()));
         }
         io.verify_pin(p).map_err(|e| match e {
             OtpTransportError::Applet(ref a)
@@ -708,7 +728,13 @@ mod tests {
 
     impl CodeStore for ScriptedStore {
         fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
-            oath_add(&mut self.0, DEFAULT_PASSWORD_HINT, name, entry)
+            oath_add(
+                &mut self.0,
+                OathFamily::Solo2,
+                DEFAULT_PASSWORD_HINT,
+                name,
+                entry,
+            )
         }
         fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
             oath_delete(&mut self.0, DEFAULT_PASSWORD_HINT, name)
@@ -794,7 +820,10 @@ mod tests {
             has_key: true,
             ..Default::default()
         };
-        assert_eq!(oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e), Ok(()));
+        assert_eq!(
+            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
+            Ok(())
+        );
         assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
 
         let mut io = ScriptedOath {
@@ -802,7 +831,10 @@ mod tests {
             has_key: true,
             ..Default::default()
         };
-        assert_eq!(oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e), Ok(()));
+        assert_eq!(
+            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
+            Ok(())
+        );
         assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
 
         let mut io = ScriptedOath {
@@ -811,7 +843,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
             Err(StoreError::Failed(
                 "the key asked for its OATH password again and refused it".to_owned()
             ))
@@ -836,7 +868,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, "pass --password env:NAME", &name, &e),
+            oath_add(
+                &mut io,
+                OathFamily::Other,
+                "pass --password env:NAME",
+                &name,
+                &e
+            ),
             Err(StoreError::Failed(
                 "this key's authenticator storage is password-protected; \
                  pass --password env:NAME"
@@ -848,6 +886,36 @@ mod tests {
     }
 
     #[test]
+    fn solo2_name_past_127_bytes_is_never_sent() {
+        // Second line of defense behind the plan: whatever a caller planned
+        // with, a Solo 2 never gets a name that makes it stop responding.
+        let e = entry(OtpKind::Totp { period: 30 });
+        let mut io = ScriptedOath::default();
+        let long = StoredName::Oath("n".repeat(128));
+        match oath_add(&mut io, OathFamily::Solo2, DEFAULT_PASSWORD_HINT, &long, &e) {
+            Err(StoreError::Failed(m)) => assert!(m.contains("127 bytes"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(io.calls.is_empty());
+        let ok = StoredName::Oath("n".repeat(127));
+        assert_eq!(
+            oath_add(&mut io, OathFamily::Solo2, DEFAULT_PASSWORD_HINT, &ok, &e),
+            Ok(())
+        );
+        // Other families keep their own limits (the plan's), not this one.
+        assert_eq!(
+            oath_add(
+                &mut io,
+                OathFamily::Nitrokey3,
+                DEFAULT_PASSWORD_HINT,
+                &long,
+                &e
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn oath_other_status_and_full_are_reported() {
         let e = entry(OtpKind::Totp { period: 30 });
         let name = StoredName::Oath("A:a".to_owned());
@@ -856,13 +924,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
             Err(StoreError::Failed(
                 "the key refused it (status 6A80)".to_owned()
             ))
         );
         assert_eq!(
-            oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e),
+            oath_add(&mut io, OathFamily::Other, DEFAULT_PASSWORD_HINT, &name, &e),
             Err(StoreError::Full)
         );
     }
@@ -1098,7 +1166,8 @@ mod tests {
             assert_eq!(io.calls, vec!["write a"]);
             assert!(!proven);
         }
-        // A closed window before the PIN ever worked: reported, not retried.
+        // A closed window before the PIN was proven on this session:
+        // reported plainly (it isn't known to be wrong), not retried.
         let mut proven = false;
         let mut io = ScriptedToken2 {
             write: [applet(OtpError::PinConditionsNotSatisfied)].into(),
@@ -1106,9 +1175,12 @@ mod tests {
         };
         assert_eq!(
             token2_add(&mut io, Some("0000"), &mut proven, &t2name(), &e),
-            Err(StoreError::Failed(
-                "the key didn't accept the OTP PIN".to_owned()
-            ))
+            Err(StoreError::Failed(TOKEN2_PIN_WINDOW_CLOSED.to_owned()))
+        );
+        assert_eq!(
+            TOKEN2_PIN_WINDOW_CLOSED,
+            "the key closed its OTP PIN window; nothing more was sent, so no PIN \
+             attempt was used. Run the import again."
         );
         assert_eq!(io.calls, vec!["write a"]);
         // A write that goes through proves the PIN for later re-verifies.
