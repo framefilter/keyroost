@@ -87,6 +87,10 @@ pub use token2otp::{
 /// module doc for why this is thread-local instead of a passed-in sink.
 pub mod trace;
 
+/// Bulk-import adapters: store a planned import on OATH, Token2 OTP and Molto2
+/// keys one code at a time (see `keyroost_import::run`).
+pub mod import;
+
 /// Read-only identity reads (#51) used to match a key's FIDO-HID node to its
 /// smart-card reader.
 pub mod identity;

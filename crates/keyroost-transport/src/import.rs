@@ -1,0 +1,431 @@
+//! Bulk-import adapters: the write side of [`keyroost_import::run`] over the
+//! real key sessions.
+//!
+//! The plan ([`keyroost_import::plan`]) decides what goes where; these
+//! adapters only store one code at a time and read the key's answer. What a
+//! status word means is decided in small pure functions, so the rules are
+//! tested without a key: a duplicate name, a full key, and an applet asking
+//! for its password again are each read from the key's own answer.
+
+use crate::{OathSession, TransportError};
+use keyroost_import::entry::{HashAlg, ImportEntry, OtpKind};
+use keyroost_import::plan::{Existing, StoredName};
+use keyroost_import::run::{CodeStore, StoreError};
+use keyroost_oath as oath;
+
+// ---------------------------------------------------------------------------
+// OATH
+// ---------------------------------------------------------------------------
+
+/// What an OATH status word means for an add or delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OathAnswer {
+    Ok,
+    Exists,
+    Full,
+    NeedsAuth,
+    Other(u16),
+}
+
+/// PUT: `9000` stored, `6983` the name exists (applets that refuse
+/// duplicates), `6A84` no space, `6982` the password is needed.
+fn oath_put_answer(sw: u16) -> OathAnswer {
+    match sw {
+        0x6983 => OathAnswer::Exists,
+        other => oath_delete_answer(other),
+    }
+}
+
+/// DELETE: as PUT, except `6983` never means "exists" here.
+fn oath_delete_answer(sw: u16) -> OathAnswer {
+    match sw {
+        oath::SW_OK => OathAnswer::Ok,
+        0x6A84 => OathAnswer::Full,
+        0x6982 => OathAnswer::NeedsAuth,
+        other => OathAnswer::Other(other),
+    }
+}
+
+/// The three OATH commands an import needs, so the adapter's rules run
+/// against a scripted key in tests.
+trait OathIo {
+    fn put(&mut self, params: &oath::PutParams<'_>) -> Result<u16, TransportError>;
+    fn delete(&mut self, name: &str) -> Result<u16, TransportError>;
+    fn reauth(&mut self) -> Result<(), TransportError>;
+}
+
+impl OathIo for OathSession {
+    fn put(&mut self, params: &oath::PutParams<'_>) -> Result<u16, TransportError> {
+        self.put_status(params)
+    }
+    fn delete(&mut self, name: &str) -> Result<u16, TransportError> {
+        self.delete_status(name)
+    }
+    fn reauth(&mut self) -> Result<(), TransportError> {
+        self.reauthenticate()
+    }
+}
+
+/// Stores planned codes in an OATH applet. The session is already selected
+/// and, when the applet has a password, unlocked.
+pub struct OathImportStore<'a> {
+    session: &'a mut OathSession,
+}
+
+impl<'a> OathImportStore<'a> {
+    pub fn new(session: &'a mut OathSession) -> Self {
+        Self { session }
+    }
+}
+
+impl CodeStore for OathImportStore<'_> {
+    fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+        oath_add(self.session, name, entry)
+    }
+    fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
+        oath_delete(self.session, name)
+    }
+}
+
+/// LIST → what the plan needs: the names on the key, and how many entries
+/// the listing couldn't show.
+pub fn read_oath_existing(session: &mut OathSession) -> Result<Existing, TransportError> {
+    let listing = session.list()?;
+    Ok(Existing {
+        names: listing
+            .credentials
+            .into_iter()
+            .map(|c| StoredName::Oath(c.name))
+            .collect(),
+        hidden: listing.skipped,
+    })
+}
+
+fn oath_stored_name(name: &StoredName) -> Result<&str, StoreError> {
+    match name {
+        StoredName::Oath(n) => Ok(n),
+        _ => Err(StoreError::Failed(
+            "this entry has no OATH name to store it under".to_owned(),
+        )),
+    }
+}
+
+/// The PUT for one entry. The plan only lets through what the applet
+/// stores; anything else fails here instead of panicking.
+fn put_params<'a>(
+    name: &'a str,
+    entry: &'a ImportEntry,
+) -> Result<oath::PutParams<'a>, StoreError> {
+    let algorithm = match entry.hash {
+        HashAlg::Sha1 => oath::Algorithm::Sha1,
+        HashAlg::Sha256 => oath::Algorithm::Sha256,
+        HashAlg::Sha512 => oath::Algorithm::Sha512,
+    };
+    let (oath_type, imf) = match entry.kind {
+        OtpKind::Totp { .. } => (oath::OathType::Totp, 0),
+        OtpKind::Hotp { counter } => {
+            let imf = u32::try_from(counter).map_err(|_| {
+                StoreError::Failed("the counter doesn't fit this key's 32 bits".to_owned())
+            })?;
+            (oath::OathType::Hotp, imf)
+        }
+    };
+    Ok(oath::PutParams {
+        name,
+        secret: &entry.secret,
+        oath_type,
+        algorithm,
+        digits: entry.digits,
+        require_touch: false,
+        imf,
+    })
+}
+
+fn oath_transport_failed(e: TransportError) -> StoreError {
+    match e {
+        TransportError::OathCredentialTooLong => {
+            StoreError::Failed("name and seed are too long for one command".to_owned())
+        }
+        other => StoreError::Failed(other.to_string()),
+    }
+}
+
+/// Send one command; when the applet asks for its password, VALIDATE again
+/// and retry once.
+fn oath_with_reauth<I: OathIo + ?Sized>(
+    io: &mut I,
+    send: &mut dyn FnMut(&mut I) -> Result<u16, TransportError>,
+    answer: fn(u16) -> OathAnswer,
+) -> Result<(), StoreError> {
+    let mut a = answer(send(io).map_err(oath_transport_failed)?);
+    if a == OathAnswer::NeedsAuth {
+        io.reauth().map_err(oath_transport_failed)?;
+        a = answer(send(io).map_err(oath_transport_failed)?);
+    }
+    match a {
+        OathAnswer::Ok => Ok(()),
+        OathAnswer::Exists => Err(StoreError::Exists),
+        OathAnswer::Full => Err(StoreError::Full),
+        OathAnswer::NeedsAuth => Err(StoreError::Failed(
+            "the key asked for its OATH password again and refused it".to_owned(),
+        )),
+        OathAnswer::Other(sw) => Err(StoreError::Failed(format!(
+            "the key refused it (status {sw:04X})"
+        ))),
+    }
+}
+
+fn oath_add<I: OathIo + ?Sized>(
+    io: &mut I,
+    name: &StoredName,
+    entry: &ImportEntry,
+) -> Result<(), StoreError> {
+    let params = put_params(oath_stored_name(name)?, entry)?;
+    oath_with_reauth(io, &mut |io| io.put(&params), oath_put_answer)
+}
+
+fn oath_delete<I: OathIo + ?Sized>(io: &mut I, name: &StoredName) -> Result<(), StoreError> {
+    let n = oath_stored_name(name)?;
+    oath_with_reauth(io, &mut |io| io.delete(n), oath_delete_answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keyroost_import::entry::{Format, ImportFile, ImportItem};
+    use keyroost_import::plan::{plan, OathFamily, Store, Target};
+    use keyroost_import::run::{run, Outcome};
+    use std::collections::VecDeque;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn oath_put_6983_is_exists() {
+        assert_eq!(oath_put_answer(0x6983), OathAnswer::Exists);
+        assert_eq!(oath_put_answer(0x9000), OathAnswer::Ok);
+    }
+
+    #[test]
+    fn oath_put_6a84_is_full() {
+        assert_eq!(oath_put_answer(0x6A84), OathAnswer::Full);
+    }
+
+    #[test]
+    fn oath_put_6982_needs_auth() {
+        assert_eq!(oath_put_answer(0x6982), OathAnswer::NeedsAuth);
+        assert_eq!(oath_put_answer(0x6A80), OathAnswer::Other(0x6A80));
+    }
+
+    #[test]
+    fn oath_delete_6983_is_not_exists() {
+        assert_eq!(oath_delete_answer(0x6983), OathAnswer::Other(0x6983));
+        assert_eq!(oath_delete_answer(0x9000), OathAnswer::Ok);
+        assert_eq!(oath_delete_answer(0x6982), OathAnswer::NeedsAuth);
+        assert_eq!(oath_delete_answer(0x6A84), OathAnswer::Full);
+    }
+
+    /// A scripted OATH applet: answers popped per call (default `9000`),
+    /// every call recorded.
+    #[derive(Default)]
+    struct ScriptedOath {
+        put: VecDeque<u16>,
+        delete: VecDeque<u16>,
+        calls: Vec<String>,
+    }
+
+    impl OathIo for ScriptedOath {
+        fn put(&mut self, p: &oath::PutParams<'_>) -> Result<u16, TransportError> {
+            self.calls.push(format!("put {}", p.name));
+            Ok(self.put.pop_front().unwrap_or(0x9000))
+        }
+        fn delete(&mut self, name: &str) -> Result<u16, TransportError> {
+            self.calls.push(format!("delete {}", name));
+            Ok(self.delete.pop_front().unwrap_or(0x9000))
+        }
+        fn reauth(&mut self) -> Result<(), TransportError> {
+            self.calls.push("reauth".to_owned());
+            Ok(())
+        }
+    }
+
+    /// `run` over the scripted applet through the real adapter rules.
+    struct ScriptedStore(ScriptedOath);
+
+    impl CodeStore for ScriptedStore {
+        fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+            oath_add(&mut self.0, name, entry)
+        }
+        fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
+            oath_delete(&mut self.0, name)
+        }
+    }
+
+    fn entry(kind: OtpKind) -> ImportEntry {
+        ImportEntry {
+            issuer: Some("A".to_owned()),
+            account: Some("a".to_owned()),
+            secret: Zeroizing::new(vec![7; 20]),
+            hash: HashAlg::Sha256,
+            digits: 8,
+            kind,
+        }
+    }
+
+    fn file(n: usize) -> ImportFile {
+        ImportFile {
+            format: Format::OtpauthList,
+            items: (0..n)
+                .map(|index| {
+                    let mut e = entry(OtpKind::Totp { period: 30 });
+                    e.issuer = Some(format!("I{index}"));
+                    ImportItem {
+                        index,
+                        label: format!("I{index}:a"),
+                        entry: Ok(e),
+                    }
+                })
+                .collect(),
+            batch: None,
+        }
+    }
+
+    fn run_scripted(
+        f: &ImportFile,
+        replace: bool,
+        io: ScriptedOath,
+    ) -> (Vec<Outcome>, ScriptedOath) {
+        let p = plan(
+            f,
+            &Target {
+                store: Store::Oath(OathFamily::Solo2),
+                first_slot: 0,
+                existing: Existing::default(),
+                replace,
+            },
+        );
+        let mut s = ScriptedStore(io);
+        let r = run(f, &p, &mut s, &mut |_, _, _| {});
+        (r.rows.into_iter().map(|(_, _, o)| o).collect(), s.0)
+    }
+
+    #[test]
+    fn oath_delete_never_sent_on_plain_add() {
+        let f = file(2);
+        let io = ScriptedOath {
+            put: [0x6983, 0x9000].into(),
+            ..Default::default()
+        };
+        let (out, io) = run_scripted(&f, false, io);
+        assert_eq!(io.calls, vec!["put I0:a", "put I1:a"]);
+        assert_eq!(out, vec![Outcome::AlreadyThere, Outcome::Added]);
+
+        // With replace, the delete follows the key's 6983 only.
+        let io = ScriptedOath {
+            put: [0x6983].into(),
+            ..Default::default()
+        };
+        let (out, io) = run_scripted(&file(1), true, io);
+        assert_eq!(io.calls, vec!["put I0:a", "delete I0:a", "put I0:a"]);
+        assert_eq!(out, vec![Outcome::Replaced]);
+    }
+
+    #[test]
+    fn needs_auth_retries_once_after_reauthenticate() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        let name = StoredName::Oath("A:a".to_owned());
+
+        let mut io = ScriptedOath {
+            put: [0x6982, 0x9000].into(),
+            ..Default::default()
+        };
+        assert_eq!(oath_add(&mut io, &name, &e), Ok(()));
+        assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
+
+        let mut io = ScriptedOath {
+            put: [0x6982, 0x6982].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            oath_add(&mut io, &name, &e),
+            Err(StoreError::Failed(
+                "the key asked for its OATH password again and refused it".to_owned()
+            ))
+        );
+        assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
+
+        let mut io = ScriptedOath {
+            delete: [0x6982].into(),
+            ..Default::default()
+        };
+        assert_eq!(oath_delete(&mut io, &name), Ok(()));
+        assert_eq!(io.calls, vec!["delete A:a", "reauth", "delete A:a"]);
+    }
+
+    #[test]
+    fn oath_other_status_and_full_are_reported() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        let name = StoredName::Oath("A:a".to_owned());
+        let mut io = ScriptedOath {
+            put: [0x6A80, 0x6A84].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            oath_add(&mut io, &name, &e),
+            Err(StoreError::Failed(
+                "the key refused it (status 6A80)".to_owned()
+            ))
+        );
+        assert_eq!(oath_add(&mut io, &name, &e), Err(StoreError::Full));
+    }
+
+    #[test]
+    fn oath_put_params_from_entry() {
+        let e = entry(OtpKind::Hotp { counter: 5 });
+        let p = put_params("A:a", &e).unwrap();
+        assert_eq!(p.oath_type, oath::OathType::Hotp);
+        assert_eq!(p.algorithm, oath::Algorithm::Sha256);
+        assert_eq!(p.digits, 8);
+        assert_eq!(p.imf, 5);
+        assert!(!p.require_touch);
+
+        let e = entry(OtpKind::Totp { period: 60 });
+        let p = put_params("60/A:a", &e).unwrap();
+        assert_eq!((p.oath_type, p.imf), (oath::OathType::Totp, 0));
+
+        // Unreachable after `plan`; refused, never truncated.
+        let e = entry(OtpKind::Hotp {
+            counter: u64::from(u32::MAX) + 1,
+        });
+        assert!(put_params("A:a", &e).is_err());
+    }
+
+    #[test]
+    fn apdu_fit_matches_builder() {
+        use keyroost_import::plan::oath_put_fits;
+        for name_len in 200..=250 {
+            let name = "n".repeat(name_len);
+            for secret_len in 1..=64 {
+                let secret = vec![1u8; secret_len];
+                for imf in [false, true] {
+                    let p = oath::PutParams {
+                        name: &name,
+                        secret: &secret,
+                        oath_type: if imf {
+                            oath::OathType::Hotp
+                        } else {
+                            oath::OathType::Totp
+                        },
+                        algorithm: oath::Algorithm::Sha1,
+                        digits: 6,
+                        require_touch: false,
+                        imf: u32::from(imf),
+                    };
+                    assert_eq!(
+                        oath_put_fits(name_len, secret_len, imf),
+                        oath::put(&p).is_ok(),
+                        "name {name_len}, secret {secret_len}, imf {imf}"
+                    );
+                }
+            }
+        }
+    }
+}

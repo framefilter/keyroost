@@ -25,6 +25,11 @@ pub struct OathSession {
     /// What the SELECT response told us — notably the device id (PBKDF2 salt) and
     /// whether a password is set (a CHALLENGE was returned). Refreshed on SELECT.
     select_info: oath::SelectInfo,
+    /// The access key from the last successful [`unlock`](Self::unlock) (or
+    /// [`set_password`](Self::set_password)), kept so
+    /// [`reauthenticate`](Self::reauthenticate) can VALIDATE again without
+    /// asking for the password. Wiped when the session drops.
+    access_key: Option<Zeroizing<[u8; oath::ACCESS_KEY_LEN]>>,
 }
 
 impl OathSession {
@@ -42,9 +47,15 @@ impl OathSession {
                 device_id: Vec::new(),
                 challenge: None,
             },
+            access_key: None,
         };
         session.select()?;
         Ok(session)
+    }
+
+    /// The applet version from SELECT (YubiKey: firmware), when it is 3 bytes.
+    pub fn version(&self) -> Option<(u8, u8, u8)> {
+        version_of(&self.select_info.version)
     }
 
     /// True when the applet is password-protected: data commands will be refused
@@ -59,13 +70,40 @@ impl OathSession {
     /// so a wrong password (or a spoofed card) is rejected. No-op if no password
     /// is set.
     pub fn unlock(&mut self, password: &str) -> Result<(), TransportError> {
-        let Some(card_challenge) = self.select_info.challenge.clone() else {
+        if self.select_info.challenge.is_none() {
             return Ok(()); // not protected
-        };
+        }
         let key = Zeroizing::new(oath::derive_access_key(
             password,
             &self.select_info.device_id,
         ));
+        self.validate_with(&key)?;
+        self.access_key = Some(key);
+        Ok(())
+    }
+
+    /// Re-SELECT and VALIDATE with the access key kept from the last
+    /// successful [`unlock`](Self::unlock); with none kept this is `Ok` and
+    /// nothing is sent. For applets that clear authorization after each
+    /// command (the Solo 2's released OATH app does, per its source), so a
+    /// refused command can be retried without asking for the password again.
+    pub fn reauthenticate(&mut self) -> Result<(), TransportError> {
+        let Some(key) = self.access_key.clone() else {
+            return Ok(());
+        };
+        self.select()?;
+        if self.select_info.challenge.is_none() {
+            return Ok(()); // the password is gone; nothing to answer
+        }
+        self.validate_with(&key)
+    }
+
+    /// Answer the current SELECT challenge with VALIDATE under `key` and check
+    /// the card's mutual-auth reply.
+    fn validate_with(&mut self, key: &[u8; oath::ACCESS_KEY_LEN]) -> Result<(), TransportError> {
+        let Some(card_challenge) = self.select_info.challenge.clone() else {
+            return Ok(());
+        };
         let host_challenge = random_challenge()?;
         let apdu = Zeroizing::new(oath::validate(&key[..], &card_challenge, &host_challenge));
         let (data, sw) = self.transmit_full(&apdu)?;
@@ -97,6 +135,7 @@ impl OathSession {
         ok_or_apdu("oath set code", sw)?;
         // A password is now set; reflect that locally.
         self.select_info.challenge = Some(challenge.to_vec());
+        self.access_key = Some(key);
         Ok(())
     }
 
@@ -105,6 +144,7 @@ impl OathSession {
         let (_, sw) = self.transmit_full(&oath::clear_code())?;
         ok_or_apdu("oath clear code", sw)?;
         self.select_info.challenge = None;
+        self.access_key = None;
         Ok(())
     }
 
@@ -120,6 +160,7 @@ impl OathSession {
         // The wipe cleared any password; reflect that locally so a follow-up
         // command in this session doesn't try to validate against stale state.
         self.select_info.challenge = None;
+        self.access_key = None;
         Ok(())
     }
 
@@ -150,6 +191,7 @@ impl OathSession {
                         device_id: Vec::new(),
                         challenge: None,
                     },
+                    access_key: None,
                 };
                 if session.select().is_ok() {
                     out.push(name.to_string_lossy().into_owned());
@@ -212,20 +254,33 @@ impl OathSession {
 
     /// Provision (add) a credential.
     pub fn put(&mut self, params: &oath::PutParams<'_>) -> Result<(), TransportError> {
+        let sw = self.put_status(params)?;
+        ok_or_apdu("oath put", sw)
+    }
+
+    /// PUT and return the raw status word, for callers that read the key's
+    /// answer themselves (bulk import: exists, full, needs the password).
+    pub fn put_status(&mut self, params: &oath::PutParams<'_>) -> Result<u16, TransportError> {
         // An over-long name/secret (e.g. from an imported otpauth:// URI)
         // surfaces as a typed error from the fallible builder.
         // The PUT body carries the raw TOTP/HOTP seed — wipe it after transmit.
         let apdu =
             Zeroizing::new(oath::put(params).map_err(|_| TransportError::OathCredentialTooLong)?);
         let (_, sw) = self.transmit_full(&apdu)?;
-        ok_or_apdu("oath put", sw)
+        Ok(sw)
     }
 
     /// Remove a credential by name.
     pub fn delete(&mut self, name: &str) -> Result<(), TransportError> {
+        let sw = self.delete_status(name)?;
+        ok_or_apdu("oath delete", sw)
+    }
+
+    /// DELETE and return the raw status word.
+    pub fn delete_status(&mut self, name: &str) -> Result<u16, TransportError> {
         let apdu = oath::delete(name).map_err(|_| TransportError::OathCredentialTooLong)?;
         let (_, sw) = self.transmit_full(&apdu)?;
-        ok_or_apdu("oath delete", sw)
+        Ok(sw)
     }
 
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
@@ -263,6 +318,15 @@ fn random_challenge() -> Result<[u8; 8], TransportError> {
     Ok(buf)
 }
 
+/// The SELECT version as `(major, minor, patch)`, only when it is exactly
+/// three bytes.
+fn version_of(v: &[u8]) -> Option<(u8, u8, u8)> {
+    match v {
+        [a, b, c] => Some((*a, *b, *c)),
+        _ => None,
+    }
+}
+
 /// Map an OATH status word to success or a labelled APDU error.
 fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     if sw == oath::SW_OK {
@@ -273,5 +337,18 @@ fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
             sw1: (sw >> 8) as u8,
             sw2: sw as u8,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_parses_three_bytes_only() {
+        assert_eq!(version_of(&[5, 7, 1]), Some((5, 7, 1)));
+        assert_eq!(version_of(&[]), None);
+        assert_eq!(version_of(&[5, 7]), None);
+        assert_eq!(version_of(&[5, 7, 1, 0]), None);
     }
 }

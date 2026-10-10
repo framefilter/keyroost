@@ -2369,6 +2369,7 @@ dependencies = [
  "hidapi",
  "keyroost-ctap",
  "keyroost-hid",
+ "keyroost-import",
  "keyroost-oath",
  "keyroost-openpgp",
  "keyroost-piv",
