@@ -22,14 +22,13 @@ use crate::secrets::{SecretIo, SecretSource, Secrets, Source};
 use crate::{
     ensure_otp_feature, oath_password_from, open_oath_unlocked, open_otp_on, otp_pin_if_needed,
     otp_precheck, sanitize_terminal, select_otp, OathAccess, OtpFeature, OtpSelect, SecondSecret,
-    SecretPair, FILE_PASSWORD, OATH_PASSWORD, OTP_PIN,
+    SecretPair, FILE_PASSWORD, UNUSED_FILE_PASSWORD,
 };
 
-/// Where an import writes: an OATH applet, or Token2 OTP storage with the
-/// `--pin` flag's source.
+/// Where an import writes: an OATH applet, or Token2 OTP storage.
 pub(crate) enum CodeDest<'a> {
     Oath(&'a OathAccess),
-    Otp(&'a OtpSelect<'a>, Option<&'a SecretSource>),
+    Otp(&'a OtpSelect<'a>),
 }
 
 /// How the report asks for the applet password when the key turns out to
@@ -41,29 +40,21 @@ const OATH_PASSWORD_HINT: &str = "pass --password env:NAME or --password stdin";
 /// select and announce the key, get the key's own secret (line 2), read the
 /// key, plan and preview, ask once, re-check the key, write, report. Exits 1
 /// (an `Err` whose text is the stop line) when the run stops early.
+///
+/// `pair` is the command's own (`oath_secret_pair` / `otp_secret_pair`):
+/// the file password first, the key's password or PIN second. Both are
+/// read through [`read_import_file`] and [`read_key_secret_given`], the
+/// functions the stdin line-order test drives.
 pub(crate) fn run_code_import(
     dest: CodeDest<'_>,
     file: &Path,
-    file_password: Option<&SecretSource>,
+    pair: SecretPair<'_>,
     replace: bool,
     dry_run: bool,
     yes: bool,
     debug: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut sec = Secrets::real();
-    let pair = SecretPair {
-        first: (&FILE_PASSWORD, file_password),
-        second: match dest {
-            CodeDest::Oath(access) => SecondSecret {
-                spec: &OATH_PASSWORD,
-                flag: access.password.as_ref(),
-            },
-            CodeDest::Otp(_, pin) => SecondSecret {
-                spec: &OTP_PIN,
-                flag: pin,
-            },
-        },
-    };
     // Only the sources a flag names: each secret is optional, asked for
     // only when the file or the key turns out to need it.
     if pair.first.1.is_some() {
@@ -92,9 +83,7 @@ pub(crate) fn run_code_import(
             replace,
             debug,
         ),
-        CodeDest::Otp(sel, _) => {
-            to_otp(&mut sec, sel, pair.second, &import, &shown, replace, debug)
-        }
+        CodeDest::Otp(sel) => to_otp(&mut sec, sel, pair.second, &import, &shown, replace, debug),
     }
 }
 
@@ -111,7 +100,7 @@ struct Shown {
 /// export asks for its password (stdin line 1). A password given for a
 /// file that doesn't need one is still read off a pipe, so the key's own
 /// secret stays on line 2, and is then dropped with a warning.
-fn read_import_file<I: SecretIo>(
+pub(crate) fn read_import_file<I: SecretIo>(
     sec: &mut Secrets<I>,
     path: &Path,
     password: Option<&SecretSource>,
@@ -140,10 +129,7 @@ fn read_import_file<I: SecretIo>(
                 if matches!(password, Some(SecretSource::Stdin)) && !sec.io.stdin_is_terminal() {
                     drop(sec.read(&FILE_PASSWORD, Source::from_flag(password))?);
                 }
-                crate::output::warn(
-                    "--file-password was given, but this file isn't an encrypted Aegis \
-                     export; it wasn't used",
-                );
+                crate::output::warn(UNUSED_FILE_PASSWORD);
             }
             file
         }
@@ -167,6 +153,17 @@ fn read_import_file<I: SecretIo>(
         crate::output::note("remember to delete the screenshot after a successful import");
     }
     Ok(file)
+}
+
+/// The key's password or PIN when a flag names its source (the pair's
+/// second secret: stdin line 2 after a file password, line 1 alone).
+/// `None` when no flag names it; the handler then asks the key whether it
+/// needs one and prompts only if it does.
+pub(crate) fn read_key_secret_given<I: SecretIo>(
+    sec: &mut Secrets<I>,
+    second: SecondSecret<'_>,
+) -> Result<Option<zeroize::Zeroizing<String>>, String> {
+    sec.read_given(second.spec, second.source())
 }
 
 /// The plan for `existing` on `store`.
@@ -271,7 +268,10 @@ fn to_oath(
     debug: bool,
 ) -> Result<(), Box<dyn Error>> {
     let dev = crate::target::select(Need::Oath, access.reader.as_deref(), None)?;
-    let (reader, pw) = oath_password_from(sec, access, password.source(), debug)?;
+    let (reader, pw) = match read_key_secret_given(sec, password)? {
+        Some(pw) => (crate::target::reader_of(&dev)?, Some(pw)),
+        None => oath_password_from(sec, access, Source::NONE, debug)?,
+    };
     crate::prompt::reverify_if_asked(&dev, sec.prompted())?;
     let pw = pw.as_deref().map(String::as_str);
     let (existing, version) = {
@@ -306,7 +306,13 @@ fn to_otp(
     let dev = select_otp(sel)?;
     otp_precheck(&dev, sel.transport, debug, OtpFeature::OnDevice)?;
     let waited = sec.prompted();
-    let pin = otp_pin_if_needed(sec, &dev, sel.transport, debug, pin.source(), waited)?;
+    let pin = match read_key_secret_given(sec, pin)? {
+        Some(pin) => {
+            crate::prompt::reverify_if_asked(&dev, waited || sec.prompted())?;
+            Some(pin)
+        }
+        None => otp_pin_if_needed(sec, &dev, sel.transport, debug, Source::NONE, waited)?,
+    };
     let pin_str = pin.as_deref().map(String::as_str);
     let existing = {
         let mut session = open_otp_on(&dev, sel.transport, debug)?;

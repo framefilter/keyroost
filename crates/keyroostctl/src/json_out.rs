@@ -617,6 +617,62 @@ mod tests {
         assert!(v["title"].is_null());
     }
 
+    /// `oath import` / `otp import --json`: every key present, `null` where
+    /// a dry run or a plain add has no value.
+    #[test]
+    fn import_shape_with_and_without_outcomes() {
+        let top = [
+            ("destination", "string"),
+            ("dry_run", "bool"),
+            ("capacity", "number|null"),
+            ("on_key", "number"),
+            ("entries", "array"),
+            ("stopped", "string|null"),
+        ];
+        let row = [
+            ("index", "number"),
+            ("label", "string"),
+            ("name", "string|null"),
+            ("plan", "string"),
+            ("reason", "string|null"),
+            ("outcome", "string|null"),
+            ("error", "string|null"),
+        ];
+        let bare = ImportRowJson {
+            index: 0,
+            label: "entry 1".into(),
+            name: None,
+            plan: "skip",
+            reason: None,
+            outcome: None,
+            error: None,
+        };
+        let full = ImportRowJson {
+            index: 1,
+            label: "A:a".into(),
+            name: Some("A:a".into()),
+            plan: "add",
+            reason: Some("r".into()),
+            outcome: Some("failed"),
+            error: Some("e".into()),
+        };
+        for (capacity, stopped, rows) in [
+            (None, None, vec![bare]),
+            (Some(32), Some("the key is full".to_owned()), vec![full]),
+        ] {
+            let v = to_v(&ImportJson {
+                destination: "oath",
+                dry_run: capacity.is_none(),
+                capacity,
+                on_key: 0,
+                entries: rows,
+                stopped,
+            });
+            assert_shape(&v, &top);
+            assert_shape(&v["entries"][0], &row);
+        }
+    }
+
     #[test]
     fn empty_lists_are_present_arrays() {
         let v = to_v(&KeysJson::<ListRowJson> { keys: vec![] });

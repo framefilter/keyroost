@@ -2336,7 +2336,7 @@ enum MoltoCmd {
         dry_run: bool,
         /// The password of an encrypted Aegis export: env:NAME or stdin (second
         /// line when --customer-key stdin is also given; hidden when typed at a
-        /// terminal). With neither, a terminal asks when the vault needs one.
+        /// terminal). With neither, a terminal asks when the file needs one.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, requires = "file")]
         file_password: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
@@ -3471,6 +3471,9 @@ const IMPORT_URI: Spec = Spec::value("otpauth:// URI", "uri")
 /// The password of an encrypted export file (`molto import`, `oath import`,
 /// `otp import`).
 const FILE_PASSWORD: Spec = Spec::current("file password", "file-password");
+/// Warned by every import when `--file-password` is given for a file that
+/// isn't encrypted. Worded as `molto import` has always worded it.
+const UNUSED_FILE_PASSWORD: &str = "password supplied but file is not an encrypted Aegis vault";
 
 /// Decode a seed; the error names the flag and the encoding, never the input.
 fn decode_seed(text: &str, e: SeedEncoding) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
@@ -4027,7 +4030,7 @@ fn load_bulk_entries<I: crate::secrets::SecretIo>(
     }
 
     if password.is_some() {
-        output::warn("password supplied but file is not an encrypted Aegis vault");
+        output::warn(UNUSED_FILE_PASSWORD);
     }
     Ok(keyroost_import::parse_bulk_any(&text)?)
 }
@@ -8225,16 +8228,16 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
         }
         OathCmd::Import {
             file,
-            file_password,
             replace,
             dry_run,
             access,
             yes,
+            ..
         } => {
             return code_import::run_code_import(
                 code_import::CodeDest::Oath(access),
                 file,
-                file_password.as_ref(),
+                pair_of(oath_secret_pair(cmd))?,
                 *replace,
                 *dry_run,
                 *yes,
@@ -8768,16 +8771,15 @@ fn run_otp(
         }
         OtpCmd::Import {
             file,
-            file_password,
             replace,
             dry_run,
-            pin,
             yes,
+            ..
         } => {
             return code_import::run_code_import(
-                code_import::CodeDest::Otp(&sel, pin.as_ref()),
+                code_import::CodeDest::Otp(&sel),
                 file,
-                file_password.as_ref(),
+                pair_of(otp_secret_pair(cmd))?,
                 *replace,
                 *dry_run,
                 *yes,
@@ -21972,6 +21974,11 @@ mod cli_tests {
                 covered.push(cols[0]);
                 continue;
             }
+            if path[1] == "import" {
+                import_stdin_order(line, &argv);
+                covered.push(cols[0]);
+                continue;
+            }
             let cli = parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             let pair = cli
                 .command
@@ -22018,6 +22025,123 @@ mod cli_tests {
     /// One Molto2 row of [`stdin_line_order_per_command`]: the customer key
     /// (`--customer-key stdin`) and `second`, both piped, read through the
     /// functions `run_molto` uses: line 1 is the key, line 2 the other.
+    /// A plain and an encrypted Aegis export, for the import line-order
+    /// tests; removed when the guard drops.
+    struct ImportFixtures {
+        plain: std::path::PathBuf,
+        encrypted: std::path::PathBuf,
+    }
+    impl ImportFixtures {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir();
+            let id = std::process::id();
+            let f = ImportFixtures {
+                plain: dir.join(format!("keyroostctl-{tag}-{id}-plain.json")),
+                encrypted: dir.join(format!("keyroostctl-{tag}-{id}-encrypted.json")),
+            };
+            std::fs::write(
+                &f.plain,
+                r#"{"version":1,"header":{"slots":null,"params":null},"db":{"version":2,"entries":[{"type":"totp","name":"alice","issuer":"Example","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"period":30}}]}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                &f.encrypted,
+                include_str!("../../keyroost-qr/tests/fixtures/aegis-encrypted.json"),
+            )
+            .unwrap();
+            f
+        }
+    }
+    impl Drop for ImportFixtures {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.plain);
+            let _ = std::fs::remove_file(&self.encrypted);
+        }
+    }
+    /// The password of the encrypted fixture (a test value, not a secret).
+    const FIXTURE_FILE_PASSWORD: &str = "keyroost-fixture";
+
+    /// The secrets an `oath import` / `otp import` run reads from `lines`
+    /// (piped), through the handler's own pair and readers: the file is
+    /// opened by `read_import_file`, then the key's secret is read by
+    /// `read_key_secret_given`, in that order, as `run_code_import` does.
+    /// Returns (stdin lines read for the file, the opened file's format,
+    /// the key's secret).
+    fn import_secrets(
+        argv: &[&str],
+        file: &std::path::Path,
+        lines: &[&str],
+    ) -> (usize, keyroost_import::Format, Option<String>) {
+        use crate::secrets::fake::FakeIo;
+        let cli = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        let pair = cli
+            .command
+            .as_ref()
+            .and_then(stdin_pair)
+            .unwrap_or_else(|| panic!("{argv:?}: the handler reads no pair"));
+        assert_eq!(pair.first.0.flag, "file-password", "{argv:?}");
+        let mut sec = Secrets::new(FakeIo::piped(lines));
+        let opened = code_import::read_import_file(&mut sec, file, pair.first.1)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        let after_file = sec.io.lines_read;
+        let key = code_import::read_key_secret_given(&mut sec, pair.second)
+            .unwrap()
+            .map(|s| s.to_string());
+        (after_file, opened.format, key)
+    }
+
+    /// One import row of [`stdin_line_order_per_command`]: both secrets on
+    /// stdin. Line 1 is the file password, line 2 the key's password or
+    /// PIN — for an encrypted export (line 1 opens it) and for a plain one
+    /// (line 1 is read and dropped, so the PIN is still line 2).
+    fn import_stdin_order(line: &str, argv: &[&str]) {
+        use keyroost_import::Format;
+        let f = ImportFixtures::new("order");
+        let pw = format!("{FIXTURE_FILE_PASSWORD}\n");
+        for (file, format) in [
+            (&f.encrypted, Format::AegisEncrypted),
+            (&f.plain, Format::Aegis),
+        ] {
+            let got = import_secrets(argv, file, &[pw.as_str(), "22\n"]);
+            assert_eq!(got, (1, format, Some("22".to_owned())), "{line}");
+        }
+    }
+
+    /// Each secret alone on stdin is line 1: the file password opens the
+    /// export and the key's secret isn't read; the key's password or PIN
+    /// alone is line 1 and the file reads nothing.
+    #[test]
+    fn import_secrets_alone_on_stdin_are_line_one() {
+        use keyroost_import::Format;
+        let f = ImportFixtures::new("alone");
+        let pw = format!("{FIXTURE_FILE_PASSWORD}\n");
+        for (group, key_flag) in [("oath", "--password"), ("otp", "--pin")] {
+            let base = ["keyroostctl", group, "import", "--in", "f"];
+            let file_only: Vec<&str> = base
+                .iter()
+                .copied()
+                .chain(["--file-password", "stdin"])
+                .collect();
+            assert_eq!(
+                import_secrets(&file_only, &f.encrypted, &[pw.as_str()]),
+                (1, Format::AegisEncrypted, None),
+                "{group}"
+            );
+            // Given but not needed: still taken off the pipe.
+            assert_eq!(
+                import_secrets(&file_only, &f.plain, &["x\n"]),
+                (1, Format::Aegis, None),
+                "{group}"
+            );
+            let key_only: Vec<&str> = base.iter().copied().chain([key_flag, "stdin"]).collect();
+            assert_eq!(
+                import_secrets(&key_only, &f.plain, &["22\n"]),
+                (0, Format::Aegis, Some("22".to_owned())),
+                "{group}"
+            );
+        }
+    }
+
     fn molto_stdin_order(line: &str, argv: &[&str], second: &str) {
         use crate::secrets::fake::FakeIo;
         let vault = std::env::temp_dir().join(format!(
