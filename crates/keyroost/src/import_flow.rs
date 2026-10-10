@@ -1543,7 +1543,8 @@ impl App {
                             .color(p.txt),
                     );
                     if view.dests.is_empty() {
-                        ui.colored_label(p.warn, NO_CAPABLE_KEY);
+                        // The reason line under the buttons says what to do.
+                        ui.colored_label(p.txt3, "No connected key can store codes yet.");
                     }
                     let locked_choice = d.running.is_some();
                     for (k, label, fit) in &view.dests {
