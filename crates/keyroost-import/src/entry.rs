@@ -22,6 +22,17 @@ pub enum HashAlg {
     Sha512,
 }
 
+impl HashAlg {
+    /// "SHA-1", "SHA-256", "SHA-512": how every message names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            HashAlg::Sha1 => "SHA-1",
+            HashAlg::Sha256 => "SHA-256",
+            HashAlg::Sha512 => "SHA-512",
+        }
+    }
+}
+
 /// Time- or counter-based, with the parameter that goes with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtpKind {
@@ -134,6 +145,20 @@ pub enum Format {
     OtpauthList,
     QrImage,
     GoogleExport,
+}
+
+impl Format {
+    /// The export's layout as the CLI and the GUI name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Aegis => "Aegis",
+            Format::AegisEncrypted => "Aegis, encrypted",
+            Format::TwoFas => "2FAS",
+            Format::OtpauthList => "otpauth:// list",
+            Format::QrImage => "QR screenshot",
+            Format::GoogleExport => "Google Authenticator export",
+        }
+    }
 }
 
 /// Everything read from one file.

@@ -54,6 +54,45 @@ pub enum Outcome {
     NotTried,
 }
 
+impl Outcome {
+    /// The one word for the outcome: the JSON's `outcome`, and (with the
+    /// dashes read as spaces) the GUI report row.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Outcome::Added => "added",
+            Outcome::Replaced => "replaced",
+            Outcome::AlreadyThere => "exists",
+            Outcome::RemovedNotAdded(_) => "removed-not-added",
+            Outcome::Failed(_) => "failed",
+            Outcome::NoRoom => "no-room",
+            Outcome::NotTried => "not-tried",
+        }
+    }
+
+    /// What happened, in plain words, when the word alone doesn't say it.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Outcome::Added | Outcome::Replaced => None,
+            Outcome::AlreadyThere => Some(crate::plan::EXISTS_REASON.to_owned()),
+            Outcome::RemovedNotAdded(e) => Some(format!(
+                "the old code was removed, but the new one wasn't added ({})",
+                e
+            )),
+            Outcome::Failed(e) => Some(e.clone()),
+            Outcome::NoRoom => Some(StoreError::Full.to_string()),
+            Outcome::NotTried => Some("stopped before this one".to_owned()),
+        }
+    }
+
+    /// The write went through, or found its code already on the key.
+    pub fn went_through(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Added | Outcome::Replaced | Outcome::AlreadyThere
+        )
+    }
+}
+
 /// What a run did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -71,12 +110,30 @@ impl Report {
 
     /// True when every planned write ended Added / Replaced / AlreadyThere.
     pub fn ok(&self) -> bool {
-        self.rows.iter().all(|(_, _, o)| {
-            matches!(
-                o,
-                Outcome::Added | Outcome::Replaced | Outcome::AlreadyThere
-            )
-        })
+        self.rows.iter().all(|(_, _, o)| o.went_through())
+    }
+
+    /// The counts line both front ends show after a run:
+    /// `Added 2, replaced 1; 3 left as is, 1 skipped.`, with `, N not added`
+    /// before the period when the run stopped early.
+    pub fn summary(&self, plan: &Plan) -> String {
+        let added = self.count(|o| matches!(o, Outcome::Added));
+        let replaced = self.count(|o| matches!(o, Outcome::Replaced));
+        let there = self.count(|o| matches!(o, Outcome::AlreadyThere));
+        let not = self.rows.len() - added - replaced - there;
+        let c = plan.counts();
+        let mut s = format!(
+            "Added {}, replaced {}; {} left as is, {} skipped",
+            added,
+            replaced,
+            c.exists + there,
+            c.skip
+        );
+        if not > 0 {
+            s.push_str(&format!(", {} not added", not));
+        }
+        s.push('.');
+        s
     }
 }
 
@@ -90,18 +147,19 @@ struct Stop {
 /// entry, and why the new one wasn't stored.
 fn removed_not_added(name: &StoredName, why: &StoreError) -> String {
     format!(
-        "the old entry {} was removed from the key, but the new one could not be added ({})",
+        "the old code {} was removed from the key, but the new one could not be added ({})",
         name, why
     )
 }
 
 /// Write every Add/Replace row of `plan`, one at a time.
-/// `progress(done, total, label)` is called before each write.
+/// `progress(done, total, row)` is called before each write. Report rows
+/// carry [`PlanRow::shown_label`] (a Molto2 row keeps its slot number).
 pub fn run(
     file: &ImportFile,
     plan: &Plan,
     store: &mut dyn CodeStore,
-    progress: &mut dyn FnMut(usize, usize, &str),
+    progress: &mut dyn FnMut(usize, usize, &PlanRow),
 ) -> Report {
     let writes: Vec<&PlanRow> = plan.writes().collect();
     let total = writes.len();
@@ -111,13 +169,13 @@ pub fn run(
         let outcome = match &stop {
             Some(s) => s.rest.clone(),
             None => {
-                progress(done, total, &row.label);
+                progress(done, total, row);
                 let (outcome, s) = write_one(file, plan, row, store);
                 stop = s;
                 outcome
             }
         };
-        rows.push((row.index, row.label.clone(), outcome));
+        rows.push((row.index, row.shown_label(), outcome));
     }
     Report {
         rows,
@@ -388,7 +446,7 @@ mod tests {
         assert_eq!(
             r.stopped.as_deref(),
             Some(
-                "the old entry A:a was removed from the key, but the new one could not be \
+                "the old code A:a was removed from the key, but the new one could not be \
                  added (the key refused it)"
             )
         );
@@ -409,7 +467,7 @@ mod tests {
         assert_eq!(
             r.stopped.as_deref(),
             Some(
-                "the old entry A:a was removed from the key, but the new one could not be \
+                "the old code A:a was removed from the key, but the new one could not be \
                  added (the key is full)"
             )
         );
@@ -483,6 +541,39 @@ mod tests {
         let r = go(&f, &p, &mut s);
         assert_eq!(s.calls, vec!["add #5 A", "add #6 B"]);
         assert_eq!(outcomes(&r), vec![Outcome::Replaced, Outcome::AlreadyThere]);
+        // Report rows keep the slot number.
+        let labels: Vec<&str> = r.rows.iter().map(|(_, l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["#05 A:a", "#06 B:b"]);
+    }
+
+    #[test]
+    fn summary_and_outcome_words() {
+        let f = file(&[("A", "a"), ("B", "b"), ("C", "c")]);
+        let p = plan_for(&f, YK, &["B:b"], false);
+        let mut s = FakeStore::default();
+        let r = go(&f, &p, &mut s);
+        assert_eq!(
+            r.summary(&p),
+            "Added 2, replaced 0; 1 left as is, 0 skipped."
+        );
+        let stopped = Report {
+            rows: vec![
+                (0, "A:a".into(), Outcome::Added),
+                (2, "C:c".into(), Outcome::Failed("x".into())),
+            ],
+            stopped: Some("x".into()),
+        };
+        assert_eq!(
+            stopped.summary(&p),
+            "Added 1, replaced 0; 1 left as is, 0 skipped, 1 not added."
+        );
+        assert_eq!(Outcome::AlreadyThere.word(), "exists");
+        assert_eq!(
+            Outcome::AlreadyThere.reason().as_deref(),
+            Some("already on the key; left as is")
+        );
+        assert_eq!(Outcome::NotTried.word(), "not-tried");
+        assert_eq!(Outcome::NoRoom.reason().as_deref(), Some("the key is full"));
     }
 
     #[test]
@@ -491,8 +582,8 @@ mod tests {
         let p = plan_for(&f, YK, &["B:b"], false);
         let mut seen = Vec::new();
         let mut s = FakeStore::default();
-        run(&f, &p, &mut s, &mut |done, total, label| {
-            seen.push((done, total, label.to_owned()))
+        run(&f, &p, &mut s, &mut |done, total, row| {
+            seen.push((done, total, row.label.clone()))
         });
         assert_eq!(
             seen,

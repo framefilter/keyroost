@@ -259,14 +259,6 @@ impl core::fmt::Display for Skip {
     }
 }
 
-fn hash_name(h: HashAlg) -> &'static str {
-    match h {
-        HashAlg::Sha1 => "SHA-1",
-        HashAlg::Sha256 => "SHA-256",
-        HashAlg::Sha512 => "SHA-512",
-    }
-}
-
 fn reason(skip: &Skip, device: &str, token2: bool) -> String {
     match skip {
         Skip::Unusable(u) => u.to_string(),
@@ -282,7 +274,7 @@ fn reason(skip: &Skip, device: &str, token2: bool) -> String {
         Skip::AmbiguousName => "the name would read back differently on the key \
              (an issuer with ':' or a name that starts like a period, such as 60/)"
             .to_owned(),
-        Skip::Hash(h) => format!("{} doesn't take {} codes", device, hash_name(*h)),
+        Skip::Hash(h) => format!("{} doesn't take {} codes", device, h.name()),
         Skip::Digits(d) => format!("{} can't store {}-digit codes", device, d),
         Skip::Period(p) => format!("{} can't use a {}-second period", device, p),
         Skip::PeriodNotStored(p) => format!(
@@ -324,20 +316,22 @@ fn reason(skip: &Skip, device: &str, token2: bool) -> String {
 /// Something the person should know about the plan as a whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Note {
-    /// Replace removes the old entry first on keys that refuse duplicates; if
-    /// the add then fails, the old entry is gone.
+    /// Replace removes the old code first on keys that refuse duplicates; if
+    /// the add then fails, the old code is gone.
     ReplaceMayLoseOld,
     /// The key doesn't report how many codes it holds; writing stops if it
     /// fills up.
     CapacityUnknown,
     /// Solo 2 HOTP: the README sentence about the 4-byte counter.
     Solo2Hotp,
-    /// Nitrokey 3 asks for a touch for each replaced entry.
+    /// A Nitrokey 3 may ask for a touch for each code it replaces (firmware
+    /// that refuses duplicates removes the old code first; source, not
+    /// hardware, says that removal asks for a touch).
     Nitrokey3TouchToReplace,
-    /// `n` entries on the key couldn't be listed; a same-name one may still
+    /// `n` codes on the key couldn't be listed; a same-name one may still
     /// be refused.
     Hidden(usize),
-    /// Molto2 slots already in use will be written over.
+    /// Molto2 slots already in use will be replaced.
     MoltoReplacesSlots,
 }
 
@@ -345,8 +339,8 @@ impl core::fmt::Display for Note {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Note::ReplaceMayLoseOld => f.write_str(
-                "Replacing removes the old entry first on keys that refuse duplicate \
-                 names. If adding the new one then fails, the old entry is gone.",
+                "Replacing removes the old code first on keys that refuse duplicate \
+                 names. If adding the new one then fails, the old code is gone.",
             ),
             Note::CapacityUnknown => f.write_str(
                 "This key doesn't report how many codes it holds; writing stops if it fills up.",
@@ -357,15 +351,15 @@ impl core::fmt::Display for Note {
                  what services expect. TOTP codes work normally.",
             ),
             Note::Nitrokey3TouchToReplace => {
-                f.write_str("Nitrokey 3 asks for a touch for each entry it replaces.")
+                f.write_str("A Nitrokey 3 may ask for a touch for each code it replaces.")
             }
             Note::Hidden(n) => write!(
                 f,
-                "{} entries on the key couldn't be listed; the key may still refuse \
-                 a name that is already there.",
+                "{} codes on the key couldn't be listed; the key may still refuse \
+                 a name that is already on it.",
                 n
             ),
-            Note::MoltoReplacesSlots => f.write_str("Slots already in use will be written over."),
+            Note::MoltoReplacesSlots => f.write_str("Slots already in use will be replaced."),
         }
     }
 }
@@ -381,6 +375,47 @@ pub struct PlanRow {
     pub name: Option<StoredName>,
     pub verdict: Verdict,
 }
+
+impl PlanRow {
+    /// The row as every list names it: the file's label, with its slot in
+    /// front for a Molto2 (`#05 GitHub`).
+    pub fn shown_label(&self) -> String {
+        match &self.name {
+            Some(StoredName::Molto2 { slot, .. }) => format!("#{:02} {}", slot, self.label),
+            _ => self.label.clone(),
+        }
+    }
+}
+
+impl Verdict {
+    /// The one word for the verdict: the CLI preview's column, the JSON's
+    /// `plan`, and the GUI preview row.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Verdict::Add => "add",
+            Verdict::Replace => "replace",
+            Verdict::Exists => "exists",
+            Verdict::Skip(_) => "skip",
+        }
+    }
+
+    /// Why a row isn't a plain add, in plain words (`None` for an add).
+    pub fn reason(&self, store: Store) -> Option<String> {
+        match self {
+            Verdict::Add => None,
+            Verdict::Replace if store == Store::Molto2 => {
+                Some("replaces the code in this slot".to_owned())
+            }
+            Verdict::Replace => Some("replaces the code of the same name on the key".to_owned()),
+            Verdict::Exists => Some(EXISTS_REASON.to_owned()),
+            Verdict::Skip(s) => Some(s.reason(store)),
+        }
+    }
+}
+
+/// Why an entry already on the key isn't written: shared by the plan's
+/// `exists` rows and the run's `exists` outcome.
+pub const EXISTS_REASON: &str = "already on the key; left as is";
 
 /// The whole plan for one destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,6 +452,12 @@ impl Plan {
             }
         }
         c
+    }
+
+    /// Whether `other` plans the same thing for every row: the re-check
+    /// after a question, before anything is written.
+    pub fn same_rows(&self, other: &Plan) -> bool {
+        self.rows == other.rows
     }
 
     /// Rows that write (Add or Replace), in file order.
@@ -734,6 +775,25 @@ fn name_for(e: &ImportEntry, store: Store, lim: &Limits) -> Result<StoredName, S
         }
         Store::Molto2 => unreachable!("Molto2 names are assigned with their slot"),
     }
+}
+
+/// [`plan`] with the target's parts given one by one.
+pub fn plan_for(
+    file: &ImportFile,
+    store: Store,
+    first_slot: u8,
+    existing: Existing,
+    replace: bool,
+) -> Plan {
+    plan(
+        file,
+        &Target {
+            store,
+            first_slot,
+            existing,
+            replace,
+        },
+    )
 }
 
 /// Plan an import of `file` into `target`.
@@ -1796,6 +1856,57 @@ mod tests {
         assert_eq!(OathFamily::Solo2.name_limit(), Some(127));
         assert_eq!(OathFamily::Nitrokey3.name_limit(), Some(128));
         assert_eq!(OathFamily::Other.name_limit(), None);
+    }
+
+    #[test]
+    fn verdict_words_and_reasons_are_one_vocabulary() {
+        let words: Vec<&str> = [
+            Verdict::Add,
+            Verdict::Replace,
+            Verdict::Exists,
+            Verdict::Skip(Skip::NoName),
+        ]
+        .iter()
+        .map(Verdict::word)
+        .collect();
+        assert_eq!(words, ["add", "replace", "exists", "skip"]);
+        assert_eq!(Verdict::Add.reason(YK57), None);
+        assert_eq!(
+            Verdict::Replace.reason(YK57).as_deref(),
+            Some("replaces the code of the same name on the key")
+        );
+        assert_eq!(
+            Verdict::Replace.reason(Store::Molto2).as_deref(),
+            Some("replaces the code in this slot")
+        );
+        assert_eq!(
+            Verdict::Exists.reason(YK57).as_deref(),
+            Some("already on the key; left as is")
+        );
+        assert_eq!(
+            Note::Nitrokey3TouchToReplace.to_string(),
+            "A Nitrokey 3 may ask for a touch for each code it replaces."
+        );
+        assert_eq!(
+            Note::MoltoReplacesSlots.to_string(),
+            "Slots already in use will be replaced."
+        );
+        let row = |name| PlanRow {
+            index: 0,
+            label: "GitHub".into(),
+            name,
+            verdict: Verdict::Add,
+        };
+        assert_eq!(
+            row(Some(StoredName::Molto2 {
+                slot: 5,
+                title: "GitHub".into()
+            }))
+            .shown_label(),
+            "#05 GitHub"
+        );
+        assert_eq!(row(Some(oath("GitHub"))).shown_label(), "GitHub");
+        assert_eq!(row(None).shown_label(), "GitHub");
     }
 
     #[test]

@@ -15,9 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use keyroost_import::plan::{Existing, OathFamily, Plan, Store, StoredName, Target, Verdict};
+use keyroost_import::plan::{
+    plan_for, Existing, OathFamily, Plan, PlanRow, Store, StoredName, Verdict,
+};
 use keyroost_import::run::{Outcome, Report};
-use keyroost_import::{Format, HashAlg, ImportFile, OtpKind};
+use keyroost_import::{Format, ImportFile, OtpKind};
 use keyroost_proto::commands::ProfilePublicData;
 
 use crate::otp_pane::{otp_target_for, OtpTransportSel};
@@ -209,25 +211,6 @@ pub fn store_of(kind: StoreKind, vendor: &str, version: Option<(u8, u8, u8)>) ->
     }
 }
 
-/// Plan `file` into `store` over what the key holds.
-pub fn plan_for(
-    file: &ImportFile,
-    store: Store,
-    first_slot: u8,
-    existing: Existing,
-    replace: bool,
-) -> Plan {
-    keyroost_import::plan::plan(
-        file,
-        &Target {
-            store,
-            first_slot,
-            existing,
-            replace,
-        },
-    )
-}
-
 /// How many entries the store's rules accept (nothing read from the key):
 /// the "N of M can be stored" count next to each destination.
 pub fn fit_count(file: &ImportFile, store: Store, first_slot: u8) -> usize {
@@ -271,27 +254,6 @@ pub fn molto_slot_count(plan: &Plan) -> usize {
         .count()
 }
 
-/// The export's layout, as the dialog's file line names it.
-pub fn format_name(f: Format) -> &'static str {
-    match f {
-        Format::Aegis => "Aegis",
-        Format::AegisEncrypted => "Aegis (encrypted)",
-        Format::TwoFas => "2FAS",
-        Format::OtpauthList => "otpauth:// list",
-        Format::QrImage => "QR screenshot",
-        Format::GoogleExport => "Google Authenticator export",
-    }
-}
-
-/// "SHA-1", "SHA-256", "SHA-512".
-fn hash_name(h: HashAlg) -> &'static str {
-    match h {
-        HashAlg::Sha1 => "SHA-1",
-        HashAlg::Sha256 => "SHA-256",
-        HashAlg::Sha512 => "SHA-512",
-    }
-}
-
 /// One entry row: `label · TOTP 30 s · SHA-1 · 6 digits` (or `· HOTP ·`),
 /// or `label — reason` for an entry no key can take. The flag is false for
 /// the latter (drawn dimmed).
@@ -307,7 +269,7 @@ pub fn entry_line(item: &keyroost_import::ImportItem) -> (String, bool) {
                     "{} \u{b7} {} \u{b7} {} \u{b7} {} digits",
                     item.label,
                     kind,
-                    hash_name(e.hash),
+                    e.hash.name(),
                     e.digits
                 ),
                 true,
@@ -348,56 +310,26 @@ pub fn holds_line(plan: &Plan, first_slot: u8) -> String {
     }
 }
 
-/// One preview row: `label — will be added` (Molto2: `#95 label — …`).
-pub fn plan_row_line(row: &keyroost_import::plan::PlanRow, store: Store) -> String {
-    let what = match &row.verdict {
-        Verdict::Add => "will be added".to_owned(),
-        Verdict::Replace => match store {
-            Store::Molto2 => "will replace what is in this slot".to_owned(),
-            _ => "will replace the one on the key".to_owned(),
-        },
-        Verdict::Exists => "already on the key".to_owned(),
-        Verdict::Skip(s) => format!("skipped: {}", s.reason(store)),
-    };
-    match &row.name {
-        Some(StoredName::Molto2 { slot, .. }) => {
-            format!("#{slot:02} {} \u{2014} {what}", row.label)
-        }
-        _ => format!("{} \u{2014} {what}", row.label),
+/// One preview row, in the words the CLI preview uses:
+/// `GitHub:alice — add`, `#05 GitHub — replace: replaces the code in this
+/// slot`, `Bank — skip: Solo 2 doesn't take SHA-512 codes`.
+pub fn plan_row_line(row: &PlanRow, store: Store) -> String {
+    let mut s = format!("{} \u{2014} {}", row.shown_label(), row.verdict.word());
+    if let Some(reason) = row.verdict.reason(store) {
+        s.push_str(": ");
+        s.push_str(&reason);
     }
+    s
 }
 
-/// One report row: `label — added` / `— not added: reason`.
+/// One report row (its label carries a Molto2 slot number):
+/// `#05 GitHub — added`, `Bank — failed: <the key's error>`.
 pub fn outcome_line(label: &str, o: &Outcome) -> String {
-    let what = match o {
-        Outcome::Added => "added".to_owned(),
-        Outcome::Replaced => "replaced".to_owned(),
-        Outcome::AlreadyThere => "already there".to_owned(),
-        Outcome::RemovedNotAdded(e) => format!("removed, not added: {e}"),
-        Outcome::Failed(e) => format!("not added: {e}"),
-        Outcome::NoRoom => "not added: the key is full".to_owned(),
-        Outcome::NotTried => "not added: stopped before this one".to_owned(),
-    };
-    format!("{label} \u{2014} {what}")
-}
-
-/// The report's summary line.
-pub fn report_summary(r: &Report) -> String {
-    let added = r.count(|o| matches!(o, Outcome::Added));
-    let replaced = r.count(|o| matches!(o, Outcome::Replaced));
-    let there = r.count(|o| matches!(o, Outcome::AlreadyThere));
-    let not = r.rows.len() - added - replaced - there;
-    let mut s = format!("Added {added}");
-    if replaced > 0 {
-        s.push_str(&format!(", replaced {replaced}"));
+    let mut s = format!("{label} \u{2014} {}", o.word().replace('-', " "));
+    if let Some(reason) = o.reason() {
+        s.push_str(": ");
+        s.push_str(&reason);
     }
-    if there > 0 {
-        s.push_str(&format!(", already there {there}"));
-    }
-    if not > 0 {
-        s.push_str(&format!(", not added {not}"));
-    }
-    s.push('.');
     s
 }
 
@@ -411,6 +343,9 @@ pub const MOLTO_SLOTS_UNREAD: &str = "Slot use is read when the Molto2 is unlock
 /// Shown for an unlocked Molto2 whose slot sweep failed.
 pub const MOLTO_SLOTS_FAILED: &str =
     "Slot use couldn't be read; click Refresh slots in the Molto2 view.";
+
+/// Shown for an OATH destination with no smart-card reader.
+pub const NO_SMART_CARD: &str = "This key has no smart-card interface to reach its OATH codes.";
 
 /// Shown for a Token2 key supplied without the on-device OTP function.
 pub const NO_OTP_FUNCTION: &str = "This key was supplied without the on-device OTP \
@@ -436,7 +371,8 @@ pub enum ImportBlock {
     KeyNotRead,
     /// The OATH password / OTP PIN is needed.
     Locked(StoreKind),
-    /// #171: the Molto2 isn't the selected device (or not connected).
+    /// The chosen Molto2's session isn't open yet (choosing it selects it,
+    /// which opens the session).
     NoMoltoSession,
     /// #171: the Molto2 isn't unlocked (Authenticate button).
     MoltoNotUnlocked,
@@ -551,11 +487,12 @@ impl ImportBlock {
             Self::Locked(_) => "This key's codes are protected by a password. Enter its OATH \
                  password and click Unlock."
                 .to_owned(),
-            Self::NoMoltoSession => {
-                "No Molto2 selected. Connect one and select it in the list on the left.".to_owned()
-            }
+            Self::NoMoltoSession => "Opening the Molto2\u{2026} If this doesn't finish, \
+                 unplug it and plug it back in."
+                .to_owned(),
             Self::MoltoNotUnlocked => "The Molto2 is not unlocked yet. Click Authenticate \
-                 (uses the customer key from the Molto2 view; blank = factory default)."
+                 (uses the factory-default customer key unless another one is entered \
+                 in the Molto2 view)."
                 .to_owned(),
             Self::MoltoTooMany { start, count, fit } => {
                 let verb = if *fit == 1 { "fits" } else { "fit" };
@@ -605,7 +542,8 @@ pub struct ImportDialog {
     pub dest: Option<DestKey>,
     /// Whether the person has picked (preselection never overrides a pick).
     pub dest_picked: bool,
-    /// "Replace existing entries with the same name" (OATH / Token2 OTP).
+    /// "Replace codes already on the key that have the same name" (OATH /
+    /// Token2 OTP).
     pub replace: bool,
     /// What the chosen key holds, read by the preview job; reused when only
     /// `replace` changes.
@@ -625,8 +563,13 @@ pub struct ImportDialog {
     /// `(done, total)` while the Add job writes.
     pub running: Option<Arc<Mutex<(usize, usize)>>>,
     pub report: Option<Report>,
+    /// The report's counts line ([`Report::summary`] over the plan it ran).
+    pub report_line: String,
     /// The last Molto2 Authenticate failed (#171).
     pub auth_failed: bool,
+    /// The destination just became a Molto2: select that Molto2 in the app
+    /// (as clicking it in the list would), which opens its session.
+    pub select_molto: bool,
 }
 
 impl Drop for ImportDialog {
@@ -665,6 +608,7 @@ impl ImportDialog {
         self.file = None;
         self.existing = None;
         self.report = None;
+        self.report_line.clear();
         self.auth_failed = false;
     }
 
@@ -682,7 +626,21 @@ impl ImportDialog {
         self.dest_error = None;
         self.report = None;
         self.preview_wanted = dest.as_ref().is_some_and(|d| d.store != StoreKind::Molto2);
+        self.select_molto = dest.as_ref().is_some_and(|d| d.store == StoreKind::Molto2);
         self.dest = dest;
+    }
+
+    /// The Molto2 to select now, once per choice: the chosen Molto2 when
+    /// another device (or none) is selected. The dialog's destination is
+    /// the choice; the list on the left follows it.
+    pub fn take_molto_select(&mut self, selected: Option<&DeviceId>) -> Option<DeviceId> {
+        if !std::mem::take(&mut self.select_molto) {
+            return None;
+        }
+        self.dest
+            .as_ref()
+            .filter(|k| k.store == StoreKind::Molto2 && Some(&k.device) != selected)
+            .map(|k| k.device.clone())
     }
 
     /// Follow the connected keys: a destination that went away is cleared
@@ -731,7 +689,8 @@ enum Preview {
 
 /// What the Add job did.
 enum Added {
-    Done(Report),
+    /// The run's report and its counts line.
+    Done(Report, String),
     /// The key's codes changed since the preview; nothing was written.
     Changed(Existing, Option<(u8, u8, u8)>),
     Locked,
@@ -903,6 +862,10 @@ impl App {
     pub(crate) fn import_auth_result(&mut self, ok: bool) {
         if let Some(d) = self.import_flow.dialog.as_mut() {
             d.auth_failed = !ok;
+            if ok {
+                // A "not unlocked" line from an earlier Add is no longer true.
+                d.dest_error = None;
+            }
         }
     }
 
@@ -922,15 +885,10 @@ impl App {
         );
     }
 
-    /// Close the dialog by a route outside its window (a finished Molto2
-    /// import): wipe, scrub the fields' undo history, and let the queue go on.
-    fn import_close_dialog(&mut self) {
-        if let Some(mut d) = self.import_flow.dialog.take() {
-            d.close();
-        }
-        if let Some(ctx) = self.egui_ctx.clone() {
-            clear_edit_undo(&ctx, egui::Id::new(FILE_PASSWORD_ID));
-            clear_edit_undo(&ctx, egui::Id::new(DEST_SECRET_ID));
+    /// "Add" couldn't start: say why on the dialog's line, never nothing.
+    fn import_add_refused(&mut self, why: &str) {
+        if let Some(d) = self.import_flow.dialog.as_mut() {
+            d.dest_error = Some(why.to_owned());
         }
     }
 
@@ -1022,13 +980,7 @@ impl App {
             StoreKind::Molto2 => return,
             StoreKind::Oath => {
                 let Some(reader) = dev.reader.clone() else {
-                    self.import_set_preview(
-                        id,
-                        &dest,
-                        Preview::Failed(
-                            "This key has no smart-card interface to reach its OATH codes.".into(),
-                        ),
-                    );
+                    self.import_set_preview(id, &dest, Preview::Failed(NO_SMART_CARD.into()));
                     return;
                 };
                 let pw = oath_pw;
@@ -1230,6 +1182,7 @@ impl App {
             return;
         };
         let Some(dev) = self.import_device(&dest.device).cloned() else {
+            self.import_add_refused("The key is no longer connected.");
             return;
         };
         let id = d.id;
@@ -1239,7 +1192,7 @@ impl App {
         let otp_pin = self.import_otp_pin(d, &dest);
         let progress = Arc::new(Mutex::new((0usize, shown.writes().count())));
         let counter = progress.clone();
-        let on_progress = move |done: usize, total: usize, _label: &str| {
+        let on_progress = move |done: usize, total: usize, _row: &PlanRow| {
             if let Ok(mut g) = counter.lock() {
                 *g = (done, total);
             }
@@ -1247,11 +1200,15 @@ impl App {
         let label = format!("Adding codes to {}\u{2026}", dev.title());
         let queued = match dest.store {
             StoreKind::Molto2 => {
-                if !self.ensure_auth() {
+                if !self.authenticated {
+                    self.import_add_refused(
+                        "The Molto2 is not unlocked yet. Click Authenticate, then Add.",
+                    );
                     return;
                 }
                 let for_device = self.selected_device.clone();
                 let Some(mut s) = self.take_molto_session() else {
+                    self.import_add_refused("The Molto2 isn't ready yet; try again in a moment.");
                     return;
                 };
                 self.spawn_job(label, move || {
@@ -1261,6 +1218,7 @@ impl App {
                             keyroost_transport::import::MoltoImportStore::new(&mut s, timeout);
                         keyroost_import::run::run(&file, &shown, &mut store, &mut on_progress)
                     };
+                    let line = report.summary(&shown);
                     drop(file);
                     // Public-block sweep, as after every Molto2 write: a
                     // failed sweep keeps the old slot list.
@@ -1272,55 +1230,59 @@ impl App {
                         app.session = Some(s);
                         if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref())
                         {
-                            if let Some(m) = meta {
-                                app.slot_meta = Some(m);
+                            match meta {
+                                Some(m) => app.slot_meta = Some(m),
+                                // The sweep failed: read the slots again so
+                                // the list shows what was written.
+                                None => app.resweep_slot_meta(LogKind::Background),
                             }
                         }
-                        app.import_finish(id, &dest, Store::Molto2, Added::Done(report));
+                        app.import_finish(id, &dest, Added::Done(report, line));
                     })
                 })
             }
             StoreKind::Oath => {
                 let Some(reader) = dev.reader.clone() else {
+                    self.import_add_refused(NO_SMART_CARD);
                     return;
                 };
                 let pw = oath_pw;
                 let vendor = dev.vendor.clone();
                 self.spawn_job(label, move || {
                     let mut on_progress = on_progress;
-                    let (store, added) = (|| {
-                        let fallback = store_of(StoreKind::Oath, &vendor, None);
+                    let added = (|| {
                         let mut s = match keyroost_transport::OathSession::open(&reader) {
                             Ok(s) => s,
-                            Err(e) => return (fallback, Added::Failed(e.to_string())),
+                            Err(e) => return Added::Failed(e.to_string()),
                         };
                         if s.password_required() {
                             let Some(pw) = pw.as_ref() else {
-                                return (fallback, Added::Locked);
+                                return Added::Locked;
                             };
                             if let Err(e) = s.unlock(pw) {
-                                return (fallback, Added::Refused(e.to_string()));
+                                return Added::Refused(e.to_string());
                             }
                         }
                         let version = s.version();
                         let store = store_of(StoreKind::Oath, &vendor, version);
                         let ex = match keyroost_transport::import::read_oath_existing(&mut s) {
                             Ok(ex) => ex,
-                            Err(e) => return (store, Added::Failed(e.to_string())),
+                            Err(e) => return Added::Failed(e.to_string()),
                         };
                         let again = plan_for(&file, store, 0, ex.clone(), replace);
-                        if again.rows != shown.rows {
-                            return (store, Added::Changed(ex, version));
+                        if !again.same_rows(&shown) {
+                            return Added::Changed(ex, version);
                         }
                         let mut w = keyroost_transport::import::OathImportStore::new(&mut s)
                             .password_hint(OATH_PASSWORD_HINT);
                         let report =
                             keyroost_import::run::run(&file, &again, &mut w, &mut on_progress);
-                        (store, Added::Done(report))
+                        let line = report.summary(&again);
+                        Added::Done(report, line)
                     })();
                     drop(file);
                     drop(pw);
-                    Box::new(move |app: &mut App| app.import_finish(id, &dest, store, added))
+                    Box::new(move |app: &mut App| app.import_finish(id, &dest, added))
                 })
             }
             StoreKind::Token2Otp => {
@@ -1352,23 +1314,19 @@ impl App {
                             Err(e) => return Added::Failed(e.to_string()),
                         };
                         let again = plan_for(&file, Store::Token2Otp, 0, ex.clone(), replace);
-                        if again.rows != shown.rows {
+                        if !again.same_rows(&shown) {
                             return Added::Changed(ex, None);
                         }
                         let mut w =
                             keyroost_transport::import::Token2ImportStore::new(&mut s, pin.clone());
-                        Added::Done(keyroost_import::run::run(
-                            &file,
-                            &again,
-                            &mut w,
-                            &mut on_progress,
-                        ))
+                        let report =
+                            keyroost_import::run::run(&file, &again, &mut w, &mut on_progress);
+                        let line = report.summary(&again);
+                        Added::Done(report, line)
                     })();
                     drop(file);
                     drop(pin);
-                    Box::new(move |app: &mut App| {
-                        app.import_finish(id, &dest, Store::Token2Otp, added)
-                    })
+                    Box::new(move |app: &mut App| app.import_finish(id, &dest, added))
                 })
             }
         };
@@ -1384,23 +1342,19 @@ impl App {
     }
 
     /// Apply the Add job's result to the dialog it ran for.
-    fn import_finish(&mut self, id: u64, dest: &DestKey, store: Store, added: Added) {
+    fn import_finish(&mut self, id: u64, dest: &DestKey, added: Added) {
         let name = self
             .import_device(&dest.device)
             .map(|d| d.title().to_owned())
             .unwrap_or_default();
         let selected = self.selected_device.as_ref() == Some(&dest.device);
-        if let Added::Done(report) = &added {
+        if let Added::Done(report, line) = &added {
             let sev = if report.ok() && report.stopped.is_none() {
                 Severity::Ok
             } else {
                 Severity::Warn
             };
-            self.log_global(
-                sev,
-                LogKind::User,
-                format!("{name}: import: {}", report_summary(report)),
-            );
+            self.log_global(sev, LogKind::User, format!("{name}: import: {line}"));
             // The matching pane shows the new codes.
             if selected {
                 match dest.store {
@@ -1418,15 +1372,10 @@ impl App {
         }
         d.running = None;
         match added {
-            Added::Done(report) => {
-                // A Molto2 import that wrote everything closes the dialog,
-                // as the bulk dialog did; otherwise the report stays up.
-                let all_done = report.ok() && report.stopped.is_none();
-                if store == Store::Molto2 && all_done {
-                    self.import_close_dialog();
-                    return;
-                }
+            // Every destination, Molto2 included, shows its report.
+            Added::Done(report, line) => {
                 d.report = Some(report);
+                d.report_line = line;
             }
             Added::Changed(ex, version) => {
                 d.existing = Some((dest.clone(), ex, version));
@@ -1502,6 +1451,19 @@ impl App {
             d.follow_devices(&dests, pre);
             if d.dest != before {
                 clear_edit_undo(ctx, egui::Id::new(DEST_SECRET_ID));
+            }
+        }
+        // A Molto2 destination works on its own: select it (once per choice)
+        // as soon as no device job runs, which opens its session.
+        if !self.busy() {
+            let selected = self.selected_device.clone();
+            let to_select = self
+                .import_flow
+                .dialog
+                .as_mut()
+                .and_then(|d| d.take_molto_select(selected.as_ref()));
+            if let Some(id) = to_select {
+                self.select_device(id);
             }
         }
         let want_preview = self
@@ -1639,7 +1601,7 @@ impl App {
                         Some(StoreKind::Oath | StoreKind::Token2Otp) => {
                             ui.checkbox(
                                 &mut d.replace,
-                                "Replace existing entries with the same name",
+                                "Replace codes already on the key that have the same name",
                             );
                         }
                         Some(StoreKind::Molto2) => {
@@ -1726,7 +1688,7 @@ impl App {
                 // The report.
                 if let Some(report) = &d.report {
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new(report_summary(report)).color(p.txt));
+                    ui.label(egui::RichText::new(&d.report_line).color(p.txt));
                     egui::ScrollArea::vertical()
                         .id_salt("import-report")
                         .max_height(8.0 * 20.0)
@@ -1886,7 +1848,7 @@ pub fn file_line(d: &ImportDialog) -> String {
     let mut s = d.file_name.clone();
     if let Some(f) = d.format {
         s.push_str(" \u{2014} ");
-        s.push_str(format_name(f));
+        s.push_str(f.name());
     }
     if let Some(file) = &d.file {
         let n = file.items.len();
@@ -1901,6 +1863,7 @@ pub fn file_line(d: &ImportDialog) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keyroost_import::HashAlg;
     use keyroost_import::{ImportEntry, ImportItem};
 
     fn dev(id: &str, caps: &[Caps]) -> Device {
@@ -2395,16 +2358,19 @@ mod tests {
     }
 
     #[test]
-    fn import_block_molto_messages_match_171() {
+    fn import_block_molto_messages() {
         assert_eq!(ImportBlock::Loading.message(), "Still reading the file.");
         assert_eq!(
             ImportBlock::NoMoltoSession.message(),
-            "No Molto2 selected. Connect one and select it in the list on the left."
+            "Opening the Molto2\u{2026} If this doesn't finish, unplug it and plug it back in."
         );
+        // The dialog works on its own: no pointer to another view for the
+        // default key.
         assert_eq!(
             ImportBlock::MoltoNotUnlocked.message(),
             "The Molto2 is not unlocked yet. Click Authenticate \
-             (uses the customer key from the Molto2 view; blank = factory default)."
+             (uses the factory-default customer key unless another one is entered \
+             in the Molto2 view)."
         );
         assert_eq!(
             ImportBlock::MoltoTooMany {
@@ -2524,6 +2490,26 @@ mod tests {
     }
 
     #[test]
+    fn choosing_a_molto2_asks_to_select_it_once() {
+        let mut d = open_dialog();
+        let a = dk("a", StoreKind::Oath);
+        let m = dk("m", StoreKind::Molto2);
+        d.set_dest(Some(m.clone()), true);
+        let sel: DeviceId = "a".into();
+        // Another key is selected: select the Molto2, once.
+        assert_eq!(d.take_molto_select(Some(&sel)), Some(m.device.clone()));
+        assert_eq!(d.take_molto_select(Some(&sel)), None);
+        // Already selected: nothing to do.
+        d.set_dest(Some(a), true);
+        d.set_dest(Some(m.clone()), true);
+        assert_eq!(d.take_molto_select(Some(&m.device)), None);
+        // An OATH destination never selects anything.
+        let mut d = open_dialog();
+        d.set_dest(Some(dk("b", StoreKind::Oath)), true);
+        assert_eq!(d.take_molto_select(None), None);
+    }
+
+    #[test]
     fn preselection_never_overrides_a_pick() {
         let mut d = open_dialog();
         let a = dk("a", StoreKind::Oath);
@@ -2596,19 +2582,58 @@ mod tests {
     fn report_and_button_wording() {
         assert_eq!(add_button_text(9, "yubi"), "Add 9 codes to yubi");
         assert_eq!(add_button_text(1, "yubi"), "Add 1 code to yubi");
-        let r = Report {
-            rows: vec![
-                (0, "a".into(), Outcome::Added),
-                (1, "b".into(), Outcome::Replaced),
-                (2, "c".into(), Outcome::Failed("x".into())),
-                (3, "d".into(), Outcome::NotTried),
-            ],
-            stopped: Some("x".into()),
-        };
-        assert_eq!(report_summary(&r), "Added 1, replaced 1, not added 2.");
         assert_eq!(
             outcome_line("c", &Outcome::Failed("x".into())),
-            "c \u{2014} not added: x"
+            "c \u{2014} failed: x"
+        );
+        assert_eq!(
+            outcome_line("#05 GitHub", &Outcome::Added),
+            "#05 GitHub \u{2014} added"
+        );
+        assert_eq!(
+            outcome_line("d", &Outcome::NotTried),
+            "d \u{2014} not tried: stopped before this one"
+        );
+        assert_eq!(
+            outcome_line("e", &Outcome::AlreadyThere),
+            "e \u{2014} exists: already on the key; left as is"
+        );
+    }
+
+    #[test]
+    fn preview_rows_use_the_shared_words_and_keep_slots() {
+        let row = |name, verdict| PlanRow {
+            index: 0,
+            label: "GitHub".into(),
+            name,
+            verdict,
+        };
+        let m = Some(StoredName::Molto2 {
+            slot: 5,
+            title: "GitHub".into(),
+        });
+        assert_eq!(
+            plan_row_line(&row(m.clone(), Verdict::Add), Store::Molto2),
+            "#05 GitHub \u{2014} add"
+        );
+        assert_eq!(
+            plan_row_line(&row(m, Verdict::Replace), Store::Molto2),
+            "#05 GitHub \u{2014} replace: replaces the code in this slot"
+        );
+        let solo = Store::Oath(OathFamily::Solo2);
+        assert_eq!(
+            plan_row_line(
+                &row(
+                    None,
+                    Verdict::Skip(keyroost_import::plan::Skip::Hash(HashAlg::Sha512))
+                ),
+                solo
+            ),
+            "GitHub \u{2014} skip: Solo 2 doesn't take SHA-512 codes"
+        );
+        assert_eq!(
+            plan_row_line(&row(None, Verdict::Exists), solo),
+            "GitHub \u{2014} exists: already on the key; left as is"
         );
     }
 }

@@ -7,7 +7,7 @@
 use std::error::Error;
 use std::path::Path;
 
-use keyroost_import::plan::{Existing, OathFamily, Plan, Store, Target, Verdict};
+use keyroost_import::plan::{Existing, OathFamily, Plan, Store, Verdict};
 use keyroost_import::run::{CodeStore, Outcome, Report};
 use keyroost_import::{Format, ImportFile};
 use keyroost_qr::file::{OpenError, Opened, MAX_FILE_BYTES};
@@ -168,15 +168,7 @@ pub(crate) fn read_key_secret_given<I: SecretIo>(
 
 /// The plan for `existing` on `store`.
 fn plan_for(file: &ImportFile, store: Store, existing: Existing, replace: bool) -> Plan {
-    keyroost_import::plan::plan(
-        file,
-        &Target {
-            store,
-            first_slot: 0,
-            existing,
-            replace,
-        },
-    )
+    keyroost_import::plan::plan_for(file, store, 0, existing, replace)
 }
 
 /// Show the plan and ask. `None` when there is nothing more to do (a dry
@@ -219,7 +211,11 @@ fn preview_and_ask(
         return Ok(None);
     }
     let replacing = if c.replace > 0 {
-        format!(", replacing {} already there", c.replace)
+        format!(
+            " ({} of them replace{} a code of the same name)",
+            c.replace,
+            if c.replace == 1 { "s" } else { "" }
+        )
     } else {
         String::new()
     };
@@ -239,12 +235,13 @@ fn write_and_report(
     plan: &Plan,
     store: &mut dyn CodeStore,
 ) -> Result<(), Box<dyn Error>> {
-    let report = keyroost_import::run::run(file, plan, store, &mut |done, total, label| {
+    let report = keyroost_import::run::run(file, plan, store, &mut |done, total, row| {
         eprintln!(
-            "[{}/{}] adding {}",
+            "[{}/{}] {} {}",
             done + 1,
             total,
-            sanitize_terminal(label)
+            progress_word(&row.verdict),
+            sanitize_terminal(&row.shown_label())
         );
     });
     let summary = report_summary(plan, &report);
@@ -337,18 +334,6 @@ fn to_otp(
 /// the next line.
 const NAME_COLUMN_MAX: usize = 32;
 
-/// How the file's layout is named in the preview's first line.
-fn format_name(f: Format) -> &'static str {
-    match f {
-        Format::Aegis => "Aegis",
-        Format::AegisEncrypted => "Aegis, encrypted",
-        Format::TwoFas => "2FAS",
-        Format::OtpauthList => "otpauth:// list",
-        Format::QrImage => "QR screenshot",
-        Format::GoogleExport => "Google Authenticator export",
-    }
-}
-
 /// "OATH" or "OTP": the storage an import writes to, as the commands name it.
 fn store_word(store: Store) -> &'static str {
     match store {
@@ -358,24 +343,22 @@ fn store_word(store: Store) -> &'static str {
     }
 }
 
-/// The verdict as the preview's first column and the JSON's `plan`.
-fn verdict_word(v: &Verdict) -> &'static str {
+/// The progress line's verb for a write.
+fn progress_word(v: &Verdict) -> &'static str {
     match v {
-        Verdict::Add => "add",
-        Verdict::Replace => "replace",
-        Verdict::Exists => "exists",
-        Verdict::Skip(_) => "skip",
+        Verdict::Replace => "replacing",
+        _ => "adding",
     }
 }
 
-/// Why a row isn't a plain add, in plain words.
+/// Why a row isn't a plain add (the shared reason), plus the CLI's flag
+/// hint on a row left as is.
 fn verdict_reason(v: &Verdict, store: Store) -> Option<String> {
-    match v {
-        Verdict::Add => None,
-        Verdict::Replace => Some("replaces the code of the same name on the key".to_owned()),
-        Verdict::Exists => Some("already on the key (--replace replaces it)".to_owned()),
-        Verdict::Skip(s) => Some(s.reason(store)),
-    }
+    let reason = v.reason(store)?;
+    Some(match v {
+        Verdict::Exists => format!("{reason} (--replace replaces it)"),
+        _ => reason,
+    })
 }
 
 /// A row's name as shown: the stored name, else the file's label.
@@ -409,7 +392,7 @@ pub(crate) fn preview_lines(
         "{} in {} ({}) for {} {}:",
         entries(plan.rows.len()),
         sanitize_terminal(file_name),
-        format_name(format),
+        format.name(),
         key,
         store_word(plan.store)
     )];
@@ -421,7 +404,7 @@ pub(crate) fn preview_lines(
         .unwrap_or(0)
         .min(NAME_COLUMN_MAX);
     for (row, name) in plan.rows.iter().zip(&names) {
-        let word = verdict_word(&row.verdict);
+        let word = row.verdict.word();
         match verdict_reason(&row.verdict, plan.store) {
             None => out.push(format!("  {word:<10}{name}")),
             Some(reason) if name.chars().count() > width => {
@@ -444,27 +427,14 @@ pub(crate) fn preview_lines(
     out
 }
 
-/// Whether a write went through (or found its code already there).
-fn went_through(o: &Outcome) -> bool {
-    matches!(
-        o,
-        Outcome::Added | Outcome::Replaced | Outcome::AlreadyThere
-    )
-}
-
 /// The closing line of a run: `Ok` with the summary when every planned
 /// write went through, otherwise `Err` with the line saying where and why
 /// the run stopped (the CLI then exits 1).
 pub(crate) fn report_summary(plan: &Plan, report: &Report) -> Result<String, String> {
     let added = report.count(|o| matches!(o, Outcome::Added));
     let replaced = report.count(|o| matches!(o, Outcome::Replaced));
-    let c = plan.counts();
-    let Some(stop) = report.rows.iter().position(|(_, _, o)| !went_through(o)) else {
-        let left = c.exists + report.count(|o| matches!(o, Outcome::AlreadyThere));
-        return Ok(format!(
-            "Added {added}, replaced {replaced}; {left} left as is, {} skipped.",
-            c.skip
-        ));
+    let Some(stop) = report.rows.iter().position(|(_, _, o)| !o.went_through()) else {
+        return Ok(report.summary(plan));
     };
     let (_, label, outcome) = &report.rows[stop];
     let reason = match (&report.stopped, outcome) {
@@ -484,7 +454,7 @@ pub(crate) fn report_summary(plan: &Plan, report: &Report) -> Result<String, Str
 /// Nothing is written when the key's codes changed between the preview and
 /// the write (the person answered a question meanwhile).
 pub(crate) fn recheck(first: &Plan, second: &Plan) -> Result<(), String> {
-    if first.rows == second.rows {
+    if first.same_rows(second) {
         Ok(())
     } else {
         Err(
@@ -497,15 +467,11 @@ pub(crate) fn recheck(first: &Plan, second: &Plan) -> Result<(), String> {
 
 /// An outcome as the JSON's `outcome`, with the key's error where it has one.
 fn outcome_json(o: &Outcome) -> (&'static str, Option<String>) {
-    match o {
-        Outcome::Added => ("added", None),
-        Outcome::Replaced => ("replaced", None),
-        Outcome::AlreadyThere => ("already-there", None),
-        Outcome::RemovedNotAdded(e) => ("removed-not-added", Some(e.clone())),
-        Outcome::Failed(e) => ("failed", Some(e.clone())),
-        Outcome::NoRoom => ("no-room", None),
-        Outcome::NotTried => ("not-tried", None),
-    }
+    let error = match o {
+        Outcome::RemovedNotAdded(e) | Outcome::Failed(e) => Some(e.clone()),
+        _ => None,
+    };
+    (o.word(), error)
 }
 
 /// The `--json` shape: the plan, plus each write's outcome after a run.
@@ -521,7 +487,7 @@ pub(crate) fn import_json(plan: &Plan, report: Option<&Report>, dry_run: bool) -
                 index: row.index,
                 label: row.label.clone(),
                 name: row.name.as_ref().map(|n| n.to_string()),
-                plan: verdict_word(&row.verdict),
+                plan: row.verdict.word(),
                 reason: verdict_reason(&row.verdict, plan.store),
                 outcome: done.as_ref().map(|(o, _)| *o),
                 error: done.and_then(|(_, e)| e),
@@ -598,7 +564,7 @@ mod tests {
             "6 entries in vault.json (Aegis, encrypted) for solo-test (serial 1234) OATH:",
             "  add       Example:alice",
             "  add       60/Example:bob",
-            "  exists    Example:dup     already on the key (--replace replaces it)",
+            "  exists    Example:dup     already on the key; left as is (--replace replaces it)",
             "  replace   Example:old     replaces the code of the same name on the key",
             "  skip      Steam:me        Steam codes aren't supported",
             "  skip      Bank:x          Solo 2 doesn't take SHA-512 codes",
@@ -631,7 +597,7 @@ mod tests {
         assert_eq!(
             lines[2],
             format!(
-                "{}already on the key (--replace replaces it)",
+                "{}already on the key; left as is (--replace replaces it)",
                 " ".repeat(2 + 10 + NAME_COLUMN_MAX + 2)
             )
         );
@@ -709,13 +675,13 @@ mod tests {
                 Outcome::RemovedNotAdded("the key is full".into()),
             )],
             Some(
-                "the old entry Example:old was removed from the key, but the new one \
+                "the old code Example:old was removed from the key, but the new one \
                  could not be added (the key is full)",
             ),
         );
         let line = report_summary(&plan, &lost).unwrap_err();
         assert!(
-            line.contains("the old entry Example:old was removed"),
+            line.contains("the old code Example:old was removed"),
             "{line}"
         );
     }

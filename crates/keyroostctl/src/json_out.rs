@@ -506,7 +506,7 @@ pub(crate) struct ImportRowJson {
     pub plan: &'static str,
     /// Why it is skipped or left as is.
     pub reason: Option<String>,
-    /// After a run: "added", "replaced", "already-there",
+    /// After a run: "added", "replaced", "exists",
     /// "removed-not-added", "failed", "no-room" or "not-tried".
     pub outcome: Option<&'static str>,
     /// The key's error for "failed" and "removed-not-added".
