@@ -425,12 +425,12 @@ fn otpauth_golden() {
 // ---- the import plan's Molto2 rules ----------------------------------------
 
 /// The plan's Molto2 verdict for a one-entry file read by a wide reader:
-/// `true` when it would be written.
+/// the slot title when it would be written, `None` otherwise.
 fn molto_plan_writes(
     file: Result<keyroost_import::ImportFile, keyroost_import::BulkError>,
-) -> bool {
-    use keyroost_import::plan::{plan, Existing, Store, Target, Verdict};
-    let Ok(file) = file else { return false };
+) -> Option<String> {
+    use keyroost_import::plan::{plan, Existing, Store, StoredName, Target, Verdict};
+    let file = file.ok()?;
     assert!(file.items.len() <= 1, "{file:?}");
     let target = Target {
         store: Store::Molto2,
@@ -438,26 +438,30 @@ fn molto_plan_writes(
         existing: Existing::default(),
         replace: false,
     };
-    plan(&file, &target)
-        .rows
-        .first()
-        .is_some_and(|r| matches!(r.verdict, Verdict::Add | Verdict::Replace))
+    let row = plan(&file, &target).rows.into_iter().next()?;
+    match (row.verdict, row.name) {
+        (Verdict::Add | Verdict::Replace, Some(StoredName::Molto2 { title, .. })) => Some(title),
+        _ => None,
+    }
 }
 
-/// What the Molto2 path writes from a one-entry file: the narrow parser
-/// accepts it and the slot writer has a title for it (untitled entries are
-/// skipped at write time).
-fn molto_narrow_writes(r: Result<Vec<BulkEntry>, keyroost_import::BulkError>) -> bool {
-    matches!(r, Ok(v) if v.len() == 1 && !v[0].suggested_title().is_empty())
+/// What the Molto2 path writes from a one-entry file: the title, when the
+/// narrow parser accepts it and the slot writer has a title for it
+/// (untitled entries are skipped at write time).
+fn molto_narrow_writes(r: Result<Vec<BulkEntry>, keyroost_import::BulkError>) -> Option<String> {
+    match r {
+        Ok(v) if v.len() == 1 => Some(v[0].suggested_title()).filter(|t| !t.is_empty()),
+        _ => None,
+    }
 }
 
 #[test]
 fn molto_rules_match_narrow_acceptance() {
     let mut mismatches = Vec::new();
-    let mut check = |what: &str, narrow: bool, wide: bool| {
+    let mut check = |what: &str, narrow: Option<String>, wide: Option<String>| {
         if narrow != wide {
             mismatches.push(format!(
-                "{what}: narrow writes {narrow}, plan writes {wide}"
+                "{what}: narrow writes {narrow:?}, plan writes {wide:?}"
             ));
         }
     };
@@ -472,6 +476,9 @@ fn molto_rules_match_narrow_acceptance() {
         AEGIS_SECRET64,
         AEGIS_EMPTY_ISSUER,
         AEGIS_DUP_COUNTER,
+        // Titles cut at 12 bytes, on a character boundary.
+        r#"{"type":"totp","name":"x","issuer":"Ünïcödé Company","info":{"secret":"JBSWY3DPEHPK3PXP"}}"#,
+        r#"{"type":"totp","name":"alice@example.com","issuer":"","info":{"secret":"JBSWY3DPEHPK3PXP"}}"#,
     ] {
         let doc = aegis_doc(&[e]);
         check(

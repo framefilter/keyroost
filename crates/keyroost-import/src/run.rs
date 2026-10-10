@@ -86,8 +86,14 @@ struct Stop {
     rest: Outcome,
 }
 
-/// The stop reason when a replace lost the old entry.
-const REMOVED_NOT_ADDED: &str = "the old entry was removed but the new one could not be added";
+/// The stop reason when a replace lost the old entry: what is gone, which
+/// entry, and why the new one wasn't stored.
+fn removed_not_added(name: &StoredName, why: &StoreError) -> String {
+    format!(
+        "the old entry {} was removed from the key, but the new one could not be added ({})",
+        name, why
+    )
+}
 
 /// Write every Add/Replace row of `plan`, one at a time.
 /// `progress(done, total, label)` is called before each write.
@@ -178,7 +184,7 @@ fn write_one(
                 Err(e) => (
                     Outcome::RemovedNotAdded(e.to_string()),
                     Some(Stop {
-                        reason: REMOVED_NOT_ADDED.to_owned(),
+                        reason: removed_not_added(name, &e),
                         rest: Outcome::NotTried,
                     }),
                 ),
@@ -381,9 +387,32 @@ mod tests {
         );
         assert_eq!(
             r.stopped.as_deref(),
-            Some("the old entry was removed but the new one could not be added")
+            Some(
+                "the old entry A:a was removed from the key, but the new one could not be \
+                 added (the key refused it)"
+            )
         );
         assert!(!r.ok());
+
+        // The key filling up between the delete and the add says so too.
+        let mut s = FakeStore::default()
+            .on_add("A:a", vec![Err(StoreError::Exists), Err(StoreError::Full)]);
+        let r = go(&f, &p, &mut s);
+        assert_eq!(
+            outcomes(&r),
+            vec![
+                Outcome::RemovedNotAdded("the key is full".into()),
+                Outcome::NotTried,
+                Outcome::NotTried
+            ]
+        );
+        assert_eq!(
+            r.stopped.as_deref(),
+            Some(
+                "the old entry A:a was removed from the key, but the new one could not be \
+                 added (the key is full)"
+            )
+        );
     }
 
     #[test]

@@ -231,7 +231,7 @@ fn reason(skip: &Skip, device: &str, token2: bool) -> String {
             len, device, max
         ),
         Skip::NotAscii => format!(
-            "{} stores names in plain ASCII letters only, and this name has others",
+            "{} stores names in plain ASCII characters only, and this name has others",
             device
         ),
         Skip::AmbiguousName => "the name would read back differently on the key \
@@ -458,7 +458,14 @@ pub fn limits(store: Store) -> Limits {
             totp: PeriodRule::Any,
             // u32 counter [S11]; see `Note::Solo2Hotp`.
             hotp: HotpRule::CounterU32,
-            // Spec cap (the research found only an implicit 256-byte buffer).
+            // Spec cap, kept at 64 on purpose. The applet serializes each
+            // credential into a 256-byte buffer [S11]; a 127-byte name plus a
+            // 64-byte secret plus the few type/digits/counter bytes comes to
+            // roughly 200, under that bound by the source's layout. That is an
+            // estimate, not a measurement: the 127-byte name measurement did
+            // not test long secrets with it, and edge probing on the key is
+            // off the table. 64 bytes covers real services' seeds (20–64), so
+            // nothing higher is offered.
             secret_max: Some(64),
             // No count limit in the applet [S11]: unknown.
             capacity: None,
@@ -552,9 +559,13 @@ fn looks_like_period_prefix(s: &str) -> bool {
 /// Name an entry for an OATH family (decision 3), or say why it can't be
 /// named. Lengths aren't checked here.
 pub fn oath_name(e: &ImportEntry, family: OathFamily) -> Result<String, Skip> {
-    let totp_period = match e.kind {
-        OtpKind::Totp { period } => Some(period),
-        OtpKind::Hotp { .. } => None,
+    // Clients read a TOTP name's leading `<digits>/` as its period [S5];
+    // Nitrokey 3 keeps no period in the name [S23][S24], so nothing is read
+    // there.
+    let period_read = matches!(e.kind, OtpKind::Totp { .. }) && family != OathFamily::Nitrokey3;
+    let prefix = match e.kind {
+        OtpKind::Totp { period } if period != 30 && period_read => Some(period),
+        _ => None,
     };
     let base = match (e.issuer.as_deref(), e.account.as_deref()) {
         (Some(i), Some(a)) => {
@@ -563,20 +574,20 @@ pub fn oath_name(e: &ImportEntry, family: OathFamily) -> Result<String, Skip> {
             }
             format!("{}:{}", i, a)
         }
-        (Some(one), None) | (None, Some(one)) => {
-            // A single part is read back as an issuer if it has ':', and as a
-            // period if it starts `<digits>/` on a TOTP name.
-            if one.contains(':') || (totp_period.is_some() && looks_like_period_prefix(one)) {
-                return Err(Skip::AmbiguousName);
-            }
-            one.to_owned()
+        // A single part with ':' would be read back as `issuer:account`.
+        (Some(one), None) | (None, Some(one)) if one.contains(':') => {
+            return Err(Skip::AmbiguousName)
         }
+        (Some(one), None) | (None, Some(one)) => one.to_owned(),
         (None, None) => return Err(Skip::NoName),
     };
-    match totp_period {
-        // Nitrokey 3 stores no period, so the name never carries one.
-        Some(p) if p != 30 && family != OathFamily::Nitrokey3 => Ok(format!("{}/{}", p, base)),
-        _ => Ok(base),
+    match prefix {
+        // After an explicit prefix the rest reads back whole.
+        Some(p) => Ok(format!("{}/{}", p, base)),
+        // A 30 s name starting `<digits>/` (issuer or bare account) would
+        // be read as a period.
+        None if period_read && looks_like_period_prefix(&base) => Err(Skip::AmbiguousName),
+        None => Ok(base),
     }
 }
 
@@ -588,17 +599,6 @@ pub fn token2_name(e: &ImportEntry) -> Result<(String, String), Skip> {
         (None, Some(one)) | (Some(one), None) => Ok((String::new(), one.to_owned())),
         (None, None) => Err(Skip::NoName),
     }
-}
-
-/// The Molto2 title (`BulkEntry::suggested_title`): issuer, else account,
-/// cut to 12 bytes on a character boundary.
-fn molto_title(e: &ImportEntry) -> String {
-    let candidate = e.issuer.as_deref().or(e.account.as_deref()).unwrap_or("");
-    let mut end = candidate.len().min(12);
-    while end > 0 && !candidate.is_char_boundary(end) {
-        end -= 1;
-    }
-    candidate[..end].to_owned()
 }
 
 /// The parameter checks of step 2: kind, hash, digits, period, counter,
@@ -711,7 +711,8 @@ pub fn plan(file: &ImportFile, target: &Target) -> Plan {
             Ok(e) => match check_params(e, store, &lim) {
                 Err(s) => (None, Verdict::Skip(s)),
                 Ok(()) if store == Store::Molto2 => {
-                    let title = molto_title(e);
+                    let title =
+                        crate::entry::molto_title(e.issuer.as_deref(), e.account.as_deref());
                     if title.is_empty() {
                         // The Molto2 writer skips untitled entries (no issuer
                         // or account to show).
@@ -1330,6 +1331,59 @@ mod tests {
     }
 
     #[test]
+    fn issuer_that_looks_like_a_period_is_ambiguous_at_30s() {
+        let mk = |kind| entry(Some("2024/Corp"), Some("bob"), 20, HashAlg::Sha1, 6, kind);
+        // "2024/Corp:bob" would read back as a 2024-second code.
+        assert_eq!(one(YK57, mk(TOTP30)), Verdict::Skip(Skip::AmbiguousName));
+        assert_eq!(one(SOLO, mk(TOTP30)), Verdict::Skip(Skip::AmbiguousName));
+        // With a prefix the issuer reads back whole: "60/2024/Corp:bob".
+        let p = plan(
+            &file(vec![mk(OtpKind::Totp { period: 60 })]),
+            &target(YK57, vec![], false),
+        );
+        assert_eq!(p.rows[0].verdict, Verdict::Add);
+        assert_eq!(p.rows[0].name, Some(oath("60/2024/Corp:bob")));
+        // HOTP names are never read for a period.
+        assert_eq!(one(YK57, mk(OtpKind::Hotp { counter: 0 })), Verdict::Add);
+        // Nitrokey 3 doesn't keep the period in the name, so nothing is misread.
+        assert_eq!(one(NK3, mk(TOTP30)), Verdict::Add);
+        let bare = entry(None, Some("30/x"), 20, HashAlg::Sha1, 6, TOTP30);
+        assert_eq!(one(NK3, bare), Verdict::Add);
+    }
+
+    #[test]
+    fn replace_on_a_full_key_is_not_skipped_for_room() {
+        // Nitrokey 3 holds 50: a full key still plans the replace (deleting
+        // the old entry frees its place); only the new name has no room.
+        let mut names: Vec<StoredName> = (0..49).map(|i| oath(&format!("Old:{}", i))).collect();
+        names.push(oath("A:a"));
+        let f = file(vec![simple("A", "a"), simple("B", "b")]);
+        let p = plan(&f, &target(NK3, names, true));
+        assert_eq!(
+            verdicts(&p),
+            vec![
+                Verdict::Replace,
+                Verdict::Skip(Skip::NoRoom { capacity: 50 })
+            ]
+        );
+    }
+
+    #[test]
+    fn molto_title_is_the_molto2_writers_title() {
+        let mk = |i: Option<&str>, a: Option<&str>| entry(i, a, 20, HashAlg::Sha1, 6, TOTP30);
+        let title = |e| match plan(&file(vec![e]), &target(Store::Molto2, vec![], false)).rows[0]
+            .name
+            .clone()
+        {
+            Some(StoredName::Molto2 { title, .. }) => title,
+            other => panic!("{other:?}"),
+        };
+        // Issuer first, else account; cut to 12 bytes on a character boundary.
+        assert_eq!(title(mk(Some("Ünïcödé Company"), Some("x"))), "Ünïcödé ");
+        assert_eq!(title(mk(None, Some("alice@example.com"))), "alice@exampl");
+    }
+
+    #[test]
     fn same_name_in_file_skips_the_second() {
         let f = file(vec![
             simple("Example", "alice"),
@@ -1664,6 +1718,10 @@ mod tests {
             .contains("Nitrokey 3 holds 50"));
         assert!(Skip::Counter(3).reason(Store::Token2Otp).contains("Token2"));
         assert!(Skip::Hotp.reason(Store::Molto2).contains("Molto2"));
+        assert_eq!(
+            Skip::NotAscii.reason(Store::Token2Otp),
+            "this Token2 key stores names in plain ASCII characters only, and this name has others"
+        );
         // Without a destination, the device is "this key".
         assert_eq!(
             Skip::Digits(10).to_string(),

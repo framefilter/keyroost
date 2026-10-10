@@ -50,16 +50,7 @@ impl Drop for BulkEntry {
 
 impl BulkEntry {
     pub fn suggested_title(&self) -> String {
-        let candidate = self
-            .issuer
-            .as_deref()
-            .or(self.account.as_deref())
-            .unwrap_or("");
-        let mut end = candidate.len().min(12);
-        while end > 0 && !candidate.is_char_boundary(end) {
-            end -= 1;
-        }
-        candidate[..end].to_owned()
+        crate::entry::molto_title(self.issuer.as_deref(), self.account.as_deref())
     }
 
     pub fn to_profile_config(
@@ -518,6 +509,21 @@ pub mod twofas {
         serde_json::from_str::<P>(json).ok().map(|p| p.services.0)
     }
 
+    /// The counter pass over `services`: each service's `otp` counter and
+    /// nothing else — the seed (`secret`) and every other key are skipped
+    /// unread, so no second copy of any seed is made.
+    #[derive(Deserialize)]
+    struct CounterRoot {
+        #[serde(default = "Vec::new")]
+        services: Vec<CounterService>,
+    }
+
+    #[derive(Deserialize)]
+    struct CounterService {
+        #[serde(default)]
+        otp: super::CounterOnly,
+    }
+
     /// Read the plaintext `services`, or the encrypted-export error.
     fn read_root<O: serde::de::DeserializeOwned + Default>(
         json: &str,
@@ -568,7 +574,7 @@ pub mod twofas {
         }
         // As for Aegis: the Molto2 path's fields, then the counters alone.
         let root = read_root::<Otp>(json)?;
-        let counters = read_root::<super::CounterOnly>(json)?;
+        let counters: CounterRoot = serde_json::from_str(json)?;
         let items: Vec<ImportItem> = root
             .services
             .iter()

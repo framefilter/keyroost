@@ -163,6 +163,18 @@ pub(crate) fn name_label(issuer: Option<&str>, account: Option<&str>) -> Option<
     }
 }
 
+/// The title a Molto2 slot gets: the issuer, else the account, cut to 12
+/// bytes on a character boundary (empty when there is neither). One rule for
+/// the Molto2 writer (`BulkEntry::suggested_title`) and the import plan.
+pub(crate) fn molto_title(issuer: Option<&str>, account: Option<&str>) -> String {
+    let candidate = issuer.or(account).unwrap_or("");
+    let mut end = candidate.len().min(12);
+    while end > 0 && !candidate.is_char_boundary(end) {
+        end -= 1;
+    }
+    candidate[..end].to_owned()
+}
+
 /// Map a hash name as exports spell it (case-insensitive).
 pub(crate) fn hash_from_name(name: &str) -> Result<HashAlg, Unusable> {
     match name.to_ascii_uppercase().as_str() {
