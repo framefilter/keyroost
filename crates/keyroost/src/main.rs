@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod import_flow;
 mod otp_pane;
 #[cfg(feature = "qr")]
 mod qrscan;
@@ -3162,6 +3163,8 @@ struct App {
     import_dialog: ImportDialog,
     /// Bulk-import dialog state.
     bulk_dialog: BulkDialog,
+    /// Files waiting to be read, and the import dialog or notice showing.
+    import_flow: import_flow::ImportFlow,
     /// Unified device list (physical keys + Molto2 tokens), most recent scan.
     devices: Vec<Device>,
     /// Selected device id — stable across refreshes so the pane doesn't jump
@@ -3399,7 +3402,7 @@ struct App {
 /// Which path text field a resolved file-chooser result should populate. Keeps
 /// the dialog plumbing generic — one helper, one drain loop, no per-field
 /// duplication.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum FileTarget {
     /// OpenPGP "Import RSA-2048" key file (`openpgp.import_path`).
     OpenpgpImport,
@@ -3420,6 +3423,9 @@ enum FileTarget {
     /// certificate — same reason `LbExport` carries an index: two save dialogs
     /// can be open at once, and each must resolve to its own certificate.
     SshCertSave(u64),
+    /// "Import file…" in a key's view: the picked file joins the import
+    /// queue, remembering which view asked.
+    ImportCodes(import_flow::Origin),
 }
 
 /// An SSH certificate extracted from a credential's largeBlob, waiting for the
@@ -3587,6 +3593,9 @@ impl App {
                                         }
                                     }
                                 });
+                            }
+                            FileTarget::ImportCodes(origin) => {
+                                self.import_flow.enqueue([path], &origin);
                             }
                         }
                     } else {
@@ -4019,7 +4028,7 @@ impl App {
                 self.import_label = Some(label.into());
             }
             Err(e) => {
-                self.bulk_dialog.error = Some(format!("could not start import thread: {}", e));
+                self.import_thread_failed(format!("Couldn't start reading the file ({e})."));
             }
         }
     }
@@ -4042,7 +4051,7 @@ impl App {
                 // Import thread died (panicked) without sending a result.
                 self.import_rx = None;
                 self.import_label = None;
-                self.bulk_dialog.error = Some("import failed unexpectedly".into());
+                self.import_thread_failed("Reading the file failed unexpectedly.".into());
             }
         }
     }
@@ -11980,20 +11989,9 @@ impl eframe::App for App {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.1)));
             }
         }
-        // Dropping a file on the window routes it to the bulk-import dialog —
-        // the natural gesture for "import this screenshot/export".
-        let dropped = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .first()
-                .and_then(|f| f.path.as_ref())
-                .map(|p| p.display().to_string())
-        });
-        if let Some(path) = dropped {
-            self.bulk_dialog.open = true;
-            self.bulk_dialog.path = path;
-            self.bulk_load();
-        }
+        // Every file dropped on the window joins the import queue; each is
+        // read and identified in turn before anything opens.
+        self.import_take_drops(ctx);
 
         // Apply any results from background device jobs and the import
         // thread before drawing.
@@ -12007,6 +12005,8 @@ impl eframe::App for App {
         self.drain_import();
         // Land any path picked by a native file-chooser into its target field.
         self.drain_file_dialogs();
+        // The next waiting file starts once nothing else is showing or running.
+        self.import_start_next();
         let p = self.palette();
         // Rebuilding + re-applying egui Visuals every frame is wasted work;
         // only do it when a theme knob actually changed.
@@ -12144,6 +12144,7 @@ impl eframe::App for App {
         self.render_piv_confirms(ctx);
         self.render_piv_cred_modal(ctx, &p);
         self.molto_dialogs(ctx, &p);
+        self.render_import(ctx, &p);
 
         // Help popover, painted last so it sits above everything.
         if let Some(topic) = self.help_open {
@@ -17842,6 +17843,15 @@ impl App {
                     self.oath.add = OathAddDialog::opened();
                 }
                 ui.add_space(6.0);
+                if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked() {
+                    if let Some(id) = self.selected_device.clone() {
+                        self.import_pick_file(import_flow::Origin::View(import_flow::DestKey {
+                            device: id,
+                            store: import_flow::StoreKind::Oath,
+                        }));
+                    }
+                }
+                ui.add_space(6.0);
                 if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
                     self.load_oath_creds();
                 }
@@ -20325,9 +20335,13 @@ impl App {
                             self.sync_time_all();
                         }
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Default, "Bulk import\u{2026}").clicked() {
-                            self.bulk_dialog.open = true;
-                            self.bulk_dialog.start = self.slot;
+                        if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked() {
+                            self.import_pick_file(import_flow::Origin::View(
+                                import_flow::DestKey {
+                                    device: dev.id.clone(),
+                                    store: import_flow::StoreKind::Molto2,
+                                },
+                            ));
                         }
                         ui.add_space(6.0);
                         if theme::button(ui, p, BtnKind::Danger, "Factory reset\u{2026}").clicked() {
