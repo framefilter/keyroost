@@ -144,7 +144,7 @@ pub(crate) fn run_molto_import(
     };
     let dev = crate::target::select(Need::Molto2, m.reader, None)?;
     let reader = crate::target::reader_of(&dev)?;
-    let (serial, existing) = molto_slot_use(&reader, debug)?; // closed before the question
+    let (serial, existing) = molto_slot_use(&reader, debug, true)?; // closed before the question
     crate::warn_default_customer_key(&key);
     let first = molto_plan(&import, m.first_slot, existing);
     let view = KeyView::from_slot(m.first_slot);
@@ -216,7 +216,7 @@ fn molto_dry_run(
         return print_dry_run(&lines, &plan, false);
     };
     let read = crate::target::reader_of(&dev)
-        .and_then(|reader| molto_slot_use(&reader, debug).map(|(_, existing)| existing));
+        .and_then(|reader| molto_slot_use(&reader, debug, false).map(|(_, existing)| existing));
     let (existing, note) = slot_use_or_note(read);
     let plan = molto_plan(import, m.first_slot, existing);
     let view = KeyView {
@@ -242,11 +242,20 @@ fn slot_use_or_note(read: Result<Existing, Box<dyn Error>>) -> (Existing, Option
 }
 
 /// The Molto2's serial and used slots, read in a short session with no key.
-fn molto_slot_use(reader: &str, debug: bool) -> Result<(String, Existing), Box<dyn Error>> {
+/// Before a real import the serial and clock go to stderr, as before every
+/// Molto2 write (which token, and the clock-drift warning); a dry run writes
+/// nothing, so it skips them.
+fn molto_slot_use(
+    reader: &str,
+    debug: bool,
+    show_info: bool,
+) -> Result<(String, Existing), Box<dyn Error>> {
     let mut session = Session::open_named(reader)?;
     session.set_debug(debug);
     let info = session.read_info()?;
-    crate::write_info(&mut std::io::stderr(), &info)?;
+    if show_info {
+        crate::write_info(&mut std::io::stderr(), &info)?;
+    }
     Ok((info.serial, read_molto_existing(&mut session)?))
 }
 
