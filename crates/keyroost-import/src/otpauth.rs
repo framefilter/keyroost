@@ -263,6 +263,9 @@ pub fn parse_entry_labeled(uri: &str) -> (Option<String>, Result<ImportEntry, Un
     let mut digits: u32 = 6;
     let mut period: u32 = 30;
     let mut counter: u64 = 0;
+    // Only a HOTP entry reads its counter; the Molto2 path ignores one on a
+    // TOTP URI, and so does this.
+    let mut counter_malformed = false;
     let mut malformed: Option<&'static str> = None;
     for (k, v) in query_params(query) {
         let v = match v {
@@ -290,9 +293,7 @@ pub fn parse_entry_labeled(uri: &str) -> (Option<String>, Result<ImportEntry, Un
             },
             "counter" => match v.parse() {
                 Ok(n) => counter = n,
-                Err(_) => {
-                    malformed.get_or_insert("the counter value isn't a number");
-                }
+                Err(_) => counter_malformed = true,
             },
             _ => {} // image, color, ... carry nothing a key stores
         }
@@ -307,6 +308,9 @@ pub fn parse_entry_labeled(uri: &str) -> (Option<String>, Result<ImportEntry, Un
         let kind = crate::entry::type_from_name(typ)?;
         if let Some(what) = malformed {
             return Err(Unusable::Malformed(what));
+        }
+        if counter_malformed && matches!(kind, crate::entry::TypeName::Hotp) {
+            return Err(Unusable::Malformed("the counter value isn't a number"));
         }
         let secret = crate::entry::decode_secret(secret_b32.as_deref().map_or("", |s| s))?;
         let hash = crate::entry::hash_from_name(algorithm.as_deref().unwrap_or("SHA1"))?;

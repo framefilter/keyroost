@@ -194,7 +194,7 @@ pub mod aegis {
     use super::*;
 
     // The JSON shape is shared by the narrow (Molto2) and wide mappings; only
-    // the per-entry `info` differs (`EntryInfo` vs `WideInfo`), so that the
+    // the per-entry `info` differs (`EntryInfo` vs `CounterOnly`), so that the
     // narrow path deserializes exactly the fields it always did.
     #[derive(Deserialize)]
     struct Root<I> {
@@ -266,25 +266,6 @@ pub mod aegis {
         }
     }
 
-    /// What the wide mapping reads: the same plus the HOTP counter.
-    #[derive(Deserialize)]
-    struct WideInfo {
-        secret: String,
-        algo: Option<String>,
-        digits: Option<u32>,
-        period: Option<u32>,
-        /// Lenient: a counter of an unexpected shape reads as absent.
-        #[serde(default, deserialize_with = "super::lenient_u64")]
-        counter: Option<u64>,
-    }
-
-    impl Drop for WideInfo {
-        fn drop(&mut self) {
-            use zeroize::Zeroize;
-            self.secret.zeroize();
-        }
-    }
-
     /// How many entries a plaintext export holds, counted without
     /// materializing any of them; `None` when the shape isn't a plaintext
     /// Aegis export (the full parse then reports why).
@@ -347,12 +328,16 @@ pub mod aegis {
         if count_entries(json).is_some_and(|n| n > MAX_ENTRIES) {
             return Err(BulkError::TooManyEntries);
         }
-        let db = read_db::<WideInfo>(json)?;
+        // Two reads: the Molto2 path's fields exactly as it reads them, then
+        // each entry's `counter` on its own (see `CounterOnly`).
+        let db = read_db::<EntryInfo>(json)?;
+        let counters = read_db::<super::CounterOnly>(json)?;
         let items: Vec<ImportItem> = db
             .entries
             .into_iter()
+            .zip(counters.entries)
             .enumerate()
-            .map(|(i, e)| {
+            .map(|(i, (e, c))| {
                 let label = name_label(e.issuer.as_deref(), e.name.as_deref())
                     .unwrap_or_else(|| format!("entry {}", i + 1));
                 let entry = wide_entry(
@@ -363,7 +348,7 @@ pub mod aegis {
                     e.info.algo.as_deref(),
                     e.info.digits.unwrap_or(6),
                     e.info.period.unwrap_or(30),
-                    e.info.counter.unwrap_or(0),
+                    c.info,
                 );
                 ImportItem {
                     index: i,
@@ -464,7 +449,7 @@ pub mod twofas {
     use super::*;
 
     // As for Aegis, the shape is shared and only `otp` differs between the
-    // narrow (`Otp`) and wide (`WideOtp`) mappings.
+    // narrow (`Otp`) and counter (`CounterOnly`) reads.
     #[derive(Deserialize)]
     #[serde(bound(deserialize = "O: Deserialize<'de> + Default"))]
     struct Root<O> {
@@ -499,21 +484,6 @@ pub mod twofas {
         algorithm: Option<String>,
         #[serde(rename = "tokenType")]
         token_type: Option<String>,
-    }
-
-    /// The wide mapping's `otp`: the same plus the HOTP counter.
-    #[derive(Deserialize, Default)]
-    struct WideOtp {
-        account: Option<String>,
-        issuer: Option<String>,
-        digits: Option<u32>,
-        period: Option<u32>,
-        algorithm: Option<String>,
-        #[serde(rename = "tokenType")]
-        token_type: Option<String>,
-        /// Lenient: a counter of an unexpected shape reads as absent.
-        #[serde(default, deserialize_with = "super::lenient_u64")]
-        counter: Option<u64>,
     }
 
     /// Whether `json` looks like a 2FAS export, without materializing any
@@ -596,12 +566,15 @@ pub mod twofas {
         if count_services(json).is_some_and(|n| n > MAX_ENTRIES) {
             return Err(BulkError::TooManyEntries);
         }
-        let root = read_root::<WideOtp>(json)?;
+        // As for Aegis: the Molto2 path's fields, then the counters alone.
+        let root = read_root::<Otp>(json)?;
+        let counters = read_root::<super::CounterOnly>(json)?;
         let items: Vec<ImportItem> = root
             .services
             .iter()
+            .zip(&counters.services)
             .enumerate()
-            .map(|(i, s)| {
+            .map(|(i, (s, c))| {
                 // Same issuer rule as the narrow mapping: the otp issuer,
                 // else the service name.
                 let issuer = s.otp.issuer.clone().or_else(|| s.name.clone());
@@ -615,7 +588,7 @@ pub mod twofas {
                     s.otp.algorithm.as_deref(),
                     s.otp.digits.unwrap_or(6),
                     s.otp.period.unwrap_or(30),
-                    s.otp.counter.unwrap_or(0),
+                    c.otp,
                 );
                 ImportItem {
                     index: i,
@@ -763,16 +736,119 @@ fn wide_entry(
     algo: Option<&str>,
     digits: u32,
     period: u32,
-    counter: u64,
+    counter: CounterOnly,
 ) -> Result<ImportEntry, Unusable> {
     let kind = type_from_name(typ)?;
     let secret = decode_secret(secret_b32)?;
     let hash = hash_from_name(algo.unwrap_or("SHA1"))?;
     let kind = match kind {
         TypeName::Totp => OtpKind::Totp { period },
-        TypeName::Hotp => OtpKind::Hotp { counter },
+        TypeName::Hotp if counter.repeated => {
+            return Err(Unusable::Malformed("the counter is given more than once"))
+        }
+        TypeName::Hotp => OtpKind::Hotp {
+            counter: counter.value.unwrap_or(0),
+        },
     };
     finish(issuer, account, secret, hash, digits, kind)
+}
+
+/// The `counter` of an Aegis `info` / 2FAS `otp` object, read on its own.
+///
+/// The wide readers read the other fields through the Molto2 path's own
+/// structs, then this in a second pass, so a file the Molto2 path takes is
+/// never refused for its counter: a `counter` key the Molto2 path ignores
+/// (repeated, or of an odd shape) can't fail the file here. Every other key
+/// is skipped unread — the seed included — and a value that isn't an object
+/// reads as no counter.
+#[derive(Default, Clone, Copy)]
+struct CounterOnly {
+    /// The last well-formed counter (lenient: an odd shape reads as absent).
+    value: Option<u64>,
+    /// `counter` appeared more than once: a HOTP entry is then unusable.
+    repeated: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for CounterOnly {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+        /// A key, compared without keeping it.
+        struct IsCounter(bool);
+        impl<'de> serde::Deserialize<'de> for IsCounter {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct K;
+                impl Visitor<'_> for K {
+                    type Value = IsCounter;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a key")
+                    }
+                    fn visit_str<E>(self, v: &str) -> Result<IsCounter, E> {
+                        Ok(IsCounter(v == "counter"))
+                    }
+                }
+                d.deserialize_str(K)
+            }
+        }
+        struct Lenient(Option<u64>);
+        impl<'de> serde::Deserialize<'de> for Lenient {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                lenient_u64(d).map(Lenient)
+            }
+        }
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = CounterOnly;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<CounterOnly, A::Error> {
+                let mut out = CounterOnly::default();
+                let mut seen = false;
+                while let Some(IsCounter(is)) = m.next_key()? {
+                    if is {
+                        out.repeated |= seen;
+                        seen = true;
+                        out.value = m.next_value::<Lenient>()?.0;
+                    } else {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(out)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<CounterOnly, A::Error> {
+                while a.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(CounterOnly::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<CounterOnly, E> {
+                Ok(CounterOnly::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<CounterOnly, E> {
+                Ok(CounterOnly::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<CounterOnly, E> {
+                Ok(CounterOnly::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<CounterOnly, E> {
+                Ok(CounterOnly::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<CounterOnly, E> {
+                Ok(CounterOnly::default())
+            }
+            fn visit_unit<E>(self) -> Result<CounterOnly, E> {
+                Ok(CounterOnly::default())
+            }
+            fn visit_none<E>(self) -> Result<CounterOnly, E> {
+                Ok(CounterOnly::default())
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                d: D,
+            ) -> Result<CounterOnly, D::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// `Option<u64>` from any JSON value: a non-negative integer becomes `Some`,
@@ -1290,6 +1366,50 @@ mod tests {
         assert_eq!(
             BulkError::TooManyEntries.to_string(),
             "more than 1000 entries; this isn't an authenticator export"
+        );
+    }
+
+    #[test]
+    fn wide_readers_read_the_counter_only_for_hotp() {
+        let kinds = |f: ImportFile| -> Vec<Result<OtpKind, Unusable>> {
+            f.items
+                .into_iter()
+                .map(|i| i.entry.map(|e| e.kind))
+                .collect()
+        };
+        // A repeated or odd counter on a TOTP entry is ignored, as the Molto2
+        // path ignores it; on a HOTP entry a repeated one is unusable.
+        let aegis = r#"{"db":{"entries":[
+            {"type":"totp","name":"a","issuer":"X","info":{"secret":"JBSWY3DP","counter":1,"counter":2}},
+            {"type":"hotp","name":"b","issuer":"X","info":{"secret":"JBSWY3DP","counter":1,"counter":2}},
+            {"type":"hotp","name":"c","issuer":"X","info":{"counter":"x","secret":"JBSWY3DP"}}]}}"#;
+        assert_eq!(
+            kinds(aegis::parse_wide(aegis).unwrap()),
+            vec![
+                Ok(OtpKind::Totp { period: 30 }),
+                Err(Unusable::Malformed("the counter is given more than once")),
+                Ok(OtpKind::Hotp { counter: 0 }),
+            ]
+        );
+        let twofas = r#"{"services":[
+            {"name":"A","secret":"JBSWY3DP","otp":{"account":"a","counter":1,"counter":2,"tokenType":"TOTP"}},
+            {"name":"B","secret":"JBSWY3DP","otp":{"account":"b","counter":1,"counter":2,"tokenType":"HOTP"}},
+            {"name":"C","secret":"JBSWY3DP","otp":{"account":"c","counter":7,"tokenType":"HOTP"}}]}"#;
+        assert_eq!(
+            kinds(twofas::parse_wide(twofas).unwrap()),
+            vec![
+                Ok(OtpKind::Totp { period: 30 }),
+                Err(Unusable::Malformed("the counter is given more than once")),
+                Ok(OtpKind::Hotp { counter: 7 }),
+            ]
+        );
+        let list = "otpauth://totp/A?secret=JBSWY3DP&counter=zz\notpauth://hotp/B?secret=JBSWY3DP&counter=zz\n";
+        assert_eq!(
+            kinds(parse_list_wide(list).unwrap()),
+            vec![
+                Ok(OtpKind::Totp { period: 30 }),
+                Err(Unusable::Malformed("the counter value isn't a number")),
+            ]
         );
     }
 }
