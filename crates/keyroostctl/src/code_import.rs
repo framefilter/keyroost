@@ -1,20 +1,23 @@
-//! `oath import` and `otp import`: read an authenticator export, show what
-//! each entry becomes on the chosen key, ask once, re-check the key, write,
-//! and report. The plan and the write loop live in `keyroost_import`; the
+//! `oath import`, `otp import` and `molto import --in`: read an
+//! authenticator export, show what each entry becomes on the chosen key,
+//! ask once, re-check the key, write, and report. The plan and the write loop live in `keyroost_import`; the
 //! per-key adapters in `keyroost_transport::import`. This module is the CLI
 //! flow around them plus the text and JSON they are shown as.
 
 use std::error::Error;
 use std::path::Path;
 
-use keyroost_import::plan::{Existing, OathFamily, Plan, Store, Verdict};
+use keyroost_import::plan::{Existing, OathFamily, Plan, Store, StoredName, Verdict};
 use keyroost_import::run::{CodeStore, Outcome, Report};
 use keyroost_import::{Format, ImportFile};
+use keyroost_proto::commands::DisplayTimeout;
 use keyroost_qr::file::{OpenError, Opened, MAX_FILE_BYTES};
-use keyroost_resolve::{Device, Need};
+use keyroost_resolve::{Device, Need, SelectError};
 use keyroost_transport::import::{
-    read_oath_existing, read_token2_existing, OathImportStore, Token2ImportStore,
+    read_molto_existing, read_oath_existing, read_token2_existing, MoltoImportStore,
+    OathImportStore, Token2ImportStore,
 };
+use keyroost_transport::Session;
 
 use crate::json_out::{ImportJson, ImportRowJson};
 use crate::output::{emit_json, json_output};
@@ -64,15 +67,7 @@ pub(crate) fn run_code_import(
         pair.second.check(&sec)?;
     }
     let import = read_import_file(&mut sec, file, pair.first.1)?;
-    let shown = Shown {
-        file_name: file
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file.display().to_string()),
-        format: import.format,
-        dry_run,
-        yes,
-    };
+    let shown = Shown::new(file, &import, dry_run, yes);
     match dest {
         CodeDest::Oath(access) => to_oath(
             &mut sec,
@@ -93,6 +88,154 @@ struct Shown {
     format: Format,
     dry_run: bool,
     yes: bool,
+}
+
+impl Shown {
+    fn new(file: &Path, import: &ImportFile, dry_run: bool, yes: bool) -> Self {
+        Shown {
+            file_name: file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.display().to_string()),
+            format: import.format,
+            dry_run,
+            yes,
+        }
+    }
+}
+
+/// `molto import --in`: the Molto2 and how to write to it.
+pub(crate) struct MoltoImport<'a> {
+    pub key: &'a crate::KeyArgs,
+    /// The molto group's `--reader`.
+    pub reader: Option<&'a str>,
+    /// The slot the first entry goes to; the others follow in order.
+    pub first_slot: u8,
+    pub display_timeout: DisplayTimeout,
+    pub file_password: Option<&'a SecretSource>,
+}
+
+/// `molto import --in`, on the same plan, preview, question, write and
+/// report as the other imports. Order: check the secret sources, read the
+/// customer key (stdin line 1) and the file (its password on line 2),
+/// select and announce the Molto2, read which slots are in use (no key
+/// needed), plan and preview, ask once, re-check, authenticate, write,
+/// report. Slots in use are replaced (the Molto2's slot model); entries the
+/// Molto2 can't store are skipped with the reason.
+///
+/// `--dry-run` writes nothing and needs no Molto2: with none connected the
+/// preview is made without slot use and says so.
+pub(crate) fn run_molto_import(
+    m: &MoltoImport<'_>,
+    file: &Path,
+    dry_run: bool,
+    yes: bool,
+    debug: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut sec = Secrets::real();
+    if m.file_password.is_some() {
+        sec.check(&FILE_PASSWORD, Source::from_flag(m.file_password))?;
+    }
+    let (key, import) = read_molto_import_secrets(&mut sec, m.key, file, m.file_password, dry_run)?;
+    let shown = Shown::new(file, &import, dry_run, yes);
+    let Some(key) = key else {
+        return molto_dry_run(m, &import, &shown, debug);
+    };
+    let dev = crate::target::select(Need::Molto2, m.reader, None)?;
+    let reader = crate::target::reader_of(&dev)?;
+    let (serial, existing) = molto_slot_use(&reader, debug)?; // closed before the question
+    crate::warn_default_customer_key(&key);
+    let first = plan_for_slots(&import, m.first_slot, existing);
+    let Some(asked) = preview_and_ask(&dev, &shown, &first)? else {
+        return Ok(());
+    };
+    crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
+    let mut session = Session::open_named(&reader)?;
+    session.set_debug(debug);
+    crate::same_molto(Some(&serial), &session.read_info()?.serial)?;
+    crate::molto_authenticate(&mut session, &key)?;
+    let again = plan_for_slots(&import, m.first_slot, read_molto_existing(&mut session)?);
+    recheck(&first, &again)?;
+    let mut writer = MoltoImportStore::new(&mut session, m.display_timeout);
+    write_and_report(&import, &again, &mut writer)
+}
+
+/// The customer key (stdin line 1), then the file (its password, when it
+/// needs one, on line 2). A dry run never uses the key: it reads and drops
+/// it only when both are piped, to keep the password on line 2, and returns
+/// `None`.
+pub(crate) fn read_molto_import_secrets<I: SecretIo>(
+    sec: &mut Secrets<I>,
+    key: &crate::KeyArgs,
+    file: &Path,
+    file_password: Option<&SecretSource>,
+    dry_run: bool,
+) -> Result<(Option<crate::CustomerKey>, ImportFile), Box<dyn Error>> {
+    let key = if dry_run {
+        crate::molto_dry_run_key(sec, key, file_password)?;
+        None
+    } else {
+        Some(crate::customer_key(sec, key)?)
+    };
+    Ok((key, read_import_file(sec, file, file_password)?))
+}
+
+/// The dry run: slot use from the Molto2 when one is connected (or named
+/// with `-d` / `--reader`), else the preview without it.
+fn molto_dry_run(
+    m: &MoltoImport<'_>,
+    import: &ImportFile,
+    shown: &Shown,
+    debug: bool,
+) -> Result<(), Box<dyn Error>> {
+    let chosen = m.reader.is_some() || crate::target::device_flag().is_some();
+    let dev = match crate::target::select(Need::Molto2, m.reader, None) {
+        Ok(dev) => Some(dev),
+        Err(e)
+            if !chosen
+                && matches!(
+                    e.downcast_ref::<SelectError>(),
+                    Some(SelectError::NoCandidates { .. })
+                ) =>
+        {
+            None
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(dev) = dev else {
+        let plan = plan_for_slots(import, m.first_slot, Existing::default());
+        let lines = preview_lines(&shown.file_name, shown.format, "the Molto2", &plan, false);
+        return print_dry_run(&lines, &plan, false);
+    };
+    let (_, existing) = molto_slot_use(&crate::target::reader_of(&dev)?, debug)?;
+    let plan = plan_for_slots(import, m.first_slot, existing);
+    preview_and_ask(&dev, shown, &plan).map(|_| ())
+}
+
+/// The Molto2's serial and used slots, read in a short session with no key.
+fn molto_slot_use(reader: &str, debug: bool) -> Result<(String, Existing), Box<dyn Error>> {
+    let mut session = Session::open_named(reader)?;
+    session.set_debug(debug);
+    let info = session.read_info()?;
+    crate::write_info(&mut std::io::stderr(), &info)?;
+    Ok((info.serial, read_molto_existing(&mut session)?))
+}
+
+/// The Molto2 plan: slots from `first_slot`, in use ones replaced.
+fn plan_for_slots(file: &ImportFile, first_slot: u8, existing: Existing) -> Plan {
+    keyroost_import::plan::plan_for(file, Store::Molto2, first_slot, existing, false)
+}
+
+/// A dry run's output: the preview on stdout, or its JSON.
+fn print_dry_run(lines: &[String], plan: &Plan, key_read: bool) -> Result<(), Box<dyn Error>> {
+    if json_output() {
+        emit_json(&import_json(plan, None, true, key_read))?;
+    } else {
+        for l in lines {
+            println!("{l}");
+        }
+    }
+    Ok(())
 }
 
 /// Read and sort the file before any key is looked at: recognized key
@@ -178,15 +321,9 @@ fn preview_and_ask(
     plan: &Plan,
 ) -> Result<Option<bool>, Box<dyn Error>> {
     let key = crate::prompt::key_label(dev);
-    let lines = preview_lines(&shown.file_name, shown.format, &key, plan);
+    let lines = preview_lines(&shown.file_name, shown.format, &key, plan, true);
     if shown.dry_run {
-        if json_output() {
-            emit_json(&import_json(plan, None, true))?;
-        } else {
-            for l in &lines {
-                println!("{l}");
-            }
-        }
+        print_dry_run(&lines, plan, true)?;
         return Ok(None);
     }
     for l in &lines {
@@ -203,28 +340,41 @@ fn preview_and_ask(
                     stopped: None,
                 }),
                 false,
+                true,
             ))?;
         } else {
             println!("Nothing to add.");
         }
         return Ok(None);
     }
+    Ok(Some(crate::prompt::confirm_then_read(
+        dev,
+        shown.yes,
+        &question(plan),
+    )?))
+}
+
+/// What the one question asks to do.
+fn question(plan: &Plan) -> String {
+    let c = plan.counts();
+    let n = c.add + c.replace;
     let replacing = if c.replace > 0 {
+        let what = match plan.store {
+            Store::Molto2 => "a slot in use",
+            _ => "a code of the same name",
+        };
         format!(
-            " ({} of them replace{} a code of the same name)",
+            " ({} of them replace{} {what})",
             c.replace,
             if c.replace == 1 { "s" } else { "" }
         )
     } else {
         String::new()
     };
-    let what = format!(
+    format!(
         "add {n} code{} to this key{replacing}",
         if n == 1 { "" } else { "s" }
-    );
-    Ok(Some(crate::prompt::confirm_then_read(
-        dev, shown.yes, &what,
-    )?))
+    )
 }
 
 /// Write `plan` through `store`, one progress line per code on stderr, then
@@ -245,7 +395,7 @@ fn write_and_report(
     });
     let summary = report_summary(plan, &report);
     if json_output() {
-        emit_json(&import_json(plan, Some(&report), false))?;
+        emit_json(&import_json(plan, Some(&report), false, true))?;
     } else if let Ok(line) = &summary {
         println!("{line}");
     }
@@ -334,14 +484,24 @@ fn to_otp(
 /// the next line.
 const NAME_COLUMN_MAX: usize = 32;
 
-/// "OATH" or "OTP": the storage an import writes to, as the commands name it.
-fn store_word(store: Store) -> &'static str {
-    match store {
-        Store::Token2Otp => "OTP",
-        Store::Oath(_) => "OATH",
-        Store::Molto2 => "Molto2",
+/// The storage an import writes to, after the key's label: " OATH",
+/// " OTP", or the Molto2 slots the plan fills (", slots #95 to #99").
+fn store_words(plan: &Plan) -> String {
+    match plan.store {
+        Store::Token2Otp => " OTP".to_owned(),
+        Store::Oath(_) => " OATH".to_owned(),
+        Store::Molto2 => format!(", slots #{:02} to #99", molto_first_slot(plan)),
     }
 }
+
+/// The slot a Molto2 plan starts at: its capacity counts the slots from
+/// there to #99.
+fn molto_first_slot(plan: &Plan) -> usize {
+    100usize.saturating_sub(plan.capacity.unwrap_or(100))
+}
+
+/// Said when a dry run had no Molto2 to read slot use from.
+const MOLTO_SLOTS_UNREAD: &str = "Slot use is read from the Molto2 when one is connected.";
 
 /// The progress line's verb for a write.
 fn progress_word(v: &Verdict) -> &'static str {
@@ -361,9 +521,12 @@ fn verdict_reason(v: &Verdict, store: Store) -> Option<String> {
     })
 }
 
-/// A row's name as shown: the stored name, else the file's label.
+/// A row's name as shown: the stored name, else the file's label; a
+/// Molto2 row is its slot and the file's label (`#05 GitHub`), as the
+/// progress lines and the GUI name it.
 fn shown_name(row: &keyroost_import::plan::PlanRow) -> String {
     let raw = match &row.name {
+        Some(StoredName::Molto2 { .. }) => row.shown_label(),
         Some(n) => n.to_string(),
         None => row.label.clone(),
     };
@@ -381,20 +544,22 @@ fn entries(n: usize) -> String {
 
 /// The preview: one header line, one line per entry (two when the name is
 /// too long for its column), the counts, then one line per note. Every
-/// name and label is sanitized; seeds never appear.
+/// name and label is sanitized; seeds never appear. `key_read` is false
+/// for a Molto2 dry run with no Molto2 to read slot use from.
 pub(crate) fn preview_lines(
     file_name: &str,
     format: Format,
     key: &str,
     plan: &Plan,
+    key_read: bool,
 ) -> Vec<String> {
     let mut out = vec![format!(
-        "{} in {} ({}) for {} {}:",
+        "{} in {} ({}) for {}{}:",
         entries(plan.rows.len()),
         sanitize_terminal(file_name),
         format.name(),
         key,
-        store_word(plan.store)
+        store_words(plan)
     )];
     let names: Vec<String> = plan.rows.iter().map(shown_name).collect();
     let width = names
@@ -415,15 +580,25 @@ pub(crate) fn preview_lines(
         }
     }
     let c = plan.counts();
-    let holds = plan
-        .capacity
-        .map(|n| format!("Holds {n} codes; "))
-        .unwrap_or_default();
+    let on_key = match (plan.store, key_read) {
+        (_, false) => String::new(),
+        (Store::Molto2, true) => format!("{} slots in use on the key; ", plan.on_key),
+        (_, true) => {
+            let holds = plan
+                .capacity
+                .map(|n| format!("Holds {n} codes; "))
+                .unwrap_or_default();
+            format!("{holds}{} on the key; ", plan.on_key)
+        }
+    };
     out.push(format!(
-        "{holds}{} on the key; {} will be added, {} replaced, {} left as is, {} skipped.",
-        plan.on_key, c.add, c.replace, c.exists, c.skip
+        "{on_key}{} will be added, {} replaced, {} left as is, {} skipped.",
+        c.add, c.replace, c.exists, c.skip
     ));
     out.extend(plan.notes.iter().map(|n| format!("Note: {n}")));
+    if !key_read {
+        out.push(format!("Note: {MOLTO_SLOTS_UNREAD}"));
+    }
     out
 }
 
@@ -475,7 +650,14 @@ fn outcome_json(o: &Outcome) -> (&'static str, Option<String>) {
 }
 
 /// The `--json` shape: the plan, plus each write's outcome after a run.
-pub(crate) fn import_json(plan: &Plan, report: Option<&Report>, dry_run: bool) -> ImportJson {
+/// `on_key` is null when nothing was read from the key (`key_read` false:
+/// a Molto2 dry run with no Molto2 connected).
+pub(crate) fn import_json(
+    plan: &Plan,
+    report: Option<&Report>,
+    dry_run: bool,
+    key_read: bool,
+) -> ImportJson {
     let entries = plan
         .rows
         .iter()
@@ -497,11 +679,12 @@ pub(crate) fn import_json(plan: &Plan, report: Option<&Report>, dry_run: bool) -
     ImportJson {
         destination: match plan.store {
             Store::Token2Otp => "otp",
-            _ => "oath",
+            Store::Molto2 => "molto2",
+            Store::Oath(_) => "oath",
         },
         dry_run,
         capacity: plan.capacity,
-        on_key: plan.on_key,
+        on_key: key_read.then_some(plan.on_key),
         entries,
         stopped: report.and_then(|r| r.stopped.clone()),
     }
@@ -559,6 +742,7 @@ mod tests {
             Format::AegisEncrypted,
             "solo-test (serial 1234)",
             &mixed_plan(),
+            true,
         );
         let want = [
             "6 entries in vault.json (Aegis, encrypted) for solo-test (serial 1234) OATH:",
@@ -588,7 +772,7 @@ mod tests {
             replace: false,
             notes: Vec::new(),
         };
-        let lines = preview_lines("list.txt", Format::OtpauthList, "t2", &plan);
+        let lines = preview_lines("list.txt", Format::OtpauthList, "t2", &plan, true);
         assert_eq!(
             lines[0],
             "2 entries in list.txt (otpauth:// list) for t2 OTP:"
@@ -607,6 +791,91 @@ mod tests {
             "0 on the key; 1 will be added, 0 replaced, 1 left as is, 0 skipped."
         );
         assert_eq!(lines.len(), 5);
+    }
+
+    fn slot_row(index: usize, label: &str, slot: Option<u8>, verdict: Verdict) -> PlanRow {
+        PlanRow {
+            index,
+            label: label.to_owned(),
+            name: slot.map(|slot| StoredName::Molto2 {
+                slot,
+                title: label.chars().take(12).collect(),
+            }),
+            verdict,
+        }
+    }
+
+    /// From slot #95: an add, a replace, a skip and one past #99.
+    fn molto_plan(on_key: usize, notes: Vec<Note>) -> Plan {
+        Plan {
+            store: Store::Molto2,
+            rows: vec![
+                slot_row(0, "GitHub:alice", Some(95), Verdict::Add),
+                slot_row(1, "Bank:bob", Some(96), Verdict::Replace),
+                slot_row(
+                    2,
+                    "Mail:x",
+                    None,
+                    Verdict::Skip(Skip::Hash(HashAlg::Sha512)),
+                ),
+                slot_row(3, "Late:y", None, Verdict::Skip(Skip::PastLastSlot)),
+            ],
+            capacity: Some(5),
+            on_key,
+            replace: false,
+            notes,
+        }
+    }
+
+    #[test]
+    fn molto_preview_shows_slots_and_slot_use() {
+        let plan = molto_plan(3, vec![Note::MoltoReplacesSlots]);
+        let lines = preview_lines("codes.json", Format::Aegis, "Molto2", &plan, true);
+        let want = [
+            "4 entries in codes.json (Aegis) for Molto2, slots #95 to #99:",
+            "  add       #95 GitHub:alice",
+            "  replace   #96 Bank:bob      replaces the code in this slot",
+            "  skip      Mail:x            Molto2 doesn't take SHA-512 codes",
+            "  skip      Late:y            no slot left after #99",
+            "3 slots in use on the key; 1 will be added, 1 replaced, 0 left as is, 2 skipped.",
+            "Note: Slots already in use will be replaced.",
+        ];
+        assert_eq!(lines, want);
+    }
+
+    #[test]
+    fn molto_dry_run_without_a_molto2_says_slot_use_is_unread() {
+        let plan = molto_plan(0, Vec::new());
+        let lines = preview_lines("codes.json", Format::Aegis, "the Molto2", &plan, false);
+        assert_eq!(
+            lines[0],
+            "4 entries in codes.json (Aegis) for the Molto2, slots #95 to #99:"
+        );
+        assert_eq!(
+            &lines[5..],
+            [
+                "1 will be added, 1 replaced, 0 left as is, 2 skipped.",
+                "Note: Slot use is read from the Molto2 when one is connected.",
+            ]
+        );
+        let json = import_json(&plan, None, true, false);
+        assert_eq!(json.destination, "molto2");
+        assert_eq!((json.capacity, json.on_key), (Some(5), None));
+        assert_eq!(json.entries[0].name.as_deref(), Some("#95 GitHub:alice"));
+        let read = import_json(&plan, None, true, true);
+        assert_eq!(read.on_key, Some(0));
+    }
+
+    #[test]
+    fn question_names_what_is_replaced() {
+        assert_eq!(
+            question(&molto_plan(3, Vec::new())),
+            "add 2 codes to this key (1 of them replaces a slot in use)"
+        );
+        assert_eq!(
+            question(&mixed_plan()),
+            "add 3 codes to this key (1 of them replaces a code of the same name)"
+        );
     }
 
     fn report(rows: Vec<(usize, &str, Outcome)>, stopped: Option<&str>) -> Report {
@@ -730,10 +999,12 @@ mod tests {
             },
         );
         let report = keyroost_import::run::run(&file, &plan, &mut Accepts, &mut |_, _, _| {});
-        let mut text = preview_lines("f.txt", file.format, "k", &plan).join("\n");
+        let mut text = preview_lines("f.txt", file.format, "k", &plan, true).join("\n");
         text.push_str(&report_summary(&plan, &report).unwrap());
-        text.push_str(&serde_json::to_string(&import_json(&plan, Some(&report), false)).unwrap());
-        text.push_str(&serde_json::to_string(&import_json(&plan, None, true)).unwrap());
+        text.push_str(
+            &serde_json::to_string(&import_json(&plan, Some(&report), false, true)).unwrap(),
+        );
+        text.push_str(&serde_json::to_string(&import_json(&plan, None, true, true)).unwrap());
         assert!(text.contains("Example:alice"), "{text}");
         let lower = text.to_ascii_lowercase();
         for secret in ["JBSWY3DPEHPK3PXP", "48656c6c6f21deadbeef"] {
@@ -744,10 +1015,10 @@ mod tests {
     #[test]
     fn json_carries_plan_and_outcomes() {
         let plan = mixed_plan();
-        let dry = import_json(&plan, None, true);
+        let dry = import_json(&plan, None, true, true);
         assert_eq!(dry.destination, "oath");
         assert!(dry.dry_run);
-        assert_eq!((dry.capacity, dry.on_key), (Some(32), 5));
+        assert_eq!((dry.capacity, dry.on_key), (Some(32), Some(5)));
         let plans: Vec<&str> = dry.entries.iter().map(|e| e.plan).collect();
         assert_eq!(plans, ["add", "add", "exists", "replace", "skip", "skip"]);
         assert!(dry.entries.iter().all(|e| e.outcome.is_none()));
@@ -764,7 +1035,7 @@ mod tests {
             ],
             Some("no"),
         );
-        let real = import_json(&plan, Some(&run), false);
+        let real = import_json(&plan, Some(&run), false, true);
         let outcomes: Vec<Option<&str>> = real.entries.iter().map(|e| e.outcome).collect();
         assert_eq!(
             outcomes,

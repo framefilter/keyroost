@@ -15,12 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use keyroost_import::plan::{
-    plan_for, Existing, OathFamily, Plan, PlanRow, Store, StoredName, Verdict,
-};
+use keyroost_import::plan::{plan_for, Existing, OathFamily, Plan, PlanRow, Store, Verdict};
 use keyroost_import::run::{Outcome, Report};
 use keyroost_import::{Format, ImportFile, OtpKind};
-use keyroost_proto::commands::ProfilePublicData;
+use keyroost_transport::import::molto_existing;
 
 use crate::otp_pane::{otp_target_for, OtpTransportSel};
 use crate::ui::device::{CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
@@ -217,25 +215,6 @@ pub fn fit_count(file: &ImportFile, store: Store, first_slot: u8) -> usize {
     plan_for(file, store, first_slot, Existing::default(), false)
         .writes()
         .count()
-}
-
-/// The Molto2's used slots from the slot sweep: a slot with a seed or a
-/// title, the same rule as `molto import` and the Molto2 slot list.
-pub fn molto_existing(meta: &[ProfilePublicData]) -> Existing {
-    Existing {
-        names: meta
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, m)| {
-                let title = m.title.as_deref().unwrap_or("");
-                (m.seed_present || !title.is_empty()).then(|| StoredName::Molto2 {
-                    slot: slot as u8,
-                    title: title.to_owned(),
-                })
-            })
-            .collect(),
-        hidden: 0,
-    }
 }
 
 /// Entries that need a Molto2 slot: everything the rules accept, including
@@ -1896,6 +1875,7 @@ pub fn file_line(d: &ImportDialog) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keyroost_import::plan::StoredName;
     use keyroost_import::HashAlg;
     use keyroost_import::{ImportEntry, ImportItem};
 
@@ -2599,46 +2579,6 @@ mod tests {
         assert_eq!(fit_count(&file, nk3, 0), 1);
         // Molto2: room from the start slot.
         assert_eq!(fit_count(&file, Store::Molto2, 99), 1);
-    }
-
-    #[test]
-    fn molto_existing_counts_seeded_or_titled_slots() {
-        let slot = |title: Option<&str>, seed_present: bool| ProfilePublicData {
-            flag: 0,
-            title: title.map(str::to_owned),
-            time_a: 0,
-            time_b: 0,
-            algorithm: 0,
-            time_step: 0,
-            digits: 0,
-            seed_present,
-        };
-        // In use: a seed or a title (as the CLI and the slot list read it).
-        let meta = vec![
-            slot(None, false),
-            slot(Some("GitHub"), false),
-            slot(Some(""), false),
-            slot(None, true),
-            slot(Some("Bank"), true),
-        ];
-        let ex = molto_existing(&meta);
-        assert_eq!(
-            ex.names,
-            vec![
-                StoredName::Molto2 {
-                    slot: 1,
-                    title: "GitHub".into()
-                },
-                StoredName::Molto2 {
-                    slot: 3,
-                    title: String::new()
-                },
-                StoredName::Molto2 {
-                    slot: 4,
-                    title: "Bank".into()
-                },
-            ]
-        );
     }
 
     #[test]

@@ -12,7 +12,9 @@ use keyroost_import::entry::{HashAlg, ImportEntry, OtpKind};
 use keyroost_import::plan::{Existing, OathFamily, StoredName};
 use keyroost_import::run::{CodeStore, StoreError};
 use keyroost_oath as oath;
-use keyroost_proto::commands::{DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep};
+use keyroost_proto::commands::{
+    DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, ProfilePublicData, TimeStep,
+};
 use keyroost_token2otp::OtpError;
 
 // ---------------------------------------------------------------------------
@@ -644,6 +646,38 @@ fn molto_add<I: MoltoIo + ?Sized>(
     io.set_title(w.slot, w.title).map_err(failed)?;
     w.config.utc_time = now();
     io.set_config(w.slot, &w.config).map_err(failed)
+}
+
+/// The Molto2's used slots: a slot with a seed or a title, the rule the
+/// Molto2 slot list, the GUI and `molto import` all read slot use by.
+pub fn molto_existing(meta: &[ProfilePublicData]) -> Existing {
+    Existing {
+        names: meta
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, m)| {
+                let title = m.title.as_deref().unwrap_or("");
+                (m.seed_present || !title.is_empty()).then(|| StoredName::Molto2 {
+                    slot: slot as u8,
+                    title: title.to_owned(),
+                })
+            })
+            .collect(),
+        hidden: 0,
+    }
+}
+
+/// Read every slot's public block (no customer key needed) and say which
+/// slots are used ([`molto_existing`]). Stops at the first failed read.
+pub fn read_molto_existing(session: &mut Session) -> Result<Existing, TransportError> {
+    molto_existing_by(|slot| session.read_public_data(slot))
+}
+
+fn molto_existing_by(
+    mut read: impl FnMut(u8) -> Result<ProfilePublicData, TransportError>,
+) -> Result<Existing, TransportError> {
+    let meta = (0..=99u8).map(&mut read).collect::<Result<Vec<_>, _>>()?;
+    Ok(molto_existing(&meta))
 }
 
 impl CodeStore for MoltoImportStore<'_> {
@@ -1399,5 +1433,81 @@ mod tests {
             assert!(molto_write(&n, &e, DisplayTimeout::Sec30, 0).is_err());
         }
         assert!(molto_write(&StoredName::Oath("x".into()), &e, DisplayTimeout::Sec30, 0).is_err());
+    }
+
+    fn public(title: Option<&str>, seed_present: bool) -> ProfilePublicData {
+        ProfilePublicData {
+            flag: 0,
+            title: title.map(str::to_owned),
+            time_a: 0,
+            time_b: 0,
+            algorithm: 0,
+            time_step: 0,
+            digits: 0,
+            seed_present,
+        }
+    }
+
+    #[test]
+    fn molto_sweep_reads_every_slot_and_stops_at_a_failed_read() {
+        let mut asked = Vec::new();
+        let ex = molto_existing_by(|slot| {
+            asked.push(slot);
+            Ok(public(None, slot == 7 || slot == 99))
+        })
+        .unwrap();
+        assert_eq!(asked, (0..=99).collect::<Vec<u8>>());
+        assert_eq!(ex.names.len(), 2);
+        let mut asked = 0;
+        let err = molto_existing_by(|slot| {
+            asked += 1;
+            if slot == 3 {
+                Err(TransportError::NoMolto2Reader)
+            } else {
+                Ok(public(None, false))
+            }
+        });
+        assert!(err.is_err());
+        assert_eq!(asked, 4);
+    }
+
+    #[test]
+    fn molto_existing_counts_seeded_or_titled_slots() {
+        let slot = |title: Option<&str>, seed_present: bool| ProfilePublicData {
+            flag: 0,
+            title: title.map(str::to_owned),
+            time_a: 0,
+            time_b: 0,
+            algorithm: 0,
+            time_step: 0,
+            digits: 0,
+            seed_present,
+        };
+        // In use: a seed or a title (as the CLI and the slot list read it).
+        let meta = vec![
+            slot(None, false),
+            slot(Some("GitHub"), false),
+            slot(Some(""), false),
+            slot(None, true),
+            slot(Some("Bank"), true),
+        ];
+        let ex = molto_existing(&meta);
+        assert_eq!(
+            ex.names,
+            vec![
+                StoredName::Molto2 {
+                    slot: 1,
+                    title: "GitHub".into()
+                },
+                StoredName::Molto2 {
+                    slot: 3,
+                    title: String::new()
+                },
+                StoredName::Molto2 {
+                    slot: 4,
+                    title: "Bank".into()
+                },
+            ]
+        );
     }
 }

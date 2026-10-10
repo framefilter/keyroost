@@ -372,9 +372,10 @@ fn molto_import_help_names_file_password() {
     assert!(!out.contains("--password env"), "{out}");
 }
 
-/// `molto import --in` keeps its own reader; only a binary file that is
-/// recognized key material gets the pointer instead of "neither a text
-/// export nor a PNG/JPEG image".
+/// `molto import --in` reads the file with the reader `oath import` and
+/// `otp import` use (it used to keep its own): recognized key material gets
+/// the pointer to where it belongs, anything else the shared "can't import
+/// this file" line (formerly "neither a text export nor a PNG/JPEG image").
 #[test]
 fn molto_import_points_binary_key_material_elsewhere() {
     let dir = input_dir("molto");
@@ -403,9 +404,6 @@ fn molto_import_points_binary_key_material_elsewhere() {
         "--dry-run",
     ]);
     assert_eq!(code, 1, "{err}");
-    assert!(
-        err.contains("neither a text export nor a PNG/JPEG image"),
-        "{err}"
-    );
+    assert!(err.contains("keyroost can't import this file"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

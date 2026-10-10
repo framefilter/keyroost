@@ -2298,12 +2298,19 @@ enum MoltoCmd {
     /// to consecutive slots: writes seed, title, and config, replacing what
     /// the slots held. Irreversible: asks first (`--yes` to skip).
     ///
-    /// Asks only when a target slot is occupied. The URI comes from --uri
-    /// env:NAME, --uri stdin or a QR screenshot (--qr IMAGE), never the
-    /// command line; with none of them and no --in, a terminal asks for it
-    /// (hidden). For an encrypted Aegis vault given with --in, the password
-    /// comes from --file-password env:NAME or --file-password stdin; with neither, a
-    /// terminal asks for it (hidden).
+    /// With --in, keyroost reads which slots are in use and shows what each
+    /// entry becomes, as `oath import` does: entries go to consecutive slots
+    /// from --slot, slots in use are replaced, and entries the Molto2 can't
+    /// store (for example a SHA-512 code or a 45-second period) are skipped
+    /// with the reason. Asks once before writing; with --dry-run nothing is
+    /// written, and a connected Molto2 is read for slot use but not needed.
+    ///
+    /// With --uri or --qr, asks only when the slot is in use. The URI comes
+    /// from --uri env:NAME, --uri stdin or a QR screenshot (--qr IMAGE),
+    /// never the command line; with none of them and no --in, a terminal
+    /// asks for it (hidden). For an encrypted Aegis vault given with --in,
+    /// the password comes from --file-password env:NAME or --file-password
+    /// stdin; with neither, a terminal asks for it (hidden).
     #[command(group(clap::ArgGroup::new("import_source").args(["uri", "qr", "file"]).multiple(false)))]
     Import {
         /// Slot number, 0-99 (Token2 calls these profiles). With --in, the
@@ -2331,7 +2338,7 @@ enum MoltoCmd {
         /// Authenticator export QR image. The format is detected.
         #[arg(long = "in", short = 'i', value_name = "FILE")]
         file: Option<std::path::PathBuf>,
-        /// Print what would be written, but don't touch the device.
+        /// Show what would be added, replaced or skipped; nothing is written.
         #[arg(long, requires = "file")]
         dry_run: bool,
         /// The password of an encrypted Aegis export: env:NAME or stdin (second
@@ -3677,21 +3684,6 @@ fn read_molto_input<I: crate::secrets::SecretIo>(
 /// A Molto2 customer key as read and decoded.
 type CustomerKey = zeroize::Zeroizing<Vec<u8>>;
 
-/// The customer key is stdin line 1 on every Molto2 command. Bulk import
-/// reads its vault password before the occupancy question, so its key is
-/// read before that, here; every other command gets `None` and reads the
-/// key after the question, in [`molto_key_and_input`].
-fn molto_early_key<I: crate::secrets::SecretIo>(
-    sec: &mut Secrets<I>,
-    key: &KeyArgs,
-    cmd: &MoltoCmd,
-) -> Result<Option<CustomerKey>, String> {
-    match cmd {
-        MoltoCmd::Import { file: Some(_), .. } => customer_key(sec, key).map(Some),
-        _ => Ok(None),
-    }
-}
-
 /// `molto import --in --dry-run` never uses the customer key. It reads and
 /// drops it only when both it and the password are piped on stdin, so the
 /// password stays on line 2 as in a real import; at a terminal each is its
@@ -3710,33 +3702,46 @@ fn molto_dry_run_key<I: crate::secrets::SecretIo>(
     Ok(())
 }
 
-/// After any question, with nothing held: the customer key (unless
-/// [`molto_early_key`] already read it), then the seed, new key or URI (or
-/// the QR image).
+/// After any question, with nothing held: the customer key (stdin line
+/// 1), then the seed, new key or URI (or the QR image).
 fn molto_key_and_input<I: crate::secrets::SecretIo>(
     sec: &mut Secrets<I>,
     key: &KeyArgs,
     cmd: &MoltoCmd,
-    early_key: Option<CustomerKey>,
 ) -> Result<(CustomerKey, MoltoInput), Box<dyn std::error::Error>> {
-    let key = match early_key {
-        Some(k) => k,
-        None => customer_key(sec, key)?,
-    };
-    // Wire confidentiality for seeds is SM4 keyed off the customer key, and
-    // the factory default is public (it ships in every unit and in this
-    // source). Programming real seeds under it means anyone holding a USB
-    // capture can decrypt them — nudge, don't block.
-    if key.as_slice() == DEFAULT_CUSTOMER_KEY
-        && matches!(cmd, MoltoCmd::Seed { .. } | MoltoCmd::Import { .. })
-    {
+    let key = customer_key(sec, key)?;
+    if matches!(cmd, MoltoCmd::Seed { .. } | MoltoCmd::Import { .. }) {
+        warn_default_customer_key(&key);
+    }
+    Ok((key, read_molto_input(sec, cmd)?))
+}
+
+/// Wire confidentiality for seeds is SM4 keyed off the customer key, and
+/// the factory default is public (it ships in every unit and in this
+/// source). Programming real seeds under it means anyone holding a USB
+/// capture can decrypt them — nudge, don't block.
+fn warn_default_customer_key(key: &[u8]) {
+    if key == DEFAULT_CUSTOMER_KEY {
         output::warn(
             "using the factory-default customer key — seeds sent to the \
              device are decryptable by anyone who captures the USB traffic. \
              Rotate it first: keyroostctl molto customer-key change (see --help).",
         );
     }
-    Ok((key, read_molto_input(sec, cmd)?))
+}
+
+/// Authenticate a Molto2 session with the customer key; a wrong key says
+/// how many tries are left.
+fn molto_authenticate(session: &mut Session, key: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    match session.authenticate(key) {
+        Ok(()) => {
+            output::status("Authenticated.");
+            Ok(())
+        }
+        // The Display impl renders the tries-remaining count (or "unknown").
+        Err(e @ TransportError::AuthFailed { .. }) => Err(e.to_string().into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Decode the one account in a QR screenshot, through the same hardened
@@ -3947,17 +3952,6 @@ impl ValidFor {
     }
 }
 
-/// The slots a bulk import writes: consecutive from `start`, leaving out the
-/// entries it skips (no issuer or account to title them with).
-fn bulk_import_slots(start: u8, entries: &[keyroost_import::BulkEntry]) -> Vec<u8> {
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| !e.suggested_title().is_empty())
-        .filter_map(|(i, _)| u8::try_from(start as usize + i).ok())
-        .collect()
-}
-
 /// Which of `slots` already hold a seed (read-only; no customer key).
 fn molto_occupied(
     session: &mut Session,
@@ -3970,69 +3964,6 @@ fn molto_occupied(
         }
     }
     Ok(out)
-}
-
-/// Load a bulk-import file, transparently decrypting an Aegis encrypted
-/// vault if `--file-password` was supplied.
-fn load_bulk_entries<I: crate::secrets::SecretIo>(
-    sec: &mut Secrets<I>,
-    path: &std::path::Path,
-    password: Option<&SecretSource>,
-) -> Result<Vec<keyroost_import::BulkEntry>, Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-
-    // Screenshot import: a PNG/JPEG (by magic bytes) goes through QR decode,
-    // accepting both a single otpauth:// enrollment code and a Google
-    // Authenticator export batch.
-    if keyroost_qr::looks_like_image(&bytes) {
-        let import = keyroost_qr::entries_from_image(&bytes)?;
-        for s in &import.skipped {
-            output::note(&format!("skipped {:?}: {}", s.label, s.reason));
-        }
-        if let Some((i, n)) = import.batch {
-            output::note(&format!(
-                "this is QR {} of {} in the export — import the other images too",
-                i + 1,
-                n
-            ));
-        }
-        output::note("remember to delete the screenshot after a successful import");
-        return Ok(import.entries);
-    }
-
-    // Only a file that is neither text nor an image is classified, so every
-    // authenticator export keeps this reader's results and errors; binary
-    // key material (a DER certificate, a PKCS #12 bundle, ...) gets a
-    // pointer to where it belongs instead.
-    if std::str::from_utf8(&bytes).is_err() {
-        let name = path.file_name().and_then(|n| n.to_str());
-        if let keyroost_import::classify::FileKind::KeyMaterial(k) =
-            keyroost_import::classify::classify(&bytes, name)
-        {
-            return Err(k.cli_pointer().into());
-        }
-    }
-    let text = String::from_utf8(bytes).map_err(|_| {
-        format!(
-            "{}: neither a text export nor a PNG/JPEG image",
-            path.display()
-        )
-    })?;
-
-    // Aegis vaults are the only format we know how to decrypt. Detect first
-    // so we only consume the password when it would actually be used.
-    let aegis_encrypted = keyroost_import::aegis::is_encrypted(&text).unwrap_or(false);
-
-    if aegis_encrypted {
-        let password = sec.read(&FILE_PASSWORD, Source::from_flag(password))?;
-        let plaintext = keyroost_import::aegis::decrypt(&text, password.as_bytes())?;
-        return Ok(keyroost_import::aegis::parse(&plaintext)?);
-    }
-
-    if password.is_some() {
-        output::warn(UNUSED_FILE_PASSWORD);
-    }
-    Ok(keyroost_import::parse_bulk_any(&text)?)
 }
 
 /// `--device` on a command that never touches a key is a mistake (it used
@@ -4097,10 +4028,6 @@ fn inert_device_flag(cmd: Option<&Cmd>) -> Option<&'static str> {
         Cmd::Completions { .. } => Some("completions"),
         Cmd::Manpage { .. } => Some("manpage"),
         Cmd::Name { cmd: NameCmd::List } => Some("name list"),
-        Cmd::Molto {
-            cmd: MoltoCmd::Import { dry_run: true, .. },
-            ..
-        } => Some("molto import --dry-run"),
         _ => None,
     }
 }
@@ -5934,38 +5861,31 @@ fn run_molto(
         return Err(msg.into());
     }
 
-    // --dry-run on bulk import doesn't need the device at all.
+    // An export file goes through the shared import (plan, preview, one
+    // question, write, report), as `oath import` and `otp import` do.
     if let MoltoCmd::Import {
         file: Some(path),
         slot,
-        dry_run: true,
+        display_timeout,
+        dry_run,
         file_password,
+        yes,
         ..
     } = cmd
     {
-        let start = slot.unwrap_or(0);
-        molto_dry_run_key(&mut sec, key, file_password.as_ref())?;
-        let entries = load_bulk_entries(&mut sec, path, file_password.as_ref())?;
-        let last = (start as usize).saturating_add(entries.len());
-        println!(
-            "Found {} entries; would fill slots #{}..#{} (dry run).",
-            entries.len(),
-            start,
-            last.saturating_sub(1)
+        return code_import::run_molto_import(
+            &code_import::MoltoImport {
+                key,
+                reader: exact,
+                first_slot: slot.unwrap_or(0),
+                display_timeout: display_timeout.to_proto(),
+                file_password: file_password.as_ref(),
+            },
+            path,
+            *dry_run,
+            *yes,
+            debug,
         );
-        for (i, entry) in entries.iter().enumerate() {
-            let p = start as usize + i;
-            println!(
-                "  #{:02}: {:?} ({} bytes, {:?}, {} digits, {:?})",
-                p,
-                entry.suggested_title(),
-                entry.secret.len(),
-                entry.algorithm,
-                entry.digits as u8,
-                entry.time_step
-            );
-        }
-        return Ok(());
     }
 
     // Info is read-only and needs no auth — mirrors the bare-invocation path.
@@ -6172,38 +6092,6 @@ fn run_molto(
         return Ok(());
     }
 
-    let early_key = molto_early_key(&mut sec, key, cmd)?;
-    // Bulk import reads its file — and so any vault password, from the
-    // environment, stdin or the hidden prompt — before the question, unlike
-    // every other secret: which slots it writes, and so whether to ask at
-    // all, depends on the entries inside. No token session is open yet. A
-    // password piped on stdin means stdin is not a terminal, so it can never
-    // be mistaken for the answer (there is no question then; an occupied
-    // slot needs --yes).
-    let bulk = match cmd {
-        MoltoCmd::Import {
-            file: Some(path),
-            slot,
-            file_password,
-            ..
-        } => {
-            let start = slot.unwrap_or(0);
-            let entries = load_bulk_entries(&mut sec, path, file_password.as_ref())?;
-            let n = entries.len();
-            let last = (start as usize).saturating_add(n);
-            if last > 100 {
-                return Err(format!(
-                    "{} entries starting at #{} would exceed slot 99 (last slot needed: #{})",
-                    n,
-                    start,
-                    last - 1
-                )
-                .into());
-            }
-            Some(entries)
-        }
-        _ => None,
-    };
     // The seed slots this command writes, and whether it may skip asking.
     let writes: Option<(Vec<u8>, bool)> = match cmd {
         MoltoCmd::Seed {
@@ -6220,15 +6108,6 @@ fn run_molto(
                 unreachable!("clap requires --slot without --in")
             };
             Some((vec![*slot], *yes))
-        }
-        MoltoCmd::Import {
-            file: Some(_),
-            slot,
-            yes,
-            ..
-        } => {
-            let entries = bulk.as_deref().unwrap_or_default();
-            Some((bulk_import_slots(slot.unwrap_or(0), entries), *yes))
         }
         _ => None,
     };
@@ -6263,7 +6142,7 @@ fn run_molto(
     {
         asked = crate::prompt::confirm_then_read(&dev, *yes, "replace the Molto2 customer key")?;
     }
-    let (key, input) = molto_key_and_input(&mut sec, key, cmd, early_key)?;
+    let (key, input) = molto_key_and_input(&mut sec, key, cmd)?;
     crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
     let mut session = open_molto_session(exact)?;
     session.set_debug(debug);
@@ -6272,12 +6151,7 @@ fn run_molto(
     if seen_serial.is_none() {
         write_info(&mut std::io::stderr(), &info)?;
     }
-    match session.authenticate(&key) {
-        Ok(()) => output::status("Authenticated."),
-        // The Display impl renders the tries-remaining count (or "unknown").
-        Err(e @ TransportError::AuthFailed { .. }) => return Err(e.to_string().into()),
-        Err(e) => return Err(e.into()),
-    }
+    molto_authenticate(&mut session, &key)?;
 
     match cmd {
         MoltoCmd::Info => unreachable!("handled above before auth"),
@@ -6388,57 +6262,8 @@ fn run_molto(
                 );
             }
         }
-        MoltoCmd::Import {
-            file: Some(_),
-            slot,
-            display_timeout,
-            dry_run,
-            ..
-        } => {
-            let start = slot.unwrap_or(0);
-            // dry-run prints the plan and returns *before* authentication
-            // (see the pre-auth handling above) — it is always false here.
-            debug_assert!(!*dry_run);
-            // Loaded and range-checked before authentication (see above).
-            let entries = bulk
-                .as_deref()
-                .ok_or("internal error: bulk entries not loaded")?;
-            let n = entries.len();
-            let last = start as usize + n;
-            output::status(&format!(
-                "Found {} entries; programming slots #{}..#{}.",
-                n,
-                start,
-                last - 1
-            ));
-            let mut written = 0usize;
-            for (i, entry) in entries.iter().enumerate() {
-                let p = start + i as u8;
-                let title = entry.suggested_title();
-                if title.is_empty() {
-                    output::warn(&format!(
-                        "  #{}: skipping — entry has no issuer or account to use as title",
-                        p
-                    ));
-                    continue;
-                }
-                output::status(&format!(
-                    "  #{}: {:?} ({} bytes secret, {:?}, {} digits)",
-                    p,
-                    title,
-                    entry.secret.len(),
-                    entry.algorithm,
-                    entry.digits as u8
-                ));
-                session.set_seed(p, &entry.secret)?;
-                session.set_title(p, &title)?;
-                session.set_config(
-                    p,
-                    &entry.to_profile_config(unix_now(), display_timeout.to_proto()),
-                )?;
-                written += 1;
-            }
-            println!("{}", import_file_ack(written, start, last - 1));
+        MoltoCmd::Import { file: Some(_), .. } => {
+            unreachable!("an export file goes through code_import above")
         }
         MoltoCmd::Reset { .. } => unreachable!("handled above before auth"),
         MoltoCmd::Probe { .. } => unreachable!("handled above before auth"),
@@ -14728,15 +14553,6 @@ fn run_probe(session: &mut Session, authed: bool, include_destructive: bool, slo
     println!("Any ✓ line is an instruction the firmware recognized and completed.");
 }
 
-/// `molto import --in`'s result line: how many entries were written (entries
-/// skipped for having no title are not counted) and the slot range covered.
-fn import_file_ack(written: usize, first: u8, last: usize) -> String {
-    format!(
-        "Imported {written} entr{} into slots #{first}..#{last}.",
-        if written == 1 { "y" } else { "ies" }
-    )
-}
-
 /// Write the Molto2's serial and clock to `w`: stdout for `molto info` (the
 /// result), stderr for every other command (context before the result).
 fn write_info(
@@ -15026,18 +14842,6 @@ mod human_style_tests {
                 "Serial:     T2M-0001\nDevice UTC: {} (epoch)\n",
                 info.utc_time
             )
-        );
-    }
-
-    #[test]
-    fn import_file_ack_counts_written_entries() {
-        assert_eq!(
-            import_file_ack(3, 95, 97),
-            "Imported 3 entries into slots #95..#97."
-        );
-        assert_eq!(
-            import_file_ack(1, 99, 99),
-            "Imported 1 entry into slots #99..#99."
         );
     }
 }
@@ -22185,27 +21989,10 @@ mod cli_tests {
 
     fn molto_stdin_order(line: &str, argv: &[&str], second: &str) {
         use crate::secrets::fake::FakeIo;
-        let vault = std::env::temp_dir().join(format!(
-            "keyroostctl-order-{}-vault.json",
-            std::process::id()
-        ));
-        // An encrypted Aegis vault as far as the importer can tell; its
-        // password is read, then decryption fails.
-        std::fs::write(&vault, r#"{"version":1,"db":"AAAA"}"#).unwrap();
-        // Removed on every path, a failing assert included.
-        struct Cleanup<'a>(&'a std::path::Path);
-        impl Drop for Cleanup<'_> {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(self.0);
-            }
+        if second == "file-password" {
+            return molto_import_stdin_order(line, argv);
         }
-        let _cleanup = Cleanup(&vault);
-        let vault_arg = vault.to_str().unwrap();
-        let argv: Vec<&str> = argv
-            .iter()
-            .map(|a| if *a == "vault.json" { vault_arg } else { a })
-            .collect();
-        let cli = parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        let cli = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         let Some(Cmd::Molto { key, cmd, .. }) = cli.command else {
             panic!("{line}: not a molto command")
         };
@@ -22215,34 +22002,62 @@ mod cli_tests {
             _ => "22\n",
         };
         let mut sec = Secrets::new(FakeIo::piped(&["11\n", line2]));
-        let early = molto_early_key(&mut sec, &key, &cmd).unwrap();
-        match (second, &cmd) {
-            (
-                "file-password",
-                MoltoCmd::Import {
-                    file: Some(path),
-                    file_password,
-                    ..
-                },
-            ) => {
-                assert_eq!(&early.unwrap()[..], [0x11], "{line}");
-                assert!(load_bulk_entries(&mut sec, path, file_password.as_ref()).is_err());
-                assert_eq!(sec.io.lines_read, 2, "{line}");
+        let (k, input) = molto_key_and_input(&mut sec, &key, &cmd).unwrap();
+        assert_eq!(&k[..], [0x11], "{line}");
+        match (second, input) {
+            ("seed", MoltoInput::Seed(s)) => assert_eq!(&s[..], [1, 2], "{line}"),
+            ("new-customer-key", MoltoInput::NewKey(k)) => assert_eq!(&k[..], [0x22], "{line}"),
+            ("uri", MoltoInput::Entry { entry, .. }) => {
+                assert_eq!(&entry.secret[..], b"Hello", "{line}")
             }
-            _ => match (second, {
-                let (k, input) = molto_key_and_input(&mut sec, &key, &cmd, early).unwrap();
-                assert_eq!(&k[..], [0x11], "{line}");
-                input
-            }) {
-                ("seed", MoltoInput::Seed(s)) => {
-                    assert_eq!(&s[..], [1, 2], "{line}")
+            _ => panic!("{line}: read the wrong input"),
+        }
+    }
+
+    /// `molto import --in` with both secrets on stdin, through the reader
+    /// `run_molto_import` uses: line 1 is the customer key, line 2 the
+    /// export's password (an encrypted export opens with it; a plain one
+    /// still takes the line off the pipe). A dry run reads the key line
+    /// only to keep the password on line 2.
+    fn molto_import_stdin_order(line: &str, argv: &[&str]) {
+        use crate::secrets::fake::FakeIo;
+        use keyroost_import::Format;
+        let f = ImportFixtures::new("molto-order");
+        let pw = format!("{FIXTURE_FILE_PASSWORD}\n");
+        for dry_run in [false, true] {
+            let mut argv = argv.to_vec();
+            if dry_run {
+                argv.push("--dry-run");
+            }
+            let cli = parse(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let Some(Cmd::Molto {
+                key,
+                cmd: MoltoCmd::Import { file_password, .. },
+                ..
+            }) = cli.command
+            else {
+                panic!("{line}: not molto import")
+            };
+            for (file, format) in [
+                (&f.encrypted, Format::AegisEncrypted),
+                (&f.plain, Format::Aegis),
+            ] {
+                let mut sec = Secrets::new(FakeIo::piped(&["11\n", pw.as_str()]));
+                let (k, opened) = code_import::read_molto_import_secrets(
+                    &mut sec,
+                    &key,
+                    file,
+                    file_password.as_ref(),
+                    dry_run,
+                )
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+                assert_eq!(opened.format, format, "{line}");
+                assert_eq!(sec.io.lines_read, 2, "{line}");
+                match k {
+                    Some(k) => assert_eq!((dry_run, &k[..]), (false, &[0x11][..]), "{line}"),
+                    None => assert!(dry_run, "{line}"),
                 }
-                ("new-customer-key", MoltoInput::NewKey(k)) => assert_eq!(&k[..], [0x22], "{line}"),
-                ("uri", MoltoInput::Entry { entry, .. }) => {
-                    assert_eq!(&entry.secret[..], b"Hello", "{line}")
-                }
-                _ => panic!("{line}: read the wrong input"),
-            },
+            }
         }
     }
 
@@ -23453,22 +23268,6 @@ mod cli_tests {
     }
 
     #[test]
-    fn bulk_import_asks_only_about_slots_it_writes() {
-        let titled = |uri: &str| -> keyroost_import::BulkEntry {
-            keyroost_import::parse_otpauth(uri).unwrap().into()
-        };
-        let entries = vec![
-            titled("otpauth://totp/a?secret=JBSWY3DP"),
-            // No issuer and no account: the import skips this slot.
-            titled("otpauth://totp/?secret=JBSWY3DP"),
-            titled("otpauth://totp/c?secret=JBSWY3DP"),
-        ];
-        assert!(entries[1].suggested_title().is_empty());
-        assert_eq!(bulk_import_slots(97, &entries), vec![97, 99]);
-        assert!(bulk_import_slots(0, &[]).is_empty());
-    }
-
-    #[test]
     fn newly_confirmed_commands_take_yes() {
         for args in [
             &["keyroostctl", "piv", "key", "generate", "--slot", "9a"][..],
@@ -23568,7 +23367,7 @@ mod cli_tests {
                     "--in",
                     "x.json",
                 ],
-                Some("molto import --dry-run"),
+                None,
             ),
             (&["keyroostctl", "molto", "import", "--in", "x.json"], None),
             (&["keyroostctl", "list"], None),

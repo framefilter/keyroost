@@ -481,13 +481,15 @@ pub(crate) struct ProgInfoJson {
 /// only, never a seed.
 #[derive(Serialize)]
 pub(crate) struct ImportJson {
-    /// "oath" or "otp".
+    /// "oath", "otp" or "molto2".
     pub destination: &'static str,
     pub dry_run: bool,
-    /// How many codes the key holds in all, when known.
+    /// How many codes the key holds in all, when known (Molto2: the slots
+    /// from the first one to #99).
     pub capacity: Option<usize>,
-    /// Codes already on the key.
-    pub on_key: usize,
+    /// Codes already on the key (Molto2: slots in use); null when the key
+    /// wasn't read (a Molto2 dry run with no Molto2 connected).
+    pub on_key: Option<usize>,
     pub entries: Vec<ImportRowJson>,
     /// Why the run stopped early, if it did.
     pub stopped: Option<String>,
@@ -617,15 +619,16 @@ mod tests {
         assert!(v["title"].is_null());
     }
 
-    /// `oath import` / `otp import --json`: every key present, `null` where
-    /// a dry run or a plain add has no value.
+    /// `oath import` / `otp import` / `molto import --in --json`: every key
+    /// present, `null` where a dry run or a plain add has no value (and
+    /// `on_key` where a Molto2 dry run had no Molto2 to read).
     #[test]
     fn import_shape_with_and_without_outcomes() {
         let top = [
             ("destination", "string"),
             ("dry_run", "bool"),
             ("capacity", "number|null"),
-            ("on_key", "number"),
+            ("on_key", "number|null"),
             ("entries", "array"),
             ("stopped", "string|null"),
         ];
@@ -656,15 +659,20 @@ mod tests {
             outcome: Some("failed"),
             error: Some("e".into()),
         };
-        for (capacity, stopped, rows) in [
-            (None, None, vec![bare]),
-            (Some(32), Some("the key is full".to_owned()), vec![full]),
+        for (capacity, on_key, stopped, rows) in [
+            (None, None, None, vec![bare]),
+            (
+                Some(32),
+                Some(0),
+                Some("the key is full".to_owned()),
+                vec![full],
+            ),
         ] {
             let v = to_v(&ImportJson {
                 destination: "oath",
                 dry_run: capacity.is_none(),
                 capacity,
-                on_key: 0,
+                on_key,
                 entries: rows,
                 stopped,
             });
