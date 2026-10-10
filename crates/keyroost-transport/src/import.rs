@@ -7,11 +7,12 @@
 //! tested without a key: a duplicate name, a full key, and an applet asking
 //! for its password again are each read from the key's own answer.
 
-use crate::{OathSession, TransportError};
+use crate::{OathSession, OtpTransportError, Session, Token2OtpSession, TransportError};
 use keyroost_import::entry::{HashAlg, ImportEntry, OtpKind};
 use keyroost_import::plan::{Existing, StoredName};
 use keyroost_import::run::{CodeStore, StoreError};
 use keyroost_oath as oath;
+use keyroost_proto::commands::{DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep};
 
 // ---------------------------------------------------------------------------
 // OATH
@@ -187,6 +188,335 @@ fn oath_add<I: OathIo + ?Sized>(
 fn oath_delete<I: OathIo + ?Sized>(io: &mut I, name: &StoredName) -> Result<(), StoreError> {
     let n = oath_stored_name(name)?;
     oath_with_reauth(io, &mut |io| io.delete(n), oath_delete_answer)
+}
+
+// ---------------------------------------------------------------------------
+// Token2 OTP
+// ---------------------------------------------------------------------------
+
+/// What a Token2 OTP status word means for a write or delete. `6983` is
+/// the OTP PIN being blocked on these keys — never "the name exists".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Token2Answer {
+    Ok,
+    Full,
+    PinWindow,
+    PinBlocked,
+    Other(u16),
+}
+
+fn token2_answer(sw: u16) -> Token2Answer {
+    use keyroost_token2otp::sw;
+    match sw {
+        sw::OK => Token2Answer::Ok,
+        sw::NOT_ENOUGH_SPACE => Token2Answer::Full,
+        sw::PIN_INVALID | sw::PIN_CONDITIONS_NOT_SATISFIED => Token2Answer::PinWindow,
+        sw::PIN_LOCKED => Token2Answer::PinBlocked,
+        other => Token2Answer::Other(other),
+    }
+}
+
+/// The Token2 OTP commands an import needs, so the PIN rules run against a
+/// scripted key in tests.
+trait Token2Io {
+    fn write(
+        &mut self,
+        entry: &keyroost_token2otp::WriteEntry<'_>,
+        pin: Option<&str>,
+    ) -> Result<(), OtpTransportError>;
+    fn delete(
+        &mut self,
+        app: &str,
+        account: &str,
+        pin: Option<&str>,
+    ) -> Result<(), OtpTransportError>;
+    fn verify_pin(&mut self, pin: &str) -> Result<(), OtpTransportError>;
+}
+
+impl Token2Io for Token2OtpSession {
+    fn write(
+        &mut self,
+        entry: &keyroost_token2otp::WriteEntry<'_>,
+        pin: Option<&str>,
+    ) -> Result<(), OtpTransportError> {
+        self.write_entry_pinned(entry, pin)
+    }
+    fn delete(
+        &mut self,
+        app: &str,
+        account: &str,
+        pin: Option<&str>,
+    ) -> Result<(), OtpTransportError> {
+        self.delete_entry_pinned(app, account, pin)
+    }
+    fn verify_pin(&mut self, pin: &str) -> Result<(), OtpTransportError> {
+        Token2OtpSession::verify_pin(self, pin)
+    }
+}
+
+/// Stores planned codes in a Token2 key's OTP storage. `pin` is the OTP
+/// PIN when the key has one; it is wiped when the store drops.
+pub struct Token2ImportStore<'a> {
+    session: &'a mut Token2OtpSession,
+    pin: Option<zeroize::Zeroizing<String>>,
+}
+
+impl<'a> Token2ImportStore<'a> {
+    pub fn new(session: &'a mut Token2OtpSession, pin: Option<zeroize::Zeroizing<String>>) -> Self {
+        Self { session, pin }
+    }
+}
+
+impl CodeStore for Token2ImportStore<'_> {
+    fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+        token2_add(
+            self.session,
+            self.pin.as_deref().map(String::as_str),
+            name,
+            entry,
+        )
+    }
+    fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
+        token2_delete(self.session, self.pin.as_deref().map(String::as_str), name)
+    }
+}
+
+/// ENUM_CODES (opening the PIN window first when the key has a PIN) → the
+/// (app, account) names on the key.
+pub fn read_token2_existing(
+    session: &mut Token2OtpSession,
+    pin: Option<&str>,
+) -> Result<Existing, OtpTransportError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entries = session.enumerate_pinned(now, pin)?;
+    Ok(Existing {
+        names: entries
+            .into_iter()
+            .map(|e| StoredName::Token2 {
+                app: e.app_name,
+                account: e.account_name,
+            })
+            .collect(),
+        hidden: 0,
+    })
+}
+
+fn token2_stored_name(name: &StoredName) -> Result<(&str, &str), StoreError> {
+    match name {
+        StoredName::Token2 { app, account } => Ok((app, account)),
+        _ => Err(StoreError::Failed(
+            "this entry has no Token2 name to store it under".to_owned(),
+        )),
+    }
+}
+
+/// The `WRITE_SEED` fields for one entry: the TOTP period as the time step
+/// (30 for HOTP, as `otp add` does), no button press. What the plan keeps
+/// out fails here instead of panicking.
+fn token2_write_entry<'a>(
+    app: &'a str,
+    account: &'a str,
+    entry: &'a ImportEntry,
+) -> Result<keyroost_token2otp::WriteEntry<'a>, StoreError> {
+    use keyroost_token2otp::{Algorithm, OtpType};
+    let algorithm = match entry.hash {
+        HashAlg::Sha1 => Algorithm::Sha1,
+        HashAlg::Sha256 => Algorithm::Sha256,
+        HashAlg::Sha512 => {
+            return Err(StoreError::Failed(
+                "this Token2 key doesn't take SHA-512 codes".to_owned(),
+            ))
+        }
+    };
+    let (otp_type, timestep) = match entry.kind {
+        OtpKind::Totp { period } => {
+            let step = u16::try_from(period).map_err(|_| {
+                StoreError::Failed(format!("this Token2 key doesn't take a {period} s period"))
+            })?;
+            (OtpType::Totp, step)
+        }
+        OtpKind::Hotp { .. } => (OtpType::Hotp, 30),
+    };
+    Ok(keyroost_token2otp::WriteEntry {
+        otp_type,
+        algorithm,
+        timestep,
+        code_length: entry.digits,
+        button_required: false,
+        app_name: app,
+        account_name: account,
+        seed: &entry.secret,
+    })
+}
+
+/// A transport result as a Token2 answer. `PinRequired` (a PIN is set and
+/// none was given) reads as the PIN window being closed.
+fn token2_classify(r: Result<(), OtpTransportError>) -> Result<Token2Answer, StoreError> {
+    match r {
+        Ok(()) => Ok(Token2Answer::Ok),
+        Err(OtpTransportError::Applet(e)) => Ok(token2_answer(e.status_word())),
+        Err(OtpTransportError::PinRequired) => Ok(Token2Answer::PinWindow),
+        Err(other) => Err(StoreError::Failed(other.to_string())),
+    }
+}
+
+const TOKEN2_PIN_BLOCKED: &str = "the key's OTP PIN is blocked";
+
+/// Send one command; when the PIN window is closed and a PIN is held,
+/// verify it and retry once.
+fn token2_with_pin<I: Token2Io + ?Sized>(
+    io: &mut I,
+    pin: Option<&str>,
+    send: &mut dyn FnMut(&mut I) -> Result<(), OtpTransportError>,
+) -> Result<(), StoreError> {
+    let mut a = token2_classify(send(io))?;
+    if a == Token2Answer::PinWindow {
+        let Some(p) = pin else {
+            return Err(StoreError::Failed(
+                "the key asks for its OTP PIN".to_owned(),
+            ));
+        };
+        io.verify_pin(p).map_err(|e| match e {
+            OtpTransportError::Applet(ref a)
+                if token2_answer(a.status_word()) == Token2Answer::PinBlocked =>
+            {
+                StoreError::Failed(TOKEN2_PIN_BLOCKED.to_owned())
+            }
+            other => StoreError::Failed(other.to_string()),
+        })?;
+        a = token2_classify(send(io))?;
+    }
+    match a {
+        Token2Answer::Ok => Ok(()),
+        Token2Answer::Full => Err(StoreError::Full),
+        Token2Answer::PinWindow => Err(StoreError::Failed(
+            "the key asked for its OTP PIN again and refused it".to_owned(),
+        )),
+        Token2Answer::PinBlocked => Err(StoreError::Failed(TOKEN2_PIN_BLOCKED.to_owned())),
+        Token2Answer::Other(sw) => Err(StoreError::Failed(format!(
+            "the key refused it (status {sw:04X})"
+        ))),
+    }
+}
+
+fn token2_add<I: Token2Io + ?Sized>(
+    io: &mut I,
+    pin: Option<&str>,
+    name: &StoredName,
+    entry: &ImportEntry,
+) -> Result<(), StoreError> {
+    let (app, account) = token2_stored_name(name)?;
+    let w = token2_write_entry(app, account, entry)?;
+    token2_with_pin(io, pin, &mut |io| io.write(&w, pin))
+}
+
+fn token2_delete<I: Token2Io + ?Sized>(
+    io: &mut I,
+    pin: Option<&str>,
+    name: &StoredName,
+) -> Result<(), StoreError> {
+    let (app, account) = token2_stored_name(name)?;
+    token2_with_pin(io, pin, &mut |io| io.delete(app, account, pin))
+}
+
+// ---------------------------------------------------------------------------
+// Molto2
+// ---------------------------------------------------------------------------
+
+/// Stores planned codes in Molto2 slots: seed, title, then config. The
+/// session is already authenticated.
+pub struct MoltoImportStore<'a> {
+    session: &'a mut Session,
+    display_timeout: DisplayTimeout,
+    utc_time: u32,
+}
+
+impl<'a> MoltoImportStore<'a> {
+    pub fn new(session: &'a mut Session, display_timeout: DisplayTimeout, utc_time: u32) -> Self {
+        Self {
+            session,
+            display_timeout,
+            utc_time,
+        }
+    }
+}
+
+/// One slot write, checked so the command builders' limits (seed 1..=63
+/// bytes, title 1..=12 bytes) can't panic: the plan keeps such entries
+/// out, and anything that slips through fails instead.
+struct MoltoWrite<'a> {
+    slot: u8,
+    title: &'a str,
+    config: ProfileConfig,
+}
+
+fn molto_write<'a>(
+    name: &'a StoredName,
+    entry: &ImportEntry,
+    display_timeout: DisplayTimeout,
+    utc_time: u32,
+) -> Result<MoltoWrite<'a>, StoreError> {
+    let unsupported = |what: String| StoreError::Failed(format!("Molto2 doesn't take {what}"));
+    let StoredName::Molto2 { slot, title } = name else {
+        return Err(StoreError::Failed(
+            "this entry has no Molto2 slot to store it in".to_owned(),
+        ));
+    };
+    if title.is_empty() || title.len() > 12 {
+        return Err(StoreError::Failed(
+            "the title must be 1 to 12 bytes".to_owned(),
+        ));
+    }
+    if entry.secret.is_empty() || entry.secret.len() > 63 {
+        return Err(unsupported(format!("a {}-byte seed", entry.secret.len())));
+    }
+    let algorithm = match entry.hash {
+        HashAlg::Sha1 => HmacAlgo::Sha1,
+        HashAlg::Sha256 => HmacAlgo::Sha256,
+        HashAlg::Sha512 => return Err(unsupported("SHA-512 codes".to_owned())),
+    };
+    let digits = match entry.digits {
+        4 => OtpDigits::Four,
+        6 => OtpDigits::Six,
+        8 => OtpDigits::Eight,
+        10 => OtpDigits::Ten,
+        d => return Err(unsupported(format!("{d}-digit codes"))),
+    };
+    let time_step = match entry.kind {
+        OtpKind::Totp { period: 30 } => TimeStep::Seconds30,
+        OtpKind::Totp { period: 60 } => TimeStep::Seconds60,
+        OtpKind::Totp { period } => return Err(unsupported(format!("a {period} s period"))),
+        OtpKind::Hotp { .. } => return Err(unsupported("counter-based (HOTP) codes".to_owned())),
+    };
+    Ok(MoltoWrite {
+        slot: *slot,
+        title,
+        config: ProfileConfig {
+            display_timeout,
+            algorithm,
+            digits,
+            time_step,
+            utc_time,
+        },
+    })
+}
+
+impl CodeStore for MoltoImportStore<'_> {
+    fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
+        let w = molto_write(name, entry, self.display_timeout, self.utc_time)?;
+        let failed = |e: TransportError| StoreError::Failed(e.to_string());
+        self.session
+            .set_seed(w.slot, &entry.secret)
+            .map_err(failed)?;
+        self.session.set_title(w.slot, w.title).map_err(failed)?;
+        self.session.set_config(w.slot, &w.config).map_err(failed)
+    }
+    fn delete(&mut self, _name: &StoredName) -> Result<(), StoreError> {
+        Err(StoreError::Failed("not supported".to_owned()))
+    }
 }
 
 #[cfg(test)]
@@ -427,5 +757,272 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Token2 ----
+
+    use keyroost_token2otp::OtpError;
+
+    /// A scripted Token2 key: write/delete answers popped per call (default
+    /// success), every call recorded.
+    #[derive(Default)]
+    struct ScriptedToken2 {
+        write: VecDeque<Result<(), OtpTransportError>>,
+        verify: VecDeque<Result<(), OtpTransportError>>,
+        calls: Vec<String>,
+    }
+
+    impl Token2Io for ScriptedToken2 {
+        fn write(
+            &mut self,
+            e: &keyroost_token2otp::WriteEntry<'_>,
+            _pin: Option<&str>,
+        ) -> Result<(), OtpTransportError> {
+            self.calls.push(format!("write {}", e.account_name));
+            self.write.pop_front().unwrap_or(Ok(()))
+        }
+        fn delete(
+            &mut self,
+            _app: &str,
+            account: &str,
+            _pin: Option<&str>,
+        ) -> Result<(), OtpTransportError> {
+            self.calls.push(format!("delete {account}"));
+            self.write.pop_front().unwrap_or(Ok(()))
+        }
+        fn verify_pin(&mut self, _pin: &str) -> Result<(), OtpTransportError> {
+            self.calls.push("verify".to_owned());
+            self.verify.pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    fn t2name() -> StoredName {
+        StoredName::Token2 {
+            app: "A".to_owned(),
+            account: "a".to_owned(),
+        }
+    }
+
+    fn applet(e: OtpError) -> Result<(), OtpTransportError> {
+        Err(OtpTransportError::Applet(e))
+    }
+
+    #[test]
+    fn token2_6983_is_pin_blocked_not_exists() {
+        assert_eq!(token2_answer(0x6983), Token2Answer::PinBlocked);
+        assert_eq!(token2_answer(0x9000), Token2Answer::Ok);
+        assert_eq!(token2_answer(0x6982), Token2Answer::PinWindow);
+        assert_eq!(token2_answer(0x6985), Token2Answer::PinWindow);
+        assert_eq!(token2_answer(0x6A80), Token2Answer::Other(0x6A80));
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::PinLocked)].into(),
+            ..Default::default()
+        };
+        let e = entry(OtpKind::Totp { period: 30 });
+        assert_eq!(
+            token2_add(&mut io, Some("1234"), &t2name(), &e),
+            Err(StoreError::Failed(
+                "the key's OTP PIN is blocked".to_owned()
+            ))
+        );
+        assert_eq!(io.calls, vec!["write a"]);
+    }
+
+    #[test]
+    fn token2_6a84_is_full() {
+        assert_eq!(token2_answer(0x6A84), Token2Answer::Full);
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::NotEnoughSpace)].into(),
+            ..Default::default()
+        };
+        let e = entry(OtpKind::Totp { period: 30 });
+        assert_eq!(
+            token2_add(&mut io, None, &t2name(), &e),
+            Err(StoreError::Full)
+        );
+    }
+
+    #[test]
+    fn token2_pin_window_reverifies_once() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::PinConditionsNotSatisfied), Ok(())].into(),
+            ..Default::default()
+        };
+        assert_eq!(token2_add(&mut io, Some("1234"), &t2name(), &e), Ok(()));
+        assert_eq!(io.calls, vec!["write a", "verify", "write a"]);
+
+        // Closed again after the verify: reported, not retried forever.
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::PinInvalid), applet(OtpError::PinInvalid)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            token2_add(&mut io, Some("1234"), &t2name(), &e),
+            Err(StoreError::Failed(
+                "the key asked for its OTP PIN again and refused it".to_owned()
+            ))
+        );
+        assert_eq!(io.calls, vec!["write a", "verify", "write a"]);
+
+        // No PIN held: never verified, the key's request is reported.
+        for first in [
+            applet(OtpError::PinConditionsNotSatisfied),
+            Err(OtpTransportError::PinRequired),
+        ] {
+            let mut io = ScriptedToken2 {
+                write: [first].into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                token2_add(&mut io, None, &t2name(), &e),
+                Err(StoreError::Failed(
+                    "the key asks for its OTP PIN".to_owned()
+                ))
+            );
+            assert_eq!(io.calls, vec!["write a"]);
+        }
+
+        // Delete takes the same path.
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::PinConditionsNotSatisfied)].into(),
+            ..Default::default()
+        };
+        assert_eq!(token2_delete(&mut io, Some("1234"), &t2name()), Ok(()));
+        assert_eq!(io.calls, vec!["delete a", "verify", "delete a"]);
+
+        // A blocked PIN at verify says so.
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::PinConditionsNotSatisfied)].into(),
+            verify: [applet(OtpError::PinLocked)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            token2_add(&mut io, Some("1234"), &t2name(), &e),
+            Err(StoreError::Failed(
+                "the key's OTP PIN is blocked".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn token2_write_entry_fields() {
+        let e = ImportEntry {
+            secret: Zeroizing::new(vec![0xAB; 3]),
+            hash: HashAlg::Sha256,
+            digits: 8,
+            ..entry(OtpKind::Totp { period: 45 })
+        };
+        let w = token2_write_entry("Ap", "acc", &e).unwrap();
+        let bytes = keyroost_token2otp::serialize_write_entry(&w).unwrap();
+        // type TOTP, SHA-256, step 45, 8 digits, no button, "Ap", "acc", seed.
+        let want: Vec<u8> = [
+            &[
+                keyroost_token2otp::OtpType::Totp.to_byte(),
+                keyroost_token2otp::Algorithm::Sha256.to_byte(),
+                0x00,
+                45,
+                8,
+                0,
+                2,
+            ][..],
+            b"Ap",
+            &[3],
+            b"acc",
+            &[3, 0xAB, 0xAB, 0xAB],
+        ]
+        .concat();
+        assert_eq!(bytes.as_bytes(), &want[..]);
+
+        // HOTP is stored with a 30 s step, as `otp add` does.
+        let e = ImportEntry {
+            hash: HashAlg::Sha1,
+            digits: 6,
+            ..entry(OtpKind::Hotp { counter: 0 })
+        };
+        let w = token2_write_entry("", "acc", &e).unwrap();
+        assert_eq!(w.otp_type, keyroost_token2otp::OtpType::Hotp);
+        assert_eq!(w.algorithm, keyroost_token2otp::Algorithm::Sha1);
+        assert_eq!(
+            (w.timestep, w.code_length, w.button_required),
+            (30, 6, false)
+        );
+
+        // Unreachable after `plan`; refused, never truncated.
+        let e = ImportEntry {
+            hash: HashAlg::Sha512,
+            ..entry(OtpKind::Totp { period: 30 })
+        };
+        assert!(token2_write_entry("", "acc", &e).is_err());
+        assert!(token2_write_entry("", "acc", &entry(OtpKind::Totp { period: 70_000 })).is_err());
+    }
+
+    // ---- Molto2 ----
+
+    #[test]
+    fn molto_store_maps_entry_to_profile_config() {
+        let name = StoredName::Molto2 {
+            slot: 7,
+            title: "Example".to_owned(),
+        };
+        let e = ImportEntry {
+            hash: HashAlg::Sha256,
+            digits: 8,
+            ..entry(OtpKind::Totp { period: 60 })
+        };
+        let w = molto_write(&name, &e, DisplayTimeout::Sec60, 1_700_000_000).unwrap();
+        assert_eq!((w.slot, w.title), (7, "Example"));
+        let c = &w.config;
+        assert_eq!(c.display_timeout, DisplayTimeout::Sec60);
+        assert_eq!(c.algorithm, HmacAlgo::Sha256);
+        assert_eq!(c.digits, OtpDigits::Eight);
+        assert_eq!(c.time_step, TimeStep::Seconds60);
+        assert_eq!(c.utc_time, 1_700_000_000);
+        let e = ImportEntry {
+            hash: HashAlg::Sha1,
+            digits: 6,
+            ..entry(OtpKind::Totp { period: 30 })
+        };
+        let w = molto_write(&name, &e, DisplayTimeout::Sec30, 1).unwrap();
+        assert_eq!(
+            (w.config.algorithm, w.config.digits, w.config.time_step),
+            (HmacAlgo::Sha1, OtpDigits::Six, TimeStep::Seconds30)
+        );
+    }
+
+    #[test]
+    fn molto_store_refuses_what_it_cannot_write() {
+        let name = StoredName::Molto2 {
+            slot: 7,
+            title: "Example".to_owned(),
+        };
+        let bad = [
+            entry(OtpKind::Hotp { counter: 0 }),
+            entry(OtpKind::Totp { period: 45 }),
+            ImportEntry {
+                hash: HashAlg::Sha512,
+                ..entry(OtpKind::Totp { period: 30 })
+            },
+            ImportEntry {
+                digits: 7,
+                ..entry(OtpKind::Totp { period: 30 })
+            },
+            ImportEntry {
+                secret: Zeroizing::new(vec![1; 64]),
+                ..entry(OtpKind::Totp { period: 30 })
+            },
+        ];
+        for e in &bad {
+            assert!(molto_write(&name, e, DisplayTimeout::Sec30, 0).is_err());
+        }
+        let e = entry(OtpKind::Totp { period: 30 });
+        for title in ["", "thirteen byte"] {
+            let n = StoredName::Molto2 {
+                slot: 7,
+                title: title.to_owned(),
+            };
+            assert!(molto_write(&n, &e, DisplayTimeout::Sec30, 0).is_err());
+        }
+        assert!(molto_write(&StoredName::Oath("x".into()), &e, DisplayTimeout::Sec30, 0).is_err());
     }
 }
