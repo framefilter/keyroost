@@ -14,6 +14,7 @@ pub mod classify;
 pub mod entry;
 pub mod otpauth;
 pub mod plan;
+pub mod run;
 
 pub use entry::{Format, HashAlg, ImportEntry, ImportFile, ImportItem, OtpKind, Unusable};
 pub use otpauth::{parse as parse_otpauth, OtpAuth, OtpAuthError};
