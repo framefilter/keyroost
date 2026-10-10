@@ -83,19 +83,22 @@ impl OathSession {
     }
 
     /// Re-SELECT and VALIDATE with the access key kept from the last
-    /// successful [`unlock`](Self::unlock); with none kept this is `Ok` and
-    /// nothing is sent. For applets that clear authorization after each
-    /// command (the Solo 2's released OATH app does, per its source), so a
+    /// successful [`unlock`](Self::unlock). Returns `Ok(false)`, sending
+    /// nothing, when no key is kept (no password was given), and `Ok(true)`
+    /// once the applet is unlocked again. For applets that clear
+    /// authorization after each command — the Solo 2's released OATH app
+    /// does, per the firmware source (not verified on hardware) — so a
     /// refused command can be retried without asking for the password again.
-    pub fn reauthenticate(&mut self) -> Result<(), TransportError> {
+    pub fn reauthenticate(&mut self) -> Result<bool, TransportError> {
         let Some(key) = self.access_key.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         self.select()?;
         if self.select_info.challenge.is_none() {
-            return Ok(()); // the password is gone; nothing to answer
+            return Ok(true); // the password is gone; nothing to answer
         }
-        self.validate_with(&key)
+        self.validate_with(&key)?;
+        Ok(true)
     }
 
     /// Answer the current SELECT challenge with VALIDATE under `key` and check

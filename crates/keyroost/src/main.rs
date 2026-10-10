@@ -797,14 +797,8 @@ impl OathAddDialog {
         }
         // Past this length the key stops responding until it is unplugged,
         // so the name never reaches it (same check as `oath add`).
-        if let Some(max) = family.hard_name_limit() {
-            if name.len() > max {
-                return Err(format!(
-                    "the name is {} bytes; a Solo 2 stores names up to {max} bytes \
-                     (a longer one makes the key stop responding until it is unplugged)",
-                    name.len()
-                ));
-            }
+        if let Some(refusal) = family.name_refusal(&name) {
+            return Err(refusal);
         }
         match keyroost_proto::codec::base32_decode(self.secret.trim()) {
             Ok(s) if !s.is_empty() => Ok((name, s)),

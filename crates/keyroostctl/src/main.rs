@@ -8190,14 +8190,7 @@ fn oath_code_period(flag: Option<u32>, name: &str) -> u32 {
 /// Why `oath add` won't send `name` to a key from `vendor`, when the key
 /// has a length it must never be given past (Solo 2).
 fn oath_name_refusal(vendor: &str, name: &str) -> Option<String> {
-    let max = keyroost_import::plan::OathFamily::from_vendor(vendor, None).hard_name_limit()?;
-    (name.len() > max).then(|| {
-        format!(
-            "the name is {} bytes; a Solo 2 stores names up to {max} bytes \
-             (a longer one makes the key stop responding until it is unplugged)",
-            name.len()
-        )
-    })
+    keyroost_import::plan::OathFamily::from_vendor(vendor, None).name_refusal(name)
 }
 
 fn oath_type_str(t: keyroost_oath::OathType) -> &'static str {

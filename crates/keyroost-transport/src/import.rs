@@ -13,6 +13,7 @@ use keyroost_import::plan::{Existing, StoredName};
 use keyroost_import::run::{CodeStore, StoreError};
 use keyroost_oath as oath;
 use keyroost_proto::commands::{DisplayTimeout, HmacAlgo, OtpDigits, ProfileConfig, TimeStep};
+use keyroost_token2otp::OtpError;
 
 // ---------------------------------------------------------------------------
 // OATH
@@ -52,7 +53,9 @@ fn oath_delete_answer(sw: u16) -> OathAnswer {
 trait OathIo {
     fn put(&mut self, params: &oath::PutParams<'_>) -> Result<u16, TransportError>;
     fn delete(&mut self, name: &str) -> Result<u16, TransportError>;
-    fn reauth(&mut self) -> Result<(), TransportError>;
+    /// VALIDATE again; `Ok(false)` when no password was ever given, so
+    /// nothing was sent.
+    fn reauth(&mut self) -> Result<bool, TransportError>;
 }
 
 impl OathIo for OathSession {
@@ -62,7 +65,7 @@ impl OathIo for OathSession {
     fn delete(&mut self, name: &str) -> Result<u16, TransportError> {
         self.delete_status(name)
     }
-    fn reauth(&mut self) -> Result<(), TransportError> {
+    fn reauth(&mut self) -> Result<bool, TransportError> {
         self.reauthenticate()
     }
 }
@@ -71,20 +74,36 @@ impl OathIo for OathSession {
 /// and, when the applet has a password, unlocked.
 pub struct OathImportStore<'a> {
     session: &'a mut OathSession,
+    password_hint: &'static str,
 }
+
+/// What [`OathImportStore`] tells a person to do when the applet turns out
+/// to need a password nobody gave, unless the front end says otherwise.
+const DEFAULT_PASSWORD_HINT: &str = "unlock it with its password first";
 
 impl<'a> OathImportStore<'a> {
     pub fn new(session: &'a mut OathSession) -> Self {
-        Self { session }
+        Self {
+            session,
+            password_hint: DEFAULT_PASSWORD_HINT,
+        }
+    }
+
+    /// How this front end gives the applet password, for the report when
+    /// the key asks for one that wasn't given — e.g. the CLI's
+    /// "pass --password env:NAME or --password stdin".
+    pub fn password_hint(mut self, hint: &'static str) -> Self {
+        self.password_hint = hint;
+        self
     }
 }
 
 impl CodeStore for OathImportStore<'_> {
     fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
-        oath_add(self.session, name, entry)
+        oath_add(self.session, self.password_hint, name, entry)
     }
     fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
-        oath_delete(self.session, name)
+        oath_delete(self.session, self.password_hint, name)
     }
 }
 
@@ -155,12 +174,17 @@ fn oath_transport_failed(e: TransportError) -> StoreError {
 /// and retry once.
 fn oath_with_reauth<I: OathIo + ?Sized>(
     io: &mut I,
+    hint: &str,
     send: &mut dyn FnMut(&mut I) -> Result<u16, TransportError>,
     answer: fn(u16) -> OathAnswer,
 ) -> Result<(), StoreError> {
     let mut a = answer(send(io).map_err(oath_transport_failed)?);
     if a == OathAnswer::NeedsAuth {
-        io.reauth().map_err(oath_transport_failed)?;
+        if !io.reauth().map_err(oath_transport_failed)? {
+            return Err(StoreError::Failed(format!(
+                "this key's authenticator storage is password-protected; {hint}"
+            )));
+        }
         a = answer(send(io).map_err(oath_transport_failed)?);
     }
     match a {
@@ -178,16 +202,21 @@ fn oath_with_reauth<I: OathIo + ?Sized>(
 
 fn oath_add<I: OathIo + ?Sized>(
     io: &mut I,
+    hint: &str,
     name: &StoredName,
     entry: &ImportEntry,
 ) -> Result<(), StoreError> {
     let params = put_params(oath_stored_name(name)?, entry)?;
-    oath_with_reauth(io, &mut |io| io.put(&params), oath_put_answer)
+    oath_with_reauth(io, hint, &mut |io| io.put(&params), oath_put_answer)
 }
 
-fn oath_delete<I: OathIo + ?Sized>(io: &mut I, name: &StoredName) -> Result<(), StoreError> {
+fn oath_delete<I: OathIo + ?Sized>(
+    io: &mut I,
+    hint: &str,
+    name: &StoredName,
+) -> Result<(), StoreError> {
     let n = oath_stored_name(name)?;
-    oath_with_reauth(io, &mut |io| io.delete(n), oath_delete_answer)
+    oath_with_reauth(io, hint, &mut |io| io.delete(n), oath_delete_answer)
 }
 
 // ---------------------------------------------------------------------------
@@ -259,25 +288,30 @@ impl Token2Io for Token2OtpSession {
 pub struct Token2ImportStore<'a> {
     session: &'a mut Token2OtpSession,
     pin: Option<zeroize::Zeroizing<String>>,
+    /// The PIN has worked once in this import (a write went through), so
+    /// re-verifying it when the key closes its PIN window can't spend an
+    /// attempt on a wrong PIN.
+    pin_proven: bool,
 }
 
 impl<'a> Token2ImportStore<'a> {
     pub fn new(session: &'a mut Token2OtpSession, pin: Option<zeroize::Zeroizing<String>>) -> Self {
-        Self { session, pin }
+        Self {
+            session,
+            pin,
+            pin_proven: false,
+        }
     }
 }
 
 impl CodeStore for Token2ImportStore<'_> {
     fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
-        token2_add(
-            self.session,
-            self.pin.as_deref().map(String::as_str),
-            name,
-            entry,
-        )
+        let pin = self.pin.as_deref().map(String::as_str);
+        token2_add(self.session, pin, &mut self.pin_proven, name, entry)
     }
     fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
-        token2_delete(self.session, self.pin.as_deref().map(String::as_str), name)
+        let pin = self.pin.as_deref().map(String::as_str);
+        token2_delete(self.session, pin, &mut self.pin_proven, name)
     }
 }
 
@@ -370,15 +404,39 @@ const TOKEN2_PIN_BLOCKED: &str = "the key's OTP PIN is blocked";
 fn token2_with_pin<I: Token2Io + ?Sized>(
     io: &mut I,
     pin: Option<&str>,
+    proven: &mut bool,
     send: &mut dyn FnMut(&mut I) -> Result<(), OtpTransportError>,
 ) -> Result<(), StoreError> {
-    let mut a = token2_classify(send(io))?;
+    let first = send(io);
+    // A wrong PIN from the write's own verify: said plainly (with the tries
+    // left, when the key reports them) and never sent again.
+    if !*proven {
+        if let Err(OtpTransportError::Applet(
+            e @ (OtpError::PinInvalid | OtpError::PinInvalidRetries(_)),
+        )) = &first
+        {
+            if pin.is_some() {
+                return Err(StoreError::Failed(e.to_string()));
+            }
+        }
+    }
+    if let Err(OtpTransportError::Applet(e @ OtpError::PinInvalidRetries(_))) = &first {
+        return Err(StoreError::Failed(e.to_string()));
+    }
+    let mut a = token2_classify(first)?;
     if a == Token2Answer::PinWindow {
         let Some(p) = pin else {
             return Err(StoreError::Failed(
                 "the key asks for its OTP PIN".to_owned(),
             ));
         };
+        // Re-verify only a PIN that already worked in this import, so no
+        // attempt is ever spent on a wrong one.
+        if !*proven {
+            return Err(StoreError::Failed(
+                "the key didn't accept the OTP PIN".to_owned(),
+            ));
+        }
         io.verify_pin(p).map_err(|e| match e {
             OtpTransportError::Applet(ref a)
                 if token2_answer(a.status_word()) == Token2Answer::PinBlocked =>
@@ -388,6 +446,9 @@ fn token2_with_pin<I: Token2Io + ?Sized>(
             other => StoreError::Failed(other.to_string()),
         })?;
         a = token2_classify(send(io))?;
+    }
+    if a == Token2Answer::Ok && pin.is_some() {
+        *proven = true;
     }
     match a {
         Token2Answer::Ok => Ok(()),
@@ -405,21 +466,23 @@ fn token2_with_pin<I: Token2Io + ?Sized>(
 fn token2_add<I: Token2Io + ?Sized>(
     io: &mut I,
     pin: Option<&str>,
+    proven: &mut bool,
     name: &StoredName,
     entry: &ImportEntry,
 ) -> Result<(), StoreError> {
     let (app, account) = token2_stored_name(name)?;
     let w = token2_write_entry(app, account, entry)?;
-    token2_with_pin(io, pin, &mut |io| io.write(&w, pin))
+    token2_with_pin(io, pin, proven, &mut |io| io.write(&w, pin))
 }
 
 fn token2_delete<I: Token2Io + ?Sized>(
     io: &mut I,
     pin: Option<&str>,
+    proven: &mut bool,
     name: &StoredName,
 ) -> Result<(), StoreError> {
     let (app, account) = token2_stored_name(name)?;
-    token2_with_pin(io, pin, &mut |io| io.delete(app, account, pin))
+    token2_with_pin(io, pin, proven, &mut |io| io.delete(app, account, pin))
 }
 
 // ---------------------------------------------------------------------------
@@ -427,20 +490,60 @@ fn token2_delete<I: Token2Io + ?Sized>(
 // ---------------------------------------------------------------------------
 
 /// Stores planned codes in Molto2 slots: seed, title, then config. The
-/// session is already authenticated.
+/// session is already authenticated. Each config carries the time read just
+/// before it is sent, as the single-slot writes do, so a long run doesn't
+/// leave the token's clock behind.
 pub struct MoltoImportStore<'a> {
     session: &'a mut Session,
     display_timeout: DisplayTimeout,
-    utc_time: u32,
+    now: fn() -> u32,
 }
 
 impl<'a> MoltoImportStore<'a> {
-    pub fn new(session: &'a mut Session, display_timeout: DisplayTimeout, utc_time: u32) -> Self {
+    pub fn new(session: &'a mut Session, display_timeout: DisplayTimeout) -> Self {
+        Self::with_clock(session, display_timeout, unix_now_u32)
+    }
+
+    /// As [`new`](Self::new), reading the time from `now` instead of the
+    /// wall clock.
+    pub fn with_clock(
+        session: &'a mut Session,
+        display_timeout: DisplayTimeout,
+        now: fn() -> u32,
+    ) -> Self {
         Self {
             session,
             display_timeout,
-            utc_time,
+            now,
         }
+    }
+}
+
+/// Wall-clock Unix seconds (0 before 1970; saturating past 2106).
+fn unix_now_u32() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+        .unwrap_or(0)
+}
+
+/// The three Molto2 slot writes, so the adapter runs against a scripted
+/// token in tests.
+trait MoltoIo {
+    fn set_seed(&mut self, slot: u8, seed: &[u8]) -> Result<(), TransportError>;
+    fn set_title(&mut self, slot: u8, title: &str) -> Result<(), TransportError>;
+    fn set_config(&mut self, slot: u8, cfg: &ProfileConfig) -> Result<(), TransportError>;
+}
+
+impl MoltoIo for Session {
+    fn set_seed(&mut self, slot: u8, seed: &[u8]) -> Result<(), TransportError> {
+        Session::set_seed(self, slot, seed)
+    }
+    fn set_title(&mut self, slot: u8, title: &str) -> Result<(), TransportError> {
+        Session::set_title(self, slot, title)
+    }
+    fn set_config(&mut self, slot: u8, cfg: &ProfileConfig) -> Result<(), TransportError> {
+        Session::set_config(self, slot, cfg)
     }
 }
 
@@ -504,15 +607,26 @@ fn molto_write<'a>(
     })
 }
 
+/// Write one slot: seed, title, then config with the time read just before
+/// the config goes out.
+fn molto_add<I: MoltoIo + ?Sized>(
+    io: &mut I,
+    now: fn() -> u32,
+    display_timeout: DisplayTimeout,
+    name: &StoredName,
+    entry: &ImportEntry,
+) -> Result<(), StoreError> {
+    let mut w = molto_write(name, entry, display_timeout, 0)?;
+    let failed = |e: TransportError| StoreError::Failed(e.to_string());
+    io.set_seed(w.slot, &entry.secret).map_err(failed)?;
+    io.set_title(w.slot, w.title).map_err(failed)?;
+    w.config.utc_time = now();
+    io.set_config(w.slot, &w.config).map_err(failed)
+}
+
 impl CodeStore for MoltoImportStore<'_> {
     fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
-        let w = molto_write(name, entry, self.display_timeout, self.utc_time)?;
-        let failed = |e: TransportError| StoreError::Failed(e.to_string());
-        self.session
-            .set_seed(w.slot, &entry.secret)
-            .map_err(failed)?;
-        self.session.set_title(w.slot, w.title).map_err(failed)?;
-        self.session.set_config(w.slot, &w.config).map_err(failed)
+        molto_add(self.session, self.now, self.display_timeout, name, entry)
     }
     fn delete(&mut self, _name: &StoredName) -> Result<(), StoreError> {
         Err(StoreError::Failed("not supported".to_owned()))
@@ -560,6 +674,8 @@ mod tests {
         put: VecDeque<u16>,
         delete: VecDeque<u16>,
         calls: Vec<String>,
+        /// A password was given (unlock kept an access key).
+        has_key: bool,
     }
 
     impl OathIo for ScriptedOath {
@@ -571,9 +687,9 @@ mod tests {
             self.calls.push(format!("delete {}", name));
             Ok(self.delete.pop_front().unwrap_or(0x9000))
         }
-        fn reauth(&mut self) -> Result<(), TransportError> {
+        fn reauth(&mut self) -> Result<bool, TransportError> {
             self.calls.push("reauth".to_owned());
-            Ok(())
+            Ok(self.has_key)
         }
     }
 
@@ -582,10 +698,10 @@ mod tests {
 
     impl CodeStore for ScriptedStore {
         fn add(&mut self, name: &StoredName, entry: &ImportEntry) -> Result<(), StoreError> {
-            oath_add(&mut self.0, name, entry)
+            oath_add(&mut self.0, DEFAULT_PASSWORD_HINT, name, entry)
         }
         fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
-            oath_delete(&mut self.0, name)
+            oath_delete(&mut self.0, DEFAULT_PASSWORD_HINT, name)
         }
     }
 
@@ -665,17 +781,19 @@ mod tests {
 
         let mut io = ScriptedOath {
             put: [0x6982, 0x9000].into(),
+            has_key: true,
             ..Default::default()
         };
-        assert_eq!(oath_add(&mut io, &name, &e), Ok(()));
+        assert_eq!(oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e), Ok(()));
         assert_eq!(io.calls, vec!["put A:a", "reauth", "put A:a"]);
 
         let mut io = ScriptedOath {
             put: [0x6982, 0x6982].into(),
+            has_key: true,
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, &name, &e),
+            oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e),
             Err(StoreError::Failed(
                 "the key asked for its OATH password again and refused it".to_owned()
             ))
@@ -684,10 +802,31 @@ mod tests {
 
         let mut io = ScriptedOath {
             delete: [0x6982].into(),
+            has_key: true,
             ..Default::default()
         };
-        assert_eq!(oath_delete(&mut io, &name), Ok(()));
+        assert_eq!(oath_delete(&mut io, DEFAULT_PASSWORD_HINT, &name), Ok(()));
         assert_eq!(io.calls, vec!["delete A:a", "reauth", "delete A:a"]);
+    }
+
+    #[test]
+    fn needs_auth_without_a_password_says_how_to_give_one() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        let name = StoredName::Oath("A:a".to_owned());
+        let mut io = ScriptedOath {
+            put: [0x6982].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            oath_add(&mut io, "pass --password env:NAME", &name, &e),
+            Err(StoreError::Failed(
+                "this key's authenticator storage is password-protected; \
+                 pass --password env:NAME"
+                    .to_owned()
+            ))
+        );
+        // Nothing to answer with, so nothing is resent.
+        assert_eq!(io.calls, vec!["put A:a", "reauth"]);
     }
 
     #[test]
@@ -699,12 +838,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            oath_add(&mut io, &name, &e),
+            oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e),
             Err(StoreError::Failed(
                 "the key refused it (status 6A80)".to_owned()
             ))
         );
-        assert_eq!(oath_add(&mut io, &name, &e), Err(StoreError::Full));
+        assert_eq!(
+            oath_add(&mut io, DEFAULT_PASSWORD_HINT, &name, &e),
+            Err(StoreError::Full)
+        );
     }
 
     #[test]
@@ -761,8 +903,6 @@ mod tests {
 
     // ---- Token2 ----
 
-    use keyroost_token2otp::OtpError;
-
     /// A scripted Token2 key: write/delete answers popped per call (default
     /// success), every call recorded.
     #[derive(Default)]
@@ -809,6 +949,7 @@ mod tests {
 
     #[test]
     fn token2_6983_is_pin_blocked_not_exists() {
+        let mut proven = true;
         assert_eq!(token2_answer(0x6983), Token2Answer::PinBlocked);
         assert_eq!(token2_answer(0x9000), Token2Answer::Ok);
         assert_eq!(token2_answer(0x6982), Token2Answer::PinWindow);
@@ -820,7 +961,7 @@ mod tests {
         };
         let e = entry(OtpKind::Totp { period: 30 });
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
             Err(StoreError::Failed(
                 "the key's OTP PIN is blocked".to_owned()
             ))
@@ -837,7 +978,7 @@ mod tests {
         };
         let e = entry(OtpKind::Totp { period: 30 });
         assert_eq!(
-            token2_add(&mut io, None, &t2name(), &e),
+            token2_add(&mut io, None, &mut false, &t2name(), &e),
             Err(StoreError::Full)
         );
     }
@@ -845,11 +986,16 @@ mod tests {
     #[test]
     fn token2_pin_window_reverifies_once() {
         let e = entry(OtpKind::Totp { period: 30 });
+        // The PIN has already worked in this import.
+        let mut proven = true;
         let mut io = ScriptedToken2 {
             write: [applet(OtpError::PinConditionsNotSatisfied), Ok(())].into(),
             ..Default::default()
         };
-        assert_eq!(token2_add(&mut io, Some("1234"), &t2name(), &e), Ok(()));
+        assert_eq!(
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            Ok(())
+        );
         assert_eq!(io.calls, vec!["write a", "verify", "write a"]);
 
         // Closed again after the verify: reported, not retried forever.
@@ -858,7 +1004,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
             Err(StoreError::Failed(
                 "the key asked for its OTP PIN again and refused it".to_owned()
             ))
@@ -875,7 +1021,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                token2_add(&mut io, None, &t2name(), &e),
+                token2_add(&mut io, None, &mut false, &t2name(), &e),
                 Err(StoreError::Failed(
                     "the key asks for its OTP PIN".to_owned()
                 ))
@@ -888,7 +1034,10 @@ mod tests {
             write: [applet(OtpError::PinConditionsNotSatisfied)].into(),
             ..Default::default()
         };
-        assert_eq!(token2_delete(&mut io, Some("1234"), &t2name()), Ok(()));
+        assert_eq!(
+            token2_delete(&mut io, Some("1234"), &mut proven, &t2name()),
+            Ok(())
+        );
         assert_eq!(io.calls, vec!["delete a", "verify", "delete a"]);
 
         // A blocked PIN at verify says so.
@@ -898,11 +1047,67 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            token2_add(&mut io, Some("1234"), &t2name(), &e),
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
             Err(StoreError::Failed(
                 "the key's OTP PIN is blocked".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn token2_wrong_pin_is_sent_once_and_said_plainly() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        // The write's own verify refused the PIN: never verified again.
+        for (refusal, msg) in [
+            (
+                OtpError::PinInvalid,
+                "wrong OTP PIN (or authentication tag mismatch)",
+            ),
+            (
+                OtpError::PinInvalidRetries(2),
+                "wrong OTP PIN \u{2014} 2 attempts remaining before lockout",
+            ),
+        ] {
+            let mut proven = false;
+            let mut io = ScriptedToken2 {
+                write: [applet(refusal)].into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                token2_add(&mut io, Some("0000"), &mut proven, &t2name(), &e),
+                Err(StoreError::Failed(msg.to_owned()))
+            );
+            assert_eq!(io.calls, vec!["write a"]);
+            assert!(!proven);
+        }
+        // A closed window before the PIN ever worked: reported, not retried.
+        let mut proven = false;
+        let mut io = ScriptedToken2 {
+            write: [applet(OtpError::PinConditionsNotSatisfied)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            token2_add(&mut io, Some("0000"), &mut proven, &t2name(), &e),
+            Err(StoreError::Failed(
+                "the key didn't accept the OTP PIN".to_owned()
+            ))
+        );
+        assert_eq!(io.calls, vec!["write a"]);
+        // A write that goes through proves the PIN for later re-verifies.
+        let mut io = ScriptedToken2 {
+            write: [Ok(()), applet(OtpError::PinConditionsNotSatisfied)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            Ok(())
+        );
+        assert!(proven);
+        assert_eq!(
+            token2_add(&mut io, Some("1234"), &mut proven, &t2name(), &e),
+            Ok(())
+        );
+        assert_eq!(io.calls, vec!["write a", "write a", "verify", "write a"]);
     }
 
     #[test]
@@ -958,6 +1163,61 @@ mod tests {
     }
 
     // ---- Molto2 ----
+
+    /// A scripted Molto2 token recording each config's time.
+    #[derive(Default)]
+    struct ScriptedMolto {
+        calls: Vec<String>,
+        times: Vec<u32>,
+    }
+
+    impl MoltoIo for ScriptedMolto {
+        fn set_seed(&mut self, slot: u8, _seed: &[u8]) -> Result<(), TransportError> {
+            self.calls.push(format!("seed {slot}"));
+            Ok(())
+        }
+        fn set_title(&mut self, slot: u8, title: &str) -> Result<(), TransportError> {
+            self.calls.push(format!("title {slot} {title}"));
+            Ok(())
+        }
+        fn set_config(&mut self, slot: u8, cfg: &ProfileConfig) -> Result<(), TransportError> {
+            self.calls.push(format!("config {slot}"));
+            self.times.push(cfg.utc_time);
+            Ok(())
+        }
+    }
+
+    static CLOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1_700_000_000);
+
+    /// Each read moves the clock on by 40 s.
+    fn ticking_clock() -> u32 {
+        CLOCK.fetch_add(40, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn molto_store_reads_the_clock_for_each_slot() {
+        let e = entry(OtpKind::Totp { period: 30 });
+        let mut io = ScriptedMolto::default();
+        for slot in [3, 4] {
+            let name = StoredName::Molto2 {
+                slot,
+                title: "T".to_owned(),
+            };
+            molto_add(&mut io, ticking_clock, DisplayTimeout::Sec30, &name, &e).unwrap();
+        }
+        assert_eq!(
+            io.calls,
+            vec![
+                "seed 3",
+                "title 3 T",
+                "config 3",
+                "seed 4",
+                "title 4 T",
+                "config 4"
+            ]
+        );
+        assert_eq!(io.times, vec![1_700_000_000, 1_700_000_040]);
+    }
 
     #[test]
     fn molto_store_maps_entry_to_profile_config() {

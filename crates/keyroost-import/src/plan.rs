@@ -88,6 +88,21 @@ impl OathFamily {
             _ => None,
         }
     }
+
+    /// Why `name` must not be sent to this family at all (past
+    /// [`hard_name_limit`](Self::hard_name_limit)), worded once for the CLI
+    /// and the GUI.
+    pub fn name_refusal(self, name: &str) -> Option<String> {
+        let max = self.hard_name_limit()?;
+        (name.len() > max).then(|| {
+            format!(
+                "the name is {} bytes; a {} stores names up to {max} bytes \
+                 (a longer one makes the key stop responding until it is unplugged)",
+                name.len(),
+                Store::Oath(self).device_name()
+            )
+        })
+    }
 }
 
 /// Longest OATH name a Solo 2 takes (measured; see [`OathFamily::name_limit`]).
@@ -842,6 +857,25 @@ mod tests {
     use super::*;
     use crate::entry::{Format, ImportItem, Unusable};
     use zeroize::Zeroizing;
+
+    #[test]
+    fn name_refusal_is_solo2_only_past_127() {
+        let long = "n".repeat(128);
+        assert_eq!(
+            OathFamily::Solo2.name_refusal(&long).as_deref(),
+            Some(
+                "the name is 128 bytes; a Solo 2 stores names up to 127 bytes \
+                 (a longer one makes the key stop responding until it is unplugged)"
+            )
+        );
+        assert_eq!(OathFamily::Solo2.name_refusal(&"n".repeat(127)), None);
+        assert_eq!(
+            OathFamily::YubiKey { version: None }.name_refusal(&long),
+            None
+        );
+        assert_eq!(OathFamily::Nitrokey3.name_refusal(&long), None);
+        assert_eq!(OathFamily::Other.name_refusal(&long), None);
+    }
 
     const YK57: Store = Store::Oath(OathFamily::YubiKey {
         version: Some((5, 7, 1)),
