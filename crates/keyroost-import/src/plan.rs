@@ -108,8 +108,9 @@ impl OathFamily {
 
 impl OathFamily {
     /// YubiKey 4 firmware after 4.0.0 and before 4.3.5, where ykman refuses
-    /// to add a name that starts a different name already on the key [S1][S6].
-    /// Unverified on hardware here; refused up front like the Solo 2 cap.
+    /// to add a name that starts a different name already on the key
+    /// (research S1, S6). Unverified on hardware here; refused up front like
+    /// the Solo 2 cap.
     pub fn prefix_issue(self) -> bool {
         matches!(self, OathFamily::YubiKey { version: Some(v) } if (4, 0, 0) < v && v < (4, 3, 5))
     }
