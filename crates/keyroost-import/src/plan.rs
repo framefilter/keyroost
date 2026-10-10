@@ -38,6 +38,7 @@ impl Store {
 
 /// Which OATH applet the key carries, as far as limits go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OathFamily {
     /// `version` from the OATH SELECT reply (YubiKey: firmware version).
     YubiKey {
@@ -199,6 +200,7 @@ pub enum Verdict {
 
 /// Why an entry isn't written to this destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Skip {
     /// No key can take it (bad secret, Steam, …).
     Unusable(crate::entry::Unusable),
@@ -315,6 +317,7 @@ fn reason(skip: &Skip, device: &str, token2: bool) -> String {
 
 /// Something the person should know about the plan as a whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Note {
     /// Replace removes the old code first on keys that refuse duplicates; if
     /// the add then fails, the old code is gone.

@@ -23,6 +23,7 @@ pub enum AuthFormat {
 /// Key material keyroost recognizes but doesn't import as authenticator
 /// codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyMaterial {
     Certificate,
     CertificateRequest,

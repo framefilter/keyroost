@@ -73,6 +73,7 @@ impl core::fmt::Debug for ImportEntry {
 
 /// Why an entry in a file can't go to any key.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Unusable {
     /// Missing, empty, over 255 bytes, or not valid base32.
     BadSecret,
@@ -138,6 +139,7 @@ pub struct ImportItem {
 
 /// Which kind of file the entries came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     Aegis,
     AegisEncrypted,

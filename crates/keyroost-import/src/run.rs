@@ -11,6 +11,7 @@ use crate::plan::{Plan, PlanRow, Store, StoredName, Verdict};
 
 /// What a key said when asked to store or remove one code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StoreError {
     /// The key refused an add because the name exists (OATH SW 6983 only).
     Exists,
