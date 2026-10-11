@@ -100,6 +100,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The Learn site's "Command line" page carries a table of every command,
+      # generated from --help; fail the PR when a command changes without it.
+      # `cargo test` above already built the debug keyroostctl.
+      - name: Command-line page matches --help
+        if: runner.os == 'Linux'
+        run: python3 packaging/gen-cli-reference.py --check --bin target/debug/keyroostctl
+
       # The `qr` screen-capture backend is cfg-gated per OS, and the matrix build
       # above uses default features — so the Windows GDI path (hand-rolled Win32
       # FFI in keyroost-screengrab) is otherwise compiled only by release.yml at
