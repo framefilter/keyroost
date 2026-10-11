@@ -97,7 +97,12 @@ jobs:
           # at this version, so it must follow keyroost-transport; it is new
           # too, so it needs the same one-time hand publish (and its Trusted
           # Publishing entry on crates.io) before this loop can publish it.
-          for crate in keyroost-proto keyroost-hid keyroost-keyring keyroost-rsakey \
+          # keyroost-windevtree (new after 0.13.0) has no in-tree deps and
+          # keyroost-hid / keyroost-transport depend on it (on Windows), so it
+          # goes right after keyroost-proto, before keyroost-hid; it too needs
+          # a one-time hand publish first.
+          for crate in keyroost-proto keyroost-windevtree keyroost-hid \
+                       keyroost-keyring keyroost-rsakey \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
                        keyroost-pivtest \
                        keyroost-token2otp keyroost-token2prog keyroost-import \

@@ -30,7 +30,7 @@ tool. Workspace contains:
 |---|---|---|
 | `keyroost-proto` | Pure-Rust protocol layer (SM4, SHA-1, APDU builders, MAC) | none |
 | `keyroost-transport` | PC/SC reader discovery, Molto2 session, YubiKey CCID serial, OATH + OpenPGP applets, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`) | `pcsc`; `aes`/`des`/`cipher`/`getrandom`/`zeroize` (PIV mgmt-key auth); `hidapi` (non-Linux HID) |
-| `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs | `hidapi` (non-Linux only; Linux uses sysfs) |
+| `keyroost-hid` | USB HID enumeration of FIDO devices via sysfs; the shared `UsbDeviceKey` "same physical USB device" evidence and the Windows device-tree decision (`usb_device_node`) | `hidapi` (non-Linux only; Linux uses sysfs); in-tree `keyroost-proto` (trace format), `keyroost-windevtree` (Windows only) |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential mgmt, largeBlob (incl. the on-key name entry, `docs/PROTOCOL-device-label.md`) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`aes-gcm`), `rand_core`, `zeroize`, `miniz_oxide` (largeBlob DEFLATE); `hidapi` (non-Linux HID) |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer (APDU + TLV) | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
@@ -44,8 +44,9 @@ tool. Workspace contains:
 | `keyroost-pivtest` | Host-side verification for the PIV slot self-test (`piv test`): fixed challenges checked against the slot certificate's public key | `rsa`, `p256`/`p384`/`p521` (ECDH), `ed25519-dalek`, `x25519-dalek`, `zeroize` (scoped exception) |
 | `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers, file classification, per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`/`aes-gcm`/`base64` (behind `encrypted`, for Aegis vaults) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots + Google Authenticator migration batches (always built; the GUI's separate `qr` feature gates *screen capture*, not this) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
-| `keyroost-screengrab` | Windows-only GDI screen capture for QR-from-screen; the sole `unsafe` FFI crate; inert on non-Windows | `windows-sys` (Windows only) |
+| `keyroost-screengrab` | Windows-only GDI screen capture for QR-from-screen; an `unsafe` FFI shim like `keyroost-winwebauthn` / `keyroost-windevtree`; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-winwebauthn` | Windows-only non-admin FIDO2 helper: detect a FIDO key, open Windows' security-key settings, relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
+| `keyroost-windevtree` | Windows-only device-tree lookups for key pairing (#51): a HID path's / PC/SC reader's ancestor devnode chain via cfgmgr32 + `SCardGetReaderDeviceInstanceIdA`, never opening the device or connecting to a card; unsafe FFI shim; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroostctl` | CLI binary | `clap` (+ `clap_complete`/`clap_mangen`), `serde`/`serde_json`, `zeroize`, `rpassword` (=7.5.4, hidden PIN/password prompt; pulls `rtoolbox`, `libc`/`windows-sys` per platform) |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `serde`/`serde_json`, `zeroize`, `base64`, plus platform UI deps (`arboard`, `rfd`, `pollster`, `png`; Linux `ashpd`/`x11rb` behind the `qr` feature); `winresource` as a Windows-only **build**-dependency (embeds the icon + version info into `keyroost.exe`; never linked into any binary, never compiled off Windows) |
 

@@ -63,3 +63,8 @@ hidapi = { version = "2.6", default-features = false, features = [
     "macos-shared-device",
     "windows-native",
 ] }
+
+# Windows device-tree lookup of each reader's USB device devnode (#51), with no
+# card connection. The unsafe winscard/cfgmgr32 FFI is confined to that crate.
+[target.'cfg(windows)'.dependencies]
+keyroost-windevtree = { path = "../keyroost-windevtree", version = "0.13.0" }

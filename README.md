@@ -973,7 +973,7 @@ old script.
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
 | `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows |
-| `keyroost-hid` | USB HID enumeration of FIDO devices | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
+| `keyroost-hid` | USB HID enumeration of FIDO devices, and the "same physical USB device" evidence used to pair a key's FIDO and smart-card sides | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
@@ -988,6 +988,7 @@ old script.
 | `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers, file classification, and the per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
+| `keyroost-windevtree` | Windows-only device-tree lookups that let a key's FIDO HID node and smart-card reader be recognized as one physical key, without opening the device or connecting to the card; isolates the unsafe Win32 FFI; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize`, `rpassword` (hidden PIN/password prompt) |
 | `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `rfd`, `pollster`, `png`, `base64`, `serde`/`serde_json`, `zeroize`; `x11rb`/`ashpd` on Linux (`qr` feature); `winresource` build-dep on Windows |

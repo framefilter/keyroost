@@ -7,8 +7,15 @@
 //!
 //! On **macOS and Windows** it uses the `hidapi` crate (IOKit / hid.dll),
 //! selected automatically off Linux. The `hidapi-backend` feature forces that
-//! path on for building/testing the cross-platform backend on Linux too. USB
-//! topology (`usb_bus`/`usb_address`) is only available via the sysfs backend.
+//! path on for building/testing the cross-platform backend on Linux too.
+//!
+//! Each node carries [`UsbDeviceKey`] evidence of which physical USB device it
+//! belongs to, when the platform offers it: bus + address from sysfs on Linux,
+//! the USB device devnode from the device tree on Windows (see [`devtree`]).
+//! macOS reports none.
+
+pub mod devtree;
+pub use devtree::{same_usb_device, usb_device_node, UsbDeviceKey};
 
 use std::fmt;
 #[cfg(all(target_os = "linux", not(feature = "hidapi-backend")))]
@@ -79,13 +86,13 @@ pub struct HidDevice {
     /// SoloKeys / Nitrokey publish a unique serial here; many YubiKeys omit it
     /// (their serial is only reachable via the management applet over CCID).
     pub serial_number: Option<String>,
-    /// USB bus number (`busnum`) of the underlying device, if known. Together
-    /// with [`Self::usb_address`] this identifies the physical USB device, which
-    /// lets a caller match this hidraw node to the same key's CCID reader (whose
-    /// PC/SC `CHANNEL_ID` encodes the same bus/address).
-    pub usb_bus: Option<u8>,
-    /// USB device address (`devnum`) of the underlying device, if known.
-    pub usb_address: Option<u8>,
+    /// Which physical USB device this node belongs to, if known: sysfs
+    /// `busnum`/`devnum` on Linux (matching the same key's CCID reader, whose
+    /// PC/SC `CHANNEL_ID` encodes the same bus/address), or the USB device
+    /// devnode on Windows (matching the reader's devnode). `None` on macOS and
+    /// whenever the evidence could not be read. Compare with
+    /// [`same_usb_device`].
+    pub usb_device: Option<UsbDeviceKey>,
 }
 
 /// Known USB `(vendor, product, description)` IDs of security keys sitting in
@@ -159,9 +166,10 @@ pub fn enumerate() -> Result<Vec<HidDevice>, HidError> {
 }
 
 /// hidapi-backed enumeration for macOS / Windows (and Linux under the
-/// `hidapi-backend` feature). USB topology (`usb_bus` / `usb_address`) isn't
-/// exposed portably by hidapi, so it's left `None` — the HID↔CCID correlation
-/// that uses it degrades gracefully to serial/identity matching.
+/// `hidapi-backend` feature). hidapi exposes no USB topology, so on Windows the
+/// USB device devnode is read from the device tree (never opening the device;
+/// see [`devtree`]); elsewhere it is left `None` and the HID↔CCID correlation
+/// degrades gracefully to serial/identity matching.
 #[cfg(any(not(target_os = "linux"), feature = "hidapi-backend"))]
 fn enumerate_hidapi() -> Result<Vec<HidDevice>, HidError> {
     let api = hidapi::HidApi::new().map_err(|e| HidError::Backend(e.to_string()))?;
@@ -175,10 +183,17 @@ fn enumerate_hidapi() -> Result<Vec<HidDevice>, HidError> {
             usage_page: info.usage_page(),
             usage: info.usage(),
             serial_number: info.serial_number().map(str::to_owned),
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         })
         .collect();
+    #[cfg(windows)]
+    for d in &mut devices {
+        let path = d.path.to_string_lossy().into_owned();
+        let chain = keyroost_windevtree::hid_path_chain(&path);
+        let trace = devtree::devtree_trace_enabled() && d.is_fido();
+        d.usb_device =
+            devtree::win_node_from_chain(&format!("hid {path}"), chain.as_deref(), trace);
+    }
     devices.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(devices)
 }
@@ -331,13 +346,15 @@ fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
     let (usage_page, usage) = parse_top_usage(&report_desc).unwrap_or((0, 0));
 
     // Locate the backing USB device node once and read its serial + topology.
-    let (serial_number, usb_bus, usb_address) = match usb_device_dir(&sysfs.join("device")) {
+    let (serial_number, usb_device) = match usb_device_dir(&sysfs.join("device")) {
         Some(dir) => (
             read_usb_serial(&dir),
-            read_sysfs_u8(&dir.join("busnum")),
-            read_sysfs_u8(&dir.join("devnum")),
+            UsbDeviceKey::from_bus_addr(
+                read_sysfs_u8(&dir.join("busnum")),
+                read_sysfs_u8(&dir.join("devnum")),
+            ),
         ),
-        None => (None, None, None),
+        None => (None, None),
     };
 
     Ok(HidDevice {
@@ -348,8 +365,7 @@ fn read_one(name: &str, sysfs: &Path) -> Result<HidDevice, HidError> {
         usage_page,
         usage,
         serial_number,
-        usb_bus,
-        usb_address,
+        usb_device,
     })
 }
 
@@ -501,8 +517,7 @@ mod tests {
             usage_page: HID_USAGE_PAGE_FIDO,
             usage: HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: None,
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         let kbd = HidDevice {
             usage_page: 0x01,
@@ -522,8 +537,7 @@ mod tests {
             usage_page: HID_USAGE_PAGE_FIDO,
             usage: HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: None,
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         // A normal FIDO key is not a bootloader.
         assert!(fido.bootloader_label().is_none());

@@ -15,7 +15,7 @@
 //! input into that merge, not a resolver of its own — this module no longer
 //! exposes a HID-only name lookup; use the device model instead.
 
-use keyroost_hid::HidDevice;
+use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
 use keyroost_transport::YubiKeyCcid;
 
 pub mod device;
@@ -93,26 +93,77 @@ pub(crate) fn ccid_serials_attributed(
     // are spoken for, so they are not available to a topology-free guess.
     let taken: Vec<String> = devices
         .iter()
-        .filter(|d| d.usb_bus.is_some())
-        .filter_map(|d| ccid_serial_for(d, readers))
+        .filter_map(|d| ccid_serial_by_topology(d, readers))
         .collect();
-    // With no topology on either side, every such node is an equally good owner
-    // of the one reader, so more than one claimant means nobody may take it.
+    // With no topology evidence either way, every such node is an equally good
+    // owner of the one reader, so more than one claimant means nobody may take
+    // it.
     let claimants = devices
         .iter()
-        .filter(|d| needs_ccid_serial(d) && d.usb_bus.is_none())
+        .filter(|d| ccid_serial_by_topology(d, readers).is_none())
+        .filter(|d| ccid_serial_guess(d, readers).is_some())
         .count();
     devices
         .iter()
         .map(|d| {
-            let serial = ccid_serial_for(d, readers);
-            let contended = claimants > 1 || serial.as_ref().is_some_and(|s| taken.contains(s));
-            if d.usb_bus.is_none() && (contended || !allow_guess) {
-                return None;
+            if let Some(serial) = ccid_serial_by_topology(d, readers) {
+                return Some(serial);
             }
-            serial
+            let guess = ccid_serial_guess(d, readers)?;
+            let contended = claimants > 1 || taken.contains(&guess);
+            (allow_guess && !contended).then_some(guess)
         })
         .collect()
+}
+
+/// Whether a node's own USB evidence rules out *guessing* that a reader
+/// carrying `reader` evidence is its sibling (the guess is only ever taken
+/// after an exact match failed).
+///
+/// Linux bus/address is read on both sides from the kernel, so a node that
+/// has one and matched nothing is positive evidence of a *different* physical
+/// device, whatever the reader reports (the rule since before #51). A Windows
+/// devnode rules a guess out only when the reader has evidence too: the reader
+/// side of the device tree can fail to resolve (or have a shape not yet seen
+/// on hardware), and a one-sided devnode then falls through to the steps that
+/// applied before Windows had any topology at all.
+pub(crate) fn topology_rules_out_guess(
+    node: Option<&UsbDeviceKey>,
+    reader: Option<&UsbDeviceKey>,
+) -> bool {
+    match node {
+        None => false,
+        Some(UsbDeviceKey::WinNode(_)) => reader.is_some(),
+        Some(_) => true,
+    }
+}
+
+/// The serial of the YubiKey reader at this node's exact USB device, if any.
+fn ccid_serial_by_topology(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String> {
+    if !needs_ccid_serial(d) {
+        return None;
+    }
+    readers
+        .iter()
+        .filter(|r| r.serial.is_some())
+        .find(|r| same_usb_device(r.usb_device.as_ref(), d.usb_device.as_ref()))
+        .and_then(|r| r.serial.clone())
+}
+
+/// The single-reader fallback for a node with no exact match: the serial of
+/// the one reader that answered, unless the node's own evidence rules it out
+/// ([`topology_rules_out_guess`]).
+fn ccid_serial_guess(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String> {
+    if !needs_ccid_serial(d) {
+        return None;
+    }
+    let with_serial: Vec<&YubiKeyCcid> = readers.iter().filter(|r| r.serial.is_some()).collect();
+    match with_serial.as_slice() {
+        [only] if !topology_rules_out_guess(d.usb_device.as_ref(), only.usb_device.as_ref()) => {
+            only.serial.clone()
+        }
+        _ => None,
+    }
 }
 
 /// Read YubiKey CCID serials once, but only if some device actually needs one.
@@ -127,9 +178,10 @@ pub fn ccid_readers_if_needed(devices: &[HidDevice]) -> Vec<YubiKeyCcid> {
 }
 
 /// Match a YubiKey HID device to one of the CCID-read serials. Prefers an exact
-/// USB-topology match (bus + address), so two connected YubiKeys are never
-/// confused; falls back to the unambiguous single-reader case only when the HID
-/// node reports no topology at all. Never guesses among several readers —
+/// USB-device match (Linux bus + address, or the Windows devnode), so two
+/// connected YubiKeys are never confused; falls back to the unambiguous
+/// single-reader case only when the HID node's own topology does not rule it
+/// out. Never guesses among several readers —
 /// returns `None` instead, which is the safe outcome.
 ///
 /// This single-node view cannot see that *another* topology-free node is an
@@ -137,30 +189,12 @@ pub fn ccid_readers_if_needed(devices: &[HidDevice]) -> Vec<YubiKeyCcid> {
 /// should use [`ccid_serials_for`], which additionally refuses that fallback
 /// when it is contended.
 pub fn ccid_serial_for(d: &HidDevice, readers: &[YubiKeyCcid]) -> Option<String> {
-    if !needs_ccid_serial(d) {
-        return None;
-    }
-    let with_serial: Vec<&YubiKeyCcid> = readers.iter().filter(|r| r.serial.is_some()).collect();
-    if let (Some(bus), Some(addr)) = (d.usb_bus, d.usb_address) {
-        if let Some(r) = with_serial
-            .iter()
-            .find(|r| r.usb_bus == Some(bus) && r.usb_address == Some(addr))
-        {
-            return r.serial.clone();
-        }
-    }
     // A node that reported its own bus/address and still matched nothing has
     // positive evidence it is a *different* physical device, so the
-    // single-reader fallback would hand it another key's serial. Only backends
-    // that report no topology whatsoever (usb_bus is None — hidapi on Windows
-    // and macOS) may take that fallback, or correlation breaks there entirely.
-    if d.usb_bus.is_some() {
-        return None;
-    }
-    match with_serial.as_slice() {
-        [only] => only.serial.clone(),
-        _ => None,
-    }
+    // single-reader fallback would hand it another key's serial. Only a node
+    // with no topology evidence against that reader may take the fallback
+    // (see `topology_rules_out_guess`), or correlation breaks there entirely.
+    ccid_serial_by_topology(d, readers).or_else(|| ccid_serial_guess(d, readers))
 }
 
 #[cfg(test)]
@@ -187,16 +221,14 @@ mod tests {
             usage_page: HID_USAGE_PAGE_FIDO,
             usage: HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: None,
-            usb_bus: bus,
-            usb_address: addr,
+            usb_device: UsbDeviceKey::from_bus_addr(bus, addr),
         }
     }
 
     fn reader(bus: Option<u8>, addr: Option<u8>, serial: &str) -> YubiKeyCcid {
         YubiKeyCcid {
             reader_name: "Yubico YubiKey OTP+FIDO+CCID".into(),
-            usb_bus: bus,
-            usb_address: addr,
+            usb_device: UsbDeviceKey::from_bus_addr(bus, addr),
             serial: Some(serial.into()),
         }
     }
@@ -277,5 +309,60 @@ mod tests {
         let mut yk = yubikey("/dev/hidraw16", Some(9), Some(53));
         yk.serial_number = Some("ABC".into());
         assert_eq!(ccid_serial_for(&yk, &readers), None);
+    }
+
+    fn with_node(mut d: HidDevice, id: &str) -> HidDevice {
+        d.usb_device = Some(UsbDeviceKey::win_node(id));
+        d
+    }
+
+    fn reader_at(id: Option<&str>, serial: &str) -> YubiKeyCcid {
+        let mut r = reader(None, None, serial);
+        r.usb_device = id.map(UsbDeviceKey::win_node);
+        r
+    }
+
+    const YK_A: &str = r"USB\VID_1050&PID_0407\5&2C1A&0&3";
+    const YK_B: &str = r"USB\VID_1050&PID_0407\5&2C1A&0&4";
+
+    #[test]
+    fn windows_devnodes_disambiguate_two_yubikeys() {
+        let readers = [
+            reader_at(Some(YK_B), "27717893"),
+            reader_at(Some(YK_A), "37806840"),
+        ];
+        let a = with_node(yubikey(r"\\?\HID#A", None, None), YK_A);
+        let b = with_node(yubikey(r"\\?\HID#B", None, None), YK_B);
+        assert_eq!(
+            ccid_serials_for(&[&a, &b], &readers),
+            vec![Some("37806840".to_string()), Some("27717893".to_string())]
+        );
+    }
+
+    #[test]
+    fn windows_one_sided_devnode_keeps_the_single_reader_fallback() {
+        // The reader's devnode didn't resolve: no evidence against the guess.
+        let d = with_node(yubikey(r"\\?\HID#A", None, None), YK_A);
+        let readers = [reader_at(None, "37806840")];
+        assert_eq!(ccid_serial_for(&d, &readers).as_deref(), Some("37806840"));
+        // Nor the other way round.
+        let d = yubikey(r"\\?\HID#A", None, None);
+        let readers = [reader_at(Some(YK_A), "37806840")];
+        assert_eq!(ccid_serial_for(&d, &readers).as_deref(), Some("37806840"));
+    }
+
+    #[test]
+    fn windows_differing_devnodes_never_fall_back() {
+        let d = with_node(yubikey(r"\\?\HID#A", None, None), YK_A);
+        let readers = [reader_at(Some(YK_B), "27717893")];
+        assert_eq!(ccid_serial_for(&d, &readers), None);
+        assert_eq!(ccid_serials_for(&[&d], &readers), vec![None]);
+    }
+
+    #[test]
+    fn windows_devnode_never_matches_a_bus_address() {
+        let d = with_node(yubikey(r"\\?\HID#A", None, None), YK_A);
+        let readers = [reader(Some(9), Some(53), "37806840")];
+        assert_eq!(ccid_serial_for(&d, &readers), None);
     }
 }

@@ -5747,6 +5747,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = target::DEBUG.set(cli.debug);
     if cli.debug {
         keyroost_ctap::set_trace(true);
+        // Windows only: each key's device-tree chain and chosen USB node.
+        keyroost_hid::devtree::set_devtree_trace(true);
     }
 
     if cli.device.is_some() {
@@ -23298,8 +23300,7 @@ mod cli_tests {
             usage_page: keyroost_hid::HID_USAGE_PAGE_FIDO,
             usage: keyroost_hid::HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: None,
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         let e = record_meta_for(&yk, std::slice::from_ref(&hid));
         assert_eq!(
