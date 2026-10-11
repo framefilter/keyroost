@@ -8,8 +8,7 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: the v0.13.0 release. Next: the Learn site's "Command line"
-page, then the GUI design pass (v0.14.0).
+Next: the GUI design pass and PIV key import from a .p12 file (v0.14.0).
 
 ---
 
@@ -32,16 +31,16 @@ Being worked on right now — check with whoever holds it before starting.
   flatpak broke at release time because a source was pruned). Full sequence:
   `packaging/RELEASING.md`, which is the playbook for the whole release.
 
-**Next, after v0.13.0:**
+**Next:**
 
-- **Learn page "Command line" (`docs/cli.html`).** One task-first page for
-  `keyroostctl`: each section is a job ("Choosing a key", "PINs and
-  passwords", "Importing codes from an app", "Resetting", "Scripts", ...),
-  a sentence of what and why, 2–5 copy-paste commands and what you'll see;
-  a reference of every command generated from `--help` at the bottom. Plain
-  enough for non-technical readers and for tools that learn from the docs.
-  The existing docs check validates every command it shows. Outline agreed
-  2026-10-10 (14 sections). (M)
+- **PIV: import an existing key and certificate from a .p12 file (v0.14.0,
+  [#174](https://github.com/framefilter/keyroost/issues/174), from discussion
+  #172).** Put an RSA or EC private key plus its certificate from a PKCS#12
+  (`.p12`) file into a PIV slot, using the import-key command the card already
+  supports. Read legacy-encrypted `.p12` files directly (40-bit RC2 / 3DES,
+  SHA-1 MAC), such as Spain's FNMT certificates, which OpenSSL 3 refuses by
+  default. GUI and CLI. Show the dependency options to the maintainer before
+  choosing one (no new dependencies without discussion). (M)
 
 - **Token2 PIN+ OTP list unreachable over HID ([#155](https://github.com/framefilter/keyroost/issues/155)).**
   On firmware 2.1.0 (`349e:0022`) the OTP applet doesn't answer keyroost's

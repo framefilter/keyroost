@@ -49,7 +49,8 @@ const PATH_HELP: &str = "USB HID device path of the key, instead of --device";
 #[command(
     name = "keyroostctl",
     version,
-    about = "Manage hardware security keys: FIDO2, OATH, OpenPGP, PIV and Token2 OTP, plus Token2 programmable TOTP tokens (Molto2 and the 2nd-generation single-profile token)"
+    about = "Manage hardware security keys: FIDO2, OATH, OpenPGP, PIV and Token2 OTP, plus Token2 programmable TOTP tokens (Molto2 and the 2nd-generation single-profile token)",
+    after_help = "Guide with examples: https://framefilter.github.io/keyroost/cli.html"
 )]
 struct Cli {
     /// Print every message sent to and received from the key to stderr (APDUs,

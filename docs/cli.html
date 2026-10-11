@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The command line (keyroostctl) — keyroost</title>
+<meta name="description" content="How to manage a hardware security key from the terminal with keyroostctl: choosing a key, PINs, passkeys, authenticator codes, importing from an app, certificates, OpenPGP, resetting, scripts, and every command.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="keyroost">
+<meta property="og:title" content="The command line (keyroostctl) — keyroost">
+<meta property="og:description" content="How to manage a hardware security key from the terminal with keyroostctl: choosing a key, PINs, passkeys, authenticator codes, importing from an app, certificates, OpenPGP, resetting, scripts, and every command.">
+<meta property="og:url" content="https://framefilter.github.io/keyroost/cli.html">
+<meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="The command line (keyroostctl) — keyroost">
+<meta name="twitter:description" content="How to manage a hardware security key from the terminal with keyroostctl: choosing a key, PINs, passkeys, authenticator codes, importing from an app, certificates, OpenPGP, resetting, scripts, and every command.">
+<meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
+
+<link rel="icon" type="image/png" href="assets/keyroost-logo.png">
+<link rel="stylesheet" href="assets/keyroost-theme.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>(function(){try{var t=localStorage.getItem('kr-theme');if(t==='light'||(!t&&window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches))document.documentElement.setAttribute('data-theme','light');}catch(e){}})();</script>
+</head>
+<body>
+
+<header class="kr-topbar">
+  <div class="kr-wrap kr-topbar-inner">
+    <a class="kr-wordmark" href="index.html" aria-label="keyroost — home"><span class="kr-mark mono">k</span><span>keyroost</span></a>
+    <nav class="kr-nav" aria-label="Learn topics">
+      <a href="security-keys.html">Security keys</a>
+      <a href="devices.html">Devices</a>
+      <a href="fido2.html">FIDO2</a>
+      <a href="oath.html">OATH</a>
+      <a href="otp.html">On-device OTP</a>
+      <a href="fingerprint.html">Fingerprints</a>
+      <a href="mds.html">Device metadata</a>
+      <a href="settings.html">Settings</a>
+      <a href="storage.html">Storage</a>
+      <a href="openpgp.html">OpenPGP</a>
+      <a href="piv.html">PIV</a>
+      <a href="molto2.html">Molto2</a>
+      <a href="naming.html">Naming</a>
+      <a href="reset.html">Reset</a>
+      <a href="migration.html">Migration</a>
+      <a href="cli.html">Command line</a>
+    </nav>
+    <button class="kr-theme-toggle" id="kr-theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<section class="kr-hero">
+  <div class="kr-wrap">
+    <p class="kr-label">Learn · Command line</p>
+    <h1>The command line</h1>
+    <p class="kr-lede">Everything the keyroost app does, you can also do by typing commands
+      in a terminal with <code>keyroostctl</code>. This page shows how, one task at a time.</p>
+    <p class="kr-meta">Jump to
+      <a href="#getting-started">getting started</a> ·
+      <a href="#choosing-a-key">choosing a key</a> ·
+      <a href="#naming">naming</a> ·
+      <a href="#pins">PINs</a> ·
+      <a href="#passkeys">passkeys</a> ·
+      <a href="#codes">codes</a> ·
+      <a href="#import">importing</a> ·
+      <a href="#piv">certificates</a> ·
+      <a href="#openpgp">OpenPGP</a> ·
+      <a href="#notes">notes</a> ·
+      <a href="#resetting">resetting</a> ·
+      <a href="#scripts">scripts</a> ·
+      <a href="#troubleshooting">troubleshooting</a> ·
+      <a href="#reference">every command</a>.</p>
+  </div>
+</section>
+
+<main class="kr-wrap">
+
+  <section class="kr-section" id="getting-started">
+    <h2>Getting started</h2>
+    <p>First check that <code>keyroostctl</code> is installed and that your computer can
+      see your key. If it isn't installed yet, see
+      <a href="index.html#install">Install keyroost</a>.</p>
+<pre><code>keyroostctl --version   # prints the version, e.g. keyroostctl 0.13.0
+keyroostctl doctor      # checks this computer; never touches a key
+keyroostctl             # shows the keys that are plugged in</code></pre>
+    <p>With no command, <code>keyroostctl</code> lists your keys with a number each:</p>
+<pre><code>Connected devices
+
+ 1) Yubico    Work key  FIDO2 · OATH · PGP · PIV  12345678  USB·PC/SC+HID
+ 2) SoloKeys  Solo 2    FIDO2 · OATH              87654321  USB·PC/SC+HID</code></pre>
+    <p>The badges show what each key can do. <code>keyroostctl list</code> shows the same
+      keys in more technical detail. If a key is missing, run <code>keyroostctl doctor</code>:
+      it checks the smart-card service and, on Linux, whether you have permission to use
+      the key.</p>
+    <p>Every command explains itself. Add <code>--help</code> to any of them:</p>
+<pre><code>keyroostctl --help
+keyroostctl oath --help
+keyroostctl oath import --help</code></pre>
+    <p>Tab completion saves typing, and even completes your key names. To set it up for
+      bash (other shells are in the
+      <a href="https://github.com/framefilter/keyroost#shell-completions">README</a>):</p>
+<pre><code>keyroostctl completions bash &gt; ~/.local/share/bash-completion/completions/keyroostctl</code></pre>
+  </section>
+
+  <section class="kr-section" id="choosing-a-key">
+    <h2>Choosing a key</h2>
+    <p>With one key plugged in, there is nothing to choose: keyroost uses it. Every command
+      starts by saying which key it is working on:</p>
+<pre><code>→ Work key · serial 12345678 · Yubico YubiKey OTP+FIDO+CCID 00 00</code></pre>
+    <p>With several keys plugged in, keyroost asks which one you mean:</p>
+<pre><code>2 connected keys qualify (key with OATH):
+   1) Work key, YubiKey 5 NFC, serial 12345678 Yubico YubiKey OTP+FIDO+CCID 00 00
+   2) Backup key, YubiKey 5 NFC, serial 87654321 Yubico YubiKey OTP+FIDO+CCID 01 00
+Select [1/2]:</code></pre>
+    <p>To skip the question, say which key with <code>-d</code> (short for
+      <code>--device</code>). It takes the number from the list, a serial number, or a
+      name you gave the key:</p>
+<pre><code>keyroostctl oath list -d 2
+keyroostctl oath list -d serial:12345678
+keyroostctl oath list -d "Work key"</code></pre>
+    <p>The numbers can change when you plug keys in and out; serials and names don't.</p>
+  </section>
+
+  <section class="kr-section" id="naming">
+    <h2>Naming your keys</h2>
+    <p>A name like "Work key" is easier to remember than a serial number. You can keep the
+      name on this computer, or store it on the key itself so it travels with the key.</p>
+<pre><code>keyroostctl name set "Work key"               # on this computer
+keyroostctl name set "Work key" --store key   # on the key (asks for the FIDO PIN)
+keyroostctl name list                         # every name, and where it lives
+keyroostctl name clear "Work key"             # remove it, wherever it is</code></pre>
+    <p><code>name list</code> shows something like this:</p>
+<pre><code>  NAME        STORED         STATUS
+  Work key    on the key     connected (#1)
+  Backup key  this computer  not connected</code></pre>
+    <p>A name stored on the key can be read by anyone who has the key, so don't put
+      anything private in it. More in <a href="naming.html">Naming your keys</a>.</p>
+  </section>
+
+  <section class="kr-section" id="pins">
+    <h2>PINs and passwords</h2>
+    <p>When a command needs a PIN, keyroost asks for it at a hidden prompt: nothing shows
+      on screen while you type. It never takes a PIN typed into the command itself,
+      because other programs on your computer could see it there.</p>
+<pre><code>PIN:</code></pre>
+    <p>Each part of a key has its own PIN or password:</p>
+<pre><code>keyroostctl fido pin set              # passkeys: set the first PIN
+keyroostctl fido pin change           # passkeys: change it
+keyroostctl piv pin change            # certificates (PIV): the PIN
+keyroostctl piv puk change            # certificates: the PUK, which unblocks the PIN
+keyroostctl openpgp pin change        # OpenPGP: the user PIN
+keyroostctl openpgp pin change --admin  # OpenPGP: the admin PIN
+keyroostctl oath password set         # authenticator codes: an optional password
+keyroostctl otp pin set               # Token2 key's code storage: an optional PIN</code></pre>
+    <p>A new PIN is asked for twice, to catch typos. Too many wrong tries locks a PIN, so
+      check how many you have left before guessing:</p>
+<pre><code>keyroostctl fido pin status    # e.g. "8 PIN attempt(s) remaining"
+keyroostctl piv info           # includes the PIN tries left
+keyroostctl openpgp info       # includes the PIN tries left
+keyroostctl otp pin status</code></pre>
+    <p>A blocked certificate PIN can be unblocked with the PUK
+      (<code>keyroostctl piv pin unblock</code>), and a blocked OpenPGP user PIN with the admin PIN
+      (<code>keyroostctl openpgp pin unblock</code>). For a forgotten passkey PIN or code
+      password, the way back is a <a href="#resetting">reset</a>.</p>
+  </section>
+
+  <section class="kr-section" id="passkeys">
+    <h2>Passkeys (FIDO2)</h2>
+    <p>Passkeys let you sign in to websites with your key instead of a password. Websites
+      add them through your browser; keyroost lets you see and manage them.</p>
+<pre><code>keyroostctl fido info                # what the key supports (no PIN needed)
+keyroostctl fido credential status   # how many passkeys it holds, and room for more
+keyroostctl fido credential list     # which sites have a passkey on this key
+keyroostctl fido credential delete &lt;ID&gt;   # remove one (asks first)</code></pre>
+    <p><code>fido credential status</code> answers in one line:</p>
+<pre><code>3 resident credential(s) stored, room for 22 more</code></pre>
+    <p>The list shows a long <code>id=…</code> for each passkey; that is the ID to give
+      <code>fido credential delete</code>. A deleted passkey can't be brought back, so
+      make sure you have another way into that account first.</p>
+    <p>Settings and fingerprints:</p>
+<pre><code>keyroostctl fido config always-uv enable    # always ask for the PIN or a fingerprint
+keyroostctl fido pin min-length set --length 8   # require longer PINs (one-way)
+keyroostctl fido fingerprint add "Right thumb"   # on keys with a sensor
+keyroostctl fido fingerprint list</code></pre>
+    <p>The minimum PIN length can only go up; lowering it again takes a reset. More in
+      <a href="fido2.html">FIDO2</a>, <a href="settings.html">Settings</a> and
+      <a href="fingerprint.html">Fingerprints</a>.</p>
+  </section>
+
+  <section class="kr-section" id="codes">
+    <h2>Authenticator codes on a key</h2>
+    <p>Your key can hold the 6-digit codes an authenticator app shows, so they live on
+      the key instead of your phone. Most keys keep them in their OATH storage:</p>
+<pre><code>keyroostctl oath list                   # every code on the key
+keyroostctl oath code GitHub:alice      # today's code for one account
+keyroostctl oath add GitHub:alice       # asks for the setup key (hidden)
+keyroostctl oath delete GitHub:alice    # asks first</code></pre>
+    <p><code>oath list</code> shows each account and its type:</p>
+<pre><code>GitHub:alice  [TOTP/SHA1]
+Mail:demo@example.com  [TOTP/SHA1]</code></pre>
+    <p>The setup key is the text a website shows next to its QR code. To add many codes at
+      once, <a href="#import">import them from your app</a>.</p>
+    <p>Token2 keys with their own code storage use <code>otp</code> instead:</p>
+<pre><code>keyroostctl otp list
+keyroostctl otp add --app GitHub --account alice
+keyroostctl otp code --app GitHub --account alice</code></pre>
+    <p>A Token2 Molto2 is a small device with a screen and 100 numbered slots:</p>
+<pre><code>keyroostctl molto list                    # slots in use, with their titles
+keyroostctl molto seed set -s 5           # put a code in slot #5 (asks for the setup key)
+keyroostctl molto title set -s 5 GitHub   # the name shown on the screen
+keyroostctl molto sync --all              # set the clock on every slot</code></pre>
+    <p>More in <a href="oath.html">OATH</a>, <a href="otp.html">On-device OTP</a> and
+      <a href="molto2.html">Token2 Molto2</a>.</p>
+  </section>
+
+  <section class="kr-section" id="import">
+    <h2>Import codes from an authenticator app</h2>
+    <p>If your codes live in an app like Aegis or 2FAS, you can copy them all onto your
+      key at once. Export them from the app first; keyroost reads Aegis exports (including
+      encrypted ones), 2FAS exports, lists of <code>otpauth://</code> links, and QR code
+      screenshots, including Google Authenticator's "Transfer accounts" QR.</p>
+    <p>See what would happen first. Nothing is written:</p>
+<pre><code>keyroostctl oath import --in aegis-export.json --dry-run</code></pre>
+<pre><code>→ Work key · serial 12345678 · Yubico YubiKey OTP+FIDO+CCID 00 00
+4 entries in aegis-export.json (Aegis) for Work key (serial 12345678) OATH:
+  add       GitHub:alice
+  add       Example:demo@example.com
+  exists    Mail:alice                already on the key; left as is (--replace replaces it)
+  skip      Steam:alice               Steam codes aren't supported
+Holds 32 codes; 3 on the key; 2 will be added, 0 replaced, 1 left as is, 1 skipped.</code></pre>
+    <p>If that looks right, run it again without <code>--dry-run</code>; keyroost asks
+      once before it writes anything. If the export is encrypted, keyroost asks for its
+      password; if your key has a password or PIN, it asks for that too.</p>
+    <p>Codes already on the key with the same name are left alone; add
+      <code>--replace</code> to overwrite them. Codes the key can't store are skipped,
+      with the reason shown. Running it again is safe.</p>
+    <p>Other keys work the same way:</p>
+<pre><code>keyroostctl otp import --in aegis-export.json                # a Token2 key's code storage
+keyroostctl molto import --in codes.txt --slot 10            # a Molto2, from slot #10 on</code></pre>
+    <p>On a Molto2, slots that are already in use are replaced, and the preview says so.
+      Prefer the app? Drop the file onto the keyroost window. More in
+      <a href="oath.html#import">Importing codes</a>.</p>
+  </section>
+
+  <section class="kr-section" id="piv">
+    <h2>Certificates and smart-card keys (PIV)</h2>
+    <p>PIV turns your key into a smart card: it holds certificates for signing in to
+      computers, VPNs or SSH servers. The private key is made on the card and never
+      leaves it.</p>
+<pre><code>keyroostctl piv info                                       # what is in each slot
+keyroostctl piv key generate --slot 9a                     # make a new key in slot 9a
+keyroostctl piv cert generate --slot 9a --subject "CN=Alice"   # give it a certificate
+keyroostctl piv cert import --slot 9a --in alice.pem       # or use one from your company
+keyroostctl piv cert export --slot 9a --out alice.pem      # save a copy of the certificate</code></pre>
+    <p>A slot is a numbered place for one key: <code>9a</code> is for signing in,
+      <code>9c</code> for signing documents, <code>9d</code> for decrypting. Changing a
+      slot needs the management key, a separate secret. If you never changed it, add
+      <code>--mgmt-key default</code>.</p>
+<pre><code>keyroostctl piv key move --from 9a --to 82   # move a key to another slot
+keyroostctl piv test --slot 9a               # check the key matches its certificate</code></pre>
+    <p><code>piv test</code> changes nothing: it asks the card to use the key and checks
+      the answer against the certificate, then reports each check as passed, failed or
+      skipped. Moving a key needs a key that supports it (for example YubiKey 5.7 and
+      later). More in <a href="piv.html">PIV</a>.</p>
+  </section>
+
+  <section class="kr-section" id="openpgp">
+    <h2>OpenPGP</h2>
+    <p>OpenPGP keys sign and encrypt email, files and git commits. keyroost sets up the
+      card; everyday use usually happens in tools like GnuPG.</p>
+<pre><code>keyroostctl openpgp info                                   # keys, PIN tries, details
+keyroostctl openpgp key generate --slot sign --algorithm ed25519   # a new signing key
+keyroostctl openpgp key import --slot decrypt --in my-key.pem      # an existing RSA-2048 key
+keyroostctl openpgp sign --in contract.pdf --out contract.sig      # sign a file
+keyroostctl openpgp url set https://example.com/alice.asc          # where your public key lives</code></pre>
+    <p>There are three slots: <code>sign</code>, <code>decrypt</code> and
+      <code>auth</code> (for logging in). Making or importing a key needs the admin PIN; using
+      it needs the user PIN. A YubiKey also wants a touch. More in
+      <a href="openpgp.html">OpenPGP</a>.</p>
+  </section>
+
+  <section class="kr-section" id="notes">
+    <h2>Notes stored on the key</h2>
+    <p>Many passkey keys have a small storage area. keyroost can keep short notes there,
+      such as where your backup key is, and SSH certificates. Anyone who has the key can
+      read it without a PIN, so never store passwords or secrets there.</p>
+<pre><code>keyroostctl fido blob list                               # everything stored, numbered
+keyroostctl fido blob add "Backup key is in the desk drawer"
+keyroostctl fido blob show 1                             # one entry in full
+keyroostctl fido blob edit 1 "Backup key is at the office"
+keyroostctl fido blob export 1 --out note.bin            # save an entry to a file</code></pre>
+<pre><code>[0] 64 bytes  key name  "Work key"
+[1] 52 bytes  note      Backup key is in the desk drawer
+
+Capacity: 116 of 1024 bytes used, 908 free</code></pre>
+    <p>For an SSH key made on the key, keyroost can save its certificate where SSH
+      expects it:</p>
+<pre><code>keyroostctl fido ssh list
+keyroostctl fido ssh export --out id_ed25519_sk-cert.pub</code></pre>
+    <p>More in <a href="storage.html">Storage</a>.</p>
+  </section>
+
+  <section class="kr-section" id="resetting">
+    <h2>Resetting</h2>
+    <p>A reset puts one part of the key back to factory condition. It erases everything
+      in that part, and can't be undone. It is also the way back from a forgotten PIN or
+      password.</p>
+<pre><code>keyroostctl fido reset      # all passkeys and the FIDO PIN (also notes and an on-key name)
+keyroostctl oath reset      # all authenticator codes and the code password
+keyroostctl piv reset       # all certificates, PIV keys and PINs
+keyroostctl openpgp reset   # all OpenPGP keys; PINs back to 123456 / 12345678
+keyroostctl otp reset       # all codes in a Token2 key's code storage
+keyroostctl molto reset     # all 100 slots of a Molto2
+keyroostctl factory-reset   # every part of the key at once</code></pre>
+    <p>Before anything is erased, keyroost names the key and asks:</p>
+<pre><code>wipe the OATH applet on Work key (serial 12345678)? [y/N]</code></pre>
+    <p>Anything other than <kbd>y</kbd> cancels. <code>factory-reset</code> asks you to
+      type the word <code>reset</code> instead. A passkey reset over USB also asks you to
+      unplug the key, plug it back in, and touch it; most keys only accept a reset just
+      after they are plugged in. Accounts that used the erased passkeys or codes need to be set up again,
+      so sign in with a backup first. More in <a href="reset.html">Resetting</a>.</p>
+  </section>
+
+  <section class="kr-section" id="scripts">
+    <h2>Using keyroostctl in scripts</h2>
+    <p>A script has no one to answer questions, so keyroost refuses to guess. Tell it
+      everything up front:</p>
+    <ul>
+      <li><strong>Which key:</strong> <code>-d</code> with a name or serial.</li>
+      <li><strong>Yes to the question:</strong> <code>-y</code> (or <code>--yes</code>).
+        Without it, a command that would erase or replace something stops and says
+        "add --yes".</li>
+      <li><strong>Secrets:</strong> <code>env:NAME</code> reads an environment variable,
+        <code>stdin</code> reads one line of input. Never the secret itself.</li>
+      <li><strong>Output:</strong> <code>--json</code> gives machine-readable output for
+        status and list commands.</li>
+    </ul>
+<pre><code>keyroostctl fido credential status -d "Work key" --pin env:KR_PIN
+pass show keys/fido-pin | keyroostctl fido credential status --pin stdin
+keyroostctl oath import -d "Work key" --in codes.txt --yes
+keyroostctl fido pin status --json</code></pre>
+<pre><code>{
+  "pin_retries": 8
+}</code></pre>
+    <p>keyroostctl exits with <strong>0</strong> when the command worked, <strong>1</strong>
+      when it failed, and <strong>2</strong> when the command itself was mistyped (an unknown
+      command or flag). Error messages go to standard error, results to standard output.</p>
+  </section>
+
+  <section class="kr-section" id="troubleshooting">
+    <h2>Troubleshooting</h2>
+    <p>Start with <code>keyroostctl doctor</code>. It only checks this computer and is safe
+      to run any time:</p>
+<pre><code>keyroost doctor — environment check
+
+✓ PC/SC service reachable
+✓ 1 reader(s):
+    Yubico YubiKey OTP+FIDO+CCID 00 00
+
+✓ YubiKey OTP+FIDO+CCID (/dev/hidraw1) is accessible
+
+✓ udev rules installed (/etc/udev/rules.d/70-keyroost-fido.rules)
+
+✓ /home/alice/.config/keyroost/keys.json is owner-only</code></pre>
+    <p>A <strong>✗</strong> line says what is wrong; a <strong>–</strong> line is
+      information. Common messages:</p>
+    <ul>
+      <li><strong><code>no key with OATH is connected</code></strong>: keyroost sees no key
+        that can do this. Check it is plugged in, and that it supports this feature.</li>
+      <li><strong><code>permission denied — install the udev rules</code></strong> (Linux):
+        install the rules from the <a href="index.html#install">install notes</a>, then
+        unplug the key and plug it back in.</li>
+      <li><strong><code>PC/SC unavailable</code></strong>: the smart-card service isn't
+        running. On Linux, install and start <code>pcscd</code>.</li>
+      <li><strong><code>the PIN was incorrect</code></strong>: one try was used up.
+        <code>keyroostctl fido pin status</code> shows how many are left.</li>
+      <li><strong><code>… without confirmation; add --yes</code></strong>: the command was
+        run without a terminal to ask on. Add <code>--yes</code> if you meant it.</li>
+      <li><strong><code>canceled; nothing was changed</code></strong>: you answered no, or
+        pressed Ctrl-C or Ctrl-D.</li>
+    </ul>
+    <p>Still stuck? <code>--debug</code> prints every message sent to and from the key.
+      Look it over before posting it publicly, then share it in an
+      <a href="https://github.com/framefilter/keyroost/issues">issue</a>:</p>
+<pre><code>keyroostctl --debug oath list</code></pre>
+  </section>
+
+  <section class="kr-section" id="reference">
+    <h2>Every command</h2>
+    <p class="kr-muted">Each command with its one-line description, taken from
+      <code>keyroostctl --help</code>. Add <code>--help</code> to any command for its
+      options.</p>
+<!-- BEGIN generated: cli-reference -->
+<!-- Generated from keyroostctl --help by packaging/gen-cli-reference.py; do not edit by hand. -->
+    <h3 id="ref-general">General</h3>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl list</code></td><td>List connected keys: smart-card (PC/SC) readers and FIDO USB (HID) devices</td></tr>
+      <tr><td><code>keyroostctl doctor</code></td><td>Diagnose the local environment: PC/SC service, readers, FIDO HID access, udev rules, registry permissions. Read-only, touches no key</td></tr>
+      <tr><td><code>keyroostctl factory-reset</code></td><td>Factory-reset EVERY resettable applet on the selected key: OATH, OpenPGP, Token2 OTP, PIV, then FIDO2. Irreversible: asks for a typed confirmation (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl completions</code></td><td>Print shell completions to stdout</td></tr>
+      <tr><td><code>keyroostctl manpage</code></td><td>Write man pages (keyroostctl.1 + keyroostctl-&lt;group&gt;.1) into a directory</td></tr>
+    </table></div>
+    <h3 id="ref-name">name</h3>
+    <p class="kr-muted">Name security keys: on this computer (keys.json) or on the key itself, where the name is visible to anyone who has the key</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl name set</code></td><td>Name the selected key, or rename it. Renaming keeps the name where it is unless --store says otherwise</td></tr>
+      <tr><td><code>keyroostctl name clear</code></td><td>Remove a name wherever it is stored: NAME, or the key selected with -d</td></tr>
+      <tr><td><code>keyroostctl name list</code></td><td>List the names this computer knows, where each lives, and which keys are connected</td></tr>
+    </table></div>
+    <h3 id="ref-fido">fido</h3>
+    <p class="kr-muted">Manage FIDO2: passkeys, PIN, fingerprints, settings, the large-blob store, SSH certificates, and reset</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl fido info</code></td><td>Show the key&#x27;s FIDO2 capabilities and settings</td></tr>
+      <tr><td><code>keyroostctl fido reset</code></td><td>Factory-reset FIDO2: wipe every credential (passkeys and security-key sign-ins) and the PIN. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl fido pin</code></td><td>Set, change or check the FIDO2 PIN, and the PIN rules (minimum length, forced change)</td></tr>
+      <tr><td><code>keyroostctl fido pin status</code></td><td>Show how many PIN attempts are left</td></tr>
+      <tr><td><code>keyroostctl fido pin set</code></td><td>Set the initial PIN on an authenticator that doesn&#x27;t have one yet. The PIN comes from an environment variable, stdin or, with neither, a hidden prompt (asked twice) — never argv</td></tr>
+      <tr><td><code>keyroostctl fido pin change</code></td><td>Change the existing PIN. Each PIN comes from an environment variable, stdin (the current PIN on the first line, the new one on the second) or, with neither, a hidden prompt — never argv</td></tr>
+      <tr><td><code>keyroostctl fido pin min-length</code></td><td>Raise the minimum PIN length</td></tr>
+      <tr><td><code>keyroostctl fido pin min-length set</code></td><td>Raise the minimum PIN length. One-way: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl fido pin force-change</code></td><td>Force a PIN change on next use, without changing the minimum length</td></tr>
+      <tr><td><code>keyroostctl fido credential</code></td><td>List, inspect or delete the credentials (passkeys and security-key sign-ins) on the key</td></tr>
+      <tr><td><code>keyroostctl fido credential list</code></td><td>List every resident credential on the authenticator, grouped by RP</td></tr>
+      <tr><td><code>keyroostctl fido credential delete</code></td><td>Delete one credential (passkey or security-key sign-in) by its hex credential ID. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl fido credential status</code></td><td>Show how many passkeys the key holds and how many more fit. Needs the PIN</td></tr>
+      <tr><td><code>keyroostctl fido fingerprint</code></td><td>List, add, rename or delete enrolled fingerprints</td></tr>
+      <tr><td><code>keyroostctl fido fingerprint list</code></td><td>List enrolled fingerprints (template id + name)</td></tr>
+      <tr><td><code>keyroostctl fido fingerprint add</code></td><td>Enroll a new fingerprint. Touch the sensor repeatedly when prompted until capture completes</td></tr>
+      <tr><td><code>keyroostctl fido fingerprint rename</code></td><td>Rename an enrolled fingerprint by its hex template ID (from <code>fido fingerprint list</code>)</td></tr>
+      <tr><td><code>keyroostctl fido fingerprint delete</code></td><td>Delete an enrolled fingerprint by its hex template ID (from <code>fido fingerprint list</code>). Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl fido config</code></td><td>Key-wide FIDO2 switches: always-uv and enterprise attestation</td></tr>
+      <tr><td><code>keyroostctl fido config always-uv</code></td><td>Always-uv (always user verification): when on, every sign-in needs the PIN or a fingerprint, not only a touch</td></tr>
+      <tr><td><code>keyroostctl fido config always-uv enable</code></td><td>Turn on &quot;always require user verification&quot; (alwaysUv). Does nothing if it is already on</td></tr>
+      <tr><td><code>keyroostctl fido config always-uv disable</code></td><td>Turn off &quot;always require user verification&quot; (alwaysUv). Does nothing if it is already off</td></tr>
+      <tr><td><code>keyroostctl fido config attestation</code></td><td>Enterprise attestation: lets a managed deployment&#x27;s sign-in prove which exact key is used</td></tr>
+      <tr><td><code>keyroostctl fido config attestation enable</code></td><td>Enable enterprise attestation. One-way: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl fido blob</code></td><td>Read and write the key&#x27;s large-blob store (notes, SSH certificates)</td></tr>
+      <tr><td><code>keyroostctl fido blob list</code></td><td>List every entry: index, size, type (note, key name, SSH certificate or opaque), and a short preview</td></tr>
+      <tr><td><code>keyroostctl fido blob show</code></td><td>Show one entry in full by its index (from <code>fido blob list</code>)</td></tr>
+      <tr><td><code>keyroostctl fido blob add</code></td><td>Append a keyroost text note</td></tr>
+      <tr><td><code>keyroostctl fido blob edit</code></td><td>Replace the text of an existing keyroost note by its index</td></tr>
+      <tr><td><code>keyroostctl fido blob delete</code></td><td>Delete a single entry by its index. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl fido blob export</code></td><td>Save one entry&#x27;s bytes to a file (read-only; no PIN needed)</td></tr>
+      <tr><td><code>keyroostctl fido blob clear</code></td><td>Erase the ENTIRE large-blob array, including any RP-owned entries. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl fido ssh</code></td><td>List SSH credentials and export their certificates</td></tr>
+      <tr><td><code>keyroostctl fido ssh list</code></td><td>List resident SSH credentials (ssh:* RP IDs) and whether each has a certificate stored in its largeBlob</td></tr>
+      <tr><td><code>keyroostctl fido ssh export</code></td><td>Save an SSH credential&#x27;s certificate from its largeBlob to a -cert.pub file</td></tr>
+    </table></div>
+    <h3 id="ref-oath">oath</h3>
+    <p class="kr-muted">Show codes and manage OATH (TOTP/HOTP) accounts on a security key</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl oath list</code></td><td>List the credentials stored on the key</td></tr>
+      <tr><td><code>keyroostctl oath code</code></td><td>Print the current TOTP code for a credential</td></tr>
+      <tr><td><code>keyroostctl oath add</code></td><td>Add (provision) a TOTP or HOTP credential</td></tr>
+      <tr><td><code>keyroostctl oath import</code></td><td>Add every code in an authenticator export to this key&#x27;s OATH storage</td></tr>
+      <tr><td><code>keyroostctl oath delete</code></td><td>Delete a credential by name. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl oath password</code></td><td>Set or clear the OATH applet&#x27;s access password</td></tr>
+      <tr><td><code>keyroostctl oath password set</code></td><td>Set (or replace) the applet password — never from argv</td></tr>
+      <tr><td><code>keyroostctl oath password clear</code></td><td>Remove the applet password. The current password comes from <code>--password env:NAME</code> / <code>--password stdin</code> or, with neither, a hidden prompt</td></tr>
+      <tr><td><code>keyroostctl oath reset</code></td><td>Factory-reset the OATH applet: wipe ALL authenticator credentials and clear the access password. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+    </table></div>
+    <h3 id="ref-otp">otp</h3>
+    <p class="kr-muted">Manage the OTP entries stored on a Token2 T2F2 / PIN+ FIDO key</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl otp list</code></td><td>List the OTP entries stored on the key, with their live codes where the device returns them (TOTP without button-press)</td></tr>
+      <tr><td><code>keyroostctl otp code</code></td><td>Print the current code for one entry, identified by app and account. A button-required entry will prompt for a touch</td></tr>
+      <tr><td><code>keyroostctl otp add</code></td><td>Add (or overwrite) an OTP entry</td></tr>
+      <tr><td><code>keyroostctl otp import</code></td><td>Add every code in an authenticator export to this key&#x27;s OTP storage</td></tr>
+      <tr><td><code>keyroostctl otp delete</code></td><td>Delete one OTP entry by app and account. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl otp reset</code></td><td>Erase every OTP entry on the key. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl otp serial</code></td><td>Read the device serial number (over USB, or NFC where the model allows)</td></tr>
+      <tr><td><code>keyroostctl otp button</code></td><td>Set or clear the HOTP code the key types when its button is pressed</td></tr>
+      <tr><td><code>keyroostctl otp button set</code></td><td>Configure the single HOTP-on-button keystroke slot, replacing any seed already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl otp button clear</code></td><td>Clear the HOTP-on-button keystroke slot. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl otp info</code></td><td>Read and print the device configuration (interface states, capabilities)</td></tr>
+      <tr><td><code>keyroostctl otp interface</code></td><td>Choose which USB interfaces the key offers (FIDO, keyboard, CCID). Irreversible: asks for a typed confirmation (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl otp pin</code></td><td>Set, change, clear, check or verify the OTP PIN</td></tr>
+      <tr><td><code>keyroostctl otp pin set</code></td><td>Set an OTP PIN on a currently-unprotected key</td></tr>
+      <tr><td><code>keyroostctl otp pin change</code></td><td>Change the OTP PIN: current first, then new (stdin lines 1 and 2, env vars, or the prompt)</td></tr>
+      <tr><td><code>keyroostctl otp pin clear</code></td><td>Remove the OTP PIN. Needs the current OTP PIN: via env, stdin or, with neither, a hidden prompt</td></tr>
+      <tr><td><code>keyroostctl otp pin status</code></td><td>Report OTP-PIN status (R3.4+ keys): whether a PIN is set and retries left</td></tr>
+      <tr><td><code>keyroostctl otp pin verify</code></td><td>Verify the OTP PIN, opening the read window for this connection (mostly for testing; <code>otp list</code> takes <code>--pin</code> directly). The PIN comes from --pin env:NAME or stdin or, with neither, a hidden prompt</td></tr>
+      <tr><td><code>keyroostctl otp fingerprint</code></td><td>Check, enable or disable fingerprint unlock for the OTP entries</td></tr>
+      <tr><td><code>keyroostctl otp fingerprint status</code></td><td>Report whether the key supports fingerprint-protected OTP and whether it is on</td></tr>
+      <tr><td><code>keyroostctl otp fingerprint enable</code></td><td>Enable fingerprint protection for OTP. Needs the current OTP PIN. After this, codes can be unlocked by a fingerprint touch as well as the PIN</td></tr>
+      <tr><td><code>keyroostctl otp fingerprint disable</code></td><td>Disable fingerprint protection for OTP. Needs the current OTP PIN</td></tr>
+    </table></div>
+    <h3 id="ref-openpgp">openpgp</h3>
+    <p class="kr-muted">Manage the OpenPGP card applet: info, keys, sign, decrypt, PINs, cardholder details, and reset</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl openpgp info</code></td><td>Show card status: AID/serial, key algorithms and fingerprints, PIN retry counters, and the signature counter. No PIN or touch required</td></tr>
+      <tr><td><code>keyroostctl openpgp pin</code></td><td>Check, change or unblock the user PIN (PW1) or the admin PIN (PW3)</td></tr>
+      <tr><td><code>keyroostctl openpgp pin verify</code></td><td>Check a PIN without changing anything (the user PIN, or the admin PIN with --admin)</td></tr>
+      <tr><td><code>keyroostctl openpgp pin change</code></td><td>Change the user PIN, or the admin PIN with --admin</td></tr>
+      <tr><td><code>keyroostctl openpgp pin unblock</code></td><td>Set a new user PIN using the admin PIN (after too many wrong user PINs)</td></tr>
+      <tr><td><code>keyroostctl openpgp key</code></td><td>Generate, import or show the card&#x27;s keys, and list the algorithms it supports</td></tr>
+      <tr><td><code>keyroostctl openpgp key generate</code></td><td>Generate a fresh key pair in a slot, replacing any key already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl openpgp key import</code></td><td>Import an RSA-2048 key into a slot, replacing any key already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl openpgp key show</code></td><td>Read the public key from a slot (read-only; no PIN). RSA keys print modulus and exponent, ECC keys the public point, in hex</td></tr>
+      <tr><td><code>keyroostctl openpgp key algorithms</code></td><td>List the key algorithms this card reports accepting per slot (read-only; no PIN). Cards that don&#x27;t publish the list accept any attempt and answer with an error if they can&#x27;t</td></tr>
+      <tr><td><code>keyroostctl openpgp name</code></td><td>Set the cardholder name stored on the card</td></tr>
+      <tr><td><code>keyroostctl openpgp name set</code></td><td>Set the cardholder name. Needs the admin PIN (PW3)</td></tr>
+      <tr><td><code>keyroostctl openpgp url</code></td><td>Set the public-key URL stored on the card</td></tr>
+      <tr><td><code>keyroostctl openpgp url set</code></td><td>Set the public-key URL. Needs the admin PIN (PW3)</td></tr>
+      <tr><td><code>keyroostctl openpgp sign</code></td><td>Sign a file with the key in the signature slot</td></tr>
+      <tr><td><code>keyroostctl openpgp decrypt</code></td><td>Decrypt a file with the key in the decryption slot</td></tr>
+      <tr><td><code>keyroostctl openpgp authenticate</code></td><td>Sign a challenge with the key in the authentication slot (client or SSH login)</td></tr>
+      <tr><td><code>keyroostctl openpgp reset</code></td><td>Factory-reset the OpenPGP applet: wipe ALL key slots and restore default PINs (PW1 123456, PW3 12345678). Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+    </table></div>
+    <h3 id="ref-piv">piv</h3>
+    <p class="kr-muted">Manage the PIV (smart card) applet: info, PIN/PUK, management key, keys, and certificates</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl piv info</code></td><td>Show PIV status: version, serial, PIN retries, and which key slots hold a certificate. No PIN or touch required</td></tr>
+      <tr><td><code>keyroostctl piv pin</code></td><td>Change the PIV PIN, or unblock it with the PUK</td></tr>
+      <tr><td><code>keyroostctl piv pin change</code></td><td>Change the PIV PIN. Each PIN comes from an environment variable, stdin (the current PIN on the first line, the new one on the second) or, with neither, a hidden prompt</td></tr>
+      <tr><td><code>keyroostctl piv pin unblock</code></td><td>Unblock a blocked PIN using the PUK, setting a new PIN</td></tr>
+      <tr><td><code>keyroostctl piv puk</code></td><td>Change the PUK (the code that unblocks the PIN)</td></tr>
+      <tr><td><code>keyroostctl piv puk change</code></td><td>Change the PUK (PIN Unblocking Key). Each PUK comes from an environment variable, stdin (the current PUK on the first line, the new one on the second) or, with neither, a hidden prompt</td></tr>
+      <tr><td><code>keyroostctl piv retries</code></td><td>Set how many wrong PIN and PUK entries are allowed</td></tr>
+      <tr><td><code>keyroostctl piv retries set</code></td><td>Set how many wrong PIN and PUK entries are allowed. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl piv mgmt-key</code></td><td>Change the management key (mgmt-key: the key that authorizes changes to keys and certificates)</td></tr>
+      <tr><td><code>keyroostctl piv mgmt-key change</code></td><td>Change the card-management (9B) key. Both keys are hex; from stdin, the current key comes on the first line and the new one on the second</td></tr>
+      <tr><td><code>keyroostctl piv key</code></td><td>Generate, delete or move the private keys in PIV slots</td></tr>
+      <tr><td><code>keyroostctl piv key generate</code></td><td>Generate a new key pair in a slot, replacing any key already there, and print its public key (PEM). Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl piv key delete</code></td><td>Delete a slot&#x27;s private key; the slot&#x27;s certificate is left in place. Needs the management key. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl piv key move</code></td><td>Move a slot&#x27;s private key to another slot, without it leaving the card</td></tr>
+      <tr><td><code>keyroostctl piv cert</code></td><td>Import, export, delete, request or generate the certificates in PIV slots</td></tr>
+      <tr><td><code>keyroostctl piv cert import</code></td><td>Import a DER or PEM X.509 certificate into a slot, replacing any certificate already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl piv cert export</code></td><td>Export a slot&#x27;s certificate as PEM (default) or DER, to a file or stdout. No PIN required</td></tr>
+      <tr><td><code>keyroostctl piv cert request</code></td><td>Create a PKCS#10 certificate signing request for the key in a slot, signed on the card (PEM to stdout or --out). Hand the result to a CA; import the certificate it issues with <code>piv cert import</code></td></tr>
+      <tr><td><code>keyroostctl piv cert generate</code></td><td>Create a self-signed certificate for the key in a slot and store it there, replacing any certificate already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl piv cert delete</code></td><td>Delete a slot&#x27;s certificate; the slot&#x27;s private key is left in place. Needs the management key. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl piv chuid</code></td><td>Write a new CHUID (Card Holder Unique Identifier, the card&#x27;s identity record)</td></tr>
+      <tr><td><code>keyroostctl piv chuid generate</code></td><td>Write a fresh, randomly-generated CHUID (Card Holder Unique Identifier). Needs the management key</td></tr>
+      <tr><td><code>keyroostctl piv test</code></td><td>Test a slot&#x27;s private key end to end against the slot certificate&#x27;s public key. Read-only — nothing on the card changes</td></tr>
+      <tr><td><code>keyroostctl piv reset</code></td><td>Reset the PIV application to factory defaults: wipe all keys, certificates and PINs. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+    </table></div>
+    <h3 id="ref-molto">molto</h3>
+    <p class="kr-muted">Token2 Molto2 / Molto2v2 programmable TOTP token</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl molto info</code></td><td>Print device serial number and on-device UTC time</td></tr>
+      <tr><td><code>keyroostctl molto list</code></td><td>List the 100 slots: occupancy, title, TOTP config. Titles and occupancy are readable by anyone holding the token — no customer key is needed (or used)</td></tr>
+      <tr><td><code>keyroostctl molto seed</code></td><td>Write a slot&#x27;s TOTP seed</td></tr>
+      <tr><td><code>keyroostctl molto seed set</code></td><td>Write a TOTP seed to a slot, replacing any seed already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl molto title</code></td><td>Show a slot&#x27;s title (and whether it holds a seed), or write one with <code>molto title set</code></td></tr>
+      <tr><td><code>keyroostctl molto title set</code></td><td>Write a slot title (1..=12 ASCII characters), replacing the one there</td></tr>
+      <tr><td><code>keyroostctl molto delete</code></td><td>Delete one slot&#x27;s seed. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl molto config</code></td><td>Set a slot&#x27;s TOTP configuration</td></tr>
+      <tr><td><code>keyroostctl molto config set</code></td><td>Set a slot&#x27;s TOTP configuration (and seed the clock with the host&#x27;s UTC time)</td></tr>
+      <tr><td><code>keyroostctl molto sync</code></td><td>Push the host&#x27;s current UTC time to one slot (or all slots)</td></tr>
+      <tr><td><code>keyroostctl molto customer-key</code></td><td>Change the Molto2&#x27;s customer key</td></tr>
+      <tr><td><code>keyroostctl molto customer-key change</code></td><td>Replace the Molto2&#x27;s customer key. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl molto import</code></td><td>Import an otpauth:// URI to a slot, or every entry of an export file to consecutive slots: writes seed, title, and config, replacing what the slots held. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl molto reset</code></td><td>Factory-reset the device: wipe all slots and restore the default customer key. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+    </table></div>
+    <h3 id="ref-prog">prog</h3>
+    <p class="kr-muted">Token2 2nd-generation single-profile programmable TOTP token. Uses the token&#x27;s fixed device key; no customer key is needed</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>keyroostctl prog info</code></td><td>Print device serial number and on-device UTC time. No auth needed</td></tr>
+      <tr><td><code>keyroostctl prog seed</code></td><td>Write the token&#x27;s TOTP seed</td></tr>
+      <tr><td><code>keyroostctl prog seed set</code></td><td>Write the TOTP seed, replacing the one on the token. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl prog config</code></td><td>Set the token&#x27;s TOTP configuration</td></tr>
+      <tr><td><code>keyroostctl prog config set</code></td><td>Set the device configuration and seed the clock with the host&#x27;s UTC time</td></tr>
+    </table></div>
+    <!-- END generated: cli-reference -->
+    <p class="kr-related" style="margin-top:18px"><a class="kr-btn kr-btn-default" href="index.html">← Back to overview</a></p>
+  </section>
+
+</main>
+
+<footer class="kr-footer">
+  <div class="kr-wrap">
+    <p><span class="kr-pill kr-pill-brand">keyroost</span> &nbsp;Independent, open-source Rust toolchain for hardware security keys. <a href="https://github.com/framefilter/keyroost">Source →</a></p>
+    <p class="kr-small">Not affiliated with or endorsed by any vendor; product names are descriptive and remain their owners' trademarks.</p>
+  </div>
+</footer>
+
+<script src="assets/site.js"></script>
+</body>
+</html>

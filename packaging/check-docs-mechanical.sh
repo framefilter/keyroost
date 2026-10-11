@@ -23,6 +23,8 @@
 #   6. A malformed changelog.d/ fragment (bad filename, missing credit ref,
 #      an overlong line) going unnoticed until release, when assembling it
 #      into CHANGELOG.md would either fail or ship a broken entry.
+#   7. The command reference generated into docs/cli.html falling behind the
+#      binary's --help tree (regenerate with packaging/gen-cli-reference.py).
 #
 # Usage:
 #   packaging/check-docs-mechanical.sh
@@ -46,7 +48,7 @@ cd "$(dirname "$0")/.."
 
 for arg in "$@"; do
   case "$arg" in
-    -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "error: unrecognized argument '$arg'" >&2; exit 2 ;;
   esac
 done
@@ -390,6 +392,18 @@ for line in (r.stdout + r.stderr).splitlines():
 if r.returncode != 0:
     fail("changelog.d/ fragment validation failed (packaging/assemble-changelog.py "
          "--check exited non-zero — see its output above)")
+
+# --- (g) generated command reference in docs/cli.html ----------------------
+
+print()
+print("== (g) docs/cli.html command reference vs the real binary ==")
+r = subprocess.run([sys.executable, "packaging/gen-cli-reference.py", "--check",
+                    "--bin", BIN], capture_output=True, text=True)
+for line in (r.stdout + r.stderr).splitlines():
+    print(line)
+if r.returncode != 0:
+    fail("docs/cli.html's command reference is stale (run "
+         "packaging/gen-cli-reference.py and commit the result)")
 
 # --- verdict ----------------------------------------------------------------
 
