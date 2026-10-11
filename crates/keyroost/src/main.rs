@@ -11878,7 +11878,7 @@ const TOPBAR_GAP: f32 = 16.0;
 /// Smallest gap kept between the left and right halves of the top bar.
 const TOPBAR_SIDE_GAP: f32 = 16.0;
 const TOPBAR_LEARN: &str = "Learn \u{2197}";
-const TOPBAR_APPEARANCE: &str = "Appearance \u{25be}";
+const TOPBAR_APPEARANCE: &str = "Appearance";
 const TOPBAR_MENU: &str = "\u{2630}";
 
 /// Which optional items the top bar shows; chosen by [`top_bar_fit`].
@@ -11889,7 +11889,7 @@ struct TopBarFit {
     /// "N connected" is shortened to "N" (full text in a tooltip).
     count_compact: bool,
     /// Learn and Activity log live in the menu, and the menu button turns
-    /// from "Appearance ▾" into "☰".
+    /// from "Appearance" into "☰".
     links_in_menu: bool,
 }
 
@@ -11933,7 +11933,7 @@ struct TopBarWidths {
     count_full: f32,
     /// Status dot + "N".
     count_short: f32,
-    /// "Appearance ▾" trigger.
+    /// "Appearance" trigger.
     appearance: f32,
     /// "☰" button.
     menu: f32,
@@ -12380,7 +12380,7 @@ impl App {
         }
     }
 
-    /// Appearance settings: Theme, Accent, Text size, Colorblind-safe colors.
+    /// Appearance settings: Theme, Accent, Text size, Colorblind-friendly colors.
     /// Same settings and persistence as before they moved into the menu.
     fn appearance_section(&mut self, ui: &mut egui::Ui, p: &Palette, focus_first: bool) {
         let caption = |t: &str| {
@@ -12454,7 +12454,11 @@ impl App {
         ui.add_space(4.0);
         let mut colorblind = self.colorblind;
         if ui
-            .checkbox(&mut colorblind, "Colorblind-safe colors")
+            .checkbox(&mut colorblind, "Colorblind-friendly colors")
+            .on_hover_text(
+                "Shows status in blue and orange instead of green and red, \
+                 for red-green color blindness",
+            )
             .changed()
         {
             self.colorblind = colorblind;
