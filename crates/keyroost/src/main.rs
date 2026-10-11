@@ -16,7 +16,7 @@ mod screengrab;
 mod settings;
 mod ui;
 use otp_pane::OtpState;
-use settings::Settings;
+use settings::{Settings, SidebarSetting};
 use ui::device::{self, CapState, CapTab, Caps, Device, DeviceId, DeviceKind, DeviceView};
 use ui::theme::{self, BtnKind, Mode, Palette};
 
@@ -3057,6 +3057,7 @@ fn main() -> eframe::Result<()> {
             // file predates an accent being removed.
             let accent_idx = saved.accent.min(Palette::ACCENTS.len() - 1);
             let colorblind = saved.colorblind;
+            let sidebar = saved.sidebar;
             // `Settings::load` already clamps zoom; clamp again defensively.
             let zoom = theme::clamp_zoom(saved.zoom);
             Palette::new(mode, Palette::ACCENTS[accent_idx], colorblind).apply(&cc.egui_ctx, mode);
@@ -3076,6 +3077,7 @@ fn main() -> eframe::Result<()> {
                 mode,
                 accent_idx,
                 colorblind,
+                sidebar,
                 zoom,
                 // Seed the persistence baseline with exactly what we loaded so
                 // the first `persist_settings()` doesn't re-write an unchanged
@@ -3086,6 +3088,7 @@ fn main() -> eframe::Result<()> {
                     mode: mode.into(),
                     accent: accent_idx,
                     colorblind,
+                    sidebar,
                 }),
                 worker: Some(Worker::spawn(cc.egui_ctx.clone(), apdu_trace.clone())),
                 egui_ctx: Some(cc.egui_ctx.clone()),
@@ -3244,6 +3247,14 @@ struct App {
     accent_idx: usize,
     /// Colorblind-safe palette (blue/vermillion status colors) — persisted.
     colorblind: bool,
+    /// Device list choice from the Appearance menu (persisted). "Always full"
+    /// is also what the overlay's "Keep open" pin sets.
+    sidebar: SidebarSetting,
+    /// Automatic mode's memory of "the page is too narrow for the cards", so
+    /// the switch back needs a little more room than the switch away.
+    sidebar_tight: bool,
+    /// The full list is open over the page (from the rail). Never saved.
+    sidebar_overlay: bool,
     /// Whether the activity-log drawer is open.
     log_open: bool,
     /// Whether the activity log is popped out into its own OS window (viewport)
@@ -7620,6 +7631,7 @@ impl App {
             mode: self.mode.into(),
             accent: self.accent_idx,
             colorblind: self.colorblind,
+            sidebar: self.sidebar,
         };
         if self.last_saved_settings.as_ref() == Some(&current) {
             return;
@@ -11496,11 +11508,53 @@ fn paint_reattach_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) 
 /// device — fixing the "only the gaps are clickable" inconsistency.
 fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> bool {
     let w = ui.available_width();
-    let h = 68.0;
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, DEVICE_CARD_H), egui::Sense::click());
+    paint_device_card(ui, p, dev, rect, selected, resp.hovered());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+/// Height of one device card in the full list.
+const DEVICE_CARD_H: f32 = 68.0;
+
+/// The key's square tile: an amber clock for programmable tokens, else the
+/// first letter of the vendor. Shared by the card and the rail.
+fn paint_device_tile(ui: &egui::Ui, p: &Palette, dev: &Device, tile: egui::Rect) {
+    if matches!(dev.kind, DeviceKind::Token | DeviceKind::ProgToken) {
+        paint_glyph_tile(ui, tile, p.brand_soft(), p.brand, None);
+    } else {
+        paint_glyph_tile(
+            ui,
+            tile,
+            p.raised2,
+            p.txt2,
+            Some(
+                dev.vendor
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_ascii_uppercase(),
+            ),
+        );
+    }
+}
+
+/// Paint one device card into `rect` (no widget allocated), so the list and
+/// the rail's hover card draw exactly the same thing.
+fn paint_device_card(
+    ui: &egui::Ui,
+    p: &Palette,
+    dev: &Device,
+    rect: egui::Rect,
+    selected: bool,
+    hovered: bool,
+) {
+    let h = rect.height();
     let bg = if selected {
         p.raised
-    } else if resp.hovered() {
+    } else if hovered {
         p.line_soft
     } else {
         egui::Color32::TRANSPARENT
@@ -11530,28 +11584,12 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
         );
     }
 
-    let token = dev.kind == DeviceKind::Token || dev.kind == DeviceKind::ProgToken;
+    let token = matches!(dev.kind, DeviceKind::Token | DeviceKind::ProgToken);
     let tile = egui::Rect::from_min_size(
         rect.left_top() + egui::vec2(14.0, (h - 38.0) / 2.0),
         egui::vec2(38.0, 38.0),
     );
-    if token {
-        paint_glyph_tile(ui, tile, p.brand_soft(), p.brand, None);
-    } else {
-        paint_glyph_tile(
-            ui,
-            tile,
-            p.raised2,
-            p.txt2,
-            Some(
-                dev.vendor
-                    .chars()
-                    .next()
-                    .unwrap_or('?')
-                    .to_ascii_uppercase(),
-            ),
-        );
-    }
+    paint_device_tile(ui, p, dev, tile);
 
     let tx = tile.right() + 11.0;
     let right_pad = 16.0;
@@ -11610,10 +11648,188 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
             px += paint_pill(ui, egui::pos2(px, py), label, fg, bg) + 5.0;
         }
     }
+}
+
+/// What the user did in the device list this frame.
+#[derive(Default)]
+struct SidebarEvents {
+    /// A key was picked.
+    picked: Option<DeviceId>,
+    /// "»" or "«" was clicked.
+    toggle: bool,
+    /// Close the overlay (Esc, a press outside it, its "«").
+    close: bool,
+    /// "Keep open" was switched on or off.
+    pin: Option<bool>,
+}
+
+impl SidebarEvents {
+    fn merge(&mut self, other: SidebarEvents) {
+        self.picked = self.picked.take().or(other.picked);
+        self.toggle |= other.toggle;
+        self.close |= other.close;
+        self.pin = self.pin.or(other.pin);
+    }
+}
+
+/// Hover fill and keyboard focus ring for the small sidebar buttons.
+fn paint_sidebar_button(ui: &egui::Ui, p: &Palette, rect: egui::Rect, resp: &egui::Response) {
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(7), p.line_soft);
+    }
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(7),
+            egui::Stroke::new(1.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// One key on the rail: its square tile, with the card's selected look and
+/// accent bar. Hover or keyboard focus shows the key's full card beside it,
+/// so two keys with the same letter can still be told apart.
+fn rail_tile(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> bool {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 50.0), egui::Sense::click());
+    let tile = egui::Rect::from_center_size(rect.center(), egui::vec2(38.0, 38.0));
+    let back = tile.expand(4.0);
+    if selected {
+        ui.painter().rect(
+            back,
+            egui::CornerRadius::same(11),
+            p.raised,
+            egui::Stroke::new(1.0, p.line),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                back.left_top() + egui::vec2(0.0, 10.0),
+                egui::vec2(3.0, back.height() - 20.0),
+            ),
+            egui::CornerRadius::same(3),
+            p.accent,
+        );
+    } else if resp.hovered() {
+        ui.painter()
+            .rect_filled(back, egui::CornerRadius::same(11), p.line_soft);
+    }
+    paint_device_tile(ui, p, dev, tile);
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            back.expand(2.0),
+            egui::CornerRadius::same(13),
+            egui::Stroke::new(1.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let card_w = SIDEBAR_FULL_W - 28.0;
+    let mut tip = egui::Tooltip::for_enabled(&resp).width(card_w);
+    tip.popup = tip
+        .popup
+        .align(egui::RectAlign::RIGHT_START)
+        .align_alternatives(&[egui::RectAlign::RIGHT, egui::RectAlign::RIGHT_END]);
+    if resp.has_focus() {
+        tip.popup = tip.popup.open(true);
+    }
+    tip.show(|ui| {
+        let (r, _) =
+            ui.allocate_exact_size(egui::vec2(card_w, DEVICE_CARD_H), egui::Sense::hover());
+        paint_device_card(ui, p, dev, r, false, false);
+    });
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp.clicked()
+}
+
+/// The "Keep open" pin: a pushpin and its label, filled in the accent color
+/// while on. Greyed out when its `Ui` is disabled.
+fn keep_open_toggle(ui: &mut egui::Ui, p: &Palette, on: bool) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let label = "Keep open";
+    let font = theme::f_sb(12.5);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, p.txt));
+    let size = egui::vec2(8.0 + 14.0 + 6.0 + galley.size().x + 10.0, 24.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let fill = if on && enabled {
+        p.raised
+    } else if resp.hovered() {
+        p.line_soft
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(7),
+        fill,
+        egui::Stroke::new(
+            1.0,
+            if on && enabled {
+                p.line
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let (icon, text) = if !enabled {
+        (p.txt3, p.txt3)
+    } else if on {
+        (p.accent, p.txt)
+    } else {
+        (p.txt2, p.txt2)
+    };
+    paint_pin_icon(
+        ui,
+        egui::pos2(rect.left() + 15.0, rect.center().y),
+        icon,
+        on,
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 28.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text,
+    );
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(7),
+            egui::Stroke::new(1.0, p.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp.on_hover_text("Keep the full list next to the page")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A small upright pushpin: cap, body, plate and needle. `filled` paints
+/// the cap and body solid (pinned).
+fn paint_pin_icon(ui: &egui::Ui, c: egui::Pos2, color: egui::Color32, filled: bool) {
+    let stroke = egui::Stroke::new(1.3, color);
+    let cap = egui::Rect::from_min_max(c + egui::vec2(-3.5, -7.0), c + egui::vec2(3.5, -4.6));
+    let body = egui::Rect::from_min_max(c + egui::vec2(-2.0, -4.6), c + egui::vec2(2.0, 0.0));
+    for r in [cap, body] {
+        if filled {
+            ui.painter()
+                .rect_filled(r, egui::CornerRadius::same(1), color);
+        } else {
+            ui.painter().rect_stroke(
+                r,
+                egui::CornerRadius::same(1),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+    }
+    ui.painter().line_segment(
+        [c + egui::vec2(-4.5, 0.4), c + egui::vec2(4.5, 0.4)],
+        stroke,
+    );
+    ui.painter()
+        .line_segment([c + egui::vec2(0.0, 0.4), c + egui::vec2(0.0, 7.0)], stroke);
 }
 
 impl eframe::App for App {
@@ -12104,6 +12320,239 @@ mod top_bar_fit_tests {
     }
 }
 
+// --- Device list: cards, icon rail, or a list over the page -----------------
+
+/// Width of the full device list (the cards), in points.
+const SIDEBAR_FULL_W: f32 = 286.0;
+/// Width of the icon rail, in points.
+const SIDEBAR_RAIL_W: f32 = 64.0;
+/// Automatic switches to the rail once the page would get less than this...
+const SIDEBAR_RAIL_BELOW: f32 = 560.0;
+/// ...and back to the cards only once it would get at least this, so dragging
+/// the window edge across the line doesn't make the list flicker.
+const SIDEBAR_FULL_ABOVE: f32 = 584.0;
+/// "Keep open" docks the cards only while the page keeps at least this.
+const SIDEBAR_PIN_MIN: f32 = 300.0;
+
+/// How the device list is drawn this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarLayout {
+    /// The docked card list (today's look).
+    Full,
+    /// The narrow strip of key icons.
+    Rail,
+    /// The rail, with the card list open over the page.
+    Overlay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidebarFit {
+    layout: SidebarLayout,
+    /// Automatic's "too narrow for the cards" state; feed it back next frame.
+    tight: bool,
+    /// The page would drop under [`SIDEBAR_PIN_MIN`] with the cards docked, so
+    /// "Keep open" cannot dock them right now.
+    pin_blocked: bool,
+}
+
+/// Decide the device list's layout from the room the window has (`available`
+/// points, so the text size counts), the full list's width, the user's choice
+/// (`Full` is also the "Keep open" pin), last frame's `was_tight` and whether
+/// the overlay is open. Pure so the thresholds can be tested without a window.
+fn sidebar_fit(
+    available: f32,
+    full_w: f32,
+    choice: SidebarSetting,
+    was_tight: bool,
+    overlay_open: bool,
+) -> SidebarFit {
+    let page = available - full_w;
+    let tight = if was_tight {
+        page < SIDEBAR_FULL_ABOVE
+    } else {
+        page < SIDEBAR_RAIL_BELOW
+    };
+    let pin_blocked = page < SIDEBAR_PIN_MIN;
+    let docked = match choice {
+        SidebarSetting::Auto => !tight,
+        SidebarSetting::Full => !pin_blocked,
+        SidebarSetting::Compact => false,
+    };
+    let layout = if docked {
+        SidebarLayout::Full
+    } else if overlay_open {
+        SidebarLayout::Overlay
+    } else {
+        SidebarLayout::Rail
+    };
+    SidebarFit {
+        layout,
+        tight,
+        pin_blocked,
+    }
+}
+
+/// What "»" / Ctrl+B does: returns the new choice and whether the overlay is
+/// open. From the rail it brings the cards back docked when there is room,
+/// else opens them over the page; from the overlay it closes it; from the
+/// docked cards it goes to the rail.
+fn sidebar_toggle(fit: SidebarFit, choice: SidebarSetting) -> (SidebarSetting, bool) {
+    match fit.layout {
+        SidebarLayout::Overlay => (choice, false),
+        SidebarLayout::Rail if !fit.tight => (SidebarSetting::Auto, false),
+        SidebarLayout::Rail => (choice, true),
+        // Docked only because of the pin: unpinning is enough to get the rail.
+        SidebarLayout::Full if choice == SidebarSetting::Full && fit.tight => {
+            (SidebarSetting::Auto, false)
+        }
+        SidebarLayout::Full => (SidebarSetting::Compact, false),
+    }
+}
+
+#[cfg(test)]
+mod sidebar_fit_tests {
+    use super::*;
+    use SidebarLayout::{Full, Overlay, Rail};
+    use SidebarSetting as S;
+
+    fn fit(available: f32, choice: S) -> SidebarFit {
+        sidebar_fit(available, SIDEBAR_FULL_W, choice, false, false)
+    }
+
+    #[test]
+    fn normal_sizes_keep_the_cards() {
+        // 1180/100%, 1180/125%, 900/100% (the minimum window) are unchanged.
+        for available in [1180.0, 944.0, 900.0] {
+            assert_eq!(fit(available, S::Auto).layout, Full, "{available}");
+        }
+    }
+
+    #[test]
+    fn tight_sizes_get_the_rail() {
+        // 1180/150%, 900/150%, 1180/200%, 800/200%.
+        for available in [787.0, 600.0, 590.0, 400.0] {
+            let f = fit(available, S::Auto);
+            assert_eq!(f.layout, Rail, "{available}");
+            assert!(f.tight);
+        }
+    }
+
+    #[test]
+    fn switches_at_560_and_back_at_584() {
+        let w = SIDEBAR_FULL_W;
+        assert_eq!(fit(w + 560.0, S::Auto).layout, Full);
+        assert_eq!(fit(w + 559.0, S::Auto).layout, Rail);
+        // Once on the rail, it stays there until the page would get 584pt.
+        let after = |a: f32| sidebar_fit(a, w, S::Auto, true, false).layout;
+        assert_eq!(after(w + 560.0), Rail);
+        assert_eq!(after(w + 583.0), Rail);
+        assert_eq!(after(w + 584.0), Full);
+    }
+
+    #[test]
+    fn hysteresis_does_not_flicker_while_dragging() {
+        // Walk the width up and down across the band; the layout may change
+        // only once each way.
+        let mut tight = false;
+        let mut changes = 0;
+        let mut last = Full;
+        let mut widths: Vec<f32> = (0..80).map(|i| 900.0 - i as f32).collect();
+        widths.extend((0..80).map(|i| 820.0 + i as f32));
+        for a in widths {
+            let f = sidebar_fit(a, SIDEBAR_FULL_W, S::Auto, tight, false);
+            tight = f.tight;
+            if f.layout != last {
+                changes += 1;
+                last = f.layout;
+            }
+        }
+        assert_eq!(changes, 2);
+    }
+
+    #[test]
+    fn compact_is_the_rail_at_any_size() {
+        for available in [2000.0, 1180.0, 900.0, 400.0] {
+            assert_eq!(fit(available, S::Compact).layout, Rail, "{available}");
+        }
+    }
+
+    #[test]
+    fn pin_docks_while_the_page_keeps_300() {
+        let w = SIDEBAR_FULL_W;
+        // 1180/150%: Automatic gives the rail, the pin docks the cards.
+        assert_eq!(fit(787.0, S::Auto).layout, Rail);
+        let f = fit(787.0, S::Full);
+        assert_eq!(f.layout, Full);
+        assert!(!f.pin_blocked);
+        assert_eq!(fit(w + 300.0, S::Full).layout, Full);
+        // Under 300pt the pin can't dock: rail, and the pin shows as blocked.
+        let f = fit(w + 299.0, S::Full);
+        assert_eq!(f.layout, Rail);
+        assert!(f.pin_blocked);
+        let f = fit(400.0, S::Full); // 800/200%
+        assert_eq!(f.layout, Rail);
+        assert!(f.pin_blocked);
+    }
+
+    #[test]
+    fn overlay_only_over_the_rail() {
+        let open = |a: f32, c: S| sidebar_fit(a, SIDEBAR_FULL_W, c, false, true).layout;
+        assert_eq!(open(400.0, S::Auto), Overlay);
+        assert_eq!(open(400.0, S::Full), Overlay);
+        assert_eq!(open(1180.0, S::Compact), Overlay);
+        // Room for the docked cards: the overlay has nothing to cover.
+        assert_eq!(open(1180.0, S::Auto), Full);
+        assert_eq!(open(787.0, S::Full), Full);
+    }
+
+    #[test]
+    fn toggle_from_the_rail() {
+        // Compact with room: back to the docked cards.
+        assert_eq!(
+            sidebar_toggle(fit(1180.0, S::Compact), S::Compact),
+            (S::Auto, false)
+        );
+        // Tight: open the cards over the page, keep the choice.
+        assert_eq!(
+            sidebar_toggle(fit(400.0, S::Auto), S::Auto),
+            (S::Auto, true)
+        );
+        assert_eq!(
+            sidebar_toggle(fit(600.0, S::Compact), S::Compact),
+            (S::Compact, true)
+        );
+        assert_eq!(
+            sidebar_toggle(fit(400.0, S::Full), S::Full),
+            (S::Full, true)
+        );
+    }
+
+    #[test]
+    fn toggle_from_the_overlay_and_the_cards() {
+        let over = sidebar_fit(400.0, SIDEBAR_FULL_W, S::Auto, true, true);
+        assert_eq!(sidebar_toggle(over, S::Auto), (S::Auto, false));
+        // Docked with room: to the rail.
+        assert_eq!(
+            sidebar_toggle(fit(1180.0, S::Auto), S::Auto),
+            (S::Compact, false)
+        );
+        // Docked only because of the pin: unpin.
+        assert_eq!(
+            sidebar_toggle(fit(787.0, S::Full), S::Full),
+            (S::Auto, false)
+        );
+    }
+
+    #[test]
+    fn follows_text_size() {
+        // The thresholds are in points, so doubling the text size halves the
+        // window width at which the rail appears.
+        let w = SIDEBAR_FULL_W;
+        assert_eq!(fit(w + 600.0, S::Auto).layout, Full);
+        assert_eq!(fit((w + 600.0) / 2.0, S::Auto).layout, Rail);
+    }
+}
+
 // --- Device-centric rendering ------------------------------------------------
 impl App {
     /// Toggle the help popover for `topic`, anchored under the clicked "?" button.
@@ -12362,7 +12811,8 @@ impl App {
         }
     }
 
-    /// Appearance settings: Theme, Accent, Text size, Colorblind-friendly colors.
+    /// Appearance settings: Theme, Accent, Device list, Text size,
+    /// Colorblind-friendly colors.
     /// Same settings and persistence as before they moved into the menu.
     fn appearance_section(&mut self, ui: &mut egui::Ui, p: &Palette, focus_first: bool) {
         let caption = |t: &str| {
@@ -12416,6 +12866,38 @@ impl App {
                         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                         if resp.clicked() {
                             self.accent_idx = i;
+                            self.persist_settings();
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label(caption("Device list"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (choice, name, tip) in [
+                        (
+                            SidebarSetting::Auto,
+                            "Automatic",
+                            "Key cards, or a narrow strip of key icons when the window is tight",
+                        ),
+                        (
+                            SidebarSetting::Full,
+                            "Always full",
+                            "Key cards whenever the page still has room",
+                        ),
+                        (
+                            SidebarSetting::Compact,
+                            "Compact",
+                            "A narrow strip of key icons",
+                        ),
+                    ] {
+                        let r = ui
+                            .add(egui::Button::selectable(self.sidebar == choice, name))
+                            .on_hover_text(tip);
+                        if r.clicked() && self.sidebar != choice {
+                            self.sidebar = choice;
+                            self.sidebar_overlay = false;
                             self.persist_settings();
                         }
                     }
@@ -12639,98 +13121,362 @@ impl App {
         }
     }
 
-    /// Left device bar: header · filter · rows · footer tip.
+    /// Left device list. At normal sizes it is the docked card list (header ·
+    /// filter · cards · footer tip). When the page would get too narrow, or
+    /// the user chose Compact, it becomes a rail of key icons; "»" / Ctrl+B
+    /// then opens the cards over the page. `sidebar_fit` makes the call.
     fn device_sidebar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
-        egui::Panel::left("devices")
-            .exact_size(286.0)
+        let ctx = root_ui.ctx().clone();
+        let region = root_ui.available_rect_before_wrap();
+        let fit_now = |app: &App| {
+            sidebar_fit(
+                region.width(),
+                SIDEBAR_FULL_W,
+                app.sidebar,
+                app.sidebar_tight,
+                app.sidebar_overlay,
+            )
+        };
+        let mut fit = fit_now(self);
+        let ctrl_b = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::B);
+        if ctx.input_mut(|i| i.consume_shortcut(&ctrl_b)) {
+            self.apply_sidebar_toggle(fit);
+            fit = fit_now(self);
+        }
+        self.sidebar_tight = fit.tight;
+        if fit.layout == SidebarLayout::Full {
+            self.sidebar_overlay = false;
+        }
+        // Called every frame so opening the overlay slides it in from 0.
+        let slide = ctx.animate_bool_with_time(
+            egui::Id::new("sidebar_overlay_slide"),
+            self.sidebar_overlay,
+            0.16,
+        );
+
+        let rail = egui::Panel::left("devices_rail")
+            .exact_size(SIDEBAR_RAIL_W)
             .resizable(false)
-            .frame(panel_frame(p.side, 14.0, 12.0))
-            .show(root_ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("DEVICES")
-                            .font(theme::f_bold(11.0))
-                            .color(p.txt3),
+            .frame(panel_frame(p.side, 5.0, 12.0));
+        let full = egui::Panel::left("devices")
+            .exact_size(SIDEBAR_FULL_W)
+            .resizable(false)
+            .frame(panel_frame(p.side, 14.0, 12.0));
+        let mut expanded = fit.layout == SidebarLayout::Full;
+        let mut ev = SidebarEvents::default();
+        egui::Panel::show_switched(root_ui, &mut expanded, rail, full, |ui, expanded| {
+            ev = if expanded {
+                self.sidebar_list(ui, p, fit, false)
+            } else {
+                self.sidebar_rail(ui, p)
+            };
+        });
+        if fit.layout == SidebarLayout::Overlay {
+            ev.merge(self.sidebar_overlay_list(&ctx, p, region, fit, slide));
+        }
+
+        if let Some(id) = ev.picked {
+            self.select_device(id);
+            self.sidebar_overlay = false;
+        }
+        if let Some(on) = ev.pin {
+            self.sidebar = if on {
+                SidebarSetting::Full
+            } else {
+                SidebarSetting::Auto
+            };
+            self.sidebar_overlay = false;
+            self.persist_settings();
+        }
+        if ev.toggle {
+            self.apply_sidebar_toggle(fit);
+        }
+        if ev.close {
+            self.sidebar_overlay = false;
+        }
+    }
+
+    /// "»", "«" and Ctrl+B: see [`sidebar_toggle`].
+    fn apply_sidebar_toggle(&mut self, fit: SidebarFit) {
+        let (choice, overlay) = sidebar_toggle(fit, self.sidebar);
+        self.sidebar_overlay = overlay;
+        if choice != self.sidebar {
+            self.sidebar = choice;
+            self.persist_settings();
+        }
+    }
+
+    /// The full card list, docked or over the page (`overlay`).
+    fn sidebar_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        fit: SidebarFit,
+        overlay: bool,
+    ) -> SidebarEvents {
+        let mut ev = SidebarEvents::default();
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("DEVICES")
+                    .font(theme::f_bold(11.0))
+                    .color(p.txt3),
+            );
+            ui.add_space(6.0);
+            theme::pill(ui, &self.devices.len().to_string(), p.txt2, p.raised2);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if overlay {
+                    let (crect, cresp) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                    paint_sidebar_button(ui, p, crect, &cresp);
+                    ui.painter().text(
+                        crect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{00ab}",
+                        theme::f_sb(16.0),
+                        p.txt2,
                     );
-                    ui.add_space(6.0);
-                    theme::pill(ui, &self.devices.len().to_string(), p.txt2, p.raised2);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (rrect, rresp) =
-                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                        paint_refresh_icon(ui, rrect.center(), 6.5, p.txt2);
-                        if rresp
-                            .on_hover_text("Rescan")
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.schedule_scan_burst();
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Filter keys\u{2026}")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(8.0);
-
-                if let Some(err) = &self.devices_error {
-                    ui.colored_label(p.err, err);
-                    ui.add_space(6.0);
+                    if cresp
+                        .on_hover_text("Close (Esc)")
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        ev.close = true;
+                    }
+                    ui.add_space(4.0);
                 }
-
-                let mut clicked: Option<DeviceId> = None;
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.devices.is_empty() {
-                            ui.add_space(12.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new("No keys detected yet.")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt3),
-                                );
-                            });
-                        }
-                        for dev in self
-                            .devices
-                            .iter()
-                            .filter(|d| matches_filter(d, &self.filter))
-                        {
-                            let selected = self.selected_device.as_deref() == Some(dev.id.as_str());
-                            if device_row(ui, p, dev, selected) {
-                                clicked = Some(dev.id.clone());
-                            }
-                            ui.add_space(2.0);
-                        }
-                    });
-                if let Some(id) = clicked {
-                    self.select_device(id);
-                }
-
-                // Footer tip (only worth showing once a key is present).
-                if !self.devices.is_empty() {
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        ui.add_space(4.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(
-                                egui::RichText::new("Several keys plugged in?")
-                                    .font(theme::f_reg(12.0))
-                                    .color(p.txt3),
-                            );
-                            ui.hyperlink_to(
-                                egui::RichText::new("Give them names")
-                                    .font(theme::f_sb(12.0))
-                                    .color(p.accent),
-                                ui::help::learn_url("/naming"),
-                            );
-                        });
-                    });
+                let (rrect, rresp) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                paint_refresh_icon(ui, rrect.center(), 6.5, p.txt2);
+                if rresp
+                    .on_hover_text("Rescan")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.schedule_scan_burst();
                 }
             });
+        });
+        // "Keep open": in the overlay, and on the docked list while it is
+        // docked only because of the pin (so it can be undone there).
+        let pinned = self.sidebar == SidebarSetting::Full;
+        if overlay || (pinned && fit.tight) {
+            ui.add_space(6.0);
+            let resp = ui
+                .add_enabled_ui(!fit.pin_blocked, |ui| keep_open_toggle(ui, p, pinned))
+                .inner;
+            if resp.clicked() {
+                ev.pin = Some(!pinned);
+            }
+            if fit.pin_blocked {
+                ui.label(
+                    egui::RichText::new(
+                        "Not enough room \u{2014} make the window wider or the text smaller",
+                    )
+                    .font(theme::f_reg(11.5))
+                    .color(p.txt3),
+                );
+            }
+        }
+        ui.add_space(8.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.filter)
+                .hint_text("Filter keys\u{2026}")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(8.0);
+
+        if let Some(err) = &self.devices_error {
+            ui.colored_label(p.err, err);
+            ui.add_space(6.0);
+        }
+
+        // Leave the footer tip its own room below the cards; without this a
+        // list taller than the panel scrolled underneath the tip.
+        let footer_h = if self.devices.is_empty() {
+            0.0
+        } else {
+            ui.fonts_mut(|f| f.row_height(&theme::f_sb(12.0))) + 4.0 + ui.spacing().item_spacing.y
+        };
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height((ui.available_height() - footer_h).max(0.0))
+            .show(ui, |ui| {
+                if self.devices.is_empty() {
+                    ui.add_space(12.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("No keys detected yet.")
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt3),
+                        );
+                    });
+                }
+                for dev in self
+                    .devices
+                    .iter()
+                    .filter(|d| matches_filter(d, &self.filter))
+                {
+                    let selected = self.selected_device.as_deref() == Some(dev.id.as_str());
+                    if device_row(ui, p, dev, selected) {
+                        ev.picked = Some(dev.id.clone());
+                    }
+                    ui.add_space(2.0);
+                }
+            });
+
+        // Footer tip (only worth showing once a key is present).
+        if !self.devices.is_empty() {
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(
+                        egui::RichText::new("Several keys plugged in?")
+                            .font(theme::f_reg(12.0))
+                            .color(p.txt3),
+                    );
+                    ui.hyperlink_to(
+                        egui::RichText::new("Give them names")
+                            .font(theme::f_sb(12.0))
+                            .color(p.accent),
+                        ui::help::learn_url("/naming"),
+                    );
+                });
+            });
+        }
+        ev
+    }
+
+    /// The rail: "»", rescan, then one square tile per key. Hover or keyboard
+    /// focus on a tile shows the key's full card; a click selects it.
+    fn sidebar_rail(&mut self, ui: &mut egui::Ui, p: &Palette) -> SidebarEvents {
+        let mut ev = SidebarEvents::default();
+        let w = ui.available_width();
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
+        paint_sidebar_button(ui, p, r, &resp);
+        ui.painter().text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            "\u{00bb}",
+            theme::f_sb(18.0),
+            p.txt2,
+        );
+        if resp
+            .on_hover_text("Show the full list (Ctrl+B)")
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            ev.toggle = true;
+        }
+        ui.add_space(2.0);
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
+        paint_sidebar_button(ui, p, r, &resp);
+        paint_refresh_icon(ui, r.center(), 6.5, p.txt2);
+        if resp
+            .on_hover_text("Rescan")
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.schedule_scan_burst();
+        }
+        if self.devices.is_empty() {
+            return ev;
+        }
+        ui.add_space(8.0);
+        let y = ui.cursor().top();
+        ui.painter().hline(
+            r.x_range().shrink(8.0),
+            y,
+            egui::Stroke::new(1.0, p.line_soft),
+        );
+        ui.add_space(9.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                for dev in &self.devices {
+                    let selected = self.selected_device.as_deref() == Some(dev.id.as_str());
+                    if rail_tile(ui, p, dev, selected) {
+                        ev.picked = Some(dev.id.clone());
+                    }
+                }
+            });
+        ev
+    }
+
+    /// The card list drawn over the page from the rail: slides in from the
+    /// left, dims the page, and closes on Esc or a press outside it.
+    fn sidebar_overlay_list(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Palette,
+        region: egui::Rect,
+        fit: SidebarFit,
+        slide: f32,
+    ) -> SidebarEvents {
+        let mut ev = SidebarEvents::default();
+        let w = SIDEBAR_FULL_W.min(region.width());
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(region.left() - w * (1.0 - slide), region.top()),
+            egui::vec2(w, region.height()),
+        );
+        let pressed_outside = ctx.input(|i| {
+            i.pointer.primary_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|pos| !rect.contains(pos))
+        });
+        if pressed_outside
+            || (!egui::Popup::is_any_open(ctx)
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)))
+        {
+            ev.close = true;
+        }
+        // The dimmed page: also swallows the press that closes the list, so
+        // it never reaches a button underneath.
+        egui::Area::new(egui::Id::new("sidebar_scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(region.min)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.allocate_exact_size(region.size(), egui::Sense::click());
+                ui.painter().rect_filled(
+                    region,
+                    0.0,
+                    egui::Color32::from_black_alpha((120.0 * slide) as u8),
+                );
+            });
+        let shown = egui::Area::new(egui::Id::new("sidebar_overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .constrain(false)
+            .interactable(true)
+            .show(ctx, |ui| {
+                // The background takes clicks first, so the cards (added
+                // after it) win and nothing falls through to the page.
+                ui.allocate_exact_size(rect.size(), egui::Sense::click());
+                ui.painter().add(
+                    egui::epaint::Shadow {
+                        offset: [6, 0],
+                        blur: 24,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(90),
+                    }
+                    .as_shape(rect, 0),
+                );
+                ui.painter().rect_filled(rect, 0.0, p.side);
+                let inner = rect.shrink2(egui::vec2(14.0, 12.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                child.set_clip_rect(rect);
+                self.sidebar_list(&mut child, p, fit, true)
+            });
+        ctx.move_to_top(shown.response.layer_id);
+        ev.merge(shown.inner);
+        ev
     }
 
     /// Global activity-log drawer (bottom), replacing the Molto2-only log.

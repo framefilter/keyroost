@@ -39,6 +39,10 @@ pub struct Settings {
     /// Colorblind-safe palette toggle.
     #[serde(default)]
     pub colorblind: bool,
+    /// How the device list on the left is shown (Appearance → Device list).
+    /// Files written before this setting existed load as `auto`.
+    #[serde(default, deserialize_with = "lenient_sidebar")]
+    pub sidebar: SidebarSetting,
 }
 
 fn default_zoom() -> f32 {
@@ -52,8 +56,29 @@ impl Default for Settings {
             mode: ModeSetting::default(),
             accent: 0,
             colorblind: false,
+            sidebar: SidebarSetting::default(),
         }
     }
+}
+
+/// The user's choice for the device list: `"auto"` (full cards, or a narrow
+/// rail of key icons when the window is too tight), `"full"` (keep the cards
+/// docked whenever the page still has room), or `"compact"` (always the rail).
+/// An unknown string loads as `auto` instead of throwing away the whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarSetting {
+    #[default]
+    Auto,
+    Full,
+    Compact,
+}
+
+/// Read `sidebar` without failing the parse: any value other than the three
+/// known strings (a typo, a newer keyroost's option) becomes `Auto`.
+fn lenient_sidebar<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SidebarSetting, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
 /// Serde-friendly mirror of [`Mode`] (which lives in the theme module and does
@@ -195,6 +220,7 @@ mod tests {
             mode: ModeSetting::Light,
             accent: 2,
             colorblind: true,
+            sidebar: SidebarSetting::Compact,
         };
         let json = serde_json::to_string_pretty(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -242,6 +268,53 @@ mod tests {
     }
 
     #[test]
+    fn old_file_without_sidebar_loads_as_auto() {
+        // A settings.json written before the device-list choice existed loads
+        // unchanged, with the list on Automatic.
+        let dir =
+            std::env::temp_dir().join(format!("keyroost-settings-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"zoom": 1.25, "mode": "light", "accent": 2, "colorblind": true}"#,
+        )
+        .unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.sidebar, SidebarSetting::Auto);
+        assert_eq!(s.zoom, 1.25);
+        assert_eq!(s.mode, ModeSetting::Light);
+        assert_eq!(s.accent, 2);
+        assert!(s.colorblind);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sidebar_encodes_as_lowercase_strings() {
+        for (v, t) in [
+            (SidebarSetting::Auto, "\"auto\""),
+            (SidebarSetting::Full, "\"full\""),
+            (SidebarSetting::Compact, "\"compact\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), t);
+            assert_eq!(serde_json::from_str::<SidebarSetting>(t).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn unknown_sidebar_value_keeps_the_rest_of_the_file() {
+        let dir =
+            std::env::temp_dir().join(format!("keyroost-settings-unk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"accent": 3, "sidebar": "sideways"}"#).unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.sidebar, SidebarSetting::Auto);
+        assert_eq!(s.accent, 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn bad_zoom_is_clamped_on_load() {
         // A wildly out-of-range or NaN zoom is clamped (clamp_zoom maps junk to
         // the default) — exercised through load_from via a temp file.
@@ -269,6 +342,7 @@ mod tests {
             mode: ModeSetting::Light,
             accent: 1,
             colorblind: true,
+            sidebar: SidebarSetting::Full,
         };
         s.save_to(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
