@@ -3255,6 +3255,8 @@ struct App {
     sidebar_tight: bool,
     /// The full list is open over the page (from the rail). Never saved.
     sidebar_overlay: bool,
+    /// The overlay just opened: move keyboard focus into it next frame.
+    sidebar_overlay_focus: bool,
     /// Whether the activity-log drawer is open.
     log_open: bool,
     /// Whether the activity log is popped out into its own OS window (viewport)
@@ -13199,6 +13201,7 @@ impl App {
     /// "»", "«" and Ctrl+B: see [`sidebar_toggle`].
     fn apply_sidebar_toggle(&mut self, fit: SidebarFit) {
         let (choice, overlay) = sidebar_toggle(fit, self.sidebar);
+        self.sidebar_overlay_focus = overlay && !self.sidebar_overlay;
         self.sidebar_overlay = overlay;
         if choice != self.sidebar {
             self.sidebar = choice;
@@ -13235,6 +13238,9 @@ impl App {
                         theme::f_sb(16.0),
                         p.txt2,
                     );
+                    if std::mem::take(&mut self.sidebar_overlay_focus) {
+                        cresp.request_focus();
+                    }
                     if cresp
                         .on_hover_text("Close (Esc)")
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -13246,6 +13252,7 @@ impl App {
                 }
                 let (rrect, rresp) =
                     ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                paint_sidebar_button(ui, p, rrect, &rresp);
                 paint_refresh_icon(ui, rrect.center(), 6.5, p.txt2);
                 if rresp
                     .on_hover_text("Rescan")
@@ -13405,7 +13412,8 @@ impl App {
     }
 
     /// The card list drawn over the page from the rail: slides in from the
-    /// left, dims the page, and closes on Esc or a press outside it.
+    /// left, dims the window, and closes on Esc or a press outside it. While
+    /// it is open nothing behind it takes clicks or keyboard focus.
     fn sidebar_overlay_list(
         &mut self,
         ctx: &egui::Context,
@@ -13432,16 +13440,17 @@ impl App {
         {
             ev.close = true;
         }
-        // The dimmed page: also swallows the press that closes the list, so
-        // it never reaches a button underneath.
+        // The dimmed window, top bar included: also swallows the press that
+        // closes the list, so it never reaches a button underneath.
+        let window = ctx.content_rect();
         egui::Area::new(egui::Id::new("sidebar_scrim"))
             .order(egui::Order::Foreground)
-            .fixed_pos(region.min)
+            .fixed_pos(window.min)
             .interactable(true)
             .show(ctx, |ui| {
-                ui.allocate_exact_size(region.size(), egui::Sense::click());
+                ui.allocate_exact_size(window.size(), egui::Sense::click());
                 ui.painter().rect_filled(
-                    region,
+                    window,
                     0.0,
                     egui::Color32::from_black_alpha((120.0 * slide) as u8),
                 );
@@ -13475,6 +13484,8 @@ impl App {
                 self.sidebar_list(&mut child, p, fit, true)
             });
         ctx.move_to_top(shown.response.layer_id);
+        // Keep Tab inside the list: the page behind it can't take focus.
+        ctx.memory_mut(|m| m.set_modal_layer(shown.response.layer_id));
         ev.merge(shown.inner);
         ev
     }
