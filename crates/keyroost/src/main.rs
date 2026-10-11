@@ -3364,10 +3364,10 @@ struct App {
     /// Text size preview from the menu's [−] / [+] steppers, not yet applied:
     /// the zoom rescales the menu the steppers sit in, so a run of clicks is
     /// previewed here and committed once the user settles — see
-    /// `text_size_stepper`. `None` means nothing pending, so the readout
+    /// `text_size_control`. `None` means nothing pending, so the readout
     /// tracks the committed factor.
     zoom_pending: Option<f32>,
-    /// Deadline for committing a +/− stepper preview (see `text_size_stepper`).
+    /// Deadline for committing a +/− stepper preview (see `text_size_control`).
     /// The steppers stash their target in `zoom_pending` and set this; the zoom
     /// is applied once the user settles — pointer off the buttons, or this
     /// instant passes — so repeated clicks don't rescale the bar out from under
@@ -11880,6 +11880,8 @@ const TOPBAR_SIDE_GAP: f32 = 16.0;
 const TOPBAR_LEARN: &str = "Learn \u{2197}";
 const TOPBAR_APPEARANCE: &str = "Appearance";
 const TOPBAR_MENU: &str = "\u{2630}";
+/// Width of the Appearance menu's Text size row (Reset · label · slider · %).
+const TEXT_SIZE_ROW_W: f32 = 290.0;
 
 /// Which optional items the top bar shows; chosen by [`top_bar_fit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12006,13 +12008,6 @@ fn top_bar_fit(available: f32, widths: &TopBarWidths) -> TopBarFit {
         .unwrap_or(TopBarFit::STAGES[TopBarFit::STAGES.len() - 1])
 }
 
-/// One Text size step from `factor`, the way Ctrl + / Ctrl − step it: ±10%,
-/// landing on a whole 10%, inside the 80%–200% range.
-fn zoom_step(factor: f32, larger: bool) -> f32 {
-    let next = if larger { factor + 0.1 } else { factor - 0.1 };
-    theme::clamp_zoom((next * 10.0).round() / 10.0)
-}
-
 #[cfg(test)]
 mod top_bar_fit_tests {
     use super::*;
@@ -12106,23 +12101,6 @@ mod top_bar_fit_tests {
         for a in [300.0, 450.0, 600.0, 700.0, 900.0] {
             assert_eq!(top_bar_fit(a, &w1), top_bar_fit(a * 2.0, &w2), "width {a}");
         }
-    }
-
-    #[test]
-    fn zoom_step_matches_the_keyboard_steps() {
-        assert!((zoom_step(1.0, true) - 1.1).abs() < 1e-6);
-        assert!((zoom_step(1.0, false) - 0.9).abs() < 1e-6);
-        // Off-grid values land on a whole 10%, as Ctrl + does.
-        assert!((zoom_step(1.13, true) - 1.2).abs() < 1e-6);
-        // Range ends hold.
-        assert!((zoom_step(theme::ZOOM_MAX, true) - theme::ZOOM_MAX).abs() < 1e-6);
-        assert!((zoom_step(theme::ZOOM_MIN, false) - theme::ZOOM_MIN).abs() < 1e-6);
-        // Ten steps up from 100% reach 200% exactly.
-        let mut f = 1.0;
-        for _ in 0..10 {
-            f = zoom_step(f, true);
-        }
-        assert!((f - 2.0).abs() < 1e-6);
     }
 }
 
@@ -12330,8 +12308,12 @@ impl App {
         // A popup doesn't scroll on its own; at a large text size in a short
         // window the menu could run off the bottom, so cap it and scroll.
         let max_h = (ctx.content_rect().bottom() - trigger.rect.bottom() - 12.0).max(120.0);
+        // Centered under its button; near the window's right edge (the ☰
+        // form) egui falls back to the alternatives so it stays on screen.
         let shown = egui::Popup::menu(trigger)
             .id(menu_id)
+            .align(egui::RectAlign::BOTTOM)
+            .align_alternatives(&[egui::RectAlign::BOTTOM_END, egui::RectAlign::BOTTOM_START])
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 ui.set_min_width(250.0);
@@ -12439,11 +12421,18 @@ impl App {
                     }
                 });
                 ui.end_row();
-
-                ui.label(caption("Text size"));
-                ui.horizontal(|ui| self.text_size_stepper(ui, p));
-                ui.end_row();
             });
+        // The Text size slider as it was on the bar (issue #42): built
+        // right-to-left, so it gets its own right-to-left row.
+        ui.add_space(4.0);
+        // A fixed width: in a popup the available width is whatever the menu
+        // grew to last frame, so filling it would widen the menu every frame.
+        let row_h = ui.spacing().interact_size.y;
+        ui.allocate_ui_with_layout(
+            egui::vec2(TEXT_SIZE_ROW_W, row_h),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| self.text_size_control(ui, p),
+        );
         ui.label(
             egui::RichText::new(
                 "Ctrl + larger \u{00b7} Ctrl \u{2212} smaller \u{00b7} Ctrl 0 reset",
@@ -12466,108 +12455,148 @@ impl App {
         }
     }
 
-    /// "Text size" row (issue #42): `[−] NN% [+]` over egui's global zoom
-    /// factor (80%–200%), stepping 10% like Ctrl + / Ctrl −; clicking the
-    /// percentage resets to 100%. Writing the zoom rescales the whole UI,
-    /// this menu included, so a stepper click is only previewed in
-    /// `zoom_pending` and committed once the user settles (pointer off both
-    /// buttons, or 350ms after the last click): a run of clicks then lands on
-    /// buttons that haven't moved.
-    fn text_size_stepper(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let factor = self
+    /// "Text size" control for the top bar (issue #42): a compact slider over
+    /// egui's global zoom factor (80%–200%), with a live "%" readout and a
+    /// "Reset" that surfaces only when the scale is off 100%. Writing the slider
+    /// calls `set_zoom_factor`, so the whole UI — fonts and painted symbols —
+    /// rescales uniformly. Lives inside the top bar's right-to-left layout, so
+    /// widgets are added right-to-left: readout, slider, label, then Reset.
+    fn text_size_control(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // The slider lives inside the very UI it scales, so applying the zoom
+        // *live* during a drag grows/shifts the slider track under the cursor
+        // and runs the value away to the maximum. Fix: apply-on-release. While
+        // dragging we edit a preview (`zoom_pending`) and leave the context
+        // factor alone, so the UI stays stable; we commit `set_zoom_factor`
+        // only when the drag ends. Keyboard/scroll zoom is unaffected (it has
+        // no feedback loop) and keeps writing the context directly.
+        //
+        // The slider edits `factor`: the pending preview if a drag is in
+        // flight, otherwise the committed live factor. The readout tracks the
+        // same value so it follows the handle during the drag.
+        let mut factor = self
             .zoom_pending
             .unwrap_or_else(|| theme::clamp_zoom(ui.ctx().zoom_factor()));
+
+        // Live percentage readout (rightmost). FIXED width: as the value crosses
+        // 99%→100% the glyph count goes 3→4; in the bar's right-to-left layout a
+        // wider readout would shove the slider track left under the cursor and
+        // make the value lurch (issue #42). `allocate_exact_size` reserves the
+        // widest readout's box unconditionally (unlike `allocate_ui_with_layout`,
+        // which advances by content width and so would still let the track move);
+        // we then paint the value right-aligned inside it, so the slider geometry
+        // is identical for "99%" and "100%".
+        let pct = (factor * 100.0).round() as i32;
+        let cell = ui.fonts_mut(|f| {
+            f.layout_no_wrap("888%".to_owned(), theme::f_sb(12.0), p.txt2)
+                .size()
+        });
+        let (rrect, _) = ui.allocate_exact_size(
+            egui::vec2(cell.x.ceil(), cell.y.ceil()),
+            egui::Sense::hover(),
+        );
+        ui.painter().text(
+            rrect.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            format!("{pct}%"),
+            theme::f_sb(12.0),
+            p.txt2,
+        );
+        ui.add_space(6.0);
+
+        // The slider itself. Style its track/handle to the palette so it reads
+        // as part of the bar rather than egui's default blue. egui draws both the
+        // rail and the handle from `inactive.bg_fill`; on the LIGHT theme `raised2`
+        // sits almost on top of the bar, so the rail, handle and steppers were
+        // near-invisible (#59). Use a clearly darker control gray on light (the
+        // dark bar keeps `raised2`, which already contrasts fine).
         let (track, track_hot) = match self.mode {
             Mode::Light => (theme::darken(p.bar, 0.16), theme::darken(p.bar, 0.26)),
             Mode::Dark => (p.raised2, theme::lighten(p.raised2, 0.08)),
         };
-        // One square stepper button; dimmed at the end of the range.
-        let step = |ui: &mut egui::Ui, glyph: &str, enabled: bool| -> egui::Response {
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-            let hot = enabled && resp.hovered();
+        let style = ui.style_mut();
+        style.visuals.widgets.inactive.bg_fill = track;
+        style.visuals.widgets.hovered.bg_fill = track_hot;
+        style.visuals.widgets.active.bg_fill = p.accent;
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.txt2);
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.txt);
+        style.spacing.slider_width = 92.0;
+
+        // [+] / [−] steppers flanking the slider, each nudging the size by 1%
+        // (0.01). The bar is laid out right-to-left, so to read "[−] slider [+]"
+        // left-to-right we emit the [+] first, then the slider, then the [−].
+        // A small closure paints one square stepper button and reports clicks.
+        let step = |ui: &mut egui::Ui, glyph: &str| -> egui::Response {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            let hot = resp.hovered();
             ui.painter()
-                .rect_filled(rect, 4.0, if hot { track_hot } else { track });
-            if resp.has_focus() {
-                ui.painter().rect_stroke(
-                    rect,
-                    4.0,
-                    egui::Stroke::new(1.0, p.accent),
-                    egui::StrokeKind::Outside,
-                );
-            }
+                .rect_filled(rect, 3.0, if hot { track_hot } else { track });
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 glyph,
-                theme::f_sb(14.0),
-                match (enabled, hot) {
-                    (false, _) => p.txt3,
-                    (true, true) => p.txt,
-                    (true, false) => p.txt2,
-                },
+                theme::f_sb(13.0),
+                if hot { p.txt } else { p.txt2 },
             );
             resp.on_hover_cursor(egui::CursorIcon::PointingHand)
         };
 
-        let minus = step(ui, "\u{2212}", factor > theme::ZOOM_MIN + 0.001)
-            .on_hover_text("Smaller (Ctrl \u{2212})");
-        ui.add_space(6.0);
-        // Fixed-width readout so "90%" → "100%" doesn't shift the [+] button.
-        let pct = (factor * 100.0).round() as i32;
-        let cell = ui.fonts_mut(|f| {
-            f.layout_no_wrap("888%".to_owned(), theme::f_sb(12.5), p.txt2)
-                .size()
-        });
-        let (rrect, reset) =
-            ui.allocate_exact_size(egui::vec2(cell.x.ceil() + 8.0, 22.0), egui::Sense::click());
-        let off_default = (factor - theme::ZOOM_DEFAULT).abs() > 0.001;
-        ui.painter().text(
-            rrect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("{pct}%"),
-            theme::f_sb(12.5),
-            if reset.hovered() && off_default {
-                p.accent
-            } else {
-                p.txt
-            },
-        );
-        if reset.has_focus() {
-            ui.painter().rect_stroke(
-                rrect,
-                4.0,
-                egui::Stroke::new(1.0, p.accent),
-                egui::StrokeKind::Outside,
-            );
-        }
-        let reset = reset
-            .on_hover_text("Back to 100% (Ctrl 0)")
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        ui.add_space(6.0);
-        let plus = step(ui, "+", factor < theme::ZOOM_MAX - 0.001).on_hover_text("Larger (Ctrl +)");
-
-        let preview = |app: &mut Self, f: f32| {
-            app.zoom_pending = Some(f);
-            app.zoom_commit_at =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
-        };
-        if minus.clicked() {
-            preview(self, zoom_step(factor, false));
-        }
+        // [+] (rightmost of the trio in this RTL row). Preview only (stash in
+        // `zoom_pending` + arm the commit timer); the rescale is deferred so the
+        // button stays under the cursor for repeated clicks — see the commit
+        // block after the [−] stepper.
+        let plus = step(ui, "+");
         if plus.clicked() {
-            preview(self, zoom_step(factor, true));
+            factor = theme::clamp_zoom(factor + 0.01);
+            self.zoom_pending = Some(factor);
+            self.zoom_commit_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
         }
-        if reset.clicked() {
-            ui.ctx().set_zoom_factor(theme::ZOOM_DEFAULT);
+        ui.add_space(4.0);
+
+        let resp = ui.add(
+            egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        if resp.dragged() {
+            // Mid-drag: preview only, don't touch the context (avoids runaway).
+            // A drag supersedes any pending stepper preview.
+            self.zoom_pending = Some(theme::clamp_zoom(factor));
+            self.zoom_commit_at = None;
+        } else if resp.drag_stopped() {
+            // Drag released: commit the chosen size to the context once.
+            ui.ctx().set_zoom_factor(theme::clamp_zoom(factor));
+            self.zoom_pending = None;
+            self.zoom_commit_at = None;
+        } else if resp.changed() {
+            // Click/keyboard committed a value without a drag (e.g. arrow keys
+            // or clicking the track): apply immediately, nothing to preview.
+            ui.ctx().set_zoom_factor(theme::clamp_zoom(factor));
             self.zoom_pending = None;
             self.zoom_commit_at = None;
         }
+        let resp = resp
+            .on_hover_text("Text size — scales the whole interface (Ctrl + / Ctrl − also work)");
 
-        // Commit a pending preview once the user settles; repaint at the
+        ui.add_space(4.0);
+        // [−] (leftmost of the trio). Preview-only like [+].
+        let minus = step(ui, "\u{2212}");
+        if minus.clicked() {
+            factor = theme::clamp_zoom(factor - 0.01);
+            self.zoom_pending = Some(factor);
+            self.zoom_commit_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
+        }
+
+        // Commit a stepper preview once the user settles: pointer off both
+        // buttons, or 350ms since the last click. The slider commits its own
+        // preview on release, so a pending value reaching here is always from a
+        // stepper. Deferring keeps the bar (and the buttons) from rescaling out
+        // from under the cursor during a run of clicks; we repaint at the
         // deadline so it still applies if the pointer never moves.
         if let Some(at) = self.zoom_commit_at {
             let settled = (!plus.hovered() && !minus.hovered()) || std::time::Instant::now() >= at;
-            if settled {
+            if settled && !resp.dragged() {
                 if let Some(f) = self.zoom_pending.take() {
                     ui.ctx().set_zoom_factor(f);
                 }
@@ -12575,6 +12604,37 @@ impl App {
             } else {
                 ui.ctx()
                     .request_repaint_after(at.saturating_duration_since(std::time::Instant::now()));
+            }
+        }
+
+        ui.add_space(7.0);
+
+        // Label.
+        ui.label(
+            egui::RichText::new("Text size")
+                .font(theme::f_reg(12.0))
+                .color(p.txt2),
+        );
+
+        // "Reset" appears only when we're off the default, so the chrome stays
+        // quiet for users who never change it.
+        if (factor - theme::ZOOM_DEFAULT).abs() > f32::EPSILON {
+            ui.add_space(8.0);
+            if ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new("Reset")
+                            .font(theme::f_sb(12.0))
+                            .color(p.accent),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                ui.ctx().set_zoom_factor(theme::ZOOM_DEFAULT);
+                self.zoom_pending = None;
+                self.zoom_commit_at = None;
             }
         }
     }
