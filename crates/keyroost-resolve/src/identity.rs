@@ -52,13 +52,7 @@ impl CanonicalId {
 
     /// First and last two characters plus the length, for traces.
     pub fn abbreviated(&self) -> String {
-        let chars: Vec<char> = self.value.chars().collect();
-        if chars.len() <= 4 {
-            return self.value.clone();
-        }
-        let head: String = chars[..2].iter().collect();
-        let tail: String = chars[chars.len() - 2..].iter().collect();
-        format!("{head}\u{2026}{tail} (len {})", chars.len())
+        keyroost_proto::trace::abbreviate(&self.value)
     }
 }
 

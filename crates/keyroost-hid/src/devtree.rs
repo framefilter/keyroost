@@ -11,7 +11,9 @@
 //! Two keys are the same physical device only when both sides carry a key and
 //! the keys are equal ([`same_usb_device`]); a missing key is never evidence.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 /// Evidence of which physical USB device a HID node or reader belongs to.
 /// Equal keys mean the same physical device; keys of different kinds are never
@@ -196,8 +198,24 @@ fn clean(s: &str) -> String {
         .collect()
 }
 
-/// The two `--debug` trace lines for one lookup: the raw chain, then the
-/// chosen node or why there is none. `subject` names what was looked up.
+/// A device instance ID as shown in a trace: `ENUMERATOR\device-id` in full,
+/// the instance part (after the last `\`) shortened with
+/// [`keyroost_proto::trace::abbreviate`], since it can carry the device's USB
+/// serial and `--debug` output gets pasted publicly. Matching always uses
+/// the full ID; only the trace is shortened.
+fn shown_id(id: &str) -> String {
+    use keyroost_proto::trace::abbreviate;
+    let id = clean(id);
+    match id.rsplit_once('\\') {
+        Some((head, instance)) => format!("{head}\\{}", abbreviate(instance)),
+        None => abbreviate(&id),
+    }
+}
+
+/// The two `--debug` trace lines for one lookup: the chain, then the chosen
+/// node or why there is none. Each ID keeps `ENUMERATOR\device-id` in full but
+/// its instance part is shortened (first two … last two, plus the length),
+/// since it can carry a USB serial. `subject` names what was looked up.
 #[must_use]
 pub fn devtree_trace_lines(subject: &str, chain: Option<&[String]>) -> [String; 2] {
     use keyroost_proto::trace::{format_line, Dir};
@@ -205,9 +223,12 @@ pub fn devtree_trace_lines(subject: &str, chain: Option<&[String]>) -> [String; 
     let (shown, decision) = match chain {
         None => ("none".to_string(), "no node: lookup failed".to_string()),
         Some(c) => (
-            c.iter().map(|s| clean(s)).collect::<Vec<_>>().join(" < "),
+            c.iter()
+                .map(|s| shown_id(s))
+                .collect::<Vec<_>>()
+                .join(" < "),
             match usb_device_node_checked(c) {
-                Ok(node) => format!("node {}", clean(&node)),
+                Ok(node) => format!("node {}", shown_id(&node)),
                 Err(why) => format!("no node: {why}"),
             },
         ),
@@ -218,8 +239,23 @@ pub fn devtree_trace_lines(subject: &str, chain: Option<&[String]>) -> [String; 
     ]
 }
 
+/// Trace lines already printed by this process. One `list` run can scan the
+/// readers twice (the applet probe and the YubiKey serial read), and the same
+/// lookup with the same result says nothing new the second time.
+static TRACED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// True the first time this exact pair of lines is offered in this process.
+fn first_time(lines: &[String; 2]) -> bool {
+    match TRACED.lock() {
+        Ok(mut seen) => seen.insert(lines.join("\n")),
+        // A poisoned set only costs a repeated line.
+        Err(_) => true,
+    }
+}
+
 /// The key for a node whose raw chain is `chain` (`None` when the lookup
-/// failed), printing the trace lines to stderr when `trace` is set.
+/// failed), printing the trace lines to stderr when `trace` is set (once per
+/// process for an identical lookup and result).
 #[must_use]
 pub fn win_node_from_chain(
     subject: &str,
@@ -227,8 +263,11 @@ pub fn win_node_from_chain(
     trace: bool,
 ) -> Option<UsbDeviceKey> {
     if trace {
-        for line in devtree_trace_lines(subject, chain) {
-            eprintln!("{line}");
+        let lines = devtree_trace_lines(subject, chain);
+        if first_time(&lines) {
+            for line in lines {
+                eprintln!("{line}");
+            }
         }
     }
     chain
@@ -446,8 +485,19 @@ mod tests {
         let [a, b] =
             devtree_trace_lines("reader 'TOKEN2 FIDO2 Security Key(0014) 0'", Some(&chain));
         assert!(a.starts_with("! devtree"), "{a}");
-        assert!(a.ends_with(&format!("chain {T14_MI01} < {T14_DEV}")), "{a}");
-        assert!(b.ends_with(&format!("node {T14_DEV}")), "{b}");
+        assert!(
+            a.ends_with(
+                r"chain USB\VID_349E&PID_0014&MI_01\7&…01 (len 17) < USB\VID_349E&PID_0014\6&…&2 (len 14)"
+            ),
+            "{a}"
+        );
+        assert!(
+            b.ends_with(r"node USB\VID_349E&PID_0014\6&…&2 (len 14)"),
+            "{b}"
+        );
+        // Full instance parts never reach the trace.
+        assert!(!a.contains("2F1E0D9C") && !a.contains("11223344"), "{a}");
+        assert!(!b.contains("11223344"), "{b}");
 
         let [a, b] = devtree_trace_lines("hid x", None);
         assert!(a.ends_with("hid x: chain none"), "{a}");
@@ -458,6 +508,48 @@ mod tests {
             b.ends_with("hid y?[2J: no node: reached a USB root hub"),
             "{b}"
         );
+    }
+
+    #[test]
+    fn shown_id_shortens_only_the_instance_part() {
+        // A serial-bearing instance part (a devnode carrying the key's USB
+        // iSerialNumber).
+        assert_eq!(
+            shown_id(r"USB\VID_1050&PID_0407\0123456789AB"),
+            r"USB\VID_1050&PID_0407\01…AB (len 12)"
+        );
+        // Short instance parts print as is.
+        assert_eq!(shown_id(r"HTREE\ROOT\0"), r"HTREE\ROOT\0");
+        assert_eq!(shown_id(r"USB\X\ABCD"), r"USB\X\ABCD");
+        // No separator at all: the whole value is shortened.
+        assert_eq!(shown_id("SERIAL123"), "SE…23 (len 9)");
+        // Control characters are cleaned first.
+        assert_eq!(shown_id("A\\B\\\u{1b}x"), r"A\B\?x");
+    }
+
+    #[test]
+    fn matching_still_uses_the_full_id() {
+        let chain = c(&[T14_HID, T14_MI00, T14_DEV]);
+        assert_eq!(
+            usb_device_node(&chain).as_deref(),
+            Some(T14_DEV),
+            "the decision keeps the full instance part"
+        );
+        assert_eq!(
+            win_node_from_chain("hid", Some(&chain), false),
+            Some(UsbDeviceKey::WinNode(T14_DEV.into()))
+        );
+    }
+
+    #[test]
+    fn identical_trace_lines_print_once_per_process() {
+        let chain = c(&[T14_MI01, r"USB\VID_349E&PID_0014\DEDUPE&TEST&1"]);
+        let lines = devtree_trace_lines("reader 'dedupe test'", Some(&chain));
+        assert!(first_time(&lines));
+        assert!(!first_time(&lines));
+        // A different result for the same subject is new information.
+        let other = devtree_trace_lines("reader 'dedupe test'", None);
+        assert!(first_time(&other));
     }
 
     #[test]
