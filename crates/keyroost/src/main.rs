@@ -3361,15 +3361,13 @@ struct App {
     /// The zoom factor currently applied to the egui context — re-applied on
     /// change, not per frame (parallel to `applied_theme`).
     applied_zoom: Option<f32>,
-    /// Slider preview while the "Text size" slider is actively dragged. The
-    /// slider lives *inside* the UI it scales, so applying the zoom live during
-    /// a drag would grow/shift the slider under the cursor and run the value
-    /// away to the maximum (issue: slider runaway). Instead we stash the
-    /// in-progress value here and keep the real `set_zoom_factor` untouched
-    /// until the drag is released — see `text_size_control`. `None` means no
-    /// drag in flight, so the readout/handle track the committed factor.
+    /// Text size preview from the menu's [−] / [+] steppers, not yet applied:
+    /// the zoom rescales the menu the steppers sit in, so a run of clicks is
+    /// previewed here and committed once the user settles — see
+    /// `text_size_stepper`. `None` means nothing pending, so the readout
+    /// tracks the committed factor.
     zoom_pending: Option<f32>,
-    /// Deadline for committing a +/− stepper preview (see `text_size_control`).
+    /// Deadline for committing a +/− stepper preview (see `text_size_stepper`).
     /// The steppers stash their target in `zoom_pending` and set this; the zoom
     /// is applied once the user settles — pointer off the buttons, or this
     /// instant passes — so repeated clicks don't rescale the bar out from under
@@ -11293,22 +11291,6 @@ fn paint_pill(
 // ---- small vector icons, painted so they render regardless of font coverage
 // (IBM Plex Sans lacks ⓘ / ◐ / ↻ / ⧉ / ✓ / ✕, which otherwise show as tofu) ----
 
-/// Half-filled circle — the light/dark theme toggle.
-fn paint_theme_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Color32) {
-    use std::f32::consts::{FRAC_PI_2, PI};
-    ui.painter()
-        .circle_stroke(center, r, egui::Stroke::new(1.3, color));
-    let n = 20;
-    let pts: Vec<egui::Pos2> = (0..=n)
-        .map(|i| {
-            let a = FRAC_PI_2 + PI * (i as f32 / n as f32);
-            center + r * egui::vec2(a.cos(), a.sin())
-        })
-        .collect();
-    ui.painter()
-        .add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-}
-
 /// An eye (two lids + a pupil) — the colorblind-mode toggle.
 fn paint_eye_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.3, color);
@@ -11715,17 +11697,16 @@ impl eframe::App for App {
                 self.applied_zoom = Some(self.zoom);
             }
             // Steady state: the context owns the live factor (Ctrl +/-/scroll
-            // and the slider's on-release commit both write it via
+            // and the menu's Text size steppers both write it via
             // `set_zoom_factor`). Mirror it back into `self.zoom` so the readout
-            // and the persisted value stay in sync — but never while the slider
-            // is mid-drag, since the drag stashes its preview in `zoom_pending`
-            // and has not committed to the context yet.
+            // and the persisted value stay in sync — but never while a stepper
+            // preview is pending in `zoom_pending` and not yet committed.
             Some(_) => {
                 if self.zoom_pending.is_none() {
                     // Ctrl +/- and Ctrl-scroll use egui's built-in keyboard zoom,
-                    // which ignores our 80–200% slider bounds. If it ran past the
+                    // which ignores our 80–200% bounds. If it ran past the
                     // limit, pull the context back to the clamp so the keyboard
-                    // path obeys the same range as the slider (issue #42).
+                    // path obeys the same range as the steppers (issue #42).
                     let live = ctx.zoom_factor();
                     let clamped = theme::clamp_zoom(live);
                     if (live - clamped).abs() > f32::EPSILON {
@@ -11734,8 +11715,8 @@ impl eframe::App for App {
                     self.zoom = clamped;
                     self.applied_zoom = Some(self.zoom);
                     // The zoom only lands here once it's committed to the
-                    // context (slider release, Ctrl +/-/scroll, or Reset), never
-                    // mid-drag (guarded by `zoom_pending`). Persist on the
+                    // context (stepper commit, Ctrl +/-/scroll, or reset), never
+                    // mid-preview (guarded by `zoom_pending`). Persist on the
                     // committed value; `persist_settings` no-ops when the factor
                     // is unchanged, so this is cheap on every quiescent frame.
                     self.persist_settings();
@@ -11890,6 +11871,261 @@ impl eframe::App for App {
     }
 }
 
+// --- Top bar fit ---------------------------------------------------------------
+
+/// Gap between neighboring items in the top bar's right-hand group.
+const TOPBAR_GAP: f32 = 16.0;
+/// Smallest gap kept between the left and right halves of the top bar.
+const TOPBAR_SIDE_GAP: f32 = 16.0;
+const TOPBAR_LEARN: &str = "Learn \u{2197}";
+const TOPBAR_APPEARANCE: &str = "Appearance \u{25be}";
+const TOPBAR_MENU: &str = "\u{2630}";
+
+/// Which optional items the top bar shows; chosen by [`top_bar_fit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TopBarFit {
+    /// The version chip sits on the bar (else in the menu's footer).
+    version_on_bar: bool,
+    /// "N connected" is shortened to "N" (full text in a tooltip).
+    count_compact: bool,
+    /// Learn and Activity log live in the menu, and the menu button turns
+    /// from "Appearance ▾" into "☰".
+    links_in_menu: bool,
+}
+
+impl TopBarFit {
+    /// The collapse order, roomiest first. Each step gives up one more thing;
+    /// the last one is the floor (logo, device count, menu button, Refresh).
+    const STAGES: [TopBarFit; 4] = [
+        TopBarFit {
+            version_on_bar: true,
+            count_compact: false,
+            links_in_menu: false,
+        },
+        TopBarFit {
+            version_on_bar: false,
+            count_compact: false,
+            links_in_menu: false,
+        },
+        TopBarFit {
+            version_on_bar: false,
+            count_compact: true,
+            links_in_menu: false,
+        },
+        TopBarFit {
+            version_on_bar: false,
+            count_compact: true,
+            links_in_menu: true,
+        },
+    ];
+}
+
+/// Widths in points of the top bar's pieces, each including the gap in front
+/// of it, measured from the real fonts every frame so the breakpoints follow
+/// the text size and the actual labels.
+#[derive(Clone, Copy, Debug)]
+struct TopBarWidths {
+    /// Glyph tile + "keyroost" (always shown).
+    brand: f32,
+    /// Version chip.
+    version: f32,
+    /// Status dot + "N connected".
+    count_full: f32,
+    /// Status dot + "N".
+    count_short: f32,
+    /// "Appearance ▾" trigger.
+    appearance: f32,
+    /// "☰" button.
+    menu: f32,
+    /// Learn ↗ + Activity log.
+    links: f32,
+    /// Refresh button (always shown).
+    refresh: f32,
+    /// Minimum gap between the left and right halves.
+    side_gap: f32,
+}
+
+impl TopBarWidths {
+    /// Measure with the fonts and gaps `App::top_bar` draws with.
+    fn measure(ui: &egui::Ui, count_full: &str, count_short: &str) -> Self {
+        let text = |t: &str, font: egui::FontId| {
+            ui.painter()
+                .layout_no_wrap(t.to_owned(), font, egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        };
+        // `theme::button`: semibold 13 label plus 14pt padding each side.
+        let button = |t: &str| text(t, theme::f_sb(13.0)) + 28.0;
+        let link = |t: &str| text(t, theme::f_sb(12.5));
+        // Status dot (7) and the gaps around it (12 before, 5 after).
+        let count = |t: &str| 12.0 + 7.0 + 5.0 + text(t, theme::f_reg(12.0));
+        TopBarWidths {
+            brand: 26.0 + 8.0 + text("keyroost", theme::f_bold(14.0)),
+            version: 6.0 + text(VERSION_LABEL, theme::f_reg(11.0)),
+            count_full: count(count_full),
+            count_short: count(count_short),
+            appearance: TOPBAR_GAP + link(TOPBAR_APPEARANCE),
+            menu: TOPBAR_GAP + button(TOPBAR_MENU),
+            links: TOPBAR_GAP + link("Activity log") + TOPBAR_GAP + link(TOPBAR_LEARN),
+            refresh: button("Refresh"),
+            side_gap: TOPBAR_SIDE_GAP,
+        }
+    }
+
+    /// Total width the bar needs to show `fit` without anything overlapping.
+    fn needed(&self, fit: TopBarFit) -> f32 {
+        let left = self.brand
+            + if fit.version_on_bar {
+                self.version
+            } else {
+                0.0
+            }
+            + if fit.count_compact {
+                self.count_short
+            } else {
+                self.count_full
+            };
+        let right = self.refresh
+            + if fit.links_in_menu {
+                self.menu
+            } else {
+                self.links + self.appearance
+            };
+        left + self.side_gap + right
+    }
+}
+
+/// Pick the roomiest top-bar layout that fits in `available` points: the
+/// first of [`TopBarFit::STAGES`] whose measured width fits, else the floor.
+/// Pure so the collapse order can be tested without a window.
+fn top_bar_fit(available: f32, widths: &TopBarWidths) -> TopBarFit {
+    // Half a point of slack absorbs pixel rounding of the drawn labels.
+    TopBarFit::STAGES
+        .into_iter()
+        .find(|&fit| widths.needed(fit) + 0.5 <= available)
+        .unwrap_or(TopBarFit::STAGES[TopBarFit::STAGES.len() - 1])
+}
+
+/// One Text size step from `factor`, the way Ctrl + / Ctrl − step it: ±10%,
+/// landing on a whole 10%, inside the 80%–200% range.
+fn zoom_step(factor: f32, larger: bool) -> f32 {
+    let next = if larger { factor + 0.1 } else { factor - 0.1 };
+    theme::clamp_zoom((next * 10.0).round() / 10.0)
+}
+
+#[cfg(test)]
+mod top_bar_fit_tests {
+    use super::*;
+
+    /// Widths close to the real ones at 100% text size.
+    fn widths() -> TopBarWidths {
+        TopBarWidths {
+            brand: 95.0,
+            version: 45.0,
+            count_full: 90.0,
+            count_short: 32.0,
+            appearance: 105.0,
+            menu: 60.0,
+            links: 160.0,
+            refresh: 85.0,
+            side_gap: 16.0,
+        }
+    }
+
+    #[test]
+    fn roomy_bar_shows_everything() {
+        let w = widths();
+        assert_eq!(top_bar_fit(2000.0, &w), TopBarFit::STAGES[0]);
+        assert_eq!(
+            top_bar_fit(w.needed(TopBarFit::STAGES[0]) + 1.0, &w),
+            TopBarFit::STAGES[0]
+        );
+    }
+
+    #[test]
+    fn collapses_in_the_fixed_order() {
+        let w = widths();
+        for i in 1..TopBarFit::STAGES.len() {
+            // Just too narrow for the previous stage → exactly this stage.
+            let just_short = w.needed(TopBarFit::STAGES[i - 1]) - 1.0;
+            assert_eq!(
+                top_bar_fit(just_short, &w),
+                TopBarFit::STAGES[i],
+                "stage {i}"
+            );
+        }
+        // Version goes first, then the count shortens, then the links move.
+        let s = TopBarFit::STAGES;
+        assert!(s[0].version_on_bar && !s[1].version_on_bar);
+        assert!(!s[1].count_compact && s[2].count_compact);
+        assert!(!s[2].links_in_menu && s[3].links_in_menu);
+    }
+
+    #[test]
+    fn too_narrow_for_anything_is_the_floor() {
+        assert_eq!(top_bar_fit(10.0, &widths()), TopBarFit::STAGES[3]);
+        assert_eq!(top_bar_fit(0.0, &widths()), TopBarFit::STAGES[3]);
+    }
+
+    #[test]
+    fn narrowing_never_brings_an_item_back() {
+        let w = widths();
+        let stage = |a: f32| {
+            let f = top_bar_fit(a, &w);
+            TopBarFit::STAGES.iter().position(|s| *s == f).unwrap()
+        };
+        let mut last = 0;
+        let mut a = 900.0;
+        while a > 0.0 {
+            let s = stage(a);
+            assert!(s >= last, "width {a}: stage {s} after {last}");
+            last = s;
+            a -= 1.0;
+        }
+    }
+
+    #[test]
+    fn breakpoints_follow_text_size() {
+        // At 2x text size every item is twice as wide and the window has half
+        // as many points, so the same layout must come out at half the width.
+        let w1 = widths();
+        let mut w2 = w1;
+        for f in [
+            &mut w2.brand,
+            &mut w2.version,
+            &mut w2.count_full,
+            &mut w2.count_short,
+            &mut w2.appearance,
+            &mut w2.menu,
+            &mut w2.links,
+            &mut w2.refresh,
+            &mut w2.side_gap,
+        ] {
+            *f *= 2.0;
+        }
+        for a in [300.0, 450.0, 600.0, 700.0, 900.0] {
+            assert_eq!(top_bar_fit(a, &w1), top_bar_fit(a * 2.0, &w2), "width {a}");
+        }
+    }
+
+    #[test]
+    fn zoom_step_matches_the_keyboard_steps() {
+        assert!((zoom_step(1.0, true) - 1.1).abs() < 1e-6);
+        assert!((zoom_step(1.0, false) - 0.9).abs() < 1e-6);
+        // Off-grid values land on a whole 10%, as Ctrl + does.
+        assert!((zoom_step(1.13, true) - 1.2).abs() < 1e-6);
+        // Range ends hold.
+        assert!((zoom_step(theme::ZOOM_MAX, true) - theme::ZOOM_MAX).abs() < 1e-6);
+        assert!((zoom_step(theme::ZOOM_MIN, false) - theme::ZOOM_MIN).abs() < 1e-6);
+        // Ten steps up from 100% reach 200% exactly.
+        let mut f = 1.0;
+        for _ in 0..10 {
+            f = zoom_step(f, true);
+        }
+        assert!((f - 2.0).abs() < 1e-6);
+    }
+}
+
 // --- Device-centric rendering ------------------------------------------------
 impl App {
     /// Toggle the help popover for `topic`, anchored under the clicked "?" button.
@@ -11903,311 +12139,431 @@ impl App {
         }
     }
 
-    /// Top bar: brand · "keyroost" · connected count | accents · theme · Learn ·
+    /// Top bar: brand · version · connected count | Appearance menu · Learn ·
     /// Activity log · Refresh.
+    ///
+    /// The optional items fold away in a fixed order as the room (in points, so
+    /// the text size counts) runs out; `top_bar_fit` makes that call from the
+    /// measured widths. The row itself is an `egui::Sides` that lays the
+    /// right-hand group out first and gives the left group only what is left,
+    /// clipped and truncated, so even a case the fit did not predict can never
+    /// paint one item over another.
     fn top_bar(&mut self, root_ui: &mut egui::Ui, p: &Palette) {
         let ctx = root_ui.ctx().clone();
         // The bar height must track the zoom factor: at a larger text size the
-        // glyph tile, labels and icons are all scaled up, and a fixed 52px panel
-        // would clip them and let the left content overrun the right-hand
-        // controls. Scale the base height by the live zoom so the bar grows with
-        // its contents (clamped so it never collapses below the base).
+        // glyph tile, labels and buttons are all scaled up, and a fixed 52px
+        // panel would clip them. Scale the base height by the live zoom so the
+        // bar grows with its contents (clamped so it never collapses below the
+        // base).
         let zoom = theme::clamp_zoom(ctx.zoom_factor());
         let bar_h = (52.0 * zoom).max(52.0);
         egui::Panel::top("bar")
             .exact_size(bar_h)
             .frame(panel_frame(p.bar, 16.0, 0.0))
             .show(root_ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    glyph_tile(ui, 26.0, p.brand, p.accent_ink, Some('k'));
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("keyroost")
-                            .font(theme::f_bold(14.0))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    // Quiet version chip: the only place the app says which
-                    // version it is (#98), so keep it visible but muted.
-                    ui.label(
-                        egui::RichText::new(VERSION_LABEL)
-                            .font(theme::f_reg(11.0))
-                            .color(p.txt3),
-                    );
-                    ui.add_space(12.0);
-                    theme::status_dot(ui, p.ok, 7.0);
-                    ui.add_space(5.0);
-                    ui.label(
-                        egui::RichText::new(format!("{} connected", self.devices.len()))
-                            .font(theme::f_reg(12.0))
-                            .color(p.txt2),
-                    );
-                    if self.busy() {
-                        ui.add_space(12.0);
-                        ui.spinner();
-                        if let Some(label) = &self.busy_label {
-                            // Truncate so a long status never pushes the left
-                            // content into the right-hand controls (overlap on
-                            // small / zoomed layouts).
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(label.as_str())
-                                        .font(theme::f_reg(12.0))
+                // Only explicit gaps between items, so the widths measured for
+                // `top_bar_fit` are exactly the widths drawn.
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let count_full = format!("{} connected", self.devices.len());
+                let count_short = self.devices.len().to_string();
+                let widths = TopBarWidths::measure(ui, &count_full, &count_short);
+                let fit = top_bar_fit(ui.available_width(), &widths);
+                let height = ui.available_height();
+                // Copied out so the left closure doesn't borrow `self` while
+                // the right one (Refresh, menu) needs it mutably.
+                let busy = self.busy();
+                let busy_label = self.busy_label.clone();
+                egui::Sides::new()
+                    .height(height)
+                    .spacing(TOPBAR_SIDE_GAP)
+                    .shrink_left()
+                    .truncate()
+                    .show(
+                        ui,
+                        |ui| {
+                            // Whatever does not fit is cut off at the edge of
+                            // the room the right-hand group left over, never
+                            // drawn underneath it.
+                            ui.shrink_clip_rect(ui.max_rect());
+                            glyph_tile(ui, 26.0, p.brand, p.accent_ink, Some('k'));
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("keyroost")
+                                    .font(theme::f_bold(14.0))
+                                    .color(p.txt),
+                            );
+                            if fit.version_on_bar {
+                                // Quiet version chip (#98); when room runs out
+                                // it moves into the menu's footer.
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(VERSION_LABEL)
+                                        .font(theme::f_reg(11.0))
                                         .color(p.txt3),
-                                )
-                                .truncate(),
-                            );
-                        }
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
-                            self.schedule_scan_burst();
-                        }
-                        ui.add_space(4.0);
-                        let log_color = if self.log_open { p.accent } else { p.txt2 };
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new("Activity log")
-                                        .font(theme::f_sb(12.5))
-                                        .color(log_color),
-                                )
-                                .sense(egui::Sense::click()),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            if self.log_detached {
-                                // The log is popped out into its own window;
-                                // the link brings that window forward rather
-                                // than toggling (and closing) the drawer that
-                                // isn't showing.
-                                ctx.send_viewport_cmd_to(
-                                    activity_log_viewport_id(),
-                                    egui::ViewportCommand::Focus,
                                 );
-                            } else {
-                                self.log_open = !self.log_open;
                             }
-                        }
-                        ui.add_space(10.0);
-                        ui.hyperlink_to(
-                            egui::RichText::new("Learn \u{2197}")
-                                .font(theme::f_sb(12.5))
+                            ui.add_space(12.0);
+                            theme::status_dot(ui, p.ok, 7.0);
+                            ui.add_space(5.0);
+                            let count = ui.label(
+                                egui::RichText::new(if fit.count_compact {
+                                    &count_short
+                                } else {
+                                    &count_full
+                                })
+                                .font(theme::f_reg(12.0))
                                 .color(p.txt2),
-                            ui::help::LEARN_BASE,
-                        );
-                        ui.add_space(10.0);
-                        let (trect, tresp) =
-                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                        paint_theme_icon(ui, trect.center(), 7.0, p.txt2);
-                        if tresp
-                            .on_hover_text("Toggle light / dark")
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.mode = match self.mode {
-                                Mode::Dark => Mode::Light,
-                                Mode::Light => Mode::Dark,
-                            };
-                            self.persist_settings();
-                        }
-                        ui.add_space(10.0);
-                        let (erect, eresp) =
-                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                        paint_eye_icon(
-                            ui,
-                            erect.center(),
-                            if self.colorblind { p.accent } else { p.txt2 },
-                        );
-                        if eresp
-                            .on_hover_text("Colorblind-safe colors")
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.colorblind = !self.colorblind;
-                            self.persist_settings();
-                        }
-                        ui.add_space(10.0);
-                        // "Text size" (issue #42): a compact UI-scale control.
-                        // The slider drives egui's global zoom factor, which
-                        // scales fonts AND painted symbols uniformly. A live "%"
-                        // readout sits to the right (rightmost in this RTL row),
-                        // with a "Reset" that appears only when off 100%.
-                        self.text_size_control(ui, p);
-                        ui.add_space(10.0);
-                        for (i, c) in Palette::ACCENTS.iter().enumerate().rev() {
-                            let (rect, resp) = ui
-                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                            let on = i == self.accent_idx;
-                            ui.painter().circle_filled(
-                                rect.center(),
-                                if on { 6.0 } else { 5.0 },
-                                *c,
                             );
-                            if on {
-                                ui.painter().circle_stroke(
-                                    rect.center(),
-                                    7.5,
-                                    egui::Stroke::new(1.5, p.txt),
+                            if fit.count_compact {
+                                count.on_hover_text(&count_full);
+                            }
+                            if busy {
+                                ui.add_space(12.0);
+                                ui.spinner();
+                                if let Some(label) = &busy_label {
+                                    ui.add_space(8.0);
+                                    // Truncated: a long status gives way rather
+                                    // than pushing into the right-hand group.
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(label.as_str())
+                                                .font(theme::f_reg(12.0))
+                                                .color(p.txt3),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            }
+                        },
+                        |ui| {
+                            // Right-to-left: Refresh is the rightmost item.
+                            if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
+                                self.schedule_scan_burst();
+                            }
+                            if !fit.links_in_menu {
+                                ui.add_space(TOPBAR_GAP);
+                                if self.activity_log_link(ui, p).clicked() {
+                                    self.toggle_activity_log(&ctx);
+                                }
+                                ui.add_space(TOPBAR_GAP);
+                                ui.hyperlink_to(
+                                    egui::RichText::new(TOPBAR_LEARN)
+                                        .font(theme::f_sb(12.5))
+                                        .color(p.txt2),
+                                    ui::help::LEARN_BASE,
                                 );
                             }
-                            if resp.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            ui.add_space(TOPBAR_GAP);
+                            let menu_id = egui::Id::new("topbar_menu");
+                            let trigger = if fit.links_in_menu {
+                                theme::button(ui, p, BtnKind::Ghost, TOPBAR_MENU)
+                                    .on_hover_text("Appearance, Learn and Activity log")
+                            } else {
+                                let open = egui::Popup::is_id_open(&ctx, menu_id);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(TOPBAR_APPEARANCE)
+                                            .font(theme::f_sb(12.5))
+                                            .color(if open { p.accent } else { p.txt2 }),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text("Theme, accent color, text size")
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            };
+                            if trigger.has_focus() {
+                                // Keyboard focus: neither trigger style draws
+                                // one itself, so outline it here.
+                                ui.painter().rect_stroke(
+                                    trigger.rect.expand(2.0),
+                                    6.0,
+                                    egui::Stroke::new(1.5, p.accent),
+                                    egui::StrokeKind::Outside,
+                                );
                             }
-                            if resp.clicked() {
-                                self.accent_idx = i;
-                                self.persist_settings();
-                            }
-                        }
-                    });
-                });
+                            self.top_bar_menu(p, &trigger, menu_id, fit);
+                        },
+                    );
             });
     }
 
-    /// "Text size" control for the top bar (issue #42): a compact slider over
-    /// egui's global zoom factor (80%–200%), with a live "%" readout and a
-    /// "Reset" that surfaces only when the scale is off 100%. Writing the slider
-    /// calls `set_zoom_factor`, so the whole UI — fonts and painted symbols —
-    /// rescales uniformly. Lives inside the top bar's right-to-left layout, so
-    /// widgets are added right-to-left: readout, slider, label, then Reset.
-    fn text_size_control(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        // The slider lives inside the very UI it scales, so applying the zoom
-        // *live* during a drag grows/shifts the slider track under the cursor
-        // and runs the value away to the maximum. Fix: apply-on-release. While
-        // dragging we edit a preview (`zoom_pending`) and leave the context
-        // factor alone, so the UI stays stable; we commit `set_zoom_factor`
-        // only when the drag ends. Keyboard/scroll zoom is unaffected (it has
-        // no feedback loop) and keeps writing the context directly.
-        //
-        // The slider edits `factor`: the pending preview if a drag is in
-        // flight, otherwise the committed live factor. The readout tracks the
-        // same value so it follows the handle during the drag.
-        let mut factor = self
+    /// The "Activity log" link (accent while the drawer is open).
+    fn activity_log_link(&self, ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+        let color = if self.log_open { p.accent } else { p.txt2 };
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Activity log")
+                    .font(theme::f_sb(12.5))
+                    .color(color),
+            )
+            .sense(egui::Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    /// Open/close the Activity log drawer, or bring the popped-out log window
+    /// forward (closing a drawer that isn't showing would do nothing visible).
+    fn toggle_activity_log(&mut self, ctx: &egui::Context) {
+        if self.log_detached {
+            ctx.send_viewport_cmd_to(activity_log_viewport_id(), egui::ViewportCommand::Focus);
+        } else {
+            self.log_open = !self.log_open;
+        }
+    }
+
+    /// The top bar's menu: Appearance (theme, accent, text size, colorblind),
+    /// then Learn / Activity log when they no longer fit on the bar, then the
+    /// version when it has left the bar. Stays open while settings are changed
+    /// (clicks inside don't close it); a click outside or Esc closes it.
+    fn top_bar_menu(
+        &mut self,
+        p: &Palette,
+        trigger: &egui::Response,
+        menu_id: egui::Id,
+        fit: TopBarFit,
+    ) {
+        let ctx = trigger.ctx.clone();
+        // Opened from the keyboard (Enter/Space on the focused trigger): move
+        // focus onto the first control so Tab continues inside the menu.
+        let opened_by_key = trigger.clicked()
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space));
+        // A popup doesn't scroll on its own; at a large text size in a short
+        // window the menu could run off the bottom, so cap it and scroll.
+        let max_h = (ctx.content_rect().bottom() - trigger.rect.bottom() - 12.0).max(120.0);
+        let shown = egui::Popup::menu(trigger)
+            .id(menu_id)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_min_width(250.0);
+                // A popup's room is last frame's size; without this the
+                // scroll area would stay as short as the menu's first frame.
+                ui.set_max_height(max_h);
+                egui::ScrollArea::vertical()
+                    .max_height(max_h)
+                    .show(ui, |ui| {
+                        self.appearance_section(ui, p, opened_by_key);
+                        if fit.links_in_menu {
+                            ui.separator();
+                            if ui
+                                .add(egui::Button::selectable(self.log_open, "Activity log"))
+                                .clicked()
+                            {
+                                self.toggle_activity_log(&ctx);
+                                ui.close();
+                            }
+                            if ui
+                                .add(egui::Button::selectable(false, TOPBAR_LEARN))
+                                .on_hover_text(ui::help::LEARN_BASE)
+                                .clicked()
+                            {
+                                ctx.open_url(egui::OpenUrl::same_tab(ui::help::LEARN_BASE));
+                                ui.close();
+                            }
+                        }
+                        if !fit.version_on_bar {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("keyroost {VERSION_LABEL}"))
+                                    .font(theme::f_reg(11.0))
+                                    .color(p.txt3),
+                            );
+                        }
+                    });
+            });
+        // The menu closed with a stepper preview still pending (e.g. a click
+        // outside right after [+]): commit it now, since the stepper that
+        // would have committed it is no longer drawn.
+        if shown.is_none() && self.zoom_commit_at.take().is_some() {
+            if let Some(f) = self.zoom_pending.take() {
+                ctx.set_zoom_factor(f);
+            }
+        }
+    }
+
+    /// Appearance settings: Theme, Accent, Text size, Colorblind-safe colors.
+    /// Same settings and persistence as before they moved into the menu.
+    fn appearance_section(&mut self, ui: &mut egui::Ui, p: &Palette, focus_first: bool) {
+        let caption = |t: &str| {
+            egui::RichText::new(t.to_owned())
+                .font(theme::f_reg(12.0))
+                .color(p.txt2)
+        };
+        egui::Grid::new("appearance_grid")
+            .num_columns(2)
+            .spacing([18.0, 10.0])
+            .show(ui, |ui| {
+                ui.label(caption("Theme"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (mode, name) in [(Mode::Light, "Light"), (Mode::Dark, "Dark")] {
+                        let r = ui.add(egui::Button::selectable(self.mode == mode, name));
+                        if focus_first && mode == Mode::Light {
+                            r.request_focus();
+                        }
+                        if r.clicked() && self.mode != mode {
+                            self.mode = mode;
+                            self.persist_settings();
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label(caption("Accent"));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (i, c) in Palette::ACCENTS.iter().enumerate() {
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        let on = i == self.accent_idx;
+                        ui.painter()
+                            .circle_filled(rect.center(), if on { 6.0 } else { 5.0 }, *c);
+                        if on {
+                            ui.painter().circle_stroke(
+                                rect.center(),
+                                7.5,
+                                egui::Stroke::new(1.5, p.txt),
+                            );
+                        }
+                        if resp.has_focus() {
+                            ui.painter().circle_stroke(
+                                rect.center(),
+                                9.0,
+                                egui::Stroke::new(1.0, p.accent),
+                            );
+                        }
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            self.accent_idx = i;
+                            self.persist_settings();
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label(caption("Text size"));
+                ui.horizontal(|ui| self.text_size_stepper(ui, p));
+                ui.end_row();
+            });
+        ui.label(
+            egui::RichText::new(
+                "Ctrl + larger \u{00b7} Ctrl \u{2212} smaller \u{00b7} Ctrl 0 reset",
+            )
+            .font(theme::f_reg(11.0))
+            .color(p.txt3),
+        );
+        ui.add_space(4.0);
+        let mut colorblind = self.colorblind;
+        if ui
+            .checkbox(&mut colorblind, "Colorblind-safe colors")
+            .changed()
+        {
+            self.colorblind = colorblind;
+            self.persist_settings();
+        }
+    }
+
+    /// "Text size" row (issue #42): `[−] NN% [+]` over egui's global zoom
+    /// factor (80%–200%), stepping 10% like Ctrl + / Ctrl −; clicking the
+    /// percentage resets to 100%. Writing the zoom rescales the whole UI,
+    /// this menu included, so a stepper click is only previewed in
+    /// `zoom_pending` and committed once the user settles (pointer off both
+    /// buttons, or 350ms after the last click): a run of clicks then lands on
+    /// buttons that haven't moved.
+    fn text_size_stepper(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let factor = self
             .zoom_pending
             .unwrap_or_else(|| theme::clamp_zoom(ui.ctx().zoom_factor()));
-
-        // Live percentage readout (rightmost). FIXED width: as the value crosses
-        // 99%→100% the glyph count goes 3→4; in the bar's right-to-left layout a
-        // wider readout would shove the slider track left under the cursor and
-        // make the value lurch (issue #42). `allocate_exact_size` reserves the
-        // widest readout's box unconditionally (unlike `allocate_ui_with_layout`,
-        // which advances by content width and so would still let the track move);
-        // we then paint the value right-aligned inside it, so the slider geometry
-        // is identical for "99%" and "100%".
-        let pct = (factor * 100.0).round() as i32;
-        let cell = ui.fonts_mut(|f| {
-            f.layout_no_wrap("888%".to_owned(), theme::f_sb(12.0), p.txt2)
-                .size()
-        });
-        let (rrect, _) = ui.allocate_exact_size(
-            egui::vec2(cell.x.ceil(), cell.y.ceil()),
-            egui::Sense::hover(),
-        );
-        ui.painter().text(
-            rrect.right_center(),
-            egui::Align2::RIGHT_CENTER,
-            format!("{pct}%"),
-            theme::f_sb(12.0),
-            p.txt2,
-        );
-        ui.add_space(6.0);
-
-        // The slider itself. Style its track/handle to the palette so it reads
-        // as part of the bar rather than egui's default blue. egui draws both the
-        // rail and the handle from `inactive.bg_fill`; on the LIGHT theme `raised2`
-        // sits almost on top of the bar, so the rail, handle and steppers were
-        // near-invisible (#59). Use a clearly darker control gray on light (the
-        // dark bar keeps `raised2`, which already contrasts fine).
         let (track, track_hot) = match self.mode {
             Mode::Light => (theme::darken(p.bar, 0.16), theme::darken(p.bar, 0.26)),
             Mode::Dark => (p.raised2, theme::lighten(p.raised2, 0.08)),
         };
-        let style = ui.style_mut();
-        style.visuals.widgets.inactive.bg_fill = track;
-        style.visuals.widgets.hovered.bg_fill = track_hot;
-        style.visuals.widgets.active.bg_fill = p.accent;
-        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.txt2);
-        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.txt);
-        style.spacing.slider_width = 92.0;
-
-        // [+] / [−] steppers flanking the slider, each nudging the size by 1%
-        // (0.01). The bar is laid out right-to-left, so to read "[−] slider [+]"
-        // left-to-right we emit the [+] first, then the slider, then the [−].
-        // A small closure paints one square stepper button and reports clicks.
-        let step = |ui: &mut egui::Ui, glyph: &str| -> egui::Response {
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-            let hot = resp.hovered();
+        // One square stepper button; dimmed at the end of the range.
+        let step = |ui: &mut egui::Ui, glyph: &str, enabled: bool| -> egui::Response {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+            let hot = enabled && resp.hovered();
             ui.painter()
-                .rect_filled(rect, 3.0, if hot { track_hot } else { track });
+                .rect_filled(rect, 4.0, if hot { track_hot } else { track });
+            if resp.has_focus() {
+                ui.painter().rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(1.0, p.accent),
+                    egui::StrokeKind::Outside,
+                );
+            }
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 glyph,
-                theme::f_sb(13.0),
-                if hot { p.txt } else { p.txt2 },
+                theme::f_sb(14.0),
+                match (enabled, hot) {
+                    (false, _) => p.txt3,
+                    (true, true) => p.txt,
+                    (true, false) => p.txt2,
+                },
             );
             resp.on_hover_cursor(egui::CursorIcon::PointingHand)
         };
 
-        // [+] (rightmost of the trio in this RTL row). Preview only (stash in
-        // `zoom_pending` + arm the commit timer); the rescale is deferred so the
-        // button stays under the cursor for repeated clicks — see the commit
-        // block after the [−] stepper.
-        let plus = step(ui, "+");
-        if plus.clicked() {
-            factor = theme::clamp_zoom(factor + 0.01);
-            self.zoom_pending = Some(factor);
-            self.zoom_commit_at =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
-        }
-        ui.add_space(4.0);
-
-        let resp = ui.add(
-            egui::Slider::new(&mut factor, theme::ZOOM_MIN..=theme::ZOOM_MAX)
-                .show_value(false)
-                .trailing_fill(true),
+        let minus = step(ui, "\u{2212}", factor > theme::ZOOM_MIN + 0.001)
+            .on_hover_text("Smaller (Ctrl \u{2212})");
+        ui.add_space(6.0);
+        // Fixed-width readout so "90%" → "100%" doesn't shift the [+] button.
+        let pct = (factor * 100.0).round() as i32;
+        let cell = ui.fonts_mut(|f| {
+            f.layout_no_wrap("888%".to_owned(), theme::f_sb(12.5), p.txt2)
+                .size()
+        });
+        let (rrect, reset) =
+            ui.allocate_exact_size(egui::vec2(cell.x.ceil() + 8.0, 22.0), egui::Sense::click());
+        let off_default = (factor - theme::ZOOM_DEFAULT).abs() > 0.001;
+        ui.painter().text(
+            rrect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{pct}%"),
+            theme::f_sb(12.5),
+            if reset.hovered() && off_default {
+                p.accent
+            } else {
+                p.txt
+            },
         );
-        if resp.dragged() {
-            // Mid-drag: preview only, don't touch the context (avoids runaway).
-            // A drag supersedes any pending stepper preview.
-            self.zoom_pending = Some(theme::clamp_zoom(factor));
-            self.zoom_commit_at = None;
-        } else if resp.drag_stopped() {
-            // Drag released: commit the chosen size to the context once.
-            ui.ctx().set_zoom_factor(theme::clamp_zoom(factor));
-            self.zoom_pending = None;
-            self.zoom_commit_at = None;
-        } else if resp.changed() {
-            // Click/keyboard committed a value without a drag (e.g. arrow keys
-            // or clicking the track): apply immediately, nothing to preview.
-            ui.ctx().set_zoom_factor(theme::clamp_zoom(factor));
-            self.zoom_pending = None;
-            self.zoom_commit_at = None;
+        if reset.has_focus() {
+            ui.painter().rect_stroke(
+                rrect,
+                4.0,
+                egui::Stroke::new(1.0, p.accent),
+                egui::StrokeKind::Outside,
+            );
         }
-        let resp = resp
-            .on_hover_text("Text size — scales the whole interface (Ctrl + / Ctrl − also work)");
+        let reset = reset
+            .on_hover_text("Back to 100% (Ctrl 0)")
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.add_space(6.0);
+        let plus = step(ui, "+", factor < theme::ZOOM_MAX - 0.001).on_hover_text("Larger (Ctrl +)");
 
-        ui.add_space(4.0);
-        // [−] (leftmost of the trio). Preview-only like [+].
-        let minus = step(ui, "\u{2212}");
-        if minus.clicked() {
-            factor = theme::clamp_zoom(factor - 0.01);
-            self.zoom_pending = Some(factor);
-            self.zoom_commit_at =
+        let preview = |app: &mut Self, f: f32| {
+            app.zoom_pending = Some(f);
+            app.zoom_commit_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
+        };
+        if minus.clicked() {
+            preview(self, zoom_step(factor, false));
+        }
+        if plus.clicked() {
+            preview(self, zoom_step(factor, true));
+        }
+        if reset.clicked() {
+            ui.ctx().set_zoom_factor(theme::ZOOM_DEFAULT);
+            self.zoom_pending = None;
+            self.zoom_commit_at = None;
         }
 
-        // Commit a stepper preview once the user settles: pointer off both
-        // buttons, or 350ms since the last click. The slider commits its own
-        // preview on release, so a pending value reaching here is always from a
-        // stepper. Deferring keeps the bar (and the buttons) from rescaling out
-        // from under the cursor during a run of clicks; we repaint at the
+        // Commit a pending preview once the user settles; repaint at the
         // deadline so it still applies if the pointer never moves.
         if let Some(at) = self.zoom_commit_at {
             let settled = (!plus.hovered() && !minus.hovered()) || std::time::Instant::now() >= at;
-            if settled && !resp.dragged() {
+            if settled {
                 if let Some(f) = self.zoom_pending.take() {
                     ui.ctx().set_zoom_factor(f);
                 }
@@ -12215,37 +12571,6 @@ impl App {
             } else {
                 ui.ctx()
                     .request_repaint_after(at.saturating_duration_since(std::time::Instant::now()));
-            }
-        }
-
-        ui.add_space(7.0);
-
-        // Label.
-        ui.label(
-            egui::RichText::new("Text size")
-                .font(theme::f_reg(12.0))
-                .color(p.txt2),
-        );
-
-        // "Reset" appears only when we're off the default, so the chrome stays
-        // quiet for users who never change it.
-        if (factor - theme::ZOOM_DEFAULT).abs() > f32::EPSILON {
-            ui.add_space(8.0);
-            if ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new("Reset")
-                            .font(theme::f_sb(12.0))
-                            .color(p.accent),
-                    )
-                    .sense(egui::Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                ui.ctx().set_zoom_factor(theme::ZOOM_DEFAULT);
-                self.zoom_pending = None;
-                self.zoom_commit_at = None;
             }
         }
     }
