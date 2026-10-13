@@ -692,6 +692,14 @@ pub struct PivSessionState {
     /// authenticates a wholly different PIN reference (HID Crescendo's ACA
     /// instance, not the standard PIV application PIN this cache tracks).
     pin_retries_cache: Option<Option<u8>>,
+    /// The management-key algorithm [`PivSession::resolve_management_key_algorithm`]
+    /// last settled on by probing (cards without GET METADATA). Only a hint:
+    /// the next resolution re-checks it with one witness request (two for
+    /// AES-192, which shares its key length with 3DES) and runs the full
+    /// probe whenever that check could pick differently, so a stale value
+    /// — the key changed by another tool, say — costs APDUs, never the
+    /// wrong answer.
+    mgmt_alg_hint: Option<MgmtAlg>,
     /// Applet-specific data resolved once and reused for the rest of a
     /// session's lineage — see [`AppletCache`]/[`AppletCacheKey`] for what's
     /// stored and why this is a dict keyed by enum rather than a dedicated
@@ -1164,6 +1172,23 @@ fn mgmt_algs_for_key_len(key_len: usize) -> &'static [MgmtAlg] {
         32 => &[MgmtAlg::Aes256],
         _ => &[],
     }
+}
+
+/// Whether the full probe would pick `hint` again, asking `accepts` (one
+/// witness request each) about at most two algorithms instead of all four.
+/// True exactly when `pick_mgmt_alg` over the card's accepted set would
+/// return `hint`: the hint must match `key_len` and still be accepted, and an
+/// AES-192 hint only stands while 3DES, which shares its key length and wins
+/// the tie, is rejected.
+fn hint_still_picked<E>(
+    hint: MgmtAlg,
+    key_len: usize,
+    mut accepts: impl FnMut(MgmtAlg) -> Result<bool, E>,
+) -> Result<bool, E> {
+    if hint.key_len() != key_len || !accepts(hint)? {
+        return Ok(false);
+    }
+    Ok(hint != MgmtAlg::Aes192 || !accepts(MgmtAlg::TripleDes)?)
 }
 
 /// Pick the management-key algorithm to authenticate with from the set the
@@ -3151,8 +3176,22 @@ impl<'tx> PivSession<'tx> {
             return Ok(alg);
         }
 
-        // No GET METADATA. Probe each algorithm's GENERAL AUTHENTICATE P1 with a
-        // bare witness request and see which the card is willing to start.
+        // No GET METADATA. Try a hint from an earlier probe on this card first.
+        if let Some(hint) = self.state.mgmt_alg_hint {
+            if hint_still_picked(hint, key_len, |alg| self.probe_mgmt_alg(alg))? {
+                trace::line(self.traced, || {
+                    format_line(
+                        Dir::Note,
+                        "piv mgmt-key",
+                        &format!("reusing {} from this key's last probe", hint.label()),
+                    )
+                });
+                return Ok(hint);
+            }
+        }
+
+        // Probe each algorithm's GENERAL AUTHENTICATE P1 with a bare witness
+        // request and see which the card is willing to start.
         const ALL: [MgmtAlg; 4] = [
             MgmtAlg::TripleDes,
             MgmtAlg::Aes128,
@@ -3169,31 +3208,7 @@ impl<'tx> PivSession<'tx> {
         });
         let mut accepted: Vec<MgmtAlg> = Vec::with_capacity(ALL.len());
         for alg in ALL {
-            // A transport failure (card pulled, reader gone) is fatal for every
-            // candidate — propagate it rather than mislabel it "bad key
-            // length". Only a non-9000 status word means "not this P1".
-            let (_, sw) = self.transmit_full(&piv::general_auth_request_witness(
-                alg,
-                piv::KEY_REF_MANAGEMENT,
-            ))?;
-            let ok = sw == piv::SW_OK;
-            trace::line(self.traced, || {
-                format_line(
-                    Dir::Note,
-                    "piv mgmt-key",
-                    &format!(
-                        "probe {} (P1={:#04x}) -> {}",
-                        alg.label(),
-                        alg.id(),
-                        if ok {
-                            "accepted".to_string()
-                        } else {
-                            format!("rejected (SW {sw:04X})")
-                        }
-                    ),
-                )
-            });
-            if ok {
+            if self.probe_mgmt_alg(alg)? {
                 accepted.push(alg);
             }
         }
@@ -3215,7 +3230,40 @@ impl<'tx> PivSession<'tx> {
                 &format!("selected {}", chosen.label()),
             )
         });
+        // A length-only fallback (nothing accepted) is a guess, not a card
+        // answer: never remember it.
+        self.state.mgmt_alg_hint = accepted.contains(&chosen).then_some(chosen);
         Ok(chosen)
+    }
+
+    /// One management-key probe: whether the card starts GENERAL
+    /// AUTHENTICATE under `alg` (a bare witness request; no key material
+    /// reaches the card). A transport failure (card pulled, reader gone) is
+    /// fatal and propagates rather than reading as "bad key length"; only a
+    /// non-9000 status word means "not this P1".
+    fn probe_mgmt_alg(&mut self, alg: MgmtAlg) -> Result<bool, TransportError> {
+        let (_, sw) = self.transmit_full(&piv::general_auth_request_witness(
+            alg,
+            piv::KEY_REF_MANAGEMENT,
+        ))?;
+        let ok = sw == piv::SW_OK;
+        trace::line(self.traced, || {
+            format_line(
+                Dir::Note,
+                "piv mgmt-key",
+                &format!(
+                    "probe {} (P1={:#04x}) -> {}",
+                    alg.label(),
+                    alg.id(),
+                    if ok {
+                        "accepted".to_string()
+                    } else {
+                        format!("rejected (SW {sw:04X})")
+                    }
+                ),
+            )
+        });
+        Ok(ok)
     }
 
     /// Authenticate to unlock PIV admin operations (key generation,
@@ -7043,6 +7091,45 @@ mod tests {
         assert!(mgmt_algs_for_key_len(8).is_empty());
         assert!(mgmt_algs_for_key_len(0).is_empty());
         assert!(mgmt_algs_for_key_len(20).is_empty());
+    }
+
+    /// #113: reusing a remembered algorithm must never change the answer.
+    /// For every set of algorithms a card could accept, every hint and every
+    /// key length, the short check says "reuse" exactly when the full probe
+    /// would pick the hint, and it asks the card at most two questions.
+    #[test]
+    fn mgmt_alg_hint_agrees_with_the_full_probe() {
+        use MgmtAlg::*;
+        const ALL: [MgmtAlg; 4] = [TripleDes, Aes128, Aes192, Aes256];
+        for mask in 0u8..16 {
+            let accepted: Vec<MgmtAlg> = ALL
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, a)| *a)
+                .collect();
+            for hint in ALL {
+                for key_len in [16, 24, 32] {
+                    let mut asked = 0;
+                    let reuse = hint_still_picked(hint, key_len, |a| {
+                        asked += 1;
+                        Ok::<_, ()>(accepted.contains(&a))
+                    })
+                    .unwrap();
+                    let full =
+                        !accepted.is_empty() && pick_mgmt_alg(&accepted, key_len) == Some(hint);
+                    assert_eq!(reuse, full, "{accepted:?} hint {hint:?} len {key_len}");
+                    assert!(asked <= 2);
+                }
+            }
+        }
+    }
+
+    /// A card pulled mid-check stops the check; it isn't read as "rejected".
+    #[test]
+    fn mgmt_alg_hint_check_propagates_transport_errors() {
+        let r = hint_still_picked(MgmtAlg::Aes192, 24, |_| Err::<bool, _>("gone"));
+        assert_eq!(r, Err("gone"));
     }
 
     #[test]
