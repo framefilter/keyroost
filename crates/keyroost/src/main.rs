@@ -1048,6 +1048,33 @@ fn completion_still_valid(captured: Option<&DeviceId>, current: Option<&DeviceId
     matches!((captured, current), (Some(c), Some(now)) if c == now)
 }
 
+/// A device scan never connects to a Molto2, so its fresh row has no serial
+/// (and so no local name); only opening the token reads them. Carry both over
+/// from the previous list for the token whose session is open, or a rescan
+/// while it stays selected would blank the header until it's reopened.
+fn keep_open_token_identity(old: &[Device], new: &mut [Device], open: Option<&DeviceId>) {
+    let Some(open) = open else {
+        return;
+    };
+    let Some(prev) = old
+        .iter()
+        .find(|d| &d.id == open && d.kind == DeviceKind::Token)
+    else {
+        return;
+    };
+    if let Some(dev) = new
+        .iter_mut()
+        .find(|d| &d.id == open && d.kind == DeviceKind::Token)
+    {
+        if dev.serial.is_empty() {
+            dev.serial = prev.serial.clone();
+        }
+        if dev.name.is_none() {
+            dev.name = prev.name.clone();
+        }
+    }
+}
+
 /// Whether a resident credential should offer the "Save certificate…" action.
 /// True only for SSH relying parties (`ssh:*`) that also carry a largeBlob key:
 /// the key is required to decrypt this credential's per-credential largeBlob
@@ -7762,6 +7789,12 @@ impl App {
                             devices.len(),
                             if devices.len() == 1 { "" } else { "s" }
                         ),
+                    );
+                    let mut devices = devices;
+                    keep_open_token_identity(
+                        &app.devices,
+                        &mut devices,
+                        app.molto_session_device.as_ref(),
                     );
                     app.devices = devices;
                     // A device that's genuinely gone shouldn't leave its
@@ -25713,6 +25746,50 @@ mod tests {
         // …and take_molto_session refuses, dropping the stale binding.
         assert!(app.take_molto_session().is_none());
         assert!(app.molto_session_device.is_none());
+    }
+
+    fn test_token(id: &str, serial: &str, name: Option<&str>) -> Device {
+        Device {
+            vendor: "Token2".into(),
+            model: "Molto2".into(),
+            kind: DeviceKind::Token,
+            reader: Some("Token2 Molto2".into()),
+            ..test_key(id, serial, name)
+        }
+    }
+
+    /// #125: a rescan rebuilds the open Molto2's row without its serial
+    /// (enumeration never connects to it); the header must keep showing it.
+    #[test]
+    fn rescan_keeps_the_open_molto2_serial_and_name() {
+        let old = [test_token("molto:A", "M2SERIAL", Some("Desk"))];
+        let mut new = vec![test_token("molto:A", "", None)];
+        keep_open_token_identity(&old, &mut new, Some(&"molto:A".to_string()));
+        assert_eq!(new[0].serial, "M2SERIAL");
+        assert_eq!(new[0].name.as_deref(), Some("Desk"));
+    }
+
+    /// Only the token whose session is open: its serial came from that
+    /// session. Nothing is carried without one, nor onto a different row.
+    #[test]
+    fn rescan_carries_nothing_without_an_open_session() {
+        let old = [
+            test_token("molto:A", "M2SERIAL", Some("Desk")),
+            test_token("molto:B", "OTHER", None),
+        ];
+        let mut new = vec![
+            test_token("molto:A", "", None),
+            test_token("molto:B", "", None),
+        ];
+        keep_open_token_identity(&old, &mut new, None);
+        assert!(new.iter().all(|d| d.serial.is_empty() && d.name.is_none()));
+        keep_open_token_identity(&old, &mut new, Some(&"molto:B".to_string()));
+        assert_eq!(new[0].serial, "");
+        assert_eq!(new[1].serial, "OTHER");
+        // A key row with the session's id is never touched.
+        let mut keys = vec![test_key("molto:A", "", None)];
+        keep_open_token_identity(&old, &mut keys, Some(&"molto:A".to_string()));
+        assert_eq!(keys[0].serial, "");
     }
 
     /// A selection change always severs the Molto session binding, so a
