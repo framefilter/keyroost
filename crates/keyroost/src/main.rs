@@ -2860,6 +2860,7 @@ fn piv_retired_slot_hover(label: &str, key: keyroost_transport::SlotKeyPresence)
 /// A PIV certificate-compression picker combo.
 fn piv_cert_compression_combo(ui: &mut egui::Ui, id: &str, sel: &mut PivCertCompressionSel) {
     egui::ComboBox::from_id_salt(id)
+        .truncate()
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             for opt in PivCertCompressionSel::ALL {
@@ -10073,6 +10074,178 @@ fn panel_frame(fill: egui::Color32, mx: f32, my: f32) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(mx as i8, my as i8))
 }
 
+/// Width of `text` laid out on one line in `font`.
+fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER)
+        .size()
+        .x
+}
+
+/// Room a help "?" dot takes after a title: the 6pt gap, the 17pt dot, and
+/// the row's item spacing on both sides of the gap.
+fn help_dot_room(ui: &egui::Ui) -> f32 {
+    6.0 + 17.0 + 2.0 * ui.spacing().item_spacing.x
+}
+
+/// A title that ends in "…" when its row runs short (the full text shows on
+/// hover), leaving `reserve` points free for what follows it on the row. A
+/// title that fits is drawn exactly as a plain label.
+fn shrink_label(ui: &mut egui::Ui, text: egui::RichText, reserve: f32) -> egui::Response {
+    let max = (ui.available_width() - reserve).max(0.0);
+    ui.allocate_ui(egui::vec2(max, ui.available_height()), |ui| {
+        ui.add(egui::Label::new(text).truncate())
+    })
+    .inner
+}
+
+/// A title row (in `p.txt`) that can never draw its parts over each other: `right` is laid
+/// out first against the right edge, and the title (plus an optional help
+/// dot, which stays next to it) gets what is left, ending in "…" when that
+/// is not enough. Returns the help dot's response, for the caller to act on,
+/// and whatever `right` returned.
+fn head_row<R>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    font: egui::FontId,
+    help_active: Option<bool>,
+    right: impl FnOnce(&mut egui::Ui) -> R,
+) -> (Option<egui::Response>, R) {
+    // As tall as the title's line, so both sides center on the same line a
+    // plain `ui.horizontal` row would.
+    let height = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+        .size()
+        .y
+        .max(ui.spacing().interact_size.y);
+    let title = egui::RichText::new(title).font(font).color(p.txt);
+    egui::Sides::new().height(height).shrink_left().show(
+        ui,
+        |ui| {
+            let reserve = if help_active.is_some() {
+                help_dot_room(ui)
+            } else {
+                0.0
+            };
+            shrink_label(ui, title, reserve);
+            help_active.map(|active| {
+                ui.add_space(6.0);
+                ui::help_button(ui, p, active)
+            })
+        },
+        right,
+    )
+}
+
+/// One button in a [`pane_head`]. The first is the pane's main action and
+/// always stays on the row; the rest may move into the "…" menu.
+struct HeadButton<'a> {
+    label: &'a str,
+    kind: BtnKind,
+    enabled: bool,
+}
+
+impl<'a> HeadButton<'a> {
+    fn new(label: &'a str, kind: BtnKind) -> Self {
+        HeadButton {
+            label,
+            kind,
+            enabled: true,
+        }
+    }
+}
+
+/// Width `theme::button` draws `label` at.
+fn button_width(ui: &egui::Ui, label: &str) -> f32 {
+    text_width(ui, label, theme::f_sb(13.0)) + 28.0
+}
+
+/// Gap between header buttons.
+const HEAD_BUTTON_GAP: f32 = 6.0;
+
+/// A pane's title row: title and help dot on the left, buttons on the right
+/// (the first rightmost). When the row can't hold the full title and every
+/// button, the buttons after the first move into a "…" menu at the right
+/// edge, and the title ends in "…" only if even that is not enough. Returns
+/// the help dot's response and the index of the button chosen, inline or
+/// from the menu.
+fn pane_head(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    help_active: bool,
+    buttons: &[HeadButton<'_>],
+    menu_id: &str,
+) -> (Option<egui::Response>, Option<usize>) {
+    let font = theme::f_sb(14.5);
+    let gap = HEAD_BUTTON_GAP + ui.spacing().item_spacing.x;
+    let all_buttons: f32 = buttons
+        .iter()
+        .map(|b| button_width(ui, b.label) + gap)
+        .sum();
+    let full = text_width(ui, title, font.clone())
+        + help_dot_room(ui)
+        + ui.spacing().item_spacing.x
+        + all_buttons;
+    let fold = buttons.len() > 1 && full > ui.available_width();
+    let mut chosen = None;
+    let (dot, ()) = egui::Sides::new().height(32.0).shrink_left().show(
+        ui,
+        |ui| {
+            shrink_label(
+                ui,
+                egui::RichText::new(title).font(font).color(p.txt),
+                help_dot_room(ui),
+            );
+            ui.add_space(6.0);
+            Some(ui::help_button(ui, p, help_active))
+        },
+        |ui| {
+            let pressed = |ui: &mut egui::Ui, b: &HeadButton<'_>| {
+                if b.enabled {
+                    theme::button(ui, p, b.kind, b.label).clicked()
+                } else {
+                    theme::button_disabled(ui, p, b.label);
+                    false
+                }
+            };
+            if fold {
+                let more =
+                    theme::button(ui, p, BtnKind::Default, "...").on_hover_text("More actions");
+                egui::Popup::menu(&more)
+                    .id(ui.make_persistent_id(menu_id))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                    .show(|ui| {
+                        ui.set_min_width(160.0);
+                        for (i, b) in buttons.iter().enumerate().skip(1) {
+                            let item =
+                                ui.add_enabled(b.enabled, egui::Button::selectable(false, b.label));
+                            if item.clicked() {
+                                chosen = Some(i);
+                            }
+                        }
+                    });
+                ui.add_space(HEAD_BUTTON_GAP);
+                if buttons.first().is_some_and(|b| pressed(ui, b)) {
+                    chosen = Some(0);
+                }
+            } else {
+                for (i, b) in buttons.iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(HEAD_BUTTON_GAP);
+                    }
+                    if pressed(ui, b) {
+                        chosen = Some(i);
+                    }
+                }
+            }
+        },
+    );
+    (dot, chosen)
+}
+
 /// A rounded square "glyph tile". `ch = Some(c)` paints a letter; `None` paints a
 /// small clock (the Molto2 token mark).
 fn glyph_tile(
@@ -11007,6 +11180,7 @@ fn piv_keyalg_combo(
     gate_of: impl Fn(keyroost_piv::KeyAlg) -> keyroost_piv::compat::FeatureGate,
 ) {
     egui::ComboBox::from_id_salt(id)
+        .truncate()
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             // `disabled_alpha`'s egui default (0.5) leaves a gated row only
@@ -11058,6 +11232,7 @@ fn openpgp_keyalg_combo(
     choices: &[OpenPgpKeyAlgSel],
 ) {
     egui::ComboBox::from_id_salt(id)
+        .truncate()
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             for &opt in choices {
@@ -11126,6 +11301,7 @@ fn piv_policy_clamp<T: PivPolicyOption>(sel: &mut T, options: &[T]) {
 fn piv_policy_combo<T: PivPolicyOption>(ui: &mut egui::Ui, id: &str, sel: &mut T, options: &[T]) {
     piv_policy_clamp(sel, options);
     egui::ComboBox::from_id_salt(id)
+        .truncate()
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             // No option is ever gated disabled today — quirk-excluded values
@@ -11241,6 +11417,7 @@ fn piv_mgmtalg_combo(
 ) {
     piv_mgmtalg_clamp(sel, options);
     egui::ComboBox::from_id_salt(id)
+        .truncate()
         .selected_text(sel.label())
         .show_ui(ui, |ui| {
             // See `piv_keyalg_combo`'s matching line: bump the dimming for
@@ -12593,6 +12770,81 @@ impl App {
     /// Toggle the help popover for `topic`, anchored under the clicked "?" button.
     fn help_dot(&mut self, ui: &mut egui::Ui, p: &Palette, topic: &'static str) {
         let r = ui::help_button(ui, p, self.help_open == Some(topic));
+        self.on_help_dot(ui, &r, topic);
+    }
+
+    /// A settings row: `left` (a label, its help dot, any markers) and
+    /// `right` (the row's buttons and inputs, added right to left as in a
+    /// `Layout::right_to_left` row) on one line when both fit. When they
+    /// don't, `right` moves to a right-aligned line of its own under `left`
+    /// and wraps there, so no control is hidden or drawn over another. Both
+    /// groups are first laid out invisibly to measure them; nothing in that
+    /// pass can be clicked.
+    fn adaptive_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        mut left: impl FnMut(&mut Self, &mut egui::Ui),
+        mut right: impl FnMut(&mut Self, &mut egui::Ui),
+    ) {
+        let room = ui.available_rect_before_wrap();
+        let mut measure =
+            |app: &mut Self,
+             salt: &str,
+             layout: egui::Layout,
+             add: &mut dyn FnMut(&mut Self, &mut egui::Ui)| {
+                let mut m = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt(("adaptive-row-measure", salt))
+                        .max_rect(room)
+                        .layout(layout)
+                        .invisible()
+                        .sizing_pass(),
+                );
+                m.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                add(app, &mut m);
+                m.min_rect().width()
+            };
+        let left_w = measure(
+            self,
+            "left",
+            egui::Layout::left_to_right(egui::Align::Center),
+            &mut left,
+        );
+        let right_w = measure(
+            self,
+            "right",
+            egui::Layout::right_to_left(egui::Align::Center),
+            &mut right,
+        );
+        let gap = 12.0 + 2.0 * ui.spacing().item_spacing.x;
+        if left_w + gap + right_w <= room.width() {
+            ui.horizontal(|ui| {
+                left(self, ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    right(self, ui);
+                });
+            });
+        } else {
+            ui.horizontal(|ui| left(self, ui));
+            ui.add_space(4.0);
+            // Labels inside the group keep to one line; a part that doesn't
+            // fit moves to the next line whole. Sized to one button-high line
+            // (wrapping grows it): a bare `with_layout` here would take the
+            // whole remaining height and center the group in it.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    right(self, ui);
+                },
+            );
+        }
+    }
+
+    /// Act on a help dot drawn without `self` at hand (see [`head_row`]).
+    fn on_help_dot(&mut self, ui: &egui::Ui, r: &egui::Response, topic: &'static str) {
         if r.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -13251,15 +13503,18 @@ impl App {
         overlay: bool,
     ) -> SidebarEvents {
         let mut ev = SidebarEvents::default();
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("DEVICES")
-                    .font(theme::f_bold(11.0))
-                    .color(p.txt3),
-            );
-            ui.add_space(6.0);
-            theme::pill(ui, &self.devices.len().to_string(), p.txt2, p.raised2);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        self.adaptive_row(
+            ui,
+            |app, ui| {
+                ui.label(
+                    egui::RichText::new("DEVICES")
+                        .font(theme::f_bold(11.0))
+                        .color(p.txt3),
+                );
+                ui.add_space(6.0);
+                theme::pill(ui, &app.devices.len().to_string(), p.txt2, p.raised2);
+            },
+            |app, ui| {
                 if overlay {
                     let (crect, cresp) =
                         ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
@@ -13271,7 +13526,7 @@ impl App {
                         theme::f_sb(16.0),
                         p.txt2,
                     );
-                    if std::mem::take(&mut self.sidebar_overlay_focus) {
+                    if std::mem::take(&mut app.sidebar_overlay_focus) {
                         cresp.request_focus();
                     }
                     if cresp
@@ -13292,10 +13547,10 @@ impl App {
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
-                    self.schedule_scan_burst();
+                    app.schedule_scan_burst();
                 }
-            });
-        });
+            },
+        );
         // "Keep open": in the overlay, and on the docked list while it is
         // docked only because of the pin (so it can be undone there).
         let pinned = self.sidebar == SidebarSetting::Full;
@@ -13574,15 +13829,18 @@ impl App {
     /// the outer-right window control: the detach icon (plus "Collapse") when
     /// docked, its mirror image — the reattach icon — when popped out.
     fn activity_log_body(&mut self, ui: &mut egui::Ui, p: &Palette, detached: bool) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("ACTIVITY LOG")
-                    .font(theme::f_bold(11.0))
-                    .color(p.txt3),
-            );
-            ui.add_space(6.0);
-            theme::pill(ui, "live", p.ok, p.ok_soft());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        self.adaptive_row(
+            ui,
+            |_, ui| {
+                ui.label(
+                    egui::RichText::new("ACTIVITY LOG")
+                        .font(theme::f_bold(11.0))
+                        .color(p.txt3),
+                );
+                ui.add_space(6.0);
+                theme::pill(ui, "live", p.ok, p.ok_soft());
+            },
+            |app, ui| {
                 // Window control at the outer right in both states: an icon-only
                 // affordance (detach glyph / its mirror) rather than a verb in
                 // the row of text actions. The hit box is a full button-height
@@ -13599,7 +13857,7 @@ impl App {
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
-                        self.log_detached = false;
+                        app.log_detached = false;
                     }
                 } else {
                     paint_detach_icon(ui, wrect.center(), p.txt2);
@@ -13608,18 +13866,18 @@ impl App {
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
-                        self.log_detached = true;
+                        app.log_detached = true;
                     }
                     ui.add_space(6.0);
                     if theme::button(ui, p, BtnKind::Ghost, "Collapse").clicked() {
-                        self.log_open = false;
+                        app.log_open = false;
                     }
                 }
                 ui.add_space(4.0);
                 if theme::button(ui, p, BtnKind::Ghost, "Clear").clicked() {
                     // Drop every entry (and its APDU trace); the next device
                     // operation starts the log fresh.
-                    self.log.clear();
+                    app.log.clear();
                 }
                 ui.add_space(4.0);
                 if theme::button(ui, p, BtnKind::Ghost, "Copy").clicked() {
@@ -13627,7 +13885,7 @@ impl App {
                     // belong to — the point of the APDU trace is
                     // having the exact wire exchange to paste, not
                     // just the summary.
-                    let all = self
+                    let all = app
                         .log
                         .iter()
                         .map(|l| match &l.trace {
@@ -13646,20 +13904,20 @@ impl App {
                     ui.ctx().copy_text(all);
                     // The user copied non-secret log text over the
                     // code; a pending auto-clear would clobber it.
-                    self.clipboard_clear_at = None;
+                    app.clipboard_clear_at = None;
                 }
                 ui.add_space(10.0);
                 // Runtime toggle for the worker thread's APDU capture
                 // (see `Worker::spawn`) — no CLI flag, no restart:
                 // flip it, and the very next device operation's trace
                 // shows up under its log entry.
-                let mut trace_on = self.apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
+                let mut trace_on = app.apdu_trace.load(std::sync::atomic::Ordering::Relaxed);
                 if ui.checkbox(&mut trace_on, "APDU trace").changed() {
-                    self.apdu_trace
+                    app.apdu_trace
                         .store(trace_on, std::sync::atomic::Ordering::Relaxed);
                 }
-            });
-        });
+            },
+        );
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -13753,6 +14011,12 @@ impl App {
                                     .id_salt(("cap-pane", self.cap_tab as u8))
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
+                                        // Text in a side-by-side row wraps at
+                                        // the room left on that row instead of
+                                        // pushing the pane wider than the window
+                                        // (egui's default there is to extend).
+                                        // Labels that set their own mode keep it.
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                                         match self.cap_tab {
                                             CapTab::Overview => self.overview(ui, p, &dev),
                                             CapTab::Fido2 => self.cap_fido2(ui, p),
@@ -14079,114 +14343,146 @@ impl App {
         let offer = device::write_back_offer(dev, self.write_back_dismissed.contains(&dev.id))
             .filter(|_| self.rename_target.is_none())
             .map(str::to_owned);
-        ui.horizontal(|ui| {
-            glyph_tile(
-                ui,
-                46.0,
-                p.raised2,
-                p.txt2,
-                Some(
-                    dev.vendor
-                        .chars()
-                        .next()
-                        .unwrap_or('?')
-                        .to_ascii_uppercase(),
-                ),
-            );
-            ui.add_space(12.0);
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
+        // "Connected" is placed first, against the right edge; the tile and
+        // the name/details column get the rest, so a long name or a narrow
+        // window shortens the name instead of widening the page. When that
+        // column would drop under 260pt, only the green dot stays.
+        let connected_text =
+            ui.available_width() - 58.0 - text_width(ui, "Connected", theme::f_sb(12.5)) - 13.0
+                >= 260.0;
+        egui::Sides::new().height(46.0).shrink_left().show(
+            ui,
+            |ui| {
+                glyph_tile(
+                    ui,
+                    46.0,
+                    p.raised2,
+                    p.txt2,
+                    Some(
+                        dev.vendor
+                            .chars()
+                            .next()
+                            .unwrap_or('?')
+                            .to_ascii_uppercase(),
+                    ),
+                );
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
                     if self.rename_target.is_some() {
-                        (do_save, do_cancel) = self.rename_field_row(ui, p);
+                        ui.horizontal(|ui| {
+                            (do_save, do_cancel) = self.rename_field_row(ui, p);
+                        });
                     } else {
-                        ui.label(
-                            egui::RichText::new(dev.title())
-                                .font(theme::f_bold(21.0))
-                                .color(p.txt),
-                        );
-                        ui.add_space(5.0);
-                        self.help_dot(ui, p, "device");
-                        ui.add_space(8.0);
                         let label = if dev.name.is_some() {
                             "Rename"
                         } else {
                             "Name this key"
                         };
-                        if ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new(label)
-                                        .font(theme::f_sb(12.0))
-                                        .color(p.accent),
+                        let title_font = theme::f_bold(21.0);
+                        let trailing = help_dot_room(ui)
+                            + 8.0
+                            + ui.spacing().item_spacing.x
+                            + text_width(ui, label, theme::f_sb(12.0));
+                        // The name comes first: when it and its "?" and
+                        // naming link don't fit on one line, the two move
+                        // to a line of their own, and only a name too long
+                        // for a whole line ends in "…".
+                        let one_line = text_width(ui, dev.title(), title_font.clone()) + trailing
+                            <= ui.available_width();
+                        let title = egui::RichText::new(dev.title())
+                            .font(title_font)
+                            .color(p.txt);
+                        let mut extras = |ui: &mut egui::Ui| {
+                            self.help_dot(ui, p, "device");
+                            ui.add_space(8.0);
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(label)
+                                            .font(theme::f_sb(12.0))
+                                            .color(p.accent),
+                                    )
+                                    .sense(egui::Sense::click()),
                                 )
-                                .sense(egui::Sense::click()),
-                            )
-                            .clicked()
-                        {
-                            open_rename = true;
+                                .clicked()
+                            {
+                                open_rename = true;
+                            }
+                        };
+                        if one_line {
+                            ui.horizontal(|ui| {
+                                ui.label(title);
+                                ui.add_space(5.0);
+                                extras(ui);
+                            });
+                        } else {
+                            ui.horizontal(|ui| shrink_label(ui, title, 0.0));
+                            ui.horizontal(|ui| extras(ui));
                         }
                     }
-                });
-                if self.rename_target.is_some() {
-                    (do_confirm, do_unconfirm, pin_enter) = self.rename_details(ui, p, "key");
-                }
-                ui.add_space(2.0);
-                let serial = if dev.serial.is_empty() {
-                    "\u{2014}".to_string()
-                } else {
-                    dev.serial.clone()
-                };
-                let mut meta = format!(
-                    "{} \u{00B7} #{} \u{00B7} {}",
-                    dev.vendor, serial, dev.transport
-                );
-                if !dev.firmware.is_empty() {
-                    meta.push_str(&format!(" \u{00B7} fw {}", dev.firmware));
-                }
-                if dev.naming.source == Some(keyroost_resolve::NameSource::Key) {
-                    meta.push_str(" \u{00B7} name on key");
-                }
-                ui.label(
-                    egui::RichText::new(meta)
-                        .font(theme::f_reg(12.5))
-                        .color(p.txt2),
-                );
-                if let Some(n) = &offer {
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "This key no longer carries its name \"{n}\"."
-                            ))
+                    if self.rename_target.is_some() {
+                        (do_confirm, do_unconfirm, pin_enter) = self.rename_details(ui, p, "key");
+                    }
+                    ui.add_space(2.0);
+                    let serial = if dev.serial.is_empty() {
+                        "\u{2014}".to_string()
+                    } else {
+                        dev.serial.clone()
+                    };
+                    let mut meta = format!(
+                        "{} \u{00B7} #{} \u{00B7} {}",
+                        dev.vendor, serial, dev.transport
+                    );
+                    if !dev.firmware.is_empty() {
+                        meta.push_str(&format!(" \u{00B7} fw {}", dev.firmware));
+                    }
+                    if dev.naming.source == Some(keyroost_resolve::NameSource::Key) {
+                        meta.push_str(" \u{00B7} name on key");
+                    }
+                    ui.label(
+                        egui::RichText::new(meta)
                             .font(theme::f_reg(12.5))
-                            .color(p.txt),
-                        );
+                            .color(p.txt2),
+                    );
+                    if let Some(n) = &offer {
                         ui.add_space(6.0);
-                        if theme::button(ui, p, BtnKind::Primary, "Write it back").clicked() {
-                            write_back = Some(WriteBack::Write);
-                        }
-                        if theme::button(ui, p, BtnKind::Ghost, "Forget")
-                            .on_hover_text("Remove this name from this computer.")
-                            .clicked()
-                        {
-                            write_back = Some(WriteBack::Forget);
-                        }
-                        if theme::button(ui, p, BtnKind::Ghost, "Not now").clicked() {
-                            write_back = Some(WriteBack::Dismiss);
-                        }
-                    });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "This key no longer carries its name \"{n}\"."
+                                ))
+                                .font(theme::f_reg(12.5))
+                                .color(p.txt),
+                            );
+                            ui.add_space(6.0);
+                            if theme::button(ui, p, BtnKind::Primary, "Write it back").clicked() {
+                                write_back = Some(WriteBack::Write);
+                            }
+                            if theme::button(ui, p, BtnKind::Ghost, "Forget")
+                                .on_hover_text("Remove this name from this computer.")
+                                .clicked()
+                            {
+                                write_back = Some(WriteBack::Forget);
+                            }
+                            if theme::button(ui, p, BtnKind::Ghost, "Not now").clicked() {
+                                write_back = Some(WriteBack::Dismiss);
+                            }
+                        });
+                    }
+                });
+            },
+            |ui| {
+                if connected_text {
+                    ui.label(
+                        egui::RichText::new("Connected")
+                            .font(theme::f_sb(12.5))
+                            .color(p.txt2),
+                    );
+                    ui.add_space(5.0);
                 }
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new("Connected")
-                        .font(theme::f_sb(12.5))
-                        .color(p.txt2),
-                );
-                ui.add_space(5.0);
                 theme::status_dot(ui, p.ok, 8.0);
-            });
-        });
+            },
+        );
         self.apply_rename_question(do_confirm, do_unconfirm);
         let save = (do_save || pin_enter) && !self.rename_blocked();
         self.apply_rename_actions(dev, open_rename, do_cancel, save);
@@ -14207,8 +14503,11 @@ impl App {
         self.cap_tab = snap_cap_tab(self.cap_tab, &dev.tabs());
         ui.add_space(12.0);
         let mut next = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 20.0;
+        // Tabs flow onto a second line when the row runs out of room, so
+        // every section stays one click away (and never widens the page).
+        // The line gap leaves room for the active tab's underline.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(20.0, 16.0);
             for t in dev.tabs() {
                 let active = self.cap_tab == t;
                 let color = if active { p.txt } else { p.txt3 };
@@ -14228,6 +14527,7 @@ impl App {
                                 .font(theme::f_sb(13.5))
                                 .color(color),
                         )
+                        .extend()
                         .sense(egui::Sense::click()),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -14268,32 +14568,28 @@ impl App {
         title: &str,
         topic: &'static str,
     ) -> bool {
-        let mut go = false;
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .font(theme::f_sb(14.5))
-                    .color(p.txt),
-            );
-            ui.add_space(6.0);
-            self.help_dot(ui, p, topic);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Label::new(
-                            egui::RichText::new("Manage \u{2192}")
-                                .font(theme::f_sb(12.5))
-                                .color(p.accent),
-                        )
-                        .sense(egui::Sense::click()),
+        let (dot, go) = head_row(
+            ui,
+            p,
+            title,
+            theme::f_sb(14.5),
+            Some(self.help_open == Some(topic)),
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Manage \u{2192}")
+                            .font(theme::f_sb(12.5))
+                            .color(p.accent),
                     )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    go = true;
-                }
-            });
-        });
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            },
+        );
+        if let Some(r) = dot {
+            self.on_help_dot(ui, &r, topic);
+        }
         go
     }
 
@@ -14449,15 +14745,17 @@ impl App {
         title: &str,
         topic: &'static str,
     ) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .font(theme::f_sb(14.5))
-                    .color(p.txt),
-            );
-            ui.add_space(6.0);
-            self.help_dot(ui, p, topic);
-        });
+        let (dot, ()) = head_row(
+            ui,
+            p,
+            title,
+            theme::f_sb(14.5),
+            Some(self.help_open == Some(topic)),
+            |_| {},
+        );
+        if let Some(r) = dot {
+            self.on_help_dot(ui, &r, topic);
+        }
     }
 
     /// Overview tab: one summary card per capability, each with a `Manage →` jump.
@@ -14848,15 +15146,18 @@ impl App {
         let mut go_change = false;
         let mut cancel = false;
         theme::card_frame(p).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("PIN & sign-in")
-                        .font(theme::f_sb(14.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "pin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.adaptive_row(
+                ui,
+                |app, ui| {
+                    ui.label(
+                        egui::RichText::new("PIN & sign-in")
+                            .font(theme::f_sb(14.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    app.help_dot(ui, p, "pin");
+                },
+                |app, ui| {
                     let (kind, label) = match pin {
                         PinSupport::Set => (BtnKind::Default, "Change PIN"),
                         PinSupport::NotSet => (BtnKind::Primary, "Set a PIN"),
@@ -14865,24 +15166,24 @@ impl App {
                         PinSupport::Unknown | PinSupport::Unsupported => return,
                     };
                     if theme::button(ui, p, kind, label).clicked() {
-                        let open = !self.security_keys.change_pin.open;
+                        let open = !app.security_keys.change_pin.open;
                         // Replacing the dialog drops the old one, whose Drop
                         // zeroizes any typed PINs; then restore the toggle state.
-                        self.security_keys.change_pin = ChangePinDialog::default();
-                        self.security_keys.change_pin.open = open;
-                        self.security_keys.error = None;
+                        app.security_keys.change_pin = ChangePinDialog::default();
+                        app.security_keys.change_pin.open = open;
+                        app.security_keys.error = None;
                     }
                     // Lock the whole session here, where the lock/unlock state
                     // lives — locking ends access to passkeys, fingerprints and
                     // settings alike, so it doesn't belong inside one panel.
-                    if self.security_keys.session.is_some() {
+                    if app.security_keys.session.is_some() {
                         ui.add_space(6.0);
                         if theme::button(ui, p, BtnKind::Ghost, "Lock").clicked() {
-                            self.lock_session();
+                            app.lock_session();
                         }
                     }
-                });
-            });
+                },
+            );
             ui.add_space(8.0);
             match pin {
                 PinSupport::Set => {
@@ -15278,20 +15579,23 @@ impl App {
             // moment it leaves the credential listing.
             let mut save_cert: Option<(String, zeroize::Zeroizing<[u8; 32]>)> = None;
             theme::card_frame(p).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Resident passkeys")
-                            .font(theme::f_sb(14.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "passkeys");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Resident passkeys")
+                                .font(theme::f_sb(14.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "passkeys");
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
                             reload = true;
                         }
-                    });
-                });
+                    },
+                );
                 ui.add_space(8.0);
                 let session_info = self.security_keys.session.as_ref().map(|s| {
                     (
@@ -15480,20 +15784,23 @@ impl App {
             let mut do_refresh_fp = false;
             let mut fp_rename_commit: Option<(Vec<u8>, String)> = None;
             theme::card_frame(p).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Fingerprints")
-                            .font(theme::f_sb(14.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "fingerprint");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Fingerprints")
+                                .font(theme::f_sb(14.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "fingerprint");
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
                             do_refresh_fp = true;
                         }
-                    });
-                });
+                    },
+                );
                 ui.add_space(8.0);
 
                 // Enroll wizard now renders as a centered modal overlay
@@ -15648,20 +15955,23 @@ impl App {
         theme::card_frame(p)
             .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Reset this key")
-                            .font(theme::f_sb(14.5))
-                            .color(p.err),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "reset");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Reset this key")
+                                .font(theme::f_sb(14.5))
+                                .color(p.err),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "reset");
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Danger, "Reset key\u{2026}").clicked() {
                             arm_reset = true;
                         }
-                    });
-                });
+                    },
+                );
                 ui.label(
                     egui::RichText::new(
                         "Wipes every passkey and the PIN on this key. Cannot be undone.",
@@ -16101,16 +16411,19 @@ impl App {
 
         // Header + Load/Reload control.
         let mut do_load = false;
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Large blob storage")
-                    .font(theme::f_sb(14.5))
-                    .color(p.txt),
-            );
-            ui.add_space(6.0);
-            self.help_dot(ui, p, "large_blobs");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if self.security_keys.large_blobs.is_some() {
+        self.adaptive_row(
+            ui,
+            |app, ui| {
+                ui.label(
+                    egui::RichText::new("Large blob storage")
+                        .font(theme::f_sb(14.5))
+                        .color(p.txt),
+                );
+                ui.add_space(6.0);
+                app.help_dot(ui, p, "large_blobs");
+            },
+            |app, ui| {
+                let label = if app.security_keys.large_blobs.is_some() {
                     "Reload"
                 } else {
                     "Load"
@@ -16119,39 +16432,39 @@ impl App {
                     do_load = true;
                 }
                 ui.add_space(8.0);
-                let add_label = if self.security_keys.lb_show_add {
+                let add_label = if app.security_keys.lb_show_add {
                     "Close"
                 } else {
                     "Add"
                 };
                 if theme::button(ui, p, BtnKind::Ghost, add_label).clicked() {
-                    self.security_keys.lb_show_add = !self.security_keys.lb_show_add;
+                    app.security_keys.lb_show_add = !app.security_keys.lb_show_add;
                 }
                 // "Clear all storage" wipes every entry — the only way to erase
                 // plaintext notes a FIDO reset leaves behind. Show it only when
                 // there is something to clear and the session is unlocked (the
                 // write needs a PIN-derived token, like Delete). The first click
                 // arms a confirm; the confirmed click fires below.
-                let entry_count = self
+                let entry_count = app
                     .security_keys
                     .large_blobs
                     .as_ref()
                     .map(|a| a.len() + a.skipped_count())
                     .unwrap_or(0);
-                let unlocked = self.security_keys.session.is_some();
+                let unlocked = app.security_keys.session.is_some();
                 if entry_count > 0 && unlocked {
                     ui.add_space(8.0);
                     if theme::button(ui, p, BtnKind::Danger, "Clear all storage").clicked() {
-                        self.security_keys.lb_confirm_clear = true;
-                        self.security_keys.lb_keep_name = self
+                        app.security_keys.lb_confirm_clear = true;
+                        app.security_keys.lb_keep_name = app
                             .security_keys
                             .large_blobs
                             .as_ref()
                             .is_some_and(device::keep_name_default);
                     }
                 }
-            });
-        });
+            },
+        );
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
@@ -16285,45 +16598,48 @@ impl App {
                     EntryKind::Note(text) => Some(text.clone()),
                     _ => None,
                 };
-                ui.horizontal(|ui| {
-                    let title = if note_text.is_some() {
-                        format!("Note {}", idx + 1)
-                    } else {
-                        format!("Entry {}", idx + 1)
-                    };
-                    ui.label(
-                        egui::RichText::new(title)
-                            .font(theme::f_sb(13.0))
-                            .color(p.txt),
-                    );
-                    ui.add_space(8.0);
-                    let meta = match &classification {
-                        EntryKind::Note(_) => "keyroost text note".to_string(),
-                        EntryKind::KeyName(l) => device::key_name_row_text(&l.label),
-                        EntryKind::SshCert { .. } => format!(
-                            "ssh-cert \u{00b7} {} bytes \u{00b7} relying-party data",
-                            entry.ciphertext.len(),
-                        ),
-                        EntryKind::Opaque => format!(
-                            "{} bytes ciphertext \u{00b7} {}-byte nonce \u{00b7} origSize {} \u{00b7} relying-party data",
-                            entry.ciphertext.len(),
-                            entry.nonce.len(),
-                            entry.orig_size,
-                        ),
-                    };
-                    ui.label(
-                        egui::RichText::new(meta)
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |_, ui| {
+                        let title = if note_text.is_some() {
+                            format!("Note {}", idx + 1)
+                        } else {
+                            format!("Entry {}", idx + 1)
+                        };
+                        ui.label(
+                            egui::RichText::new(title)
+                                .font(theme::f_sb(13.0))
+                                .color(p.txt),
+                        );
+                        ui.add_space(8.0);
+                        let meta = match &classification {
+                            EntryKind::Note(_) => "keyroost text note".to_string(),
+                            EntryKind::KeyName(l) => device::key_name_row_text(&l.label),
+                            EntryKind::SshCert { .. } => format!(
+                                "ssh-cert \u{00b7} {} bytes \u{00b7} relying-party data",
+                                entry.ciphertext.len(),
+                            ),
+                            EntryKind::Opaque => format!(
+                                "{} bytes ciphertext \u{00b7} {}-byte nonce \u{00b7} origSize {} \u{00b7} relying-party data",
+                                entry.ciphertext.len(),
+                                entry.nonce.len(),
+                                entry.orig_size,
+                            ),
+                        };
+                        ui.label(
+                            egui::RichText::new(meta)
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                        );
+                    },
+                    |app, ui| {
                         if theme::button(ui, p, BtnKind::Danger, "Delete").clicked() {
                             delete_request = Some(idx);
                         }
                         let is_open = selected == Some(idx);
                         let toggle = if is_open { "Hide bytes" } else { "View bytes" };
                         if theme::button(ui, p, BtnKind::Ghost, toggle).clicked() {
-                            self.security_keys.lb_selected =
+                            app.security_keys.lb_selected =
                                 if is_open { None } else { Some(idx) };
                         }
                         // The key's name is changed with Rename, never here.
@@ -16348,15 +16664,15 @@ impl App {
                             } else {
                                 format!("large-blob-entry-{idx}.bin")
                             };
-                            self.spawn_file_dialog(
+                            app.spawn_file_dialog(
                                 FileTarget::LbExport(idx),
                                 true,
                                 &[("All files", &["*"])],
                                 Some(&default_name),
                             );
                         }
-                    });
-                });
+                    },
+                );
                 // keyroost notes: inline editor when editing this entry, else
                 // the decoded text read-only. SSH certificates get a parsed
                 // field-by-field view; anything else (opaque RP data) shows
@@ -16689,106 +17005,122 @@ impl App {
             let mut arm: Option<AdvancedAction> = None;
 
             // Always-UV (reversible toggle).
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Always require user verification")
-                            .font(theme::f_sb(13.0))
-                            .color(p.txt),
-                    );
-                    let state = match always_uv {
-                        Some(true) => "Currently on \u{2014} every sign-in needs PIN or biometric.",
-                        Some(false) => "Currently off.",
-                        None => "State unknown.",
-                    };
-                    ui.label(
-                        egui::RichText::new(state)
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Toggle").clicked() {
-                        arm = Some(AdvancedAction::ToggleAlwaysUv);
-                    }
-                });
-            });
-            ui.add_space(8.0);
-
-            // Set minimum PIN length (one-way).
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Set minimum PIN length")
-                            .font(theme::f_sb(13.0))
-                            .color(p.txt),
-                    );
-                    ui.label(
-                        egui::RichText::new("Can only be raised, never lowered without a reset.")
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
-                    );
-                    let current = match min_pin_length {
-                        Some(n) => format!("Current minimum: {} characters", n),
-                        None => "Current minimum: \u{2014}".to_string(),
-                    };
-                    ui.label(
-                        egui::RichText::new(current)
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Set\u{2026}").clicked() {
-                        arm = Some(AdvancedAction::SetMinPin);
-                    }
-                });
-            });
-            ui.add_space(8.0);
-
-            // Force PIN change.
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Force PIN change on next use")
-                            .font(theme::f_sb(13.0))
-                            .color(p.txt),
-                    );
-                    ui.label(
-                        egui::RichText::new("Useful before handing the key to someone else.")
-                            .font(theme::f_reg(11.5))
-                            .color(p.txt3),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Force\u{2026}").clicked() {
-                        arm = Some(AdvancedAction::ForcePinChange);
-                    }
-                });
-            });
-            // Enterprise attestation (one-way) — only shown on keys that
-            // support it (the `ep` getInfo option is present).
-            if supports_ep {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
+            self.adaptive_row(
+                ui,
+                |_, ui| {
                     ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new("Enable enterprise attestation")
+                            egui::RichText::new("Always require user verification")
                                 .font(theme::f_sb(13.0))
                                 .color(p.txt),
                         );
-                        let note = if ep_enabled {
-                            "Currently on. Disabling it again requires a device reset."
-                        } else {
-                            "One-way: disabling it again requires a device reset."
+                        let state = match always_uv {
+                            Some(true) => {
+                                "Currently on \u{2014} every sign-in needs PIN or biometric."
+                            }
+                            Some(false) => "Currently off.",
+                            None => "State unknown.",
                         };
                         ui.label(
-                            egui::RichText::new(note)
+                            egui::RichText::new(state)
                                 .font(theme::f_reg(11.5))
                                 .color(p.txt3),
                         );
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                },
+                |_, ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Toggle").clicked() {
+                        arm = Some(AdvancedAction::ToggleAlwaysUv);
+                    }
+                },
+            );
+            ui.add_space(8.0);
+
+            // Set minimum PIN length (one-way).
+            self.adaptive_row(
+                ui,
+                |_, ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Set minimum PIN length")
+                                .font(theme::f_sb(13.0))
+                                .color(p.txt),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Can only be raised, never lowered without a reset.",
+                            )
+                            .font(theme::f_reg(11.5))
+                            .color(p.txt3),
+                        );
+                        let current = match min_pin_length {
+                            Some(n) => format!("Current minimum: {} characters", n),
+                            None => "Current minimum: \u{2014}".to_string(),
+                        };
+                        ui.label(
+                            egui::RichText::new(current)
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                        );
+                    });
+                },
+                |_, ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Set\u{2026}").clicked() {
+                        arm = Some(AdvancedAction::SetMinPin);
+                    }
+                },
+            );
+            ui.add_space(8.0);
+
+            // Force PIN change.
+            self.adaptive_row(
+                ui,
+                |_, ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Force PIN change on next use")
+                                .font(theme::f_sb(13.0))
+                                .color(p.txt),
+                        );
+                        ui.label(
+                            egui::RichText::new("Useful before handing the key to someone else.")
+                                .font(theme::f_reg(11.5))
+                                .color(p.txt3),
+                        );
+                    });
+                },
+                |_, ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Force\u{2026}").clicked() {
+                        arm = Some(AdvancedAction::ForcePinChange);
+                    }
+                },
+            );
+            // Enterprise attestation (one-way) — only shown on keys that
+            // support it (the `ep` getInfo option is present).
+            if supports_ep {
+                ui.add_space(8.0);
+                self.adaptive_row(
+                    ui,
+                    |_, ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("Enable enterprise attestation")
+                                    .font(theme::f_sb(13.0))
+                                    .color(p.txt),
+                            );
+                            let note = if ep_enabled {
+                                "Currently on. Disabling it again requires a device reset."
+                            } else {
+                                "One-way: disabling it again requires a device reset."
+                            };
+                            ui.label(
+                                egui::RichText::new(note)
+                                    .font(theme::f_reg(11.5))
+                                    .color(p.txt3),
+                            );
+                        });
+                    },
+                    |_, ui| {
                         if ep_enabled {
                             // Already enabled: nothing actionable, show a pill.
                             theme::pill(ui, "Enabled", p.ok, p.ok_soft());
@@ -16796,8 +17128,8 @@ impl App {
                         {
                             arm = Some(AdvancedAction::EnterpriseAttestation);
                         }
-                    });
-                });
+                    },
+                );
             }
 
             if let Some(action) = arm {
@@ -17074,13 +17406,16 @@ impl App {
                 ui.set_max_width(300.0);
                 // Custom title at the button font size (the default window title
                 // bar is dropped via title_bar(false), so render our own).
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .font(theme::f_sb(13.0))
-                            .color(p.txt),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |_, ui| {
+                        ui.label(
+                            egui::RichText::new(title)
+                                .font(theme::f_sb(13.0))
+                                .color(p.txt),
+                        );
+                    },
+                    |_, ui| {
                         let (xr, xresp) =
                             ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                         let xcolor = if xresp.hovered() { p.txt } else { p.txt3 };
@@ -17088,8 +17423,8 @@ impl App {
                         if xresp.clicked() {
                             cancel = true;
                         }
-                    });
-                });
+                    },
+                );
                 ui.add_space(12.0);
                 if irreversible {
                     ui.label(
@@ -18196,6 +18531,7 @@ impl App {
                                     .map(|d| d.label())
                                     .unwrap_or_else(|| "Choose a slot\u{2026}".to_string());
                                 egui::ComboBox::from_id_salt("piv-move-dest")
+                                    .truncate()
                                     .selected_text(sel_text)
                                     .show_ui(ui, |ui| {
                                         for dest in &move_dests {
@@ -18686,35 +19022,36 @@ impl App {
             self.oath_tried = true;
             self.load_oath_creds();
         }
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Authenticator codes")
-                    .font(theme::f_sb(14.5))
-                    .color(p.txt),
-            );
-            ui.add_space(6.0);
-            self.help_dot(ui, p, "oath");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::button(ui, p, BtnKind::Primary, "+ Add credential").clicked() {
-                    // Opens the centered "New credential" modal (rendered in the
-                    // update loop alongside the other credential modals).
-                    self.oath.add = OathAddDialog::opened();
+        let (dot, chosen) = pane_head(
+            ui,
+            p,
+            "Authenticator codes",
+            self.help_open == Some("oath"),
+            &[
+                HeadButton::new("+ Add credential", BtnKind::Primary),
+                HeadButton::new("Import file\u{2026}", BtnKind::Default),
+                HeadButton::new("Refresh", BtnKind::Default),
+            ],
+            "oath_more_menu",
+        );
+        if let Some(r) = dot {
+            self.on_help_dot(ui, &r, "oath");
+        }
+        match chosen {
+            // Opens the centered "New credential" modal (rendered in the
+            // update loop alongside the other credential modals).
+            Some(0) => self.oath.add = OathAddDialog::opened(),
+            Some(1) => {
+                if let Some(id) = self.selected_device.clone() {
+                    self.import_pick_file(import_flow::Origin::View(import_flow::DestKey {
+                        device: id,
+                        store: import_flow::StoreKind::Oath,
+                    }));
                 }
-                ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked() {
-                    if let Some(id) = self.selected_device.clone() {
-                        self.import_pick_file(import_flow::Origin::View(import_flow::DestKey {
-                            device: id,
-                            store: import_flow::StoreKind::Oath,
-                        }));
-                    }
-                }
-                ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                    self.load_oath_creds();
-                }
-            });
-        });
+            }
+            Some(2) => self.load_oath_creds(),
+            _ => {}
+        }
         ui.add_space(12.0);
         if let Some(err) = &self.oath.error {
             ui.colored_label(p.err, err);
@@ -18852,18 +19189,21 @@ impl App {
         theme::card_frame(p)
             .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Reset applet")
-                            .font(theme::f_sb(14.5))
-                            .color(p.err),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |_, ui| {
+                        ui.label(
+                            egui::RichText::new("Reset applet")
+                                .font(theme::f_sb(14.5))
+                                .color(p.err),
+                        );
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
                             arm = true;
                         }
-                    });
-                });
+                    },
+                );
                 ui.label(
                     egui::RichText::new(
                         "Wipes every authenticator credential and clears the password. \
@@ -18900,20 +19240,23 @@ impl App {
         // admin (Card details, PINs) folded in as setting-rows.
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("OpenPGP card")
-                        .font(theme::f_sb(14.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "pgp");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.adaptive_row(
+                ui,
+                |app, ui| {
+                    ui.label(
+                        egui::RichText::new("OpenPGP card")
+                            .font(theme::f_sb(14.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    app.help_dot(ui, p, "pgp");
+                },
+                |_, ui| {
                     if theme::button(ui, p, BtnKind::Default, "Read status").clicked() {
                         do_refresh = true;
                     }
-                });
-            });
+                },
+            );
             ui.add_space(8.0);
             if let Some(err) = &self.openpgp.error {
                 ui.colored_label(p.err, err);
@@ -18966,15 +19309,18 @@ impl App {
             // Card details: cardholder name + public-key URL. The values are
             // typed in the per-row text fields; both writes prompt for the admin
             // PIN (PW3) in a dialog.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Card details")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "pgp-card-details");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.adaptive_row(
+                ui,
+                |app, ui| {
+                    ui.label(
+                        egui::RichText::new("Card details")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    app.help_dot(ui, p, "pgp-card-details");
+                },
+                |_, ui| {
                     if theme::button(ui, p, BtnKind::Default, "Set URL\u{2026}").clicked() {
                         open_modal = Some(OpenPgpCredKind::SetUrl);
                     }
@@ -18982,8 +19328,8 @@ impl App {
                     if theme::button(ui, p, BtnKind::Default, "Set name\u{2026}").clicked() {
                         open_modal = Some(OpenPgpCredKind::SetName);
                     }
-                });
-            });
+                },
+            );
             ui.add_space(6.0);
             text_field(
                 ui,
@@ -19006,15 +19352,18 @@ impl App {
             // PINs: change user / admin, unblock user. Each opens a dialog where
             // the PIN entry happens; nothing secret is typed inline.
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("PINs")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "pin");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.adaptive_row(
+                ui,
+                |app, ui| {
+                    ui.label(
+                        egui::RichText::new("PINs")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    app.help_dot(ui, p, "pin");
+                },
+                |_, ui| {
                     if theme::button(ui, p, BtnKind::Default, "Unblock user PIN\u{2026}").clicked()
                     {
                         open_modal = Some(OpenPgpCredKind::UnblockUserPin);
@@ -19028,8 +19377,8 @@ impl App {
                     if theme::button(ui, p, BtnKind::Default, "Change user PIN\u{2026}").clicked() {
                         open_modal = Some(OpenPgpCredKind::ChangeUserPin);
                     }
-                });
-            });
+                },
+            );
         });
 
         // --- Selected-key display data (shown under the key tab strip) -------
@@ -19113,20 +19462,23 @@ impl App {
             ui.set_min_width(ui.available_width());
 
             // Generate on-card: label + help left, Generate pinned right.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Generate on-card")
-                        .font(theme::f_sb(13.5))
-                        .color(p.txt),
-                );
-                ui.add_space(6.0);
-                self.help_dot(ui, p, "pgp-keys");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.adaptive_row(
+                ui,
+                |app, ui| {
+                    ui.label(
+                        egui::RichText::new("Generate on-card")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    app.help_dot(ui, p, "pgp-keys");
+                },
+                |_, ui| {
                     if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
                         open_modal = Some(OpenPgpCredKind::GenerateKey);
                     }
-                });
-            });
+                },
+            );
             note(
                 ui,
                 "Generating OVERWRITES this key (clearable only by a full reset). \
@@ -19146,20 +19498,23 @@ impl App {
                 self.help_dot(ui, p, "pgp-keys");
             });
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                text_field(
-                    ui,
-                    p,
-                    "From file",
-                    &mut self.openpgp.import_path,
-                    "/path/to/key.pem (PKCS#1/8, PEM or DER)",
-                    240.0,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            self.adaptive_row(
+                ui,
+                |app, ui| {
+                    text_field(
+                        ui,
+                        p,
+                        "From file",
+                        &mut app.openpgp.import_path,
+                        "/path/to/key.pem (PKCS#1/8, PEM or DER)",
+                        240.0,
+                    );
+                },
+                |_, ui| {
                     browse_import_key =
                         theme::button(ui, p, BtnKind::Default, "Browse\u{2026}").clicked();
-                });
-            });
+                },
+            );
             let have_path = !self.openpgp.import_path.trim().is_empty();
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -19183,20 +19538,23 @@ impl App {
             .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Reset applet")
-                            .font(theme::f_sb(14.5))
-                            .color(p.err),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "reset");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Reset applet")
+                                .font(theme::f_sb(14.5))
+                                .color(p.err),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "reset");
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Danger, "Reset applet\u{2026}").clicked() {
                             open_modal = Some(OpenPgpCredKind::Reset);
                         }
-                    });
-                });
+                    },
+                );
                 ui.label(
                     egui::RichText::new(
                         "Wipes ALL OpenPGP keys and restores default PINs. Works even if \
@@ -19383,20 +19741,23 @@ impl App {
         ui.add_enabled_ui(!self.piv.inflight, |ui| {
             theme::card_frame(p).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("PIV smart card")
-                            .font(theme::f_sb(14.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("PIV smart card")
+                                .font(theme::f_sb(14.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv");
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
                             do_refresh = true;
                         }
-                    });
-                });
+                    },
+                );
                 ui.add_space(8.0);
                 if let Some(err) = &self.piv.error {
                     ui.colored_label(p.err, err);
@@ -19490,15 +19851,18 @@ impl App {
                 ui.add_space(12.0);
 
                 // PIN & PUK: bold label + help left, the three actions right.
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("PIN & PUK")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "pin");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("PIN & PUK")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "pin");
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Default, "Unblock PIN\u{2026}").clicked() {
                             open_unblock = true;
                         }
@@ -19510,8 +19874,8 @@ impl App {
                         if theme::button(ui, p, BtnKind::Default, "Change PIN\u{2026}").clicked() {
                             open_change_pin = true;
                         }
-                    });
-                });
+                    },
+                );
 
                 // Retry counts: label + help left, the tries DragValues and the
                 // apply button right-aligned. SET PIN RETRIES (Yubico `INS
@@ -19524,19 +19888,22 @@ impl App {
                 // `Unverified` only adds the same warning marker Move key uses,
                 // leaving everything else live.
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Retry counts")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-admin");
-                    if matches!(set_retries_gate, FeatureGate::Unverified) {
-                        ui.add_space(4.0);
-                        theme::warn_marker(ui, p).on_hover_text(set_retries_unverified_hint.as_str());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Retry counts")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-admin");
+                        if matches!(set_retries_gate, FeatureGate::Unverified) {
+                            ui.add_space(4.0);
+                            theme::warn_marker(ui, p).on_hover_text(set_retries_unverified_hint.as_str());
+                        }
+                    },
+                    |app, ui| {
                         if matches!(set_retries_gate, FeatureGate::Unsupported) {
                             theme::button_disabled(ui, p, "Set retry counts\u{2026}")
                                 .on_hover_text(set_retries_blocked_hint.as_str());
@@ -19548,7 +19915,7 @@ impl App {
                         ui.add_space(8.0);
                         let retries_unsupported = matches!(set_retries_gate, FeatureGate::Unsupported);
                         // A disabled `DragValue` still renders whatever number
-                        // `self.piv.retries_{pin,puk}` currently holds — the
+                        // `app.piv.retries_{pin,puk}` currently holds — the
                         // factory-default `3` these two reset to just above, on
                         // a device that plain doesn't support setting retries at
                         // all. Left alone, that reads as a real reported count
@@ -19568,7 +19935,7 @@ impl App {
                         };
                         ui.add_enabled(
                             !retries_unsupported,
-                            egui::DragValue::new(&mut self.piv.retries_puk)
+                            egui::DragValue::new(&mut app.piv.retries_puk)
                                 .range(1..=15u8)
                                 .custom_formatter(blank_when_unsupported),
                         );
@@ -19580,7 +19947,7 @@ impl App {
                         ui.add_space(8.0);
                         ui.add_enabled(
                             !retries_unsupported,
-                            egui::DragValue::new(&mut self.piv.retries_pin)
+                            egui::DragValue::new(&mut app.piv.retries_pin)
                                 .range(1..=15u8)
                                 .custom_formatter(blank_when_unsupported),
                         );
@@ -19589,8 +19956,8 @@ impl App {
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt2),
                         );
-                    });
-                });
+                    },
+                );
 
                 // Management key: label + help left, algorithm combo and change
                 // button right-aligned.
@@ -19629,33 +19996,36 @@ impl App {
                     "No entry for this key in keyroost's list: {}.",
                     mgmt_alg_unverified.join(", ")
                 );
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Management key")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-admin");
-                    let extension_unverified = matches!(change_mgmt_key_gate, FeatureGate::Unverified);
-                    if extension_unverified || !mgmt_alg_unverified.is_empty() {
-                        ui.add_space(4.0);
-                        // Both hints can apply at once (whether the
-                        // management key can be changed at all, and which
-                        // algorithms an actual change could use) — combined
-                        // into one tooltip rather than two markers, same as
-                        // this row's other pairs of caveats.
-                        let combined_hint = match (extension_unverified, mgmt_alg_unverified.is_empty()) {
-                            (true, false) => {
-                                format!("{change_mgmt_key_unverified_hint} {mgmt_alg_unverified_hint}")
-                            }
-                            (true, true) => change_mgmt_key_unverified_hint.clone(),
-                            (false, false) => mgmt_alg_unverified_hint.clone(),
-                            (false, true) => unreachable!("guarded by the `if` above"),
-                        };
-                        theme::warn_marker(ui, p).on_hover_text(combined_hint.as_str());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Management key")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-admin");
+                        let extension_unverified = matches!(change_mgmt_key_gate, FeatureGate::Unverified);
+                        if extension_unverified || !mgmt_alg_unverified.is_empty() {
+                            ui.add_space(4.0);
+                            // Both hints can apply at once (whether the
+                            // management key can be changed at all, and which
+                            // algorithms an actual change could use) — combined
+                            // into one tooltip rather than two markers, same as
+                            // this row's other pairs of caveats.
+                            let combined_hint = match (extension_unverified, mgmt_alg_unverified.is_empty()) {
+                                (true, false) => {
+                                    format!("{change_mgmt_key_unverified_hint} {mgmt_alg_unverified_hint}")
+                                }
+                                (true, true) => change_mgmt_key_unverified_hint.clone(),
+                                (false, false) => mgmt_alg_unverified_hint.clone(),
+                                (false, true) => unreachable!("guarded by the `if` above"),
+                            };
+                            theme::warn_marker(ui, p).on_hover_text(combined_hint.as_str());
+                        }
+                    },
+                    |app, ui| {
                         if matches!(change_mgmt_key_gate, FeatureGate::Unsupported) {
                             theme::button_disabled(ui, p, "Change management key\u{2026}")
                                 .on_hover_text(change_mgmt_key_blocked_hint.as_str());
@@ -19674,32 +20044,35 @@ impl App {
                             piv_mgmtalg_combo(
                                 ui,
                                 "piv-new-mgmt-alg",
-                                &mut self.piv.new_mgmt_alg,
+                                &mut app.piv.new_mgmt_alg,
                                 mgmt_alg_options,
                                 mgmtalg_gate,
                             );
                         })
                         .response
                         .on_disabled_hover_text(change_mgmt_key_blocked_hint.as_str());
-                    });
-                });
+                    },
+                );
 
                 // CHUID: label + help left, the write action right-aligned.
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("CHUID")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-admin");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("CHUID")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-admin");
+                    },
+                    |_, ui| {
                         if theme::button(ui, p, BtnKind::Default, "New CHUID\u{2026}").clicked() {
                             open_new_chuid = true;
                         }
-                    });
-                });
+                    },
+                );
             });
         });
 
@@ -20177,30 +20550,33 @@ impl App {
                     "No entry for this key in keyroost's list: {}.",
                     unverified_algs.join(", ")
                 );
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Generate key")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-generate");
-                    // Same warn-triangle convention as Move/Delete/Reset key below:
-                    // sits right after the help dot rather than a printed line, so
-                    // "support unverified" reads the same way everywhere in this
-                    // pane instead of being the one section that just prints it.
-                    if !unverified_algs.is_empty() {
-                        ui.add_space(4.0);
-                        theme::warn_marker(ui, p).on_hover_text(gen_alg_unverified_hint.as_str());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Generate key")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-generate");
+                        // Same warn-triangle convention as Move/Delete/Reset key below:
+                        // sits right after the help dot rather than a printed line, so
+                        // "support unverified" reads the same way everywhere in this
+                        // pane instead of being the one section that just prints it.
+                        if !unverified_algs.is_empty() {
+                            ui.add_space(4.0);
+                            theme::warn_marker(ui, p).on_hover_text(gen_alg_unverified_hint.as_str());
+                        }
+                    },
+                    |app, ui| {
                         if theme::button(ui, p, BtnKind::Default, "Generate\u{2026}").clicked() {
                             open_generate = true;
                         }
                         ui.add_space(8.0);
-                        piv_keyalg_combo(ui, "piv-gen-alg", &mut self.piv.gen_alg, keyalg_gate);
-                    });
-                });
+                        piv_keyalg_combo(ui, "piv-gen-alg", &mut app.piv.gen_alg, keyalg_gate);
+                    },
+                );
                 // Derived from the per-device session cache rather than a
                 // dedicated field: that cache now survives switching to
                 // another device's tab and back (see `App::piv_session_state`'s
@@ -20254,17 +20630,20 @@ impl App {
                 // with the same reason when the slot has none. "Sign & save
                 // CSR" opens a save dialog first (see `drain_file_dialogs`);
                 // "Self-signed -> slot" opens the PIN / management-key modal.
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Certificate")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-certificate");
-                    // right_to_left: add "Self-signed" first so it sits at the
-                    // far right, then "Sign & save CSR" to its left.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Certificate")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-certificate");
+                        // right_to_left: add "Self-signed" first so it sits at the
+                        // far right, then "Sign & save CSR" to its left.
+                    },
+                    |_, ui| {
                         if selected_has_key && sel_key_can_sign {
                             if theme::button(ui, p, BtnKind::Default, "Self-signed \u{2192} slot")
                                 .clicked()
@@ -20295,8 +20674,8 @@ impl App {
                                 },
                             );
                         }
-                    });
-                });
+                    },
+                );
                 ui.add_space(6.0);
                 text_field(
                     ui,
@@ -20536,17 +20915,20 @@ impl App {
                 // (`slot_confirmed_empty`, same gate "Delete key" uses) — an
                 // unconfirmed reading leaves it enabled, since a matching key may
                 // have been loaded out of band this session can't see.
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Import/Export cert")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-import-export");
-                    // right_to_left: add "Export" first so it sits at the far
-                    // right, then "Import" to its left.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Import/Export cert")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-import-export");
+                        // right_to_left: add "Export" first so it sits at the far
+                        // right, then "Import" to its left.
+                    },
+                    |_, ui| {
                         if selected_has_cert {
                             if theme::button(ui, p, BtnKind::Default, "Export certificate\u{2026}")
                                 .clicked()
@@ -20571,8 +20953,8 @@ impl App {
                         {
                             open_import = true;
                         }
-                    });
-                });
+                    },
+                );
 
                 ui.add_space(12.0);
                 // --- Move key: its own row, above Delete. It used to be a button
@@ -20582,24 +20964,27 @@ impl App {
                 // look. The row is always shown so the capability stays
                 // discoverable; the button is dimmed with a hover reason when the
                 // slot has no key to move, or on pre-5.7 firmware.
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Move key")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-move");
-                    // Support-unverified warning sits right after the help dot, by
-                    // the operation's own explanation — not out by the button. It
-                    // reflects the device's MOVE KEY support, so it shows whether or
-                    // not this slot currently has a key for the button to act on
-                    // (the button may be dimmed for "no key" underneath it).
-                    if matches!(move_key_gate, FeatureGate::Unverified) {
-                        ui.add_space(4.0);
-                        theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Move key")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-move");
+                        // Support-unverified warning sits right after the help dot, by
+                        // the operation's own explanation — not out by the button. It
+                        // reflects the device's MOVE KEY support, so it shows whether or
+                        // not this slot currently has a key for the button to act on
+                        // (the button may be dimmed for "no key" underneath it).
+                        if matches!(move_key_gate, FeatureGate::Unverified) {
+                            ui.add_space(4.0);
+                            theme::warn_marker(ui, p).on_hover_text(move_key_unverified_hint.as_str());
+                        }
+                    },
+                    |_, ui| {
                         match move_key_gate {
                             // Known-unsupported on this device wins over "no key": the
                             // firmware reason is the one the user has to resolve
@@ -20622,32 +21007,35 @@ impl App {
                                 }
                             }
                         }
-                    });
-                });
+                    },
+                );
                 ui.add_space(12.0);
                 // --- Delete: bold label + help left, the two delete
                 // actions right-aligned (Delete key is Danger, gated 5.7+).
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Delete")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-delete");
-                    // Support-unverified warning for "Delete key" sits here, beside
-                    // the row's help dot — not out by the button — so its hover
-                    // text names "Delete key" explicitly and spells out that
-                    // "Delete certificate" (the other button on this row) is
-                    // standard PIV and unaffected.
-                    if matches!(delete_key_gate, FeatureGate::Unverified) {
-                        ui.add_space(4.0);
-                        theme::warn_marker(ui, p).on_hover_text(format!(
-                            "{delete_key_unverified_hint} \u{201c}Delete certificate\u{201d} is \
-                         standard PIV and unaffected."
-                        ));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Delete")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-delete");
+                        // Support-unverified warning for "Delete key" sits here, beside
+                        // the row's help dot — not out by the button — so its hover
+                        // text names "Delete key" explicitly and spells out that
+                        // "Delete certificate" (the other button on this row) is
+                        // standard PIV and unaffected.
+                        if matches!(delete_key_gate, FeatureGate::Unverified) {
+                            ui.add_space(4.0);
+                            theme::warn_marker(ui, p).on_hover_text(format!(
+                                "{delete_key_unverified_hint} \u{201c}Delete certificate\u{201d} is \
+                             standard PIV and unaffected."
+                            ));
+                        }
+                    },
+                    |_, ui| {
                         match delete_key_gate {
                             // Unsupported blocks outright, regardless of slot
                             // content — an operation the device can't run at all
@@ -20703,8 +21091,8 @@ impl App {
                             theme::button_disabled(ui, p, "Delete certificate\u{2026}")
                                 .on_hover_text(no_del_cert_hint);
                         }
-                    });
-                });
+                    },
+                );
 
                 // --- Test: one button that runs every self-test the selected
                 // slot's key supports (decrypt / key-agree / sign, in that order)
@@ -20714,16 +21102,19 @@ impl App {
                 // below the other slot actions, since it's a diagnostic rather
                 // than a slot-management action.
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Test")
-                            .font(theme::f_sb(13.5))
-                            .color(p.txt),
-                    );
-                    ui.add_space(6.0);
-                    self.help_dot(ui, p, "piv-test");
-                    let (test_alg, test_has_cert) = self.piv_selected_test_target();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (test_alg, test_has_cert) = self.piv_selected_test_target();
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Test")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-test");
+                    },
+                    |_, ui| {
                         if test_has_cert && test_alg.is_some() {
                             if theme::button(ui, p, BtnKind::Default, "Test\u{2026}").clicked() {
                                 open_self_test = true;
@@ -20740,8 +21131,8 @@ impl App {
                             .inner
                             .on_disabled_hover_text(why);
                         }
-                    });
-                });
+                    },
+                );
             });
             ui.add_space(12.0);
 
@@ -20752,22 +21143,25 @@ impl App {
                 .stroke(egui::Stroke::new(1.0, theme::tint(p.err, 90)))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Reset applet")
-                                .font(theme::f_sb(14.5))
-                                .color(p.err),
-                        );
-                        ui.add_space(6.0);
-                        self.help_dot(ui, p, "reset");
-                        // Same three-way gate as Move key / Delete key, from the
-                        // same `keyroost_piv::compat` known-support table — see
-                        // `reset_gate`'s definition above.
-                        if matches!(reset_gate, FeatureGate::Unverified) {
-                            ui.add_space(4.0);
-                            theme::warn_marker(ui, p).on_hover_text(reset_unverified_hint.as_str());
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.adaptive_row(
+                        ui,
+                        |app, ui| {
+                            ui.label(
+                                egui::RichText::new("Reset applet")
+                                    .font(theme::f_sb(14.5))
+                                    .color(p.err),
+                            );
+                            ui.add_space(6.0);
+                            app.help_dot(ui, p, "reset");
+                            // Same three-way gate as Move key / Delete key, from the
+                            // same `keyroost_piv::compat` known-support table — see
+                            // `reset_gate`'s definition above.
+                            if matches!(reset_gate, FeatureGate::Unverified) {
+                                ui.add_space(4.0);
+                                theme::warn_marker(ui, p).on_hover_text(reset_unverified_hint.as_str());
+                            }
+                        },
+                        |_, ui| {
                             match reset_gate {
                                 // Unverified still runs — the card refuses if it
                                 // truly can't — so the button stays live; only
@@ -20787,8 +21181,8 @@ impl App {
                                         .on_hover_text(reset_blocked_hint.as_str());
                                 }
                             }
-                        });
-                    });
+                        },
+                    );
                     ui.label(
                         egui::RichText::new(if matches!(reset_gate, FeatureGate::Supported) {
                             // Known-supported: `force_reset_if_known_supported`
@@ -21067,76 +21461,108 @@ impl App {
         egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(26, 16))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    glyph_tile(ui, 46.0, p.brand, p.accent_ink, None);
-                    ui.add_space(12.0);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
+                // Same rules as the security-key hero: "Connected" goes first
+                // against the right edge (only the dot when the name column
+                // would get tight), and the badge, "?" and naming link flow
+                // onto the next line rather than past the window edge.
+                let connected_text = ui.available_width()
+                    - 58.0
+                    - text_width(ui, "Connected", theme::f_sb(12.5))
+                    - 13.0
+                    >= 260.0;
+                egui::Sides::new().height(46.0).shrink_left().show(
+                    ui,
+                    |ui| {
+                        glyph_tile(ui, 46.0, p.brand, p.accent_ink, None);
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| {
                             if self.rename_target.is_some() {
-                                (do_save, do_cancel) = self.rename_field_row(ui, p);
+                                ui.horizontal(|ui| {
+                                    (do_save, do_cancel) = self.rename_field_row(ui, p);
+                                });
+                                // A token can't hold its own name: this computer only.
+                                self.rename_details(ui, p, "token");
                             } else {
-                                ui.label(
-                                    egui::RichText::new(dev.title())
-                                        .font(theme::f_bold(21.0))
-                                        .color(p.txt),
-                                );
-                                ui.add_space(6.0);
-                                theme::pill(ui, "Programmable TOTP token", p.brand, p.brand_soft());
-                                ui.add_space(4.0);
-                                self.help_dot(ui, p, "molto");
-                                ui.add_space(6.0);
-                                let label = if dev.name.is_some() {
-                                    "Rename"
-                                } else {
-                                    "Name this token"
-                                };
-                                if ui
-                                    .add(
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(label)
-                                                .font(theme::f_sb(12.0))
-                                                .color(p.accent),
+                                            egui::RichText::new(dev.title())
+                                                .font(theme::f_bold(21.0))
+                                                .color(p.txt),
                                         )
-                                        .sense(egui::Sense::click()),
-                                    )
-                                    .clicked()
-                                {
-                                    open_rename = true;
-                                }
+                                        .truncate(),
+                                    );
+                                    ui.add_space(6.0);
+                                    theme::pill(
+                                        ui,
+                                        "Programmable TOTP token",
+                                        p.brand,
+                                        p.brand_soft(),
+                                    );
+                                    ui.add_space(4.0);
+                                    self.help_dot(ui, p, "molto");
+                                    ui.add_space(6.0);
+                                    let label = if dev.name.is_some() {
+                                        "Rename"
+                                    } else {
+                                        "Name this token"
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new(label)
+                                                    .font(theme::f_sb(12.0))
+                                                    .color(p.accent),
+                                            )
+                                            .extend()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .clicked()
+                                    {
+                                        open_rename = true;
+                                    }
+                                });
                             }
-                        });
-                        if self.rename_target.is_some() {
-                            // A token can't hold its own name: this computer only.
-                            self.rename_details(ui, p, "token");
-                        }
-                        ui.add_space(2.0);
-                        let serial = if dev.serial.is_empty() {
-                            "\u{2014}".to_string()
-                        } else {
-                            dev.serial.clone()
-                        };
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} \u{00B7} #{} \u{00B7} {} slots",
-                                dev.vendor, serial, PROFILES
-                            ))
-                            .font(theme::f_reg(12.5))
-                            .color(p.txt2),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new("Connected")
-                                .font(theme::f_sb(12.5))
+                            ui.add_space(2.0);
+                            let serial = if dev.serial.is_empty() {
+                                "\u{2014}".to_string()
+                            } else {
+                                dev.serial.clone()
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} \u{00B7} #{} \u{00B7} {} slots",
+                                    dev.vendor, serial, PROFILES
+                                ))
+                                .font(theme::f_reg(12.5))
                                 .color(p.txt2),
-                        );
-                        ui.add_space(5.0);
+                            );
+                        });
+                    },
+                    |ui| {
+                        if connected_text {
+                            ui.label(
+                                egui::RichText::new("Connected")
+                                    .font(theme::f_sb(12.5))
+                                    .color(p.txt2),
+                            );
+                            ui.add_space(5.0);
+                        }
                         theme::status_dot(ui, p.ok, 8.0);
-                    });
-                });
+                    },
+                );
             });
         self.apply_rename_actions(dev, open_rename, do_cancel, do_save);
 
+        // Everything below the hero scrolls once it is taller than the window
+        // (large text, short window). Text wraps at the room it has.
+        let view_h = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("molto-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        let content_top = ui.cursor().top();
         // --- Device-wide settings (apply to the whole token) ---
         egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(26, 14))
@@ -21148,7 +21574,7 @@ impl App {
                         self.help_dot(ui, p, "molto");
                     });
                     ui.add_space(10.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.add_sized(
                             [104.0, 22.0],
                             egui::Label::new(egui::RichText::new("Customer key").font(theme::f_reg(13.0)).color(p.txt2)),
@@ -21163,7 +21589,13 @@ impl App {
                             &mut self.customer_key_input,
                             &mut rev,
                             "default if empty",
-                            200.0,
+                            // Room left on this line after the eye toggle (in a
+                            // wrapping row `available_width` is the whole line).
+                            (ui.max_rect().right()
+                                - ui.cursor().min.x
+                                - 26.0
+                                - 2.0 * ui.spacing().item_spacing.x)
+                                .clamp(80.0, 200.0),
                         );
                         self.secret_reveal.insert("customer-key", rev);
                         ui.checkbox(&mut self.customer_key_hex, "hex");
@@ -21181,7 +21613,7 @@ impl App {
                             .color(p.txt3),
                     );
                     ui.add_space(12.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         // Re-read every slot's public block on demand — keyless,
                         // so it works without authenticating. Covers a factory
                         // reset (which clears the list) and a failed open-sweep.
@@ -21247,15 +21679,30 @@ impl App {
                             .color(p.txt3),
                     );
                     ui.add_space(10.0);
-                    ui.horizontal_top(|ui| {
+                    // The slot list sits beside the editor when both fit, and
+                    // above it otherwise.
+                    let side_by_side = ui.available_width() >= 212.0 + 24.0 + 380.0;
+                    let layout = if side_by_side {
+                        egui::Layout::left_to_right(egui::Align::Min)
+                    } else {
+                        egui::Layout::top_down(egui::Align::Min)
+                    };
+                    ui.with_layout(layout, |ui| {
                         ui.vertical(|ui| {
                             // Wide enough for "Slot NN · " plus a full 12-char
                             // title (the device's title limit) in the mono font,
                             // with the seed dot clear of the text.
                             ui.set_width(212.0);
-                            // Fill the remaining height so the rail isn't a fixed
-                            // block jammed at the window bottom; leave a margin.
-                            let rail_h = (ui.available_height() - 48.0).max(160.0);
+                            // Fill the rest of the window's height so the rail
+                            // isn't a fixed block jammed at the window bottom;
+                            // leave a margin. Measured from the page top, not
+                            // the scrolled position, so scrolling never resizes
+                            // it. Above the editor it stays short.
+                            let rail_h = if side_by_side {
+                                (view_h - (ui.cursor().top() - content_top) - 48.0).max(160.0)
+                            } else {
+                                240.0
+                            };
                             let mut pick = None;
                             egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(rail_h).show(ui, |ui| {
                                 for s in 0..PROFILES {
@@ -21319,7 +21766,7 @@ impl App {
                             ui.label(egui::RichText::new(format!("SLOT {:02}", self.slot)).font(theme::f_bold(11.0)).color(p.brand));
                             ui.add_space(10.0);
                             editor_row(ui, p, "Title", |ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(360.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.draft.title).hint_text("\u{2264} 12 chars").desired_width(ui.available_width().min(360.0)));
                             });
                             editor_row(ui, p, "Secret", |ui| {
                                 let mut rev = self
@@ -21333,7 +21780,7 @@ impl App {
                                     &mut self.draft.secret_base32,
                                     &mut rev,
                                     "base32 secret",
-                                    360.0,
+                                    (ui.available_width() - 34.0).clamp(80.0, 360.0),
                                 );
                                 self.secret_reveal.insert("molto-secret", rev);
                             });
@@ -21341,61 +21788,91 @@ impl App {
                             let field_label = |ui: &mut egui::Ui, w: f32, text: &str| {
                                 ui.add_sized([w, 22.0], egui::Label::new(egui::RichText::new(text).font(theme::f_reg(13.0)).color(p.txt2)));
                             };
-                            ui.horizontal(|ui| {
+                            // Two choices per line when they fit, one per line
+                            // otherwise (a choice group can't wrap inside itself).
+                            let two_per_line = ui.available_width() >= 440.0;
+                            let algorithm = |ui: &mut egui::Ui, draft: &mut Draft| {
                                 field_label(ui, 92.0, "Algorithm");
-                                let cur = match self.draft.algorithm {
+                                let cur = match draft.algorithm {
                                     AlgoChoice::Sha1 => "SHA1",
                                     AlgoChoice::Sha256 => "SHA256",
                                 };
                                 if let Some(v) = theme::segmented(ui, p, &["SHA1", "SHA256"], cur, p.brand) {
-                                    self.draft.algorithm = if v == "SHA256" { AlgoChoice::Sha256 } else { AlgoChoice::Sha1 };
+                                    draft.algorithm = if v == "SHA256" { AlgoChoice::Sha256 } else { AlgoChoice::Sha1 };
                                 }
-                                ui.add_space(30.0);
-                                field_label(ui, 50.0, "Digits");
-                                let cur = match self.draft.digits {
+                            };
+                            let digits = |ui: &mut egui::Ui, draft: &mut Draft, w: f32| {
+                                field_label(ui, w, "Digits");
+                                let cur = match draft.digits {
                                     DigitsChoice::Four => "4",
                                     DigitsChoice::Six => "6",
                                     DigitsChoice::Eight => "8",
                                     DigitsChoice::Ten => "10",
                                 };
                                 if let Some(v) = theme::segmented(ui, p, &["4", "6", "8", "10"], cur, p.brand) {
-                                    self.draft.digits = match v.as_str() {
+                                    draft.digits = match v.as_str() {
                                         "4" => DigitsChoice::Four,
                                         "8" => DigitsChoice::Eight,
                                         "10" => DigitsChoice::Ten,
                                         _ => DigitsChoice::Six,
                                     };
                                 }
-                            });
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
+                            };
+                            let time_step = |ui: &mut egui::Ui, draft: &mut Draft| {
                                 field_label(ui, 92.0, "Time step");
-                                let cur = match self.draft.time_step {
+                                let cur = match draft.time_step {
                                     StepChoice::S30 => "30s",
                                     StepChoice::S60 => "60s",
                                 };
                                 if let Some(v) = theme::segmented(ui, p, &["30s", "60s"], cur, p.brand) {
-                                    self.draft.time_step = if v == "60s" { StepChoice::S60 } else { StepChoice::S30 };
+                                    draft.time_step = if v == "60s" { StepChoice::S60 } else { StepChoice::S30 };
                                 }
-                                ui.add_space(30.0);
-                                field_label(ui, 50.0, "Display");
-                                let cur = match self.draft.display_timeout {
+                            };
+                            let display = |ui: &mut egui::Ui, draft: &mut Draft, w: f32| {
+                                field_label(ui, w, "Display");
+                                let cur = match draft.display_timeout {
                                     TimeoutChoice::S15 => "15s",
                                     TimeoutChoice::S30 => "30s",
                                     TimeoutChoice::S60 => "60s",
                                     TimeoutChoice::S120 => "120s",
                                 };
                                 if let Some(v) = theme::segmented(ui, p, &["15s", "30s", "60s", "120s"], cur, p.brand) {
-                                    self.draft.display_timeout = match v.as_str() {
+                                    draft.display_timeout = match v.as_str() {
                                         "15s" => TimeoutChoice::S15,
                                         "60s" => TimeoutChoice::S60,
                                         "120s" => TimeoutChoice::S120,
                                         _ => TimeoutChoice::S30,
                                     };
                                 }
-                            });
+                            };
+                            let draft = &mut self.draft;
+                            if two_per_line {
+                                ui.horizontal(|ui| {
+                                    algorithm(ui, draft);
+                                    ui.add_space(30.0);
+                                    digits(ui, draft, 50.0);
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    time_step(ui, draft);
+                                    ui.add_space(30.0);
+                                    display(ui, draft, 50.0);
+                                });
+                            } else {
+                                for row in 0..4 {
+                                    if row > 0 {
+                                        ui.add_space(8.0);
+                                    }
+                                    ui.horizontal(|ui| match row {
+                                        0 => algorithm(ui, draft),
+                                        1 => digits(ui, draft, 92.0),
+                                        2 => time_step(ui, draft),
+                                        _ => display(ui, draft, 92.0),
+                                    });
+                                }
+                            }
                             ui.add_space(8.0);
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if theme::button(ui, p, BtnKind::Primary, "Write to slot").clicked() {
                                     self.apply_draft();
                                 }
@@ -21455,6 +21932,7 @@ impl App {
                         });
                     });
                 });
+            });
             });
     }
 
