@@ -634,7 +634,7 @@ fn capabilities(algo: u8) -> u8 {
     }
 }
 
-fn key_type(part: &KeyPart) -> Option<KeyType> {
+pub(crate) fn key_type(part: &KeyPart) -> Option<KeyType> {
     match &part.material {
         Material::Rsa { n, .. } => {
             let start = n.iter().position(|&b| b != 0)?;

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side RSA-2048 key material (generate / load) for OpenPGP card import."
+description = "Host-side RSA key material (generate / load, 2048-4096 bits) for OpenPGP card import."
 
 [lints]
 workspace = true

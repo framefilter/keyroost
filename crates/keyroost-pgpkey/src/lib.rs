@@ -7,6 +7,8 @@
 use std::fmt;
 
 pub mod armor;
+#[cfg(feature = "card")]
+pub mod card;
 pub mod cert;
 pub mod files;
 pub mod keys;

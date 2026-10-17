@@ -942,6 +942,24 @@ impl Curve {
         }
     }
 
+    /// Bytes of a private scalar (and field element) on this curve: the
+    /// width the card wants the `92` key-import field padded to. The 25519
+    /// pair, P-256, secp256k1 and brainpoolP256r1 are 32; P-384 and
+    /// brainpoolP384r1 48; brainpoolP512r1 64; P-521 66.
+    #[must_use]
+    pub const fn field_len(self) -> usize {
+        match self {
+            Curve::Ed25519
+            | Curve::X25519
+            | Curve::NistP256
+            | Curve::Secp256k1
+            | Curve::BrainpoolP256r1 => 32,
+            Curve::NistP384 | Curve::BrainpoolP384r1 => 48,
+            Curve::BrainpoolP512r1 => 64,
+            Curve::NistP521 => 66,
+        }
+    }
+
     /// Whether the public point is the 32-byte 25519 form (which the OpenPGP
     /// packet prefixes with `0x40`) rather than an uncompressed `04||X||Y`.
     #[must_use]
@@ -1708,6 +1726,135 @@ pub fn import_rsa_key_chained(
     max_chunk: usize,
 ) -> Result<Vec<Vec<u8>>, ExponentTooWide> {
     let header_list = Zeroizing::new(extended_header_list(crt, key, format, e_bits)?);
+    Ok(put_data_odd_chained(0x3F, 0xFF, &header_list, max_chunk))
+}
+
+/// ECC private key material for a card import: the private scalar and,
+/// for cards that ask for it, the public point.
+///
+/// For ECDSA and ECDH `scalar` is the private scalar, big-endian. For
+/// EdDSA it is the 32-byte Ed25519 seed (the card derives the scalar and
+/// point from it, as for a generated key). `public` is the point as the
+/// card returns it from READ PUBLIC KEY (`04||X||Y`, or the raw 32 bytes
+/// for the 25519 curves); send it only when the slot's algorithm
+/// attributes end in `0xFF` ("import with public key", OpenPGP Card spec
+/// v3.4 §4.4.3.10), since other cards reject an unexpected `99`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EccPrivateKeyParts<'a> {
+    /// The private scalar (or Ed25519 seed), big-endian.
+    pub scalar: &'a [u8],
+    /// The public point, sent as tag `99` when present.
+    pub public: Option<&'a [u8]>,
+}
+
+/// The private scalar is wider than the curve's field, so it is not a key
+/// on that curve; padding works one way only, and cutting bytes off would
+/// import a different key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarTooWide {
+    /// Byte length of the scalar after dropping one leading zero.
+    pub scalar_len: usize,
+    /// The curve's field length ([`Curve::field_len`]).
+    pub field_len: usize,
+}
+
+impl core::fmt::Display for ScalarTooWide {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "ECC private key ({} bytes) is wider than its curve's field ({} bytes)",
+            self.scalar_len, self.field_len
+        )
+    }
+}
+
+impl std::error::Error for ScalarTooWide {}
+
+/// Build the `0x4D` Extended Header List for an ECC key import (OpenPGP
+/// Card spec v3.4, §4.4.3.12) — the ECC counterpart of
+/// [`extended_header_list`]:
+///
+/// ```text
+/// 4D <len>
+///    <CRT>                     B6 00 / B8 00 / A4 00
+///    7F48 <len> 92 .. [99 ..]  template: scalar length [, public length]
+///    5F48 <len> <scalar>[<pub>] the field bytes, same order
+/// ```
+///
+/// The scalar is left zero-padded to `field_len` bytes (an MPI drops
+/// leading zeros, the card wants the full field — GnuPG pads the same
+/// way); one leading zero beyond the field is dropped. A scalar still wider
+/// than `field_len` is [`ScalarTooWide`].
+pub fn ecc_extended_header_list(
+    crt: KeyCrt,
+    key: &EccPrivateKeyParts,
+    field_len: usize,
+) -> Result<Vec<u8>, ScalarTooWide> {
+    let scalar = if key.scalar.len() > field_len {
+        strip_leading_zero(key.scalar)
+    } else {
+        key.scalar
+    };
+    if scalar.len() > field_len {
+        return Err(ScalarTooWide {
+            scalar_len: scalar.len(),
+            field_len,
+        });
+    }
+
+    let mut template = key_template_entry(0x92, field_len);
+    if let Some(public) = key.public {
+        template.extend_from_slice(&key_template_entry(0x99, public.len()));
+    }
+
+    // The private scalar: wiped on drop, like the RSA builder's buffers.
+    let mut key_data = Zeroizing::new(vec![0u8; field_len - scalar.len()]);
+    key_data.extend_from_slice(scalar);
+    if let Some(public) = key.public {
+        key_data.extend_from_slice(public);
+    }
+
+    let mut body = Zeroizing::new(Vec::new());
+    body.extend_from_slice(&[crt.tag(), 0x00]);
+    body.extend_from_slice(&ber_tlv(0x7F48, &template));
+    body.extend_from_slice(&Zeroizing::new(ber_tlv(0x5F48, &key_data)));
+
+    Ok(ber_tlv(0x4D, &body))
+}
+
+/// The full PUT DATA APDU that imports an ECC private key into `crt`'s slot:
+/// `00 DB 3F FF <extended Lc> <4D>` (see [`ecc_extended_header_list`] and
+/// [`import_rsa_key`]). Requires a verified PW3; the slot's algorithm
+/// attributes must already name the key's curve.
+pub fn import_ecc_key(
+    crt: KeyCrt,
+    key: &EccPrivateKeyParts,
+    field_len: usize,
+) -> Result<Vec<u8>, ScalarTooWide> {
+    let header_list = Zeroizing::new(ecc_extended_header_list(crt, key, field_len)?);
+    Ok(build_apdu_extended(
+        0x00,
+        INS_PUT_DATA_ODD,
+        0x3F,
+        0xFF,
+        &header_list,
+    ))
+}
+
+/// Command-chaining form of [`import_ecc_key`] (see
+/// [`put_data_odd_chained`]): the same `4D` object in links of at most
+/// `max_chunk` bytes.
+///
+/// # Panics
+/// Panics if `max_chunk` is 0 or greater than 255, as
+/// [`put_data_odd_chained`] does.
+pub fn import_ecc_key_chained(
+    crt: KeyCrt,
+    key: &EccPrivateKeyParts,
+    field_len: usize,
+    max_chunk: usize,
+) -> Result<Vec<Vec<u8>>, ScalarTooWide> {
+    let header_list = Zeroizing::new(ecc_extended_header_list(crt, key, field_len)?);
     Ok(put_data_odd_chained(0x3F, 0xFF, &header_list, max_chunk))
 }
 
@@ -3398,6 +3545,151 @@ mod tests {
                 field_len: 1
             }
         );
+    }
+
+    #[test]
+    fn curve_field_lengths() {
+        assert_eq!(Curve::Ed25519.field_len(), 32);
+        assert_eq!(Curve::X25519.field_len(), 32);
+        assert_eq!(Curve::NistP256.field_len(), 32);
+        assert_eq!(Curve::Secp256k1.field_len(), 32);
+        assert_eq!(Curve::NistP384.field_len(), 48);
+        assert_eq!(Curve::NistP521.field_len(), 66);
+        assert_eq!(Curve::BrainpoolP256r1.field_len(), 32);
+        assert_eq!(Curve::BrainpoolP384r1.field_len(), 48);
+        assert_eq!(Curve::BrainpoolP512r1.field_len(), 64);
+    }
+
+    #[test]
+    fn ecc_header_list_pads_a_short_scalar() {
+        // A P-256 scalar whose top byte is zero arrives as 31 bytes; the card
+        // wants the full 32-byte field, so it is left-padded.
+        let scalar = [0x11u8; 31];
+        let key = EccPrivateKeyParts {
+            scalar: &scalar,
+            public: None,
+        };
+        let ehl = ecc_extended_header_list(KeyCrt::Sign, &key, 32).unwrap();
+        let mut want = vec![
+            0x4D, 0x2A, // 4D, 42 bytes
+            0xB6, 0x00, // signature slot
+            0x7F, 0x48, 0x02, 0x92, 0x20, // template: 92 = 32-byte scalar
+            0x5F, 0x48, 0x20, 0x00, // 5F48, 32 bytes, the pad byte
+        ];
+        want.extend_from_slice(&scalar);
+        assert_eq!(ehl, want);
+    }
+
+    #[test]
+    fn ecc_header_list_with_public_point() {
+        let scalar = [0x22u8; 32];
+        let mut point = vec![0x04u8];
+        point.extend_from_slice(&[0x33u8; 64]);
+        let key = EccPrivateKeyParts {
+            scalar: &scalar,
+            public: Some(&point),
+        };
+        let ehl = ecc_extended_header_list(KeyCrt::Decrypt, &key, 32).unwrap();
+        let mut want = vec![
+            0x4D, 0x6D, // 4D, 109 bytes
+            0xB8, 0x00, // decryption slot
+            0x7F, 0x48, 0x04, 0x92, 0x20, 0x99, 0x41, // scalar 32, public 65
+            0x5F, 0x48, 0x61, // 97 bytes: scalar || point
+        ];
+        want.extend_from_slice(&scalar);
+        want.extend_from_slice(&point);
+        assert_eq!(ehl, want);
+    }
+
+    #[test]
+    fn ecc_header_list_ed25519_seed() {
+        let seed = [0x44u8; 32];
+        let key = EccPrivateKeyParts {
+            scalar: &seed,
+            public: None,
+        };
+        let ehl = ecc_extended_header_list(KeyCrt::Auth, &key, Curve::Ed25519.field_len()).unwrap();
+        let mut want = vec![
+            0x4D, 0x2A, 0xA4, 0x00, 0x7F, 0x48, 0x02, 0x92, 0x20, 0x5F, 0x48, 0x20,
+        ];
+        want.extend_from_slice(&seed);
+        assert_eq!(ehl, want);
+    }
+
+    #[test]
+    fn ecc_header_list_p521_field() {
+        // P-521 scalars are 66 bytes; a 65-byte one is padded to 66.
+        let scalar = [0x01u8; 65];
+        let key = EccPrivateKeyParts {
+            scalar: &scalar,
+            public: None,
+        };
+        let ehl =
+            ecc_extended_header_list(KeyCrt::Sign, &key, Curve::NistP521.field_len()).unwrap();
+        assert_eq!(
+            &ehl[..13],
+            &[0x4D, 0x4C, 0xB6, 0x00, 0x7F, 0x48, 0x02, 0x92, 0x42, 0x5F, 0x48, 0x42, 0x00]
+        );
+        assert_eq!(&ehl[13..], &scalar);
+    }
+
+    #[test]
+    fn ecc_header_list_scalar_wider_than_field() {
+        // One defensive leading zero (a DER INTEGER habit) is dropped.
+        let mut scalar = vec![0x00u8];
+        scalar.extend_from_slice(&[0x55u8; 32]);
+        let key = EccPrivateKeyParts {
+            scalar: &scalar,
+            public: None,
+        };
+        let ehl = ecc_extended_header_list(KeyCrt::Sign, &key, 32).unwrap();
+        assert_eq!(&ehl[12..], &[0x55u8; 32]);
+        // A genuinely wider scalar is a different key: an error, not a cut.
+        let wide = [0x55u8; 33];
+        let key = EccPrivateKeyParts {
+            scalar: &wide,
+            public: None,
+        };
+        let err = ecc_extended_header_list(KeyCrt::Sign, &key, 32).unwrap_err();
+        assert_eq!(
+            err,
+            ScalarTooWide {
+                scalar_len: 33,
+                field_len: 32
+            }
+        );
+        assert!(import_ecc_key(KeyCrt::Sign, &key, 32).is_err());
+        assert!(import_ecc_key_chained(KeyCrt::Sign, &key, 32, 254).is_err());
+    }
+
+    #[test]
+    fn import_ecc_key_apdu_and_chained_split() {
+        // P-521 with its 133-byte public point: a 216-byte 4D object, so
+        // 100-byte links split it three ways.
+        let scalar = [0x66u8; 66];
+        let mut point = vec![0x04u8];
+        point.extend_from_slice(&[0x77u8; 132]);
+        let key = EccPrivateKeyParts {
+            scalar: &scalar,
+            public: Some(&point),
+        };
+        let ehl = ecc_extended_header_list(KeyCrt::Sign, &key, 66).unwrap();
+        let apdu = import_ecc_key(KeyCrt::Sign, &key, 66).unwrap();
+        let lc = ehl.len() as u16;
+        assert_eq!(
+            &apdu[..7],
+            &[0x00, 0xDB, 0x3F, 0xFF, 0x00, (lc >> 8) as u8, lc as u8]
+        );
+        assert_eq!(&apdu[7..], &ehl[..]);
+
+        assert_eq!(ehl.len(), 216);
+        let chunks = import_ecc_key_chained(KeyCrt::Sign, &key, 66, 100).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0][0], 0x10);
+        assert_eq!(chunks[1][0], 0x10);
+        assert_eq!(chunks[2][0], 0x00);
+        let body: Vec<u8> = chunks.iter().flat_map(|c| c[5..].iter().copied()).collect();
+        assert_eq!(body, ehl);
     }
 
     #[test]

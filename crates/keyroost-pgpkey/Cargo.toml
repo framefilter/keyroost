@@ -16,6 +16,8 @@ workspace = true
 # workspace for keyroost-pivtest / keyroost-ctap.
 keyroost-proto = { path = "../keyroost-proto", version = "0.13.0" }
 keyroost-openpgp = { path = "../keyroost-openpgp", version = "0.13.0" }
+# Only with the `card` feature: the restore-onto-a-card glue.
+keyroost-transport = { path = "../keyroost-transport", version = "0.13.0", optional = true }
 rsa = { version = "0.9", features = ["sha2"] }
 p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 p384 = { version = "0.13", features = ["ecdsa", "ecdh"] }
@@ -27,3 +29,8 @@ sha2 = "0.10"
 aes = "0.8"
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1", features = ["alloc", "zeroize_derive"] }
+
+[features]
+# `card`: import key sets onto an OpenPGP card (`keyroost_pgpkey::card`).
+# Off by default so the key/backup core builds without PC/SC.
+card = ["dep:keyroost-transport"]

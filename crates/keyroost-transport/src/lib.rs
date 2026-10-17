@@ -40,7 +40,7 @@ mod token2prog;
 pub use token2prog::Token2ProgSession;
 
 mod openpgp;
-pub use openpgp::{OpenPgpSession, OpenPgpStatus};
+pub use openpgp::{ImportKey, KeyImport, OpenPgpSession, OpenPgpStatus};
 
 mod gzip;
 
@@ -99,7 +99,7 @@ pub mod identity;
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{
     describe_algorithm_attributes, parse_algorithm_attributes, AlgorithmAttributes,
-    AlgorithmInformation, Curve, EccKind, KeyAlg as OpenPgpKeyAlg, KeyCrt,
+    AlgorithmInformation, Curve, EccKind, EccPrivateKeyParts, KeyAlg as OpenPgpKeyAlg, KeyCrt,
     PublicKey as OpenPgpPublicKey, RsaPrivateKeyParts, SlotMismatch,
 };
 
@@ -331,6 +331,24 @@ pub enum TransportError {
     /// ECC key instead. `slot` is the CLI's `--slot` value (`sign` / `decrypt`
     /// / `auth`); `label` is the ECC algorithm's display label.
     OpenPgpSlotNotRsa { slot: &'static str, label: String },
+    /// The card refused to set `slot` to the `label` algorithm (or, right
+    /// after setting it, refused the key's data): it doesn't hold that key
+    /// type there. `slot` is the slot's prose name (`signature` /
+    /// `decryption` / `authentication`).
+    OpenPgpAlgorithmRefused {
+        slot: &'static str,
+        label: &'static str,
+    },
+    /// After an import, the card's public key in `slot` is not the one the
+    /// file has, so the slot was not registered.
+    OpenPgpFingerprintMismatch { slot: &'static str },
+    /// The private key handed to an import is not a `label` key (an RSA key
+    /// for an ECC slot, a scalar wider than the curve's field, or an RSA
+    /// size no card holds).
+    OpenPgpKeyNotForAlgorithm {
+        slot: &'static str,
+        label: &'static str,
+    },
 }
 
 impl fmt::Display for TransportError {
@@ -613,6 +631,17 @@ impl fmt::Display for TransportError {
                 "the {slot} slot holds an ECC key ({label}); RSA import needs an RSA \
                  slot — run `openpgp key generate --slot {slot} --algorithm rsa2048` first"
             ),
+            TransportError::OpenPgpAlgorithmRefused { slot, label } => write!(
+                f,
+                "This card doesn't accept {label} keys in the {slot} slot."
+            ),
+            TransportError::OpenPgpFingerprintMismatch { slot } => write!(
+                f,
+                "The card holds a different {slot} key than the file has; it was not registered."
+            ),
+            TransportError::OpenPgpKeyNotForAlgorithm { slot, label } => {
+                write!(f, "The {slot} key can't be imported as {label}.")
+            }
             TransportError::PivImportCertificateKeyMismatch(slot) => write!(
                 f,
                 "certificate not imported: its public key does not match the key \

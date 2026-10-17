@@ -2293,6 +2293,7 @@ dependencies = [
  "k256",
  "keyroost-openpgp",
  "keyroost-proto",
+ "keyroost-transport",
  "p256",
  "p384",
  "p521",

@@ -181,7 +181,10 @@ pub enum CardKey {
     },
     /// ECC private scalar (big-endian, zero-padded to the field length) and
     /// public point. X25519's scalar is the RFC 7748 bytes reversed here,
-    /// the same as the file MPI; hardware confirms the byte order later.
+    /// the same as the file MPI. A YubiKey 5 (firmware 5.7.4) takes this
+    /// order: after importing it, the card's READ PUBLIC KEY returned the
+    /// same X25519 point as `point`, and the registered fingerprints
+    /// matched (both the extended-length and the command-chaining paths).
     Ecc { scalar: Vec<u8>, point: Vec<u8> },
     /// Ed25519 seed.
     Ed25519 { seed: [u8; 32] },
