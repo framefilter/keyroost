@@ -197,8 +197,12 @@ impl ExpiryInput {
             ExpiryChoice::Years(n) => Ok(Expiry::Years(n)),
             ExpiryChoice::Date => {
                 let d = Date::parse(&self.text).ok_or("Type a date as YYYY-MM-DD.")?;
-                if !d.is_after(&today) {
+                // Valid through the whole of the chosen day, so today is fine.
+                if today.is_after(&d) {
                     return Err("That date is in the past.");
+                }
+                if d.y > 2105 {
+                    return Err("Pick a date before 2106.");
                 }
                 Ok(Expiry::Date {
                     y: d.y,
@@ -343,7 +347,20 @@ mod tests {
         i.text = "2029-02-30".into();
         assert_eq!(i.resolve(today), Err("Type a date as YYYY-MM-DD."));
         i.text = "2026-10-17".into();
+        assert_eq!(
+            i.resolve(today),
+            Ok(Expiry::Date {
+                y: 2026,
+                m: 10,
+                d: 17
+            })
+        );
+        i.text = "2026-10-16".into();
         assert_eq!(i.resolve(today), Err("That date is in the past."));
+        i.text = "2105-12-31".into();
+        assert!(i.resolve(today).is_ok());
+        i.text = "2106-01-01".into();
+        assert_eq!(i.resolve(today), Err("Pick a date before 2106."));
         i.text = "2020-01-01".into();
         assert_eq!(i.resolve(today), Err("That date is in the past."));
     }
