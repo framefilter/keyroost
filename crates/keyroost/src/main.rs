@@ -855,6 +855,8 @@ struct OpenPgpState {
     /// Keys made and saved by the create dialog, waiting for the "load onto
     /// the card" confirmation. Holds secret key material; dropped on close.
     created: Option<std::sync::Arc<CreatedKeys>>,
+    /// How the last "load onto the card" of `created` failed, if one ran.
+    created_failure: Option<LoadFailure>,
     /// The backup file the restore dialog reads.
     restore_path: String,
     /// The passphrase of the file being restored or imported. Cleared after use.
@@ -901,6 +903,7 @@ impl OpenPgpState {
         wipe(&mut self.create.pass);
         wipe(&mut self.create.pass_repeat);
         self.created = None;
+        self.created_failure = None;
         self.restore_loaded = None;
         self.use_default_admin = false;
     }
@@ -1061,6 +1064,32 @@ fn canceled_after_write(backup: &std::path::Path) -> String {
          three files if you don't want them).",
         backup.display()
     )
+}
+
+/// A failed "load onto the card" of a created key set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadFailure {
+    /// Whether the failure came after keys may have been written: anything
+    /// from the import itself. Only a failure before it (the card not
+    /// opening, the admin PIN refused) provably left the card as it was.
+    card_touched: bool,
+    /// The error shown, naming the backup.
+    message: String,
+}
+
+/// What the pane says when the create dialog closes with its keys saved but
+/// not (fully) on the card.
+#[derive(Debug, PartialEq, Eq)]
+enum CloseMessage {
+    Notice(String),
+    Error(String),
+}
+
+fn close_message(load: Option<&LoadFailure>, backup: &std::path::Path) -> CloseMessage {
+    match load {
+        Some(f) if f.card_touched => CloseMessage::Error(f.message.clone()),
+        _ => CloseMessage::Notice(canceled_after_write(backup)),
+    }
 }
 
 fn pgp_slot_index(s: keyroost_pgpkey::read::Slot) -> usize {
@@ -7504,13 +7533,17 @@ impl App {
         self.openpgp.notice = None;
         let for_device = self.selected_device.clone();
         self.spawn_job("Importing key from file\u{2026} (touch if it blinks)", move || {
+            // Whether the file read as OpenPGP, so a dialog opened before the
+            // path changed still learns to ask for the passphrase.
+            let mut file_is_openpgp = false;
             let result = (|| -> Result<(keyroost_transport::OpenPgpStatus, String, [u8; 20]), String> {
                 let data = zeroize::Zeroizing::new(
                     std::fs::read(&path)
                         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?,
                 );
                 let crt = slot.to_crt();
-                if is_openpgp(&data) {
+                file_is_openpgp = is_openpgp(&data);
+                if file_is_openpgp {
                     let pass = (!pass.is_empty()).then(|| pass.as_bytes());
                     let loaded = keyroost_pgpkey::read::open(&data, pass).map_err(|e| match e {
                         keyroost_pgpkey::Error::NeedsPassphrase => {
@@ -7586,6 +7619,9 @@ impl App {
                         app.openpgp.import_path.clear();
                     }
                     Err(e) => app.openpgp.error = Some(e),
+                }
+                if file_is_openpgp {
+                    app.openpgp.import_is_openpgp = true;
                 }
                 wipe(&mut app.openpgp.admin_pin);
                 wipe(&mut app.openpgp.passphrase);
@@ -7697,12 +7733,20 @@ impl App {
         self.openpgp.notice = None;
         self.spawn_job("Putting the keys on the card\u{2026}", move || {
             let backup = created.paths.secret.clone();
-            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
-                let mut s = Self::openpgp_open_admin(&name, &pin)?;
-                keyroost_pgpkey::card::import_set(&mut s, &created.set)?;
-                s.status()
-            })()
-            .map_err(|e| with_backup(e, &backup));
+            // Opening the card and verifying the admin PIN write nothing;
+            // any failure from the import on may have left keys behind.
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, LoadFailure> {
+                let backup = &backup;
+                let failed = |card_touched: bool| {
+                    move |e: TransportError| LoadFailure {
+                        card_touched,
+                        message: with_backup(e, backup),
+                    }
+                };
+                let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
+                keyroost_pgpkey::card::import_set(&mut s, &created.set).map_err(failed(true))?;
+                s.status().map_err(failed(true))
+            })();
             drop(created);
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -7725,7 +7769,18 @@ impl App {
                             m.result = Some(Ok(()));
                         }
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                    Err(mut f) => {
+                        // An earlier attempt that may have written keys
+                        // still counts after a later one that didn't.
+                        f.card_touched |= app
+                            .openpgp
+                            .created_failure
+                            .as_ref()
+                            .is_some_and(|prev| prev.card_touched);
+                        let msg = f.message.clone();
+                        app.openpgp.created_failure = Some(f);
+                        Self::openpgp_modal_step(app, Some(msg));
+                    }
                 }
             })
         })
@@ -17842,6 +17897,23 @@ impl App {
         width: f32,
         body: impl FnOnce(&mut egui::Ui),
     ) -> bool {
+        Self::modal_window_help(ctx, p, id, title, width, None, body).0
+    }
+
+    /// [`modal_window`](Self::modal_window) with a help "?" after the title
+    /// when `help` is `Some(open)` (`open`: its popover is showing). Returns
+    /// whether the dialog was dismissed and the help button's response, for
+    /// [`on_help_dot`](Self::on_help_dot).
+    fn modal_window_help(
+        ctx: &egui::Context,
+        p: &Palette,
+        id: &str,
+        title: &str,
+        width: f32,
+        help: Option<bool>,
+        body: impl FnOnce(&mut egui::Ui),
+    ) -> (bool, Option<egui::Response>) {
+        let mut help_resp = None;
         let mut closed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         egui::Window::new(id)
             .collapsible(false)
@@ -17869,6 +17941,10 @@ impl App {
                             .font(theme::f_sb(13.0))
                             .color(p.txt),
                     );
+                    if let Some(open) = help {
+                        ui.add_space(6.0);
+                        help_resp = Some(ui::help_button(ui, p, open));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (xr, xresp) =
                             ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
@@ -17882,7 +17958,7 @@ impl App {
                 ui.add_space(12.0);
                 body(ui);
             });
-        closed
+        (closed, help_resp)
     }
 
     /// Centered-modal enrollment dialog (same chrome as the Settings dialogs):
@@ -19704,10 +19780,19 @@ impl App {
     /// use-default toggle.
     fn openpgp_cred_modal_close(&mut self) {
         // Closing the create dialog after its files were written, before the
-        // keys went onto the card: say where they are.
+        // keys went (fully) onto the card: say where they are, and claim the
+        // card is unchanged only when no load could have written to it.
         if let Some(c) = &self.openpgp.created {
-            self.openpgp.error = None;
-            self.openpgp.notice = Some(canceled_after_write(&c.paths.secret));
+            match close_message(self.openpgp.created_failure.as_ref(), &c.paths.secret) {
+                CloseMessage::Notice(n) => {
+                    self.openpgp.error = None;
+                    self.openpgp.notice = Some(n);
+                }
+                CloseMessage::Error(e) => {
+                    self.openpgp.notice = None;
+                    self.openpgp.error = Some(e);
+                }
+            }
         }
         self.openpgp.wipe_secrets();
         self.openpgp.cred_modal = None;
@@ -19762,230 +19847,257 @@ impl App {
         // Tall at large text sizes: the body scrolls inside the window
         // instead of running off the top and bottom.
         let max_body = (ctx.content_rect().height() - 120.0).max(160.0);
-        let closed = Self::modal_window(ctx, p, "openpgp_backup", kind.title(), 340.0, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(max_body)
-                .show(ui, |ui| {
-                    if let Some(Ok(())) = &result {
-                        ui.label(
-                            egui::RichText::new(format!("\u{2713} {}", kind.success()))
-                                .font(theme::f_sb(13.0))
-                                .color(p.ok),
-                        );
-                        if let Some(n) = &self.openpgp.notice {
-                            ui.add_space(6.0);
+        let help_topic: &'static str = if create { "pgp-backup" } else { "pgp-restore" };
+        let help_open = self.help_open == Some(help_topic);
+        let (closed, help_resp) = Self::modal_window_help(
+            ctx,
+            p,
+            "openpgp_backup",
+            kind.title(),
+            340.0,
+            Some(help_open),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(max_body)
+                    .show(ui, |ui| {
+                        if let Some(Ok(())) = &result {
                             ui.label(
-                                egui::RichText::new(n)
-                                    .font(theme::f_reg(12.5))
-                                    .color(p.txt2),
+                                egui::RichText::new(format!("\u{2713} {}", kind.success()))
+                                    .font(theme::f_sb(13.0))
+                                    .color(p.ok),
                             );
-                        }
-                        ui.add_space(16.0);
-                        if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
-                            want_close = true;
-                        }
-                        return;
-                    }
-                    let mut submit_label = kind.submit_label();
-                    let mut can_submit = true;
-                    match (create, second) {
-                        (true, false) => {
-                            let f = &mut self.openpgp.create;
-                            text_field(ui, p, "Name", &mut f.name, "Your name", 200.0);
-                            text_field(ui, p, "Email", &mut f.email, "optional", 200.0);
-                            ui.horizontal(|ui| {
-                                label_w(ui, "Key type");
-                                egui::ComboBox::from_id_salt("pgp-create-type")
-                                    .truncate()
-                                    .selected_text(f.key_type.map_or("\u{2014}", |t| t.label()))
-                                    .show_ui(ui, |ui| {
-                                        for &t in &offered {
-                                            ui.selectable_value(
-                                                &mut f.key_type,
-                                                Some(t),
-                                                t.label(),
-                                            );
-                                        }
-                                    });
-                            });
-                            if f.key_type == Some(keyroost_pgpkey::keys::KeyType::Rsa4096) {
-                                card_note(ui, p, "Making RSA-4096 keys can take a minute.");
-                            }
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                label_w(ui, "Expires");
-                                ui.vertical(|ui| ui::date::expiry_row(ui, p, &mut f.expiry, today));
-                            });
-                            ui.add_space(4.0);
-                            pin_field(ui, p, "Passphrase", &mut f.pass);
-                            pin_field(ui, p, "Repeat", &mut f.pass_repeat);
-                            ui.horizontal(|ui| {
-                                label_w(ui, "Save to");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut f.save_path)
-                                        .hint_text("openpgp-backup.asc")
-                                        .desired_width(130.0),
-                                );
-                                browse = theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
-                                    .clicked();
-                            });
-                            card_note(
-                                ui,
-                                p,
-                                "Also writes NAME.pub.asc (public key) and NAME.rev.asc \
-                         (revocation certificate) next to it.",
-                            );
-                            ui.add_space(6.0);
-                            self.openpgp_modal_admin_field(ui, p, kind);
-                            card_note(
-                                ui,
-                                p,
-                                "Makes the keys on this computer and saves the backup, then \
-                         REPLACES all three OpenPGP keys on the card.",
-                            );
-                            if let Some(e) = form_error {
-                                // Only a typed mismatch is a mistake; the rest say
-                                // what is still to fill in.
-                                let c = if e == "The passphrases don't match."
-                                    && !self.openpgp.create.pass_repeat.is_empty()
-                                {
-                                    p.err
-                                } else {
-                                    p.txt3
-                                };
+                            if let Some(n) = &self.openpgp.notice {
                                 ui.add_space(6.0);
-                                ui.colored_label(c, e);
-                                can_submit = false;
+                                ui.label(
+                                    egui::RichText::new(n)
+                                        .font(theme::f_reg(12.5))
+                                        .color(p.txt2),
+                                );
                             }
+                            ui.add_space(16.0);
+                            if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                                want_close = true;
+                            }
+                            return;
                         }
-                        (true, true) => {
-                            if let Some(c) = &self.openpgp.created {
-                                ui.label(
-                                    egui::RichText::new("The keys are made and saved:")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt),
-                                );
-                                ui.add_space(4.0);
-                                for (what, path) in [
-                                    ("Backup", &c.paths.secret),
-                                    ("Public key", &c.paths.public),
-                                    ("Revocation", &c.paths.revocation),
-                                ] {
-                                    ui.label(
-                                        egui::RichText::new(format!("{what}: {}", path.display()))
-                                            .font(theme::f_reg(12.0))
-                                            .color(p.txt2),
-                                    );
+                        let mut submit_label = kind.submit_label();
+                        let mut can_submit = true;
+                        match (create, second) {
+                            (true, false) => {
+                                let f = &mut self.openpgp.create;
+                                text_field(ui, p, "Name", &mut f.name, "Your name", 200.0);
+                                text_field(ui, p, "Email", &mut f.email, "optional", 200.0);
+                                ui.horizontal(|ui| {
+                                    label_w(ui, "Key type");
+                                    egui::ComboBox::from_id_salt("pgp-create-type")
+                                        .truncate()
+                                        .selected_text(f.key_type.map_or("\u{2014}", |t| t.label()))
+                                        .show_ui(ui, |ui| {
+                                            for &t in &offered {
+                                                ui.selectable_value(
+                                                    &mut f.key_type,
+                                                    Some(t),
+                                                    t.label(),
+                                                );
+                                            }
+                                        });
+                                });
+                                if f.key_type == Some(keyroost_pgpkey::keys::KeyType::Rsa4096) {
+                                    card_note(ui, p, "Making RSA-4096 keys can take a minute.");
                                 }
-                                ui.add_space(8.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Load them onto the card now? This replaces all three \
-                                 OpenPGP keys on it.",
-                                    )
-                                    .font(theme::f_reg(13.0))
-                                    .color(p.txt),
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    label_w(ui, "Expires");
+                                    ui.vertical(|ui| {
+                                        ui::date::expiry_row(ui, p, &mut f.expiry, today)
+                                    });
+                                });
+                                ui.add_space(4.0);
+                                pin_field(ui, p, "Passphrase", &mut f.pass);
+                                pin_field(ui, p, "Repeat", &mut f.pass_repeat);
+                                ui.horizontal(|ui| {
+                                    label_w(ui, "Save to");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut f.save_path)
+                                            .hint_text("openpgp-backup.asc")
+                                            .desired_width(130.0),
+                                    );
+                                    browse =
+                                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
+                                            .clicked();
+                                });
+                                card_note(
+                                    ui,
+                                    p,
+                                    "Also writes NAME.pub.asc (public key) and NAME.rev.asc \
+                         (revocation certificate) next to it.",
                                 );
-                            }
-                            // A wrong admin PIN is the usual failure: ask again here.
-                            if matches!(result, Some(Err(_))) {
                                 ui.add_space(6.0);
                                 self.openpgp_modal_admin_field(ui, p, kind);
-                            }
-                            submit_label = "Load onto card";
-                        }
-                        (false, false) => {
-                            ui.horizontal(|ui| {
-                                label_w(ui, "File");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.openpgp.restore_path)
-                                        .hint_text("openpgp-backup.asc")
-                                        .desired_width(130.0),
+                                card_note(
+                                    ui,
+                                    p,
+                                    "Makes the keys on this computer and saves the backup, then \
+                         REPLACES all three OpenPGP keys on the card.",
                                 );
-                                browse = theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
-                                    .clicked();
-                            });
-                            pin_field(ui, p, "Passphrase", &mut self.openpgp.passphrase);
-                            card_note(
+                                if let Some(e) = form_error {
+                                    // Only a typed mismatch is a mistake; the rest say
+                                    // what is still to fill in.
+                                    let c = if e == "The passphrases don't match."
+                                        && !self.openpgp.create.pass_repeat.is_empty()
+                                    {
+                                        p.err
+                                    } else {
+                                        p.txt3
+                                    };
+                                    ui.add_space(6.0);
+                                    ui.colored_label(c, e);
+                                    can_submit = false;
+                                }
+                            }
+                            (true, true) => {
+                                if let Some(c) = &self.openpgp.created {
+                                    ui.label(
+                                        egui::RichText::new("The keys are made and saved:")
+                                            .font(theme::f_reg(13.0))
+                                            .color(p.txt),
+                                    );
+                                    ui.add_space(4.0);
+                                    for (what, path) in [
+                                        ("Backup", &c.paths.secret),
+                                        ("Public key", &c.paths.public),
+                                        ("Revocation", &c.paths.revocation),
+                                    ] {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{what}: {}",
+                                                path.display()
+                                            ))
+                                            .font(theme::f_reg(12.0))
+                                            .color(p.txt2),
+                                        );
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Load them onto the card now? This replaces all three \
+                                 OpenPGP keys on it.",
+                                        )
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt),
+                                    );
+                                }
+                                // A wrong admin PIN is the usual failure: ask again here.
+                                if matches!(result, Some(Err(_))) {
+                                    ui.add_space(6.0);
+                                    self.openpgp_modal_admin_field(ui, p, kind);
+                                }
+                                submit_label = "Load onto card";
+                            }
+                            (false, false) => {
+                                ui.horizontal(|ui| {
+                                    label_w(ui, "File");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.openpgp.restore_path)
+                                            .hint_text("openpgp-backup.asc")
+                                            .desired_width(130.0),
+                                    );
+                                    browse =
+                                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
+                                            .clicked();
+                                });
+                                pin_field(ui, p, "Passphrase", &mut self.openpgp.passphrase);
+                                card_note(
                                 ui,
                                 p,
                                 "A keyroost backup or a GnuPG export (gpg --export-secret-keys). \
                          Leave the passphrase empty if the file has none.",
                             );
-                            submit_label = "Open";
-                            can_submit = !self.openpgp.restore_path.trim().is_empty();
-                        }
-                        (false, true) => {
-                            if let Some(loaded) = self.openpgp.restore_loaded.clone() {
-                                for uid in &loaded.user_ids {
-                                    ui.label(
-                                        egui::RichText::new(uid)
-                                            .font(theme::f_sb(13.0))
-                                            .color(p.txt),
-                                    );
-                                }
-                                for n in &loaded.notes {
-                                    card_note(ui, p, n);
-                                }
-                                ui.add_space(6.0);
-                                for s in PGP_SLOTS {
-                                    let Some(k) = loaded.keys.iter().find(|k| k.slot == Some(s))
-                                    else {
-                                        continue;
-                                    };
-                                    let sel = OpenPgpSlotSel::from_slot(s);
-                                    let kind_text = k
-                                        .key_type
-                                        .map_or("OpenPGP", |t| t.card_alg(sel.to_crt()).label());
-                                    let hex = hex_lower(&k.fpr);
-                                    let tail = &hex[hex.len().saturating_sub(16)..];
-                                    ui.checkbox(
-                                        &mut self.openpgp.restore_pick[pgp_slot_index(s)],
-                                        format!(
+                                submit_label = "Open";
+                                can_submit = !self.openpgp.restore_path.trim().is_empty();
+                            }
+                            (false, true) => {
+                                if let Some(loaded) = self.openpgp.restore_loaded.clone() {
+                                    for uid in &loaded.user_ids {
+                                        ui.label(
+                                            egui::RichText::new(uid)
+                                                .font(theme::f_sb(13.0))
+                                                .color(p.txt),
+                                        );
+                                    }
+                                    for n in &loaded.notes {
+                                        card_note(ui, p, n);
+                                    }
+                                    ui.add_space(6.0);
+                                    for s in PGP_SLOTS {
+                                        let Some(k) =
+                                            loaded.keys.iter().find(|k| k.slot == Some(s))
+                                        else {
+                                            continue;
+                                        };
+                                        let sel = OpenPgpSlotSel::from_slot(s);
+                                        let kind_text = k.key_type.map_or("OpenPGP", |t| {
+                                            t.card_alg(sel.to_crt()).label()
+                                        });
+                                        let hex = hex_lower(&k.fpr);
+                                        let tail = &hex[hex.len().saturating_sub(16)..];
+                                        ui.checkbox(
+                                            &mut self.openpgp.restore_pick[pgp_slot_index(s)],
+                                            format!(
                                             "{} \u{2014} {kind_text} \u{2014} fpr \u{2026}{tail}",
                                             sel.tab_label()
                                         ),
-                                    );
+                                        );
+                                    }
+                                    can_submit = PGP_SLOTS.into_iter().any(|s| {
+                                        self.openpgp.restore_pick[pgp_slot_index(s)]
+                                            && loaded.keys.iter().any(|k| k.slot == Some(s))
+                                    });
                                 }
-                                can_submit = PGP_SLOTS.into_iter().any(|s| {
-                                    self.openpgp.restore_pick[pgp_slot_index(s)]
-                                        && loaded.keys.iter().any(|k| k.slot == Some(s))
-                                });
+                                ui.add_space(6.0);
+                                self.openpgp_modal_admin_field(ui, p, kind);
+                                card_note(ui, p, "Each ticked key REPLACES the key in its slot.");
                             }
-                            ui.add_space(6.0);
-                            self.openpgp_modal_admin_field(ui, p, kind);
-                            card_note(ui, p, "Each ticked key REPLACES the key in its slot.");
                         }
-                    }
 
-                    if let Some(Err(e)) = &result {
-                        ui.add_space(6.0);
-                        ui.colored_label(p.err, e);
-                    }
-                    ui.add_space(16.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if busy {
-                            ui.add(egui::Spinner::new());
-                            ui.label(
-                                egui::RichText::new(&busy_label)
-                                    .font(theme::f_reg(12.5))
-                                    .color(p.txt2),
-                            );
-                        } else {
-                            let clicked = ui
-                                .add_enabled_ui(can_submit, |ui| {
-                                    theme::button(ui, p, BtnKind::Primary, submit_label).clicked()
-                                })
-                                .inner;
-                            want_submit = clicked && can_submit;
-                            ui.add_space(8.0);
-                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
-                                want_close = true;
-                            }
+                        if let Some(Err(e)) = &result {
+                            ui.add_space(6.0);
+                            ui.colored_label(p.err, e);
                         }
+                        ui.add_space(16.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if busy {
+                                ui.add(egui::Spinner::new());
+                                ui.label(
+                                    egui::RichText::new(&busy_label)
+                                        .font(theme::f_reg(12.5))
+                                        .color(p.txt2),
+                                );
+                            } else {
+                                let clicked = ui
+                                    .add_enabled_ui(can_submit, |ui| {
+                                        theme::button(ui, p, BtnKind::Primary, submit_label)
+                                            .clicked()
+                                    })
+                                    .inner;
+                                want_submit = clicked && can_submit;
+                                ui.add_space(8.0);
+                                if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                                    want_close = true;
+                                }
+                            }
+                        });
                     });
-                });
-        });
+            },
+        );
+        if let Some(r) = help_resp {
+            if r.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.clicked() {
+                self.toggle_help(help_topic, r.rect.left_bottom());
+            }
+        }
 
         if browse {
             if create {
@@ -23822,6 +23934,34 @@ mod tests {
         assert!(!is_openpgp(b"-----BEGIN PRIVATE KEY-----\n"));
         assert!(!is_openpgp(&[0x30, 0x82]));
         assert!(!is_openpgp(b""));
+    }
+
+    #[test]
+    fn closing_after_a_failed_load_never_claims_an_unchanged_card() {
+        let p = std::path::Path::new("k.asc");
+        // No load tried, or one refused before anything was written.
+        assert_eq!(
+            close_message(None, p),
+            CloseMessage::Notice(canceled_after_write(p))
+        );
+        let refused = LoadFailure {
+            card_touched: false,
+            message: with_backup("Wrong admin PIN", p),
+        };
+        assert_eq!(
+            close_message(Some(&refused), p),
+            CloseMessage::Notice(canceled_after_write(p))
+        );
+        // A load that may have written keys keeps its own error.
+        let partial = LoadFailure {
+            card_touched: true,
+            message: with_backup("Loaded the signature key; the decryption key failed", p),
+        };
+        let CloseMessage::Error(e) = close_message(Some(&partial), p) else {
+            panic!("a possibly changed card must not be reported as unchanged");
+        };
+        assert!(e.contains("Your backup is saved at k.asc."));
+        assert!(!e.contains("not changed"));
     }
 
     #[test]
