@@ -89,6 +89,13 @@ x11rb = { version = "0.14", optional = true }
 # `serde_repr` without pulling it, and `trash` is the lightest feature that does.
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "screenshot", "trash"], optional = true }
 
+# Windows: draw with wgpu on DirectX 12 (it falls back to Windows' software
+# renderer where there's no GPU driver), keeping OpenGL as a fallback. Only the
+# DX12 backend is built. Elsewhere the app stays on OpenGL alone.
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.35", default-features = false, features = ["wgpu_no_default_features"] }
+wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+
 [target.'cfg(windows)'.build-dependencies]
 # Embeds the app icon + VS_VERSION_INFO into keyroost.exe (see build.rs).
 # Host-gated: only Windows builds compile it (CI builds Windows natively),

@@ -3420,76 +3420,97 @@ fn main() -> eframe::Result<()> {
     // something decided once at launch.
     let apdu_trace = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([900.0, 560.0])
-            .with_title("keyroost"),
-        ..Default::default()
-    };
-    let started = eframe::run_native(
-        "keyroost",
-        options,
-        Box::new(|cc| {
-            // Register IBM Plex Sans + JetBrains Mono so the redesign's type
-            // weights resolve. (Vendored under assets/.)
-            theme::install_fonts(&cc.egui_ctx);
-            // Restore the persisted UI preferences (theme mode + accent +
-            // colorblind + zoom) from our own settings.json, defaulting to the
-            // refined dark + blue accent the prototype ships with. eframe's own
-            // storage is off in this crate (no `persistence` feature), so
-            // `App::save()` never fires — `settings::Settings` carries the
-            // persistence instead. A missing/corrupt file yields defaults.
-            let saved = Settings::load();
-            let mode: Mode = saved.mode.into();
-            // Clamp the accent index against the live accent count in case the
-            // file predates an accent being removed.
-            let accent_idx = saved.accent.min(Palette::ACCENTS.len() - 1);
-            let colorblind = saved.colorblind;
-            let sidebar = saved.sidebar;
-            // `Settings::load` already clamps zoom; clamp again defensively.
-            let zoom = theme::clamp_zoom(saved.zoom);
-            Palette::new(mode, Palette::ACCENTS[accent_idx], colorblind).apply(&cc.egui_ctx, mode);
-            // Watch for reader hotplug so already-plugged-in or newly-inserted
-            // devices appear without a manual Refresh. The watcher only flags a
-            // shared bit and wakes the frame loop; `update()` does the rescan.
-            let devices_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let reader_watch = {
-                let dirty = devices_dirty.clone();
-                let egui_ctx = cc.egui_ctx.clone();
-                keyroost_transport::ReaderWatcher::spawn(move || {
-                    dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                    egui_ctx.request_repaint();
-                })
-            };
-            let app = App {
-                mode,
-                accent_idx,
-                colorblind,
-                sidebar,
-                zoom,
-                // Seed the persistence baseline with exactly what we loaded so
-                // the first `persist_settings()` doesn't re-write an unchanged
-                // file. The sanitized values (clamped zoom / accent) are what we
-                // actually hold, so record those.
-                last_saved_settings: Some(Settings {
-                    zoom,
-                    mode: mode.into(),
-                    accent: accent_idx,
+    // `None` takes eframe's default renderer: wgpu (DirectX 12) on Windows,
+    // OpenGL elsewhere.
+    let open_window = |renderer: Option<eframe::Renderer>| {
+        let apdu_trace = apdu_trace.clone();
+        let mut options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1180.0, 760.0])
+                .with_min_inner_size([900.0, 560.0])
+                .with_title("keyroost"),
+            ..Default::default()
+        };
+        if let Some(r) = renderer {
+            options.renderer = r;
+        }
+        eframe::run_native(
+            "keyroost",
+            options,
+            Box::new(move |cc| {
+                // Register IBM Plex Sans + JetBrains Mono so the redesign's type
+                // weights resolve. (Vendored under assets/.)
+                theme::install_fonts(&cc.egui_ctx);
+                // Restore the persisted UI preferences (theme mode + accent +
+                // colorblind + zoom) from our own settings.json, defaulting to the
+                // refined dark + blue accent the prototype ships with. eframe's own
+                // storage is off in this crate (no `persistence` feature), so
+                // `App::save()` never fires — `settings::Settings` carries the
+                // persistence instead. A missing/corrupt file yields defaults.
+                let saved = Settings::load();
+                let mode: Mode = saved.mode.into();
+                // Clamp the accent index against the live accent count in case the
+                // file predates an accent being removed.
+                let accent_idx = saved.accent.min(Palette::ACCENTS.len() - 1);
+                let colorblind = saved.colorblind;
+                let sidebar = saved.sidebar;
+                // `Settings::load` already clamps zoom; clamp again defensively.
+                let zoom = theme::clamp_zoom(saved.zoom);
+                Palette::new(mode, Palette::ACCENTS[accent_idx], colorblind)
+                    .apply(&cc.egui_ctx, mode);
+                // Watch for reader hotplug so already-plugged-in or newly-inserted
+                // devices appear without a manual Refresh. The watcher only flags a
+                // shared bit and wakes the frame loop; `update()` does the rescan.
+                let devices_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let reader_watch = {
+                    let dirty = devices_dirty.clone();
+                    let egui_ctx = cc.egui_ctx.clone();
+                    keyroost_transport::ReaderWatcher::spawn(move || {
+                        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        egui_ctx.request_repaint();
+                    })
+                };
+                let app = App {
+                    mode,
+                    accent_idx,
                     colorblind,
                     sidebar,
-                }),
-                worker: Some(Worker::spawn(cc.egui_ctx.clone(), apdu_trace.clone())),
-                egui_ctx: Some(cc.egui_ctx.clone()),
-                devices_dirty,
-                reader_watch: Some(reader_watch),
-                mds: ui::mds::MdsDb::load_bundled(),
-                apdu_trace,
-                ..Default::default()
-            };
-            Ok(Box::new(app))
-        }),
-    );
+                    zoom,
+                    // Seed the persistence baseline with exactly what we loaded so
+                    // the first `persist_settings()` doesn't re-write an unchanged
+                    // file. The sanitized values (clamped zoom / accent) are what we
+                    // actually hold, so record those.
+                    last_saved_settings: Some(Settings {
+                        zoom,
+                        mode: mode.into(),
+                        accent: accent_idx,
+                        colorblind,
+                        sidebar,
+                    }),
+                    worker: Some(Worker::spawn(cc.egui_ctx.clone(), apdu_trace.clone())),
+                    egui_ctx: Some(cc.egui_ctx.clone()),
+                    devices_dirty,
+                    reader_watch: Some(reader_watch),
+                    mds: ui::mds::MdsDb::load_bundled(),
+                    apdu_trace,
+                    ..Default::default()
+                };
+                Ok(Box::new(app))
+            }),
+        )
+    };
+    let started = open_window(None);
+    // DirectX 12 can be missing or broken (old drivers, some VMs and
+    // remote sessions); OpenGL may still work there, so try it before
+    // giving up. eframe keeps its event loop, so a second window can open.
+    #[cfg(windows)]
+    let started = match started {
+        Err(e @ eframe::Error::Wgpu(_)) => {
+            eprintln!("DirectX 12 didn't start ({e}); trying OpenGL");
+            open_window(Some(eframe::Renderer::Glow))
+        }
+        other => other,
+    };
     if let Err(e) = &started {
         report_start_failure(e);
     }
@@ -3499,14 +3520,31 @@ fn main() -> eframe::Result<()> {
 /// Say why the window never opened. A release build on Windows has no
 /// console, so without a dialog the app would just vanish.
 fn report_start_failure(e: &eframe::Error) {
-    let graphics = matches!(
-        e,
-        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
+    #[cfg(windows)]
+    let (graphics, needs) = (
+        matches!(
+            e,
+            eframe::Error::OpenGL(_)
+                | eframe::Error::Glutin(_)
+                | eframe::Error::NoGlutinConfigs(..)
+                | eframe::Error::Wgpu(_)
+        ),
+        "DirectX 12 or OpenGL 2.0",
+    );
+    #[cfg(not(windows))]
+    let (graphics, needs) = (
+        matches!(
+            e,
+            eframe::Error::OpenGL(_)
+                | eframe::Error::Glutin(_)
+                | eframe::Error::NoGlutinConfigs(..)
+        ),
+        "OpenGL 2.0 or newer",
     );
     let text = if graphics {
         format!(
             "keyroost couldn't open its window because this computer's graphics \
-             don't provide OpenGL 2.0 or newer. This is common in virtual machines \
+             don't provide {needs}. This is common in virtual machines \
              without 3D acceleration and in some remote-desktop sessions; turning \
              on 3D acceleration or updating the graphics driver usually fixes it. \
              The command-line tool, keyroostctl, works without it.\n\nDetails: {e}"

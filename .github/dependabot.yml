@@ -88,6 +88,10 @@ updates:
         versions: ['>=0.36']
       - dependency-name: egui
         versions: ['>=0.36']
+      # The Windows-only direct wgpu dep only picks backends; its version must
+      # stay the one eframe 0.35's egui-wgpu uses, so it moves with eframe.
+      - dependency-name: wgpu
+        versions: ['>=30']
   # Keeps the flake.lock inputs (nixpkgs, flake-parts) fresh for the Nix
   # packaging added in #109. Grouped so all input bumps arrive as one
   # reviewable PR, like the cargo tree above.
