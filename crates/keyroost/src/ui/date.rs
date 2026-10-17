@@ -1,8 +1,8 @@
 //! Calendar-date model and typed expiry entry for OpenPGP key creation and
 //! "Change expiry date…".
 
-// Nothing draws `expiry_row` until the create/change-expiry dialogs (Task 11)
-// land, and the calendar helpers wait for the calendar popup (Task 13).
+// The calendar helpers and `for_existing` wait for the calendar popup and
+// the change-expiry dialog.
 #![allow(dead_code)]
 
 use super::theme::{f_reg, Palette};

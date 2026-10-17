@@ -5,20 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side RSA key material (generate / load, 2048-4096 bits) for OpenPGP card import."
+description = "Host-side RSA key material (PEM/DER loading, 2048-4096 bits) for OpenPGP card import."
 
 [lints]
 workspace = true
 
 [dependencies]
 # This crate is the single home for the workspace's one "vendor over depend"
-# exception: RSA key generation and PKCS#1/PKCS#8 parsing are security-critical
-# and not something to hand-roll. Confining `rsa`/`rand` here keeps the protocol
+# exception: RSA PKCS#1/PKCS#8 parsing and CRT math are security-critical
+# and not something to hand-roll. Confining `rsa` here keeps the protocol
 # crates dependency-free and lets both front-ends (keyroostctl, keyroost) share the
 # exact same key path. `rsa` re-exports the pkcs1/pkcs8 decoders we use.
 rsa = "0.9"
-rand = "0.8"
 # Part of the same scoped exception: `rsa` already pulls zeroize in, and the
 # workspace-wide forbid(unsafe_code) rules out a hand-rolled volatile wipe.
 # Used to scrub the extracted CRT components on drop.
 zeroize = "1"
+
+[dev-dependencies]
+# The tests make throwaway keys to parse back.
+rand = "0.8"

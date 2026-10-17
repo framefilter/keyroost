@@ -22,7 +22,8 @@ pub struct Help {
 }
 
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
-///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-card-details, piv,
+///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-backup, pgp-restore,
+///   pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate,
 ///   piv-import-export, piv-delete, piv-test, piv-admin, piv-move, piv-retired
 pub fn help(topic: &str) -> Option<&'static Help> {
@@ -84,8 +85,18 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "pgp-keys" => &Help {
             title: "Generate or import a key",
-            body: "Each of the three keys \u{2014} signature, decryption, authentication \u{2014} can be created right on the card, or imported from an RSA-2048 file you already have. Either way OVERWRITES whatever was in that key, and the only way to clear it again is a full reset. You'll need the admin PIN, and the key may ask for a touch.",
+            body: "Each of the three keys \u{2014} signature, decryption, authentication \u{2014} can be created right on the card, or imported from a file you already have: an RSA key file (PEM or DER, 2048 to 4096 bits) or an OpenPGP backup, from which only this key is loaded. Either way OVERWRITES whatever was in that key, and the only way to clear it again is a full reset. You'll need the admin PIN, and the key may ask for a touch.",
             slug: "/openpgp#keys",
+        },
+        "pgp-backup" => &Help {
+            title: "Keys with a backup",
+            body: "Create keys with a backup makes all three keys on this computer, saves them to a file protected by a passphrase you choose, and then loads them onto the card. Keep that backup and its revocation certificate offline: if the card is lost or broken, Restore a backup puts the same keys onto a new card. Keys made on the card itself can never be backed up.",
+            slug: "/openpgp#backup",
+        },
+        "pgp-restore" => &Help {
+            title: "Restore a backup",
+            body: "Loads keys from a backup file \u{2014} one keyroost saved, or one exported from GnuPG \u{2014} onto this card. You choose which of the keys to load; each replaces the key in its slot. You'll need the backup's passphrase and the card's admin PIN.",
+            slug: "/openpgp#backup",
         },
         "pgp-card-details" => &Help {
             title: "Cardholder name & URL",

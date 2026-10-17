@@ -844,8 +844,27 @@ struct OpenPgpState {
     /// one — feeds the Generate-key modal's algorithm choices. `None` means
     /// the card didn't publish one (pre-3.4 cards), not that it has none.
     supported: Option<keyroost_transport::AlgorithmInformation>,
-    /// Path to an RSA key file for import-from-file (text-entered).
+    /// Path to a key file for a key's "Import from a file" (an RSA PEM/DER
+    /// key, or an OpenPGP backup that key is loaded from).
     import_path: String,
+    /// Whether `import_path` held OpenPGP data when its dialog opened, so the
+    /// dialog asks for the file's passphrase.
+    import_is_openpgp: bool,
+    /// The "Create keys with a backup" form.
+    create: CreateForm,
+    /// Keys made and saved by the create dialog, waiting for the "load onto
+    /// the card" confirmation. Holds secret key material; dropped on close.
+    created: Option<std::sync::Arc<CreatedKeys>>,
+    /// The backup file the restore dialog reads.
+    restore_path: String,
+    /// The passphrase of the file being restored or imported. Cleared after use.
+    passphrase: String,
+    /// The keys read from `restore_path`, waiting for "Load onto card".
+    /// Holds secret key material; dropped on close.
+    restore_loaded: Option<std::sync::Arc<keyroost_pgpkey::read::Loaded>>,
+    /// The restore checklist: load the signature / decryption /
+    /// authentication key.
+    restore_pick: [bool; 3],
     /// Change-user-PIN (PW1) old/new entries. Cleared after use.
     user_pin_old: String,
     user_pin_new: String,
@@ -878,7 +897,198 @@ impl OpenPgpState {
         wipe(&mut self.admin_pin_old);
         wipe(&mut self.admin_pin_new);
         wipe(&mut self.unblock_new);
+        wipe(&mut self.passphrase);
+        wipe(&mut self.create.pass);
+        wipe(&mut self.create.pass_repeat);
+        self.created = None;
+        self.restore_loaded = None;
         self.use_default_admin = false;
+    }
+}
+
+/// The "Create keys with a backup" form. The passphrase fields are wiped on
+/// drop and by [`OpenPgpState::wipe_secrets`].
+struct CreateForm {
+    name: String,
+    email: String,
+    /// `None` only when the card lists no type keyroost can back up.
+    key_type: Option<keyroost_pgpkey::keys::KeyType>,
+    expiry: ui::date::ExpiryInput,
+    pass: String,
+    pass_repeat: String,
+    /// What the user chose for the backup; the three file names come from it
+    /// (`files::paths_for`).
+    save_path: String,
+}
+
+impl Default for CreateForm {
+    fn default() -> Self {
+        CreateForm {
+            name: String::new(),
+            email: String::new(),
+            key_type: None,
+            expiry: ui::date::ExpiryInput::for_new(ui::date::Date::today_utc()),
+            pass: String::new(),
+            pass_repeat: String::new(),
+            save_path: String::new(),
+        }
+    }
+}
+
+impl Drop for CreateForm {
+    fn drop(&mut self) {
+        wipe(&mut self.pass);
+        wipe(&mut self.pass_repeat);
+    }
+}
+
+/// A key set made and written to its three files, not yet on the card.
+struct CreatedKeys {
+    set: keyroost_pgpkey::cert::KeySet,
+    paths: keyroost_pgpkey::files::Paths,
+}
+
+/// The key types the create dialog offers: all eight when the card lists no
+/// algorithms, otherwise those whose algorithm the card lists for each of
+/// the three slots. A slot the card lists nothing for counts as unknown,
+/// as in the Generate menu ([`OpenPgpKeyAlgSel::choices`]).
+fn offered_key_types(
+    supported: Option<&keyroost_transport::AlgorithmInformation>,
+) -> Vec<keyroost_pgpkey::keys::KeyType> {
+    use keyroost_pgpkey::keys::KeyType;
+    use keyroost_transport::KeyCrt;
+    let Some(fa) = supported else {
+        return KeyType::ALL.to_vec();
+    };
+    let lists: Vec<_> = [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth]
+        .into_iter()
+        .map(|crt| (crt, fa.key_algs(crt)))
+        .collect();
+    KeyType::ALL
+        .into_iter()
+        .filter(|t| {
+            lists
+                .iter()
+                .all(|(crt, algs)| algs.is_empty() || algs.contains(&t.card_alg(*crt)))
+        })
+        .collect()
+}
+
+/// The type the create dialog starts on, the CLI's rule: Curve 25519 (GnuPG's
+/// default) when offered, else RSA-3072, else the first offered.
+fn default_create_type(
+    offered: &[keyroost_pgpkey::keys::KeyType],
+) -> Option<keyroost_pgpkey::keys::KeyType> {
+    use keyroost_pgpkey::keys::KeyType;
+    [KeyType::Cv25519, KeyType::Rsa3072]
+        .into_iter()
+        .find(|t| offered.contains(t))
+        .or_else(|| offered.first().copied())
+}
+
+/// Why the create form can't be submitted yet, checked before any key is
+/// made; `None` when it can.
+fn create_form_error(f: &CreateForm) -> Option<&'static str> {
+    if f.name.trim().is_empty() {
+        return Some("Enter a name for the key.");
+    }
+    if f.key_type.is_none() {
+        return Some("This card lists no key type keyroost can back up.");
+    }
+    if let Err(e) = f.expiry.resolve(ui::date::Date::today_utc()) {
+        return Some(e);
+    }
+    if f.pass.is_empty() {
+        return Some("Enter a passphrase to protect the backup.");
+    }
+    if f.pass != f.pass_repeat {
+        return Some("The passphrases don't match.");
+    }
+    let path = f.save_path.trim();
+    if path.is_empty() {
+        return Some("Choose where to save the backup.");
+    }
+    // The app's working directory is wherever it was started from; a bare
+    // name would land somewhere the user can't predict.
+    if !std::path::Path::new(path).is_absolute() {
+        return Some("Use Browse\u{2026} or type the full path for the backup.");
+    }
+    None
+}
+
+/// Whether `data` is OpenPGP (an armor header, or a binary packet: the
+/// first byte's top bit is always set) rather than a PEM or DER key. Same
+/// rule as the CLI's `openpgp key import --in`.
+fn is_openpgp(data: &[u8]) -> bool {
+    data.trim_ascii_start().starts_with(b"-----BEGIN PGP ")
+        || data.first().is_some_and(|b| b & 0x80 != 0)
+}
+
+/// Whether the file at `path` starts like OpenPGP data (see [`is_openpgp`]);
+/// `false` when it can't be read (the import then reports why).
+fn file_starts_openpgp(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = zeroize::Zeroizing::new([0u8; 256]);
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let n = f.read(&mut head[..]).unwrap_or(0);
+    is_openpgp(&head[..n])
+}
+
+/// pgpkey's errors, without "Cryptographic error:" on the messages about the
+/// input or the card rather than the math.
+fn pgp_plain(e: keyroost_pgpkey::Error) -> String {
+    match e {
+        keyroost_pgpkey::Error::Crypto(msg) => msg,
+        e => e.to_string(),
+    }
+}
+
+/// `e` followed by where the backup is, for a failure after it was written.
+fn with_backup(e: impl std::fmt::Display, backup: &std::path::Path) -> String {
+    format!(
+        "{}. Your backup is saved at {}.",
+        e.to_string().trim_end_matches('.'),
+        backup.display()
+    )
+}
+
+/// The create dialog closed after the three files were written.
+fn canceled_after_write(backup: &std::path::Path) -> String {
+    format!(
+        "Canceled; the card was not changed. The new keys are saved at {} (delete those \
+         three files if you don't want them).",
+        backup.display()
+    )
+}
+
+fn pgp_slot_index(s: keyroost_pgpkey::read::Slot) -> usize {
+    use keyroost_pgpkey::read::Slot;
+    match s {
+        Slot::Sign => 0,
+        Slot::Decrypt => 1,
+        Slot::Auth => 2,
+    }
+}
+
+const PGP_SLOTS: [keyroost_pgpkey::read::Slot; 3] = [
+    keyroost_pgpkey::read::Slot::Sign,
+    keyroost_pgpkey::read::Slot::Decrypt,
+    keyroost_pgpkey::read::Slot::Auth,
+];
+
+/// "the signature key", "the signature and decryption keys", "all three keys".
+fn pgp_slots_text(slots: &[keyroost_pgpkey::read::Slot]) -> String {
+    let names: Vec<&str> = slots
+        .iter()
+        .map(|&s| OpenPgpSlotSel::from_slot(s).label())
+        .collect();
+    match names.as_slice() {
+        [_, _, _] => "all three keys".to_string(),
+        [one] => format!("the {one} key"),
+        [a, b] => format!("the {a} and {b} keys"),
+        _ => "no keys".to_string(),
     }
 }
 
@@ -897,8 +1107,11 @@ enum OpenPgpCredKind {
     SetName,
     SetUrl,
     GenerateKey,
-    GenerateImportKey,
     ImportKeyFile,
+    /// Make a key set on the computer, save its backup, then load it.
+    CreateWithBackup,
+    /// Read a backup file and load the chosen keys from it.
+    RestoreBackup,
     Reset,
 }
 
@@ -912,8 +1125,9 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::SetName => "Set cardholder name",
             OpenPgpCredKind::SetUrl => "Set public-key URL",
             OpenPgpCredKind::GenerateKey => "Generate key on-card",
-            OpenPgpCredKind::GenerateImportKey => "Generate & import key",
             OpenPgpCredKind::ImportKeyFile => "Import key from file",
+            OpenPgpCredKind::CreateWithBackup => "Create keys with a backup",
+            OpenPgpCredKind::RestoreBackup => "Restore a backup",
             OpenPgpCredKind::Reset => "Reset applet",
         }
     }
@@ -927,8 +1141,9 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::SetName => "Set name",
             OpenPgpCredKind::SetUrl => "Set URL",
             OpenPgpCredKind::GenerateKey => "Generate",
-            OpenPgpCredKind::GenerateImportKey => "Generate & import",
             OpenPgpCredKind::ImportKeyFile => "Import",
+            OpenPgpCredKind::CreateWithBackup => "Create & load onto card",
+            OpenPgpCredKind::RestoreBackup => "Load onto card",
             OpenPgpCredKind::Reset => "Reset applet",
         }
     }
@@ -941,8 +1156,9 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::SetName => "Setting cardholder name\u{2026}",
             OpenPgpCredKind::SetUrl => "Setting public-key URL\u{2026}",
             OpenPgpCredKind::GenerateKey => "Generating key\u{2026}",
-            OpenPgpCredKind::GenerateImportKey => "Generating & importing key\u{2026}",
             OpenPgpCredKind::ImportKeyFile => "Importing key from file\u{2026}",
+            OpenPgpCredKind::CreateWithBackup => "Working\u{2026}",
+            OpenPgpCredKind::RestoreBackup => "Working\u{2026}",
             OpenPgpCredKind::Reset => "Resetting OpenPGP applet\u{2026}",
         }
     }
@@ -957,8 +1173,9 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::SetName => "Cardholder name set",
             OpenPgpCredKind::SetUrl => "Public-key URL set",
             OpenPgpCredKind::GenerateKey => "Key generated",
-            OpenPgpCredKind::GenerateImportKey => "Key generated and imported",
             OpenPgpCredKind::ImportKeyFile => "Key imported",
+            OpenPgpCredKind::CreateWithBackup => "Keys loaded",
+            OpenPgpCredKind::RestoreBackup => "Keys loaded",
             OpenPgpCredKind::Reset => "Applet reset",
         }
     }
@@ -974,8 +1191,9 @@ impl OpenPgpCredKind {
                 | OpenPgpCredKind::SetName
                 | OpenPgpCredKind::SetUrl
                 | OpenPgpCredKind::GenerateKey
-                | OpenPgpCredKind::GenerateImportKey
                 | OpenPgpCredKind::ImportKeyFile
+                | OpenPgpCredKind::CreateWithBackup
+                | OpenPgpCredKind::RestoreBackup
         )
     }
 }
@@ -2146,16 +2364,6 @@ pub(crate) fn scan_qr_button(ui: &mut egui::Ui, p: &Palette) -> bool {
     resp.clicked()
 }
 
-/// Where an OpenPGP key import gets its key material. Mirrors the CLI's
-/// `--generate` / `--in <FILE>` choice.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ImportSource {
-    /// Generate a fresh RSA-2048 key on the host.
-    Generate,
-    /// Load an RSA-2048 key from a file (PKCS#1/PKCS#8, PEM or DER).
-    FromFile,
-}
-
 /// Which key slot a GUI generate targets. Mirrors the CLI's slot choice.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenPgpSlotSel {
@@ -2171,6 +2379,22 @@ impl OpenPgpSlotSel {
             OpenPgpSlotSel::Sign => keyroost_transport::KeyCrt::Sign,
             OpenPgpSlotSel::Decrypt => keyroost_transport::KeyCrt::Decrypt,
             OpenPgpSlotSel::Auth => keyroost_transport::KeyCrt::Auth,
+        }
+    }
+    fn to_slot(self) -> keyroost_pgpkey::read::Slot {
+        use keyroost_pgpkey::read::Slot;
+        match self {
+            OpenPgpSlotSel::Sign => Slot::Sign,
+            OpenPgpSlotSel::Decrypt => Slot::Decrypt,
+            OpenPgpSlotSel::Auth => Slot::Auth,
+        }
+    }
+    fn from_slot(s: keyroost_pgpkey::read::Slot) -> Self {
+        use keyroost_pgpkey::read::Slot;
+        match s {
+            Slot::Sign => OpenPgpSlotSel::Sign,
+            Slot::Decrypt => OpenPgpSlotSel::Decrypt,
+            Slot::Auth => OpenPgpSlotSel::Auth,
         }
     }
     fn label(self) -> &'static str {
@@ -3441,8 +3665,13 @@ struct App {
 /// duplication.
 #[derive(Clone, PartialEq, Eq)]
 enum FileTarget {
-    /// OpenPGP "Import RSA-2048" key file (`openpgp.import_path`).
+    /// OpenPGP per-key "Import from a file" source (`openpgp.import_path`).
     OpenpgpImport,
+    /// OpenPGP "Create keys with a backup" destination
+    /// (`openpgp.create.save_path`).
+    OpenpgpBackupSave,
+    /// OpenPGP "Restore a backup" source (`openpgp.restore_path`).
+    OpenpgpRestore,
     /// PIV "Sign & save CSR" destination (`piv.csr_path`).
     PivCsr,
     /// PIV "Import certificate" source file (`piv.cert_path`).
@@ -3553,6 +3782,13 @@ impl App {
                         let text = path.display().to_string();
                         match target {
                             FileTarget::OpenpgpImport => self.openpgp.import_path = text,
+                            FileTarget::OpenpgpBackupSave => self.openpgp.create.save_path = text,
+                            FileTarget::OpenpgpRestore => {
+                                // A different file: what was read from the old
+                                // one no longer applies.
+                                self.openpgp.restore_path = text;
+                                self.openpgp.restore_loaded = None;
+                            }
                             // PIV cert file ops pick the path first, then act:
                             // CSR and import need a secret, so open their modal;
                             // export writes straight to the chosen path.
@@ -7251,74 +7487,362 @@ impl App {
         })
     }
 
-    /// Import a key into the selected slot (PW3-gated, destructive), then refresh
-    /// status. The key material comes from host keygen or a file, obtained on the
-    /// worker thread (keygen is slow). May require a touch on the key. Returns
-    /// `false` when the job couldn't be queued (worker busy).
-    fn import_openpgp_key(&mut self, source: ImportSource) -> bool {
+    /// Import a key file into the selected slot (PW3-gated, destructive),
+    /// then refresh status. A PEM/DER RSA key (2048, 3072 or 4096 bits) sets
+    /// the slot to its size first; an OpenPGP file (a backup or a GnuPG
+    /// export) is unlocked with the dialog's passphrase and only this slot's
+    /// key is loaded from it. Runs on the worker. May require a touch on the
+    /// key. Returns `false` when the job couldn't be queued (worker busy).
+    fn import_openpgp_key(&mut self) -> bool {
         let Some(name) = self.selected_openpgp_reader() else {
             return true; // nothing to do; let the modal close
         };
         let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
+        let pass = zeroize::Zeroizing::new(self.openpgp.passphrase.clone());
         let slot = self.openpgp.selected_key;
-        let path = self.openpgp.import_path.clone();
-        let creation_time = unix_now();
+        let path = std::path::PathBuf::from(self.openpgp.import_path.trim());
         self.openpgp.notice = None;
-        let label = match source {
-            ImportSource::Generate => "Generating & importing RSA-2048 key… (touch if it blinks)",
-            ImportSource::FromFile => "Importing RSA key from file… (touch if it blinks)",
-        };
-        self.spawn_job(label, move || {
-            // Obtain the key parts first (keygen / file parse on this worker
-            // thread). Map every error to a String so success and the various
-            // failure kinds (key, PIN, card) flow through one result channel.
-            let result = (|| -> Result<(keyroost_transport::OpenPgpStatus, [u8; 20]), String> {
-                let k = match source {
-                    ImportSource::Generate => keyroost_rsakey::generate_2048(),
-                    ImportSource::FromFile => {
-                        keyroost_rsakey::load_from_file(std::path::Path::new(&path))
-                    }
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Importing key from file\u{2026} (touch if it blinks)", move || {
+            let result = (|| -> Result<(keyroost_transport::OpenPgpStatus, String, [u8; 20]), String> {
+                let data = zeroize::Zeroizing::new(
+                    std::fs::read(&path)
+                        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?,
+                );
+                let crt = slot.to_crt();
+                if is_openpgp(&data) {
+                    let pass = (!pass.is_empty()).then(|| pass.as_bytes());
+                    let loaded = keyroost_pgpkey::read::open(&data, pass).map_err(|e| match e {
+                        keyroost_pgpkey::Error::NeedsPassphrase => {
+                            "This file is protected; enter its passphrase.".to_string()
+                        }
+                        e => pgp_plain(e),
+                    })?;
+                    drop(data);
+                    let Some(key) = loaded.keys.iter().find(|k| k.slot == Some(slot.to_slot()))
+                    else {
+                        return Err(format!(
+                            "{} has no key for the {} slot.",
+                            path.display(),
+                            slot.label()
+                        ));
+                    };
+                    let kind = key
+                        .key_type
+                        .map_or("OpenPGP", |t| t.card_alg(crt).label())
+                        .to_string();
+                    let mut s =
+                        Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
+                    let fprs =
+                        keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &[slot.to_slot()])
+                            .map_err(|e| e.to_string())?;
+                    let status = s.status().map_err(|e| e.to_string())?;
+                    Ok((status, kind, fprs[0]))
+                } else {
+                    drop(data);
+                    let k = keyroost_rsakey::load_from_file(&path).map_err(|e| e.to_string())?;
+                    let alg = match k.n.len() {
+                        256 => keyroost_transport::OpenPgpKeyAlg::Rsa2048,
+                        384 => keyroost_transport::OpenPgpKeyAlg::Rsa3072,
+                        512 => keyroost_transport::OpenPgpKeyAlg::Rsa4096,
+                        n => return Err(format!("Unexpected RSA modulus of {n} bytes.")),
+                    };
+                    let mut s =
+                        Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
+                    let parts = keyroost_transport::RsaPrivateKeyParts {
+                        e: &k.e,
+                        p: &k.p,
+                        q: &k.q,
+                        u: &k.u,
+                        dp: &k.dp,
+                        dq: &k.dq,
+                        n: &k.n,
+                    };
+                    // Sets the slot to this key's size before the import, so a
+                    // 3072/4096-bit key lands in a slot that was 2048.
+                    s.import_any(crt, alg, &keyroost_transport::ImportKey::Rsa(parts))
+                        .map_err(|e| e.to_string())?;
+                    let fpr = s
+                        .register_key(crt, unix_now())
+                        .map_err(|e| e.to_string())?;
+                    let status = s.status().map_err(|e| e.to_string())?;
+                    Ok((status, alg.label().to_string(), fpr))
                 }
-                .map_err(|e| e.to_string())?;
-
-                let mut s = Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
-                let parts = keyroost_transport::RsaPrivateKeyParts {
-                    e: &k.e,
-                    p: &k.p,
-                    q: &k.q,
-                    u: &k.u,
-                    dp: &k.dp,
-                    dq: &k.dq,
-                    n: &k.n,
-                };
-                s.import_key(slot.to_crt(), &parts)
-                    .map_err(|e| e.to_string())?;
-                let fpr = s
-                    .register_key(slot.to_crt(), creation_time)
-                    .map_err(|e| e.to_string())?;
-                let status = s.status().map_err(|e| e.to_string())?;
-                Ok((status, fpr))
             })();
             Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
                 match result {
-                    Ok((status, fpr)) => {
+                    Ok((status, kind, fpr)) => {
                         app.openpgp.status = Some(status);
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!(
-                            "Imported {} key: {}",
+                            "Imported {} key ({kind}): {}",
                             slot.label(),
                             hex_lower(&fpr)
                         ));
-                        wipe(&mut app.openpgp.admin_pin);
                         app.openpgp.import_path.clear();
                     }
-                    Err(e) => {
-                        app.openpgp.error = Some(e);
-                        wipe(&mut app.openpgp.admin_pin);
+                    Err(e) => app.openpgp.error = Some(e),
+                }
+                wipe(&mut app.openpgp.admin_pin);
+                wipe(&mut app.openpgp.passphrase);
+                Self::apply_openpgp_cred_result(app);
+            })
+        })
+    }
+
+    /// Settle one step of a multi-step OpenPGP dialog (create, restore) that
+    /// moves to its next stage rather than finishing: `busy` clears, and an
+    /// error stays in the dialog for a retry.
+    fn openpgp_modal_step(app: &mut App, err: Option<String>) {
+        if let Some(m) = app.openpgp.cred_modal.as_mut() {
+            m.busy = false;
+            m.result = err.map(Err);
+        }
+    }
+
+    /// Create keys with a backup, step 1 (worker): refuse a backup name that
+    /// is taken, make the key set, write the backup, public key and
+    /// revocation certificate, and read the backup back with its
+    /// passphrase. The card is not touched; the keys wait in
+    /// `openpgp.created` for the dialog's "load onto the card" step.
+    fn create_openpgp_keys(&mut self) -> bool {
+        use keyroost_pgpkey::{cert, files};
+        if let Some(e) = create_form_error(&self.openpgp.create) {
+            self.openpgp.error = Some(e.to_string());
+            return true;
+        }
+        let f = &self.openpgp.create;
+        let (Some(key_type), Ok(expiry)) =
+            (f.key_type, f.expiry.resolve(ui::date::Date::today_utc()))
+        else {
+            return true; // create_form_error checked both
+        };
+        let identity = cert::Identity {
+            name: f.name.trim().to_string(),
+            email: f.email.trim().to_string(),
+        };
+        let pass = zeroize::Zeroizing::new(f.pass.clone());
+        let paths = files::paths_for(std::path::Path::new(f.save_path.trim()));
+        let for_device = self.selected_device.clone();
+        self.openpgp.notice = None;
+        let label = if key_type == keyroost_pgpkey::keys::KeyType::Rsa4096 {
+            format!(
+                "Making the {} keys\u{2026} (this can take a minute)",
+                key_type.label()
+            )
+        } else {
+            format!("Making the {} keys\u{2026}", key_type.label())
+        };
+        self.spawn_job(label, move || {
+            let result = (|| -> Result<CreatedKeys, String> {
+                for p in [&paths.secret, &paths.public, &paths.revocation] {
+                    if std::fs::symlink_metadata(p).is_ok() {
+                        return Err(format!(
+                            "{} already exists; choose another name for the backup.",
+                            p.display()
+                        ));
                     }
                 }
-                Self::apply_openpgp_cred_result(app);
+                let now = unix_now();
+                let set = cert::create(key_type, &identity, expiry, now).map_err(pgp_plain)?;
+                let out = cert::export(&set, pass.as_bytes(), now).map_err(pgp_plain)?;
+                files::write_new(&paths.secret, &out.secret, true).map_err(pgp_plain)?;
+                let saved = |e: keyroost_pgpkey::Error| with_backup(pgp_plain(e), &paths.secret);
+                files::write_new(&paths.public, &out.public, false).map_err(saved)?;
+                files::write_new(&paths.revocation, &out.revocation, true).map_err(saved)?;
+                cert::verify_backup(&out.secret, pass.as_bytes(), &set).map_err(|e| {
+                    format!(
+                        "The backup just written doesn't read back ({}); the card was not \
+                         changed. Check {}.",
+                        pgp_plain(e).trim_end_matches('.'),
+                        paths.secret.display()
+                    )
+                })?;
+                Ok(CreatedKeys { set, paths })
+            })();
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                match result {
+                    Ok(created) => {
+                        // Kept on an error so a taken name can be fixed
+                        // without typing the passphrase again.
+                        wipe(&mut app.openpgp.create.pass);
+                        wipe(&mut app.openpgp.create.pass_repeat);
+                        app.openpgp.created = Some(std::sync::Arc::new(created));
+                        Self::openpgp_modal_step(app, None);
+                    }
+                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                }
+            })
+        })
+    }
+
+    /// Create keys with a backup, step 2 (worker): load the saved key set
+    /// onto the card. Every failure names the backup, which stays.
+    fn load_created_openpgp_keys(&mut self) -> bool {
+        let Some(created) = self.openpgp.created.clone() else {
+            return true;
+        };
+        let Some(name) = self.selected_openpgp_reader() else {
+            return true;
+        };
+        let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
+        let for_device = self.selected_device.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Putting the keys on the card\u{2026}", move || {
+            let backup = created.paths.secret.clone();
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                keyroost_pgpkey::card::import_set(&mut s, &created.set)?;
+                s.status()
+            })()
+            .map_err(|e| with_backup(e, &backup));
+            drop(created);
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                wipe(&mut app.openpgp.admin_pin);
+                match result {
+                    Ok(status) => {
+                        app.openpgp.created = None;
+                        app.openpgp.status = Some(status);
+                        app.openpgp.loaded = true;
+                        app.openpgp.error = None;
+                        app.openpgp.notice = Some(format!(
+                            "Keys loaded. Backup saved to {}; keep it and the revocation \
+                             certificate offline.",
+                            backup.display()
+                        ));
+                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                            m.busy = false;
+                            m.result = Some(Ok(()));
+                        }
+                    }
+                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                }
+            })
+        })
+    }
+
+    /// Restore a backup, step 1 (worker): read `restore_path` with the typed
+    /// passphrase and list the keys found for the checklist.
+    fn open_openpgp_backup(&mut self) -> bool {
+        let path = std::path::PathBuf::from(self.openpgp.restore_path.trim());
+        if path.as_os_str().is_empty() {
+            Self::openpgp_modal_step(self, Some("Choose the backup file to restore.".into()));
+            return true;
+        }
+        let pass = zeroize::Zeroizing::new(self.openpgp.passphrase.clone());
+        let for_device = self.selected_device.clone();
+        self.spawn_job("Reading the backup\u{2026}", move || {
+            let result = (|| -> Result<keyroost_pgpkey::read::Loaded, String> {
+                let data = zeroize::Zeroizing::new(
+                    std::fs::read(&path)
+                        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?,
+                );
+                if !is_openpgp(&data) {
+                    return Err(format!(
+                        "{} is a PEM or DER key file, not an OpenPGP backup; import it from \
+                         a key's tab with Import file\u{2026}.",
+                        path.display()
+                    ));
+                }
+                let pass = (!pass.is_empty()).then(|| pass.as_bytes());
+                let loaded = keyroost_pgpkey::read::open(&data, pass).map_err(|e| match e {
+                    keyroost_pgpkey::Error::NeedsPassphrase => {
+                        "This backup is protected; enter its passphrase.".to_string()
+                    }
+                    e => pgp_plain(e),
+                })?;
+                if !loaded.keys.iter().any(|k| k.slot.is_some()) {
+                    return Err(format!(
+                        "{} has no key that fits a card slot.",
+                        path.display()
+                    ));
+                }
+                Ok(loaded)
+            })();
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                wipe(&mut app.openpgp.passphrase);
+                match result {
+                    Ok(loaded) => {
+                        let mut pick = [false; 3];
+                        for k in &loaded.keys {
+                            if let Some(s) = k.slot {
+                                pick[pgp_slot_index(s)] = true;
+                            }
+                        }
+                        app.openpgp.restore_pick = pick;
+                        app.openpgp.restore_loaded = Some(std::sync::Arc::new(loaded));
+                        Self::openpgp_modal_step(app, None);
+                    }
+                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                }
+            })
+        })
+    }
+
+    /// Restore a backup, step 2 (worker): load the ticked keys, each into
+    /// its own slot.
+    fn restore_openpgp_keys(&mut self) -> bool {
+        let Some(loaded) = self.openpgp.restore_loaded.clone() else {
+            return true;
+        };
+        let Some(name) = self.selected_openpgp_reader() else {
+            return true;
+        };
+        let slots: Vec<keyroost_pgpkey::read::Slot> = PGP_SLOTS
+            .into_iter()
+            .filter(|&s| {
+                self.openpgp.restore_pick[pgp_slot_index(s)]
+                    && loaded.keys.iter().any(|k| k.slot == Some(s))
+            })
+            .collect();
+        if slots.is_empty() {
+            Self::openpgp_modal_step(self, Some("Tick at least one key to load.".into()));
+            return true;
+        }
+        let pin = zeroize::Zeroizing::new(self.openpgp_admin_pin_value());
+        let path = self.openpgp.restore_path.trim().to_string();
+        let for_device = self.selected_device.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Putting the keys on the card\u{2026}", move || {
+            let result = (|| -> Result<keyroost_transport::OpenPgpStatus, TransportError> {
+                let mut s = Self::openpgp_open_admin(&name, &pin)?;
+                keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &slots)?;
+                s.status()
+            })();
+            drop(loaded);
+            let what = pgp_slots_text(&slots);
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                wipe(&mut app.openpgp.admin_pin);
+                match result {
+                    Ok(status) => {
+                        app.openpgp.restore_loaded = None;
+                        app.openpgp.status = Some(status);
+                        app.openpgp.loaded = true;
+                        app.openpgp.error = None;
+                        app.openpgp.notice = Some(format!("Loaded {what} from {path}."));
+                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                            m.busy = false;
+                            m.result = Some(Ok(()));
+                        }
+                    }
+                    Err(e) => Self::openpgp_modal_step(app, Some(e.to_string())),
+                }
             })
         })
     }
@@ -18937,6 +19461,13 @@ impl App {
         let Some(kind) = self.openpgp.cred_modal.as_ref().map(|m| m.kind) else {
             return;
         };
+        if matches!(
+            kind,
+            OpenPgpCredKind::CreateWithBackup | OpenPgpCredKind::RestoreBackup
+        ) {
+            self.render_openpgp_backup_modal(ctx, p, kind);
+            return;
+        }
         let busy = self.openpgp.cred_modal.as_ref().is_some_and(|m| m.busy);
         let result = self
             .openpgp
@@ -19033,7 +19564,20 @@ impl App {
                                  only by a full reset). May need a touch.",
                             );
                         }
-                        OpenPgpCredKind::GenerateImportKey | OpenPgpCredKind::ImportKeyFile => {
+                        OpenPgpCredKind::ImportKeyFile => {
+                            if self.openpgp.import_is_openpgp {
+                                pin_field(ui, p, "Passphrase", &mut self.openpgp.passphrase);
+                                card_note(
+                                    ui,
+                                    p,
+                                    &format!(
+                                        "An OpenPGP file: only its {} key is loaded. Leave \
+                                         the passphrase empty if the file has none.",
+                                        self.openpgp.selected_key.label()
+                                    ),
+                                );
+                                ui.add_space(4.0);
+                            }
                             self.openpgp_modal_admin_field(ui, p, kind);
                             card_note(
                                 ui,
@@ -19042,6 +19586,8 @@ impl App {
                                  by a full reset). May need a touch.",
                             );
                         }
+                        // Drawn by `render_openpgp_backup_modal`.
+                        OpenPgpCredKind::CreateWithBackup | OpenPgpCredKind::RestoreBackup => {}
                         OpenPgpCredKind::Reset => {
                             card_note(
                                 ui,
@@ -19127,12 +19673,11 @@ impl App {
                 OpenPgpCredKind::GenerateKey => {
                     self.generate_openpgp_key();
                 }
-                OpenPgpCredKind::GenerateImportKey => {
-                    self.import_openpgp_key(ImportSource::Generate);
-                }
                 OpenPgpCredKind::ImportKeyFile => {
-                    self.import_openpgp_key(ImportSource::FromFile);
+                    self.import_openpgp_key();
                 }
+                // Drawn and dispatched by `render_openpgp_backup_modal`.
+                OpenPgpCredKind::CreateWithBackup | OpenPgpCredKind::RestoreBackup => {}
                 OpenPgpCredKind::Reset => {
                     self.reset_openpgp();
                 }
@@ -19158,8 +19703,349 @@ impl App {
     /// touched (cheap to over-wipe; all are secrets) and clearing the
     /// use-default toggle.
     fn openpgp_cred_modal_close(&mut self) {
+        // Closing the create dialog after its files were written, before the
+        // keys went onto the card: say where they are.
+        if let Some(c) = &self.openpgp.created {
+            self.openpgp.error = None;
+            self.openpgp.notice = Some(canceled_after_write(&c.paths.secret));
+        }
         self.openpgp.wipe_secrets();
         self.openpgp.cred_modal = None;
+    }
+
+    /// The "Create keys with a backup" and "Restore a backup" dialogs. Each
+    /// has two steps on the worker: create makes and saves the keys, then
+    /// (after the user confirms) loads them; restore reads the file with its
+    /// passphrase, then loads the keys ticked in the checklist.
+    fn render_openpgp_backup_modal(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Palette,
+        kind: OpenPgpCredKind,
+    ) {
+        let create = kind == OpenPgpCredKind::CreateWithBackup;
+        let busy = self.openpgp.cred_modal.as_ref().is_some_and(|m| m.busy);
+        let result = self
+            .openpgp
+            .cred_modal
+            .as_ref()
+            .and_then(|m| m.result.clone());
+        let busy_label = self
+            .busy_label
+            .clone()
+            .unwrap_or_else(|| "Working\u{2026}".to_string());
+        // Step 2 of either flow: what step 1 produced is waiting.
+        let second = if create {
+            self.openpgp.created.is_some()
+        } else {
+            self.openpgp.restore_loaded.is_some()
+        };
+        let offered = offered_key_types(self.openpgp.supported.as_ref());
+        let today = ui::date::Date::today_utc();
+        let form_error = create_form_error(&self.openpgp.create);
+
+        let mut want_submit = false;
+        let mut want_close = false;
+        let mut browse = false;
+
+        let label_w = |ui: &mut egui::Ui, t: &str| {
+            ui.add_sized(
+                [96.0, 22.0],
+                egui::Label::new(
+                    egui::RichText::new(t)
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt2),
+                ),
+            );
+        };
+
+        // Tall at large text sizes: the body scrolls inside the window
+        // instead of running off the top and bottom.
+        let max_body = (ctx.content_rect().height() - 120.0).max(160.0);
+        let closed = Self::modal_window(ctx, p, "openpgp_backup", kind.title(), 340.0, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(max_body)
+                .show(ui, |ui| {
+                    if let Some(Ok(())) = &result {
+                        ui.label(
+                            egui::RichText::new(format!("\u{2713} {}", kind.success()))
+                                .font(theme::f_sb(13.0))
+                                .color(p.ok),
+                        );
+                        if let Some(n) = &self.openpgp.notice {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(n)
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt2),
+                            );
+                        }
+                        ui.add_space(16.0);
+                        if theme::button(ui, p, BtnKind::Primary, "Done").clicked() {
+                            want_close = true;
+                        }
+                        return;
+                    }
+                    let mut submit_label = kind.submit_label();
+                    let mut can_submit = true;
+                    match (create, second) {
+                        (true, false) => {
+                            let f = &mut self.openpgp.create;
+                            text_field(ui, p, "Name", &mut f.name, "Your name", 200.0);
+                            text_field(ui, p, "Email", &mut f.email, "optional", 200.0);
+                            ui.horizontal(|ui| {
+                                label_w(ui, "Key type");
+                                egui::ComboBox::from_id_salt("pgp-create-type")
+                                    .truncate()
+                                    .selected_text(f.key_type.map_or("\u{2014}", |t| t.label()))
+                                    .show_ui(ui, |ui| {
+                                        for &t in &offered {
+                                            ui.selectable_value(
+                                                &mut f.key_type,
+                                                Some(t),
+                                                t.label(),
+                                            );
+                                        }
+                                    });
+                            });
+                            if f.key_type == Some(keyroost_pgpkey::keys::KeyType::Rsa4096) {
+                                card_note(ui, p, "Making RSA-4096 keys can take a minute.");
+                            }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                label_w(ui, "Expires");
+                                ui.vertical(|ui| ui::date::expiry_row(ui, p, &mut f.expiry, today));
+                            });
+                            ui.add_space(4.0);
+                            pin_field(ui, p, "Passphrase", &mut f.pass);
+                            pin_field(ui, p, "Repeat", &mut f.pass_repeat);
+                            ui.horizontal(|ui| {
+                                label_w(ui, "Save to");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.save_path)
+                                        .hint_text("openpgp-backup.asc")
+                                        .desired_width(130.0),
+                                );
+                                browse = theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
+                                    .clicked();
+                            });
+                            card_note(
+                                ui,
+                                p,
+                                "Also writes NAME.pub.asc (public key) and NAME.rev.asc \
+                         (revocation certificate) next to it.",
+                            );
+                            ui.add_space(6.0);
+                            self.openpgp_modal_admin_field(ui, p, kind);
+                            card_note(
+                                ui,
+                                p,
+                                "Makes the keys on this computer and saves the backup, then \
+                         REPLACES all three OpenPGP keys on the card.",
+                            );
+                            if let Some(e) = form_error {
+                                // Only a typed mismatch is a mistake; the rest say
+                                // what is still to fill in.
+                                let c = if e == "The passphrases don't match."
+                                    && !self.openpgp.create.pass_repeat.is_empty()
+                                {
+                                    p.err
+                                } else {
+                                    p.txt3
+                                };
+                                ui.add_space(6.0);
+                                ui.colored_label(c, e);
+                                can_submit = false;
+                            }
+                        }
+                        (true, true) => {
+                            if let Some(c) = &self.openpgp.created {
+                                ui.label(
+                                    egui::RichText::new("The keys are made and saved:")
+                                        .font(theme::f_reg(13.0))
+                                        .color(p.txt),
+                                );
+                                ui.add_space(4.0);
+                                for (what, path) in [
+                                    ("Backup", &c.paths.secret),
+                                    ("Public key", &c.paths.public),
+                                    ("Revocation", &c.paths.revocation),
+                                ] {
+                                    ui.label(
+                                        egui::RichText::new(format!("{what}: {}", path.display()))
+                                            .font(theme::f_reg(12.0))
+                                            .color(p.txt2),
+                                    );
+                                }
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Load them onto the card now? This replaces all three \
+                                 OpenPGP keys on it.",
+                                    )
+                                    .font(theme::f_reg(13.0))
+                                    .color(p.txt),
+                                );
+                            }
+                            // A wrong admin PIN is the usual failure: ask again here.
+                            if matches!(result, Some(Err(_))) {
+                                ui.add_space(6.0);
+                                self.openpgp_modal_admin_field(ui, p, kind);
+                            }
+                            submit_label = "Load onto card";
+                        }
+                        (false, false) => {
+                            ui.horizontal(|ui| {
+                                label_w(ui, "File");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.openpgp.restore_path)
+                                        .hint_text("openpgp-backup.asc")
+                                        .desired_width(130.0),
+                                );
+                                browse = theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
+                                    .clicked();
+                            });
+                            pin_field(ui, p, "Passphrase", &mut self.openpgp.passphrase);
+                            card_note(
+                                ui,
+                                p,
+                                "A keyroost backup or a GnuPG export (gpg --export-secret-keys). \
+                         Leave the passphrase empty if the file has none.",
+                            );
+                            submit_label = "Open";
+                            can_submit = !self.openpgp.restore_path.trim().is_empty();
+                        }
+                        (false, true) => {
+                            if let Some(loaded) = self.openpgp.restore_loaded.clone() {
+                                for uid in &loaded.user_ids {
+                                    ui.label(
+                                        egui::RichText::new(uid)
+                                            .font(theme::f_sb(13.0))
+                                            .color(p.txt),
+                                    );
+                                }
+                                for n in &loaded.notes {
+                                    card_note(ui, p, n);
+                                }
+                                ui.add_space(6.0);
+                                for s in PGP_SLOTS {
+                                    let Some(k) = loaded.keys.iter().find(|k| k.slot == Some(s))
+                                    else {
+                                        continue;
+                                    };
+                                    let sel = OpenPgpSlotSel::from_slot(s);
+                                    let kind_text = k
+                                        .key_type
+                                        .map_or("OpenPGP", |t| t.card_alg(sel.to_crt()).label());
+                                    let hex = hex_lower(&k.fpr);
+                                    let tail = &hex[hex.len().saturating_sub(16)..];
+                                    ui.checkbox(
+                                        &mut self.openpgp.restore_pick[pgp_slot_index(s)],
+                                        format!(
+                                            "{} \u{2014} {kind_text} \u{2014} fpr \u{2026}{tail}",
+                                            sel.tab_label()
+                                        ),
+                                    );
+                                }
+                                can_submit = PGP_SLOTS.into_iter().any(|s| {
+                                    self.openpgp.restore_pick[pgp_slot_index(s)]
+                                        && loaded.keys.iter().any(|k| k.slot == Some(s))
+                                });
+                            }
+                            ui.add_space(6.0);
+                            self.openpgp_modal_admin_field(ui, p, kind);
+                            card_note(ui, p, "Each ticked key REPLACES the key in its slot.");
+                        }
+                    }
+
+                    if let Some(Err(e)) = &result {
+                        ui.add_space(6.0);
+                        ui.colored_label(p.err, e);
+                    }
+                    ui.add_space(16.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if busy {
+                            ui.add(egui::Spinner::new());
+                            ui.label(
+                                egui::RichText::new(&busy_label)
+                                    .font(theme::f_reg(12.5))
+                                    .color(p.txt2),
+                            );
+                        } else {
+                            let clicked = ui
+                                .add_enabled_ui(can_submit, |ui| {
+                                    theme::button(ui, p, BtnKind::Primary, submit_label).clicked()
+                                })
+                                .inner;
+                            want_submit = clicked && can_submit;
+                            ui.add_space(8.0);
+                            if theme::button(ui, p, BtnKind::Default, "Cancel").clicked() {
+                                want_close = true;
+                            }
+                        }
+                    });
+                });
+        });
+
+        if browse {
+            if create {
+                self.spawn_file_dialog(
+                    FileTarget::OpenpgpBackupSave,
+                    true,
+                    &[("OpenPGP backup", &["asc"])],
+                    Some("openpgp-backup.asc"),
+                );
+            } else {
+                self.spawn_file_dialog(
+                    FileTarget::OpenpgpRestore,
+                    false,
+                    &[
+                        ("OpenPGP keys", &["asc", "gpg", "pgp", "key"]),
+                        ("All files", &["*"]),
+                    ],
+                    None,
+                );
+            }
+        }
+        if (closed || want_close) && !busy {
+            self.openpgp_cred_modal_close();
+            return;
+        }
+        if !want_submit || busy {
+            return;
+        }
+        if !completion_still_valid(
+            self.openpgp
+                .cred_modal
+                .as_ref()
+                .and_then(|m| m.device.as_ref()),
+            self.selected_device.as_ref(),
+        ) {
+            self.openpgp_cred_modal_close();
+            return;
+        }
+        if let Some(m) = self.openpgp.cred_modal.as_mut() {
+            m.busy = true;
+            m.result = None;
+        }
+        self.openpgp.error = None;
+        match (create, second) {
+            (true, false) => self.create_openpgp_keys(),
+            (true, true) => self.load_created_openpgp_keys(),
+            (false, false) => self.open_openpgp_backup(),
+            (false, true) => self.restore_openpgp_keys(),
+        };
+        // Not queued: the worker was busy (try again) or a guard refused the
+        // input; show the refusal in the dialog.
+        if !self.busy() {
+            let guard_err = self.openpgp.error.take();
+            if let Some(m) = self.openpgp.cred_modal.as_mut() {
+                m.busy = false;
+                if let Some(e) = guard_err {
+                    m.result = Some(Err(e));
+                }
+            }
+        }
     }
 
     /// Authenticator / OATH tab — live codes with countdown rings + copy.
@@ -19526,6 +20412,34 @@ impl App {
                     }
                 },
             );
+
+            // Keys: a key set made on the computer with a backup file, or
+            // a backup restored. Both replace keys in every slot they fill.
+            ui.add_space(10.0);
+            self.adaptive_row(
+                ui,
+                |app, ui| {
+                    ui.label(
+                        egui::RichText::new("Keys")
+                            .font(theme::f_sb(13.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(6.0);
+                    app.help_dot(ui, p, "pgp-backup");
+                },
+                |_, ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Restore a backup\u{2026}").clicked()
+                    {
+                        open_modal = Some(OpenPgpCredKind::RestoreBackup);
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Create keys with a backup\u{2026}")
+                        .clicked()
+                    {
+                        open_modal = Some(OpenPgpCredKind::CreateWithBackup);
+                    }
+                },
+            );
         });
 
         // --- Selected-key display data (shown under the key tab strip) -------
@@ -19612,11 +20526,11 @@ impl App {
             );
 
             ui.add_space(12.0);
-            // Import RSA-2048: file path + Browse left, the two import actions
-            // pinned right.
+            // Import from a file: an RSA key (PEM/DER) or an OpenPGP backup
+            // this key is loaded from. File path + Browse, Import pinned right.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Import RSA-2048")
+                    egui::RichText::new("Import from a file")
                         .font(theme::f_sb(13.5))
                         .color(p.txt),
                 );
@@ -19632,7 +20546,7 @@ impl App {
                         p,
                         "From file",
                         &mut app.openpgp.import_path,
-                        "/path/to/key.pem (PKCS#1/8, PEM or DER)",
+                        "/path/to/key (PEM, DER or OpenPGP)",
                         240.0,
                     );
                 },
@@ -19653,11 +20567,6 @@ impl App {
                         && have_path
                     {
                         open_modal = Some(OpenPgpCredKind::ImportKeyFile);
-                    }
-                    ui.add_space(6.0);
-                    if theme::button(ui, p, BtnKind::Default, "Generate & import\u{2026}").clicked()
-                    {
-                        open_modal = Some(OpenPgpCredKind::GenerateImportKey);
                     }
                 },
             );
@@ -19712,7 +20621,10 @@ impl App {
             self.spawn_file_dialog(
                 FileTarget::OpenpgpImport,
                 false,
-                &[("Keys", &["pem", "der", "key"]), ("All files", &["*"])],
+                &[
+                    ("Keys", &["pem", "der", "key", "asc", "gpg", "pgp"]),
+                    ("All files", &["*"]),
+                ],
                 None,
             );
         }
@@ -19721,6 +20633,19 @@ impl App {
         if let Some(kind) = open_modal {
             self.openpgp.wipe_secrets();
             self.openpgp.error = None;
+            match kind {
+                OpenPgpCredKind::CreateWithBackup => {
+                    let mut form = CreateForm::default();
+                    form.key_type =
+                        default_create_type(&offered_key_types(self.openpgp.supported.as_ref()));
+                    self.openpgp.create = form;
+                }
+                OpenPgpCredKind::ImportKeyFile => {
+                    self.openpgp.import_is_openpgp =
+                        file_starts_openpgp(std::path::Path::new(self.openpgp.import_path.trim()));
+                }
+                _ => {}
+            }
             self.openpgp.cred_modal =
                 Some(OpenPgpCredModal::new(kind, self.selected_device.clone()));
         }
@@ -22783,6 +23708,134 @@ mod tests {
         );
         // A slot the card lists nothing for still offers everything (unknown ≠ none).
         assert!(OpenPgpKeyAlgSel::choices(Some(&info), KeyCrt::Auth).len() > 1);
+    }
+
+    const FA_ED25519: [u8; 10] = [0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+    const FA_X25519: [u8; 11] = [
+        0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+    ];
+    const FA_RSA2048: [u8; 6] = [0x01, 0x08, 0x00, 0x00, 0x20, 0x00];
+    const FA_RSA3072: [u8; 6] = [0x01, 0x0C, 0x00, 0x00, 0x20, 0x00];
+
+    #[test]
+    fn create_offers_every_type_without_a_list_and_only_full_sets_with_one() {
+        use keyroost_pgpkey::keys::KeyType;
+        assert_eq!(offered_key_types(None), KeyType::ALL.to_vec());
+        assert_eq!(
+            default_create_type(&offered_key_types(None)),
+            Some(KeyType::Cv25519)
+        );
+        // Curve 25519 needs Ed25519 in sign + auth and X25519 in decrypt;
+        // RSA-3072 is listed in sign and auth only, so it is not offered.
+        let info = keyroost_transport::AlgorithmInformation {
+            sig: vec![
+                FA_ED25519.to_vec(),
+                FA_RSA2048.to_vec(),
+                FA_RSA3072.to_vec(),
+            ],
+            dec: vec![FA_X25519.to_vec(), FA_RSA2048.to_vec()],
+            aut: vec![
+                FA_ED25519.to_vec(),
+                FA_RSA2048.to_vec(),
+                FA_RSA3072.to_vec(),
+            ],
+        };
+        let offered = offered_key_types(Some(&info));
+        assert_eq!(offered, vec![KeyType::Rsa2048, KeyType::Cv25519]);
+        assert_eq!(default_create_type(&offered), Some(KeyType::Cv25519));
+        // No Curve 25519: RSA-3072 when offered, else the first type listed.
+        let rsa = keyroost_transport::AlgorithmInformation {
+            sig: vec![FA_RSA2048.to_vec(), FA_RSA3072.to_vec()],
+            dec: vec![FA_RSA2048.to_vec(), FA_RSA3072.to_vec()],
+            aut: vec![FA_RSA2048.to_vec(), FA_RSA3072.to_vec()],
+        };
+        let offered = offered_key_types(Some(&rsa));
+        assert_eq!(offered, vec![KeyType::Rsa2048, KeyType::Rsa3072]);
+        assert_eq!(default_create_type(&offered), Some(KeyType::Rsa3072));
+        assert_eq!(
+            default_create_type(&[KeyType::Rsa2048]),
+            Some(KeyType::Rsa2048)
+        );
+        assert_eq!(default_create_type(&[]), None);
+    }
+
+    fn filled_create_form() -> CreateForm {
+        let mut f = CreateForm::default();
+        f.name = "Alice".into();
+        f.key_type = Some(keyroost_pgpkey::keys::KeyType::Cv25519);
+        f.pass = "correct horse".into();
+        f.pass_repeat = "correct horse".into();
+        f.save_path = if cfg!(windows) {
+            r"C:\keys\openpgp-backup.asc".into()
+        } else {
+            "/keys/openpgp-backup.asc".into()
+        };
+        f
+    }
+
+    #[test]
+    fn create_form_refuses_what_the_library_would() {
+        assert_eq!(create_form_error(&filled_create_form()), None);
+        let mut f = filled_create_form();
+        f.name = "   ".into();
+        assert_eq!(create_form_error(&f), Some("Enter a name for the key."));
+        let mut f = filled_create_form();
+        f.key_type = None;
+        assert_eq!(
+            create_form_error(&f),
+            Some("This card lists no key type keyroost can back up.")
+        );
+        let mut f = filled_create_form();
+        f.pass_repeat = "correct horsf".into();
+        assert_eq!(create_form_error(&f), Some("The passphrases don't match."));
+        let mut f = filled_create_form();
+        f.pass.clear();
+        f.pass_repeat.clear();
+        assert_eq!(
+            create_form_error(&f),
+            Some("Enter a passphrase to protect the backup.")
+        );
+        let mut f = filled_create_form();
+        f.save_path = "  ".into();
+        assert_eq!(
+            create_form_error(&f),
+            Some("Choose where to save the backup.")
+        );
+        let mut f = filled_create_form();
+        f.save_path = "openpgp-backup.asc".into();
+        assert_eq!(
+            create_form_error(&f),
+            Some("Use Browse\u{2026} or type the full path for the backup.")
+        );
+        let mut f = filled_create_form();
+        f.expiry.choice = ui::date::ExpiryChoice::Date;
+        f.expiry.text = "2020-01-01".into();
+        assert_eq!(create_form_error(&f), Some("That date is in the past."));
+        f.expiry.text = "2029-13-01".into();
+        assert_eq!(create_form_error(&f), Some("Type a date as YYYY-MM-DD."));
+    }
+
+    #[test]
+    fn openpgp_files_are_told_from_pem_and_der() {
+        assert!(is_openpgp(b"\n-----BEGIN PGP PRIVATE KEY BLOCK-----\n"));
+        assert!(is_openpgp(&[0x95, 0x01]));
+        assert!(!is_openpgp(b"-----BEGIN PRIVATE KEY-----\n"));
+        assert!(!is_openpgp(&[0x30, 0x82]));
+        assert!(!is_openpgp(b""));
+    }
+
+    #[test]
+    fn create_messages_keep_the_backup_path() {
+        let p = std::path::Path::new("k.asc");
+        assert_eq!(
+            with_backup("This card doesn't accept X keys in the signature slot.", p),
+            "This card doesn't accept X keys in the signature slot. Your backup is saved at k.asc."
+        );
+        assert_eq!(
+            canceled_after_write(p),
+            "Canceled; the card was not changed. The new keys are saved at k.asc (delete \
+             those three files if you don't want them)."
+        );
     }
 
     /// #98: the top bar's version chip is the only place the running app
@@ -25944,7 +26997,8 @@ mod tests {
             SetName,
             SetUrl,
             GenerateKey,
-            GenerateImportKey,
+            CreateWithBackup,
+            RestoreBackup,
             ImportKeyFile,
         ] {
             assert!(k.needs_admin_pin(), "{} should need PW3", k.title());
@@ -26277,7 +27331,8 @@ mod tests {
             SetName,
             SetUrl,
             GenerateKey,
-            GenerateImportKey,
+            CreateWithBackup,
+            RestoreBackup,
             ImportKeyFile,
             Reset,
         ] {

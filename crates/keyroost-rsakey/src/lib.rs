@@ -2,8 +2,8 @@
 //!
 //! A small front-end helper shared by `keyroostctl` and `keyroost`. It owns the one
 //! external-dependency exception in the workspace — the `rsa` crate — so the
-//! protocol crates stay dependency-free and the security-critical keygen / parse
-//! logic lives in exactly one place. It produces the full CRT component set
+//! protocol crates stay dependency-free and the security-critical parse logic lives
+//! in exactly one place. It produces the full CRT component set
 //! (`e, p, q, u, dp, dq, n`, minimal big-endian) that `keyroost_openpgp`'s import
 //! path frames into the card's Extended Header List; the card selects which of
 //! those parts it actually wants per its declared algorithm attributes.
@@ -60,7 +60,7 @@ pub enum RsaKeyError {
     /// The key is not 2048, 3072 or 4096 bits (carries the actual modulus
     /// bit length).
     WrongSize(usize),
-    /// Key generation or CRT precompute failed inside the `rsa` crate.
+    /// The CRT precompute failed inside the `rsa` crate.
     Crypto(String),
     /// A required component was missing after CRT precompute.
     MissingComponent(&'static str),
@@ -87,17 +87,6 @@ impl From<std::io::Error> for RsaKeyError {
     fn from(e: std::io::Error) -> Self {
         RsaKeyError::Io(e)
     }
-}
-
-/// Generate a fresh RSA-2048 key on the host and extract its import parts.
-///
-/// `RsaPrivateKey::new` validates the key and precomputes the CRT values
-/// (dp, dq, qinv), so the full component set is available immediately.
-pub fn generate_2048() -> Result<RsaKeyParts, RsaKeyError> {
-    let mut rng = rand::thread_rng();
-    let key =
-        rsa::RsaPrivateKey::new(&mut rng, 2048).map_err(|e| RsaKeyError::Crypto(e.to_string()))?;
-    parts_from_key(key)
 }
 
 /// Load an RSA private key from `path` and extract its import parts.
@@ -186,25 +175,9 @@ mod tests {
     use rsa::pkcs8::EncodePrivateKey;
 
     #[test]
-    fn generate_2048_has_expected_shapes() {
-        let k = generate_2048().expect("keygen");
-        // A 2048-bit modulus is exactly 256 bytes minimal big-endian (top bit
-        // set); each prime is 1024 bits = 128 bytes.
-        assert_eq!(k.n.len(), 256, "modulus should be 256 bytes");
-        assert_eq!(k.p.len(), 128, "p should be 128 bytes");
-        assert_eq!(k.q.len(), 128, "q should be 128 bytes");
-        // Default public exponent is 65537 = 01 00 01.
-        assert_eq!(k.e, vec![0x01, 0x00, 0x01]);
-        // CRT components are present and sized like the primes.
-        assert!(!k.u.is_empty() && !k.dp.is_empty() && !k.dq.is_empty());
-        assert!(k.dp.len() <= 128 && k.dq.len() <= 128);
-    }
-
-    #[test]
     fn load_round_trips_through_der() {
-        // Generate, serialize to PKCS#8 DER, parse back, and confirm the public
-        // modulus survives the round trip (exercises the file-parse path
-        // without keygen in the loader).
+        // Make a key, serialize it to PKCS#8 DER, parse it back, and confirm
+        // the public modulus survives the round trip.
         let mut rng = rand::thread_rng();
         let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
         let der = key.to_pkcs8_der().expect("encode der");
