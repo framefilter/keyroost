@@ -1,0 +1,71 @@
+//! Host-side OpenPGP key sets for keyroost: key generation, GnuPG-compatible
+//! secret-key backups, restore onto a card, and expiry changes.
+//!
+//! This module tree starts with the byte layer: packet framing, MPIs and
+//! ASCII armor.
+
+use std::fmt;
+
+pub mod armor;
+pub mod packet;
+
+/// Everything this crate can report. The `Display` text is written for end
+/// users, one line each.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// The input ended before a complete value was read.
+    Truncated,
+    /// The input is not valid OpenPGP data.
+    Malformed(&'static str),
+    /// Valid OpenPGP, but a form this tool does not handle.
+    Unsupported(&'static str),
+    /// A checksum (armor CRC or secret-key checksum) did not match.
+    BadChecksum,
+    /// The passphrase did not unlock the secret key.
+    WrongPassphrase,
+    /// The secret key is protected and no passphrase was given.
+    NeedsPassphrase,
+    /// The file holds GnuPG card stubs, not key material.
+    CardStubs,
+    /// A cryptographic operation failed.
+    Crypto(String),
+    /// A file operation failed.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Truncated => write!(f, "The key data ends too early; the file looks cut off."),
+            Error::Malformed(what) => write!(f, "The key data is not valid OpenPGP ({what})."),
+            Error::Unsupported(what) => {
+                write!(f, "This key uses something not supported here ({what}).")
+            }
+            Error::BadChecksum => write!(f, "The key data is damaged (checksum mismatch)."),
+            Error::WrongPassphrase => write!(f, "The passphrase is wrong."),
+            Error::NeedsPassphrase => write!(f, "This key is protected; a passphrase is needed."),
+            Error::CardStubs => write!(
+                f,
+                "This file holds placeholders for keys on a smart card, not the keys themselves."
+            ),
+            Error::Crypto(msg) => write!(f, "Cryptographic error: {msg}"),
+            Error::Io(e) => write!(f, "File error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}

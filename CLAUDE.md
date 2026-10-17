@@ -40,6 +40,7 @@ tool. Workspace contains:
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints); no hardware | `serde`, `serde_json`, `getrandom` (per-computer salt); in-tree `keyroost-proto` (SHA-256) |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (on-key names, first-seen records) | in-tree only (incl. `keyroost-ctap`) |
 | `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading for OpenPGP import | `rsa`, `rand`, `zeroize` (scoped exception) |
+| `keyroost-pgpkey` | Host-side OpenPGP key sets: packet/armor layer, keygen, GnuPG-compatible secret-key backups, restore and expiry changes | `rsa`, `p256`/`p384`/`p521`/`k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `zeroize` (scoped exception) |
 | `keyroost-pivtest` | Host-side verification for the PIV slot self-test (`piv test`): fixed challenges checked against the slot certificate's public key | `rsa`, `p256`/`p384`/`p521` (ECDH), `ed25519-dalek`, `x25519-dalek`, `zeroize` (scoped exception) |
 | `keyroost-import` | otpauth:// + Aegis / 2FAS / otpauth-list parsers, file classification, per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`/`aes-gcm`/`base64` (behind `encrypted`, for Aegis vaults) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots + Google Authenticator migration batches (always built; the GUI's separate `qr` feature gates *screen capture*, not this) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |

@@ -17,6 +17,7 @@ members = [
     "crates/keyroost-token2otp",
     "crates/keyroost-token2prog",
     "crates/keyroost-rsakey",
+    "crates/keyroost-pgpkey",
     "crates/keyroost-qr",
     "crates/keyroost-import",
     "crates/keyroost-winwebauthn",

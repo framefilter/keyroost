@@ -95,7 +95,7 @@ jobs:
           # keyroost-piv, so it follows it; same one-time hand publish first.
           for crate in keyroost-proto keyroost-hid keyroost-keyring keyroost-rsakey \
                        keyroost-ctap keyroost-oath keyroost-openpgp keyroost-piv \
-                       keyroost-pivtest \
+                       keyroost-pivtest keyroost-pgpkey \
                        keyroost-token2otp keyroost-token2prog keyroost-import \
                        keyroost-transport keyroost-resolve keyroost-qr \
                        keyroost-winwebauthn keyroost-screengrab \
