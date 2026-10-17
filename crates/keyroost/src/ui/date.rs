@@ -80,6 +80,11 @@ impl Date {
     }
 
     /// Same day `n` years on; Feb 29 falls back to Feb 28 in a common year.
+    /// The day after this one.
+    pub fn next_day(&self) -> Date {
+        Date::from_civil(civil_from_days(days_from_civil(self.y, self.m, self.d) + 1))
+    }
+
     pub fn add_years(&self, n: i32) -> Date {
         let y = self.y + n;
         Date {
@@ -194,10 +199,11 @@ impl ExpiryInput {
         }
     }
 
-    /// Changing an existing key: open on its current expiry date (or today
-    /// when it has none), with "Pick a date…" selected.
+    /// Changing an existing key: open on its current expiry date (or
+    /// tomorrow, the first date it can take, when it has none), with
+    /// "Pick a date…" selected.
     pub fn for_existing(current: Option<Date>, today: Date) -> Self {
-        let d = current.unwrap_or(today);
+        let d = current.unwrap_or_else(|| today.next_day());
         ExpiryInput {
             choice: ExpiryChoice::Date,
             text: d.iso(),
@@ -216,9 +222,13 @@ impl ExpiryInput {
                 let Expiry::Date { y, m, d } = e else {
                     return Ok(e);
                 };
-                // Valid through the whole of the chosen day, so today is fine.
-                if today.is_after(&Date { y, m, d }) {
+                // The key expires at midday UTC that day, so today is too soon.
+                let day = Date { y, m, d };
+                if today.is_after(&day) {
                     return Err("That date is in the past.");
+                }
+                if day == today {
+                    return Err("Pick a date after today.");
                 }
                 Ok(e)
             }
@@ -339,7 +349,7 @@ pub fn calendar_showing(ctx: &egui::Context) -> bool {
 }
 
 /// A "Calendar" button and, while open, a month popup under it. Picking a
-/// day writes it into `input.text`; days before `today` can't be picked.
+/// day writes it into `input.text`; today and earlier days can't be picked.
 pub fn calendar_button(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, today: Date) {
     let btn = button(ui, p, BtnKind::Default, "Calendar");
     if btn.clicked() {
@@ -425,7 +435,7 @@ pub fn calendar_button(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, 
                             ui.end_row();
                             for (i, day) in month_grid(month).iter().enumerate() {
                                 let in_month = day.m == month.m;
-                                let past = today.is_after(day);
+                                let past = !day.is_after(&today);
                                 let sense = if past {
                                     egui::Sense::hover()
                                 } else {
@@ -555,7 +565,8 @@ mod tests {
         assert_eq!(n.text, "2029-10-17");
         let e = ExpiryInput::for_existing(None, today);
         assert_eq!(e.choice, ExpiryChoice::Date);
-        assert_eq!(e.text, "2026-10-17");
+        assert_eq!(e.text, "2026-10-18");
+        assert_eq!(dt(2026, 12, 31).next_day(), dt(2027, 1, 1));
         let e = ExpiryInput::for_existing(Some(dt(2028, 1, 2)), today);
         assert_eq!(e.text, "2028-01-02");
         assert_eq!(e.month, dt(2028, 1, 1));
@@ -598,15 +609,17 @@ mod tests {
         assert_eq!(i.resolve(today), Err("That date does not exist."));
         i.text = "2029-2-3".into();
         assert_eq!(i.resolve(today), Err("Enter the date as YYYY-MM-DD."));
-        i.text = "2026-10-17".into();
+        i.text = "2026-10-18".into();
         assert_eq!(
             i.resolve(today),
             Ok(Expiry::Date {
                 y: 2026,
                 m: 10,
-                d: 17
+                d: 18
             })
         );
+        i.text = "2026-10-17".into();
+        assert_eq!(i.resolve(today), Err("Pick a date after today."));
         i.text = "2026-10-16".into();
         assert_eq!(i.resolve(today), Err("That date is in the past."));
         i.text = "2105-12-31".into();

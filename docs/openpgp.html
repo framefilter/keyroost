@@ -168,9 +168,8 @@ keyroostctl openpgp key import --in alice.asc          # restore onto a card</co
       card are unchanged; only the public key's date moves. When you create keys, the choices
       are <strong>Never</strong>, <strong>1</strong>, <strong>2</strong>, <strong>3</strong>
       (the default, as in GnuPG 2.4) or <strong>5</strong> years, or a date picked from the
-      calendar or typed as <code>YYYY-MM-DD</code>. A date means the key works through the end
-      of that day in UTC; GnuPG shows local time, so if you are ahead of UTC it may show the
-      next day.</p>
+      calendar or typed as <code>YYYY-MM-DD</code>. As in GnuPG, a date means the key expires
+      at midday (UTC) on that day, so it shows the same date in nearly every time zone.</p>
     <p><strong>Renewing.</strong> Open <strong>Change expiry date&hellip;</strong> and choose
       how to sign the change: with the card (needs the user PIN) or with the backup (needs its
       passphrase, so the card need not be present; the backup file is updated too). Choosing <strong>Never</strong> removes the

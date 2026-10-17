@@ -293,9 +293,8 @@ keyroostctl openpgp url set https://example.com/alice.asc          # where your 
       <code>rsa3072</code> when listed, else the first type the card lists; a type the card
       doesn't list is refused before any key is made. Keys expire after three years unless
       <code>--expires</code> says otherwise (<code>never</code>, <code>1y</code>,
-      <code>2y</code>, <code>3y</code>, <code>5y</code> or <code>YYYY-MM-DD</code>; a date
-      works through the end of that day in UTC, so GnuPG, which shows local time, may show
-      the next day if you are ahead of UTC). <code>key expiry</code> signs the new date with
+      <code>2y</code>, <code>3y</code>, <code>5y</code> or <code>YYYY-MM-DD</code>; as in
+      GnuPG, a date expires at midday UTC that day). <code>key expiry</code> signs the new date with
       the card, or with <code>--backup alice.asc</code> on this computer; it reads armored or
       binary files and writes them back armored. More in
       <a href="openpgp.html">OpenPGP</a>.</p>

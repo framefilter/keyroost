@@ -66,7 +66,8 @@ pub enum Expiry {
     Never,
     /// Calendar years after the creation date (1, 2, 3 or 5).
     Years(u8),
-    /// Valid through the whole of this day (UTC).
+    /// Expires at midday UTC on this day, as GnuPG does with a date, so
+    /// the date reads the same in nearly every time zone.
     Date {
         y: i32,
         m: u8,
@@ -129,15 +130,15 @@ impl Expiry {
     }
 
     /// Seconds after `created` at which the key expires, or `None` for
-    /// never. Whole-year and date choices both resolve to 00:00:00 UTC of
-    /// the day after the target date, so the key works through that day.
+    /// never. Whole-year and date choices both resolve to midday UTC of the
+    /// target date.
     pub fn seconds_after(self, created: u32) -> Result<Option<u32>, String> {
         Ok(self.end_time(created)?.map(|end| end - created))
     }
 
     /// The moment (seconds since 1970) the key stops working, or `None` for
-    /// never: 00:00:00 UTC of the day after the target date, whole years
-    /// counting from `from`. That moment must come after `from`.
+    /// never: midday UTC of the target date, whole years counting from
+    /// `from`. A date must be after the day `from` falls on.
     pub fn end_time(self, from: u32) -> Result<Option<u32>, String> {
         let (y, m, d) = match self {
             Expiry::Never => return Ok(None),
@@ -146,9 +147,18 @@ impl Expiry {
                 let y = cy + i32::from(n);
                 (y, cm, cd.min(days_in_month(y, cm)))
             }
-            Expiry::Date { y, m, d } => (y, m, d),
+            Expiry::Date { y, m, d } => {
+                let (day, today) = (days_from_civil(y, m, d), i64::from(from) / DAY);
+                if day < today {
+                    return Err("That date is in the past.".into());
+                }
+                if day == today {
+                    return Err("Pick a date after today.".into());
+                }
+                (y, m, d)
+            }
         };
-        let end = (days_from_civil(y, m, d) + 1) * DAY;
+        let end = days_from_civil(y, m, d) * DAY + DAY / 2;
         if end <= i64::from(from) {
             return Err("That date is in the past.".into());
         }
@@ -688,7 +698,7 @@ mod tests {
     #[test]
     fn seconds_after_rules() {
         let created = ts(2024, 2, 29) + 3600;
-        let want = ts(2025, 2, 28) + 86_400;
+        let want = ts(2025, 2, 28) + 43_200;
         assert_eq!(
             Expiry::Years(1).seconds_after(created),
             Ok(Some(want - created))
@@ -701,7 +711,7 @@ mod tests {
         };
         assert_eq!(
             on.seconds_after(created),
-            Ok(Some(ts(2024, 3, 2) - created))
+            Ok(Some(ts(2024, 3, 1) + 43_200 - created))
         );
         let past = Expiry::Date {
             y: 2024,
@@ -712,13 +722,16 @@ mod tests {
             past.seconds_after(created),
             Err("That date is in the past.".to_string())
         );
-        // Today still works, through the end of today.
+        // A key that expires today is refused: midday may already be gone.
         let today = Expiry::Date {
             y: 2024,
             m: 2,
             d: 29,
         };
-        assert!(today.seconds_after(created).unwrap().is_some());
+        assert_eq!(
+            today.seconds_after(created),
+            Err("Pick a date after today.".to_string())
+        );
     }
 
     #[test]
@@ -810,7 +823,7 @@ mod tests {
             later,
         )
         .unwrap();
-        let end = ts(2031, 10, 17);
+        let end = ts(2031, 10, 16) + 43_200;
         let want = Some(end - now);
         let sigs = sig_expiries(&five);
         // Every old signature kept; a new one right after each.
@@ -939,7 +952,7 @@ mod tests {
         );
         // Same passphrase, same keys, new expiry.
         let got = crate::read::open(secret.as_bytes(), Some(b"pw")).unwrap();
-        assert_eq!(got.expiry, Some(ts(2028, 10, 17) - now));
+        assert_eq!(got.expiry, Some(ts(2028, 10, 16) + 43_200 - now));
         verify_backup(&secret, b"pw", &set).unwrap();
         assert!(matches!(
             change_expiry_in_backup(out.secret.as_bytes(), b"nope", Expiry::Never, now + 5),
@@ -1087,7 +1100,7 @@ mod tests {
     #[test]
     fn current_expiry_round_trips_the_chosen_date() {
         let now = ts(2026, 10, 16) + 43_210;
-        for (y, m, d) in [(2026, 10, 16), (2028, 2, 29), (2031, 12, 31)] {
+        for (y, m, d) in [(2026, 10, 17), (2028, 2, 29), (2031, 12, 31)] {
             let (_, out) = made(KeyType::Cv25519, Expiry::Date { y, m, d }, now);
             let public = crate::read::open_public(out.public.as_bytes()).unwrap();
             assert_eq!(current_expiry(&public), Some((y, m, d)));

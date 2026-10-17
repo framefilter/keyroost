@@ -100,7 +100,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "pgp-expiry" => &Help {
             title: "Change expiry date",
-            body: "Moves the expiry date of your public key. Choose Never, 1, 2, 3 or 5 years, or a date; a date works through the end of that day in UTC (GnuPG shows local time, so it may show the next day if you're ahead of UTC). Sign the change with this card (user PIN) or with the backup (its passphrase), then share the updated public key file again so others see the new date. The keys themselves stay the same.",
+            body: "Moves the expiry date of your public key. Choose Never, 1, 2, 3 or 5 years, or a date; a date expires at midday (UTC) on that day, as in GnuPG. Sign the change with this card (user PIN) or with the backup (its passphrase), then share the updated public key file again so others see the new date. The keys themselves stay the same.",
             slug: "/openpgp#expiry",
         },
         "pgp-card-details" => &Help {
