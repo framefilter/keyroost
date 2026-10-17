@@ -1678,8 +1678,9 @@ enum OpenpgpKeyCmd {
         #[arg(long, value_name = "EMAIL", conflicts_with = "in_file")]
         email: Option<String>,
         /// With --generate: the key type (rsa2048, rsa3072, rsa4096,
-        /// nistp256, nistp384, nistp521, secp256k1 or ed25519). Omit for
-        /// ed25519 when the card lists it, rsa3072 otherwise.
+        /// nistp256, nistp384, nistp521, secp256k1 or ed25519); the card
+        /// must list it for all three slots. Omit for ed25519 when the card
+        /// lists it, else rsa3072 when listed, else the first type it lists.
         #[arg(long, value_enum, conflicts_with = "in_file")]
         algorithm: Option<CliOpenpgpKeyAlg>,
         /// With --generate: when the keys expire (never, 1y, 2y, 3y, 5y or
@@ -1730,7 +1731,7 @@ enum OpenpgpKeyCmd {
         backup: Option<std::path::PathBuf>,
         /// The backup's passphrase: env:NAME reads that environment
         /// variable, stdin reads one line (hidden when typed at a terminal).
-        /// With neither, a terminal asks.
+        /// With neither, a terminal asks when the backup is protected.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, requires = "backup")]
         passphrase: Option<SecretSource>,
         /// The signing PIN (PW1): env:NAME reads that environment variable,
