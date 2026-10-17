@@ -34,6 +34,7 @@ keyroost-import = { path = "../keyroost-import", version = "0.13.0", features = 
 # Host-side RSA keygen / key-file loading for OpenPGP on-card import (shared with
 # keyroostctl). Owns the scoped `rsa` dependency exception.
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.13.0" }
+keyroost-pgpkey = { path = "../keyroost-pgpkey", version = "0.13.0", features = ["card"] }
 # Windows-only helper for the non-admin FIDO2 path: detect a FIDO key, open
 # Windows' security-key settings, and relaunch elevated. Inert on other platforms.
 keyroost-winwebauthn = { path = "../keyroost-winwebauthn", version = "0.13.0" }
