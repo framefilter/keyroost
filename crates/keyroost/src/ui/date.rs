@@ -1,8 +1,7 @@
 //! Calendar-date model and typed expiry entry for OpenPGP key creation and
 //! "Change expiry date…".
 
-// The calendar helpers and `for_existing` wait for the calendar popup and
-// the change-expiry dialog.
+// The calendar helpers wait for the calendar popup.
 #![allow(dead_code)]
 
 use super::theme::{f_reg, Palette};
@@ -38,6 +37,12 @@ impl Date {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let (y, m, d) = civil_from_days(i64::try_from(secs / 86_400).unwrap_or(0));
+        Date { y, m, d }
+    }
+
+    /// A `(year, month, day)` as the key library gives it
+    /// (`cert::current_expiry`).
+    pub fn from_civil((y, m, d): (i32, u8, u8)) -> Date {
         Date { y, m, d }
     }
 
@@ -325,6 +330,22 @@ mod tests {
         let e = ExpiryInput::for_existing(Some(dt(2028, 1, 2)), today);
         assert_eq!(e.text, "2028-01-02");
         assert_eq!(e.month, dt(2028, 1, 1));
+    }
+
+    #[test]
+    fn change_dialog_opens_on_the_keys_own_expiry() {
+        let today = dt(2026, 10, 17);
+        let e = ExpiryInput::for_existing(Some(Date::from_civil((2027, 10, 8))), today);
+        assert_eq!(e.choice, ExpiryChoice::Date);
+        assert_eq!(e.text, "2027-10-08");
+        assert_eq!(
+            e.resolve(today),
+            Ok(Expiry::Date {
+                y: 2027,
+                m: 10,
+                d: 8
+            })
+        );
     }
 
     #[test]

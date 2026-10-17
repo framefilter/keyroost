@@ -23,7 +23,7 @@ pub struct Help {
 
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
 ///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-backup, pgp-restore,
-///   pgp-card-details, piv,
+///   pgp-expiry, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate,
 ///   piv-import-export, piv-delete, piv-test, piv-admin, piv-move, piv-retired
 pub fn help(topic: &str) -> Option<&'static Help> {
@@ -97,6 +97,11 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "Restore a backup",
             body: "Loads keys from a backup file \u{2014} one keyroost saved, or one exported from GnuPG \u{2014} onto this card. You choose which of the keys to load; each replaces the key in its slot. You'll need the backup's passphrase and the card's admin PIN.",
             slug: "/openpgp#backup",
+        },
+        "pgp-expiry" => &Help {
+            title: "Change expiry date",
+            body: "Signs a new expiry date into your public key file, with this card and its user PIN or, when the card isn't at hand, with the backup and its passphrase. Choosing Never removes the date. The keys themselves stay the same; share the updated public key file again so others see the new date.",
+            slug: "/openpgp#expiry",
         },
         "pgp-card-details" => &Help {
             title: "Cardholder name & URL",

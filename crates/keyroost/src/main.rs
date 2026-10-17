@@ -867,6 +867,8 @@ struct OpenPgpState {
     /// The restore checklist: load the signature / decryption /
     /// authentication key.
     restore_pick: [bool; 3],
+    /// The "Change expiry date" form.
+    expiry: ExpiryForm,
     /// Change-user-PIN (PW1) old/new entries. Cleared after use.
     user_pin_old: String,
     user_pin_new: String,
@@ -902,6 +904,7 @@ impl OpenPgpState {
         wipe(&mut self.passphrase);
         wipe(&mut self.create.pass);
         wipe(&mut self.create.pass_repeat);
+        wipe(&mut self.expiry.user_pin);
         self.created = None;
         self.created_failure = None;
         self.restore_loaded = None;
@@ -1092,6 +1095,125 @@ fn close_message(load: Option<&LoadFailure>, backup: &std::path::Path) -> CloseM
     }
 }
 
+/// The "Change expiry date\u{2026}" form. The user PIN is wiped on drop and
+/// by [`OpenPgpState::wipe_secrets`]; the backup's passphrase is
+/// [`OpenPgpState::passphrase`].
+struct ExpiryForm {
+    /// The public key file (`NAME.pub.asc`) that gets the new date.
+    public_path: String,
+    /// The public key read from `public_path`; `None` until it is opened.
+    cert: Option<keyroost_pgpkey::read::PublicCert>,
+    /// Starts on the key's current expiry once the file is read.
+    expiry: ui::date::ExpiryInput,
+    /// Sign with the backup instead of the card.
+    with_backup: bool,
+    backup_path: String,
+    /// The card's user PIN (PW1), for signing with the card.
+    user_pin: String,
+    /// The opened key's last day, `None` when it never expires.
+    current: Option<ui::date::Date>,
+}
+
+impl Default for ExpiryForm {
+    fn default() -> Self {
+        ExpiryForm {
+            public_path: String::new(),
+            cert: None,
+            current: None,
+            expiry: ui::date::ExpiryInput::for_existing(None, ui::date::Date::today_utc()),
+            with_backup: false,
+            backup_path: String::new(),
+            user_pin: String::new(),
+        }
+    }
+}
+
+impl Drop for ExpiryForm {
+    fn drop(&mut self) {
+        wipe(&mut self.user_pin);
+    }
+}
+
+/// Why the opened change-expiry form can't be submitted yet; `None` when it
+/// can. The backup's passphrase may be empty (an unprotected GnuPG export).
+fn expiry_form_error(f: &ExpiryForm, today: ui::date::Date) -> Option<&'static str> {
+    if let Err(e) = f.expiry.resolve(today) {
+        return Some(e);
+    }
+    if f.with_backup {
+        if f.backup_path.trim().is_empty() {
+            return Some("Choose the backup file.");
+        }
+    } else if f.user_pin.is_empty() {
+        return Some("Enter the card's user PIN.");
+    }
+    None
+}
+
+/// Read the public key the new date goes into, refusing a backup given in
+/// its place (the CLI's rule).
+fn public_for_expiry(
+    text: &str,
+    path: &std::path::Path,
+) -> Result<keyroost_pgpkey::read::PublicCert, String> {
+    if text.contains("-----BEGIN PGP PRIVATE KEY BLOCK-----") {
+        return Err(format!(
+            "{} is a backup, not a public key: choose the public key file (NAME.pub.asc) \
+             here, and the backup under Sign with.",
+            path.display()
+        ));
+    }
+    keyroost_pgpkey::read::open_public(text.as_bytes()).map_err(pgp_plain)
+}
+
+/// A fingerprint as GnuPG prints it: upper-case hex in groups of four.
+fn fingerprint_groups(fpr: &[u8]) -> String {
+    let hex = hex_lower(fpr).to_ascii_uppercase();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expiry_saved_notice(public: &std::path::Path) -> String {
+    format!(
+        "New expiry saved to {}. Share it again so others see the new date.",
+        public.display()
+    )
+}
+
+/// Replace each file through `<path>.tmp` and a rename, so a failure never
+/// leaves one half-written. All tmp files are written before the first
+/// rename; `secret` ones are created 0600 on Unix. Same as the CLI's
+/// `openpgp key expiry`.
+fn replace_files(writes: &[(&std::path::Path, &str, bool)]) -> Result<(), String> {
+    let tmp_for = |p: &std::path::Path| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".tmp");
+        std::path::PathBuf::from(name)
+    };
+    let mut done: Vec<std::path::PathBuf> = Vec::new();
+    for (path, contents, secret) in writes {
+        let tmp = tmp_for(path);
+        if let Err(e) = keyroost_pgpkey::files::write_new(&tmp, contents, *secret) {
+            for t in &done {
+                let _ = std::fs::remove_file(t);
+            }
+            // write_new names an existing tmp file itself.
+            return Err(pgp_plain(e));
+        }
+        done.push(tmp);
+    }
+    for ((path, ..), tmp) in writes.iter().zip(&done) {
+        std::fs::rename(tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(tmp);
+            format!("Cannot replace {}: {e}", path.display())
+        })?;
+    }
+    Ok(())
+}
+
 fn pgp_slot_index(s: keyroost_pgpkey::read::Slot) -> usize {
     use keyroost_pgpkey::read::Slot;
     match s {
@@ -1141,6 +1263,9 @@ enum OpenPgpCredKind {
     CreateWithBackup,
     /// Read a backup file and load the chosen keys from it.
     RestoreBackup,
+    /// Sign a new expiry date into a public key file, with the card or the
+    /// backup.
+    ChangeExpiry,
     Reset,
 }
 
@@ -1157,6 +1282,7 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::ImportKeyFile => "Import key from file",
             OpenPgpCredKind::CreateWithBackup => "Create keys with a backup",
             OpenPgpCredKind::RestoreBackup => "Restore a backup",
+            OpenPgpCredKind::ChangeExpiry => "Change expiry date",
             OpenPgpCredKind::Reset => "Reset applet",
         }
     }
@@ -1173,6 +1299,7 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::ImportKeyFile => "Import",
             OpenPgpCredKind::CreateWithBackup => "Create & load onto card",
             OpenPgpCredKind::RestoreBackup => "Load onto card",
+            OpenPgpCredKind::ChangeExpiry => "Change date",
             OpenPgpCredKind::Reset => "Reset applet",
         }
     }
@@ -1188,6 +1315,7 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::ImportKeyFile => "Importing key from file\u{2026}",
             OpenPgpCredKind::CreateWithBackup => "Working\u{2026}",
             OpenPgpCredKind::RestoreBackup => "Working\u{2026}",
+            OpenPgpCredKind::ChangeExpiry => "Working\u{2026}",
             OpenPgpCredKind::Reset => "Resetting OpenPGP applet\u{2026}",
         }
     }
@@ -1205,6 +1333,7 @@ impl OpenPgpCredKind {
             OpenPgpCredKind::ImportKeyFile => "Key imported",
             OpenPgpCredKind::CreateWithBackup => "Keys loaded",
             OpenPgpCredKind::RestoreBackup => "Keys loaded",
+            OpenPgpCredKind::ChangeExpiry => "Expiry date changed",
             OpenPgpCredKind::Reset => "Applet reset",
         }
     }
@@ -3701,6 +3830,12 @@ enum FileTarget {
     OpenpgpBackupSave,
     /// OpenPGP "Restore a backup" source (`openpgp.restore_path`).
     OpenpgpRestore,
+    /// OpenPGP "Change expiry date" public key file
+    /// (`openpgp.expiry.public_path`).
+    OpenpgpExpiryPublic,
+    /// OpenPGP "Change expiry date" backup that signs
+    /// (`openpgp.expiry.backup_path`).
+    OpenpgpExpiryBackup,
     /// PIV "Sign & save CSR" destination (`piv.csr_path`).
     PivCsr,
     /// PIV "Import certificate" source file (`piv.cert_path`).
@@ -3817,6 +3952,14 @@ impl App {
                                 // one no longer applies.
                                 self.openpgp.restore_path = text;
                                 self.openpgp.restore_loaded = None;
+                            }
+                            FileTarget::OpenpgpExpiryPublic => {
+                                // A different file: open it again for its date.
+                                self.openpgp.expiry.public_path = text;
+                                self.openpgp.expiry.cert = None;
+                            }
+                            FileTarget::OpenpgpExpiryBackup => {
+                                self.openpgp.expiry.backup_path = text;
                             }
                             // PIV cert file ops pick the path first, then act:
                             // CSR and import need a secret, so open their modal;
@@ -7897,6 +8040,174 @@ impl App {
                         }
                     }
                     Err(e) => Self::openpgp_modal_step(app, Some(e.to_string())),
+                }
+            })
+        })
+    }
+
+    /// Change expiry date, step 1 (worker): read the public key file and
+    /// start the date on the key's current expiry.
+    fn open_openpgp_public(&mut self) -> bool {
+        let path = std::path::PathBuf::from(self.openpgp.expiry.public_path.trim());
+        if path.as_os_str().is_empty() {
+            Self::openpgp_modal_step(
+                self,
+                Some("Choose the public key file (NAME.pub.asc).".into()),
+            );
+            return true;
+        }
+        let for_device = self.selected_device.clone();
+        self.openpgp.notice = None;
+        self.spawn_job("Reading the public key\u{2026}", move || {
+            let result = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Cannot read {}: {e}", path.display()))
+                .and_then(|text| public_for_expiry(&text, &path));
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                match result {
+                    Ok(cert) => {
+                        let f = &mut app.openpgp.expiry;
+                        f.current = keyroost_pgpkey::cert::current_expiry(&cert)
+                            .map(ui::date::Date::from_civil);
+                        f.expiry = ui::date::ExpiryInput::for_existing(
+                            f.current,
+                            ui::date::Date::today_utc(),
+                        );
+                        f.cert = Some(cert);
+                        Self::openpgp_modal_step(app, None);
+                    }
+                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
+                }
+            })
+        })
+    }
+
+    /// Change expiry date, step 2 (worker): sign the new date with the card
+    /// (user PIN) or the backup (passphrase) and write it back into the
+    /// public key file, and into the backup when that signed. The CLI's
+    /// `openpgp key expiry`, step for step.
+    fn change_openpgp_expiry(&mut self) -> bool {
+        use keyroost_pgpkey::{cert, read};
+        let today = ui::date::Date::today_utc();
+        let f = &self.openpgp.expiry;
+        if let Some(e) = expiry_form_error(f, today) {
+            self.openpgp.error = Some(e.to_string());
+            return true;
+        }
+        let (Some(shown), Ok(expiry)) = (
+            f.cert.as_ref().map(|c| c.primary.fpr),
+            f.expiry.resolve(today),
+        ) else {
+            return true; // step 1 opened the file; expiry_form_error checked the date
+        };
+        let public = std::path::PathBuf::from(f.public_path.trim());
+        /// What signs the new date.
+        enum By {
+            Backup(std::path::PathBuf),
+            Card(String),
+        }
+        let by = if f.with_backup {
+            By::Backup(std::path::PathBuf::from(f.backup_path.trim()))
+        } else {
+            let Some(name) = self.selected_openpgp_reader() else {
+                return true;
+            };
+            By::Card(name)
+        };
+        let (secret, label) = match by {
+            By::Backup(_) => (
+                zeroize::Zeroizing::new(self.openpgp.passphrase.clone()),
+                "Signing with the backup\u{2026}",
+            ),
+            By::Card(_) => (
+                zeroize::Zeroizing::new(f.user_pin.clone()),
+                "Signing with the card \u{2014} touch the key each time it blinks\u{2026}",
+            ),
+        };
+        let for_device = self.selected_device.clone();
+        self.openpgp.notice = None;
+        self.spawn_job(label, move || {
+            let result = (|| -> Result<(), String> {
+                let now = unix_now();
+                let text = std::fs::read_to_string(&public)
+                    .map_err(|e| format!("Cannot read {}: {e}", public.display()))?;
+                let cert = public_for_expiry(&text, &public)?;
+                if cert.primary.fpr != shown {
+                    return Err(format!(
+                        "{} holds a different key since it was opened; open it again.",
+                        public.display()
+                    ));
+                }
+                match &by {
+                    By::Backup(b) => {
+                        let secret_text = zeroize::Zeroizing::new(
+                            std::fs::read_to_string(b)
+                                .map_err(|e| format!("Cannot read {}: {e}", b.display()))?,
+                        );
+                        if read::open_public(secret_text.as_bytes())
+                            .map_err(pgp_plain)?
+                            .primary
+                            .fpr
+                            != cert.primary.fpr
+                        {
+                            return Err(format!(
+                                "{} is not the public key of {}.",
+                                public.display(),
+                                b.display()
+                            ));
+                        }
+                        let (new_secret, new_public) = cert::change_expiry_with_backup(
+                            &cert,
+                            &secret_text,
+                            secret.as_bytes(),
+                            expiry,
+                            now,
+                        )
+                        .map_err(pgp_plain)?;
+                        let new_secret = zeroize::Zeroizing::new(new_secret);
+                        replace_files(&[(b, &new_secret, true), (&public, &new_public, false)])
+                    }
+                    By::Card(name) => {
+                        let mut session = keyroost_transport::OpenPgpSession::open(name)
+                            .map_err(|e| e.to_string())?;
+                        // The signer first checks the card holds this key,
+                        // then verifies the PIN before each signature: a
+                        // wrong PIN fails at the first one, before any file
+                        // is written.
+                        let mut signer = keyroost_pgpkey::card::CardSigner::new(
+                            &mut session,
+                            &cert,
+                            secret.as_bytes(),
+                        )
+                        .map_err(pgp_plain)?;
+                        let new_public =
+                            cert::change_expiry(&cert, &mut signer, cert.primary.fpr, expiry, now)
+                                .map_err(pgp_plain)?;
+                        drop(signer);
+                        drop(session);
+                        replace_files(&[(&public, &new_public, false)])
+                    }
+                }
+            })();
+            drop(secret);
+            Box::new(move |app: &mut App| {
+                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    return;
+                }
+                wipe(&mut app.openpgp.passphrase);
+                wipe(&mut app.openpgp.expiry.user_pin);
+                match result {
+                    Ok(()) => {
+                        app.openpgp.error = None;
+                        app.openpgp.notice = Some(expiry_saved_notice(&public));
+                        if let Some(m) = app.openpgp.cred_modal.as_mut() {
+                            m.busy = false;
+                            m.result = Some(Ok(()));
+                        }
+                    }
+                    Err(e) => Self::openpgp_modal_step(app, Some(e)),
                 }
             })
         })
@@ -19539,7 +19850,9 @@ impl App {
         };
         if matches!(
             kind,
-            OpenPgpCredKind::CreateWithBackup | OpenPgpCredKind::RestoreBackup
+            OpenPgpCredKind::CreateWithBackup
+                | OpenPgpCredKind::RestoreBackup
+                | OpenPgpCredKind::ChangeExpiry
         ) {
             self.render_openpgp_backup_modal(ctx, p, kind);
             return;
@@ -19663,7 +19976,9 @@ impl App {
                             );
                         }
                         // Drawn by `render_openpgp_backup_modal`.
-                        OpenPgpCredKind::CreateWithBackup | OpenPgpCredKind::RestoreBackup => {}
+                        OpenPgpCredKind::CreateWithBackup
+                        | OpenPgpCredKind::RestoreBackup
+                        | OpenPgpCredKind::ChangeExpiry => {}
                         OpenPgpCredKind::Reset => {
                             card_note(
                                 ui,
@@ -19753,7 +20068,9 @@ impl App {
                     self.import_openpgp_key();
                 }
                 // Drawn and dispatched by `render_openpgp_backup_modal`.
-                OpenPgpCredKind::CreateWithBackup | OpenPgpCredKind::RestoreBackup => {}
+                OpenPgpCredKind::CreateWithBackup
+                | OpenPgpCredKind::RestoreBackup
+                | OpenPgpCredKind::ChangeExpiry => {}
                 OpenPgpCredKind::Reset => {
                     self.reset_openpgp();
                 }
@@ -19798,10 +20115,12 @@ impl App {
         self.openpgp.cred_modal = None;
     }
 
-    /// The "Create keys with a backup" and "Restore a backup" dialogs. Each
-    /// has two steps on the worker: create makes and saves the keys, then
-    /// (after the user confirms) loads them; restore reads the file with its
-    /// passphrase, then loads the keys ticked in the checklist.
+    /// The "Create keys with a backup", "Restore a backup" and "Change expiry
+    /// date" dialogs. Each has two steps on the worker: create makes and
+    /// saves the keys, then (after the user confirms) loads them; restore
+    /// reads the file with its passphrase, then loads the keys ticked in the
+    /// checklist; change expiry reads the public key file, then signs the
+    /// new date with the card or the backup.
     fn render_openpgp_backup_modal(
         &mut self,
         ctx: &egui::Context,
@@ -19819,11 +20138,11 @@ impl App {
             .busy_label
             .clone()
             .unwrap_or_else(|| "Working\u{2026}".to_string());
-        // Step 2 of either flow: what step 1 produced is waiting.
-        let second = if create {
-            self.openpgp.created.is_some()
-        } else {
-            self.openpgp.restore_loaded.is_some()
+        // Step 2 of each flow: what step 1 produced is waiting.
+        let second = match kind {
+            OpenPgpCredKind::CreateWithBackup => self.openpgp.created.is_some(),
+            OpenPgpCredKind::RestoreBackup => self.openpgp.restore_loaded.is_some(),
+            _ => self.openpgp.expiry.cert.is_some(),
         };
         let offered = offered_key_types(self.openpgp.supported.as_ref());
         let today = ui::date::Date::today_utc();
@@ -19832,6 +20151,8 @@ impl App {
         let mut want_submit = false;
         let mut want_close = false;
         let mut browse = false;
+        let mut browse_backup = false;
+        let expiry_error = expiry_form_error(&self.openpgp.expiry, today);
 
         let label_w = |ui: &mut egui::Ui, t: &str| {
             ui.add_sized(
@@ -19845,9 +20166,16 @@ impl App {
         };
 
         // Tall at large text sizes: the body scrolls inside the window
-        // instead of running off the top and bottom.
+        // instead of running off the top and bottom. The window only offers
+        // its last frame's height, so the scroll area asks for up to
+        // `max_body` itself, or a body that grows (a step, a choice) would
+        // stay clipped at the old height.
         let max_body = (ctx.content_rect().height() - 120.0).max(160.0);
-        let help_topic: &'static str = if create { "pgp-backup" } else { "pgp-restore" };
+        let help_topic: &'static str = match kind {
+            OpenPgpCredKind::CreateWithBackup => "pgp-backup",
+            OpenPgpCredKind::RestoreBackup => "pgp-restore",
+            _ => "pgp-expiry",
+        };
         let help_open = self.help_open == Some(help_topic);
         let (closed, help_resp) = Self::modal_window_help(
             ctx,
@@ -19859,6 +20187,7 @@ impl App {
             |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(max_body)
+                    .min_scrolled_height(max_body)
                     .show(ui, |ui| {
                         if let Some(Ok(())) = &result {
                             ui.label(
@@ -19883,6 +20212,132 @@ impl App {
                         let mut submit_label = kind.submit_label();
                         let mut can_submit = true;
                         match (create, second) {
+                            _ if kind == OpenPgpCredKind::ChangeExpiry => {
+                                let f = &mut self.openpgp.expiry;
+                                let mut path_changed = false;
+                                ui.horizontal(|ui| {
+                                    label_w(ui, "Public key");
+                                    path_changed = ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut f.public_path)
+                                                .hint_text("NAME.pub.asc")
+                                                .desired_width(130.0),
+                                        )
+                                        .changed();
+                                    browse =
+                                        theme::button(ui, p, BtnKind::Default, "Browse\u{2026}")
+                                            .clicked();
+                                });
+                                // A different file: open it again for its date.
+                                if path_changed {
+                                    f.cert = None;
+                                }
+                                match &f.cert {
+                                    None => {
+                                        card_note(
+                                            ui,
+                                            p,
+                                            "The public key file saved with the backup \
+                                         (NAME.pub.asc). The new date is written back into it.",
+                                        );
+                                        submit_label = "Open";
+                                        can_submit = !f.public_path.trim().is_empty();
+                                    }
+                                    Some(cert) => {
+                                        ui.add_space(6.0);
+                                        for uid in &cert.user_ids {
+                                            ui.label(
+                                                egui::RichText::new(uid)
+                                                    .font(theme::f_sb(13.0))
+                                                    .color(p.txt),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(fingerprint_groups(
+                                                &cert.primary.fpr,
+                                            ))
+                                            .font(theme::f_reg(12.0))
+                                            .color(p.txt2),
+                                        );
+                                        let now = match f.current {
+                                            Some(d) => format!("Currently expires on {}", d.long()),
+                                            None => "Currently never expires".to_string(),
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(now)
+                                                .font(theme::f_reg(12.0))
+                                                .color(p.txt2),
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            label_w(ui, "New date");
+                                            ui.vertical(|ui| {
+                                                ui::date::expiry_row(ui, p, &mut f.expiry, today)
+                                            });
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.horizontal(|ui| {
+                                            label_w(ui, "Sign with");
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.radio_value(
+                                                    &mut f.with_backup,
+                                                    false,
+                                                    "this card",
+                                                );
+                                                ui.radio_value(
+                                                    &mut f.with_backup,
+                                                    true,
+                                                    "the backup",
+                                                );
+                                            });
+                                        });
+                                        ui.add_space(4.0);
+                                        if f.with_backup {
+                                            ui.horizontal(|ui| {
+                                                label_w(ui, "Backup");
+                                                ui.add(
+                                                    egui::TextEdit::singleline(&mut f.backup_path)
+                                                        .hint_text("NAME.asc")
+                                                        .desired_width(130.0),
+                                                );
+                                                browse_backup = theme::button(
+                                                    ui,
+                                                    p,
+                                                    BtnKind::Default,
+                                                    "Browse\u{2026}",
+                                                )
+                                                .clicked();
+                                            });
+                                            pin_field(
+                                                ui,
+                                                p,
+                                                "Passphrase",
+                                                &mut self.openpgp.passphrase,
+                                            );
+                                            card_note(
+                                                ui,
+                                                p,
+                                                "Signs on this computer; the backup gets the new \
+                                             date too. Leave the passphrase empty if the \
+                                             backup has none.",
+                                            );
+                                        } else {
+                                            pin_field(ui, p, "User PIN", &mut f.user_pin);
+                                            card_note(
+                                                ui,
+                                                p,
+                                                "The card signs the new date. It may ask for a \
+                                             touch for each signature.",
+                                            );
+                                        }
+                                        if let Some(e) = expiry_error {
+                                            ui.add_space(6.0);
+                                            ui.colored_label(p.txt3, e);
+                                            can_submit = false;
+                                        }
+                                    }
+                                }
+                            }
                             (true, false) => {
                                 let f = &mut self.openpgp.create;
                                 text_field(ui, p, "Name", &mut f.name, "Your name", 200.0);
@@ -20099,7 +20554,25 @@ impl App {
             }
         }
 
-        if browse {
+        if browse_backup {
+            self.spawn_file_dialog(
+                FileTarget::OpenpgpExpiryBackup,
+                false,
+                &[
+                    ("OpenPGP keys", &["asc", "gpg", "pgp", "key"]),
+                    ("All files", &["*"]),
+                ],
+                None,
+            );
+        }
+        if browse && kind == OpenPgpCredKind::ChangeExpiry {
+            self.spawn_file_dialog(
+                FileTarget::OpenpgpExpiryPublic,
+                false,
+                &[("OpenPGP public key", &["asc"]), ("All files", &["*"])],
+                None,
+            );
+        } else if browse {
             if create {
                 self.spawn_file_dialog(
                     FileTarget::OpenpgpBackupSave,
@@ -20141,11 +20614,13 @@ impl App {
             m.result = None;
         }
         self.openpgp.error = None;
-        match (create, second) {
-            (true, false) => self.create_openpgp_keys(),
-            (true, true) => self.load_created_openpgp_keys(),
-            (false, false) => self.open_openpgp_backup(),
-            (false, true) => self.restore_openpgp_keys(),
+        match (kind, second) {
+            (OpenPgpCredKind::ChangeExpiry, false) => self.open_openpgp_public(),
+            (OpenPgpCredKind::ChangeExpiry, true) => self.change_openpgp_expiry(),
+            (_, false) if create => self.create_openpgp_keys(),
+            (_, true) if create => self.load_created_openpgp_keys(),
+            (_, false) => self.open_openpgp_backup(),
+            (_, true) => self.restore_openpgp_keys(),
         };
         // Not queued: the worker was busy (try again) or a guard refused the
         // input; show the refusal in the dialog.
@@ -20550,6 +21025,12 @@ impl App {
                     {
                         open_modal = Some(OpenPgpCredKind::CreateWithBackup);
                     }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Change expiry date\u{2026}")
+                        .clicked()
+                    {
+                        open_modal = Some(OpenPgpCredKind::ChangeExpiry);
+                    }
                 },
             );
         });
@@ -20752,6 +21233,7 @@ impl App {
                         default_create_type(&offered_key_types(self.openpgp.supported.as_ref()));
                     self.openpgp.create = form;
                 }
+                OpenPgpCredKind::ChangeExpiry => self.openpgp.expiry = ExpiryForm::default(),
                 OpenPgpCredKind::ImportKeyFile => {
                     self.openpgp.import_is_openpgp =
                         file_starts_openpgp(std::path::Path::new(self.openpgp.import_path.trim()));
@@ -23925,6 +24407,92 @@ mod tests {
         assert_eq!(create_form_error(&f), Some("That date is in the past."));
         f.expiry.text = "2029-13-01".into();
         assert_eq!(create_form_error(&f), Some("Type a date as YYYY-MM-DD."));
+    }
+
+    fn opened_expiry_form() -> ExpiryForm {
+        let mut f = ExpiryForm::default();
+        f.public_path = "/keys/k.pub.asc".into();
+        f.user_pin = "123456".into();
+        f
+    }
+
+    #[test]
+    fn expiry_form_asks_for_what_the_chosen_signer_needs() {
+        let today = ui::date::Date::today_utc();
+        assert_eq!(expiry_form_error(&opened_expiry_form(), today), None);
+        let mut f = opened_expiry_form();
+        f.user_pin.clear();
+        assert_eq!(
+            expiry_form_error(&f, today),
+            Some("Enter the card's user PIN.")
+        );
+        // Signing with the backup needs the file, not the card's PIN; the
+        // passphrase may be empty (an unprotected GnuPG export).
+        f.with_backup = true;
+        assert_eq!(
+            expiry_form_error(&f, today),
+            Some("Choose the backup file.")
+        );
+        f.backup_path = "/keys/k.asc".into();
+        assert_eq!(expiry_form_error(&f, today), None);
+        f.expiry.choice = ui::date::ExpiryChoice::Date;
+        f.expiry.text = "2020-01-01".into();
+        assert_eq!(
+            expiry_form_error(&f, today),
+            Some("That date is in the past.")
+        );
+        f.expiry.choice = ui::date::ExpiryChoice::Never;
+        assert_eq!(expiry_form_error(&f, today), None);
+    }
+
+    #[test]
+    fn a_backup_given_as_the_public_key_is_refused() {
+        let p = std::path::Path::new("k.asc");
+        let e = public_for_expiry(
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n-----END PGP PRIVATE KEY BLOCK-----\n",
+            p,
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "k.asc is a backup, not a public key: choose the public key file (NAME.pub.asc) \
+             here, and the backup under Sign with."
+        );
+        assert!(public_for_expiry("not a key", p).is_err());
+    }
+
+    #[test]
+    fn the_expiry_notice_says_to_share_the_file_again() {
+        assert_eq!(
+            expiry_saved_notice(std::path::Path::new("/keys/k.pub.asc")),
+            "New expiry saved to /keys/k.pub.asc. Share it again so others see the new date."
+        );
+    }
+
+    #[test]
+    fn replacing_files_leaves_no_tmp_and_keeps_the_backup_private() {
+        let dir = std::env::temp_dir().join(format!("keyroost-expiry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (b, pubf) = (dir.join("k.asc"), dir.join("k.pub.asc"));
+        std::fs::write(&b, "old secret").unwrap();
+        std::fs::write(&pubf, "old public").unwrap();
+        replace_files(&[(&b, "new secret", true), (&pubf, "new public", false)]).unwrap();
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new secret");
+        assert_eq!(std::fs::read_to_string(&pubf).unwrap(), "new public");
+        assert!(!dir.join("k.asc.tmp").exists() && !dir.join("k.pub.asc.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&b).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // A left-over tmp file stops the write before anything is replaced.
+        std::fs::write(dir.join("k.pub.asc.tmp"), "stale").unwrap();
+        assert!(replace_files(&[(&b, "newer", true), (&pubf, "newer", false)]).is_err());
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new secret");
+        assert!(!dir.join("k.asc.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -27143,7 +27711,7 @@ mod tests {
         ] {
             assert!(k.needs_admin_pin(), "{} should need PW3", k.title());
         }
-        for k in [ChangeUserPin, Reset] {
+        for k in [ChangeUserPin, ChangeExpiry, Reset] {
             assert!(!k.needs_admin_pin(), "{} should not need PW3", k.title());
         }
     }
@@ -27473,6 +28041,7 @@ mod tests {
             GenerateKey,
             CreateWithBackup,
             RestoreBackup,
+            ChangeExpiry,
             ImportKeyFile,
             Reset,
         ] {
