@@ -310,14 +310,21 @@ fn showing_id() -> egui::Id {
 }
 
 fn set_calendar_showing(ctx: &egui::Context, on: bool) {
-    ctx.data_mut(|d| d.insert_temp(showing_id(), on));
+    let stamp = on.then(|| ctx.cumulative_pass_nr());
+    ctx.data_mut(|d| d.insert_temp(showing_id(), stamp));
 }
 
-/// Whether a calendar popup was open last frame. The dialog around it uses
-/// this to leave Esc to the calendar instead of closing itself too.
+/// A stamp counts when it was written this pass or the one before, so a
+/// calendar that stops being drawn stops counting by itself.
+fn stamp_is_fresh(stamp: Option<u64>, now: u64) -> bool {
+    stamp.is_some_and(|s| s.saturating_add(1) >= now)
+}
+
+/// Whether a calendar popup is open. The dialog around it uses this to
+/// leave Esc to the calendar instead of closing itself too.
 pub fn calendar_showing(ctx: &egui::Context) -> bool {
-    ctx.data(|d| d.get_temp::<bool>(showing_id()))
-        .unwrap_or(false)
+    let stamp = ctx.data(|d| d.get_temp::<Option<u64>>(showing_id()));
+    stamp_is_fresh(stamp.flatten(), ctx.cumulative_pass_nr())
 }
 
 /// A "Calendar" button and, while open, a month popup under it. Picking a
@@ -507,9 +514,21 @@ mod tests {
         assert_eq!(g[0], dt(2026, 9, 28));
         assert_eq!(g[0].weekday(), 0);
         assert!(g.contains(&dt(2026, 10, 31)));
+        assert!(g
+            .iter()
+            .enumerate()
+            .all(|(i, d)| usize::from(d.weekday()) == i % 7));
         assert_eq!(g[41], dt(2026, 11, 8));
         // A month starting on Monday begins its own grid.
         assert_eq!(month_grid(dt(2026, 6, 15))[0], dt(2026, 6, 1));
+    }
+
+    #[test]
+    fn calendar_stamp_expires() {
+        assert!(stamp_is_fresh(Some(10), 10));
+        assert!(stamp_is_fresh(Some(10), 11));
+        assert!(!stamp_is_fresh(Some(10), 12));
+        assert!(!stamp_is_fresh(None, 10));
     }
 
     #[test]
