@@ -52,13 +52,7 @@ impl CanonicalId {
 
     /// First and last two characters plus the length, for traces.
     pub fn abbreviated(&self) -> String {
-        let chars: Vec<char> = self.value.chars().collect();
-        if chars.len() <= 4 {
-            return self.value.clone();
-        }
-        let head: String = chars[..2].iter().collect();
-        let tail: String = chars[chars.len() - 2..].iter().collect();
-        format!("{head}\u{2026}{tail} (len {})", chars.len())
+        keyroost_proto::trace::abbreviate(&self.value)
     }
 }
 
@@ -315,7 +309,8 @@ pub fn plan_identity_reads(
         .iter()
         .filter(|p| !p.is_molto2 && !p.is_prog && !claimed.contains(&p.reader_name.as_str()))
         .collect();
-    let eligible = |h: &HidDevice, p: &ReaderProbe| !(h.usb_bus.is_some() && p.usb_bus.is_some());
+    let eligible =
+        |h: &HidDevice, p: &ReaderProbe| !(h.usb_device.is_some() && p.usb_device.is_some());
     let mut plan = IdentityPlan::default();
     for (v, r) in registry.iter().enumerate() {
         let hs: Vec<&HidDevice> = free_hids
@@ -536,8 +531,7 @@ mod tests {
             usage_page: HID_USAGE_PAGE_FIDO,
             usage: HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: serial.map(str::to_owned),
-            usb_bus: bus,
-            usb_address: addr,
+            usb_device: keyroost_hid::UsbDeviceKey::from_bus_addr(bus, addr),
         }
     }
     fn reader(name: &str, yk: Option<&str>, bus: Option<u8>, addr: Option<u8>) -> ReaderProbe {
@@ -554,8 +548,7 @@ mod tests {
             is_prog: false,
             prog_serial: None,
             yubikey_serial: yk.map(str::to_owned),
-            usb_bus: bus,
-            usb_address: addr,
+            usb_device: keyroost_hid::UsbDeviceKey::from_bus_addr(bus, addr),
         }
     }
     #[test]

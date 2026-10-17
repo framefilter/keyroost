@@ -27,6 +27,21 @@ impl Dir {
     }
 }
 
+/// A serial-like value shortened for a trace: the first and last two
+/// characters plus the length (`12…78 (len 8)`), so pasted `--debug` output
+/// never carries the whole value. Values of four characters or fewer are shown
+/// as is.
+#[must_use]
+pub fn abbreviate(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 4 {
+        return value.to_string();
+    }
+    let head: String = chars[..2].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}\u{2026}{tail} (len {})", chars.len())
+}
+
 /// `"> label                body"`, with no trailing whitespace.
 #[must_use]
 pub fn format_line(dir: Dir, label: &str, body: &str) -> String {
@@ -42,7 +57,15 @@ pub fn format_line(dir: Dir, label: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_line, Dir, LABEL_WIDTH};
+    use super::{abbreviate, format_line, Dir, LABEL_WIDTH};
+
+    #[test]
+    fn abbreviate_keeps_two_each_end_plus_length() {
+        assert_eq!(abbreviate("12345678"), "12\u{2026}78 (len 8)");
+        assert_eq!(abbreviate("12345"), "12\u{2026}45 (len 5)");
+        assert_eq!(abbreviate("1234"), "1234");
+        assert_eq!(abbreviate(""), "");
+    }
 
     #[test]
     fn format_line_grammar() {

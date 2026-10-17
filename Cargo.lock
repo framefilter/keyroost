@@ -2243,6 +2243,8 @@ name = "keyroost-hid"
 version = "0.13.0"
 dependencies = [
  "hidapi",
+ "keyroost-proto",
+ "keyroost-windevtree",
 ]
 
 [[package]]
@@ -2411,9 +2413,17 @@ dependencies = [
  "keyroost-proto",
  "keyroost-token2otp",
  "keyroost-token2prog",
+ "keyroost-windevtree",
  "miniz_oxide 0.9.1",
  "pcsc",
  "zeroize",
+]
+
+[[package]]
+name = "keyroost-windevtree"
+version = "0.13.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2446,6 +2456,7 @@ dependencies = [
  "keyroost-token2otp",
  "keyroost-token2prog",
  "keyroost-transport",
+ "keyroost-winwebauthn",
  "proptest",
  "rpassword",
  "serde",

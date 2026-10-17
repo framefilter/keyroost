@@ -549,24 +549,23 @@ struct ResetArm {
 /// that path — and the armed reset never fires; the touch prompt waits
 /// forever for a replug the code already missed.
 ///
-/// `usb_bus`/`usb_address` (sysfs `busnum`/`devnum`) are the kernel's own
-/// per-attach counters, so they're what [`same_hid_connection`] compares
-/// first. `hidapi` (macOS/Windows) doesn't expose USB topology, so identity
-/// there falls back to the path — no better than before on those platforms,
-/// but no worse either.
+/// The Linux USB bus/address (sysfs `busnum`/`devnum`) is the kernel's own
+/// per-attach counter, so it's what [`same_hid_connection`] compares first.
+/// `hidapi` (macOS) exposes no USB topology, and the Windows devnode is
+/// persistent across a replug (it names the device, not the attach), so
+/// identity there falls back to the path — no better than before on those
+/// platforms, but no worse either.
 #[derive(Clone)]
 struct HidIdentity {
     path: std::path::PathBuf,
-    usb_bus: Option<u8>,
-    usb_address: Option<u8>,
+    usb_device: Option<keyroost_hid::UsbDeviceKey>,
 }
 
 impl HidIdentity {
     fn of(d: &FidoHid) -> Self {
         HidIdentity {
             path: d.path.clone(),
-            usb_bus: d.usb_bus,
-            usb_address: d.usb_address,
+            usb_device: d.usb_device.clone(),
         }
     }
 }
@@ -574,10 +573,12 @@ impl HidIdentity {
 /// Whether `a` and `b` are the same physical USB attach, for telling a
 /// reinserted key apart from one that never left. Bus+address decide it when
 /// both sides have them; otherwise this falls back to path equality, all the
-/// hidapi backend can offer.
+/// hidapi backend can offer (a Windows devnode survives a replug, so it can't
+/// tell a new attach apart).
 fn same_hid_connection(a: &HidIdentity, b: &HidIdentity) -> bool {
-    match (a.usb_bus, a.usb_address, b.usb_bus, b.usb_address) {
-        (Some(ab), Some(aa), Some(bb), Some(ba)) => ab == bb && aa == ba,
+    use keyroost_hid::UsbDeviceKey::BusAddr;
+    match (&a.usb_device, &b.usb_device) {
+        (Some(x @ BusAddr(..)), Some(y @ BusAddr(..))) => x == y,
         _ => a.path == b.path,
     }
 }
@@ -648,11 +649,10 @@ struct FidoHid {
     path: std::path::PathBuf,
     serial: Option<String>,
     ids: (u16, u16),
-    /// USB bus/device-address of the underlying device (Linux sysfs backend
-    /// only; `None` on the hidapi backend). Used by [`same_hid_connection`] to
-    /// tell a reinserted key apart from a recycled `/dev/hidrawN` path.
-    usb_bus: Option<u8>,
-    usb_address: Option<u8>,
+    /// Which USB device this is (bus/address on Linux, the devnode on
+    /// Windows, `None` on macOS). Used by [`same_hid_connection`] to tell a
+    /// reinserted key apart from a recycled `/dev/hidrawN` path.
+    usb_device: Option<keyroost_hid::UsbDeviceKey>,
 }
 
 #[derive(Default)]
@@ -3427,7 +3427,7 @@ fn main() -> eframe::Result<()> {
             .with_title("keyroost"),
         ..Default::default()
     };
-    eframe::run_native(
+    let started = eframe::run_native(
         "keyroost",
         options,
         Box::new(|cc| {
@@ -3489,7 +3489,41 @@ fn main() -> eframe::Result<()> {
             };
             Ok(Box::new(app))
         }),
-    )
+    );
+    if let Err(e) = &started {
+        report_start_failure(e);
+    }
+    started
+}
+
+/// Say why the window never opened. A release build on Windows has no
+/// console, so without a dialog the app would just vanish.
+fn report_start_failure(e: &eframe::Error) {
+    let graphics = matches!(
+        e,
+        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
+    );
+    let text = if graphics {
+        format!(
+            "keyroost couldn't open its window because this computer's graphics \
+             don't provide OpenGL 2.0 or newer. This is common in virtual machines \
+             without 3D acceleration and in some remote-desktop sessions; turning \
+             on 3D acceleration or updating the graphics driver usually fixes it. \
+             The command-line tool, keyroostctl, works without it.\n\nDetails: {e}"
+        )
+    } else {
+        format!("keyroost couldn't open its window.\n\nDetails: {e}")
+    };
+    eprintln!("{text}");
+    #[cfg(windows)]
+    {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("keyroost")
+            .set_description(&text)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
 }
 
 #[derive(Default)]
@@ -7307,8 +7341,7 @@ impl App {
                 path: h.path,
                 serial: h.serial_number,
                 ids: (h.vendor_id, h.product_id),
-                usb_bus: h.usb_bus,
-                usb_address: h.usb_address,
+                usb_device: h.usb_device,
             })
             .collect()
     }
@@ -28425,13 +28458,11 @@ mod tests {
     fn same_hid_connection_tells_a_recycled_path_apart_from_the_old_device() {
         let before = HidIdentity {
             path: "/dev/hidraw0".into(),
-            usb_bus: Some(1),
-            usb_address: Some(8),
+            usb_device: Some(keyroost_hid::UsbDeviceKey::BusAddr(1, 8)),
         };
         let after_replug = HidIdentity {
             path: "/dev/hidraw0".into(), // recycled by the kernel
-            usb_bus: Some(1),
-            usb_address: Some(9), // advanced: a genuinely new attach
+            usb_device: Some(keyroost_hid::UsbDeviceKey::BusAddr(1, 9)), // advanced: a genuinely new attach
         };
         assert!(
             !same_hid_connection(&before, &after_replug),
@@ -28445,13 +28476,11 @@ mod tests {
     fn same_hid_connection_recognises_a_device_that_never_left() {
         let seen_before = HidIdentity {
             path: "/dev/hidraw1".into(),
-            usb_bus: Some(1),
-            usb_address: Some(4),
+            usb_device: Some(keyroost_hid::UsbDeviceKey::BusAddr(1, 4)),
         };
         let seen_again = HidIdentity {
             path: "/dev/hidraw1".into(),
-            usb_bus: Some(1),
-            usb_address: Some(4),
+            usb_device: Some(keyroost_hid::UsbDeviceKey::BusAddr(1, 4)),
         };
         assert!(same_hid_connection(&seen_before, &seen_again));
     }
@@ -28463,21 +28492,39 @@ mod tests {
     fn same_hid_connection_falls_back_to_path_without_usb_topology() {
         let a = HidIdentity {
             path: "/dev/hidraw0".into(),
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         let b = HidIdentity {
             path: "/dev/hidraw0".into(),
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         let c = HidIdentity {
             path: "/dev/hidraw1".into(),
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         assert!(same_hid_connection(&a, &b));
         assert!(!same_hid_connection(&a, &c));
+    }
+
+    /// A Windows devnode names the device, not the attach (it survives a
+    /// replug), so it never decides this: the path does, as before #51.
+    #[test]
+    fn same_hid_connection_ignores_windows_devnodes() {
+        let node = |id: &str| Some(keyroost_hid::UsbDeviceKey::win_node(id));
+        let a = HidIdentity {
+            path: r"\\?\HID#VID_349E&PID_0014&MI_00#8&1A#0000".into(),
+            usb_device: node(r"USB\VID_349E&PID_0014\6&11223344&0&2"),
+        };
+        let replugged_same_path = HidIdentity {
+            path: a.path.clone(),
+            usb_device: node(r"USB\VID_349E&PID_0024\6&11223344&0&3"),
+        };
+        let same_node_other_path = HidIdentity {
+            path: r"\\?\HID#VID_349E&PID_0014&MI_00#8&2B#0000".into(),
+            usb_device: a.usb_device.clone(),
+        };
+        assert!(same_hid_connection(&a, &replugged_same_path));
+        assert!(!same_hid_connection(&a, &same_node_other_path));
     }
 }
 

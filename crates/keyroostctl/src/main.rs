@@ -5747,6 +5747,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = target::DEBUG.set(cli.debug);
     if cli.debug {
         keyroost_ctap::set_trace(true);
+        // Windows only: each key's device-tree chain and chosen USB node.
+        keyroost_hid::devtree::set_devtree_trace(true);
+        // Each reader's applet SELECTs during device discovery.
+        keyroost_transport::set_probe_trace(true);
     }
 
     if cli.device.is_some() {
@@ -5822,7 +5826,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // List touches neither PC/SC card state nor any HID device — just enumerates.
+    // List only reads: it selects applets on each reader and asks FIDO keys
+    // for their info and on-key name, but changes nothing.
     if let Cmd::List { all_hid } = cmd {
         run_list(*all_hid, cli.device.as_deref())?;
         return Ok(());
@@ -6551,6 +6556,9 @@ fn run_doctor() {
                 let fido: Vec<_> = devices.iter().filter(|d| d.is_fido()).collect();
                 if fido.is_empty() {
                     println!("– no FIDO HID devices present");
+                    if admin_only_fido_key_present() {
+                        println!("  {ADMIN_ONLY_FIDO_NOTE}");
+                    }
                     for d in &devices {
                         if let Some(label) = d.bootloader_label() {
                             println!("  note: {} at {} — re-plug it", label, d.path.display());
@@ -6633,6 +6641,18 @@ fn run_doctor() {
         ),
         None => println!("– no config dir resolvable (HOME/XDG unset?)"),
     }
+}
+
+/// What `list` and `doctor` print when Windows hides a plugged-in FIDO key
+/// from a program that isn't running as administrator.
+const ADMIN_ONLY_FIDO_NOTE: &str = "note: a FIDO key is plugged in, but Windows only lets an \
+     administrator open it; run keyroostctl from an administrator terminal to use FIDO2.";
+
+/// Windows: a FIDO key is present that this (non-elevated) process can't
+/// open. Seen through the HID usage page alone, without opening the device.
+/// Always false elsewhere.
+fn admin_only_fido_key_present() -> bool {
+    keyroost_winwebauthn::fido_key_present()
 }
 
 fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -6723,6 +6743,9 @@ fn run_list(all_hid: bool, device: Option<&str>) -> Result<(), Box<dyn std::erro
         let filtered: Vec<_> = hids.iter().filter(|d| all_hid || d.is_fido()).collect();
         if filtered.is_empty() {
             println!("  (none)");
+            if admin_only_fido_key_present() {
+                println!("  {ADMIN_ONLY_FIDO_NOTE}");
+            }
             if let Some(bl) = keyroost_hid::bootloader_device_present() {
                 println!("  note: detected {bl} — re-plug it to return to application mode.");
             }
@@ -23298,8 +23321,7 @@ mod cli_tests {
             usage_page: keyroost_hid::HID_USAGE_PAGE_FIDO,
             usage: keyroost_hid::HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: None,
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         let e = record_meta_for(&yk, std::slice::from_ref(&hid));
         assert_eq!(

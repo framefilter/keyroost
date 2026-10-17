@@ -1,0 +1,25 @@
+[package]
+name = "keyroost-windevtree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Windows-only device-tree lookups (HID path / smart-card reader to ancestor devnodes) for keyroost; inert on other platforms."
+
+# The one place keyroost's device-tree pairing needs unsafe: a thin FFI shim
+# over cfgmgr32 and winscard, confined here so keyroost-hid and
+# keyroost-transport keep forbid(unsafe_code). It only returns raw ancestor
+# chains; the decision of which node counts lives in keyroost-hid.
+[lints.rust]
+unsafe_code = "allow"
+
+# Windows-only: on every other target the crate compiles to an inert stub with
+# no dependencies, so callers can depend on it unconditionally.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",                          # DEVPROPKEY
+    "Win32_Devices_DeviceAndDriverInstallation", # CM_Locate_DevNodeW, CM_Get_Parent, CM_Get_Device_IDW
+    "Win32_Devices_Properties",                  # CM_Get_Device_Interface_PropertyW, DEVPKEY_Device_InstanceId
+    "Win32_Security_Credentials",                # SCardEstablishContext, SCardGetReaderDeviceInstanceIdA
+] }

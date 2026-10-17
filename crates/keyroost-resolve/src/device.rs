@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use keyroost_hid::HidDevice;
+use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
 use keyroost_keyring::Keyring;
 use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
@@ -267,8 +267,8 @@ pub struct MatchOptions {
     pub trace: bool,
 }
 
-/// The same snapshot with every USB bus+address dropped — what a backend
-/// that reports no topology (hidapi on Windows and macOS) would have seen.
+/// The same snapshot with every USB device key dropped — what a backend
+/// that reports no topology (hidapi on macOS) would have seen.
 fn without_topology(
     hids: &[HidDevice],
     probes: &[ReaderProbe],
@@ -277,8 +277,7 @@ fn without_topology(
         .iter()
         .cloned()
         .map(|mut h| {
-            h.usb_bus = None;
-            h.usb_address = None;
+            h.usb_device = None;
             h
         })
         .collect();
@@ -286,24 +285,20 @@ fn without_topology(
         .iter()
         .cloned()
         .map(|mut p| {
-            p.usb_bus = None;
-            p.usb_address = None;
+            p.usb_device = None;
             p
         })
         .collect();
     (hids, probes)
 }
 
-/// True when some FIDO HID node shares this reader's USB topology (bus+address) —
-/// i.e. they are the same physical device. Used to keep a Token2 *FIDO key* from
-/// ever being classified as a Molto2 (the Molto2 has no FIDO HID interface).
+/// True when some FIDO HID node shares this reader's USB device (Linux
+/// bus+address, or the Windows devnode) — i.e. they are the same physical
+/// device. Used to keep a Token2 *FIDO key* from ever being classified as a
+/// Molto2 (the Molto2 has no FIDO HID interface).
 fn has_fido_hid_sibling(p: &ReaderProbe, hids: &[&HidDevice]) -> bool {
-    match (p.usb_bus, p.usb_address) {
-        (Some(bus), Some(addr)) => hids
-            .iter()
-            .any(|h| h.usb_bus == Some(bus) && h.usb_address == Some(addr)),
-        _ => false,
-    }
+    hids.iter()
+        .any(|h| same_usb_device(p.usb_device.as_ref(), h.usb_device.as_ref()))
 }
 
 /// True when a reader plausibly belongs to a Yubico key: it answered the YubiKey
@@ -315,29 +310,50 @@ fn is_yubico_reader(c: &YubiKeyCcid) -> bool {
     c.serial.is_some() || c.reader_name.to_ascii_lowercase().contains("yubikey")
 }
 
+/// Readers already bound, keyed by reader name and carrying the claiming node's
+/// USB device key (see [`reader_is_bindable`]).
+type Claimed = std::collections::HashMap<String, Option<UsbDeviceKey>>;
+
 /// True when `reader` may still be bound by this HID node. A reader belongs to
-/// exactly one physical device, so once a node has claimed it only a node at the
-/// *same* USB bus+address — another interface of that very device — may share
+/// exactly one physical device, so once a node has claimed it only a node on
+/// the *same* USB device — another interface of that very device — may share
 /// it. Without this, two keys fuse into one row whose card operations go to one
 /// device and whose FIDO operations go to another.
-fn reader_is_bindable(
-    claimed: &std::collections::HashMap<String, (Option<u8>, Option<u8>)>,
-    reader: &str,
-    hid: &HidDevice,
-) -> bool {
+fn reader_is_bindable(claimed: &Claimed, reader: &str, hid: &HidDevice) -> bool {
     match claimed.get(reader) {
         None => true,
-        Some(&(bus, addr)) => bus.is_some() && bus == hid.usb_bus && addr == hid.usb_address,
+        Some(key) => same_usb_device(key.as_ref(), hid.usb_device.as_ref()),
     }
 }
 
-/// The reader this HID node shares a USB bus+address with — the strongest
-/// correlation signal available, and unambiguous even with several same-vendor
-/// keys plugged in (#51). `None` when either side reports no topology.
+/// The reader this HID node shares a USB device with (Linux bus+address, or
+/// the Windows devnode) — the strongest correlation signal available, and
+/// unambiguous even with several same-vendor keys plugged in (#51). `None`
+/// when either side reports no topology.
 fn reader_by_topology<'a>(probes: &'a [ReaderProbe], hid: &HidDevice) -> Option<&'a ReaderProbe> {
-    probes.iter().filter(|p| !p.is_molto2).find(|p| {
-        p.usb_bus.is_some() && p.usb_bus == hid.usb_bus && p.usb_address == hid.usb_address
-    })
+    probes
+        .iter()
+        .filter(|p| !p.is_molto2)
+        .find(|p| same_usb_device(p.usb_device.as_ref(), hid.usb_device.as_ref()))
+}
+
+/// The USB device key the reader called `name` reported, if any.
+fn reader_key<'a>(
+    probes: &'a [ReaderProbe],
+    yk_readers: &'a [YubiKeyCcid],
+    name: &str,
+) -> Option<&'a UsbDeviceKey> {
+    probes
+        .iter()
+        .find(|p| p.reader_name == name)
+        .map(|p| p.usb_device.as_ref())
+        .or_else(|| {
+            yk_readers
+                .iter()
+                .find(|c| c.reader_name == name)
+                .map(|c| c.usb_device.as_ref())
+        })
+        .flatten()
 }
 
 /// The reader this HID node can only *guess* at, by vendor: for Yubico the sole
@@ -375,12 +391,11 @@ fn reader_by_vendor(
 /// only for what this leaves unmatched.
 pub(crate) fn topology_bound(hids: &[&HidDevice], probes: &[ReaderProbe]) -> Vec<Option<String>> {
     let mut bound: Vec<Option<String>> = vec![None; hids.len()];
-    let mut claimed: std::collections::HashMap<String, (Option<u8>, Option<u8>)> =
-        std::collections::HashMap::new();
+    let mut claimed = Claimed::new();
     for (i, hid) in hids.iter().enumerate() {
         if let Some(p) = reader_by_topology(probes, hid) {
             if reader_is_bindable(&claimed, &p.reader_name, hid) {
-                claimed.insert(p.reader_name.clone(), (hid.usb_bus, hid.usb_address));
+                claimed.insert(p.reader_name.clone(), hid.usb_device.clone());
                 bound[i] = Some(p.reader_name.clone());
             }
         }
@@ -414,15 +429,14 @@ fn bind_readers(
 ) -> Vec<Option<(String, MatchStep)>> {
     let mut bound: Vec<Option<(String, MatchStep)>> = vec![None; hids.len()];
     // Readers already bound, keyed by reader name and carrying the claiming
-    // node's USB topology (see `reader_is_bindable`).
-    let mut claimed: std::collections::HashMap<String, (Option<u8>, Option<u8>)> =
-        std::collections::HashMap::new();
+    // node's USB device key (see `reader_is_bindable`).
+    let mut claimed = Claimed::new();
 
-    // Step 1 — exact USB bus+address.
+    // Step 1 — exact USB device (bus+address, or the Windows devnode).
     if !opts.skip_topology {
         for (i, reader) in topology_bound(hids, probes).into_iter().enumerate() {
             if let Some(reader) = reader {
-                claimed.insert(reader.clone(), (hids[i].usb_bus, hids[i].usb_address));
+                claimed.insert(reader.clone(), hids[i].usb_device.clone());
                 bound[i] = Some((reader, MatchStep::Topology));
             }
         }
@@ -450,13 +464,13 @@ fn bind_readers(
         let [owner] = owners.as_slice() else {
             continue;
         };
-        if twins != 1 || (hid.usb_bus.is_some() && owner.usb_bus.is_some()) {
+        if twins != 1 || (hid.usb_device.is_some() && owner.usb_device.is_some()) {
             continue;
         }
         if !reader_is_bindable(&claimed, &owner.reader_name, hid) {
             continue;
         }
-        claimed.insert(owner.reader_name.clone(), (hid.usb_bus, hid.usb_address));
+        claimed.insert(owner.reader_name.clone(), hid.usb_device.clone());
         bound[i] = Some((owner.reader_name.clone(), MatchStep::Identity));
     }
 
@@ -464,19 +478,23 @@ fn bind_readers(
     // except that two identities that both answered and differ veto it.
     if !opts.skip_vendor_fallback {
         for (i, hid) in hids.iter().enumerate() {
-            // Already paired on hard evidence, or it reported its own bus/address
-            // and matched no reader — positive evidence it is a different
-            // physical device. Only backends that report no topology at all
-            // (usb_bus is None — hidapi on Windows and macOS) may guess, or
-            // correlation breaks there.
-            if bound[i].is_some() || hid.usb_bus.is_some() {
+            // Already paired on hard evidence.
+            if bound[i].is_some() {
                 continue;
             }
+            // Or it reported its own topology and matched no reader — positive
+            // evidence it is a different physical device. Only a node with no
+            // topology evidence against the guessed reader may guess (see
+            // `topology_rules_out_guess`), or correlation breaks there.
             let Some(name) = reader_by_vendor(probes, yk_readers, hid)
                 .filter(|n| reader_is_bindable(&claimed, n, hid))
             else {
                 continue;
             };
+            let guessed_key = reader_key(probes, yk_readers, &name);
+            if crate::topology_rules_out_guess(hid.usb_device.as_ref(), guessed_key) {
+                continue;
+            }
             // Differing identities (including differing schemes) fail closed by design.
             if let (Some(a), Some(b)) = (ids.hid.get(&hid.path), ids.reader.get(&name)) {
                 if a != b {
@@ -494,13 +512,13 @@ fn bind_readers(
             let contended = hids.iter().enumerate().any(|(j, h)| {
                 j != i
                     && bound[j].is_none()
-                    && h.usb_bus.is_none()
+                    && !crate::topology_rules_out_guess(h.usb_device.as_ref(), guessed_key)
                     && reader_by_vendor(probes, yk_readers, h).as_deref() == Some(name.as_str())
             });
             if contended {
                 continue;
             }
-            claimed.insert(name.clone(), (hid.usb_bus, hid.usb_address));
+            claimed.insert(name.clone(), hid.usb_device.clone());
             bound[i] = Some((name, MatchStep::Vendor));
         }
     }
@@ -532,8 +550,7 @@ pub fn correlate_with(
         .filter(|p| !p.is_molto2)
         .map(|p| YubiKeyCcid {
             reader_name: p.reader_name.clone(),
-            usb_bus: p.usb_bus,
-            usb_address: p.usb_address,
+            usb_device: p.usb_device.clone(),
             serial: p.yubikey_serial.clone(),
         })
         .collect();
@@ -1490,8 +1507,7 @@ mod tests {
             usage_page: HID_USAGE_PAGE_FIDO,
             usage: HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: serial.map(str::to_owned),
-            usb_bus: bus,
-            usb_address: addr,
+            usb_device: UsbDeviceKey::from_bus_addr(bus, addr),
         }
     }
 
@@ -1520,8 +1536,7 @@ mod tests {
             is_prog: false,
             prog_serial: None,
             yubikey_serial: yk_serial.map(str::to_owned),
-            usb_bus: bus,
-            usb_address: addr,
+            usb_device: UsbDeviceKey::from_bus_addr(bus, addr),
         }
     }
 
@@ -2503,7 +2518,8 @@ mod tests {
     }
 
     /// Two topology-free Yubico nodes and a single Yubico reader — the shape
-    /// hidapi reports on Windows and macOS, where `usb_bus` is always `None`, so
+    /// hidapi reports on macOS (and on Windows when the device tree gave no
+    /// node), where `usb_device` is `None`, so
     /// the vendor guess is the only correlation path. One of these nodes is a
     /// FIDO-only key with no card interface at all, but nothing in the reported
     /// data says which. Returned in the given enumeration order.
@@ -3052,6 +3068,209 @@ mod tests {
             }
         );
     }
+
+    // --- #51 on Windows: device-tree pairing (`UsbDeviceKey::WinNode`) ---
+    //
+    // Shaped on the v0.13.0 report: two different Token2 keys (PIDs 0014 and
+    // 0024), each a FIDO HID node plus a CCID reader, with no bus/address on
+    // either side and no identity answer from the HID side.
+
+    const T2_A_NODE: &str = r"USB\VID_349E&PID_0014\6&11223344&0&2";
+    const T2_B_NODE: &str = r"USB\VID_349E&PID_0024\6&11223344&0&3";
+    const T2_A_HID: &str =
+        r"\\?\HID#VID_349E&PID_0014&MI_00#8&1A2B3C4D&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+    const T2_B_HID: &str =
+        r"\\?\HID#VID_349E&PID_0024&MI_00#8&5E6F7A8B&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+    const T2_A_READER: &str = "TOKEN2 FIDO2 Security Key(0014) 0";
+    const T2_B_READER: &str = "TOKEN2 FIDO2 Security Key(0024) 0";
+
+    fn win(id: &str) -> Option<UsbDeviceKey> {
+        Some(UsbDeviceKey::win_node(id))
+    }
+
+    fn win_hid(pid: u16, path: &str, node: Option<UsbDeviceKey>) -> HidDevice {
+        let mut h = hid(keyroost_proto::USB_VID, pid, path, None, None, None);
+        h.usb_device = node;
+        h
+    }
+
+    fn win_reader(name: &str, node: Option<UsbDeviceKey>) -> ReaderProbe {
+        let mut p = probe(name, false, true, false, false, None, None, None);
+        p.usb_device = node;
+        p
+    }
+
+    fn binds(hids: &[HidDevice], probes: &[ReaderProbe]) -> Vec<Option<(String, MatchStep)>> {
+        let refs: Vec<&HidDevice> = hids.iter().collect();
+        bind_readers(
+            &refs,
+            probes,
+            &[],
+            &Identities::default(),
+            &MatchOptions::default(),
+        )
+    }
+
+    fn bound(reader: &str, step: MatchStep) -> Option<(String, MatchStep)> {
+        Some((reader.to_string(), step))
+    }
+
+    #[test]
+    fn windows_two_token2_keys_without_devnodes_bind_nothing() {
+        // Today's Windows behavior, kept as the baseline the devnode fixes:
+        // two same-vendor readers, so the vendor guess is ambiguous and every
+        // node stays unbound (two rows per key).
+        let hids = [
+            win_hid(0x0014, T2_A_HID, None),
+            win_hid(0x0024, T2_B_HID, None),
+        ];
+        let probes = [win_reader(T2_A_READER, None), win_reader(T2_B_READER, None)];
+        assert_eq!(binds(&hids, &probes), vec![None, None]);
+    }
+
+    #[test]
+    fn windows_two_token2_keys_bind_by_devnode() {
+        let hids = [
+            win_hid(0x0014, T2_A_HID, win(T2_A_NODE)),
+            win_hid(0x0024, T2_B_HID, win(T2_B_NODE)),
+        ];
+        // Reader order must not matter.
+        for probes in [
+            [
+                win_reader(T2_A_READER, win(T2_A_NODE)),
+                win_reader(T2_B_READER, win(T2_B_NODE)),
+            ],
+            [
+                win_reader(T2_B_READER, win(T2_B_NODE)),
+                win_reader(T2_A_READER, win(T2_A_NODE)),
+            ],
+        ] {
+            assert_eq!(
+                binds(&hids, &probes),
+                vec![
+                    bound(T2_A_READER, MatchStep::Topology),
+                    bound(T2_B_READER, MatchStep::Topology),
+                ]
+            );
+            let devs = correlate(&hids, &probes, &Keyring::default());
+            assert_eq!(devs.len(), 2, "one row per physical key");
+            for (path, reader) in [(T2_A_HID, T2_A_READER), (T2_B_HID, T2_B_READER)] {
+                let d = devs
+                    .iter()
+                    .find(|d| d.reader.as_deref() == Some(reader))
+                    .expect("reader row");
+                assert_eq!(d.hid_path.as_deref(), Some(std::path::Path::new(path)));
+            }
+        }
+    }
+
+    #[test]
+    fn windows_devnode_comparison_ignores_case() {
+        let hids = [win_hid(
+            0x0014,
+            T2_A_HID,
+            win(&T2_A_NODE.to_ascii_lowercase()),
+        )];
+        let probes = [win_reader(T2_A_READER, win(T2_A_NODE))];
+        assert_eq!(
+            binds(&hids, &probes),
+            vec![bound(T2_A_READER, MatchStep::Topology)]
+        );
+    }
+
+    #[test]
+    fn windows_same_devnode_binds_by_topology_step() {
+        let hids = [win_hid(0x0014, T2_A_HID, win(T2_A_NODE))];
+        let probes = [win_reader(T2_A_READER, win(T2_A_NODE))];
+        assert_eq!(
+            binds(&hids, &probes),
+            vec![bound(T2_A_READER, MatchStep::Topology)]
+        );
+        let refs: Vec<&HidDevice> = hids.iter().collect();
+        assert_eq!(
+            topology_bound(&refs, &probes),
+            vec![Some(T2_A_READER.to_string())]
+        );
+    }
+
+    #[test]
+    fn windows_devnode_on_one_side_only_falls_through_to_todays_steps() {
+        // HID side resolved, reader side did not (or the reverse): no topology
+        // evidence either way, so the single-vendor guess still applies.
+        let one_sided = [(win(T2_A_NODE), None), (None, win(T2_A_NODE)), (None, None)];
+        for (hid_node, reader_node) in one_sided {
+            let hids = [win_hid(0x0014, T2_A_HID, hid_node.clone())];
+            let probes = [win_reader(T2_A_READER, reader_node.clone())];
+            assert_eq!(
+                binds(&hids, &probes),
+                vec![bound(T2_A_READER, MatchStep::Vendor)],
+                "hid {hid_node:?} / reader {reader_node:?}"
+            );
+        }
+        // ...and the contention rule still holds: two one-sided nodes guessing
+        // the same single reader bind neither.
+        let hids = [
+            win_hid(0x0014, T2_A_HID, win(T2_A_NODE)),
+            win_hid(0x0024, T2_B_HID, win(T2_B_NODE)),
+        ];
+        let probes = [win_reader(T2_A_READER, None)];
+        assert_eq!(binds(&hids, &probes), vec![None, None]);
+    }
+
+    #[test]
+    fn windows_differing_devnodes_never_guess() {
+        // Both sides resolved and they differ: positive evidence that this
+        // reader belongs to another device, so no vendor guess either.
+        let hids = [win_hid(0x0024, T2_B_HID, win(T2_B_NODE))];
+        let probes = [win_reader(T2_A_READER, win(T2_A_NODE))];
+        assert_eq!(binds(&hids, &probes), vec![None]);
+    }
+
+    #[test]
+    fn windows_devnode_never_equals_bus_address() {
+        let hids = [win_hid(0x0014, T2_A_HID, win(T2_A_NODE))];
+        let probes = [win_reader(
+            T2_A_READER,
+            UsbDeviceKey::from_bus_addr(Some(9), Some(4)),
+        )];
+        let refs: Vec<&HidDevice> = hids.iter().collect();
+        assert_eq!(topology_bound(&refs, &probes), vec![None]);
+        assert!(!binds(&hids, &probes)
+            .iter()
+            .flatten()
+            .any(|(_, step)| *step == MatchStep::Topology));
+    }
+
+    #[test]
+    fn windows_molto2_sibling_guard_uses_devnodes() {
+        let molto = |node: Option<UsbDeviceKey>| {
+            let mut p = probe(
+                "TOKEN2 Molto2 0",
+                true,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+            );
+            p.usb_device = node;
+            p
+        };
+        // A "Molto2"-named reader on the same devnode as a FIDO HID node is a
+        // FIDO key's reader, never a Molto2 token.
+        let hids = [win_hid(0x0014, T2_A_HID, win(T2_A_NODE))];
+        let devs = correlate(&hids, &[molto(win(T2_A_NODE))], &Keyring::default());
+        assert!(devs.iter().all(|d| d.kind != DeviceKind::Token));
+        // A Molto2 on its own devnode, next to an unrelated FIDO key, stays a
+        // token.
+        let devs = correlate(
+            &hids,
+            &[molto(win(r"USB\VID_349E&PID_0300\5&3A4B5C6D&0&4"))],
+            &Keyring::default(),
+        );
+        assert!(devs.iter().any(|d| d.kind == DeviceKind::Token));
+    }
 }
 
 #[cfg(test)]
@@ -3155,8 +3374,7 @@ mod plan_tests {
             usage_page: keyroost_hid::HID_USAGE_PAGE_FIDO,
             usage: keyroost_hid::HID_USAGE_FIDO_AUTHENTICATOR,
             serial_number: Some(serial.into()),
-            usb_bus: None,
-            usb_address: None,
+            usb_device: None,
         };
         let hids = [
             key("/dev/hidraw1", "12345678"),

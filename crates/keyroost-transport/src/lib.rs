@@ -20,6 +20,7 @@
 
 use std::fmt;
 
+use keyroost_hid::UsbDeviceKey;
 use keyroost_proto::commands::{
     self, derive_sm4_key, sw_auth_failed, sw_completed, sw_ok, Command, ProfileConfig,
     ProfilePublicData, PublicDataError,
@@ -1032,17 +1033,18 @@ const YK_INS_API_REQ: u8 = 0x01;
 /// OTP applet slot/command selecting the 4-byte device serial.
 const YK_SLOT_DEVICE_SERIAL: u8 = 0x10;
 
-/// A connected YubiKey CCID interface: its reader, USB topology (decoded from
-/// the reader's PC/SC `CHANNEL_ID`), and management serial if it could be read.
+/// A connected YubiKey CCID interface: its reader, which physical USB device it
+/// belongs to, and its management serial if it could be read.
 ///
-/// `usb_bus` / `usb_address` let a caller match this reader to the same physical
-/// key's `/dev/hidrawN` node (whose sysfs `busnum`/`devnum` carry the same
-/// numbers), which is how two connected YubiKeys are told apart.
+/// `usb_device` lets a caller match this reader to the same physical key's FIDO
+/// HID node, which is how two connected YubiKeys are told apart: on Linux it is
+/// the bus/address decoded from the reader's PC/SC `CHANNEL_ID` (the HID node's
+/// sysfs `busnum`/`devnum` carry the same numbers), on Windows the reader's USB
+/// device devnode from the device tree (see [`keyroost_hid::devtree`]).
 #[derive(Debug, Clone)]
 pub struct YubiKeyCcid {
     pub reader_name: String,
-    pub usb_bus: Option<u8>,
-    pub usb_address: Option<u8>,
+    pub usb_device: Option<UsbDeviceKey>,
     pub serial: Option<String>,
 }
 
@@ -1064,12 +1066,17 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
         .map(|r| r.to_owned())
         .collect();
 
+    let tree = reader_devtree_keys(&names);
     let mut out = Vec::with_capacity(names.len());
-    for name in names {
+    for (name, tree_key) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
-        let (mut usb_bus, mut usb_address, mut serial) = (None, None, None);
+        let (mut usb_device, mut serial) = (tree_key, None);
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
-            (usb_bus, usb_address) = read_channel_id(&card);
+            // Windows reports no bus/address here; its evidence is the device
+            // tree read above, without a connection.
+            if !cfg!(windows) {
+                usb_device = read_channel_id(&card);
+            }
             serial = read_yubikey_serial(&card).ok();
             // Release without resetting — pcsc's `Drop` hard-codes ResetCard,
             // which would yank the rug from under any session another process
@@ -1078,8 +1085,7 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
         }
         out.push(YubiKeyCcid {
             reader_name,
-            usb_bus,
-            usb_address,
+            usb_device,
             serial,
         });
     }
@@ -1129,11 +1135,56 @@ pub struct ReaderProbe {
     /// YubiKey management serial, read on the same connection when the reader is
     /// a YubiKey.
     pub yubikey_serial: Option<String>,
-    pub usb_bus: Option<u8>,
-    pub usb_address: Option<u8>,
+    /// Which physical USB device this reader belongs to, if known: the
+    /// bus/address from the reader's PC/SC `CHANNEL_ID` on Linux (read on the
+    /// probe connection, so never for a Molto2), or the reader's USB device
+    /// devnode from the Windows device tree (read without connecting, so for a
+    /// Molto2 too). Compare with [`keyroost_hid::same_usb_device`].
+    pub usb_device: Option<UsbDeviceKey>,
 }
 
-/// One `KEYROOST_PROBE_DEBUG` line on stderr, in the shared trace grammar.
+/// Each reader's USB device evidence that needs no card connection, parallel
+/// to `names`: on Windows the reader's USB device devnode, read from the device
+/// tree on one short-lived PC/SC context (traced under `--debug`); `None`
+/// everywhere else, where the evidence comes from `CHANNEL_ID` instead.
+fn reader_devtree_keys(names: &[std::ffi::CString]) -> Vec<Option<UsbDeviceKey>> {
+    #[cfg(windows)]
+    {
+        let refs: Vec<&std::ffi::CStr> = names.iter().map(|n| n.as_c_str()).collect();
+        let trace = keyroost_hid::devtree::devtree_trace_enabled();
+        names
+            .iter()
+            .zip(keyroost_windevtree::reader_chains(&refs))
+            .map(|(name, chain)| {
+                keyroost_hid::devtree::win_node_from_chain(
+                    &format!("reader '{}'", name.to_string_lossy()),
+                    chain.as_deref(),
+                    trace,
+                )
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![None; names.len()]
+    }
+}
+
+static PROBE_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the `--debug` trace of [`probe_readers`] on or off for this process:
+/// each reader seen and the status word of every applet SELECT, on stderr.
+/// Setting `KEYROOST_PROBE_DEBUG` in the environment also turns it on.
+pub fn set_probe_trace(on: bool) {
+    PROBE_TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn probe_trace_on() -> bool {
+    PROBE_TRACE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("KEYROOST_PROBE_DEBUG").is_some()
+}
+
+/// One reader-probe trace line on stderr, in the shared trace grammar.
 fn probe_note(body: &str) {
     eprintln!("{}", format_line(Dir::Note, "probe", body));
 }
@@ -1160,8 +1211,9 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
         .map(|r| r.to_owned())
         .collect();
 
+    let tree = reader_devtree_keys(&names);
     let mut out = Vec::with_capacity(names.len());
-    for name in names {
+    for (name, tree_key) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
         // Lowercased copy for the YubiKey-hint check below, taken before
         // `reader_name` is moved into a `ReaderProbe`.
@@ -1191,8 +1243,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 is_prog: false,
                 prog_serial: None,
                 yubikey_serial: None,
-                usb_bus: None,
-                usb_address: None,
+                usb_device: tree_key,
             });
             continue;
         }
@@ -1210,15 +1261,18 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             is_prog: false,
             prog_serial: None,
             yubikey_serial: None,
-            usb_bus: None,
-            usb_address: None,
+            usb_device: tree_key,
         };
-        let trace = std::env::var_os("KEYROOST_PROBE_DEBUG").is_some();
+        let trace = probe_trace_on();
         if trace {
             probe_note(&format!("reader seen: {}", probe.reader_name));
         }
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
-            (probe.usb_bus, probe.usb_address) = read_channel_id(&card);
+            // Windows reports no bus/address here; its evidence is the device
+            // tree read above, without a connection.
+            if !cfg!(windows) {
+                probe.usb_device = read_channel_id(&card);
+            }
             // An applet SELECT counts as "present" on a 9000, and also on the
             // T=0 continuation status words 61xx ("more data available") and
             // 6Cxx ("wrong Le"): both mean the SELECT was accepted and the applet
@@ -1469,21 +1523,24 @@ impl Drop for ReaderWatcher {
     }
 }
 
-/// Decode a reader's PC/SC `CHANNEL_ID` into `(usb_bus, usb_address)`. For USB
+/// Decode a reader's PC/SC `CHANNEL_ID` into its USB bus/address. For USB
 /// readers the DWORD's high word is `0x0020` and the low word is
 /// `(bus << 8) | address`; anything else (or an unreadable attribute) is `None`.
-fn read_channel_id(card: &Card) -> (Option<u8>, Option<u8>) {
+fn read_channel_id(card: &Card) -> Option<UsbDeviceKey> {
     let mut buf = [0u8; 16];
     match card.get_attribute(Attribute::ChannelId, &mut buf) {
         Ok(b) if b.len() >= 4 => {
             let dw = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             if (dw >> 16) == 0x0020 {
-                (Some(((dw >> 8) & 0xff) as u8), Some((dw & 0xff) as u8))
+                Some(UsbDeviceKey::BusAddr(
+                    ((dw >> 8) & 0xff) as u8,
+                    (dw & 0xff) as u8,
+                ))
             } else {
-                (None, None)
+                None
             }
         }
-        _ => (None, None),
+        _ => None,
     }
 }
 

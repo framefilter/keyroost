@@ -82,12 +82,13 @@ What keyroost does **not** defend against:
   not: the GUI's "Learn" link hands a documentation URL to your browser
   (keyroost makes no connection itself), and the Wayland screenshot path
   talks to `xdg-desktop-portal` over the session bus, which is local IPC.
-- **`unsafe` only in two scoped FFI shims.** `unsafe_code = "forbid"` is
+- **`unsafe` only in three scoped FFI shims.** `unsafe_code = "forbid"` is
   the workspace-wide default; the sole exceptions are the Windows-only
-  `keyroost-winwebauthn` (HID enumeration / shell launch) and
-  `keyroost-screengrab` (GDI screen capture) crates, which set
-  `unsafe_code = "allow"` to confine their thin `windows-sys` FFI. Both
-  are inert on non-Windows targets. No `unsafe` appears in any
+  `keyroost-winwebauthn` (HID enumeration / shell launch),
+  `keyroost-screengrab` (GDI screen capture) and `keyroost-windevtree`
+  (read-only device-tree lookups) crates, which set
+  `unsafe_code = "allow"` to confine their thin `windows-sys` FFI. All
+  three are inert on non-Windows targets. No `unsafe` appears in any
   cross-platform crate.
 - **Vendored protocol code, scoped dependencies.** SM4, SHA-1/256/512, the
   OATH HMAC, base32/hex, and the APDU/TLV/CBOR and `otpauth://` parsers are
