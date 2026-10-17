@@ -91,8 +91,17 @@ fn b64_decode(text: &str) -> Result<Vec<u8>, Error> {
 
 /// Armor binary data: header, blank line, 64-column base64, CRC line, footer.
 pub fn encode(kind: Kind, data: &[u8]) -> String {
+    encode_with_comment(kind, data, None)
+}
+
+/// Like [`encode`], with an optional `Comment:` armor header line.
+pub fn encode_with_comment(kind: Kind, data: &[u8], comment: Option<&str>) -> String {
     let body = b64_encode(data);
-    let mut s = format!("-----BEGIN PGP {}-----\n\n", kind.label());
+    let mut s = format!("-----BEGIN PGP {}-----\n", kind.label());
+    if let Some(c) = comment {
+        s.push_str(&format!("Comment: {c}\n"));
+    }
+    s.push('\n');
     for line in body.as_bytes().chunks(64) {
         // Base64 output is ASCII, so every chunk is valid UTF-8.
         s.push_str(std::str::from_utf8(line).unwrap_or_default());

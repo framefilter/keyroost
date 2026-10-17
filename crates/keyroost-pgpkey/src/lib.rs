@@ -7,6 +7,8 @@
 use std::fmt;
 
 pub mod armor;
+pub mod cert;
+pub mod files;
 pub mod keys;
 pub mod packet;
 pub mod s2k;
