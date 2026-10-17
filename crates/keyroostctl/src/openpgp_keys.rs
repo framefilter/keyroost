@@ -132,6 +132,15 @@ fn with_backup(e: impl Display, backup: &Path) -> String {
     )
 }
 
+/// A "no" to the question after the three files were written.
+fn canceled_after_write(backup: &Path) -> String {
+    format!(
+        "Canceled; the card was not changed. The new keys are saved at {} (delete those \
+         three files if you don't want them).",
+        backup.display()
+    )
+}
+
 fn slot_of(s: OpenpgpSlot) -> Slot {
     match s {
         OpenpgpSlot::Sign => Slot::Sign,
@@ -319,7 +328,13 @@ fn create(
         |card| format!("This replaces all three OpenPGP keys on {card}."),
         "replace all three OpenPGP keys",
     )
-    .map_err(|e| saved(&e))?;
+    .map_err(|e| {
+        if e.to_string() == crate::prompt::CANCELED {
+            canceled_after_write(&paths.secret)
+        } else {
+            saved(&e)
+        }
+    })?;
     let admin = admin_secret
         .read(sec)
         .and_then(|v| v.text())
@@ -617,7 +632,7 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
             }
             let pass = sec.read(spec, src)?;
             let (new_secret, new_public) =
-                cert::change_expiry_in_backup(&secret, pass.as_bytes(), *set, now)
+                cert::change_expiry_with_backup(&cert, &secret, pass.as_bytes(), *set, now)
                     .map_err(plain)?;
             drop(pass);
             let new_secret = Zeroizing::new(new_secret);
@@ -665,4 +680,25 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
     }
     println!("Share the updated public key again.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_no_after_the_files_are_written_says_where_they_are() {
+        assert_eq!(
+            canceled_after_write(Path::new("keys.asc")),
+            "Canceled; the card was not changed. The new keys are saved at keys.asc (delete \
+             those three files if you don't want them)."
+        );
+        assert_eq!(
+            with_backup(
+                "This card doesn't accept X keys in the signature slot.",
+                Path::new("k.asc")
+            ),
+            "This card doesn't accept X keys in the signature slot. Your backup is saved at k.asc."
+        );
+    }
 }

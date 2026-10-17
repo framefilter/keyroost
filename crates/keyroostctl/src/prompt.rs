@@ -138,9 +138,12 @@ pub(crate) fn confirm_statement(
         .map_err(|e| e.to_string())?;
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Ok(true),
-        _ => Err("canceled; nothing was changed".into()),
+        _ => Err(CANCELED.into()),
     }
 }
+
+/// What [`confirm_statement`] answers when the person says no.
+pub(crate) const CANCELED: &str = "canceled; nothing was changed";
 
 /// The stronger check (factory-reset, otp interface): a typed word, read
 /// from the terminal only. `--yes` skips it deliberately. `Ok(true)` means

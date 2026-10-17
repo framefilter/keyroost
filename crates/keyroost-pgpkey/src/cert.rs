@@ -482,10 +482,29 @@ pub fn change_expiry(
 }
 
 /// [`change_expiry`] signed on the host with the primary key of a backup
-/// (unlocked with `pass`). Returns the new backup and public certificate;
-/// the backup's key packets are kept as they are, so the same passphrase
-/// still protects them.
+/// (unlocked with `pass`), the public certificate taken from the backup
+/// itself. Returns the new backup and public certificate; the backup's key
+/// packets are kept as they are, so the same passphrase still protects
+/// them.
 pub fn change_expiry_in_backup(
+    secret_armor: &str,
+    pass: &[u8],
+    new: Expiry,
+    now: u32,
+) -> Result<(String, String), Error> {
+    let public = crate::read::open_public(secret_armor.as_bytes())?;
+    change_expiry_with_backup(&public, secret_armor, pass, new, now)
+}
+
+/// [`change_expiry`] on `public` (the user's own public key file, with
+/// everything it has collected: other people's certifications, user IDs
+/// added later, revocations), signed on the host with the primary key of
+/// the backup `secret_armor` (unlocked with `pass`). Every packet of
+/// `public` is kept. The backup gets the same new signatures for the user
+/// IDs and subkeys it has; its key packets are kept as they are, so the
+/// same passphrase still protects them. Returns (backup, public).
+pub fn change_expiry_with_backup(
+    public: &PublicCert,
     secret_armor: &str,
     pass: &[u8],
     new: Expiry,
@@ -496,24 +515,62 @@ pub fn change_expiry_in_backup(
         Err(Error::NoSecretPart) => return Err(Error::Refused(NO_PRIMARY_SECRET)),
         r => r?,
     };
+    if loaded.primary_fpr != public.primary.fpr {
+        return Err(Error::Refused(
+            "The backup and the public key belong to different keys.",
+        ));
+    }
     let primary = loaded
         .keys
         .iter()
         .find(|k| loaded.primary_secret && k.fpr == loaded.primary_fpr)
         .ok_or(Error::Refused(NO_PRIMARY_SECRET))?;
-    let public = crate::read::open_public(data)?;
     let sigs = resign(
-        &public,
+        public,
         &mut HostSigner(&primary.part),
         loaded.primary_fpr,
         new,
         now,
     )?;
+    // The backup's user IDs and subkeys, matched to the public file's by
+    // content and fingerprint: either file may hold some the other lacks.
+    let mine = crate::read::open_public(data)?;
+    let public_uids: Vec<&[u8]> = uid_bodies(&public.packets);
+    let for_backup = NewSigs {
+        uids: uid_bodies(&mine.packets)
+            .into_iter()
+            .map(|u| {
+                public_uids
+                    .iter()
+                    .position(|p| *p == u)
+                    .and_then(|i| sigs.uids.get(i).cloned().flatten())
+            })
+            .collect(),
+        subkeys: mine
+            .subkeys
+            .iter()
+            .map(|k| {
+                public
+                    .subkeys
+                    .iter()
+                    .position(|p| p.fpr == k.fpr)
+                    .and_then(|i| sigs.subkeys.get(i).cloned().flatten())
+            })
+            .collect(),
+    };
     let secret = crate::read::key_packets(data)?;
     Ok((
-        armor::encode(Kind::PrivateKey, &with_new_sigs(&secret, &sigs)),
+        armor::encode(Kind::PrivateKey, &with_new_sigs(&secret, &for_backup)),
         armor::encode(Kind::PublicKey, &with_new_sigs(&public.packets, &sigs)),
     ))
+}
+
+fn uid_bodies(packets: &[(u8, Vec<u8>)]) -> Vec<&[u8]> {
+    packets
+        .iter()
+        .filter(|(tag, _)| *tag == Tag::USER_ID)
+        .map(|(_, body)| body.as_slice())
+        .collect()
 }
 
 /// The last day (UTC) the key set works, as its newest self-signature
@@ -844,6 +901,101 @@ mod tests {
             change_expiry_in_backup(&out.secret, b"nope", Expiry::Never, now + 5),
             Err(Error::WrongPassphrase)
         ));
+    }
+
+    /// A public file that collected more than the backup has (another
+    /// person's certification, a user ID added later) keeps all of it, and
+    /// both files get the new expiry.
+    #[test]
+    fn change_expiry_with_backup_keeps_what_only_the_public_file_has() {
+        let now = ts(2026, 10, 16);
+        let (set, out) = made(KeyType::NistP256, Expiry::Years(1), now);
+        let primary = &set.parts[0];
+        let other = generate(KeyType::Cv25519, now).unwrap();
+        let (_, bin) = armor::decode(&out.public).unwrap();
+        let packets = parse_packets(&bin).unwrap();
+        let pkey = signed_key(&primary.public_body());
+        // Someone else's certification of the first user ID.
+        let mut data = pkey.clone();
+        data.extend(signed_uid(&set.user_id));
+        let third = sign(
+            &mut HostSigner(&other[0]),
+            SigType::PositiveCert,
+            hash_for(&other[0]),
+            &Subpackets::new()
+                .created(now + 1)
+                .issuer_fpr(&other[0].fingerprint()),
+            &Subpackets::new(),
+            &data,
+        )
+        .unwrap();
+        // A second user ID, self-certified, only in the public file.
+        let uid2 = "Ada Two <two@example.org>";
+        let mut data = pkey.clone();
+        data.extend(signed_uid(uid2));
+        let uid2_sig = sign(
+            &mut HostSigner(primary),
+            SigType::PositiveCert,
+            hash_for(primary),
+            &Subpackets::new()
+                .created(now + 1)
+                .key_expiry(set.expiry)
+                .key_flags(FLAGS_PRIMARY)
+                .issuer_fpr(&primary.fingerprint()),
+            &Subpackets::new(),
+            &data,
+        )
+        .unwrap();
+        let mut grown = Vec::new();
+        for (i, p) in packets.iter().enumerate() {
+            write_packet(&mut grown, p.tag, p.body);
+            if i == 2 {
+                // after the user ID's self-certification
+                write_packet(&mut grown, Tag::SIGNATURE, &third);
+                write_packet(&mut grown, Tag::USER_ID, uid2.as_bytes());
+                write_packet(&mut grown, Tag::SIGNATURE, &uid2_sig);
+            }
+        }
+        assert_eq!(packets[1].tag, Tag::USER_ID);
+        let grown = armor::encode(Kind::PublicKey, &grown);
+        let public = crate::read::open_public(grown.as_bytes()).unwrap();
+        let (secret, new_public) =
+            change_expiry_with_backup(&public, &out.secret, b"pw", Expiry::Years(2), now + 5)
+                .unwrap();
+        let (_, nb) = armor::decode(&new_public).unwrap();
+        let new_packets = parse_packets(&nb).unwrap();
+        assert!(new_packets.iter().any(|p| p.body == third.as_slice()));
+        assert!(new_packets.iter().any(|p| p.body == uid2.as_bytes()));
+        // Every old packet is still there, plus one signature per user ID
+        // and subkey.
+        for p in &packets {
+            assert!(new_packets
+                .iter()
+                .any(|q| q.tag == p.tag && q.body == p.body));
+        }
+        assert_eq!(new_packets.len(), packets.len() + 3 + 4);
+        let want = Some((2028, 10, 16));
+        let reread = crate::read::open_public(new_public.as_bytes()).unwrap();
+        assert_eq!(reread.user_ids.len(), 2);
+        assert_eq!(current_expiry(&reread), want);
+        // The backup gets the new signatures for what it has, nothing else.
+        let (_, sb) = armor::decode(&secret).unwrap();
+        let secret_packets = parse_packets(&sb).unwrap();
+        assert!(!secret_packets.iter().any(|p| p.body == uid2.as_bytes()));
+        assert_eq!(
+            current_expiry(&crate::read::open_public(secret.as_bytes()).unwrap()),
+            want
+        );
+        verify_backup(&secret, b"pw", &set).unwrap();
+        // A backup of another key is refused plainly.
+        let (_, other_out) = made(KeyType::NistP256, Expiry::Years(1), now);
+        let err = change_expiry_with_backup(&public, &other_out.secret, b"pw", Expiry::Never, now)
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "The backup and the public key belong to different keys."
+        );
     }
 
     #[test]
