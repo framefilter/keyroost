@@ -912,6 +912,15 @@ impl OpenPgpState {
     }
 }
 
+/// Replacing the pane's state (a device switch, a factory reset) drops the
+/// old one: its PINs and passphrases are wiped then too, not only when a
+/// dialog closes. (No struct-update construction past this point.)
+impl Drop for OpenPgpState {
+    fn drop(&mut self) {
+        self.wipe_secrets();
+    }
+}
+
 /// The "Create keys with a backup" form. The passphrase fields are wiped on
 /// drop and by [`OpenPgpState::wipe_secrets`].
 struct CreateForm {
@@ -24383,7 +24392,9 @@ mod tests {
         f.expiry.text = "2020-01-01".into();
         assert_eq!(create_form_error(&f), Some("That date is in the past."));
         f.expiry.text = "2029-13-01".into();
-        assert_eq!(create_form_error(&f), Some("Type a date as YYYY-MM-DD."));
+        assert_eq!(create_form_error(&f), Some("That date does not exist."));
+        f.expiry.text = "2029-1-1".into();
+        assert_eq!(create_form_error(&f), Some("Enter the date as YYYY-MM-DD."));
     }
 
     fn opened_expiry_form() -> ExpiryForm {
@@ -28023,16 +28034,49 @@ mod tests {
         assert_eq!(t.choices, vec![device::NameStoreChoice::Computer]);
     }
 
+    /// Every secret the pane holds is in the wipe that runs on drop.
+    #[test]
+    fn openpgp_state_wipe_covers_every_secret() {
+        let mut pgp = OpenPgpState::default();
+        for f in [
+            &mut pgp.admin_pin,
+            &mut pgp.user_pin_old,
+            &mut pgp.user_pin_new,
+            &mut pgp.admin_pin_old,
+            &mut pgp.admin_pin_new,
+            &mut pgp.unblock_new,
+            &mut pgp.passphrase,
+            &mut pgp.create.pass,
+            &mut pgp.create.pass_repeat,
+            &mut pgp.expiry.user_pin,
+        ] {
+            *f = "secret".into();
+        }
+        pgp.wipe_secrets();
+        for f in [
+            &pgp.admin_pin,
+            &pgp.user_pin_old,
+            &pgp.user_pin_new,
+            &pgp.admin_pin_old,
+            &pgp.admin_pin_new,
+            &pgp.unblock_new,
+            &pgp.passphrase,
+            &pgp.create.pass,
+            &pgp.create.pass_repeat,
+            &pgp.expiry.user_pin,
+        ] {
+            assert!(f.is_empty());
+        }
+    }
+
     /// The OpenPGP mismatch guard is inert (the PIN forms have no confirm field),
     /// so it returns `None` for every flow — locks in the documented behaviour.
     #[test]
     fn openpgp_cred_mismatch_never_fires() {
         use OpenPgpCredKind::*;
-        let pgp = OpenPgpState {
-            user_pin_new: "111111".into(),
-            admin_pin_new: "22222222".into(),
-            ..Default::default()
-        };
+        let mut pgp = OpenPgpState::default();
+        pgp.user_pin_new = "111111".into();
+        pgp.admin_pin_new = "22222222".into();
         for k in [
             ChangeUserPin,
             ChangeAdminPin,

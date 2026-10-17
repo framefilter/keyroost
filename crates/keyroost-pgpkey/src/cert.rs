@@ -57,6 +57,8 @@ fn days_in_month(y: i32, m: u8) -> u8 {
     }
 }
 
+const DATE_FORMAT: &str = "Enter the date as YYYY-MM-DD.";
+
 /// When a key set stops being valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -94,21 +96,36 @@ impl Expiry {
                 _ => Err("Choose never, 1y, 2y, 3y, 5y or a date (YYYY-MM-DD).".into()),
             };
         }
-        let bad = || "Enter the date as YYYY-MM-DD.".to_string();
-        let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
-            return Err(bad());
+        Expiry::parse_date(&s).map_err(String::from)
+    }
+
+    /// Parse a typed `YYYY-MM-DD` date: the one check, and the one set of
+    /// messages, the CLI's `--expires` and the GUI's date field share.
+    /// Whether the date is still ahead is [`end_time`](Self::end_time)'s
+    /// check ("That date is in the past.").
+    pub fn parse_date(s: &str) -> Result<Expiry, &'static str> {
+        let parts: Vec<&str> = s.trim().split('-').collect();
+        let well_formed = matches!(parts[..], [y, m, d] if y.len() == 4 && m.len() == 2 && d.len() == 2)
+            && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit()));
+        if !well_formed {
+            return Err(DATE_FORMAT);
         }
-        let y: i32 = parts[0].parse().map_err(|_| bad())?;
-        let m: u8 = parts[1].parse().map_err(|_| bad())?;
-        let d: u8 = parts[2].parse().map_err(|_| bad())?;
-        if !(1970..=2105).contains(&y) || !(1..=12).contains(&m) || d == 0 {
-            return Err(bad());
+        let num = |p: &str| p.parse::<u16>().map_err(|_| DATE_FORMAT);
+        let (y, m, d) = (i32::from(num(parts[0])?), num(parts[1])?, num(parts[2])?);
+        if !(1..=12).contains(&m) || d == 0 || d > u16::from(days_in_month(y, m as u8)) {
+            return Err("That date does not exist.");
         }
-        if d > days_in_month(y, m) {
-            return Err("That date does not exist.".into());
+        if y > 2105 {
+            return Err("Pick a date before 2106.");
         }
-        Ok(Expiry::Date { y, m, d })
+        if y < 1970 {
+            return Err("That date is in the past.");
+        }
+        Ok(Expiry::Date {
+            y,
+            m: m as u8,
+            d: d as u8,
+        })
     }
 
     /// Seconds after `created` at which the key expires, or `None` for
@@ -642,6 +659,21 @@ mod tests {
         );
         assert!(Expiry::parse("2029-13-01").is_err());
         assert!(Expiry::parse("soon").is_err());
+        // One wording, shared with the GUI's date field.
+        for (typed, msg) in [
+            ("2027-2-28", "Enter the date as YYYY-MM-DD."),
+            ("+202-01-01", "Enter the date as YYYY-MM-DD."),
+            ("2027/02/28", "Enter the date as YYYY-MM-DD."),
+            ("2027-02-29", "That date does not exist."),
+            ("2029-13-01", "That date does not exist."),
+            ("2029-01-00", "That date does not exist."),
+            ("2106-01-01", "Pick a date before 2106."),
+            ("1969-12-31", "That date is in the past."),
+        ] {
+            assert_eq!(Expiry::parse_date(typed), Err(msg), "{typed}");
+            assert_eq!(Expiry::parse(typed), Err(msg.to_string()), "{typed}");
+        }
+        assert!(Expiry::parse_date("2105-12-31").is_ok());
         assert_eq!(Expiry::default(), Expiry::Years(3));
     }
 

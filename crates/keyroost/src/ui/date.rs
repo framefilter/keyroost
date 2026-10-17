@@ -211,19 +211,16 @@ impl ExpiryInput {
             ExpiryChoice::Never => Ok(Expiry::Never),
             ExpiryChoice::Years(n) => Ok(Expiry::Years(n)),
             ExpiryChoice::Date => {
-                let d = Date::parse(&self.text).ok_or("Type a date as YYYY-MM-DD.")?;
+                // The CLI's check and wording (`--expires`).
+                let e = Expiry::parse_date(&self.text)?;
+                let Expiry::Date { y, m, d } = e else {
+                    return Ok(e);
+                };
                 // Valid through the whole of the chosen day, so today is fine.
-                if today.is_after(&d) {
+                if today.is_after(&Date { y, m, d }) {
                     return Err("That date is in the past.");
                 }
-                if d.y > 2105 {
-                    return Err("Pick a date before 2106.");
-                }
-                Ok(Expiry::Date {
-                    y: d.y,
-                    m: d.m,
-                    d: d.d,
-                })
+                Ok(e)
             }
         }
     }
@@ -595,7 +592,9 @@ mod tests {
             })
         );
         i.text = "2029-02-30".into();
-        assert_eq!(i.resolve(today), Err("Type a date as YYYY-MM-DD."));
+        assert_eq!(i.resolve(today), Err("That date does not exist."));
+        i.text = "2029-2-3".into();
+        assert_eq!(i.resolve(today), Err("Enter the date as YYYY-MM-DD."));
         i.text = "2026-10-17".into();
         assert_eq!(
             i.resolve(today),
