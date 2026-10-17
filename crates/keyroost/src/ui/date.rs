@@ -288,7 +288,10 @@ pub fn expiry_row(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, today
                 // A choice added later: its end moment, as a date.
                 other => {
                     let from = days_from_civil(today.y, today.m, today.d) * 86_400;
-                    match u32::try_from(from).ok().and_then(|f| other.end_time(f).ok()) {
+                    match u32::try_from(from)
+                        .ok()
+                        .and_then(|f| other.end_time(f).ok())
+                    {
                         Some(Some(end)) => {
                             let (y, m, d) = civil_from_days((i64::from(end) - 1) / 86_400);
                             format!("Expires on {}", Date { y, m, d }.long())

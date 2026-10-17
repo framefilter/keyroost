@@ -2346,7 +2346,10 @@ mod tests {
                 public: Some(&k),
             }
         );
-        assert_eq!(ecc, "EccPrivateKeyParts { scalar_len: 32, public_len: Some(32) }");
+        assert_eq!(
+            ecc,
+            "EccPrivateKeyParts { scalar_len: 32, public_len: Some(32) }"
+        );
         let e = [1u8, 0, 1];
         let rsa = format!(
             "{:?}",

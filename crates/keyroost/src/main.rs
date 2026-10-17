@@ -1043,7 +1043,11 @@ fn pgp_plain(e: keyroost_pgpkey::Error) -> String {
 
 /// `e` followed by where the backup is, for a failure after it was written.
 fn with_backup(e: impl std::fmt::Display, backup: &std::path::Path) -> String {
-    format!("{} Your backup is saved at {}.", sentence(e), backup.display())
+    format!(
+        "{} Your backup is saved at {}.",
+        sentence(e),
+        backup.display()
+    )
 }
 
 /// An error (the transport's read lowercase, for the CLI's `error:`
@@ -24442,7 +24446,13 @@ mod tests {
             email: String::new(),
         };
         let now = 1_792_108_800;
-        let set = create(keyroost_pgpkey::keys::KeyType::Cv25519, &id, Expiry::Never, now).unwrap();
+        let set = create(
+            keyroost_pgpkey::keys::KeyType::Cv25519,
+            &id,
+            Expiry::Never,
+            now,
+        )
+        .unwrap();
         let out = export(&set, b"pw", now).unwrap();
         // Armored or binary, a backup is refused here; a public key is read
         // either way.

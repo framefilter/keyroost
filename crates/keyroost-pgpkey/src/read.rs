@@ -384,10 +384,12 @@ pub fn needs_passphrase(data: &[u8]) -> Result<bool> {
 pub fn is_secret(data: &[u8]) -> bool {
     match decode_input(data) {
         Ok((Some(kind), _)) => kind == Kind::PrivateKey,
-        Ok((None, bin)) => parse_packets(&bin)
-            .ok()
-            .and_then(|p| p.first().map(|p| p.tag))
-            == Some(Tag::SECRET_KEY),
+        Ok((None, bin)) => {
+            parse_packets(&bin)
+                .ok()
+                .and_then(|p| p.first().map(|p| p.tag))
+                == Some(Tag::SECRET_KEY)
+        }
         Err(_) => false,
     }
 }
@@ -1106,7 +1108,7 @@ mod tests {
             crate::cert::change_expiry_with_backup(&public, &plain, b"", Expiry::Never, NOW)
                 .is_ok()
         );
-        assert!(matches!(needs_passphrase(b"junk"), Err(_)));
+        assert!(needs_passphrase(b"junk").is_err());
     }
 
     #[test]
@@ -1142,7 +1144,11 @@ mod tests {
         let got = open_at(&primary_on_card, Some(b"pw"), NOW).unwrap();
         assert!(!got.primary_secret);
         assert_eq!(got.keys.len(), 2);
-        assert!(got.notes[0].starts_with("The primary key "), "{:?}", got.notes);
+        assert!(
+            got.notes[0].starts_with("The primary key "),
+            "{:?}",
+            got.notes
+        );
 
         // Every key on a card: nothing to restore.
         let all = rebuild(&bin, |i, _, b| match i {

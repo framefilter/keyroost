@@ -195,8 +195,14 @@ mod tests {
     #[test]
     fn short_and_non_ascii_names_keep_their_ending() {
         assert_eq!(paths_for(Path::new("asc")).secret, Path::new("asc.asc"));
-        assert_eq!(paths_for(Path::new("k\u{e9}y")).secret, Path::new("k\u{e9}y.asc"));
-        assert_eq!(paths_for(Path::new("\u{e9}asc")).secret, Path::new("\u{e9}asc.asc"));
+        assert_eq!(
+            paths_for(Path::new("k\u{e9}y")).secret,
+            Path::new("k\u{e9}y.asc")
+        );
+        assert_eq!(
+            paths_for(Path::new("\u{e9}asc")).secret,
+            Path::new("\u{e9}asc.asc")
+        );
     }
 
     #[test]
@@ -209,7 +215,10 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("disk full"), "{err}");
-        assert!(std::fs::symlink_metadata(&p).is_err(), "half-written file left");
+        assert!(
+            std::fs::symlink_metadata(&p).is_err(),
+            "half-written file left"
+        );
         // So a retry is not told the file already exists.
         write_new(&p, "whole", true).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "whole");

@@ -585,7 +585,8 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
         sec.check(spec, src)?;
     }
     // Armored or binary; the files are written back armored.
-    let data = std::fs::read(public).map_err(|e| format!("cannot read {}: {e}", public.display()))?;
+    let data =
+        std::fs::read(public).map_err(|e| format!("cannot read {}: {e}", public.display()))?;
     if read::is_secret(&data) {
         return Err(format!(
             "{} is a backup, not a public key: give it with --backup and the public key \
@@ -721,7 +722,10 @@ mod tests {
             dec: vec![attr(KeyAlg::Rsa2048, KeyCrt::Decrypt)],
             aut: vec![attr(KeyAlg::Rsa2048, KeyCrt::Auth)],
         };
-        assert_eq!(key_type_for_card(None, Some(&rsa2048)), Ok(KeyType::Rsa2048));
+        assert_eq!(
+            key_type_for_card(None, Some(&rsa2048)),
+            Ok(KeyType::Rsa2048)
+        );
         // An explicit type the card doesn't list is refused, naming the
         // type and the slot.
         let no_x25519 = AlgorithmInformation {
@@ -730,18 +734,26 @@ mod tests {
         };
         assert_eq!(
             key_type_for_card(Some(KeyType::Cv25519), Some(&no_x25519)),
-            Err("this card doesn't list X25519 keys for the decryption slot, so it can't \
+            Err(
+                "this card doesn't list X25519 keys for the decryption slot, so it can't \
                  take a ed25519 set; choose another --algorithm"
-                .to_string())
+                    .to_string()
+            )
         );
-        assert_eq!(key_type_for_card(None, Some(&no_x25519)), Ok(KeyType::Rsa2048));
+        assert_eq!(
+            key_type_for_card(None, Some(&no_x25519)),
+            Ok(KeyType::Rsa2048)
+        );
         // A slot listing nothing is unknown, not a refusal.
         let sig_only = AlgorithmInformation {
             sig: vec![attr(KeyAlg::Rsa2048, KeyCrt::Sign)],
             dec: Vec::new(),
             aut: Vec::new(),
         };
-        assert_eq!(key_type_for_card(None, Some(&sig_only)), Ok(KeyType::Rsa2048));
+        assert_eq!(
+            key_type_for_card(None, Some(&sig_only)),
+            Ok(KeyType::Rsa2048)
+        );
         let nothing = AlgorithmInformation {
             sig: vec![attr(KeyAlg::BrainpoolP256r1, KeyCrt::Sign)],
             dec: vec![attr(KeyAlg::BrainpoolP256r1, KeyCrt::Decrypt)],

@@ -676,7 +676,10 @@ impl fmt::Display for TransportError {
                     Some((one, [])) => format!("the {one} key"),
                     Some((last, rest)) => format!("the {} and {last} keys", rest.join(", ")),
                 };
-                write!(f, "loaded {list}; the {failed} key failed ({state}): {cause}")
+                write!(
+                    f,
+                    "loaded {list}; the {failed} key failed ({state}): {cause}"
+                )
             }
             TransportError::OpenPgpKeyNotForAlgorithm { slot, label } => {
                 write!(f, "the {slot} key can't be imported as {label}")

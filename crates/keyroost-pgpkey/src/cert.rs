@@ -268,9 +268,17 @@ pub fn export(set: &KeySet, pass: &[u8], signer_now: u32) -> Result<Outputs, Err
     write_packet(&mut secret, Tag::SECRET_KEY, &secret_body(primary)?);
     write_packet(&mut secret, Tag::USER_ID, set.user_id.as_bytes());
     write_packet(&mut secret, Tag::SIGNATURE, &self_cert);
-    write_packet(&mut secret, Tag::SECRET_SUBKEY, &secret_body(&set.parts[1])?);
+    write_packet(
+        &mut secret,
+        Tag::SECRET_SUBKEY,
+        &secret_body(&set.parts[1])?,
+    );
     write_packet(&mut secret, Tag::SIGNATURE, &dec_bind);
-    write_packet(&mut secret, Tag::SECRET_SUBKEY, &secret_body(&set.parts[2])?);
+    write_packet(
+        &mut secret,
+        Tag::SECRET_SUBKEY,
+        &secret_body(&set.parts[2])?,
+    );
     write_packet(&mut secret, Tag::SIGNATURE, &auth_bind);
 
     let mut public = Vec::new();
@@ -918,7 +926,8 @@ mod tests {
         let now = ts(2026, 10, 16);
         let (set, out) = made(KeyType::Cv25519, Expiry::Years(1), now);
         let (secret, public) =
-            change_expiry_in_backup(out.secret.as_bytes(), b"pw", Expiry::Years(2), now + 5).unwrap();
+            change_expiry_in_backup(out.secret.as_bytes(), b"pw", Expiry::Years(2), now + 5)
+                .unwrap();
         let want = Some((2028, 10, 16));
         assert_eq!(
             current_expiry(&crate::read::open_public(public.as_bytes()).unwrap()),
@@ -994,9 +1003,14 @@ mod tests {
         assert_eq!(packets[1].tag, Tag::USER_ID);
         let grown = armor::encode(Kind::PublicKey, &grown);
         let public = crate::read::open_public(grown.as_bytes()).unwrap();
-        let (secret, new_public) =
-            change_expiry_with_backup(&public, out.secret.as_bytes(), b"pw", Expiry::Years(2), now + 5)
-                .unwrap();
+        let (secret, new_public) = change_expiry_with_backup(
+            &public,
+            out.secret.as_bytes(),
+            b"pw",
+            Expiry::Years(2),
+            now + 5,
+        )
+        .unwrap();
         let (_, nb) = armor::decode(&new_public).unwrap();
         let new_packets = parse_packets(&nb).unwrap();
         assert!(new_packets.iter().any(|p| p.body == third.as_slice()));
@@ -1024,9 +1038,15 @@ mod tests {
         verify_backup(&secret, b"pw", &set).unwrap();
         // A backup of another key is refused plainly.
         let (_, other_out) = made(KeyType::NistP256, Expiry::Years(1), now);
-        let err = change_expiry_with_backup(&public, other_out.secret.as_bytes(), b"pw", Expiry::Never, now)
-            .err()
-            .unwrap();
+        let err = change_expiry_with_backup(
+            &public,
+            other_out.secret.as_bytes(),
+            b"pw",
+            Expiry::Never,
+            now,
+        )
+        .err()
+        .unwrap();
         assert_eq!(
             err.to_string(),
             "The backup and the public key belong to different keys."
@@ -1050,7 +1070,8 @@ mod tests {
         }
         // A binary (non-armored) backup works as well as an armored one;
         // the results are armored.
-        let (secret, public) = change_expiry_in_backup(&bin, b"pw", Expiry::Never, now + 5).unwrap();
+        let (secret, public) =
+            change_expiry_in_backup(&bin, b"pw", Expiry::Never, now + 5).unwrap();
         assert!(secret.starts_with("-----BEGIN PGP PRIVATE KEY BLOCK-----"));
         assert!(public.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
         let stub = armor::encode(Kind::PrivateKey, &stub);
