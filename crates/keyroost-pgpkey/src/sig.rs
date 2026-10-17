@@ -3,7 +3,7 @@
 //! other [`Signer`] (the card signs the same digest the host would).
 
 use keyroost_openpgp::Curve;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::keys::{KeyPart, Material};
 use crate::s2k::Hash;
@@ -71,6 +71,7 @@ impl Signer for HostSigner<'_> {
                     .map_err(crypto)?;
                 let scheme = match hash {
                     Hash::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+                    Hash::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
                     Hash::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
                     Hash::Sha1 => return Err(Error::Unsupported("SHA-1 signatures")),
                 };
@@ -111,11 +112,16 @@ fn ecdsa_sign(curve: Curve, d: &[u8], digest: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 /// The hash keyroost signs with for a key set whose primary is `primary`:
-/// SHA-512 for P-521 (the digest should not be shorter than the curve),
-/// SHA-256 otherwise.
+/// never shorter than the curve, because GnuPG refuses an ECDSA signature
+/// over a shorter digest — SHA-384 for P-384 (GnuPG's own choice there),
+/// SHA-512 for P-521, SHA-256 otherwise.
 #[must_use]
 pub fn hash_for(primary: &KeyPart) -> Hash {
     match primary.material {
+        Material::Ecdsa {
+            curve: Curve::NistP384,
+            ..
+        } => Hash::Sha384,
         Material::Ecdsa {
             curve: Curve::NistP521,
             ..
@@ -127,6 +133,7 @@ pub fn hash_for(primary: &KeyPart) -> Hash {
 fn digest(hash: Hash, data: &[u8]) -> Result<Vec<u8>> {
     match hash {
         Hash::Sha256 => Ok(Sha256::digest(data).to_vec()),
+        Hash::Sha384 => Ok(Sha384::digest(data).to_vec()),
         Hash::Sha512 => Ok(Sha512::digest(data).to_vec()),
         Hash::Sha1 => Err(Error::Unsupported("SHA-1 signatures")),
     }
@@ -360,6 +367,7 @@ mod tests {
         data.extend_from_slice(&(p.prefix_len as u32).to_be_bytes());
         match p.hash {
             8 => Sha256::digest(&data).to_vec(),
+            9 => Sha384::digest(&data).to_vec(),
             10 => Sha512::digest(&data).to_vec(),
             h => panic!("hash {h}"),
         }
@@ -533,15 +541,18 @@ mod tests {
     }
 
     #[test]
-    fn hash_for_picks_sha512_only_for_p521() {
-        for t in [KeyType::NistP256, KeyType::NistP521, KeyType::Cv25519] {
+    fn hash_for_never_goes_below_the_curve_size() {
+        // GnuPG refuses a P-384 signature over a SHA-256 digest ("requires
+        // a 384 bit or larger hash").
+        for (t, want) in [
+            (KeyType::NistP256, Hash::Sha256),
+            (KeyType::NistP384, Hash::Sha384),
+            (KeyType::NistP521, Hash::Sha512),
+            (KeyType::Secp256k1, Hash::Sha256),
+            (KeyType::Cv25519, Hash::Sha256),
+        ] {
             let parts = generate(t, 1).unwrap();
-            let want = if t == KeyType::NistP521 {
-                Hash::Sha512
-            } else {
-                Hash::Sha256
-            };
-            assert_eq!(hash_for(&parts[0]), want);
+            assert_eq!(hash_for(&parts[0]), want, "{t:?}");
         }
     }
 

@@ -4,6 +4,7 @@
 use crate::armor::{self, Kind};
 use crate::keys::{generate, KeyPart, KeyType};
 use crate::packet::{write_packet, Tag};
+use crate::read::Slot;
 use crate::s2k;
 use crate::sig::{
     hash_for, sign, signed_key, signed_uid, HostSigner, SigType, Subpackets, FEATURES, FLAGS_AUTH,
@@ -276,12 +277,35 @@ pub fn export(set: &KeySet, pass: &[u8], signer_now: u32) -> Result<Outputs, Err
     Ok(Outputs {
         secret: armor::encode(Kind::PrivateKey, &secret),
         public: armor::encode(Kind::PublicKey, &public),
+        // GnuPG writes (and only imports) a revocation certificate as a
+        // public key block, like its openpgp-revocs.d files.
         revocation: armor::encode_with_comment(
-            Kind::Signature,
+            Kind::PublicKey,
             &revocation,
             Some("This is a revocation certificate"),
         ),
     })
+}
+
+/// Re-read a just-written backup with its passphrase and check that it
+/// holds `expect`'s three keys in their slots.
+pub fn verify_backup(secret_armor: &str, pass: &[u8], expect: &KeySet) -> Result<(), Error> {
+    let got = crate::read::open(secret_armor.as_bytes(), Some(pass))?;
+    let slots = [Slot::Sign, Slot::Decrypt, Slot::Auth];
+    let all_there = got.keys.len() == 3
+        && slots.iter().zip(&expect.parts).all(|(slot, part)| {
+            let fpr = part.fingerprint();
+            got.keys
+                .iter()
+                .any(|k| k.slot == Some(*slot) && k.fpr == fpr)
+        });
+    if all_there {
+        Ok(())
+    } else {
+        Err(Error::Malformed(
+            "the backup does not hold the keys just made",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -389,9 +413,27 @@ mod tests {
         };
         assert_eq!(tags(&out.secret, Kind::PrivateKey), [5, 13, 2, 7, 2, 7, 2]);
         assert_eq!(tags(&out.public, Kind::PublicKey), [6, 13, 2, 14, 2, 14, 2]);
-        assert_eq!(tags(&out.revocation, Kind::Signature), [2]);
+        assert_eq!(tags(&out.revocation, Kind::PublicKey), [2]);
         assert!(out
             .revocation
             .contains("Comment: This is a revocation certificate\n\n"));
+    }
+
+    #[test]
+    fn verify_backup_accepts_its_own_keys_only() {
+        let now = 1_792_108_800;
+        let id = Identity {
+            name: "Ada".into(),
+            email: String::new(),
+        };
+        let set = create(KeyType::Cv25519, &id, Expiry::default(), now).unwrap();
+        let other = create(KeyType::Cv25519, &id, Expiry::default(), now).unwrap();
+        let out = export(&set, b"pw", now).unwrap();
+        verify_backup(&out.secret, b"pw", &set).unwrap();
+        assert!(verify_backup(&out.secret, b"pw", &other).is_err());
+        assert!(matches!(
+            verify_backup(&out.secret, b"nope", &set),
+            Err(Error::WrongPassphrase)
+        ));
     }
 }

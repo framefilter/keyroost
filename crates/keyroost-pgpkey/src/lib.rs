@@ -11,6 +11,7 @@ pub mod cert;
 pub mod files;
 pub mod keys;
 pub mod packet;
+pub mod read;
 pub mod s2k;
 pub mod sig;
 
@@ -33,6 +34,11 @@ pub enum Error {
     NeedsPassphrase,
     /// The file holds GnuPG card stubs, not key material.
     CardStubs,
+    /// The secret part of a key was left out of the file (GnuPG's
+    /// `gnu-dummy`, as written by `gpg --export-secret-subkeys`).
+    NoSecretPart,
+    /// The file holds a public key only, not a backup.
+    PublicOnly,
     /// A cryptographic operation failed.
     Crypto(String),
     /// A file operation failed.
@@ -49,10 +55,18 @@ impl fmt::Display for Error {
             }
             Error::BadChecksum => write!(f, "The key data is damaged (checksum mismatch)."),
             Error::WrongPassphrase => write!(f, "The passphrase is wrong."),
-            Error::NeedsPassphrase => write!(f, "This key is protected; a passphrase is needed."),
+            Error::NeedsPassphrase => write!(f, "This backup needs its passphrase."),
             Error::CardStubs => write!(
                 f,
                 "This file holds placeholders for keys on a smart card, not the keys themselves."
+            ),
+            Error::NoSecretPart => write!(
+                f,
+                "This file has no secret part for this key (it was exported without it)."
+            ),
+            Error::PublicOnly => write!(
+                f,
+                "This file holds only a public key; restoring needs the backup with the secret keys."
             ),
             Error::Crypto(msg) => write!(f, "Cryptographic error: {msg}"),
             Error::Io(e) => write!(f, "File error: {e}"),

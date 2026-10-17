@@ -25,6 +25,7 @@ keyroost-qr = { path = "../crates/keyroost-qr" }
 keyroost-ctap = { path = "../crates/keyroost-ctap" }
 keyroost-oath = { path = "../crates/keyroost-oath" }
 keyroost-openpgp = { path = "../crates/keyroost-openpgp" }
+keyroost-pgpkey = { path = "../crates/keyroost-pgpkey" }
 keyroost-piv = { path = "../crates/keyroost-piv" }
 keyroost-token2otp = { path = "../crates/keyroost-token2otp" }
 # winwebauthn is Windows-only for its FFI, but parse_detail_path is pure and
@@ -82,6 +83,13 @@ bench = false
 [[bin]]
 name = "openpgp_parse"
 path = "fuzz_targets/openpgp_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgpkey_parse"
+path = "fuzz_targets/pgpkey_parse.rs"
 test = false
 doc = false
 bench = false

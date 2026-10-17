@@ -5,7 +5,7 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use keyroost_proto::sha1::Sha1;
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use zeroize::Zeroizing;
 
 use crate::packet::Reader;
@@ -48,6 +48,7 @@ impl Cipher {
 pub enum Hash {
     Sha1 = 2,
     Sha256 = 8,
+    Sha384 = 9,
     Sha512 = 10,
 }
 
@@ -56,6 +57,7 @@ impl Hash {
         match id {
             2 => Ok(Hash::Sha1),
             8 => Ok(Hash::Sha256),
+            9 => Ok(Hash::Sha384),
             10 => Ok(Hash::Sha512),
             _ => Err(Error::Unsupported("S2K hash")),
         }
@@ -65,6 +67,7 @@ impl Hash {
 enum Hasher {
     Sha1(Sha1),
     Sha256(Sha256),
+    Sha384(Sha384),
     Sha512(Sha512),
 }
 
@@ -73,6 +76,7 @@ impl Hasher {
         match h {
             Hash::Sha1 => Hasher::Sha1(Sha1::new()),
             Hash::Sha256 => Hasher::Sha256(Sha256::new()),
+            Hash::Sha384 => Hasher::Sha384(Sha384::new()),
             Hash::Sha512 => Hasher::Sha512(Sha512::new()),
         }
     }
@@ -80,6 +84,7 @@ impl Hasher {
         match self {
             Hasher::Sha1(x) => x.update(d),
             Hasher::Sha256(x) => Digest::update(x, d),
+            Hasher::Sha384(x) => Digest::update(x, d),
             Hasher::Sha512(x) => Digest::update(x, d),
         }
     }
@@ -87,6 +92,7 @@ impl Hasher {
         Zeroizing::new(match self {
             Hasher::Sha1(x) => x.finalize().to_vec(),
             Hasher::Sha256(x) => x.finalize().to_vec(),
+            Hasher::Sha384(x) => x.finalize().to_vec(),
             Hasher::Sha512(x) => x.finalize().to_vec(),
         })
     }
@@ -135,7 +141,19 @@ impl Spec {
                 // A count byte always decodes to at most decode_count(0xFF).
                 Ok(Spec::Iterated(h, s, r.u8()?))
             }
-            101 => Err(Error::CardStubs),
+            // GnuPG extension: hash id, "GNU", then the mode — 1 means the
+            // secret was left out (gnu-dummy), 2 that it lives on a card.
+            101 => {
+                r.u8()?;
+                if r.take(3)? != b"GNU" {
+                    return Err(Error::Unsupported("S2K type"));
+                }
+                match r.u8()? {
+                    1 => Err(Error::NoSecretPart),
+                    2 => Err(Error::CardStubs),
+                    _ => Err(Error::Unsupported("GnuPG S2K extension")),
+                }
+            }
             _ => Err(Error::Unsupported("S2K type")),
         }
     }
@@ -373,6 +391,19 @@ mod tests {
         assert!(matches!(
             unprotect(&mut Reader::new(&blob), Some(b"x")),
             Err(Error::CardStubs)
+        ));
+    }
+    #[test]
+    fn gnu_dummy_without_a_card_is_a_missing_secret() {
+        let blob = [254u8, 0, 101, 0, b'G', b'N', b'U', 1];
+        assert!(matches!(
+            unprotect(&mut Reader::new(&blob), Some(b"x")),
+            Err(Error::NoSecretPart)
+        ));
+        let odd = [254u8, 0, 101, 0, b'G', b'N', b'U', 7];
+        assert!(matches!(
+            unprotect(&mut Reader::new(&odd), Some(b"x")),
+            Err(Error::Unsupported(_))
         ));
     }
     #[test]

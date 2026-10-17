@@ -115,9 +115,16 @@ pub fn encode_with_comment(kind: Kind, data: &[u8], comment: Option<&str>) -> St
     s
 }
 
+/// Largest armored text `decode` looks at (comfortably above the 1 MiB
+/// binary limit of `packet::parse_packets`).
+const MAX_TEXT: usize = 2 << 20;
+
 /// Decode one armored block. Verifies the CRC when present; ignores armor
 /// header lines such as `Comment:`; accepts CRLF line endings.
 pub fn decode(text: &str) -> Result<(Kind, Vec<u8>), Error> {
+    if text.len() > MAX_TEXT {
+        return Err(Error::Malformed("file too large"));
+    }
     let mut lines = text.lines().map(str::trim_end);
     let kind = loop {
         let line = lines.next().ok_or(Error::Malformed("no armor header"))?;
@@ -143,7 +150,10 @@ pub fn decode(text: &str) -> Result<(Kind, Vec<u8>), Error> {
     let mut crc_text: Option<&str> = None;
     let mut ended = false;
     for line in lines {
-        if line.starts_with("-----END PGP ") {
+        if let Some(rest) = line.strip_prefix("-----END PGP ") {
+            if rest.strip_suffix("-----") != Some(kind.label()) {
+                return Err(Error::Malformed("armor footer does not match its header"));
+            }
             ended = true;
             break;
         }
@@ -189,5 +199,14 @@ mod tests {
             decode(&bad),
             Err(Error::BadChecksum) | Err(Error::Malformed(_))
         ));
+    }
+    #[test]
+    fn footer_must_be_complete_and_match() {
+        let text = encode(Kind::PublicKey, b"hello pgp");
+        let cut = text.trim_end().trim_end_matches('-');
+        assert!(decode(cut).is_err());
+        let other = text.replace("END PGP PUBLIC", "END PGP PRIVATE");
+        assert!(decode(&other).is_err());
+        assert!(decode(&"A".repeat(MAX_TEXT + 1)).is_err());
     }
 }
