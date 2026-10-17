@@ -991,7 +991,7 @@ old script.
 | `keyroost-windevtree` | Windows-only device-tree lookups that let a key's FIDO HID node and smart-card reader be recognized as one physical key, without opening the device or connecting to the card; isolates the unsafe Win32 FFI; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-screengrab` | Windows-only still screen capture (GDI `BitBlt`) for QR-from-screen; isolates the unsafe Win32 FFI from the GUI crate; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroostctl` | Command-line interface | `clap`, `clap_complete`, `clap_mangen`, `serde`/`serde_json`, `zeroize`, `rpassword` (hidden PIN/password prompt) |
-| `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `rfd`, `pollster`, `png`, `base64`, `serde`/`serde_json`, `zeroize`; `x11rb`/`ashpd` on Linux (`qr` feature); `winresource` build-dep on Windows |
+| `keyroost` | egui desktop GUI | `eframe`, `egui`, `arboard`, `rfd`, `pollster`, `png`, `base64`, `serde`/`serde_json`, `zeroize`; `x11rb`/`ashpd` on Linux (`qr` feature); `wgpu` (DirectX 12 only) on Windows; `winresource` build-dep on Windows |
 
 ## Protocol
 
