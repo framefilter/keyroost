@@ -8,7 +8,7 @@
 
 use std::error::Error;
 use std::fmt::Display;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use keyroost_openpgp::{AlgorithmInformation, KeyAlg, KeyCrt, PW3_ADMIN};
 use keyroost_pgpkey::cert::{self, Expiry, Identity};
@@ -550,34 +550,6 @@ fn import_rsa_file(
 
 /// Write `contents` over `path` without a half-written file at any moment:
 /// into `path.tmp` (which must not exist), then renamed over `path`.
-fn tmp_for(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".tmp");
-    PathBuf::from(name)
-}
-
-fn replace_files(writes: &[(&Path, &str, bool)]) -> Result<(), String> {
-    let mut done: Vec<PathBuf> = Vec::new();
-    for (path, contents, secret) in writes {
-        let tmp = tmp_for(path);
-        if let Err(e) = files::write_new(&tmp, contents, *secret) {
-            for t in &done {
-                let _ = std::fs::remove_file(t);
-            }
-            // write_new names an existing tmp file itself.
-            return Err(plain(e));
-        }
-        done.push(tmp);
-    }
-    for ((path, ..), tmp) in writes.iter().zip(&done) {
-        std::fs::rename(tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(tmp);
-            format!("cannot replace {}: {e}", path.display())
-        })?;
-    }
-    Ok(())
-}
-
 /// `openpgp key expiry`.
 pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
     let OpenpgpKeyCmd::Expiry {
@@ -636,8 +608,11 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
                     .map_err(plain)?;
             drop(pass);
             let new_secret = Zeroizing::new(new_secret);
-            replace_files(&[(b, &new_secret, true), (public, &new_public, false)])?;
-            written.extend([b.as_path(), public.as_path()]);
+            // The public file first: if the backup then can't be replaced, the
+            // error says the public file already has the new date.
+            files::replace(&[(public, &new_public, false), (b, &new_secret, true)])
+                .map_err(plain)?;
+            written.extend([public.as_path(), b.as_path()]);
         }
         None => {
             let reader = reader.as_deref();
@@ -656,7 +631,7 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
                 .map_err(plain)?;
             drop(signer);
             drop(session);
-            replace_files(&[(public, &new_public, false)])?;
+            files::replace(&[(public, &new_public, false)]).map_err(plain)?;
             written.push(public);
         }
     }

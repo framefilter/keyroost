@@ -1,4 +1,4 @@
-//! Backup file naming and never-overwrite writes.
+//! Backup file naming, never-overwrite writes, and whole-file replacement.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +60,79 @@ pub fn write_new(path: &Path, contents: &str, secret: bool) -> Result<(), Error>
     Ok(())
 }
 
+/// `path` with `.tmp` added, where [`replace`] writes it first.
+fn tmp_for(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// Replace existing files, each `(path, contents, secret)`, so that none is
+/// ever left half-written: every new version is written to `<path>.tmp`
+/// first (0600 on Unix when `secret`, as [`write_new`]), and only when all
+/// are written is each renamed over its file, in the order given.
+///
+/// A `.tmp` file already there (left over from an attempt that was cut
+/// off) stops everything before any file changes. If a rename fails after
+/// an earlier one went through, the error names the files already
+/// replaced, so put the one that matters most to keep consistent (the
+/// public key others are sent) first.
+pub fn replace(files: &[(&Path, &str, bool)]) -> Result<(), Error> {
+    let mut written: Vec<PathBuf> = Vec::new();
+    let remove_all = |tmps: &[PathBuf]| {
+        for t in tmps {
+            let _ = std::fs::remove_file(t);
+        }
+    };
+    for (path, contents, secret) in files {
+        let tmp = tmp_for(path);
+        if let Err(e) = write_new(&tmp, contents, *secret) {
+            remove_all(&written);
+            return Err(match e {
+                Error::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "{} is left over from an earlier attempt; delete it and try again \
+                             (nothing was changed)",
+                            tmp.display()
+                        ),
+                    ))
+                }
+                e => {
+                    // A partly written tmp of our own: don't leave it.
+                    let _ = std::fs::remove_file(&tmp);
+                    e
+                }
+            });
+        }
+        written.push(tmp);
+    }
+    for (i, ((path, ..), tmp)) in files.iter().zip(&written).enumerate() {
+        if let Err(e) = std::fs::rename(tmp, path) {
+            remove_all(&written[i..]);
+            let done: Vec<String> = files[..i]
+                .iter()
+                .map(|(p, ..)| p.display().to_string())
+                .collect();
+            let msg = if done.is_empty() {
+                format!(
+                    "cannot replace {}: {e} (nothing was changed)",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "cannot replace {}: {e}; {} was already updated",
+                    path.display(),
+                    done.join(" and ")
+                )
+            };
+            return Err(Error::Io(std::io::Error::new(e.kind(), msg)));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +176,73 @@ mod tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         std::fs::remove_file(&p).unwrap();
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pgpkey-replace-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn replace_swaps_whole_files_and_keeps_secret_ones_private() {
+        let d = dir("ok");
+        let (pubf, b) = (d.join("k.pub.asc"), d.join("k.asc"));
+        std::fs::write(&pubf, "old public").unwrap();
+        std::fs::write(&b, "old secret").unwrap();
+        replace(&[(&pubf, "new public", false), (&b, "new secret", true)]).unwrap();
+        assert_eq!(std::fs::read_to_string(&pubf).unwrap(), "new public");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new secret");
+        assert!(!d.join("k.pub.asc.tmp").exists() && !d.join("k.asc.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&b).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_left_over_tmp_changes_nothing() {
+        let d = dir("stale");
+        let (pubf, b) = (d.join("k.pub.asc"), d.join("k.asc"));
+        std::fs::write(&pubf, "public").unwrap();
+        std::fs::write(&b, "secret").unwrap();
+        std::fs::write(d.join("k.asc.tmp"), "stale").unwrap();
+        let err = replace(&[(&pubf, "new", false), (&b, "new", true)]).unwrap_err();
+        assert!(err.to_string().contains("k.asc.tmp is left over"), "{err}");
+        assert!(err.to_string().contains("nothing was changed"), "{err}");
+        assert_eq!(std::fs::read_to_string(&pubf).unwrap(), "public");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "secret");
+        // Our own tmp for the public file is cleaned up; the stale one stays.
+        assert!(!d.join("k.pub.asc.tmp").exists());
+        assert_eq!(
+            std::fs::read_to_string(d.join("k.asc.tmp")).unwrap(),
+            "stale"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_failed_second_rename_says_the_first_file_was_updated() {
+        let d = dir("half");
+        let pubf = d.join("k.pub.asc");
+        std::fs::write(&pubf, "old public").unwrap();
+        // A directory where the backup should be: its rename fails.
+        let b = d.join("k.asc");
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("keep"), "x").unwrap();
+        let err = replace(&[(&pubf, "new public", false), (&b, "new secret", true)]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot replace"), "{msg}");
+        assert!(
+            msg.contains(&format!("{} was already updated", pubf.display())),
+            "{msg}"
+        );
+        assert_eq!(std::fs::read_to_string(&pubf).unwrap(), "new public");
+        assert!(!d.join("k.asc.tmp").exists());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

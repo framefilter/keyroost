@@ -1183,37 +1183,6 @@ fn expiry_saved_notice(public: &std::path::Path) -> String {
     )
 }
 
-/// Replace each file through `<path>.tmp` and a rename, so a failure never
-/// leaves one half-written. All tmp files are written before the first
-/// rename; `secret` ones are created 0600 on Unix. Same as the CLI's
-/// `openpgp key expiry`.
-fn replace_files(writes: &[(&std::path::Path, &str, bool)]) -> Result<(), String> {
-    let tmp_for = |p: &std::path::Path| {
-        let mut name = p.as_os_str().to_owned();
-        name.push(".tmp");
-        std::path::PathBuf::from(name)
-    };
-    let mut done: Vec<std::path::PathBuf> = Vec::new();
-    for (path, contents, secret) in writes {
-        let tmp = tmp_for(path);
-        if let Err(e) = keyroost_pgpkey::files::write_new(&tmp, contents, *secret) {
-            for t in &done {
-                let _ = std::fs::remove_file(t);
-            }
-            // write_new names an existing tmp file itself.
-            return Err(pgp_plain(e));
-        }
-        done.push(tmp);
-    }
-    for ((path, ..), tmp) in writes.iter().zip(&done) {
-        std::fs::rename(tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(tmp);
-            format!("Cannot replace {}: {e}", path.display())
-        })?;
-    }
-    Ok(())
-}
-
 fn pgp_slot_index(s: keyroost_pgpkey::read::Slot) -> usize {
     use keyroost_pgpkey::read::Slot;
     match s {
@@ -8167,7 +8136,14 @@ impl App {
                         )
                         .map_err(pgp_plain)?;
                         let new_secret = zeroize::Zeroizing::new(new_secret);
-                        replace_files(&[(b, &new_secret, true), (&public, &new_public, false)])
+                        // The public file first: if the backup then can't be
+                        // replaced, the error says the public file already
+                        // has the new date.
+                        keyroost_pgpkey::files::replace(&[
+                            (&public, &new_public, false),
+                            (b, &new_secret, true),
+                        ])
+                        .map_err(pgp_plain)
                     }
                     By::Card(name) => {
                         let mut session = keyroost_transport::OpenPgpSession::open(name)
@@ -8187,7 +8163,8 @@ impl App {
                                 .map_err(pgp_plain)?;
                         drop(signer);
                         drop(session);
-                        replace_files(&[(&public, &new_public, false)])
+                        keyroost_pgpkey::files::replace(&[(&public, &new_public, false)])
+                            .map_err(pgp_plain)
                     }
                 }
             })();
@@ -24467,32 +24444,6 @@ mod tests {
             expiry_saved_notice(std::path::Path::new("/keys/k.pub.asc")),
             "New expiry saved to /keys/k.pub.asc. Share it again so others see the new date."
         );
-    }
-
-    #[test]
-    fn replacing_files_leaves_no_tmp_and_keeps_the_backup_private() {
-        let dir = std::env::temp_dir().join(format!("keyroost-expiry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let (b, pubf) = (dir.join("k.asc"), dir.join("k.pub.asc"));
-        std::fs::write(&b, "old secret").unwrap();
-        std::fs::write(&pubf, "old public").unwrap();
-        replace_files(&[(&b, "new secret", true), (&pubf, "new public", false)]).unwrap();
-        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new secret");
-        assert_eq!(std::fs::read_to_string(&pubf).unwrap(), "new public");
-        assert!(!dir.join("k.asc.tmp").exists() && !dir.join("k.pub.asc.tmp").exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&b).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-        // A left-over tmp file stops the write before anything is replaced.
-        std::fs::write(dir.join("k.pub.asc.tmp"), "stale").unwrap();
-        assert!(replace_files(&[(&b, "newer", true), (&pubf, "newer", false)]).is_err());
-        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new secret");
-        assert!(!dir.join("k.asc.tmp").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
