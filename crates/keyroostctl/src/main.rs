@@ -26,6 +26,7 @@ use keyroost_resolve::{ccid_readers_if_needed, ccid_serials_for, Need};
 
 mod code_import;
 mod json_out;
+mod openpgp_keys;
 mod output;
 mod overview;
 mod prompt;
@@ -1429,7 +1430,7 @@ enum OpenpgpCmd {
         #[command(subcommand)]
         cmd: OpenpgpPinCmd,
     },
-    /// Generate, import or show the card's keys, and list the algorithms it supports.
+    /// Generate, import or show the card's keys, change when they expire, and list the algorithms it supports.
     Key {
         #[command(subcommand)]
         cmd: OpenpgpKeyCmd,
@@ -1639,22 +1640,25 @@ enum OpenpgpKeyCmd {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
     },
-    /// Import an RSA-2048 key into a slot, replacing any key already there.
-    /// Irreversible: asks first (`--yes` to skip).
+    /// Put a new key set, a backup or an RSA key file onto the card,
+    /// replacing the keys already there. Irreversible: asks first (`--yes`
+    /// to skip).
     ///
-    /// The key comes from either `--generate` (fresh host keygen) or `--in
-    /// <FILE>` (an existing PKCS#1/PKCS#8 PEM or DER key); exactly one is
-    /// required. Needs the admin PIN (PW3). The key is registered (fingerprint
-    /// + timestamp) like `openpgp key generate`.
+    /// `--generate` makes a new OpenPGP key set (a signing main key with
+    /// decryption and authentication subkeys), saves it first as a
+    /// passphrase-protected backup, its public key and a revocation
+    /// certificate, then puts all three keys on the card. `--in <FILE>`
+    /// restores a backup (keyroost's, or `gpg --export-secret-keys` output)
+    /// into its slots, or imports an RSA private key (PKCS#1/PKCS#8, PEM or
+    /// DER) into one slot. Exactly one of the two is required. Needs the
+    /// admin PIN (PW3). Each key is registered (fingerprint + timestamp)
+    /// like `openpgp key generate`.
     Import {
-        /// Generate a fresh RSA-2048 key on the host and import it.
-        /// Mutually exclusive with `--in`.
+        /// Make a new key set, save it to `--backup`, and put it on the card.
         #[arg(long, conflicts_with = "in_file", required_unless_present = "in_file")]
         generate: bool,
-        /// Import an existing RSA-2048 private key from a file (PKCS#1 or
-        /// PKCS#8, PEM or DER; auto-detected). Mutually exclusive with
-        /// `--generate`. The key is read locally and imported; it is never
-        /// logged. Prefer an unencrypted key file you can delete afterward.
+        /// Restore a backup or import an RSA key from this file (OpenPGP,
+        /// PEM or DER; detected from the contents).
         #[arg(
             long = "in",
             short = 'i',
@@ -1662,18 +1666,79 @@ enum OpenpgpKeyCmd {
             conflicts_with = "generate"
         )]
         in_file: Option<std::path::PathBuf>,
-        /// Which key slot to (over)write: `sign`, `decrypt`, or `auth`.
-        #[arg(long, short = 's', value_enum, default_value_t = OpenpgpSlot::Sign)]
-        slot: OpenpgpSlot,
+        /// With --generate: where to save the keys. FILE.asc is the backup,
+        /// FILE.pub.asc the public key, FILE.rev.asc the revocation
+        /// certificate; none of them may exist yet.
+        #[arg(long, value_name = "FILE", conflicts_with = "in_file")]
+        backup: Option<std::path::PathBuf>,
+        /// With --generate: the name in the key's user ID.
+        #[arg(long, value_name = "NAME", conflicts_with = "in_file")]
+        name: Option<String>,
+        /// With --generate: the email address in the key's user ID.
+        #[arg(long, value_name = "EMAIL", conflicts_with = "in_file")]
+        email: Option<String>,
+        /// With --generate: the key type (rsa2048, rsa3072, rsa4096,
+        /// nistp256, nistp384, nistp521, secp256k1 or ed25519). Omit for
+        /// ed25519 when the card lists it, rsa3072 otherwise.
+        #[arg(long, value_enum, conflicts_with = "in_file")]
+        algorithm: Option<CliOpenpgpKeyAlg>,
+        /// With --generate: when the keys expire (never, 1y, 2y, 3y, 5y or
+        /// a date YYYY-MM-DD). Default 3y.
+        #[arg(long, value_name = "WHEN", value_parser = parse_expires, conflicts_with = "in_file")]
+        expires: Option<keyroost_pgpkey::cert::Expiry>,
+        /// With --in: the one slot to fill (`sign`, `decrypt`, or `auth`).
+        /// A backup fills every slot it has a key for unless this is
+        /// given; an RSA key file goes into `sign` unless this is given.
+        #[arg(long, short = 's', value_enum, conflicts_with = "generate")]
+        slot: Option<OpenpgpSlot>,
+        /// The backup's passphrase: env:NAME reads that environment
+        /// variable, stdin reads one line (first line when --admin-pin stdin
+        /// is also given; hidden when typed at a terminal, twice for a new
+        /// backup; with --in, read only when the file is protected). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
+        passphrase: Option<SecretSource>,
         /// Confirm without asking (required when not run from a terminal).
         #[arg(long, short = 'y')]
         yes: bool,
         /// The admin PIN (PW3): env:NAME reads that environment variable, stdin
-        /// reads one line (hidden when typed at a terminal). With neither, a
-        /// terminal asks.
+        /// reads one line (second line when --passphrase stdin is also given;
+        /// hidden when typed at a terminal). With neither, a terminal asks.
         #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true)]
         admin_pin: Option<SecretSource>,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
+        reader: Option<String>,
+    },
+    /// Change when a key set expires and update its public key file.
+    ///
+    /// Signs new self-signatures with the main key: on the card (needs the
+    /// signing PIN, PW1, and on a YubiKey a touch per signature), or with
+    /// `--backup`, on this computer from the backup (needs its passphrase;
+    /// the backup is rewritten too). The keys themselves stay the same.
+    /// Share the updated public key again afterward.
+    Expiry {
+        /// The new expiry: never, 1y, 2y, 3y, 5y (counted from today) or a
+        /// date YYYY-MM-DD.
+        #[arg(long, value_name = "WHEN", value_parser = parse_expires)]
+        set: keyroost_pgpkey::cert::Expiry,
+        /// The key set's public key file (FILE.pub.asc); rewritten in place.
+        #[arg(long, value_name = "FILE")]
+        public: std::path::PathBuf,
+        /// Sign with the backup (FILE.asc) instead of the card; rewritten in
+        /// place.
+        #[arg(long, value_name = "FILE")]
+        backup: Option<std::path::PathBuf>,
+        /// The backup's passphrase: env:NAME reads that environment
+        /// variable, stdin reads one line (hidden when typed at a terminal).
+        /// With neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, requires = "backup")]
+        passphrase: Option<SecretSource>,
+        /// The signing PIN (PW1): env:NAME reads that environment variable,
+        /// stdin reads one line (hidden when typed at a terminal). With
+        /// neither, a terminal asks.
+        #[arg(long, value_name = "SOURCE", value_parser = crate::secrets::parse_source, allow_hyphen_values = true, conflicts_with_all = ["backup", "passphrase"])]
+        pin: Option<SecretSource>,
+        #[arg(long, value_name = "SUBSTR", help = READER_HELP, conflicts_with = "backup")]
         reader: Option<String>,
     },
     /// Read the public key from a slot (read-only; no PIN). RSA keys print
@@ -3798,6 +3863,13 @@ fn same_prog_token(before: &str, now: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Clap value parser for `--expires` / `--set`: `never`, `1y`, `2y`, `3y`,
+/// `5y` or a real calendar date `YYYY-MM-DD`. Whether the date is still
+/// ahead is checked against the clock by the handler, before anything else.
+fn parse_expires(s: &str) -> Result<keyroost_pgpkey::cert::Expiry, String> {
+    keyroost_pgpkey::cert::Expiry::parse(s)
 }
 
 fn unix_now() -> u32 {
@@ -9095,6 +9167,8 @@ const PGP_OLD_USER_PIN: Spec = Spec::current("current user PIN (PW1)", "pin");
 const PGP_NEW_USER_PIN: Spec = Spec::new_secret("new user PIN (PW1)", "new-pin");
 const PGP_OLD_ADMIN_PIN: Spec = Spec::current("current admin PIN (PW3)", "pin");
 const PGP_NEW_ADMIN_PIN: Spec = Spec::new_secret("new admin PIN (PW3)", "new-pin");
+const PGP_NEW_PASSPHRASE: Spec = Spec::new_secret("backup passphrase", "passphrase");
+const PGP_PASSPHRASE: Spec = Spec::current("backup passphrase", "passphrase");
 
 fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
@@ -9265,73 +9339,11 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             println!("  created:     {} (unix)", creation_time);
         }
         OpenpgpCmd::Key {
-            cmd:
-                OpenpgpKeyCmd::Import {
-                    generate,
-                    in_file,
-                    slot,
-                    yes,
-                    admin_pin,
-                    reader,
-                },
-        } => {
-            let mut sec = Secrets::real();
-            let src = Source::from_flag(admin_pin.as_ref());
-            sec.check(&PGP_ADMIN_PIN, src)?;
-
-            // Obtain the RSA-2048 key parts (full CRT set, big-endian) either by
-            // host keygen or by loading a key file. Both go through the shared
-            // `keyroost-rsakey` crate (which owns the scoped `rsa` dep); the card
-            // decides which parts it wants. A key file is loaded and checked
-            // first, so a wrong path or key type fails before the question and
-            // the admin PIN; keygen waits until the question is answered.
-            let loaded = if *generate {
-                None
-            } else {
-                let path = in_file
-                    .as_deref()
-                    .ok_or("provide --generate or --in <FILE>")?;
-                output::status(&format!("Loading RSA key from {}…", path.display()));
-                Some(keyroost_rsakey::load_from_file(path)?)
-            };
-            let dev = crate::target::select(Need::OpenPgp, reader.as_deref(), None)?;
-            let asked = crate::prompt::confirm_then_read(
-                &dev,
-                *yes,
-                &format!("overwrite the OpenPGP {} key", slot.label()),
-            )?;
-            let admin_pin = sec.read(&PGP_ADMIN_PIN, src)?;
-            let k = match loaded {
-                Some(k) => k,
-                None => {
-                    output::status("Generating an RSA-2048 key on the host…");
-                    keyroost_rsakey::generate_2048()?
-                }
-            };
-
-            crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
-            let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
-            session.verify_pin(keyroost_openpgp::PW3_ADMIN, admin_pin.as_bytes())?;
-            output::status(&format!("Importing {} key…", slot.label()));
-            let parts = keyroost_transport::RsaPrivateKeyParts {
-                e: &k.e,
-                p: &k.p,
-                q: &k.q,
-                u: &k.u,
-                dp: &k.dp,
-                dq: &k.dq,
-                n: &k.n,
-            };
-            session.import_key(slot.to_crt(), &parts)?;
-            // Register so gpg recognizes it; fingerprint is over (n, e) + time.
-            let creation_time = unix_now();
-            let fpr = session.register_key(slot.to_crt(), creation_time)?;
-            println!("Imported {} key (RSA-2048):", slot.label());
-            println!("  modulus:  {}", hex_encode(&k.n));
-            println!("  exponent: {}", hex_encode(&k.e));
-            println!("  fingerprint: {}", hex_encode(&fpr));
-            println!("  created:     {} (unix)", creation_time);
-        }
+            cmd: cmd @ OpenpgpKeyCmd::Import { .. },
+        } => crate::openpgp_keys::run_import(cmd, debug)?,
+        OpenpgpCmd::Key {
+            cmd: cmd @ OpenpgpKeyCmd::Expiry { .. },
+        } => crate::openpgp_keys::run_expiry(cmd, debug)?,
         OpenpgpCmd::Name {
             cmd:
                 OpenpgpNameCmd::Set {
@@ -11510,6 +11522,24 @@ fn pgp_secret_pair(cmd: &OpenpgpCmd) -> Option<SecretPair<'_>> {
                 admin_pin, new_pin, ..
             },
         } => secret_pair((&PGP_ADMIN_PIN, admin_pin), (&PGP_NEW_USER_PIN, new_pin)),
+        // The passphrase is needed to write (or read) the backup before the
+        // question; the admin PIN after it.
+        OpenpgpCmd::Key {
+            cmd:
+                OpenpgpKeyCmd::Import {
+                    generate,
+                    passphrase,
+                    admin_pin,
+                    ..
+                },
+        } => {
+            let pass = if *generate {
+                &PGP_NEW_PASSPHRASE
+            } else {
+                &PGP_PASSPHRASE
+            };
+            secret_pair((pass, passphrase), (&PGP_ADMIN_PIN, admin_pin))
+        }
         _ => return None,
     })
 }
@@ -19374,8 +19404,10 @@ mod cli_tests {
                 "key",
                 "import",
                 "--generate",
-                "--slot",
-                "sign",
+                "--backup",
+                "keys",
+                "--name",
+                "A",
             ],
             &["keyroostctl", "openpgp", "key", "show", "--slot", "sign"],
             &["keyroostctl", "openpgp", "key", "algorithms"],
@@ -19783,6 +19815,343 @@ mod cli_tests {
             }
         }
         assert!(parse(&["keyroostctl", "openpgp", "key", "algorithms"]).is_ok());
+    }
+
+    fn pgp_import(args: &[&str]) -> Result<OpenpgpKeyCmd, clap::Error> {
+        let mut argv = vec!["keyroostctl", "openpgp", "key", "import"];
+        argv.extend_from_slice(args);
+        match parse(&argv)?.command {
+            Some(Cmd::Openpgp {
+                cmd: OpenpgpCmd::Key { cmd },
+            }) => Ok(cmd),
+            _ => panic!("expected openpgp key import"),
+        }
+    }
+
+    fn pgp_expiry(args: &[&str]) -> Result<OpenpgpKeyCmd, clap::Error> {
+        let mut argv = vec!["keyroostctl", "openpgp", "key", "expiry"];
+        argv.extend_from_slice(args);
+        match parse(&argv)?.command {
+            Some(Cmd::Openpgp {
+                cmd: OpenpgpCmd::Key { cmd },
+            }) => Ok(cmd),
+            _ => panic!("expected openpgp key expiry"),
+        }
+    }
+
+    #[test]
+    fn openpgp_import_generate_takes_the_create_flags() {
+        use keyroost_pgpkey::cert::Expiry;
+        match pgp_import(&["--generate", "--backup", "keys", "--name", "Alice", "--yes"]).unwrap() {
+            OpenpgpKeyCmd::Import {
+                generate,
+                backup,
+                name,
+                algorithm,
+                expires,
+                slot,
+                ..
+            } => {
+                assert!(generate);
+                assert_eq!(backup.as_deref(), Some(Path::new("keys")));
+                assert_eq!(name.as_deref(), Some("Alice"));
+                assert!(algorithm.is_none());
+                assert!(expires.is_none());
+                assert!(slot.is_none());
+            }
+            _ => panic!("expected import"),
+        }
+        match pgp_import(&[
+            "--generate",
+            "--backup",
+            "keys.asc",
+            "--name",
+            "Alice",
+            "--email",
+            "alice@example.com",
+            "--algorithm",
+            "nistp384",
+            "--expires",
+            "2y",
+            "--passphrase",
+            "env:KR_PASS",
+            "--admin-pin",
+            "env:KR_ADMIN",
+        ])
+        .unwrap()
+        {
+            OpenpgpKeyCmd::Import {
+                email,
+                algorithm,
+                expires,
+                passphrase,
+                ..
+            } => {
+                assert_eq!(email.as_deref(), Some("alice@example.com"));
+                assert_eq!(
+                    algorithm.map(|a| a.to_alg()),
+                    Some(keyroost_openpgp::KeyAlg::NistP384)
+                );
+                assert_eq!(expires, Some(Expiry::Years(2)));
+                assert!(passphrase.is_some());
+            }
+            _ => panic!("expected import"),
+        }
+        for when in ["never", "1y", "3y", "5y", "2031-06-30"] {
+            assert!(
+                pgp_import(&[
+                    "--generate",
+                    "--backup",
+                    "k",
+                    "--name",
+                    "A",
+                    "--expires",
+                    when
+                ])
+                .is_ok(),
+                "{when}"
+            );
+        }
+    }
+
+    #[test]
+    fn openpgp_import_refuses_bad_expiry_and_mixed_sources() {
+        let e = pgp_import(&[
+            "--generate",
+            "--backup",
+            "k",
+            "--name",
+            "A",
+            "--expires",
+            "4y",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(e.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(e.to_string().contains("never, 1y, 2y, 3y, 5y"), "{e}");
+        for bad in ["2029-13-01", "2027-02-29", "tomorrow"] {
+            assert!(
+                pgp_import(&[
+                    "--generate",
+                    "--backup",
+                    "k",
+                    "--name",
+                    "A",
+                    "--expires",
+                    bad
+                ])
+                .is_err(),
+                "{bad}"
+            );
+        }
+        // Exactly one key source.
+        assert!(pgp_import(&[]).is_err());
+        assert!(pgp_import(&["--generate", "--in", "f.asc"]).is_err());
+        // The create flags belong to --generate; --slot to --in.
+        for extra in [
+            &["--backup", "k"][..],
+            &["--name", "A"],
+            &["--email", "a@example.com"],
+            &["--algorithm", "ed25519"],
+            &["--expires", "1y"],
+        ] {
+            let mut args = vec!["--in", "f.asc"];
+            args.extend_from_slice(extra);
+            assert!(pgp_import(&args).is_err(), "{extra:?}");
+        }
+        assert!(pgp_import(&[
+            "--generate",
+            "--backup",
+            "k",
+            "--name",
+            "A",
+            "--slot",
+            "sign"
+        ])
+        .is_err());
+        // --in: a slot and a passphrase source are fine.
+        assert!(pgp_import(&[
+            "--in",
+            "f.asc",
+            "--slot",
+            "decrypt",
+            "--passphrase",
+            "stdin"
+        ])
+        .is_ok());
+        assert!(pgp_import(&["--in", "f.asc"]).is_ok());
+    }
+
+    #[test]
+    fn openpgp_create_plan_checks_everything_before_the_card() {
+        use crate::openpgp_keys::create_plan;
+        use keyroost_pgpkey::cert::{days_from_civil, Expiry};
+        use keyroost_pgpkey::keys::KeyType;
+        let now = (days_from_civil(2026, 10, 17) * 86_400) as u32;
+        let p = Path::new("keys.asc");
+        assert_eq!(
+            create_plan(None, Some("A"), None, None, None, now)
+                .err()
+                .unwrap(),
+            "--generate needs --backup FILE: keyroost saves the keys it makes."
+        );
+        assert!(create_plan(Some(p), None, None, None, None, now)
+            .err()
+            .unwrap()
+            .contains("--name"));
+        assert!(create_plan(Some(p), Some("  "), None, None, None, now).is_err());
+        let past = Some(Expiry::Date {
+            y: 2026,
+            m: 10,
+            d: 1,
+        });
+        assert_eq!(
+            create_plan(Some(p), Some("A"), None, None, past, now)
+                .err()
+                .unwrap(),
+            "That date is in the past."
+        );
+        let e = create_plan(
+            Some(p),
+            Some("A"),
+            None,
+            Some(CliOpenpgpKeyAlg::BrainpoolP384r1),
+            None,
+            now,
+        )
+        .err()
+        .unwrap();
+        assert!(e.contains("openpgp key generate"), "{e}");
+        let plan = create_plan(
+            Some(p),
+            Some("Alice"),
+            Some("alice@example.com"),
+            Some(CliOpenpgpKeyAlg::Rsa4096),
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(plan.key_type, Some(KeyType::Rsa4096));
+        assert_eq!(plan.expiry, Expiry::Years(3));
+        assert_eq!(plan.paths.public, Path::new("keys.pub.asc"));
+        assert_eq!(
+            plan.identity.user_id().unwrap(),
+            "Alice <alice@example.com>"
+        );
+        // Every type keyroost can back up has its CLI name.
+        for t in KeyType::ALL {
+            let alg: CliOpenpgpKeyAlg = clap::ValueEnum::from_str(t.cli_name(), false)
+                .unwrap_or_else(|e| panic!("{}: {e}", t.cli_name()));
+            let plan = create_plan(Some(p), Some("A"), None, Some(alg), None, now).unwrap();
+            assert_eq!(plan.key_type, Some(t));
+        }
+    }
+
+    #[test]
+    fn openpgp_default_key_type_follows_the_card_list() {
+        use crate::openpgp_keys::default_key_type;
+        use keyroost_openpgp::{AlgorithmInformation, KeyAlg, KeyCrt};
+        use keyroost_pgpkey::keys::KeyType;
+        assert_eq!(default_key_type(None), KeyType::Cv25519);
+        let attr = |a: KeyAlg, c: KeyCrt| a.attributes(c).unwrap();
+        let both = AlgorithmInformation {
+            sig: vec![
+                attr(KeyAlg::Rsa2048, KeyCrt::Sign),
+                attr(KeyAlg::Ed25519, KeyCrt::Sign),
+            ],
+            dec: vec![attr(KeyAlg::X25519, KeyCrt::Decrypt)],
+            aut: vec![attr(KeyAlg::Ed25519, KeyCrt::Auth)],
+        };
+        assert_eq!(default_key_type(Some(&both)), KeyType::Cv25519);
+        let rsa_only = AlgorithmInformation {
+            sig: vec![attr(KeyAlg::Rsa2048, KeyCrt::Sign)],
+            dec: vec![attr(KeyAlg::Rsa2048, KeyCrt::Decrypt)],
+            aut: vec![attr(KeyAlg::Rsa2048, KeyCrt::Auth)],
+        };
+        assert_eq!(default_key_type(Some(&rsa_only)), KeyType::Rsa3072);
+        let no_x25519 = AlgorithmInformation {
+            dec: vec![attr(KeyAlg::Rsa2048, KeyCrt::Decrypt)],
+            ..both
+        };
+        assert_eq!(default_key_type(Some(&no_x25519)), KeyType::Rsa3072);
+    }
+
+    #[test]
+    fn openpgp_files_are_told_apart_from_pem_and_der() {
+        use crate::openpgp_keys::is_openpgp;
+        assert!(is_openpgp(b"-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nxxx"));
+        assert!(is_openpgp(b"\r\n  -----BEGIN PGP PRIVATE KEY BLOCK-----\n"));
+        assert!(is_openpgp(&[0x95, 0x01, 0xD8]));
+        assert!(is_openpgp(&[0xC5, 0x01]));
+        assert!(!is_openpgp(b"-----BEGIN PRIVATE KEY-----\nMIIE"));
+        assert!(!is_openpgp(b"-----BEGIN RSA PRIVATE KEY-----\nMIIE"));
+        assert!(!is_openpgp(&[0x30, 0x82, 0x04, 0xBD]));
+        assert!(!is_openpgp(b""));
+    }
+
+    #[test]
+    fn openpgp_key_expiry_flags() {
+        use keyroost_pgpkey::cert::Expiry;
+        match pgp_expiry(&["--set", "5y", "--public", "keys.pub.asc"]).unwrap() {
+            OpenpgpKeyCmd::Expiry {
+                set,
+                public,
+                backup,
+                ..
+            } => {
+                assert_eq!(set, Expiry::Years(5));
+                assert_eq!(public, Path::new("keys.pub.asc"));
+                assert!(backup.is_none());
+            }
+            _ => panic!("expected expiry"),
+        }
+        assert!(pgp_expiry(&[
+            "--set",
+            "never",
+            "--public",
+            "k.pub.asc",
+            "--backup",
+            "k.asc",
+            "--passphrase",
+            "env:KR_PASS"
+        ])
+        .is_ok());
+        assert!(pgp_expiry(&[
+            "--set",
+            "2y",
+            "--public",
+            "k.pub.asc",
+            "--pin",
+            "env:KR_PIN"
+        ])
+        .is_ok());
+        // The card's PIN signs; with a backup the passphrase does.
+        assert!(pgp_expiry(&[
+            "--set",
+            "2y",
+            "--public",
+            "k.pub.asc",
+            "--backup",
+            "k.asc",
+            "--pin",
+            "env:KR_PIN"
+        ])
+        .is_err());
+        assert!(pgp_expiry(&[
+            "--set",
+            "2y",
+            "--public",
+            "k.pub.asc",
+            "--passphrase",
+            "env:KR_PASS"
+        ])
+        .is_err());
+        assert!(pgp_expiry(&["--public", "k.pub.asc"]).is_err());
+        assert!(pgp_expiry(&["--set", "1y"]).is_err());
+        let e = pgp_expiry(&["--set", "4y", "--public", "k.pub.asc"])
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("never, 1y, 2y, 3y, 5y"), "{e}");
     }
 
     #[test]
@@ -21852,6 +22221,7 @@ mod cli_tests {
                 "oath add",
                 "oath import",
                 "oath password set",
+                "openpgp key import",
                 "openpgp pin change",
                 "openpgp pin unblock",
                 "piv pin change",

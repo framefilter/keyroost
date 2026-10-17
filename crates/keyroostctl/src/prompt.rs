@@ -117,6 +117,31 @@ pub(crate) fn confirm(
     }
 }
 
+/// [`confirm`] for a question better said as a whole sentence:
+/// `"{statement} Continue? [y/N] "`. Without a terminal it refuses the
+/// same way, naming `action` and `key`.
+pub(crate) fn confirm_statement(
+    term: &mut dyn Term,
+    yes: bool,
+    statement: &str,
+    action: &str,
+    key: &str,
+) -> Result<bool, String> {
+    if yes {
+        return Ok(false);
+    }
+    if !term.present() {
+        return Err(refusal(action, key));
+    }
+    let answer = term
+        .ask(&format!("{statement} Continue? [y/N] "))
+        .map_err(|e| e.to_string())?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        _ => Err("canceled; nothing was changed".into()),
+    }
+}
+
 /// The stronger check (factory-reset, otp interface): a typed word, read
 /// from the terminal only. `--yes` skips it deliberately. `Ok(true)` means
 /// the question was shown and answered.
@@ -328,6 +353,24 @@ pub(crate) fn confirm_then_read(
     Ok(confirm(&mut RealTerm, yes, action, &key_label(d))?)
 }
 
+/// [`confirm_then_read`] with the question as a sentence about `d`;
+/// `statement` gets the key's label (`"This replaces ... on {key}."`).
+pub(crate) fn confirm_statement_then_read(
+    d: &Device,
+    yes: bool,
+    statement: impl FnOnce(&str) -> String,
+    action: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let key = key_label(d);
+    Ok(confirm_statement(
+        &mut RealTerm,
+        yes,
+        &statement(&key),
+        action,
+        &key,
+    )?)
+}
+
 /// Re-find `d` ([`crate::target::reverify`]) only when the person was kept
 /// waiting: callers pass `asked || sec.prompted()` — the question was shown
 /// ([`confirm_then_read`]) or a secret was typed at the hidden prompt — since
@@ -460,6 +503,25 @@ mod tests {
         assert!(!terminal_present(false, true));
         assert!(!terminal_present(true, false));
         assert!(!terminal_present(false, false));
+    }
+
+    #[test]
+    fn confirm_statement_asks_the_sentence_and_refuses_like_confirm() {
+        let mut t = FakeTerm::new(true, &["y"]);
+        let s = "This replaces all three OpenPGP keys on yk (serial 1).";
+        assert!(
+            confirm_statement(&mut t, false, s, "replace all three OpenPGP keys", "yk").unwrap()
+        );
+        assert_eq!(t.asked, [format!("{s} Continue? [y/N] ")]);
+        let mut t = FakeTerm::new(true, &["n"]);
+        assert!(confirm_statement(&mut t, false, s, "x", "yk").is_err());
+        let mut t = FakeTerm::new(false, &[]);
+        assert_eq!(
+            confirm_statement(&mut t, false, s, "replace all three OpenPGP keys", "yk")
+                .unwrap_err(),
+            "refusing to replace all three OpenPGP keys on yk without confirmation; add --yes"
+        );
+        assert!(!confirm_statement(&mut t, true, s, "x", "yk").unwrap());
     }
 
     #[test]

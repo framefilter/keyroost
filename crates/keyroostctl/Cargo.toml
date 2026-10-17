@@ -33,6 +33,8 @@ keyroost-import = { path = "../keyroost-import", version = "0.13.0", features = 
 # keyroost; owns the workspace's scoped `rsa` dependency exception so the protocol
 # crates stay dependency-free (see that crate's Cargo.toml).
 keyroost-rsakey = { path = "../keyroost-rsakey", version = "0.13.0" }
+# Host-side OpenPGP key sets: create with a backup, restore, change expiry.
+keyroost-pgpkey = { path = "../keyroost-pgpkey", version = "0.13.0", features = ["card"] }
 clap = { version = "4", features = ["derive"] }
 # Same project family as clap; generate shell completions / a man page at
 # runtime (`completions` / `manpage` subcommands) rather than from a build

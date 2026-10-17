@@ -287,6 +287,11 @@ pub(crate) const SECRET_FLAGS: &[SecretFlag] = &[
         default_ok: false,
     },
     SecretFlag {
+        long: "passphrase",
+        what: "the passphrase",
+        default_ok: false,
+    },
+    SecretFlag {
         long: "seed",
         what: "the seed",
         default_ok: false,

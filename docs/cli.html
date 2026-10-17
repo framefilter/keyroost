@@ -270,13 +270,25 @@ keyroostctl piv test --slot 9a               # check the key matches its certifi
     <p>OpenPGP keys sign and encrypt email, files and git commits. keyroost sets up the
       card; everyday use usually happens in tools like GnuPG.</p>
 <pre><code>keyroostctl openpgp info                                   # keys, PIN tries, details
-keyroostctl openpgp key generate --slot sign --algorithm ed25519   # a new signing key
-keyroostctl openpgp key import --slot decrypt --in my-key.pem      # an existing RSA-2048 key
+keyroostctl openpgp key import --generate --backup alice --name "Alice Example"
+                                                           # new keys, saved first, then put on the card
+keyroostctl openpgp key import --in alice.asc              # restore a backup onto a card
+keyroostctl openpgp key expiry --set 2y --public alice.pub.asc     # two more years
+keyroostctl openpgp key generate --slot sign --algorithm ed25519   # a key made on the card (no backup)
+keyroostctl openpgp key import --slot decrypt --in my-key.pem      # an existing RSA key
 keyroostctl openpgp sign --in contract.pdf --out contract.sig      # sign a file
 keyroostctl openpgp url set https://example.com/alice.asc          # where your public key lives</code></pre>
     <p>There are three slots: <code>sign</code>, <code>decrypt</code> and
       <code>auth</code> (for logging in). Making or importing a key needs the admin PIN; using
-      it needs the user PIN. A YubiKey also wants a touch. More in
+      it needs the user PIN. A YubiKey also wants a touch. <code>import --generate</code>
+      makes all three keys on this computer and writes three files before it touches the card:
+      <code>alice.asc</code> (the backup, protected by a passphrase you choose),
+      <code>alice.pub.asc</code> (the public key to share) and <code>alice.rev.asc</code> (a
+      revocation certificate). Keep the backup and the revocation certificate offline. The
+      type is <code>ed25519</code> when the card lists it, <code>rsa3072</code> otherwise
+      (<code>--algorithm</code> picks another); keys expire after three years unless
+      <code>--expires</code> says otherwise. <code>key expiry</code> signs the new date with the
+      card, or with <code>--backup alice.asc</code> on this computer. More in
       <a href="openpgp.html">OpenPGP</a>.</p>
   </section>
 
@@ -500,9 +512,10 @@ keyroostctl fido pin status --json</code></pre>
       <tr><td><code>keyroostctl openpgp pin verify</code></td><td>Check a PIN without changing anything (the user PIN, or the admin PIN with --admin)</td></tr>
       <tr><td><code>keyroostctl openpgp pin change</code></td><td>Change the user PIN, or the admin PIN with --admin</td></tr>
       <tr><td><code>keyroostctl openpgp pin unblock</code></td><td>Set a new user PIN using the admin PIN (after too many wrong user PINs)</td></tr>
-      <tr><td><code>keyroostctl openpgp key</code></td><td>Generate, import or show the card&#x27;s keys, and list the algorithms it supports</td></tr>
+      <tr><td><code>keyroostctl openpgp key</code></td><td>Generate, import or show the card&#x27;s keys, change when they expire, and list the algorithms it supports</td></tr>
       <tr><td><code>keyroostctl openpgp key generate</code></td><td>Generate a fresh key pair in a slot, replacing any key already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
-      <tr><td><code>keyroostctl openpgp key import</code></td><td>Import an RSA-2048 key into a slot, replacing any key already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl openpgp key import</code></td><td>Put a new key set, a backup or an RSA key file onto the card, replacing the keys already there. Irreversible: asks first (<code>--yes</code> to skip)</td></tr>
+      <tr><td><code>keyroostctl openpgp key expiry</code></td><td>Change when a key set expires and update its public key file</td></tr>
       <tr><td><code>keyroostctl openpgp key show</code></td><td>Read the public key from a slot (read-only; no PIN). RSA keys print modulus and exponent, ECC keys the public point, in hex</td></tr>
       <tr><td><code>keyroostctl openpgp key algorithms</code></td><td>List the key algorithms this card reports accepting per slot (read-only; no PIN). Cards that don&#x27;t publish the list accept any attempt and answer with an error if they can&#x27;t</td></tr>
       <tr><td><code>keyroostctl openpgp name</code></td><td>Set the cardholder name stored on the card</td></tr>

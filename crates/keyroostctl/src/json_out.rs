@@ -301,6 +301,27 @@ pub(crate) struct OpenpgpStatusJson {
     pub signature_count: Option<u32>,
 }
 
+/// `openpgp key import` (a new key set, a backup restored, an RSA key file)
+/// and `openpgp key expiry`.
+#[derive(Serialize)]
+pub(crate) struct OpenpgpKeysJson {
+    /// The key type made or imported (`ed25519`, `rsa3072`, ...), when one
+    /// type covers it all; null for a restored backup and an expiry change.
+    pub key_type: Option<&'static str>,
+    /// The slots written ("sign", "decrypt", "auth"), in `fingerprints`
+    /// order; empty for an expiry change.
+    pub slots: Vec<&'static str>,
+    /// Fingerprints, hex: one per slot written, or the main key's for an
+    /// expiry change.
+    pub fingerprints: Vec<String>,
+    /// The files written (backup, public key, revocation certificate), read
+    /// (the `--in` file), or rewritten (expiry change).
+    pub files: Vec<String>,
+    /// The last day the keys work (`YYYY-MM-DD`) or "never"; null when the
+    /// command doesn't set it.
+    pub expires: Option<String>,
+}
+
 /// `keyroostctl otp --json serial`.
 #[derive(Serialize)]
 pub(crate) struct OtpSerialJson {
