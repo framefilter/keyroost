@@ -8,6 +8,7 @@ use std::fmt;
 
 pub mod armor;
 pub mod packet;
+pub mod s2k;
 
 /// Everything this crate can report. The `Display` text is written for end
 /// users, one line each.
