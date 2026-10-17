@@ -1197,7 +1197,9 @@ pub fn put_algorithm_attributes(crt: KeyCrt, attr: &[u8]) -> Vec<u8> {
 /// declare the *standard* format simply ignore the CRT components (and the
 /// modulus). The mapping to the OpenPGP `7F48` tags is: `91`=e, `92`=p, `93`=q,
 /// `94`=u, `95`=dp, `96`=dq, `97`=n (OpenPGP Card spec v3.4, §4.4.3.12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` shows the public exponent and the modulus length only.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RsaPrivateKeyParts<'a> {
     /// Public exponent `e`, big-endian (commonly `01 00 01`).
     pub e: &'a [u8],
@@ -1739,12 +1741,32 @@ pub fn import_rsa_key_chained(
 /// for the 25519 curves); send it only when the slot's algorithm
 /// attributes end in `0xFF` ("import with public key", OpenPGP Card spec
 /// v3.4 §4.4.3.10), since other cards reject an unexpected `99`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Debug` shows the lengths only.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EccPrivateKeyParts<'a> {
     /// The private scalar (or Ed25519 seed), big-endian.
     pub scalar: &'a [u8],
     /// The public point, sent as tag `99` when present.
     pub public: Option<&'a [u8]>,
+}
+
+impl core::fmt::Debug for RsaPrivateKeyParts<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RsaPrivateKeyParts")
+            .field("e", &self.e)
+            .field("n_len", &self.n.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for EccPrivateKeyParts<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EccPrivateKeyParts")
+            .field("scalar_len", &self.scalar.len())
+            .field("public_len", &self.public.map(<[u8]>::len))
+            .finish()
+    }
 }
 
 /// The private scalar is wider than the curve's field, so it is not a key
@@ -2313,6 +2335,34 @@ pub fn parse_generated_public_key(buf: &[u8]) -> Result<PublicKey, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_key_parts_debug_shows_no_key_bytes() {
+        let k = [0xA7u8; 32];
+        let ecc = format!(
+            "{:?}",
+            EccPrivateKeyParts {
+                scalar: &k,
+                public: Some(&k),
+            }
+        );
+        assert_eq!(ecc, "EccPrivateKeyParts { scalar_len: 32, public_len: Some(32) }");
+        let e = [1u8, 0, 1];
+        let rsa = format!(
+            "{:?}",
+            RsaPrivateKeyParts {
+                e: &e,
+                p: &k,
+                q: &k,
+                u: &k,
+                dp: &k,
+                dq: &k,
+                n: &k,
+            }
+        );
+        assert!(!rsa.contains("167"), "{rsa}");
+        assert!(rsa.contains("n_len: 32"), "{rsa}");
+    }
 
     #[test]
     fn rsa_exponent_fits_bounds() {
