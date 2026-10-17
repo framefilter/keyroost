@@ -2157,7 +2157,7 @@ enum ImportSource {
 }
 
 /// Which key slot a GUI generate targets. Mirrors the CLI's slot choice.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenPgpSlotSel {
     #[default]
     Sign,
@@ -10099,6 +10099,150 @@ fn shrink_label(ui: &mut egui::Ui, text: egui::RichText, reserve: f32) -> egui::
     .inner
 }
 
+/// How long a sub-tab switch animates: the accent bar sliding to the new tab
+/// and the panel under the strip fading in.
+const SUB_TAB_ANIM_SECS: f32 = 0.18;
+
+/// A strip of sub-tabs (FIDO2 views, OpenPGP keys, PIV slots). The active tab
+/// is drawn as a raised tab in the card color with an accent bar along its
+/// top that slides to a newly clicked tab, and the others light up under the
+/// pointer, so a click visibly lands even when the panels below look alike.
+/// Tabs wrap to a second row when the pane is narrow. `trailing` adds
+/// anything that sits after the last tab (a help dot). Returns the tab
+/// clicked this frame.
+fn sub_tab_strip<T: Copy>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    id_salt: &str,
+    tabs: &[(T, String)],
+    is_active: impl Fn(T) -> bool,
+    trailing: impl FnOnce(&mut egui::Ui),
+) -> Option<T> {
+    let id = ui.id().with(id_salt);
+    let font = theme::f_sb(13.5);
+    let pad = egui::vec2(12.0, 7.0);
+    let strip_bg = ui.painter().add(egui::Shape::Noop);
+    let mut clicked = None;
+    let mut active_rect: Option<egui::Rect> = None;
+    let row = ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 8.0);
+        for (value, label) in tabs {
+            let active = is_active(*value);
+            let galley = ui.painter().layout_no_wrap(
+                label.clone(),
+                font.clone(),
+                egui::Color32::PLACEHOLDER,
+            );
+            let size = galley.size() + 2.0 * pad;
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let hovered = resp.hovered() && !active;
+            let top = egui::CornerRadius {
+                nw: 8,
+                ne: 8,
+                sw: 0,
+                se: 0,
+            };
+            if active {
+                ui.painter().rect(
+                    rect,
+                    top,
+                    p.panel,
+                    egui::Stroke::new(1.0, p.line),
+                    egui::StrokeKind::Inside,
+                );
+                active_rect = Some(rect);
+            } else if hovered {
+                ui.painter().rect_filled(rect, top, p.raised2);
+            }
+            let color = if active {
+                p.txt
+            } else if hovered {
+                p.txt2
+            } else {
+                p.txt3
+            };
+            ui.painter().galley(rect.min + pad, galley, color);
+            if resp.clicked() {
+                clicked = Some(*value);
+            }
+        }
+        trailing(ui);
+    });
+    let strip = row.response.rect;
+    let left = ui.max_rect().left();
+    let right = ui.max_rect().right();
+    ui.painter().set(
+        strip_bg,
+        egui::Shape::rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(left, strip.top()),
+                egui::pos2(right, strip.bottom()),
+            ),
+            0.0,
+            p.surface,
+        ),
+    );
+    // Baseline under the strip, open under the active tab so the tab reads
+    // as joined to the panel beneath it.
+    let base_y = strip.bottom() - 0.5;
+    let line = egui::Stroke::new(1.0, p.line);
+    match active_rect.filter(|r| (r.bottom() - strip.bottom()).abs() < 1.0) {
+        Some(r) => {
+            ui.painter().hline(left..=r.left(), base_y, line);
+            ui.painter().hline(r.right()..=right, base_y, line);
+        }
+        None => {
+            ui.painter().hline(left..=right, base_y, line);
+        }
+    }
+    // Accent bar along the active tab's top, sliding between tabs.
+    if let Some(r) = active_rect {
+        let ctx = ui.ctx();
+        let x0 = ctx.animate_value_with_time(id.with("x0"), r.left() + 6.0, SUB_TAB_ANIM_SECS);
+        let x1 = ctx.animate_value_with_time(id.with("x1"), r.right() - 6.0, SUB_TAB_ANIM_SECS);
+        let y = ctx.animate_value_with_time(id.with("y"), r.top() + 1.5, SUB_TAB_ANIM_SECS);
+        ui.painter()
+            .hline(x0..=x1, y, egui::Stroke::new(2.5, p.accent));
+    }
+    clicked
+}
+
+/// Fade what follows in for a moment whenever `key` (the open tab) changes,
+/// so switching tabs reads as the app responding even when the new panel
+/// looks like the old one. Nothing fades on a pane's first paint. Returns
+/// the opacity to restore with `ui.set_opacity` where the tab's panel ends.
+fn fade_in_on_switch(ui: &mut egui::Ui, id_salt: &str, key: impl std::fmt::Debug) -> f32 {
+    let prev = ui.opacity();
+    let id = ui.id().with(id_salt).with("fade");
+    let key = egui::Id::new(format!("{key:?}"));
+    let now = ui.input(|i| i.time);
+    let start = ui.data_mut(|d| {
+        let seen = d.get_temp::<(egui::Id, f64)>(id);
+        match seen {
+            Some((k, t)) if k == key => t,
+            Some(_) => {
+                d.insert_temp(id, (key, now));
+                now
+            }
+            None => {
+                // First paint: start already finished.
+                let done = now - f64::from(SUB_TAB_ANIM_SECS);
+                d.insert_temp(id, (key, done));
+                done
+            }
+        }
+    });
+    let t = ((now - start) as f32 / SUB_TAB_ANIM_SECS).clamp(0.0, 1.0);
+    if t < 1.0 {
+        ui.ctx().request_repaint();
+        // Ease out, from a third visible so the panel never blinks away.
+        let eased = 1.0 - (1.0 - t) * (1.0 - t);
+        ui.multiply_opacity(0.35 + 0.65 * eased);
+    }
+    prev
+}
+
 /// A title row (in `p.txt`) that can never draw its parts over each other: `right` is laid
 /// out first against the right edge, and the title (plus an optional help
 /// dot, which stays next to it) gets what is left, ending in "…" when that
@@ -15493,8 +15637,7 @@ impl App {
         }
 
         // Once unlocked, the sub-view tabs sit at the top of the content, each
-        // owning its own panel below. Styled like the main capability tabs:
-        // bold label with an accent underline on the active one.
+        // owning its own panel below (see `sub_tab_strip`).
         if unlocked {
             let mut tabs: Vec<(FidoSubview, &str)> = Vec::new();
             // Passkey management is its own capability (credMgmt, or the
@@ -15517,55 +15660,19 @@ impl App {
             // to a tab this key actually has before painting the strip.
             self.security_keys.subview = snap_subview(self.security_keys.subview, &tabs);
             ui.add_space(14.0);
-            let mut next: Option<FidoSubview> = None;
-            // Paint an opaque surface strip here first (full content width,
-            // fixed height covering the label row + its underline) so the row has
-            // a clean backing - drawn before the labels, so it sits under them.
+            let tabs: Vec<(FidoSubview, String)> =
+                tabs.iter().map(|(v, l)| (*v, (*l).to_string())).collect();
+            let current = self.security_keys.subview;
+            if let Some(v) =
+                sub_tab_strip(ui, p, "fido-subview-tabs", &tabs, |v| v == current, |_| {})
             {
-                let top = ui.cursor().top();
-                let strip = egui::Rect::from_min_max(
-                    egui::pos2(ui.max_rect().left(), top - 4.0),
-                    egui::pos2(ui.max_rect().right(), top + 30.0),
-                );
-                ui.painter().rect_filled(strip, 0.0, p.surface);
-            }
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 20.0;
-                for (view, label) in &tabs {
-                    let active = self.security_keys.subview == *view;
-                    let color = if active { p.txt } else { p.txt3 };
-                    let resp = ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(*label)
-                                    .font(theme::f_sb(13.5))
-                                    .color(color),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if active {
-                        let y = resp.rect.bottom() + 6.0;
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(resp.rect.left(), y),
-                                egui::pos2(resp.rect.right(), y),
-                            ],
-                            egui::Stroke::new(2.0, p.accent),
-                        );
-                    }
-                    if resp.clicked() {
-                        next = Some(*view);
-                    }
-                }
-            });
-            if let Some(v) = next {
                 self.security_keys.subview = v;
             }
         } else {
             self.security_keys.subview = FidoSubview::Passkeys;
         }
         let subview = self.security_keys.subview;
+        let restore_opacity = fade_in_on_switch(ui, "fido-subview-tabs", subview);
 
         // --- Passkeys panel: only when unlocked and the Passkeys tab is active. ---
         if unlocked && subview == FidoSubview::Passkeys {
@@ -15942,6 +16049,7 @@ impl App {
         if subview == FidoSubview::LargeBlobs {
             self.render_large_blobs(ui, p);
         }
+        ui.set_opacity(restore_opacity);
     }
 
     /// The destructive "Reset this key" card (red stroke; arms the
@@ -19398,62 +19506,40 @@ impl App {
                     )
                 }
             }
-            None => "read status to view this key".to_string(),
+            None => "Read status to see this key.".to_string(),
         };
 
         // --- Key sub-tab strip ----------------------------------------------
-        // Signature / Decryption / Authentication, each a tab exactly like the
-        // FIDO2 sub-tab strip: an opaque surface strip behind a row of bold
-        // labels, the active one underlined with a 2px accent. Clicking a tab
-        // selects that key; the Generate / Import cards below target it.
+        // Signature / Decryption / Authentication, one tab per key (the same
+        // strip as FIDO2 and PIV). Clicking a tab selects that key; the
+        // Generate / Import card below targets it.
         ui.add_space(14.0);
+        let key_tabs: Vec<(OpenPgpSlotSel, String)> = [
+            OpenPgpSlotSel::Sign,
+            OpenPgpSlotSel::Decrypt,
+            OpenPgpSlotSel::Auth,
+        ]
+        .into_iter()
+        .map(|k| (k, k.tab_label().to_string()))
+        .collect();
+        if let Some(key) =
+            sub_tab_strip(ui, p, "pgp-key-tabs", &key_tabs, |k| k == selected, |_| {})
         {
-            let top = ui.cursor().top();
-            let strip = egui::Rect::from_min_max(
-                egui::pos2(ui.max_rect().left(), top - 4.0),
-                egui::pos2(ui.max_rect().right(), top + 30.0),
-            );
-            ui.painter().rect_filled(strip, 0.0, p.surface);
+            clicked_key = Some(key);
         }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 20.0;
-            for key in [
-                OpenPgpSlotSel::Sign,
-                OpenPgpSlotSel::Decrypt,
-                OpenPgpSlotSel::Auth,
-            ] {
-                let active = selected == key;
-                let color = if active { p.txt } else { p.txt3 };
-                let resp = ui
-                    .add(
-                        egui::Label::new(
-                            egui::RichText::new(key.tab_label())
-                                .font(theme::f_sb(13.5))
-                                .color(color),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if active {
-                    let y = resp.rect.bottom() + 6.0;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(resp.rect.left(), y),
-                            egui::pos2(resp.rect.right(), y),
-                        ],
-                        egui::Stroke::new(2.0, p.accent),
-                    );
-                }
-                if resp.clicked() {
-                    clicked_key = Some(key);
-                }
-            }
-        });
+        let restore_opacity = fade_in_on_switch(ui, "pgp-key-tabs", selected);
 
         // --- Selected key content (single column under the strip) -----------
+        // Named after the open key, so the panel says which key it acts on.
         ui.add_space(14.0);
         ui.label(
-            egui::RichText::new(format!("State: {sel_state}"))
+            egui::RichText::new(format!("{} key", selected.tab_label()))
+                .font(theme::f_sb(14.5))
+                .color(p.txt),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(sel_state)
                 .font(theme::f_reg(12.5))
                 .color(p.txt2),
         );
@@ -19517,18 +19603,26 @@ impl App {
             );
             let have_path = !self.openpgp.import_path.trim().is_empty();
             ui.add_space(6.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked()
-                    && have_path
-                {
-                    open_modal = Some(OpenPgpCredKind::ImportKeyFile);
-                }
-                ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Generate & import\u{2026}").clicked() {
-                    open_modal = Some(OpenPgpCredKind::GenerateImportKey);
-                }
-            });
+            // A bare right-to-left layout would take every point of height
+            // left in the card; give the button row just one line.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 32.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked()
+                        && have_path
+                    {
+                        open_modal = Some(OpenPgpCredKind::ImportKeyFile);
+                    }
+                    ui.add_space(6.0);
+                    if theme::button(ui, p, BtnKind::Default, "Generate & import\u{2026}").clicked()
+                    {
+                        open_modal = Some(OpenPgpCredKind::GenerateImportKey);
+                    }
+                },
+            );
         });
+        ui.set_opacity(restore_opacity);
         ui.add_space(12.0);
 
         // Reset applet — its own destructive card with a red stroke at the
@@ -20330,91 +20424,50 @@ impl App {
         let no_import_cert_hint = "This slot has no key for a certificate to match \u{2014} \
              generate or move one into this slot first.";
         // --- Slot sub-tab strip ---------------------------------------------
-        // Each PIV slot is a tab, exactly like the FIDO2 sub-tab strip
-        // (Passkeys / Settings / Storage): an opaque surface strip behind a row
-        // of bold labels, the active one underlined with a 2px accent. Clicking
-        // a tab selects that slot; every action card below targets it.
+        // Each PIV slot is a tab (the same strip as FIDO2 and OpenPGP).
+        // Clicking a tab selects that slot; every action card below targets
+        // it. The twenty retired slots are a peer of the four standard ones,
+        // so they get a tab of their own rather than a section wedged between
+        // this strip and the cards it heads; their own pane then has room to
+        // list all twenty.
         ui.add_space(14.0);
-        // Opaque surface behind the tab labels. The strip wraps to more than one
-        // line when the window is too narrow to hold every tab on one row — the
-        // slot cards below would otherwise be pinned to the unwrapped width of
-        // this row and spill past the pane's right edge. Because the wrapped
-        // height isn't known until the row is laid out, reserve a paint slot
-        // here and fill it from the row's real rect afterwards.
-        let strip_bg = ui.painter().add(egui::Shape::Noop);
-        let strip_resp = ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 20.0;
-            // Rows are far enough apart that a wrapped second row clears the
-            // accent underline (drawn 6px below the row above) with margin.
-            ui.spacing_mut().item_spacing.y = 22.0;
-            let tab = |ui: &mut egui::Ui, label: String, active: bool| -> bool {
-                let color = if active { p.txt } else { p.txt3 };
-                let resp = ui
-                    .add(
-                        egui::Label::new(
-                            egui::RichText::new(label)
-                                .font(theme::f_sb(13.5))
-                                .color(color),
-                        )
-                        // Each tab is one atom: it moves to the next row whole
-                        // rather than letting its own text break across two.
-                        .wrap_mode(egui::TextWrapMode::Extend)
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if active {
-                    let y = resp.rect.bottom() + 6.0;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(resp.rect.left(), y),
-                            egui::pos2(resp.rect.right(), y),
-                        ],
-                        egui::Stroke::new(2.0, p.accent),
-                    );
-                }
-                resp.clicked()
-            };
-            for slot in [
-                PivSlotSel::Auth,
-                PivSlotSel::Sign,
-                PivSlotSel::KeyMgmt,
-                PivSlotSel::CardAuth,
-            ] {
-                if tab(ui, slot.label(), selected == slot) {
-                    clicked_slot = Some(slot);
-                }
-            }
-            // The twenty retired slots are a peer of the four standard ones, so
-            // they get a tab of their own rather than a section wedged between
-            // this strip and the cards it heads. Their own pane then has room to
-            // list all twenty — a wrapped row of chips here would have swamped
-            // the strip the moment more than a couple held keys.
-            let retired_active = matches!(selected, PivSlotSel::Retired(_));
-            if tab(
-                ui,
-                "retired keys (82\u{2013}95)".to_string(),
-                retired_active,
-            ) {
-                click_retired_tab = true;
-            }
+        let retired_active = matches!(selected, PivSlotSel::Retired(_));
+        let mut slot_tabs: Vec<(Option<PivSlotSel>, String)> = [
+            PivSlotSel::Auth,
+            PivSlotSel::Sign,
+            PivSlotSel::KeyMgmt,
+            PivSlotSel::CardAuth,
+        ]
+        .into_iter()
+        .map(|s| (Some(s), s.label()))
+        .collect();
+        // `None` is the retired-keys tab.
+        slot_tabs.push((None, "retired keys (82\u{2013}95)".to_string()));
+        let tab_click = sub_tab_strip(
+            ui,
+            p,
+            "piv-slot-tabs",
+            &slot_tabs,
+            |t| match t {
+                Some(s) => s == selected,
+                None => retired_active,
+            },
             // Anchored to the tab rather than a line of prose above the list:
-            // the list's own dots already say what is occupied, so a sentence
-            // there was only restating them. Shown while the tab is active so
-            // the strip stays clean the rest of the time.
-            if retired_active {
-                ui.add_space(2.0);
-                self.help_dot(ui, p, "piv-retired");
-            }
-        });
-        {
-            let row = strip_resp.response.rect;
-            let strip = egui::Rect::from_min_max(
-                egui::pos2(ui.max_rect().left(), row.top() - 4.0),
-                egui::pos2(ui.max_rect().right(), row.bottom() + 6.0),
-            );
-            ui.painter()
-                .set(strip_bg, egui::Shape::rect_filled(strip, 0.0, p.surface));
+            // the list's own dots already say what is occupied. Shown while
+            // the tab is active so the strip stays clean the rest of the time.
+            |ui| {
+                if retired_active {
+                    ui.add_space(2.0);
+                    self.help_dot(ui, p, "piv-retired");
+                }
+            },
+        );
+        match tab_click {
+            Some(Some(slot)) => clicked_slot = Some(slot),
+            Some(None) => click_retired_tab = true,
+            None => {}
         }
+        let restore_opacity = fade_in_on_switch(ui, "piv-slot-tabs", selected);
         // --- Retired-slot rail (only on the retired tab) --------------------
         // All twenty slots, listed the way the Molto2 view lists its profiles:
         // one row each, a filled dot on the right for the ones holding a key,
@@ -20500,9 +20553,23 @@ impl App {
         // --- Selected slot content (single column under the strip) ----------
         // State line for the active slot, then the styled full-width action
         // cards (unchanged from the old detail column) in single-column flow.
+        // Named after the open slot, so the panel says which slot it acts on.
         ui.add_space(14.0);
+        let slot_title = {
+            let label = selected.label();
+            let mut c = label.chars();
+            c.next().map_or(String::new(), |f| {
+                format!("{}{} slot", f.to_uppercase(), c.as_str())
+            })
+        };
         ui.label(
-            egui::RichText::new(format!("State: {sel_state}"))
+            egui::RichText::new(slot_title)
+                .font(theme::f_sb(14.5))
+                .color(p.txt),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(sel_state)
                 .font(theme::f_reg(12.5))
                 .color(p.txt2),
         );
@@ -21134,6 +21201,7 @@ impl App {
                     },
                 );
             });
+            ui.set_opacity(restore_opacity);
             ui.add_space(12.0);
 
             // Reset applet — its own destructive card with a red stroke at the
