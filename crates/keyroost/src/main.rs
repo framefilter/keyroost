@@ -10103,29 +10103,51 @@ fn shrink_label(ui: &mut egui::Ui, text: egui::RichText, reserve: f32) -> egui::
 /// and the panel under the strip fading in.
 const SUB_TAB_ANIM_SECS: f32 = 0.18;
 
-/// A strip of sub-tabs (FIDO2 views, OpenPGP keys, PIV slots). The active tab
-/// is drawn as a raised tab in the card color with an accent bar along its
-/// top that slides to a newly clicked tab, and the others light up under the
-/// pointer, so a click visibly lands even when the panels below look alike.
-/// Tabs wrap to a second row when the pane is narrow. `trailing` adds
-/// anything that sits after the last tab (a help dot). Returns the tab
-/// clicked this frame.
+/// Where a joined tab strip starts, so the tabs clear the rounded corner of
+/// the card they sit on.
+const SUB_TAB_INSET: f32 = 14.0;
+
+/// What a [`sub_tab_strip`] reports back.
+struct SubTabs<T> {
+    /// The tab clicked this frame.
+    clicked: Option<T>,
+    /// The open tab, when it sits on the strip's bottom row and so can join
+    /// the card below it (see [`join_open_tab`]).
+    joinable: Option<egui::Rect>,
+}
+
+/// A strip of sub-tabs (FIDO2 views, OpenPGP keys, PIV slots). The open tab
+/// is drawn in the card color with an accent bar along its top that slides
+/// to a newly clicked tab, and the others light up under the pointer, so a
+/// click visibly lands even when the panels below look alike. Tabs wrap to a
+/// second row when the pane is narrow; `trailing` adds anything that sits
+/// after the last tab (a help dot).
+///
+/// `joined` is for a tab whose content is one card: the strip sits directly
+/// on that card (the caller starts the card with no gap and then calls
+/// [`join_open_tab`]), so the open tab and its card read as one index card
+/// and the tab is the card's title. Otherwise a baseline runs under the
+/// strip, open under the active tab.
 fn sub_tab_strip<T: Copy>(
     ui: &mut egui::Ui,
     p: &Palette,
     id_salt: &str,
     tabs: &[(T, String)],
     is_active: impl Fn(T) -> bool,
+    joined: bool,
     trailing: impl FnOnce(&mut egui::Ui),
-) -> Option<T> {
+) -> SubTabs<T> {
     let id = ui.id().with(id_salt);
     let font = theme::f_sb(13.5);
     let pad = egui::vec2(12.0, 7.0);
-    let strip_bg = ui.painter().add(egui::Shape::Noop);
+    let line = egui::Stroke::new(1.0, p.line);
     let mut clicked = None;
     let mut active_rect: Option<egui::Rect> = None;
     let row = ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 8.0);
+        if joined {
+            ui.add_space(SUB_TAB_INSET - 4.0);
+        }
         for (value, label) in tabs {
             let active = is_active(*value);
             let galley = ui.painter().layout_no_wrap(
@@ -10144,13 +10166,8 @@ fn sub_tab_strip<T: Copy>(
                 se: 0,
             };
             if active {
-                ui.painter().rect(
-                    rect,
-                    top,
-                    p.panel,
-                    egui::Stroke::new(1.0, p.line),
-                    egui::StrokeKind::Inside,
-                );
+                ui.painter()
+                    .rect(rect, top, p.panel, line, egui::StrokeKind::Inside);
                 active_rect = Some(rect);
             } else if hovered {
                 ui.painter().rect_filled(rect, top, p.raised2);
@@ -10170,42 +10187,59 @@ fn sub_tab_strip<T: Copy>(
         trailing(ui);
     });
     let strip = row.response.rect;
-    let left = ui.max_rect().left();
-    let right = ui.max_rect().right();
-    ui.painter().set(
-        strip_bg,
-        egui::Shape::rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(left, strip.top()),
-                egui::pos2(right, strip.bottom()),
-            ),
-            0.0,
-            p.surface,
-        ),
-    );
-    // Baseline under the strip, open under the active tab so the tab reads
-    // as joined to the panel beneath it.
-    let base_y = strip.bottom() - 0.5;
-    let line = egui::Stroke::new(1.0, p.line);
-    match active_rect.filter(|r| (r.bottom() - strip.bottom()).abs() < 1.0) {
-        Some(r) => {
-            ui.painter().hline(left..=r.left(), base_y, line);
-            ui.painter().hline(r.right()..=right, base_y, line);
-        }
-        None => {
-            ui.painter().hline(left..=right, base_y, line);
+    let joinable = active_rect.filter(|r| (r.bottom() - strip.bottom()).abs() < 1.0);
+    if !joined {
+        // Baseline under the strip, open under the active tab.
+        let (left, right) = (ui.max_rect().left(), ui.max_rect().right());
+        let base_y = strip.bottom() - 0.5;
+        match joinable {
+            Some(r) => {
+                ui.painter().hline(left..=r.left(), base_y, line);
+                ui.painter().hline(r.right()..=right, base_y, line);
+            }
+            None => {
+                ui.painter().hline(left..=right, base_y, line);
+            }
         }
     }
-    // Accent bar along the active tab's top, sliding between tabs.
+    // Accent bar along the open tab's top, sliding between tabs. Animated in
+    // the strip's own coordinates, so scrolling the pane moves it with the
+    // tabs instead of making it chase them.
     if let Some(r) = active_rect {
         let ctx = ui.ctx();
-        let x0 = ctx.animate_value_with_time(id.with("x0"), r.left() + 6.0, SUB_TAB_ANIM_SECS);
-        let x1 = ctx.animate_value_with_time(id.with("x1"), r.right() - 6.0, SUB_TAB_ANIM_SECS);
-        let y = ctx.animate_value_with_time(id.with("y"), r.top() + 1.5, SUB_TAB_ANIM_SECS);
-        ui.painter()
-            .hline(x0..=x1, y, egui::Stroke::new(2.5, p.accent));
+        let o = strip.min;
+        let x0 =
+            ctx.animate_value_with_time(id.with("x0"), r.left() + 6.0 - o.x, SUB_TAB_ANIM_SECS);
+        let x1 =
+            ctx.animate_value_with_time(id.with("x1"), r.right() - 6.0 - o.x, SUB_TAB_ANIM_SECS);
+        let y = ctx.animate_value_with_time(id.with("y"), r.top() + 1.5 - o.y, SUB_TAB_ANIM_SECS);
+        ui.painter().hline(
+            o.x + x0..=o.x + x1,
+            o.y + y,
+            egui::Stroke::new(2.5, p.accent),
+        );
     }
-    clicked
+    if joined {
+        // The card starts right under the strip.
+        ui.add_space(-ui.spacing().item_spacing.y);
+    }
+    SubTabs { clicked, joinable }
+}
+
+/// Open the card's top edge under the open tab of a joined strip, so the
+/// tab and the card it heads read as one index card. Call right after the
+/// card is drawn (it paints over the card's border).
+fn join_open_tab(ui: &egui::Ui, p: &Palette, tab: Option<egui::Rect>) {
+    if let Some(r) = tab {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(r.left() + 1.0, r.bottom() - 1.0),
+                egui::pos2(r.right() - 1.0, r.bottom() + 1.5),
+            ),
+            0.0,
+            p.panel,
+        );
+    }
 }
 
 /// Fade what follows in for a moment whenever `key` (the open tab) changes,
@@ -15663,8 +15697,16 @@ impl App {
             let tabs: Vec<(FidoSubview, String)> =
                 tabs.iter().map(|(v, l)| (*v, (*l).to_string())).collect();
             let current = self.security_keys.subview;
-            if let Some(v) =
-                sub_tab_strip(ui, p, "fido-subview-tabs", &tabs, |v| v == current, |_| {})
+            if let Some(v) = sub_tab_strip(
+                ui,
+                p,
+                "fido-subview-tabs",
+                &tabs,
+                |v| v == current,
+                false,
+                |_| {},
+            )
+            .clicked
             {
                 self.security_keys.subview = v;
             }
@@ -19522,30 +19564,31 @@ impl App {
         .into_iter()
         .map(|k| (k, k.tab_label().to_string()))
         .collect();
-        if let Some(key) =
-            sub_tab_strip(ui, p, "pgp-key-tabs", &key_tabs, |k| k == selected, |_| {})
-        {
+        // The strip sits on the key's card, so the open tab is that card's
+        // title.
+        let strip = sub_tab_strip(
+            ui,
+            p,
+            "pgp-key-tabs",
+            &key_tabs,
+            |k| k == selected,
+            true,
+            |_| {},
+        );
+        if let Some(key) = strip.clicked {
             clicked_key = Some(key);
         }
         let restore_opacity = fade_in_on_switch(ui, "pgp-key-tabs", selected);
 
-        // --- Selected key content (single column under the strip) -----------
-        // Named after the open key, so the panel says which key it acts on.
-        ui.add_space(14.0);
-        ui.label(
-            egui::RichText::new(format!("{} key", selected.tab_label()))
-                .font(theme::f_sb(14.5))
-                .color(p.txt),
-        );
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(sel_state)
-                .font(theme::f_reg(12.5))
-                .color(p.txt2),
-        );
-        ui.add_space(10.0);
+        // --- Selected key content: the card under the strip -----------------
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(format!("State: {sel_state}"))
+                    .font(theme::f_reg(12.5))
+                    .color(p.txt2),
+            );
+            ui.add_space(12.0);
 
             // Generate on-card: label + help left, Generate pinned right.
             self.adaptive_row(
@@ -19622,6 +19665,7 @@ impl App {
                 },
             );
         });
+        join_open_tab(ui, p, strip.joinable);
         ui.set_opacity(restore_opacity);
         ui.add_space(12.0);
 
@@ -20443,7 +20487,9 @@ impl App {
         .collect();
         // `None` is the retired-keys tab.
         slot_tabs.push((None, "retired keys (82\u{2013}95)".to_string()));
-        let tab_click = sub_tab_strip(
+        // The strip sits on the slot's card, so the open tab is that card's
+        // title.
+        let strip = sub_tab_strip(
             ui,
             p,
             "piv-slot-tabs",
@@ -20452,6 +20498,7 @@ impl App {
                 Some(s) => s == selected,
                 None => retired_active,
             },
+            true,
             // Anchored to the tab rather than a line of prose above the list:
             // the list's own dots already say what is occupied. Shown while
             // the tab is active so the strip stays clean the rest of the time.
@@ -20462,12 +20509,16 @@ impl App {
                 }
             },
         );
-        match tab_click {
+        match strip.clicked {
             Some(Some(slot)) => clicked_slot = Some(slot),
             Some(None) => click_retired_tab = true,
             None => {}
         }
         let restore_opacity = fade_in_on_switch(ui, "piv-slot-tabs", selected);
+        // --- The open slot's card: the retired-slot rail (on the retired
+        // tab), the slot's state, then its actions.
+        theme::card_frame(p).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
         // --- Retired-slot rail (only on the retired tab) --------------------
         // All twenty slots, listed the way the Molto2 view lists its profiles:
         // one row each, a filled dot on the right for the ones holding a key,
@@ -20476,7 +20527,6 @@ impl App {
         // the card about each of the twenty in turn, which is not worth doing
         // on every status refresh.
         if matches!(selected, PivSlotSel::Retired(_)) {
-            ui.add_space(14.0);
             match self.piv.retired_occupancy.clone() {
                 Some(occ) => {
                     // Show as many rows as the pane can spare before the action
@@ -20549,41 +20599,22 @@ impl App {
                 }
                 None => note(ui, "Reading retired slots\u{2026}"),
             }
+            ui.add_space(14.0);
         }
-        // --- Selected slot content (single column under the strip) ----------
-        // State line for the active slot, then the styled full-width action
-        // cards (unchanged from the old detail column) in single-column flow.
-        // Named after the open slot, so the panel says which slot it acts on.
-        ui.add_space(14.0);
-        let slot_title = {
-            let label = selected.label();
-            let mut c = label.chars();
-            c.next().map_or(String::new(), |f| {
-                format!("{}{} slot", f.to_uppercase(), c.as_str())
-            })
-        };
         ui.label(
-            egui::RichText::new(slot_title)
-                .font(theme::f_sb(14.5))
-                .color(p.txt),
-        );
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(sel_state)
+            egui::RichText::new(format!("State: {sel_state}"))
                 .font(theme::f_reg(12.5))
                 .color(p.txt2),
         );
-        ui.add_space(10.0);
-        // Same `add_enabled_ui` inheritance trick as the status card above —
-        // one wrap covers the per-slot action card and the "Reset applet"
-        // card below it, dimming Generate/Certificate/Delete/Move/Test and
-        // Reset together for any in-flight PIV job (`self.piv.inflight`).
-        // The slot tab strip and retired-slot rail above this point stay
-        // outside any wrap, so selecting a different slot (or a different
-        // retired key) still works while a job is in flight.
+        ui.add_space(12.0);
+        // Same `add_enabled_ui` inheritance trick as the status card above:
+        // this wrap and the one around the "Reset applet" card below dim
+        // Generate/Certificate/Delete/Move/Test and Reset together for any
+        // in-flight PIV job (`self.piv.inflight`). The slot tab strip and
+        // retired-slot rail stay outside them, so selecting a different slot
+        // (or a different retired key) still works while a job is in flight.
         ui.add_enabled_ui(!self.piv.inflight, |ui| {
-            theme::card_frame(p).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
+            {
 
                 // --- Generate key: bold label + help left, algorithm combo
                 // and primary button pinned right (FIDO2 setting-row shape).
@@ -21200,7 +21231,11 @@ impl App {
                         }
                     },
                 );
-            });
+            }
+        });
+        });
+        join_open_tab(ui, p, strip.joinable);
+        ui.add_enabled_ui(!self.piv.inflight, |ui| {
             ui.set_opacity(restore_opacity);
             ui.add_space(12.0);
 
