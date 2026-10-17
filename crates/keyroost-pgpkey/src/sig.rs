@@ -6,6 +6,8 @@ use keyroost_openpgp::Curve;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::keys::{KeyPart, Material};
+use crate::packet::Reader;
+use crate::read::PublicPart;
 use crate::s2k::Hash;
 use crate::Error;
 
@@ -118,14 +120,33 @@ fn ecdsa_sign(curve: Curve, d: &[u8], digest: &[u8]) -> Result<Vec<Vec<u8>>> {
 #[must_use]
 pub fn hash_for(primary: &KeyPart) -> Hash {
     match primary.material {
-        Material::Ecdsa {
-            curve: Curve::NistP384,
-            ..
-        } => Hash::Sha384,
-        Material::Ecdsa {
-            curve: Curve::NistP521,
-            ..
-        } => Hash::Sha512,
+        Material::Ecdsa { curve, .. } => hash_for_curve(curve),
+        _ => Hash::Sha256,
+    }
+}
+
+/// [`hash_for`] for a primary key known only by its public part, as when
+/// re-signing a public certificate with a card.
+#[must_use]
+pub fn hash_for_public(primary: &PublicPart) -> Hash {
+    // v4 key body: version, created (4), algo, then for ECDSA the OID length
+    // and the OID.
+    const ALGO_ECDSA: u8 = 19;
+    let b = &primary.body;
+    if primary.algo != ALGO_ECDSA {
+        return Hash::Sha256;
+    }
+    let curve = b
+        .get(6)
+        .and_then(|&n| b.get(7..7 + usize::from(n)))
+        .and_then(Curve::from_oid);
+    curve.map_or(Hash::Sha256, hash_for_curve)
+}
+
+fn hash_for_curve(curve: Curve) -> Hash {
+    match curve {
+        Curve::NistP384 => Hash::Sha384,
+        Curve::NistP521 => Hash::Sha512,
         _ => Hash::Sha256,
     }
 }
@@ -245,11 +266,52 @@ impl Subpackets {
         self.push(29, &d)
     }
 
+    /// One subpacket copied as it is: `typ` keeps its critical bit.
+    #[must_use]
+    pub(crate) fn raw(self, typ: u8, data: &[u8]) -> Self {
+        self.push(typ, data)
+    }
+
     /// Issuer key id (type 16), written unhashed.
     #[must_use]
     pub fn issuer_key_id(self, id: &[u8; 8]) -> Self {
         self.push(16, id)
     }
+}
+
+/// A v4 signature body's type, hashed and unhashed subpacket areas.
+pub(crate) fn sig_areas(body: &[u8]) -> Result<(u8, &[u8], &[u8])> {
+    let mut r = Reader::new(body);
+    if r.u8()? != 4 {
+        return Err(Error::Unsupported("signatures other than version 4"));
+    }
+    let typ = r.u8()?;
+    r.take(2)?;
+    let n = usize::from(r.u16()?);
+    let hashed = r.take(n)?;
+    let n = usize::from(r.u16()?);
+    let unhashed = r.take(n)?;
+    Ok((typ, hashed, unhashed))
+}
+
+/// Split a subpacket area into (type byte with its critical bit, data).
+pub(crate) fn split_subpackets(data: &[u8]) -> Result<Vec<(u8, &[u8])>> {
+    let mut r = Reader::new(data);
+    let mut out = Vec::new();
+    while !r.is_empty() {
+        let first = usize::from(r.u8()?);
+        let len = match first {
+            0..=191 => first,
+            192..=254 => ((first - 192) << 8) + usize::from(r.u8()?) + 192,
+            _ => usize::try_from(r.u32()?).map_err(|_| Error::Truncated)?,
+        };
+        let sp = r.take(len)?;
+        let (&typ, v) = sp
+            .split_first()
+            .ok_or(Error::Malformed("empty signature subpacket"))?;
+        out.push((typ, v));
+    }
+    Ok(out)
 }
 
 /// A public-key body as it enters a signature hash: `0x99 | len16 | body`.
@@ -264,11 +326,12 @@ pub fn signed_key(pub_body: &[u8]) -> Vec<u8> {
 
 /// A user id as it enters a certification hash: `0xB4 | len32 | uid`.
 #[must_use]
-pub fn signed_uid(uid: &str) -> Vec<u8> {
+pub fn signed_uid(uid: impl AsRef<[u8]>) -> Vec<u8> {
+    let uid = uid.as_ref();
     let mut v = Vec::with_capacity(5 + uid.len());
     v.push(0xB4);
     v.extend_from_slice(&(uid.len() as u32).to_be_bytes());
-    v.extend_from_slice(uid.as_bytes());
+    v.extend_from_slice(uid);
     v
 }
 
@@ -316,7 +379,6 @@ pub fn sign(
 mod tests {
     use super::*;
     use crate::keys::{generate, KeyType};
-    use crate::packet::Reader;
 
     /// A parsed signature body, read back independently of `sign`.
     struct Parsed {
@@ -550,9 +612,17 @@ mod tests {
             (KeyType::NistP521, Hash::Sha512),
             (KeyType::Secp256k1, Hash::Sha256),
             (KeyType::Cv25519, Hash::Sha256),
+            (KeyType::Rsa2048, Hash::Sha256),
         ] {
             let parts = generate(t, 1).unwrap();
             assert_eq!(hash_for(&parts[0]), want, "{t:?}");
+            let public = PublicPart {
+                algo: parts[0].algo_id(),
+                body: parts[0].public_body(),
+                fpr: parts[0].fingerprint(),
+                created: 1,
+            };
+            assert_eq!(hash_for_public(&public), want, "{t:?} public");
         }
     }
 

@@ -8,9 +8,15 @@
 use keyroost_openpgp::{EccPrivateKeyParts, KeyCrt, PublicKey, RsaPrivateKeyParts};
 use keyroost_transport::{ImportKey, KeyImport, OpenPgpSession, TransportError};
 
+use keyroost_openpgp::PW1_SIGN;
+use zeroize::Zeroizing;
+
 use crate::cert::KeySet;
 use crate::keys::{CardKey, KeyPart, Material};
-use crate::read::{self, Loaded, Slot};
+use crate::read::{self, Loaded, PublicCert, Slot};
+use crate::s2k::Hash;
+use crate::sig::Signer;
+use crate::Error;
 
 /// Borrow a [`CardKey`] as the transport's import form. ECC keys carry
 /// their public point (sent only to cards that ask for it).
@@ -145,6 +151,114 @@ fn import_parts(
     session.import_key_set(&imports)
 }
 
+/// PKCS#1 v1.5 DigestInfo prefixes (RFC 8017 section 9.2).
+const DIGEST_INFO_SHA256: [u8; 19] = [
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
+];
+const DIGEST_INFO_SHA384: [u8; 19] = [
+    0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
+    0x00, 0x04, 0x30,
+];
+const DIGEST_INFO_SHA512: [u8; 19] = [
+    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+    0x00, 0x04, 0x40,
+];
+
+const ALGO_RSA: u8 = 1;
+const ALGO_ECDSA: u8 = 19;
+const ALGO_EDDSA: u8 = 22;
+
+/// Signs with the card's signature key (PSO: COMPUTE DIGITAL SIGNATURE),
+/// so an expiry change never needs the primary key's secret on the host.
+///
+/// The user PIN (PW1, reference 0x81) is verified again before every
+/// signature: a card in its default "PIN once per signature" mode accepts
+/// only one signature per verification, and an expiry change makes one
+/// signature per user ID and subkey. A card with touch enabled asks for a
+/// touch each time.
+pub struct CardSigner<'s> {
+    session: &'s mut OpenPgpSession,
+    algo: u8,
+    pin: Zeroizing<Vec<u8>>,
+}
+
+impl<'s> CardSigner<'s> {
+    /// A signer for `cert`'s primary key. Refuses a card whose signature
+    /// slot holds a different key (by fingerprint) before anything is
+    /// signed.
+    pub fn new(
+        session: &'s mut OpenPgpSession,
+        cert: &PublicCert,
+        pin: &[u8],
+    ) -> Result<Self, Error> {
+        let status = session.status().map_err(card_error)?;
+        if status.fingerprint_sig != cert.primary.fpr {
+            return Err(Error::Refused(
+                "This card's signature key is not this public key's primary key.",
+            ));
+        }
+        Ok(CardSigner {
+            session,
+            algo: cert.primary.algo,
+            pin: Zeroizing::new(pin.to_vec()),
+        })
+    }
+}
+
+fn card_error(e: TransportError) -> Error {
+    Error::Crypto(e.to_string())
+}
+
+impl Signer for CardSigner<'_> {
+    fn algo_id(&self) -> u8 {
+        self.algo
+    }
+
+    fn sign_digest(&mut self, hash: Hash, digest: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        let input = card_input(self.algo, hash, digest)?;
+        self.session
+            .verify_pin(PW1_SIGN, &self.pin)
+            .map_err(card_error)?;
+        let sig = self.session.sign(&input).map_err(card_error)?;
+        split_signature(self.algo, sig)
+    }
+}
+
+/// What the card signs: an RSA key wraps the digest in its DigestInfo,
+/// ECDSA and EdDSA keys take the bare digest.
+fn card_input(algo: u8, hash: Hash, digest: &[u8]) -> Result<Vec<u8>, Error> {
+    match algo {
+        ALGO_RSA => {
+            let prefix = match hash {
+                Hash::Sha256 => &DIGEST_INFO_SHA256,
+                Hash::Sha384 => &DIGEST_INFO_SHA384,
+                Hash::Sha512 => &DIGEST_INFO_SHA512,
+                Hash::Sha1 => return Err(Error::Unsupported("SHA-1 signatures")),
+            };
+            Ok([prefix.as_slice(), digest].concat())
+        }
+        ALGO_ECDSA | ALGO_EDDSA => Ok(digest.to_vec()),
+        _ => Err(Error::Unsupported("signing with this card key's algorithm")),
+    }
+}
+
+/// The card's signature as OpenPGP MPI values: RSA `[s]`, ECDSA and EdDSA
+/// `r || s` split in halves.
+fn split_signature(algo: u8, sig: Vec<u8>) -> Result<Vec<Vec<u8>>, Error> {
+    match algo {
+        ALGO_RSA if !sig.is_empty() => Ok(vec![sig]),
+        ALGO_EDDSA if sig.len() == 64 => Ok(vec![sig[..32].to_vec(), sig[32..].to_vec()]),
+        ALGO_ECDSA if !sig.is_empty() && sig.len() % 2 == 0 => {
+            let (r, s) = sig.split_at(sig.len() / 2);
+            Ok(vec![r.to_vec(), s.to_vec()])
+        }
+        _ => Err(Error::Malformed(
+            "the card's signature has an unexpected length",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +288,47 @@ mod tests {
             expected_public(&s.parts[1]),
             PublicKey::Ecc { point } if point.len() == 65 && point[0] == 0x04
         ));
+    }
+
+    #[test]
+    fn rsa_card_input_is_the_digest_info() {
+        let d = [0xAB; 32];
+        let got = card_input(ALGO_RSA, Hash::Sha256, &d).unwrap();
+        let hex: String = got[..19].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "3031300d060960864801650304020105000420");
+        assert_eq!(&got[19..], d);
+        for (h, n, want) in [
+            (Hash::Sha384, 48, "3041300d060960864801650304020205000430"),
+            (Hash::Sha512, 64, "3051300d060960864801650304020305000440"),
+        ] {
+            let got = card_input(ALGO_RSA, h, &vec![1; n]).unwrap();
+            let hex: String = got[..19].iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, want);
+            assert_eq!(got.len(), 19 + n);
+        }
+        assert_eq!(card_input(ALGO_ECDSA, Hash::Sha256, &d).unwrap(), d);
+        assert_eq!(card_input(ALGO_EDDSA, Hash::Sha256, &d).unwrap(), d);
+        assert!(card_input(18, Hash::Sha256, &d).is_err());
+    }
+
+    #[test]
+    fn card_signatures_split_into_mpis() {
+        let rs: Vec<u8> = (0..64).collect();
+        let ed = split_signature(ALGO_EDDSA, rs.clone()).unwrap();
+        assert_eq!((ed[0].as_slice(), ed[1].as_slice()), (&rs[..32], &rs[32..]));
+        let p384: Vec<u8> = (0..96).collect();
+        let ec = split_signature(ALGO_ECDSA, p384.clone()).unwrap();
+        assert_eq!(
+            (ec[0].as_slice(), ec[1].as_slice()),
+            (&p384[..48], &p384[48..])
+        );
+        assert_eq!(
+            split_signature(ALGO_RSA, vec![7; 256]).unwrap(),
+            [vec![7; 256]]
+        );
+        assert!(split_signature(ALGO_EDDSA, vec![0; 63]).is_err());
+        assert!(split_signature(ALGO_ECDSA, vec![0; 65]).is_err());
+        assert!(split_signature(ALGO_RSA, Vec::new()).is_err());
     }
 
     #[test]

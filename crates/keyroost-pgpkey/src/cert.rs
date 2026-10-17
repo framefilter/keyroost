@@ -4,11 +4,12 @@
 use crate::armor::{self, Kind};
 use crate::keys::{generate, KeyPart, KeyType};
 use crate::packet::{write_packet, Tag};
-use crate::read::Slot;
+use crate::read::{PublicCert, PublicPart, Slot};
 use crate::s2k;
 use crate::sig::{
-    hash_for, sign, signed_key, signed_uid, HostSigner, SigType, Subpackets, FEATURES, FLAGS_AUTH,
-    FLAGS_DECRYPT, FLAGS_PRIMARY, KEYSERVER_PREFS, PREF_COMPRESSION, PREF_HASH, PREF_SYM,
+    hash_for, hash_for_public, sig_areas, sign, signed_key, signed_uid, split_subpackets,
+    HostSigner, SigType, Signer, Subpackets, FEATURES, FLAGS_AUTH, FLAGS_DECRYPT, FLAGS_PRIMARY,
+    KEYSERVER_PREFS, PREF_COMPRESSION, PREF_HASH, PREF_SYM,
 };
 use crate::Error;
 
@@ -113,25 +114,29 @@ impl Expiry {
     /// never. Whole-year and date choices both resolve to 00:00:00 UTC of
     /// the day after the target date, so the key works through that day.
     pub fn seconds_after(self, created: u32) -> Result<Option<u32>, String> {
+        Ok(self.end_time(created)?.map(|end| end - created))
+    }
+
+    /// The moment (seconds since 1970) the key stops working, or `None` for
+    /// never: 00:00:00 UTC of the day after the target date, whole years
+    /// counting from `from`. That moment must come after `from`.
+    pub fn end_time(self, from: u32) -> Result<Option<u32>, String> {
         let (y, m, d) = match self {
             Expiry::Never => return Ok(None),
             Expiry::Years(n) => {
-                let (cy, cm, cd) = civil_from_days(i64::from(created) / DAY);
+                let (cy, cm, cd) = civil_from_days(i64::from(from) / DAY);
                 let y = cy + i32::from(n);
                 (y, cm, cd.min(days_in_month(y, cm)))
             }
             Expiry::Date { y, m, d } => (y, m, d),
         };
         let end = (days_from_civil(y, m, d) + 1) * DAY;
-        let secs = end - i64::from(created);
-        if secs <= 0 {
+        if end <= i64::from(from) {
             return Err("That date is in the past.".into());
         }
-        u32::try_from(secs)
-            .ok()
-            .filter(|_| u32::try_from(end).is_ok())
+        u32::try_from(end)
             .map(Some)
-            .ok_or_else(|| "That date is too far in the future.".into())
+            .map_err(|_| "That date is too far in the future.".into())
     }
 }
 
@@ -287,6 +292,240 @@ pub fn export(set: &KeySet, pass: &[u8], signer_now: u32) -> Result<Outputs, Err
     })
 }
 
+const NO_PRIMARY_SECRET: &str = "This backup doesn't contain the main key's secret part, so it can't sign a new date. Use the card instead.";
+
+/// The new signatures of an expiry change: per user ID packet and per
+/// subkey, in file order (`None` where nothing is re-signed).
+struct NewSigs {
+    uids: Vec<Option<Vec<u8>>>,
+    subkeys: Vec<Option<Vec<u8>>>,
+}
+
+/// A new signature like `old` (same subpackets, in the same order) but made
+/// at `t` with key expiry `secs`.
+fn resign_like(
+    signer: &mut dyn Signer,
+    old: &[u8],
+    sig_type: SigType,
+    hash: crate::s2k::Hash,
+    primary: &PublicPart,
+    (t, secs): (u32, Option<u32>),
+    data: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let (_, old_hashed, old_unhashed) = sig_areas(old)?;
+    let mut hashed = Subpackets::new().created(t).key_expiry(secs);
+    let mut has_fpr = false;
+    for (typ, v) in split_subpackets(old_hashed)? {
+        match typ & 0x7F {
+            2 | 9 => {}
+            33 => {
+                has_fpr = true;
+                hashed = hashed.raw(typ, v);
+            }
+            _ => hashed = hashed.raw(typ, v),
+        }
+    }
+    if !has_fpr {
+        hashed = hashed.issuer_fpr(&primary.fpr);
+    }
+    let mut unhashed = Subpackets::new();
+    let mut has_id = false;
+    for (typ, v) in split_subpackets(old_unhashed)? {
+        has_id |= typ & 0x7F == 16;
+        unhashed = unhashed.raw(typ, v);
+    }
+    if !has_id {
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&primary.fpr[12..]);
+        unhashed = unhashed.issuer_key_id(&id);
+    }
+    sign(signer, sig_type, hash, &hashed, &unhashed, data)
+}
+
+/// Sign the new self-certifications and bindings for an expiry change.
+fn resign(
+    public: &PublicCert,
+    signer: &mut dyn Signer,
+    primary_fpr: [u8; 20],
+    new: Expiry,
+    now: u32,
+) -> Result<NewSigs, Error> {
+    let primary = &public.primary;
+    if primary.fpr != primary_fpr || signer.algo_id() != primary.algo {
+        return Err(Error::Refused(
+            "The signing key is not this public key's primary key.",
+        ));
+    }
+    let old = crate::read::self_sigs(public)?;
+    let end = new.end_time(now).map_err(Error::Crypto)?;
+    // Strictly newer than every signature already there, so it wins.
+    let t = now.max(
+        old.newest
+            .checked_add(1)
+            .ok_or(Error::Malformed("bad signature time"))?,
+    );
+    let secs = |created: u32| -> Result<Option<u32>, Error> {
+        end.map(|e| {
+            e.checked_sub(created)
+                .filter(|&s| s > 0)
+                .ok_or_else(|| Error::Crypto("That date is in the past.".into()))
+        })
+        .transpose()
+    };
+    let hash = hash_for_public(primary);
+    let pkey = signed_key(&primary.body);
+
+    let uid_packets = public
+        .packets
+        .iter()
+        .filter(|(tag, _)| *tag == Tag::USER_ID)
+        .map(|(_, body)| body);
+    let mut uids = Vec::with_capacity(old.uids.len());
+    for (uid, old_sig) in uid_packets.zip(&old.uids) {
+        uids.push(match old_sig {
+            Some(old_sig) => {
+                let mut data = pkey.clone();
+                data.extend(signed_uid(uid));
+                let when = (t, secs(primary.created)?);
+                let sig = resign_like(
+                    signer,
+                    old_sig,
+                    SigType::PositiveCert,
+                    hash,
+                    primary,
+                    when,
+                    &data,
+                )?;
+                Some(sig)
+            }
+            None => None,
+        });
+    }
+    if uids.iter().all(Option::is_none) {
+        return Err(Error::Malformed("no user id with a self-signature"));
+    }
+    let mut subkeys = Vec::with_capacity(old.subkeys.len());
+    for (sub, old_sig) in public.subkeys.iter().zip(&old.subkeys) {
+        subkeys.push(match old_sig {
+            Some(old_sig) => {
+                let mut data = pkey.clone();
+                data.extend(signed_key(&sub.body));
+                let when = (t, secs(sub.created)?);
+                let sig = resign_like(
+                    signer,
+                    old_sig,
+                    SigType::SubkeyBinding,
+                    hash,
+                    primary,
+                    when,
+                    &data,
+                )?;
+                Some(sig)
+            }
+            None => None,
+        });
+    }
+    Ok(NewSigs { uids, subkeys })
+}
+
+/// `packets` with each new signature placed after the last signature of
+/// its user ID or subkey.
+fn with_new_sigs(packets: &[(u8, Vec<u8>)], new: &NewSigs) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pending: Option<&[u8]> = None;
+    let (mut ui, mut si) = (0, 0);
+    for (tag, body) in packets {
+        if *tag != Tag::SIGNATURE {
+            if let Some(sig) = pending.take() {
+                write_packet(&mut out, Tag::SIGNATURE, sig);
+            }
+            pending = match *tag {
+                Tag::USER_ID => {
+                    ui += 1;
+                    new.uids.get(ui - 1).and_then(Option::as_deref)
+                }
+                Tag::PUBLIC_SUBKEY | Tag::SECRET_SUBKEY => {
+                    si += 1;
+                    new.subkeys.get(si - 1).and_then(Option::as_deref)
+                }
+                _ => None,
+            };
+        }
+        write_packet(&mut out, *tag, body);
+    }
+    if let Some(sig) = pending {
+        write_packet(&mut out, Tag::SIGNATURE, sig);
+    }
+    out
+}
+
+/// Give a key set a new expiry date: keeps every packet of `public` and
+/// adds, signed by `signer` (the primary key `primary_fpr`, on the host or
+/// on a card), a new self-certification per user ID and a new binding per
+/// subkey. Each keeps the subpackets of the signature it replaces (flags,
+/// preferences); only its time (`now`, or one second after the newest
+/// signature there) and the key expiry change. [`Expiry::Never`] writes
+/// no expiry; whole years count from `now`. Returns the armored public
+/// certificate.
+pub fn change_expiry(
+    public: &PublicCert,
+    signer: &mut dyn Signer,
+    primary_fpr: [u8; 20],
+    new: Expiry,
+    now: u32,
+) -> Result<String, Error> {
+    let sigs = resign(public, signer, primary_fpr, new, now)?;
+    Ok(armor::encode(
+        Kind::PublicKey,
+        &with_new_sigs(&public.packets, &sigs),
+    ))
+}
+
+/// [`change_expiry`] signed on the host with the primary key of a backup
+/// (unlocked with `pass`). Returns the new backup and public certificate;
+/// the backup's key packets are kept as they are, so the same passphrase
+/// still protects them.
+pub fn change_expiry_in_backup(
+    secret_armor: &str,
+    pass: &[u8],
+    new: Expiry,
+    now: u32,
+) -> Result<(String, String), Error> {
+    let data = secret_armor.as_bytes();
+    let loaded = match crate::read::open(data, Some(pass)) {
+        Err(Error::NoSecretPart) => return Err(Error::Refused(NO_PRIMARY_SECRET)),
+        r => r?,
+    };
+    let primary = loaded
+        .keys
+        .iter()
+        .find(|k| loaded.primary_secret && k.fpr == loaded.primary_fpr)
+        .ok_or(Error::Refused(NO_PRIMARY_SECRET))?;
+    let public = crate::read::open_public(data)?;
+    let sigs = resign(
+        &public,
+        &mut HostSigner(&primary.part),
+        loaded.primary_fpr,
+        new,
+        now,
+    )?;
+    let secret = crate::read::key_packets(data)?;
+    Ok((
+        armor::encode(Kind::PrivateKey, &with_new_sigs(&secret, &sigs)),
+        armor::encode(Kind::PublicKey, &with_new_sigs(&public.packets, &sigs)),
+    ))
+}
+
+/// The last day (UTC) the key set works, as its newest self-signature
+/// says, or `None` when it never expires. A key made with
+/// [`Expiry::Date`] shows that date again.
+#[must_use]
+pub fn current_expiry(public: &PublicCert) -> Option<(i32, u8, u8)> {
+    let secs = crate::read::self_sigs(public).ok()?.expiry?;
+    let end = i64::from(public.primary.created) + i64::from(secs);
+    Some(civil_from_days((end - 1).div_euclid(DAY)))
+}
+
 /// Re-read a just-written backup with its passphrase and check that it
 /// holds `expect`'s three keys in their slots.
 pub fn verify_backup(secret_armor: &str, pass: &[u8], expect: &KeySet) -> Result<(), Error> {
@@ -417,6 +656,232 @@ mod tests {
         assert!(out
             .revocation
             .contains("Comment: This is a revocation certificate\n\n"));
+    }
+
+    fn made(t: KeyType, e: Expiry, now: u32) -> (KeySet, Outputs) {
+        let id = Identity {
+            name: "Ada".into(),
+            email: "ada@example.org".into(),
+        };
+        let set = create(t, &id, e, now).unwrap();
+        let out = export(&set, b"pw", now).unwrap();
+        (set, out)
+    }
+
+    /// (type, expiry) of every self-signature, in file order, with the
+    /// packet tag that precedes its run.
+    fn sig_expiries(armored: &str) -> Vec<(u8, u8, Option<u32>, u32)> {
+        let (_, bin) = armor::decode(armored).unwrap();
+        let mut owner = 0;
+        let mut out = Vec::new();
+        for p in parse_packets(&bin).unwrap() {
+            if p.tag != Tag::SIGNATURE {
+                owner = p.tag;
+                continue;
+            }
+            let (typ, hashed, _) = sig_areas(p.body).unwrap();
+            let mut exp = None;
+            let mut created = 0;
+            for (t, v) in crate::sig::split_subpackets(hashed).unwrap() {
+                match t & 0x7F {
+                    9 => exp = Some(u32::from_be_bytes(v.try_into().unwrap())),
+                    2 => created = u32::from_be_bytes(v.try_into().unwrap()),
+                    _ => {}
+                }
+            }
+            out.push((owner, typ, exp, created));
+        }
+        out
+    }
+
+    #[test]
+    fn change_expiry_on_the_host_appends_one_signature_per_component() {
+        let now = ts(2026, 10, 16) + 500;
+        let (set, out) = made(KeyType::NistP256, Expiry::Years(1), now);
+        let public = crate::read::open_public(out.public.as_bytes()).unwrap();
+        assert_eq!(current_expiry(&public), Some((2027, 10, 16)));
+        let later = now + 3600;
+        let fpr = set.parts[0].fingerprint();
+        let five = change_expiry(
+            &public,
+            &mut HostSigner(&set.parts[0]),
+            fpr,
+            Expiry::Years(5),
+            later,
+        )
+        .unwrap();
+        let end = ts(2031, 10, 17);
+        let want = Some(end - now);
+        let sigs = sig_expiries(&five);
+        // Every old signature kept; a new one right after each.
+        assert_eq!(
+            sigs.iter().map(|s| (s.0, s.1)).collect::<Vec<_>>(),
+            [
+                (13, 0x13),
+                (13, 0x13),
+                (14, 0x18),
+                (14, 0x18),
+                (14, 0x18),
+                (14, 0x18)
+            ]
+        );
+        for pair in sigs.chunks(2) {
+            assert_eq!(pair[1].2, want);
+            assert_eq!(pair[1].3, later);
+        }
+        let reread = crate::read::open_public(five.as_bytes()).unwrap();
+        assert_eq!(current_expiry(&reread), Some((2031, 10, 16)));
+        assert_eq!(reread.primary, public.primary);
+        assert_eq!(reread.subkeys, public.subkeys);
+
+        // Never: no key-expiration subpacket; a same-second change still
+        // lands after the newest signature.
+        let never = change_expiry(
+            &reread,
+            &mut HostSigner(&set.parts[0]),
+            fpr,
+            Expiry::Never,
+            later,
+        )
+        .unwrap();
+        let sigs = sig_expiries(&never);
+        assert_eq!(sigs.len(), 9);
+        for i in [2, 5, 8] {
+            assert_eq!(sigs[i].2, None);
+            assert_eq!(sigs[i].3, later + 1);
+        }
+        assert_eq!(
+            current_expiry(&crate::read::open_public(never.as_bytes()).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn change_expiry_keeps_flags_and_preferences() {
+        let now = ts(2026, 10, 16);
+        let (set, out) = made(KeyType::Cv25519, Expiry::default(), now);
+        let public = crate::read::open_public(out.public.as_bytes()).unwrap();
+        let on = Expiry::Date {
+            y: 2030,
+            m: 1,
+            d: 31,
+        };
+        let new = change_expiry(
+            &public,
+            &mut HostSigner(&set.parts[0]),
+            set.parts[0].fingerprint(),
+            on,
+            now + 10,
+        )
+        .unwrap();
+        assert_eq!(
+            current_expiry(&crate::read::open_public(new.as_bytes()).unwrap()),
+            Some((2030, 1, 31))
+        );
+        let (_, bin) = armor::decode(&new).unwrap();
+        let pk = parse_packets(&bin).unwrap();
+        let strip = |body: &[u8]| {
+            let (_, h, _) = sig_areas(body).unwrap();
+            crate::sig::split_subpackets(h)
+                .unwrap()
+                .into_iter()
+                .filter(|(t, _)| !matches!(t & 0x7F, 2 | 9))
+                .map(|(t, v)| (t, v.to_vec()))
+                .collect::<Vec<_>>()
+        };
+        // Old and new self-cert / bindings differ only in time and expiry.
+        for (old, new) in [(2, 3), (5, 6), (8, 9)] {
+            assert_eq!(strip(pk[old].body), strip(pk[new].body), "{old}");
+        }
+    }
+
+    #[test]
+    fn change_expiry_refuses_a_past_date_and_a_foreign_signer() {
+        let now = ts(2026, 10, 16);
+        let (set, out) = made(KeyType::Cv25519, Expiry::default(), now);
+        let (other, _) = made(KeyType::Cv25519, Expiry::default(), now);
+        let public = crate::read::open_public(out.public.as_bytes()).unwrap();
+        let fpr = set.parts[0].fingerprint();
+        let past = Expiry::Date {
+            y: 2026,
+            m: 10,
+            d: 15,
+        };
+        assert!(change_expiry(&public, &mut HostSigner(&set.parts[0]), fpr, past, now).is_err());
+        assert!(change_expiry(
+            &public,
+            &mut HostSigner(&set.parts[0]),
+            other.parts[0].fingerprint(),
+            Expiry::Never,
+            now
+        )
+        .is_err());
+        // An RSA signer for an EdDSA primary.
+        let rsa = generate(KeyType::Rsa2048, now).unwrap();
+        assert!(change_expiry(&public, &mut HostSigner(&rsa[0]), fpr, Expiry::Never, now).is_err());
+    }
+
+    #[test]
+    fn change_expiry_in_backup_rewrites_both_files() {
+        let now = ts(2026, 10, 16);
+        let (set, out) = made(KeyType::Cv25519, Expiry::Years(1), now);
+        let (secret, public) =
+            change_expiry_in_backup(&out.secret, b"pw", Expiry::Years(2), now + 5).unwrap();
+        let want = Some((2028, 10, 16));
+        assert_eq!(
+            current_expiry(&crate::read::open_public(public.as_bytes()).unwrap()),
+            want
+        );
+        assert_eq!(
+            current_expiry(&crate::read::open_public(secret.as_bytes()).unwrap()),
+            want
+        );
+        // Same passphrase, same keys, new expiry.
+        let got = crate::read::open(secret.as_bytes(), Some(b"pw")).unwrap();
+        assert_eq!(got.expiry, Some(ts(2028, 10, 17) - now));
+        verify_backup(&secret, b"pw", &set).unwrap();
+        assert!(matches!(
+            change_expiry_in_backup(&out.secret, b"nope", Expiry::Never, now + 5),
+            Err(Error::WrongPassphrase)
+        ));
+    }
+
+    #[test]
+    fn change_expiry_in_backup_needs_the_primary_secret() {
+        let now = ts(2026, 10, 16);
+        let (set, out) = made(KeyType::Cv25519, Expiry::Years(1), now);
+        // Strip the primary's secret the way --export-secret-subkeys does.
+        let (_, bin) = armor::decode(&out.secret).unwrap();
+        let mut stub = Vec::new();
+        for (i, p) in parse_packets(&bin).unwrap().iter().enumerate() {
+            let mut body = p.body.to_vec();
+            if i == 0 {
+                body.truncate(set.parts[0].public_body().len());
+                body.extend_from_slice(&[254, 0, 101, 0, b'G', b'N', b'U', 1]);
+            }
+            write_packet(&mut stub, p.tag, &body);
+        }
+        let stub = armor::encode(Kind::PrivateKey, &stub);
+        let err = change_expiry_in_backup(&stub, b"pw", Expiry::Never, now + 5)
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "This backup doesn't contain the main key's secret part, so it can't sign a new date. Use the card instead."
+        );
+    }
+
+    #[test]
+    fn current_expiry_round_trips_the_chosen_date() {
+        let now = ts(2026, 10, 16) + 43_210;
+        for (y, m, d) in [(2026, 10, 16), (2028, 2, 29), (2031, 12, 31)] {
+            let (_, out) = made(KeyType::Cv25519, Expiry::Date { y, m, d }, now);
+            let public = crate::read::open_public(out.public.as_bytes()).unwrap();
+            assert_eq!(current_expiry(&public), Some((y, m, d)));
+        }
+        let (_, out) = made(KeyType::Cv25519, Expiry::Never, now);
+        let public = crate::read::open_public(out.public.as_bytes()).unwrap();
+        assert_eq!(current_expiry(&public), None);
     }
 
     #[test]

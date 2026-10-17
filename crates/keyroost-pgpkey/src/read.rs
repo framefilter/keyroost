@@ -262,22 +262,31 @@ struct PrimaryInfo {
 /// no user ID certification at all, comes from the newest direct-key
 /// signature (0x1F) that carries it: GnuPG's designated-revoker
 /// signatures, for one, are 0x1F without flags or expiry.
+fn newest<'s>(sigs: &'s [Sig], pfpr: &[u8; 20], typ: fn(u8) -> bool) -> Option<&'s Sig> {
+    sigs.iter()
+        .filter(|s| typ(s.typ) && s.by(pfpr))
+        .max_by_key(|s| s.created)
+}
+
+/// Each user ID's newest self-certification (0x10–0x13), for the user IDs
+/// not revoked (0x30) at or after it, in file order.
+fn live_uids<'c>(cert: &'c Cert, pfpr: &[u8; 20]) -> Vec<(&'c str, &'c Sig)> {
+    cert.uids
+        .iter()
+        .filter_map(|(uid, sigs)| live_cert(sigs, pfpr).map(|c| (uid.as_str(), c)))
+        .collect()
+}
+
+/// A user ID's newest self-certification, unless a revocation at or after
+/// it drops the user ID.
+fn live_cert<'s>(sigs: &'s [Sig], pfpr: &[u8; 20]) -> Option<&'s Sig> {
+    let c = newest(sigs, pfpr, |t| (0x10..=0x13).contains(&t))?;
+    let revoked = newest(sigs, pfpr, |t| t == 0x30).is_some_and(|r| r.created >= c.created);
+    (!revoked).then_some(c)
+}
+
 fn primary_info(cert: &Cert, pfpr: &[u8; 20]) -> Result<PrimaryInfo> {
-    fn newest<'s>(sigs: &'s [Sig], pfpr: &[u8; 20], typ: fn(u8) -> bool) -> Option<&'s Sig> {
-        sigs.iter()
-            .filter(|s| typ(s.typ) && s.by(pfpr))
-            .max_by_key(|s| s.created)
-    }
-    let mut live: Vec<(&str, &Sig)> = Vec::new();
-    for (uid, sigs) in &cert.uids {
-        let Some(c) = newest(sigs, pfpr, |t| (0x10..=0x13).contains(&t)) else {
-            continue;
-        };
-        let revoked = newest(sigs, pfpr, |t| t == 0x30).is_some_and(|r| r.created >= c.created);
-        if !revoked {
-            live.push((uid, c));
-        }
-    }
+    let live = live_uids(cert, pfpr);
     let chosen = live
         .iter()
         .filter(|(_, s)| s.primary_uid)
@@ -353,6 +362,75 @@ pub fn open_public(data: &[u8]) -> Result<PublicCert> {
     })
 }
 
+/// The self-signatures an expiry change re-signs, read from a public
+/// certificate the way [`open`] reads them.
+pub(crate) struct SelfSigs {
+    /// Per user ID packet, in file order: the body of its newest live
+    /// self-certification (`None` for a revoked or uncertified user ID).
+    pub uids: Vec<Option<Vec<u8>>>,
+    /// Per subkey, in file order: the body of its newest binding (`None`
+    /// for a revoked or unbound subkey).
+    pub subkeys: Vec<Option<Vec<u8>>>,
+    /// Creation time of the newest signature the primary key made.
+    pub newest: u32,
+    /// The primary key's expiry, seconds after its creation.
+    pub expiry: Option<u32>,
+}
+
+pub(crate) fn self_sigs(public: &PublicCert) -> Result<SelfSigs> {
+    let packets: Vec<Packet<'_>> = public
+        .packets
+        .iter()
+        .map(|(tag, body)| Packet { tag: *tag, body })
+        .collect();
+    let cert = parse_cert(&packets)?;
+    let pfpr = cert.primary.fpr;
+    let info = primary_info(&cert, &pfpr)?;
+    let uids = cert
+        .uids
+        .iter()
+        .map(|(_, sigs)| live_cert(sigs, &pfpr).map(|s| s.raw.clone()))
+        .collect();
+    let subkeys = cert
+        .subkeys
+        .iter()
+        .map(|sub| {
+            if sub.sigs.iter().any(|s| s.typ == 0x28 && s.by(&pfpr)) {
+                return None;
+            }
+            newest(&sub.sigs, &pfpr, |t| t == 0x18).map(|s| s.raw.clone())
+        })
+        .collect();
+    let all = cert
+        .primary
+        .sigs
+        .iter()
+        .chain(cert.uids.iter().flat_map(|(_, s)| s))
+        .chain(cert.subkeys.iter().flat_map(|k| &k.sigs));
+    let newest = all
+        .filter(|s| s.by(&pfpr))
+        .map(|s| s.created)
+        .max()
+        .unwrap_or(0);
+    Ok(SelfSigs {
+        uids,
+        subkeys,
+        newest,
+        expiry: info.expiry,
+    })
+}
+
+/// A key file's packets (armored or binary), marker and trust packets left
+/// out, secret parts kept.
+pub(crate) fn key_packets(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>> {
+    let (_, bin) = decode_input(data)?;
+    Ok(parse_packets(&bin)?
+        .iter()
+        .filter(|p| !matches!(p.tag, 10 | 12))
+        .map(|p| (p.tag, p.body.to_vec()))
+        .collect())
+}
+
 /// Armored text or binary packets. Armored input must be a key block.
 fn decode_input(data: &[u8]) -> Result<(Option<Kind>, Cow<'_, [u8]>)> {
     match data.first() {
@@ -382,6 +460,8 @@ struct Sig {
     primary_uid: bool,
     issuer_fpr: Option<[u8; 20]>,
     issuer_id: Option<[u8; 8]>,
+    /// The whole signature packet body.
+    raw: Vec<u8>,
 }
 
 impl Sig {
@@ -410,6 +490,7 @@ fn parse_sig(body: &[u8]) -> Result<Option<Sig>> {
     r.take(2)?; // hash check bytes; the MPIs follow
     let mut sig = Sig {
         typ,
+        raw: body.to_vec(),
         ..Sig::default()
     };
     subpackets(hashed, &mut sig, true)?;
@@ -418,18 +499,7 @@ fn parse_sig(body: &[u8]) -> Result<Option<Sig>> {
 }
 
 fn subpackets(data: &[u8], sig: &mut Sig, hashed: bool) -> Result<()> {
-    let mut r = Reader::new(data);
-    while !r.is_empty() {
-        let first = usize::from(r.u8()?);
-        let len = match first {
-            0..=191 => first,
-            192..=254 => ((first - 192) << 8) + usize::from(r.u8()?) + 192,
-            _ => usize::try_from(r.u32()?).map_err(|_| Error::Truncated)?,
-        };
-        let sp = r.take(len)?;
-        let (&typ, v) = sp
-            .split_first()
-            .ok_or(Error::Malformed("empty signature subpacket"))?;
+    for (typ, v) in crate::sig::split_subpackets(data)? {
         let be32 = |v: &[u8]| <[u8; 4]>::try_from(v).ok().map(u32::from_be_bytes);
         match (typ & 0x7F, hashed) {
             (2, true) => sig.created = be32(v).ok_or(Error::Malformed("bad signature time"))?,

@@ -711,3 +711,100 @@ fn gpg_secp256k1_loads() {
 fn gpg_ed25519_loads() {
     gpg_made_key_loads("ed", "ed25519", "cv25519", "ed25519", KeyType::Cv25519);
 }
+
+/// gpg's view (pub + subs) of the expiry fields after importing `files`.
+fn expiries_after_import(tag: &str, fpr: &str, files: &[&str]) -> Vec<(String, String)> {
+    let home = Home::new(tag);
+    let h = &home.0;
+    for (i, data) in files.iter().enumerate() {
+        let f = home.write(&format!("{i}.asc"), data.as_bytes());
+        ok(&gpg(h, &["--import", &f], None), "import");
+    }
+    let o = ok(
+        &gpg(h, &["--with-colons", "--list-keys", fpr], None),
+        "list-keys",
+    );
+    colon_keys(&o)
+        .into_iter()
+        .map(|k| (k.rec, k.expires))
+        .collect()
+}
+
+fn change_expiry_shows_in_gpg(t: KeyType) {
+    use keyroost_pgpkey::cert::change_expiry;
+    use keyroost_pgpkey::sig::HostSigner;
+    let (set, out, now) = make(t, Expiry::Years(1));
+    let fpr = hex(&set.parts[0].fingerprint());
+    let public = read::open_public(out.public.as_bytes()).unwrap();
+    let mut signer = HostSigner(&set.parts[0]);
+    let pfpr = set.parts[0].fingerprint();
+    let five = change_expiry(&public, &mut signer, pfpr, Expiry::Years(5), now + 1).unwrap();
+    let end = Expiry::Years(5).end_time(now + 1).unwrap().unwrap();
+    let got = expiries_after_import("exp5", &fpr, &[&out.public, &five]);
+    let recs: Vec<&str> = got.iter().map(|(r, _)| r.as_str()).collect();
+    assert_eq!(recs, ["pub", "sub", "sub"], "{t:?}");
+    for (rec, e) in &got {
+        assert_eq!(e, &end.to_string(), "{t:?} {rec}");
+    }
+    let never = change_expiry(&public, &mut signer, pfpr, Expiry::Never, now + 1).unwrap();
+    let got = expiries_after_import("expn", &fpr, &[&out.public, &never]);
+    assert_eq!(got.len(), 3);
+    assert!(got.iter().all(|(_, e)| e.is_empty()), "{t:?} {got:?}");
+}
+
+#[test]
+fn changed_expiry_shows_in_gpg() {
+    if !have_gpg() {
+        return;
+    }
+    for t in [
+        KeyType::Cv25519,
+        KeyType::NistP256,
+        KeyType::NistP384,
+        KeyType::NistP521,
+        KeyType::Secp256k1,
+        KeyType::Rsa2048,
+    ] {
+        change_expiry_shows_in_gpg(t);
+    }
+}
+
+#[test]
+fn backup_with_changed_expiry_still_imports_in_gpg() {
+    if !have_gpg() {
+        return;
+    }
+    let (set, out, now) = make(KeyType::NistP256, Expiry::Years(1));
+    let fpr = hex(&set.parts[0].fingerprint());
+    let (secret, public) = keyroost_pgpkey::cert::change_expiry_in_backup(
+        &out.secret,
+        PASS,
+        Expiry::Years(2),
+        now + 1,
+    )
+    .unwrap();
+    let end = Expiry::Years(2).end_time(now + 1).unwrap().unwrap();
+    let got = expiries_after_import("expb", &fpr, &[&out.public, &public]);
+    assert!(got.iter().all(|(_, e)| e == &end.to_string()), "{got:?}");
+    let home = Home::new("expbs");
+    let h = &home.0;
+    let f = home.write("sec.asc", secret.as_bytes());
+    ok(&gpg(h, &["--import", &f], Some(PASS)), "import secret");
+    let o = ok(
+        &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
+        "list-secret-keys",
+    );
+    let keys = colon_keys(&o);
+    assert_eq!(keys.len(), 3);
+    assert!(keys.iter().all(|k| k.expires == end.to_string()), "{o}");
+    // The secret parts still unlock with the same passphrase: sign.
+    let msg = home.write("msg.txt", b"hello");
+    ok(
+        &gpg(
+            h,
+            &["--local-user", &fpr, "--detach-sign", "--output", "-", &msg],
+            Some(PASS),
+        ),
+        "sign",
+    );
+}

@@ -41,6 +41,9 @@ pub enum Error {
     NoSecretPart,
     /// The file holds a public key only, not a backup.
     PublicOnly,
+    /// The operation cannot be done with what was given; the text says
+    /// why and what to do instead.
+    Refused(&'static str),
     /// A cryptographic operation failed.
     Crypto(String),
     /// A file operation failed.
@@ -70,6 +73,7 @@ impl fmt::Display for Error {
                 f,
                 "This file holds only a public key; restoring needs the backup with the secret keys."
             ),
+            Error::Refused(why) => write!(f, "{why}"),
             Error::Crypto(msg) => write!(f, "Cryptographic error: {msg}"),
             Error::Io(e) => write!(f, "File error: {e}"),
         }
