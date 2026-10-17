@@ -48,7 +48,7 @@ tool. Workspace contains:
 | `keyroost-winwebauthn` | Windows-only non-admin FIDO2 helper: detect a FIDO key, open Windows' security-key settings, relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroost-windevtree` | Windows-only device-tree lookups for key pairing (#51): a HID path's / PC/SC reader's ancestor devnode chain via cfgmgr32 + `SCardGetReaderDeviceInstanceIdA`, never opening the device or connecting to a card; unsafe FFI shim; inert on non-Windows | `windows-sys` (Windows only) |
 | `keyroostctl` | CLI binary | `clap` (+ `clap_complete`/`clap_mangen`), `serde`/`serde_json`, `zeroize`, `rpassword` (=7.5.4, hidden PIN/password prompt; pulls `rtoolbox`, `libc`/`windows-sys` per platform) |
-| `keyroost` | egui desktop GUI | `eframe`, `egui`, `serde`/`serde_json`, `zeroize`, `base64`, plus platform UI deps (`arboard`, `rfd`, `pollster`, `png`; Linux `ashpd`/`x11rb` behind the `qr` feature); `winresource` as a Windows-only **build**-dependency (embeds the icon + version info into `keyroost.exe`; never linked into any binary, never compiled off Windows) |
+| `keyroost` | egui desktop GUI | `eframe`, `egui`, `serde`/`serde_json`, `zeroize`, `base64`, plus platform UI deps (`arboard`, `rfd`, `pollster`, `png`; Linux `ashpd`/`x11rb` behind the `qr` feature; Windows `wgpu`, DirectX 12 backend only, with OpenGL as fallback); `winresource` as a Windows-only **build**-dependency (embeds the icon + version info into `keyroost.exe`; never linked into any binary, never compiled off Windows) |
 
 ## Where to start reading
 

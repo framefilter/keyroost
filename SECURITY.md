@@ -105,7 +105,8 @@ What keyroost does **not** defend against:
   directly; `windows-sys` on Windows), the interface boundary (`clap` and
   `clap_complete`/`clap_mangen`; `rpassword` for the hidden terminal
   prompt; `eframe`/`egui` with `arboard`, `rfd`,
-  `pollster`, `png` and Linux's `x11rb`/`ashpd`; `serde`/`serde_json` and
+  `pollster`, `png`, Linux's `x11rb`/`ashpd` and Windows' `wgpu`
+  (DirectX 12 backend only); `serde`/`serde_json` and
   `base64`), and cryptography that would be irresponsible to hand-roll
   under `forbid(unsafe_code)` — RustCrypto (`sha2`, `hmac`, `aes`, `des`,
   `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `rand_core`, `zeroize`, `scrypt`
