@@ -4,7 +4,7 @@
 //! one [`KeyType`]. Each [`KeyPart`] knows how to write its public-key packet
 //! body (byte-identical to what `keyroost-openpgp` hashes for the card's
 //! fingerprint), its secret MPIs in GnuPG's layout, and the neutral
-//! [`CardKey`] form the card import needs.
+//! form the card import takes.
 
 use keyroost_openpgp::{ecdh_kdf_params, AlgorithmInformation, Curve, EccKind, KeyAlg, KeyCrt};
 use rand_core::{OsRng, RngCore};
@@ -208,6 +208,8 @@ pub struct KeyPart {
 }
 
 /// Key material in the form the card import takes, without transport types.
+// Only the `card` feature's import uses it (and the tests).
+#[cfg_attr(not(feature = "card"), allow(dead_code))]
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) enum CardKey {
     /// PKCS#1 CRT components; `u = q⁻¹ mod p`.
@@ -612,6 +614,7 @@ impl KeyPart {
 
     /// The key in the card-import form.
     #[must_use]
+    #[cfg_attr(not(feature = "card"), allow(dead_code))]
     pub(crate) fn card_key(&self) -> CardKey {
         match &self.material {
             Material::Rsa {
