@@ -139,13 +139,15 @@ fn import_parts(
         .iter()
         .zip(&keys)
         .zip(algs)
-        .map(|((&(crt, part), key), alg)| KeyImport {
-            crt,
-            alg,
-            key: to_import(key),
-            created: part.created,
-            expect_fpr: part.fingerprint(),
-            expect_public: expected_public(part),
+        .map(|((&(crt, part), key), alg)| {
+            KeyImport::new(
+                crt,
+                alg,
+                to_import(key),
+                part.created,
+                part.fingerprint(),
+                expected_public(part),
+            )
         })
         .collect();
     session.import_key_set(&imports)

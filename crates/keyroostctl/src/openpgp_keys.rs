@@ -670,10 +670,10 @@ mod tests {
         );
         assert_eq!(
             with_backup(
-                "This card doesn't accept X keys in the signature slot.",
+                "this card doesn't accept X keys in the signature slot",
                 Path::new("k.asc")
             ),
-            "This card doesn't accept X keys in the signature slot. Your backup is saved at k.asc."
+            "this card doesn't accept X keys in the signature slot. Your backup is saved at k.asc."
         );
     }
 }

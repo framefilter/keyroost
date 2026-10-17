@@ -342,12 +342,19 @@ pub enum TransportError {
     /// After an import, the card's public key in `slot` is not the one the
     /// file has, so the slot was not registered.
     OpenPgpFingerprintMismatch { slot: &'static str },
-    /// A key-set import failed after `done` slots already hold their new
-    /// keys; `failed` is the slot whose import went wrong (its old key may
-    /// already be wiped) and `cause` why. Slots are prose names.
+    /// A key import failed after the card was already changed: `done` are
+    /// the slots of the same set that now hold their new keys (empty for a
+    /// single key, or when the first key of a set failed), `failed` is the
+    /// slot whose import went wrong and `cause` why. `slot_changed`: a
+    /// write for `failed` had already been sent (an attribute change, which
+    /// wipes the slot, or the key itself), so its old key may be gone;
+    /// otherwise that slot is as it was. Never built with `done` empty and
+    /// `slot_changed` false — that failure changed nothing and is returned
+    /// as its plain cause. Slots are prose names.
     OpenPgpKeySetPartial {
         done: Vec<&'static str>,
         failed: &'static str,
+        slot_changed: bool,
         cause: Box<TransportError>,
     },
     /// The private key handed to an import is not a `label` key (an RSA key
@@ -641,30 +648,38 @@ impl fmt::Display for TransportError {
             ),
             TransportError::OpenPgpAlgorithmRefused { slot, label } => write!(
                 f,
-                "This card doesn't accept {label} keys in the {slot} slot."
+                "this card doesn't accept {label} keys in the {slot} slot"
             ),
             TransportError::OpenPgpFingerprintMismatch { slot } => write!(
                 f,
-                "The card holds a different {slot} key than the file has; it was not registered."
+                "the card holds a different {slot} key than the file has; it was not registered"
             ),
             TransportError::OpenPgpKeySetPartial {
                 done,
                 failed,
+                slot_changed,
                 cause,
             } => {
-                let list = match done.as_slice() {
-                    [] => String::new(),
-                    [one] => format!("the {one} key"),
-                    [rest @ .., last] => format!("the {} and {last} keys", rest.join(", ")),
+                let state = if *slot_changed {
+                    "that slot's old key may be gone"
+                } else {
+                    "that slot was not changed"
                 };
-                write!(
-                    f,
-                    "Loaded {list}; the {failed} key failed (that slot's old key may be \
-                     gone): {cause}"
-                )
+                let list = match done.split_last() {
+                    None => {
+                        return write!(
+                            f,
+                            "the {failed} key failed after the card began replacing it \
+                             ({state}): {cause}"
+                        )
+                    }
+                    Some((one, [])) => format!("the {one} key"),
+                    Some((last, rest)) => format!("the {} and {last} keys", rest.join(", ")),
+                };
+                write!(f, "loaded {list}; the {failed} key failed ({state}): {cause}")
             }
             TransportError::OpenPgpKeyNotForAlgorithm { slot, label } => {
-                write!(f, "The {slot} key can't be imported as {label}.")
+                write!(f, "the {slot} key can't be imported as {label}")
             }
             TransportError::PivImportCertificateKeyMismatch(slot) => write!(
                 f,

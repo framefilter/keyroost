@@ -1053,11 +1053,26 @@ fn pgp_plain(e: keyroost_pgpkey::Error) -> String {
 
 /// `e` followed by where the backup is, for a failure after it was written.
 fn with_backup(e: impl std::fmt::Display, backup: &std::path::Path) -> String {
-    format!(
-        "{}. Your backup is saved at {}.",
-        e.to_string().trim_end_matches('.'),
-        backup.display()
-    )
+    format!("{} Your backup is saved at {}.", sentence(e), backup.display())
+}
+
+/// An error (the transport's read lowercase, for the CLI's `error:`
+/// prefix) as a sentence for a dialog: capitalized, ending in a period.
+fn sentence(e: impl std::fmt::Display) -> String {
+    let e = e.to_string();
+    let mut chars = e.trim_end_matches('.').chars();
+    let first = chars.next().map(|c| c.to_uppercase().to_string());
+    format!("{}{}.", first.unwrap_or_default(), chars.as_str())
+}
+
+/// A failed load of a created key set. Only an
+/// [`TransportError::OpenPgpKeySetPartial`] means the card may have been
+/// changed: anything else from the import was refused before a write.
+fn load_failure(e: TransportError, backup: &std::path::Path) -> LoadFailure {
+    LoadFailure {
+        card_touched: matches!(e, TransportError::OpenPgpKeySetPartial { .. }),
+        message: with_backup(e, backup),
+    }
 }
 
 /// The create dialog closed after the three files were written.
@@ -1072,9 +1087,10 @@ fn canceled_after_write(backup: &std::path::Path) -> String {
 /// A failed "load onto the card" of a created key set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadFailure {
-    /// Whether the failure came after keys may have been written: anything
-    /// from the import itself. Only a failure before it (the card not
-    /// opening, the admin PIN refused) provably left the card as it was.
+    /// Whether the failure came after keys may have been written (a
+    /// partial import, or a failure once all keys were in). A failure
+    /// before the first write (the card not opening, the admin PIN or the
+    /// key type refused) left the card as it was.
     card_touched: bool,
     /// The error shown, naming the backup.
     message: String,
@@ -7680,7 +7696,7 @@ impl App {
                         Self::openpgp_open_admin(&name, &pin).map_err(|e| e.to_string())?;
                     let fprs =
                         keyroost_pgpkey::card::import_loaded(&mut s, &loaded, &[slot.to_slot()])
-                            .map_err(|e| e.to_string())?;
+                            .map_err(sentence)?;
                     let status = s.status().map_err(|e| e.to_string())?;
                     Ok((status, kind, fprs[0]))
                 } else {
@@ -7706,7 +7722,7 @@ impl App {
                     // Sets the slot to this key's size before the import, so a
                     // 3072/4096-bit key lands in a slot that was 2048.
                     s.import_any(crt, alg, &keyroost_transport::ImportKey::Rsa(parts))
-                        .map_err(|e| e.to_string())?;
+                        .map_err(sentence)?;
                     let fpr = s
                         .register_key(crt, unix_now())
                         .map_err(|e| e.to_string())?;
@@ -7856,7 +7872,8 @@ impl App {
                     }
                 };
                 let mut s = Self::openpgp_open_admin(&name, &pin).map_err(failed(false))?;
-                keyroost_pgpkey::card::import_set(&mut s, &created.set).map_err(failed(true))?;
+                keyroost_pgpkey::card::import_set(&mut s, &created.set)
+                    .map_err(|e| load_failure(e, backup))?;
                 s.status().map_err(failed(true))
             })();
             drop(created);
@@ -8008,7 +8025,7 @@ impl App {
                             m.result = Some(Ok(()));
                         }
                     }
-                    Err(e) => Self::openpgp_modal_step(app, Some(e.to_string())),
+                    Err(e) => Self::openpgp_modal_step(app, Some(sentence(e))),
                 }
             })
         })
@@ -24478,6 +24495,35 @@ mod tests {
             card_touched: true,
             message: with_backup("Loaded the signature key; the decryption key failed", p),
         };
+        let from_import = load_failure(
+            TransportError::OpenPgpKeySetPartial {
+                done: Vec::new(),
+                failed: "signature",
+                slot_changed: true,
+                cause: Box::new(TransportError::OpenPgpFingerprintMismatch { slot: "signature" }),
+            },
+            p,
+        );
+        assert!(from_import.card_touched);
+        assert!(
+            from_import
+                .message
+                .starts_with("The signature key failed after the card began replacing it"),
+            "{}",
+            from_import.message
+        );
+        let pre_write = load_failure(
+            TransportError::OpenPgpAlgorithmRefused {
+                slot: "signature",
+                label: "Ed25519",
+            },
+            p,
+        );
+        assert!(!pre_write.card_touched);
+        assert_eq!(
+            close_message(Some(&pre_write), p),
+            CloseMessage::Notice(canceled_after_write(p))
+        );
         let CloseMessage::Error(e) = close_message(Some(&partial), p) else {
             panic!("a possibly changed card must not be reported as unchanged");
         };
@@ -24486,10 +24532,19 @@ mod tests {
     }
 
     #[test]
+    fn dialog_errors_read_as_sentences() {
+        assert_eq!(
+            sentence("the signature key can't be imported as Ed25519"),
+            "The signature key can't be imported as Ed25519."
+        );
+        assert_eq!(sentence("Already one."), "Already one.");
+    }
+
+    #[test]
     fn create_messages_keep_the_backup_path() {
         let p = std::path::Path::new("k.asc");
         assert_eq!(
-            with_backup("This card doesn't accept X keys in the signature slot.", p),
+            with_backup("this card doesn't accept X keys in the signature slot", p),
             "This card doesn't accept X keys in the signature slot. Your backup is saved at k.asc."
         );
         assert_eq!(

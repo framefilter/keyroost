@@ -137,9 +137,11 @@
       &mdash; or from a file exported by GnuPG with
       <code>gpg --export-secret-keys --armor</code> &mdash; onto a card. You choose which of
       the keys to load; each replaces the key in its slot. It needs the backup's passphrase
-      and the card's admin PIN. A wrong passphrase or an unreadable file is reported in one
-      line and nothing on the card changes. If the card does not accept a key type in a slot,
-      keyroost says so, and a backup already written stays where it is.</p>
+      and the card's admin PIN. A wrong passphrase, an unreadable file or a key type the card
+      does not list is reported in one line before anything is written, so the card stays as
+      it was. If the card does not accept a key type in a slot, keyroost says so, and a backup
+      already written stays where it is. If loading fails after the card began replacing a
+      key, keyroost names that slot: its old key may be gone.</p>
     <h3>Using it with GnuPG</h3>
 <pre><code>gpg --import NAME.pub.asc     # your public key
 gpg --card-status             # links the card's keys to it</code></pre>

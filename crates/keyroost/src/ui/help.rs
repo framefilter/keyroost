@@ -95,7 +95,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "pgp-restore" => &Help {
             title: "Restore a backup",
-            body: "Loads keys from a backup file onto this card: one keyroost saved, or one exported from GnuPG. You choose which of the keys to load; each REPLACES the key in its slot. You'll need the backup's passphrase and the card's admin PIN. A wrong passphrase or unreadable file changes nothing on the card.",
+            body: "Loads keys from a backup file onto this card: one keyroost saved, or one exported from GnuPG. You choose which of the keys to load; each REPLACES the key in its slot. You'll need the backup's passphrase and the card's admin PIN. A wrong passphrase, an unreadable file or a key type the card doesn't list is caught before anything is written, so the card stays as it was. If loading fails after the card began replacing a key, keyroost names that slot: its old key may be gone.",
             slug: "/openpgp#backup",
         },
         "pgp-expiry" => &Help {
