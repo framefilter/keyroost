@@ -342,6 +342,14 @@ pub enum TransportError {
     /// After an import, the card's public key in `slot` is not the one the
     /// file has, so the slot was not registered.
     OpenPgpFingerprintMismatch { slot: &'static str },
+    /// A key-set import failed after `done` slots already hold their new
+    /// keys; `failed` is the slot whose import went wrong (its old key may
+    /// already be wiped) and `cause` why. Slots are prose names.
+    OpenPgpKeySetPartial {
+        done: Vec<&'static str>,
+        failed: &'static str,
+        cause: Box<TransportError>,
+    },
     /// The private key handed to an import is not a `label` key (an RSA key
     /// for an ECC slot, a scalar wider than the curve's field, or an RSA
     /// size no card holds).
@@ -639,6 +647,22 @@ impl fmt::Display for TransportError {
                 f,
                 "The card holds a different {slot} key than the file has; it was not registered."
             ),
+            TransportError::OpenPgpKeySetPartial {
+                done,
+                failed,
+                cause,
+            } => {
+                let list = match done.as_slice() {
+                    [] => String::new(),
+                    [one] => format!("the {one} key"),
+                    [rest @ .., last] => format!("the {} and {last} keys", rest.join(", ")),
+                };
+                write!(
+                    f,
+                    "Loaded {list}; the {failed} key failed (that slot's old key may be \
+                     gone): {cause}"
+                )
+            }
             TransportError::OpenPgpKeyNotForAlgorithm { slot, label } => {
                 write!(f, "The {slot} key can't be imported as {label}.")
             }
@@ -676,6 +700,7 @@ impl std::error::Error for TransportError {
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::OpenPgpSlotMismatch(e) => Some(e),
+            TransportError::OpenPgpKeySetPartial { cause, .. } => Some(cause.as_ref()),
             TransportError::PivParse(e) => Some(e),
             TransportError::PivResetUnverifiedFailed(e)
             | TransportError::PivResetForcedFailed(e)

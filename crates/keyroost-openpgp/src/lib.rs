@@ -1770,6 +1770,15 @@ impl core::fmt::Display for ScalarTooWide {
 
 impl std::error::Error for ScalarTooWide {}
 
+/// Whether `scalar` fits a `field_len`-byte field the way
+/// [`ecc_extended_header_list`] encodes it: at most `field_len` bytes, or
+/// one byte more when that extra leading byte is zero. A check that builds
+/// nothing, so it can run before any key material is copied.
+#[must_use]
+pub fn ecc_scalar_fits(scalar: &[u8], field_len: usize) -> bool {
+    scalar.len() <= field_len || (scalar.len() == field_len + 1 && scalar[0] == 0x00)
+}
+
 /// Build the `0x4D` Extended Header List for an ECC key import (OpenPGP
 /// Card spec v3.4, §4.4.3.12) — the ECC counterpart of
 /// [`extended_header_list`]:
@@ -1795,7 +1804,7 @@ pub fn ecc_extended_header_list(
     } else {
         key.scalar
     };
-    if scalar.len() > field_len {
+    if !ecc_scalar_fits(key.scalar, field_len) {
         return Err(ScalarTooWide {
             scalar_len: scalar.len(),
             field_len,
@@ -3660,6 +3669,30 @@ mod tests {
         );
         assert!(import_ecc_key(KeyCrt::Sign, &key, 32).is_err());
         assert!(import_ecc_key_chained(KeyCrt::Sign, &key, 32, 254).is_err());
+    }
+
+    #[test]
+    fn ecc_scalar_fits_matches_the_builder() {
+        let mut zero_led = vec![0x00u8];
+        zero_led.extend_from_slice(&[0x55u8; 32]);
+        let cases: [(&[u8], bool); 5] = [
+            (&[0x55u8; 31], true),
+            (&[0x55u8; 32], true),
+            (&zero_led, true),
+            (&[0x55u8; 33], false),
+            (&[0x00u8; 34], false),
+        ];
+        for (scalar, fits) in cases {
+            assert_eq!(ecc_scalar_fits(scalar, 32), fits, "{} bytes", scalar.len());
+            let key = EccPrivateKeyParts {
+                scalar,
+                public: None,
+            };
+            assert_eq!(
+                ecc_extended_header_list(KeyCrt::Sign, &key, 32).is_ok(),
+                fits
+            );
+        }
     }
 
     #[test]
