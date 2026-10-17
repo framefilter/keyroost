@@ -228,7 +228,8 @@ pub fn protect(secret_mpis: &[u8], pass: &[u8]) -> Vec<u8> {
     OsRng.fill_bytes(&mut iv);
     let spec = Spec::Iterated(Hash::Sha256, salt, WRITE_COUNT);
     let key = spec.derive(pass, Cipher::Aes256.key_len());
-    let mut plain = Zeroizing::new(secret_mpis.to_vec());
+    let mut plain = Zeroizing::new(Vec::with_capacity(secret_mpis.len() + 20));
+    plain.extend_from_slice(secret_mpis);
     plain.extend_from_slice(&keyroost_proto::sha1::sha1(secret_mpis));
     let ct = cfb_encrypt(Cipher::Aes256, &key, &iv, &plain);
     let mut out = vec![254, Cipher::Aes256 as u8];
