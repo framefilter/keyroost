@@ -14,15 +14,18 @@ pub struct Paths {
 }
 
 /// Derive the three file names from the one the user chose: strip a single
-/// trailing `.asc`, `.gpg` or `.pgp`, then add `.asc`, `.pub.asc`, `.rev.asc`.
+/// trailing `.asc`, `.gpg` or `.pgp` (in any case), then add `.asc`,
+/// `.pub.asc`, `.rev.asc`.
 #[must_use]
 pub fn paths_for(chosen: &Path) -> Paths {
     let mut name = chosen.as_os_str().to_string_lossy().into_owned();
-    for ext in [".asc", ".gpg", ".pgp"] {
-        if let Some(stem) = name.strip_suffix(ext) {
-            name = stem.to_string();
-            break;
-        }
+    let cut = name.len().saturating_sub(4);
+    if name.is_char_boundary(cut)
+        && [".asc", ".gpg", ".pgp"]
+            .iter()
+            .any(|ext| name[cut..].eq_ignore_ascii_case(ext))
+    {
+        name.truncate(cut);
     }
     let with = |suffix: &str| PathBuf::from(format!("{name}{suffix}"));
     Paths {
@@ -34,8 +37,24 @@ pub fn paths_for(chosen: &Path) -> Paths {
 
 /// Write `contents` to a file that must not exist yet. On Unix the file is
 /// created with mode 0600 when `secret` is set (the backup and the
-/// revocation certificate).
+/// revocation certificate). A write that fails after the file was created
+/// removes it again: a cut-off backup must not be left looking like one
+/// (and a retry would say it already exists).
 pub fn write_new(path: &Path, contents: &str, secret: bool) -> Result<(), Error> {
+    create_then(path, secret, |f| {
+        f.write_all(contents.as_bytes())?;
+        f.flush()?;
+        f.sync_all()
+    })
+}
+
+/// [`write_new`]'s body: create `path` (never over an existing file or a
+/// symlink), run `write` on it, and remove the file again if `write` fails.
+fn create_then(
+    path: &Path,
+    secret: bool,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), Error> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -55,8 +74,12 @@ pub fn write_new(path: &Path, contents: &str, secret: bool) -> Result<(), Error>
             Error::Io(e)
         }
     })?;
-    f.write_all(contents.as_bytes())?;
-    f.flush()?;
+    let written = write(&mut f);
+    drop(f);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(path);
+        return Err(Error::Io(e));
+    }
     Ok(())
 }
 
@@ -145,7 +168,9 @@ mod tests {
 
     #[test]
     fn names_derive_from_the_chosen_one() {
-        for chosen in ["keys.asc", "keys", "keys.gpg", "keys.pgp"] {
+        for chosen in [
+            "keys.asc", "keys", "keys.gpg", "keys.pgp", "keys.ASC", "keys.Gpg", "keys.PGP",
+        ] {
             let p = paths_for(Path::new(chosen));
             assert_eq!(p.secret, Path::new("keys.asc"));
             assert_eq!(p.public, Path::new("keys.pub.asc"));
@@ -165,6 +190,30 @@ mod tests {
         assert!(err.to_string().contains("pgpkey-files"), "{err}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "one");
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn short_and_non_ascii_names_keep_their_ending() {
+        assert_eq!(paths_for(Path::new("asc")).secret, Path::new("asc.asc"));
+        assert_eq!(paths_for(Path::new("k\u{e9}y")).secret, Path::new("k\u{e9}y.asc"));
+        assert_eq!(paths_for(Path::new("\u{e9}asc")).secret, Path::new("\u{e9}asc.asc"));
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_file() {
+        let d = dir("failwrite");
+        let p = d.join("k.asc");
+        let err = create_then(&p, true, |f| {
+            f.write_all(b"-----BEGIN PGP PRIV")?;
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("disk full"), "{err}");
+        assert!(std::fs::symlink_metadata(&p).is_err(), "half-written file left");
+        // So a retry is not told the file already exists.
+        write_new(&p, "whole", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "whole");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[cfg(unix)]
