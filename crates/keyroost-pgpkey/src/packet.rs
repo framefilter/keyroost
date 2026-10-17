@@ -36,6 +36,7 @@ pub fn write_packet(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
 
 /// Encode big-endian bytes as an MPI: leading zeros stripped, 2-byte bit
 /// count, then the value. All-zero input gives a zero-bit MPI.
+#[cfg(test)]
 pub fn mpi(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + bytes.len());
     push_mpi(&mut out, bytes);

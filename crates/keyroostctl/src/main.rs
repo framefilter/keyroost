@@ -20048,35 +20048,6 @@ mod cli_tests {
     }
 
     #[test]
-    fn openpgp_default_key_type_follows_the_card_list() {
-        use crate::openpgp_keys::default_key_type;
-        use keyroost_openpgp::{AlgorithmInformation, KeyAlg, KeyCrt};
-        use keyroost_pgpkey::keys::KeyType;
-        assert_eq!(default_key_type(None), KeyType::Cv25519);
-        let attr = |a: KeyAlg, c: KeyCrt| a.attributes(c).unwrap();
-        let both = AlgorithmInformation {
-            sig: vec![
-                attr(KeyAlg::Rsa2048, KeyCrt::Sign),
-                attr(KeyAlg::Ed25519, KeyCrt::Sign),
-            ],
-            dec: vec![attr(KeyAlg::X25519, KeyCrt::Decrypt)],
-            aut: vec![attr(KeyAlg::Ed25519, KeyCrt::Auth)],
-        };
-        assert_eq!(default_key_type(Some(&both)), KeyType::Cv25519);
-        let rsa_only = AlgorithmInformation {
-            sig: vec![attr(KeyAlg::Rsa2048, KeyCrt::Sign)],
-            dec: vec![attr(KeyAlg::Rsa2048, KeyCrt::Decrypt)],
-            aut: vec![attr(KeyAlg::Rsa2048, KeyCrt::Auth)],
-        };
-        assert_eq!(default_key_type(Some(&rsa_only)), KeyType::Rsa3072);
-        let no_x25519 = AlgorithmInformation {
-            dec: vec![attr(KeyAlg::Rsa2048, KeyCrt::Decrypt)],
-            ..both
-        };
-        assert_eq!(default_key_type(Some(&no_x25519)), KeyType::Rsa3072);
-    }
-
-    #[test]
     fn openpgp_files_are_told_apart_from_pem_and_der() {
         use crate::openpgp_keys::is_openpgp;
         assert!(is_openpgp(b"-----BEGIN PGP PRIVATE KEY BLOCK-----\n\nxxx"));

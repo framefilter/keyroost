@@ -21,7 +21,7 @@ use crate::Error;
 /// Borrow a [`CardKey`] as the transport's import form. ECC keys carry
 /// their public point (sent only to cards that ask for it).
 #[must_use]
-pub fn to_import(k: &CardKey) -> ImportKey<'_> {
+pub(crate) fn to_import(k: &CardKey) -> ImportKey<'_> {
     match k {
         CardKey::Rsa {
             e,
@@ -284,7 +284,7 @@ mod tests {
                 assert_eq!(p.scalar.len(), 32);
                 assert_eq!(p.public.map(<[u8]>::len), Some(65));
             }
-            ImportKey::Rsa(_) => panic!("P-256 imported as RSA"),
+            other => panic!("P-256 imported as {other:?}"),
         }
         assert!(matches!(
             expected_public(&s.parts[1]),
@@ -342,7 +342,7 @@ mod tests {
                 assert_eq!(p.scalar.len(), 32);
                 assert_eq!(p.public, None);
             }
-            ImportKey::Rsa(_) => panic!("Ed25519 imported as RSA"),
+            other => panic!("Ed25519 imported as {other:?}"),
         }
         assert!(matches!(
             expected_public(&s.parts[1]),

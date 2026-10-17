@@ -4,6 +4,7 @@ use crate::Error;
 
 /// What an armored block contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     PrivateKey,
     PublicKey,
@@ -21,7 +22,7 @@ impl Kind {
 }
 
 /// CRC-24 as defined in RFC 4880 section 6.1.
-pub fn crc24(data: &[u8]) -> u32 {
+pub(crate) fn crc24(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xB7_04CE;
     for &b in data {
         crc ^= (b as u32) << 16;
@@ -95,7 +96,7 @@ pub fn encode(kind: Kind, data: &[u8]) -> String {
 }
 
 /// Like [`encode`], with an optional `Comment:` armor header line.
-pub fn encode_with_comment(kind: Kind, data: &[u8], comment: Option<&str>) -> String {
+pub(crate) fn encode_with_comment(kind: Kind, data: &[u8], comment: Option<&str>) -> String {
     let body = b64_encode(data);
     let mut s = format!("-----BEGIN PGP {}-----\n", kind.label());
     if let Some(c) = comment {

@@ -8,14 +8,14 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 use crate::keys::{KeyPart, Material};
 use crate::packet::Reader;
 use crate::read::PublicPart;
-use crate::s2k::Hash;
+pub use crate::s2k::Hash;
 use crate::Error;
 
 type Result<T> = std::result::Result<T, Error>;
 
 /// Signature types keyroost writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigType {
+pub(crate) enum SigType {
     /// Positive certification of a user id by the primary key.
     PositiveCert = 0x13,
     /// Binding of a subkey to the primary key.
@@ -25,21 +25,21 @@ pub enum SigType {
 }
 
 /// Key flags for the primary key: certify and sign.
-pub const FLAGS_PRIMARY: u8 = 0x03;
+pub(crate) const FLAGS_PRIMARY: u8 = 0x03;
 /// Key flags for the decryption subkey: encrypt communications and storage.
-pub const FLAGS_DECRYPT: u8 = 0x0C;
+pub(crate) const FLAGS_DECRYPT: u8 = 0x0C;
 /// Key flags for the authentication subkey.
-pub const FLAGS_AUTH: u8 = 0x20;
+pub(crate) const FLAGS_AUTH: u8 = 0x20;
 /// Preferred symmetric ciphers: AES-256, AES-192, AES-128.
-pub const PREF_SYM: [u8; 3] = [9, 8, 7];
+pub(crate) const PREF_SYM: [u8; 3] = [9, 8, 7];
 /// Preferred hashes: SHA-512, SHA-384, SHA-256.
-pub const PREF_HASH: [u8; 3] = [10, 9, 8];
+pub(crate) const PREF_HASH: [u8; 3] = [10, 9, 8];
 /// Preferred compression: uncompressed.
-pub const PREF_COMPRESSION: [u8; 1] = [0];
+pub(crate) const PREF_COMPRESSION: [u8; 1] = [0];
 /// Features: modification detection (SEIPD v1).
-pub const FEATURES: u8 = 0x01;
+pub(crate) const FEATURES: u8 = 0x01;
 /// Key server preferences: no-modify.
-pub const KEYSERVER_PREFS: u8 = 0x80;
+pub(crate) const KEYSERVER_PREFS: u8 = 0x80;
 
 /// Anything that can sign an OpenPGP digest: the host (from a [`KeyPart`])
 /// or a card.
@@ -118,7 +118,7 @@ fn ecdsa_sign(curve: Curve, d: &[u8], digest: &[u8]) -> Result<Vec<Vec<u8>>> {
 /// over a shorter digest — SHA-384 for P-384 (GnuPG's own choice there),
 /// SHA-512 for P-521, SHA-256 otherwise.
 #[must_use]
-pub fn hash_for(primary: &KeyPart) -> Hash {
+pub(crate) fn hash_for(primary: &KeyPart) -> Hash {
     match primary.material {
         Material::Ecdsa { curve, .. } => hash_for_curve(curve),
         _ => Hash::Sha256,
@@ -128,7 +128,7 @@ pub fn hash_for(primary: &KeyPart) -> Hash {
 /// [`hash_for`] for a primary key known only by its public part, as when
 /// re-signing a public certificate with a card.
 #[must_use]
-pub fn hash_for_public(primary: &PublicPart) -> Hash {
+pub(crate) fn hash_for_public(primary: &PublicPart) -> Hash {
     // v4 key body: version, created (4), algo, then for ECDSA the OID length
     // and the OID.
     const ALGO_ECDSA: u8 = 19;
@@ -162,7 +162,7 @@ fn digest(hash: Hash, data: &[u8]) -> Result<Vec<u8>> {
 
 /// A run of signature subpackets, built in order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Subpackets(Vec<u8>);
+pub(crate) struct Subpackets(Vec<u8>);
 
 impl Subpackets {
     #[must_use]
@@ -316,7 +316,7 @@ pub(crate) fn split_subpackets(data: &[u8]) -> Result<Vec<(u8, &[u8])>> {
 
 /// A public-key body as it enters a signature hash: `0x99 | len16 | body`.
 #[must_use]
-pub fn signed_key(pub_body: &[u8]) -> Vec<u8> {
+pub(crate) fn signed_key(pub_body: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(3 + pub_body.len());
     v.push(0x99);
     v.extend_from_slice(&(pub_body.len() as u16).to_be_bytes());
@@ -326,7 +326,7 @@ pub fn signed_key(pub_body: &[u8]) -> Vec<u8> {
 
 /// A user id as it enters a certification hash: `0xB4 | len32 | uid`.
 #[must_use]
-pub fn signed_uid(uid: impl AsRef<[u8]>) -> Vec<u8> {
+pub(crate) fn signed_uid(uid: impl AsRef<[u8]>) -> Vec<u8> {
     let uid = uid.as_ref();
     let mut v = Vec::with_capacity(5 + uid.len());
     v.push(0xB4);
@@ -343,7 +343,7 @@ fn len16(n: usize, what: &'static str) -> Result<[u8; 2]> {
 
 /// Sign `signed_data` (the [`signed_key`] / [`signed_uid`] concatenation for
 /// `sig_type`) and return the v4 signature packet body.
-pub fn sign(
+pub(crate) fn sign(
     signer: &mut dyn Signer,
     sig_type: SigType,
     hash: Hash,

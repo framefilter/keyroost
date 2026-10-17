@@ -1,8 +1,17 @@
 //! Host-side OpenPGP key sets for keyroost: key generation, GnuPG-compatible
 //! secret-key backups, restore onto a card, and expiry changes.
 //!
-//! This module tree starts with the byte layer: packet framing, MPIs and
-//! ASCII armor.
+//! - [`cert`]: make a key set ([`cert::create`]), write its backup, public
+//!   key and revocation certificate ([`cert::export`]), and change its
+//!   expiry date.
+//! - [`read`]: read backups and GnuPG secret exports back
+//!   ([`read::open`]), and public keys ([`read::open_public`]).
+//! - [`files`]: the file names and never-overwrite writes.
+//! - `card` (feature `card`): load a key set onto an OpenPGP card, and
+//!   sign with the card.
+//!
+//! The byte layer (packets, MPIs, S2K, signature encoding) stays inside
+//! the crate.
 
 use std::fmt;
 
@@ -12,9 +21,9 @@ pub mod card;
 pub mod cert;
 pub mod files;
 pub mod keys;
-pub mod packet;
+pub(crate) mod packet;
 pub mod read;
-pub mod s2k;
+pub(crate) mod s2k;
 pub mod sig;
 
 /// Everything this crate can report. The `Display` text is written for end

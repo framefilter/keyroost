@@ -59,6 +59,7 @@ fn days_in_month(y: i32, m: u8) -> u8 {
 
 /// When a key set stops being valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Expiry {
     Never,
     /// Calendar years after the creation date (1, 2, 3 or 5).
@@ -240,19 +241,19 @@ pub fn export(set: &KeySet, pass: &[u8], signer_now: u32) -> Result<Outputs, Err
     let dec_bind = sub_binding(set, 1, FLAGS_DECRYPT, signer_now)?;
     let auth_bind = sub_binding(set, 2, FLAGS_AUTH, signer_now)?;
 
-    let secret_body = |part: &KeyPart| {
+    let secret_body = |part: &KeyPart| -> Result<Vec<u8>, Error> {
         let mut b = part.public_body();
-        b.extend(s2k::protect(&part.secret_mpis(), pass));
-        b
+        b.extend(s2k::protect(&part.secret_mpis(), pass)?);
+        Ok(b)
     };
 
     let mut secret = Vec::new();
-    write_packet(&mut secret, Tag::SECRET_KEY, &secret_body(primary));
+    write_packet(&mut secret, Tag::SECRET_KEY, &secret_body(primary)?);
     write_packet(&mut secret, Tag::USER_ID, set.user_id.as_bytes());
     write_packet(&mut secret, Tag::SIGNATURE, &self_cert);
-    write_packet(&mut secret, Tag::SECRET_SUBKEY, &secret_body(&set.parts[1]));
+    write_packet(&mut secret, Tag::SECRET_SUBKEY, &secret_body(&set.parts[1])?);
     write_packet(&mut secret, Tag::SIGNATURE, &dec_bind);
-    write_packet(&mut secret, Tag::SECRET_SUBKEY, &secret_body(&set.parts[2]));
+    write_packet(&mut secret, Tag::SECRET_SUBKEY, &secret_body(&set.parts[2])?);
     write_packet(&mut secret, Tag::SIGNATURE, &auth_bind);
 
     let mut public = Vec::new();
@@ -485,32 +486,34 @@ pub fn change_expiry(
 /// (unlocked with `pass`), the public certificate taken from the backup
 /// itself. Returns the new backup and public certificate; the backup's key
 /// packets are kept as they are, so the same passphrase still protects
-/// them.
+/// them. `secret` is armored or binary; both results are armored.
 pub fn change_expiry_in_backup(
-    secret_armor: &str,
+    secret: &[u8],
     pass: &[u8],
     new: Expiry,
     now: u32,
 ) -> Result<(String, String), Error> {
-    let public = crate::read::open_public(secret_armor.as_bytes())?;
-    change_expiry_with_backup(&public, secret_armor, pass, new, now)
+    let public = crate::read::open_public(secret)?;
+    change_expiry_with_backup(&public, secret, pass, new, now)
 }
 
 /// [`change_expiry`] on `public` (the user's own public key file, with
 /// everything it has collected: other people's certifications, user IDs
 /// added later, revocations), signed on the host with the primary key of
-/// the backup `secret_armor` (unlocked with `pass`). Every packet of
-/// `public` is kept. The backup gets the same new signatures for the user
-/// IDs and subkeys it has; its key packets are kept as they are, so the
-/// same passphrase still protects them. Returns (backup, public).
+/// the backup `secret` (unlocked with `pass`). Every packet of `public` is
+/// kept. The backup gets the same new signatures for the user IDs and
+/// subkeys it has; its key packets are kept as they are, so the same
+/// passphrase still protects them (and a GnuPG placeholder for a key that
+/// lives on a card stays a placeholder). `secret` is armored or binary;
+/// both results are armored. Returns (backup, public).
 pub fn change_expiry_with_backup(
     public: &PublicCert,
-    secret_armor: &str,
+    secret: &[u8],
     pass: &[u8],
     new: Expiry,
     now: u32,
 ) -> Result<(String, String), Error> {
-    let data = secret_armor.as_bytes();
+    let data = secret;
     let loaded = match crate::read::open(data, Some(pass)) {
         Err(Error::NoSecretPart) => return Err(Error::Refused(NO_PRIMARY_SECRET)),
         r => r?,
@@ -883,7 +886,7 @@ mod tests {
         let now = ts(2026, 10, 16);
         let (set, out) = made(KeyType::Cv25519, Expiry::Years(1), now);
         let (secret, public) =
-            change_expiry_in_backup(&out.secret, b"pw", Expiry::Years(2), now + 5).unwrap();
+            change_expiry_in_backup(out.secret.as_bytes(), b"pw", Expiry::Years(2), now + 5).unwrap();
         let want = Some((2028, 10, 16));
         assert_eq!(
             current_expiry(&crate::read::open_public(public.as_bytes()).unwrap()),
@@ -898,7 +901,7 @@ mod tests {
         assert_eq!(got.expiry, Some(ts(2028, 10, 17) - now));
         verify_backup(&secret, b"pw", &set).unwrap();
         assert!(matches!(
-            change_expiry_in_backup(&out.secret, b"nope", Expiry::Never, now + 5),
+            change_expiry_in_backup(out.secret.as_bytes(), b"nope", Expiry::Never, now + 5),
             Err(Error::WrongPassphrase)
         ));
     }
@@ -960,7 +963,7 @@ mod tests {
         let grown = armor::encode(Kind::PublicKey, &grown);
         let public = crate::read::open_public(grown.as_bytes()).unwrap();
         let (secret, new_public) =
-            change_expiry_with_backup(&public, &out.secret, b"pw", Expiry::Years(2), now + 5)
+            change_expiry_with_backup(&public, out.secret.as_bytes(), b"pw", Expiry::Years(2), now + 5)
                 .unwrap();
         let (_, nb) = armor::decode(&new_public).unwrap();
         let new_packets = parse_packets(&nb).unwrap();
@@ -989,7 +992,7 @@ mod tests {
         verify_backup(&secret, b"pw", &set).unwrap();
         // A backup of another key is refused plainly.
         let (_, other_out) = made(KeyType::NistP256, Expiry::Years(1), now);
-        let err = change_expiry_with_backup(&public, &other_out.secret, b"pw", Expiry::Never, now)
+        let err = change_expiry_with_backup(&public, other_out.secret.as_bytes(), b"pw", Expiry::Never, now)
             .err()
             .unwrap();
         assert_eq!(
@@ -1013,8 +1016,13 @@ mod tests {
             }
             write_packet(&mut stub, p.tag, &body);
         }
+        // A binary (non-armored) backup works as well as an armored one;
+        // the results are armored.
+        let (secret, public) = change_expiry_in_backup(&bin, b"pw", Expiry::Never, now + 5).unwrap();
+        assert!(secret.starts_with("-----BEGIN PGP PRIVATE KEY BLOCK-----"));
+        assert!(public.starts_with("-----BEGIN PGP PUBLIC KEY BLOCK-----"));
         let stub = armor::encode(Kind::PrivateKey, &stub);
-        let err = change_expiry_in_backup(&stub, b"pw", Expiry::Never, now + 5)
+        let err = change_expiry_in_backup(stub.as_bytes(), b"pw", Expiry::Never, now + 5)
             .err()
             .unwrap();
         assert_eq!(

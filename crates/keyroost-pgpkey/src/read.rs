@@ -17,10 +17,35 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// The card slot a loaded key belongs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Slot {
     Sign,
     Decrypt,
     Auth,
+}
+
+impl Slot {
+    /// The card's key slot.
+    #[must_use]
+    pub const fn crt(self) -> keyroost_openpgp::KeyCrt {
+        use keyroost_openpgp::KeyCrt;
+        match self {
+            Slot::Sign => KeyCrt::Sign,
+            Slot::Decrypt => KeyCrt::Decrypt,
+            Slot::Auth => KeyCrt::Auth,
+        }
+    }
+
+    /// The slot for a card key slot.
+    #[must_use]
+    pub const fn from_crt(crt: keyroost_openpgp::KeyCrt) -> Slot {
+        use keyroost_openpgp::KeyCrt;
+        match crt {
+            KeyCrt::Sign => Slot::Sign,
+            KeyCrt::Decrypt => Slot::Decrypt,
+            KeyCrt::Auth => Slot::Auth,
+        }
+    }
 }
 
 /// One secret key read from a file.
@@ -163,6 +188,8 @@ pub(crate) fn open_at(data: &[u8], pass: Option<&[u8]>, now: u32) -> Result<Load
     }
 
     let mut primary_secret = true;
+    // Keys whose secret lives on a card (GnuPG's S2K 101 mode 2 stub).
+    let mut stubs = 0usize;
     let mut keys = Vec::with_capacity(chosen.len());
     // Per loaded key: (usable flags, key creation time, signature time).
     let mut rank = Vec::with_capacity(chosen.len());
@@ -170,14 +197,21 @@ pub(crate) fn open_at(data: &[u8], pass: Option<&[u8]>, now: u32) -> Result<Load
         let mut r = Reader::new(&key.body[key.pub_len..]);
         let secret = match s2k::unprotect(&mut r, pass) {
             Ok(secret) => secret,
-            Err(Error::NoSecretPart) => {
+            Err(e @ (Error::NoSecretPart | Error::CardStubs)) => {
                 let what = if n == 0 {
                     primary_secret = false;
                     format!("The primary key {}", key_id_hex(&key.fpr))
                 } else {
                     format!("Subkey {}", key_id_hex(&key.fpr))
                 };
-                notes.push(format!("{what} has no secret part in this file."));
+                if matches!(e, Error::CardStubs) {
+                    stubs += 1;
+                    notes.push(format!(
+                        "{what} lives on a card; this file has only a placeholder for it."
+                    ));
+                } else {
+                    notes.push(format!("{what} has no secret part in this file."));
+                }
                 continue;
             }
             Err(e) => return Err(e),
@@ -196,7 +230,11 @@ pub(crate) fn open_at(data: &[u8], pass: Option<&[u8]>, now: u32) -> Result<Load
         });
     }
     if keys.is_empty() {
-        return Err(Error::NoSecretPart);
+        return Err(if stubs > 0 {
+            Error::CardStubs
+        } else {
+            Error::NoSecretPart
+        });
     }
     assign_slots(&mut keys, &rank);
 
@@ -325,6 +363,33 @@ fn primary_info(cert: &Cert, pfpr: &[u8; 20]) -> Result<PrimaryInfo> {
         time,
         user_ids: live.iter().map(|(u, _)| (*u).to_string()).collect(),
     })
+}
+
+/// Whether opening the secret key file `data` needs a passphrase: `false`
+/// for a file whose keys are not protected (as `gpg --export-secret-keys`
+/// writes a key that has no passphrase). Errors as [`open`] does without a
+/// passphrase, other than [`Error::NeedsPassphrase`].
+pub fn needs_passphrase(data: &[u8]) -> Result<bool> {
+    match open(data, None) {
+        Ok(_) => Ok(false),
+        Err(Error::NeedsPassphrase) => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `data` (armored or binary) is a secret key file — a backup or a
+/// GnuPG secret export — rather than a public certificate. Unreadable data
+/// is not.
+#[must_use]
+pub fn is_secret(data: &[u8]) -> bool {
+    match decode_input(data) {
+        Ok((Some(kind), _)) => kind == Kind::PrivateKey,
+        Ok((None, bin)) => parse_packets(&bin)
+            .ok()
+            .and_then(|p| p.first().map(|p| p.tag))
+            == Some(Tag::SECRET_KEY),
+        Err(_) => false,
+    }
 }
 
 /// Read a public certificate. A secret file is accepted too; its key
@@ -987,13 +1052,143 @@ mod tests {
             err.to_string(),
             "This file has no secret part for this key (it was exported without it)."
         );
-        let stub = rebuild(&bin, |i, _, b| {
-            if i == 0 {
-                b.truncate(lens[0]);
-                b.extend_from_slice(&[254, 0, 101, 0, b'G', b'N', b'U', 2, 0]);
+    }
+
+    /// GnuPG's placeholder for a key moved to a card with `keytocard`:
+    /// S2K 101 ("GNU") mode 2, then the card serial (length-prefixed).
+    fn card_stub(b: &mut Vec<u8>, len: usize) {
+        b.truncate(len);
+        b.extend_from_slice(&[254, 0, 101, 0, b'G', b'N', b'U', 2, 4, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn secret_files_are_told_from_public_ones_armored_or_not() {
+        let (_, text) = make(KeyType::Cv25519, Expiry::default());
+        let (_, bin) = armor::decode(&text).unwrap();
+        assert!(is_secret(text.as_bytes()));
+        assert!(is_secret(&bin));
+        let public = crate::cert::export(&make(KeyType::Cv25519, Expiry::default()).0, b"pw", NOW)
+            .unwrap()
+            .public;
+        let (_, pub_bin) = armor::decode(&public).unwrap();
+        assert!(!is_secret(public.as_bytes()));
+        assert!(!is_secret(&pub_bin));
+        assert!(!is_secret(b"not a key"));
+        assert!(!is_secret(b""));
+    }
+
+    #[test]
+    fn unprotected_files_need_no_passphrase() {
+        let (set, text) = make(KeyType::Cv25519, Expiry::default());
+        assert!(needs_passphrase(text.as_bytes()).unwrap());
+        let (_, bin) = armor::decode(&text).unwrap();
+        let parts: Vec<(usize, usize)> = [(0, 0), (3, 1), (5, 2)]
+            .into_iter()
+            .map(|(i, k)| (i, set.parts[k].public_body().len()))
+            .collect();
+        // Usage 0: the secret MPIs in the clear, then their 16-bit sum.
+        let plain = rebuild(&bin, |i, _, b| {
+            if let Some(&(_, len)) = parts.iter().find(|(at, _)| *at == i) {
+                let k = [0, 3, 5].iter().position(|&x| x == i).unwrap();
+                let mpis = set.parts[k].secret_mpis();
+                let sum = mpis.iter().fold(0u16, |a, &x| a.wrapping_add(u16::from(x)));
+                b.truncate(len);
+                b.push(0);
+                b.extend_from_slice(&mpis);
+                b.extend_from_slice(&sum.to_be_bytes());
             }
         });
-        assert!(matches!(open(&stub, Some(b"pw")), Err(Error::CardStubs)));
+        assert!(!needs_passphrase(&plain).unwrap());
+        assert_eq!(open_at(&plain, None, NOW).unwrap().keys.len(), 3);
+        // An expiry change on it signs with an empty passphrase.
+        let public = open_public(&plain).unwrap();
+        assert!(
+            crate::cert::change_expiry_with_backup(&public, &plain, b"", Expiry::Never, NOW)
+                .is_ok()
+        );
+        assert!(matches!(needs_passphrase(b"junk"), Err(_)));
+    }
+
+    #[test]
+    fn card_stubs_are_skipped_per_key() {
+        let (set, text) = make(KeyType::Cv25519, Expiry::default());
+        let (_, bin) = armor::decode(&text).unwrap();
+        let lens: Vec<usize> = set.parts.iter().map(|p| p.public_body().len()).collect();
+
+        // Subkeys on a card, primary in the file (`keytocard` on the
+        // subkeys only): the primary loads, each stub is a note.
+        let subs_on_card = rebuild(&bin, |i, _, b| match i {
+            3 => card_stub(b, lens[1]),
+            5 => card_stub(b, lens[2]),
+            _ => {}
+        });
+        let got = open_at(&subs_on_card, Some(b"pw"), NOW).unwrap();
+        assert!(got.primary_secret);
+        assert_eq!(got.keys.len(), 1);
+        assert_eq!(got.keys[0].fpr, set.parts[0].fingerprint());
+        assert_eq!(got.keys[0].slot, Some(Slot::Sign));
+        assert_eq!(got.notes.len(), 2, "{:?}", got.notes);
+        assert!(got
+            .notes
+            .iter()
+            .all(|n| n.ends_with("lives on a card; this file has only a placeholder for it.")));
+
+        // Primary on a card, subkeys in the file.
+        let primary_on_card = rebuild(&bin, |i, _, b| {
+            if i == 0 {
+                card_stub(b, lens[0]);
+            }
+        });
+        let got = open_at(&primary_on_card, Some(b"pw"), NOW).unwrap();
+        assert!(!got.primary_secret);
+        assert_eq!(got.keys.len(), 2);
+        assert!(got.notes[0].starts_with("The primary key "), "{:?}", got.notes);
+
+        // Every key on a card: nothing to restore.
+        let all = rebuild(&bin, |i, _, b| match i {
+            0 => card_stub(b, lens[0]),
+            3 => card_stub(b, lens[1]),
+            5 => card_stub(b, lens[2]),
+            _ => {}
+        });
+        assert!(matches!(open(&all, Some(b"pw")), Err(Error::CardStubs)));
+        // Stubs need no passphrase to be recognized.
+        let none = rebuild(&bin, |i, _, b| match i {
+            0 => card_stub(b, lens[0]),
+            3 => card_stub(b, lens[1]),
+            5 => card_stub(b, lens[2]),
+            _ => {}
+        });
+        assert!(matches!(open(&none, None), Err(Error::CardStubs)));
+    }
+
+    #[test]
+    fn expiry_changes_with_a_file_whose_subkeys_live_on_a_card() {
+        let (set, text) = make(KeyType::Cv25519, Expiry::default());
+        let (_, bin) = armor::decode(&text).unwrap();
+        let lens: Vec<usize> = set.parts.iter().map(|p| p.public_body().len()).collect();
+        let subs_on_card = rebuild(&bin, |i, _, b| match i {
+            3 => card_stub(b, lens[1]),
+            5 => card_stub(b, lens[2]),
+            _ => {}
+        });
+        let armored = armor::encode(Kind::PrivateKey, &subs_on_card);
+        let public = open_public(&subs_on_card).unwrap();
+        let (secret, new_public) = crate::cert::change_expiry_with_backup(
+            &public,
+            armored.as_bytes(),
+            b"pw",
+            Expiry::Never,
+            NOW,
+        )
+        .unwrap();
+        let cert = open_public(new_public.as_bytes()).unwrap();
+        assert_eq!(crate::cert::current_expiry(&cert), None);
+        // The backup keeps its placeholders and gets the new date too.
+        let back = open_at(secret.as_bytes(), Some(b"pw"), NOW).unwrap();
+        assert_eq!(back.expiry, None);
+        assert_eq!(back.keys.len(), 1);
+        assert_eq!(back.notes.len(), 2);
     }
 
     /// A v4 signature body with the given hashed subpackets and no MPIs

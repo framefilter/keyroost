@@ -777,7 +777,7 @@ fn backup_with_changed_expiry_still_imports_in_gpg() {
     let (set, out, now) = make(KeyType::NistP256, Expiry::Years(1));
     let fpr = hex(&set.parts[0].fingerprint());
     let (secret, public) = keyroost_pgpkey::cert::change_expiry_in_backup(
-        &out.secret,
+        out.secret.as_bytes(),
         PASS,
         Expiry::Years(2),
         now + 1,

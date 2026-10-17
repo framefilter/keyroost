@@ -6,7 +6,7 @@
 //! fingerprint), its secret MPIs in GnuPG's layout, and the neutral
 //! [`CardKey`] form the card import needs.
 
-use keyroost_openpgp::{ecdh_kdf_params, Curve, EccKind, KeyAlg, KeyCrt};
+use keyroost_openpgp::{ecdh_kdf_params, AlgorithmInformation, Curve, EccKind, KeyAlg, KeyCrt};
 use rand_core::{OsRng, RngCore};
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use rsa::{BigUint, RsaPrivateKey};
@@ -25,6 +25,7 @@ const ALGO_EDDSA: u8 = 22;
 
 /// The key types keyroost can create and back up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyType {
     Rsa2048,
     Rsa3072,
@@ -98,6 +99,45 @@ impl KeyType {
         }
     }
 
+    /// The first slot whose Algorithm Information (`FA`) lists algorithms
+    /// but not this type's for it — the card would refuse the set there. A
+    /// slot that lists nothing counts as unknown, not as a refusal.
+    #[must_use]
+    pub fn refused_slot(self, fa: &AlgorithmInformation) -> Option<KeyCrt> {
+        [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth]
+            .into_iter()
+            .find(|&crt| {
+                let algs = fa.key_algs(crt);
+                !algs.is_empty() && !algs.contains(&self.card_alg(crt))
+            })
+    }
+
+    /// The types a card takes in all three slots: every type when it
+    /// publishes no Algorithm Information (`None`), otherwise those
+    /// [`refused_slot`](Self::refused_slot) finds no slot against, in
+    /// [`ALL`](Self::ALL) order.
+    #[must_use]
+    pub fn offered(fa: Option<&AlgorithmInformation>) -> Vec<KeyType> {
+        match fa {
+            None => KeyType::ALL.to_vec(),
+            Some(fa) => KeyType::ALL
+                .into_iter()
+                .filter(|t| t.refused_slot(fa).is_none())
+                .collect(),
+        }
+    }
+
+    /// The type to use when none was chosen: Curve 25519 (GnuPG's default)
+    /// when `offered` has it, else RSA-3072, else the first offered;
+    /// `None` when nothing is offered.
+    #[must_use]
+    pub fn preferred(offered: &[KeyType]) -> Option<KeyType> {
+        [KeyType::Cv25519, KeyType::Rsa3072]
+            .into_iter()
+            .find(|t| offered.contains(t))
+            .or_else(|| offered.first().copied())
+    }
+
     /// The key type a card algorithm belongs to; `None` for the card-only
     /// Brainpool curves.
     #[must_use]
@@ -118,6 +158,7 @@ impl KeyType {
 
 /// The key material of one key. All integers are big-endian unless noted.
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[non_exhaustive]
 pub enum Material {
     /// RSA with `p < q` (OpenPGP's order). `u_pgp = p⁻¹ mod q` goes in the
     /// OpenPGP file; `u_card = q⁻¹ mod p` (PKCS#1 `qinv`) goes to the card.
@@ -168,7 +209,7 @@ pub struct KeyPart {
 
 /// Key material in the form the card import takes, without transport types.
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub enum CardKey {
+pub(crate) enum CardKey {
     /// PKCS#1 CRT components; `u = q⁻¹ mod p`.
     Rsa {
         e: Vec<u8>,
@@ -392,7 +433,7 @@ fn x25519_generate() -> Material {
 
 /// Generate a key set of type `t`: index 0 signs (the primary key), 1
 /// decrypts, 2 authenticates.
-pub fn generate(t: KeyType, created: u32) -> Result<[KeyPart; 3]> {
+pub(crate) fn generate(t: KeyType, created: u32) -> Result<[KeyPart; 3]> {
     let part = |material| KeyPart { material, created };
     let [s, d, a] = match t {
         KeyType::Rsa2048 | KeyType::Rsa3072 | KeyType::Rsa4096 => {
@@ -494,7 +535,7 @@ impl KeyPart {
     /// ECDSA/ECDH `d`, with X25519's RFC 7748 scalar byte-reversed
     /// (big-endian), GnuPG's convention; EdDSA the seed.
     #[must_use]
-    pub fn secret_mpis(&self) -> Zeroizing<Vec<u8>> {
+    pub(crate) fn secret_mpis(&self) -> Zeroizing<Vec<u8>> {
         match &self.material {
             Material::Rsa { d, p, q, u_pgp, .. } => {
                 let parts = [d, p, q, u_pgp];
@@ -532,7 +573,7 @@ impl KeyPart {
     /// secret MPIs — the inverse of [`KeyPart::public_body`] and
     /// [`KeyPart::secret_mpis`]. The public part is recomputed from the
     /// secret and must match the body.
-    pub fn from_secret(algo: u8, public_body: &[u8], secret_mpis: &[u8]) -> Result<KeyPart> {
+    pub(crate) fn from_secret(algo: u8, public_body: &[u8], secret_mpis: &[u8]) -> Result<KeyPart> {
         let mut r = Reader::new(public_body);
         if r.u8()? != 4 {
             return Err(Error::Unsupported("key version other than 4"));
@@ -571,7 +612,7 @@ impl KeyPart {
 
     /// The key in the card-import form.
     #[must_use]
-    pub fn card_key(&self) -> CardKey {
+    pub(crate) fn card_key(&self) -> CardKey {
         match &self.material {
             Material::Rsa {
                 n,

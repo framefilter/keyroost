@@ -33,7 +33,7 @@ const DAY: i64 = 86_400;
 pub(crate) struct CreatePlan {
     pub(crate) paths: Paths,
     pub(crate) identity: Identity,
-    /// `None`: the card's default ([`default_key_type`]).
+    /// `None`: the card's default ([`key_type_for_card`]).
     pub(crate) key_type: Option<KeyType>,
     pub(crate) expiry: Expiry,
 }
@@ -89,21 +89,37 @@ fn create_type(a: CliOpenpgpKeyAlg) -> Result<KeyType, String> {
     }
 }
 
-/// The key type `--generate` uses without `--algorithm`: ed25519 (GnuPG's
-/// default) when the card lists Ed25519 and X25519 for their slots or
-/// publishes no list, rsa3072 otherwise.
-pub(crate) fn default_key_type(fa: Option<&AlgorithmInformation>) -> KeyType {
-    let Some(fa) = fa else {
-        return KeyType::Cv25519;
-    };
-    let lists = |crt, alg| fa.key_algs(crt).contains(&alg);
-    if lists(KeyCrt::Sign, KeyAlg::Ed25519)
-        && lists(KeyCrt::Decrypt, KeyAlg::X25519)
-        && lists(KeyCrt::Auth, KeyAlg::Ed25519)
-    {
-        KeyType::Cv25519
-    } else {
-        KeyType::Rsa3072
+/// The key type `--generate` makes on a card with Algorithm Information
+/// `fa`: the chosen one, which the card must list for all three slots (a
+/// card that publishes no list is not judged), or — with no `--algorithm` —
+/// the GUI's rule over the types the card lists: ed25519 (GnuPG's default),
+/// else rsa3072, else the first listed. Checked before any key is made or
+/// file written.
+pub(crate) fn key_type_for_card(
+    chosen: Option<KeyType>,
+    fa: Option<&AlgorithmInformation>,
+) -> Result<KeyType, String> {
+    match chosen {
+        Some(t) => match fa.and_then(|fa| t.refused_slot(fa)) {
+            None => Ok(t),
+            Some(crt) => Err(format!(
+                "this card doesn't list {} keys for the {} slot, so it can't take a {} \
+                 set; choose another --algorithm",
+                t.card_alg(crt).label(),
+                crt_label(crt),
+                t.cli_name()
+            )),
+        },
+        None => KeyType::preferred(&KeyType::offered(fa))
+            .ok_or_else(|| "this card lists no key type keyroost can back up".to_string()),
+    }
+}
+
+fn crt_label(crt: KeyCrt) -> &'static str {
+    match crt {
+        KeyCrt::Sign => "signature",
+        KeyCrt::Decrypt => "decryption",
+        KeyCrt::Auth => "authentication",
     }
 }
 
@@ -150,18 +166,14 @@ fn slot_of(s: OpenpgpSlot) -> Slot {
 }
 
 fn slot_label(s: Slot) -> &'static str {
-    match s {
-        Slot::Sign => "signature",
-        Slot::Decrypt => "decryption",
-        Slot::Auth => "authentication",
-    }
+    crt_label(s.crt())
 }
 
 fn slot_word(s: Slot) -> &'static str {
-    match s {
-        Slot::Sign => "sign",
-        Slot::Decrypt => "decrypt",
-        Slot::Auth => "auth",
+    match s.crt() {
+        KeyCrt::Sign => "sign",
+        KeyCrt::Decrypt => "decrypt",
+        KeyCrt::Auth => "auth",
     }
 }
 
@@ -288,20 +300,19 @@ fn create(
     );
     secrets.check(sec)?;
     let dev = crate::target::select(Need::OpenPgp, reader, None)?;
-    let key_type = match plan.key_type {
-        Some(t) => t,
-        None => {
-            let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
-            let t = default_key_type(session.supported_algorithms()?.as_ref());
-            drop(session);
-            output::status(&format!(
-                "No --algorithm given: using {} ({}).",
-                t.cli_name(),
-                t.label()
-            ));
-            t
-        }
-    };
+    // What the card lists decides the default and refuses a type it can't
+    // take, before a key is made or a file written.
+    let mut session = open_openpgp_at(&crate::target::reader_of(&dev)?, debug)?;
+    let fa = session.supported_algorithms()?;
+    drop(session);
+    let key_type = key_type_for_card(plan.key_type, fa.as_ref())?;
+    if plan.key_type.is_none() {
+        output::status(&format!(
+            "No --algorithm given: using {} ({}).",
+            key_type.cli_name(),
+            key_type.label()
+        ));
+    }
 
     let (pass, admin_secret) = secrets.read_first(sec)?;
     let pass = pass.text()?;
@@ -548,8 +559,6 @@ fn import_rsa_file(
     Ok(())
 }
 
-/// Write `contents` over `path` without a half-written file at any moment:
-/// into `path.tmp` (which must not exist), then renamed over `path`.
 /// `openpgp key expiry`.
 pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
     let OpenpgpKeyCmd::Expiry {
@@ -570,10 +579,14 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
         Some(_) => (&PGP_PASSPHRASE, Source::from_flag(passphrase.as_ref())),
         None => (&PGP_SIGN_PIN, Source::from_flag(pin.as_ref())),
     };
-    sec.check(spec, src)?;
-    let text = std::fs::read_to_string(public)
-        .map_err(|e| format!("cannot read {}: {e}", public.display()))?;
-    if text.contains("-----BEGIN PGP PRIVATE KEY BLOCK-----") {
+    // An unprotected backup needs no passphrase, so without the flag the
+    // backup case checks for a source only once the file says it needs one.
+    if backup.is_none() || src.given() {
+        sec.check(spec, src)?;
+    }
+    // Armored or binary; the files are written back armored.
+    let data = std::fs::read(public).map_err(|e| format!("cannot read {}: {e}", public.display()))?;
+    if read::is_secret(&data) {
         return Err(format!(
             "{} is a backup, not a public key: give it with --backup and the public key \
              with --public.",
@@ -581,20 +594,14 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
         )
         .into());
     }
-    let cert = read::open_public(text.as_bytes()).map_err(plain)?;
+    let cert = read::open_public(&data).map_err(plain)?;
     let mut written: Vec<&Path> = Vec::new();
     match backup {
         Some(b) => {
             let secret = Zeroizing::new(
-                std::fs::read_to_string(b)
-                    .map_err(|e| format!("cannot read {}: {e}", b.display()))?,
+                std::fs::read(b).map_err(|e| format!("cannot read {}: {e}", b.display()))?,
             );
-            if read::open_public(secret.as_bytes())
-                .map_err(plain)?
-                .primary
-                .fpr
-                != cert.primary.fpr
-            {
+            if read::open_public(&secret).map_err(plain)?.primary.fpr != cert.primary.fpr {
                 return Err(format!(
                     "{} is not the public key of {}.",
                     public.display(),
@@ -602,7 +609,12 @@ pub(crate) fn run_expiry(cmd: &OpenpgpKeyCmd, debug: bool) -> Res<()> {
                 )
                 .into());
             }
-            let pass = sec.read(spec, src)?;
+            let pass = if src.given() || read::needs_passphrase(&secret).map_err(plain)? {
+                sec.check(spec, src)?;
+                sec.read(spec, src)?
+            } else {
+                Zeroizing::new(String::new())
+            };
             let (new_secret, new_public) =
                 cert::change_expiry_with_backup(&cert, &secret, pass.as_bytes(), *set, now)
                     .map_err(plain)?;
@@ -674,6 +686,70 @@ mod tests {
                 Path::new("k.asc")
             ),
             "this card doesn't accept X keys in the signature slot. Your backup is saved at k.asc."
+        );
+    }
+
+    #[test]
+    fn create_takes_its_key_type_from_the_card_list() {
+        use keyroost_openpgp::{AlgorithmInformation, KeyAlg, KeyCrt};
+        let attr = |a: KeyAlg, c: KeyCrt| a.attributes(c).unwrap();
+        // No list: every type goes, ed25519 by default.
+        assert_eq!(key_type_for_card(None, None), Ok(KeyType::Cv25519));
+        assert_eq!(
+            key_type_for_card(Some(KeyType::NistP384), None),
+            Ok(KeyType::NistP384)
+        );
+        let both = AlgorithmInformation {
+            sig: vec![
+                attr(KeyAlg::Rsa2048, KeyCrt::Sign),
+                attr(KeyAlg::Ed25519, KeyCrt::Sign),
+            ],
+            dec: vec![
+                attr(KeyAlg::Rsa2048, KeyCrt::Decrypt),
+                attr(KeyAlg::X25519, KeyCrt::Decrypt),
+            ],
+            aut: vec![
+                attr(KeyAlg::Rsa2048, KeyCrt::Auth),
+                attr(KeyAlg::Ed25519, KeyCrt::Auth),
+            ],
+        };
+        assert_eq!(key_type_for_card(None, Some(&both)), Ok(KeyType::Cv25519));
+        // A card listing only RSA-2048 gets RSA-2048, not an unlisted
+        // RSA-3072.
+        let rsa2048 = AlgorithmInformation {
+            sig: vec![attr(KeyAlg::Rsa2048, KeyCrt::Sign)],
+            dec: vec![attr(KeyAlg::Rsa2048, KeyCrt::Decrypt)],
+            aut: vec![attr(KeyAlg::Rsa2048, KeyCrt::Auth)],
+        };
+        assert_eq!(key_type_for_card(None, Some(&rsa2048)), Ok(KeyType::Rsa2048));
+        // An explicit type the card doesn't list is refused, naming the
+        // type and the slot.
+        let no_x25519 = AlgorithmInformation {
+            dec: vec![attr(KeyAlg::Rsa2048, KeyCrt::Decrypt)],
+            ..both.clone()
+        };
+        assert_eq!(
+            key_type_for_card(Some(KeyType::Cv25519), Some(&no_x25519)),
+            Err("this card doesn't list X25519 keys for the decryption slot, so it can't \
+                 take a ed25519 set; choose another --algorithm"
+                .to_string())
+        );
+        assert_eq!(key_type_for_card(None, Some(&no_x25519)), Ok(KeyType::Rsa2048));
+        // A slot listing nothing is unknown, not a refusal.
+        let sig_only = AlgorithmInformation {
+            sig: vec![attr(KeyAlg::Rsa2048, KeyCrt::Sign)],
+            dec: Vec::new(),
+            aut: Vec::new(),
+        };
+        assert_eq!(key_type_for_card(None, Some(&sig_only)), Ok(KeyType::Rsa2048));
+        let nothing = AlgorithmInformation {
+            sig: vec![attr(KeyAlg::BrainpoolP256r1, KeyCrt::Sign)],
+            dec: vec![attr(KeyAlg::BrainpoolP256r1, KeyCrt::Decrypt)],
+            aut: vec![attr(KeyAlg::BrainpoolP256r1, KeyCrt::Auth)],
+        };
+        assert_eq!(
+            key_type_for_card(None, Some(&nothing)),
+            Err("this card lists no key type keyroost can back up".to_string())
         );
     }
 }

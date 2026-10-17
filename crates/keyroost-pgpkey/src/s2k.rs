@@ -14,18 +14,18 @@ use crate::Error;
 type Result<T> = std::result::Result<T, Error>;
 
 /// Count byte written for new keys: 16,777,216 octets hashed.
-pub const WRITE_COUNT: u8 = 0xE0;
+pub(crate) const WRITE_COUNT: u8 = 0xE0;
 
 /// Symmetric ciphers for secret-key protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cipher {
+pub(crate) enum Cipher {
     Aes128 = 7,
     Aes192 = 8,
     Aes256 = 9,
 }
 
 impl Cipher {
-    pub fn key_len(self) -> usize {
+    pub(crate) fn key_len(self) -> usize {
         match self {
             Cipher::Aes128 => 16,
             Cipher::Aes192 => 24,
@@ -43,8 +43,10 @@ impl Cipher {
     }
 }
 
-/// Hash algorithms for the S2K.
+/// Hash algorithms: the S2K's, and the ones a [`Signer`](crate::sig::Signer)
+/// is asked to sign a digest of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Hash {
     Sha1 = 2,
     Sha256 = 8,
@@ -99,20 +101,20 @@ impl Hasher {
 }
 
 /// Octets hashed for a count byte (RFC 4880 section 3.7.1.3).
-pub fn decode_count(c: u8) -> u32 {
+pub(crate) fn decode_count(c: u8) -> u32 {
     (16 + (c & 15) as u32) << ((c >> 4) + 6)
 }
 
 /// A string-to-key specifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Spec {
+pub(crate) enum Spec {
     Simple(Hash),
     Salted(Hash, [u8; 8]),
     Iterated(Hash, [u8; 8], u8),
 }
 
 impl Spec {
-    pub fn write(&self, out: &mut Vec<u8>) {
+    pub(crate) fn write(&self, out: &mut Vec<u8>) {
         match *self {
             Spec::Simple(h) => out.extend_from_slice(&[0, h as u8]),
             Spec::Salted(h, salt) => {
@@ -127,7 +129,7 @@ impl Spec {
         }
     }
 
-    pub fn read(r: &mut Reader) -> Result<Spec> {
+    pub(crate) fn read(r: &mut Reader) -> Result<Spec> {
         let kind = r.u8()?;
         match kind {
             0 => Ok(Spec::Simple(Hash::from_id(r.u8()?)?)),
@@ -159,7 +161,7 @@ impl Spec {
     }
 
     /// Derive `key_len` bytes from a passphrase.
-    pub fn derive(&self, pass: &[u8], key_len: usize) -> Zeroizing<Vec<u8>> {
+    pub(crate) fn derive(&self, pass: &[u8], key_len: usize) -> Zeroizing<Vec<u8>> {
         let (hash, salt, total): (Hash, &[u8], usize) = match self {
             Spec::Simple(h) => (*h, &[], pass.len()),
             Spec::Salted(h, s) => (*h, &s[..], 8 + pass.len()),
@@ -195,41 +197,60 @@ fn salt(r: &mut Reader) -> Result<[u8; 8]> {
     Ok(s)
 }
 
-fn encrypt_block(cipher: Cipher, key: &[u8], block: &mut [u8; 16]) {
-    let b = aes::Block::from_mut_slice(block);
-    // Key length is fixed by `Cipher`; callers pass `key_len()` bytes.
-    match cipher {
-        Cipher::Aes128 => Aes128::new_from_slice(key).map(|c| c.encrypt_block(b)),
-        Cipher::Aes192 => Aes192::new_from_slice(key).map(|c| c.encrypt_block(b)),
-        Cipher::Aes256 => Aes256::new_from_slice(key).map(|c| c.encrypt_block(b)),
-    }
-    .expect("key length matches cipher");
+/// One AES block cipher with its key schedule, for [`cfb`].
+enum Block {
+    Aes128(Aes128),
+    Aes192(Aes192),
+    Aes256(Aes256),
 }
 
-fn cfb(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8], decrypt: bool) -> Vec<u8> {
-    let mut fb = [0u8; 16];
-    let n = iv.len().min(16);
-    fb[..n].copy_from_slice(&iv[..n]);
+impl Block {
+    fn new(cipher: Cipher, key: &[u8]) -> Result<Block> {
+        let bad = |_| Error::Crypto("wrong key length for the cipher".into());
+        Ok(match cipher {
+            Cipher::Aes128 => Block::Aes128(Aes128::new_from_slice(key).map_err(bad)?),
+            Cipher::Aes192 => Block::Aes192(Aes192::new_from_slice(key).map_err(bad)?),
+            Cipher::Aes256 => Block::Aes256(Aes256::new_from_slice(key).map_err(bad)?),
+        })
+    }
+
+    fn encrypt(&self, block: &mut [u8; 16]) {
+        let b = aes::Block::from_mut_slice(block);
+        match self {
+            Block::Aes128(c) => c.encrypt_block(b),
+            Block::Aes192(c) => c.encrypt_block(b),
+            Block::Aes256(c) => c.encrypt_block(b),
+        }
+    }
+}
+
+/// Plain CFB-128 (no resync). `key` must be `cipher.key_len()` bytes and
+/// `iv` one 16-byte block; anything else is an error, not a panic.
+fn cfb(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8], decrypt: bool) -> Result<Vec<u8>> {
+    let block = Block::new(cipher, key)?;
+    let mut fb: [u8; 16] = iv
+        .try_into()
+        .map_err(|_| Error::Crypto("the IV is not one 16-byte block".into()))?;
     let mut out = Vec::with_capacity(data.len());
     for chunk in data.chunks(16) {
         let mut ks = fb;
-        encrypt_block(cipher, key, &mut ks);
+        block.encrypt(&mut ks);
         let start = out.len();
         out.extend(chunk.iter().zip(ks.iter()).map(|(a, b)| a ^ b));
         let ct = if decrypt { chunk } else { &out[start..] };
         fb = [0u8; 16];
         fb[..ct.len()].copy_from_slice(ct);
     }
-    out
+    Ok(out)
 }
 
-/// Plain CFB-128 encryption (no resync). `key` must be `cipher.key_len()` bytes.
-pub fn cfb_encrypt(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+/// Plain CFB-128 encryption (no resync).
+pub(crate) fn cfb_encrypt(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     cfb(cipher, key, iv, data, false)
 }
 
 /// Plain CFB-128 decryption (no resync).
-pub fn cfb_decrypt(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn cfb_decrypt(cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     cfb(cipher, key, iv, data, true)
 }
 
@@ -239,7 +260,7 @@ fn sum16(d: &[u8]) -> u16 {
 
 /// Protect plaintext secret MPIs for a secret-key packet: returns the bytes
 /// after the public part (usage 254, AES-256, iterated SHA-256, SHA-1 check).
-pub fn protect(secret_mpis: &[u8], pass: &[u8]) -> Vec<u8> {
+pub(crate) fn protect(secret_mpis: &[u8], pass: &[u8]) -> Result<Vec<u8>> {
     let mut salt = [0u8; 8];
     OsRng.fill_bytes(&mut salt);
     let mut iv = [0u8; 16];
@@ -249,17 +270,17 @@ pub fn protect(secret_mpis: &[u8], pass: &[u8]) -> Vec<u8> {
     let mut plain = Zeroizing::new(Vec::with_capacity(secret_mpis.len() + 20));
     plain.extend_from_slice(secret_mpis);
     plain.extend_from_slice(&keyroost_proto::sha1::sha1(secret_mpis));
-    let ct = cfb_encrypt(Cipher::Aes256, &key, &iv, &plain);
+    let ct = cfb_encrypt(Cipher::Aes256, &key, &iv, &plain)?;
     let mut out = vec![254, Cipher::Aes256 as u8];
     spec.write(&mut out);
     out.extend_from_slice(&iv);
     out.extend_from_slice(&ct);
-    out
+    Ok(out)
 }
 
 /// Read the protection fields following a secret key's public part and
 /// return the plaintext secret MPIs, checking the integrity value.
-pub fn unprotect(r: &mut Reader, pass: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn unprotect(r: &mut Reader, pass: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
     let usage = r.u8()?;
     match usage {
         0 => {
@@ -275,7 +296,7 @@ pub fn unprotect(r: &mut Reader, pass: Option<&[u8]>) -> Result<Zeroizing<Vec<u8
             let iv = r.take(16)?;
             let ct = r.rest()?;
             let key = spec.derive(pass, cipher.key_len());
-            let plain = Zeroizing::new(cfb_decrypt(cipher, &key, iv, ct));
+            let plain = Zeroizing::new(cfb_decrypt(cipher, &key, iv, ct)?);
             if usage == 254 {
                 let split = plain.len().checked_sub(20).ok_or(Error::Truncated)?;
                 let (data, mac) = plain.split_at(split);
@@ -334,7 +355,7 @@ mod tests {
         let iv = hex("000102030405060708090a0b0c0d0e0f");
         let pt = hex("6bc1bee22e409f96e93d7e117393172a");
         assert_eq!(
-            cfb_encrypt(Cipher::Aes128, &key, &iv, &pt),
+            cfb_encrypt(Cipher::Aes128, &key, &iv, &pt).unwrap(),
             hex("3b3fd92eb72dad20333449f8e83cfb4a")
         );
         assert_eq!(
@@ -343,9 +364,25 @@ mod tests {
                 &key,
                 &iv,
                 &hex("3b3fd92eb72dad20333449f8e83cfb4a")
-            ),
+            )
+            .unwrap(),
             pt
         );
+    }
+
+    #[test]
+    fn cfb_refuses_a_wrong_key_or_iv_length() {
+        let key = [0u8; 16];
+        let iv = [0u8; 16];
+        assert!(matches!(
+            cfb_encrypt(Cipher::Aes256, &key, &iv, b"x"),
+            Err(Error::Crypto(_))
+        ));
+        assert!(matches!(
+            cfb_decrypt(Cipher::Aes128, &key, &iv[..8], b"x"),
+            Err(Error::Crypto(_))
+        ));
+        assert!(cfb_decrypt(Cipher::Aes128, &key, &iv, b"x").is_ok());
     }
     #[test]
     fn iterated_s2k_hashes_count_octets_of_salt_then_pass() {
@@ -368,7 +405,7 @@ mod tests {
     #[test]
     fn protect_unprotect_round_trip_and_wrong_pass() {
         let secret = vec![0x00, 0x08, 0x42];
-        let blob = protect(&secret, b"correct horse");
+        let blob = protect(&secret, b"correct horse").unwrap();
         let mut r = Reader::new(&blob);
         assert_eq!(
             &unprotect(&mut r, Some(b"correct horse")).unwrap()[..],

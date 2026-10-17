@@ -957,27 +957,12 @@ struct CreatedKeys {
 /// The key types the create dialog offers: all eight when the card lists no
 /// algorithms, otherwise those whose algorithm the card lists for each of
 /// the three slots. A slot the card lists nothing for counts as unknown,
-/// as in the Generate menu ([`OpenPgpKeyAlgSel::choices`]).
+/// as in the Generate menu ([`OpenPgpKeyAlgSel::choices`]). The CLI uses
+/// the same rule ([`keyroost_pgpkey::keys::KeyType::offered`]).
 fn offered_key_types(
     supported: Option<&keyroost_transport::AlgorithmInformation>,
 ) -> Vec<keyroost_pgpkey::keys::KeyType> {
-    use keyroost_pgpkey::keys::KeyType;
-    use keyroost_transport::KeyCrt;
-    let Some(fa) = supported else {
-        return KeyType::ALL.to_vec();
-    };
-    let lists: Vec<_> = [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth]
-        .into_iter()
-        .map(|crt| (crt, fa.key_algs(crt)))
-        .collect();
-    KeyType::ALL
-        .into_iter()
-        .filter(|t| {
-            lists
-                .iter()
-                .all(|(crt, algs)| algs.is_empty() || algs.contains(&t.card_alg(*crt)))
-        })
-        .collect()
+    keyroost_pgpkey::keys::KeyType::offered(supported)
 }
 
 /// The type the create dialog starts on, the CLI's rule: Curve 25519 (GnuPG's
@@ -985,11 +970,7 @@ fn offered_key_types(
 fn default_create_type(
     offered: &[keyroost_pgpkey::keys::KeyType],
 ) -> Option<keyroost_pgpkey::keys::KeyType> {
-    use keyroost_pgpkey::keys::KeyType;
-    [KeyType::Cv25519, KeyType::Rsa3072]
-        .into_iter()
-        .find(|t| offered.contains(t))
-        .or_else(|| offered.first().copied())
+    keyroost_pgpkey::keys::KeyType::preferred(offered)
 }
 
 /// Why the create form can't be submitted yet, checked before any key is
@@ -1169,17 +1150,17 @@ fn expiry_form_error(f: &ExpiryForm, today: ui::date::Date) -> Option<&'static s
 /// Read the public key the new date goes into, refusing a backup given in
 /// its place (the CLI's rule).
 fn public_for_expiry(
-    text: &str,
+    data: &[u8],
     path: &std::path::Path,
 ) -> Result<keyroost_pgpkey::read::PublicCert, String> {
-    if text.contains("-----BEGIN PGP PRIVATE KEY BLOCK-----") {
+    if keyroost_pgpkey::read::is_secret(data) {
         return Err(format!(
             "{} is a backup, not a public key: choose the public key file (NAME.pub.asc) \
              here, and the backup under Sign with.",
             path.display()
         ));
     }
-    keyroost_pgpkey::read::open_public(text.as_bytes()).map_err(pgp_plain)
+    keyroost_pgpkey::read::open_public(data).map_err(pgp_plain)
 }
 
 /// A fingerprint as GnuPG prints it: upper-case hex in groups of four.
@@ -1200,11 +1181,11 @@ fn expiry_saved_notice(public: &std::path::Path) -> String {
 }
 
 fn pgp_slot_index(s: keyroost_pgpkey::read::Slot) -> usize {
-    use keyroost_pgpkey::read::Slot;
-    match s {
-        Slot::Sign => 0,
-        Slot::Decrypt => 1,
-        Slot::Auth => 2,
+    use keyroost_transport::KeyCrt;
+    match s.crt() {
+        KeyCrt::Sign => 0,
+        KeyCrt::Decrypt => 1,
+        KeyCrt::Auth => 2,
     }
 }
 
@@ -2533,11 +2514,11 @@ impl OpenPgpSlotSel {
         }
     }
     fn from_slot(s: keyroost_pgpkey::read::Slot) -> Self {
-        use keyroost_pgpkey::read::Slot;
-        match s {
-            Slot::Sign => OpenPgpSlotSel::Sign,
-            Slot::Decrypt => OpenPgpSlotSel::Decrypt,
-            Slot::Auth => OpenPgpSlotSel::Auth,
+        use keyroost_transport::KeyCrt;
+        match s.crt() {
+            KeyCrt::Sign => OpenPgpSlotSel::Sign,
+            KeyCrt::Decrypt => OpenPgpSlotSel::Decrypt,
+            KeyCrt::Auth => OpenPgpSlotSel::Auth,
         }
     }
     fn label(self) -> &'static str {
@@ -8045,9 +8026,9 @@ impl App {
         let for_device = self.selected_device.clone();
         self.openpgp.notice = None;
         self.spawn_job("Reading the public key\u{2026}", move || {
-            let result = std::fs::read_to_string(&path)
+            let result = std::fs::read(&path)
                 .map_err(|e| format!("Cannot read {}: {e}", path.display()))
-                .and_then(|text| public_for_expiry(&text, &path));
+                .and_then(|data| public_for_expiry(&data, &path));
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return;
@@ -8117,9 +8098,9 @@ impl App {
         self.spawn_job(label, move || {
             let result = (|| -> Result<(), String> {
                 let now = unix_now();
-                let text = std::fs::read_to_string(&public)
+                let data = std::fs::read(&public)
                     .map_err(|e| format!("Cannot read {}: {e}", public.display()))?;
-                let cert = public_for_expiry(&text, &public)?;
+                let cert = public_for_expiry(&data, &public)?;
                 if cert.primary.fpr != shown {
                     return Err(format!(
                         "{} holds a different key since it was opened; open it again.",
@@ -8129,10 +8110,10 @@ impl App {
                 match &by {
                     By::Backup(b) => {
                         let secret_text = zeroize::Zeroizing::new(
-                            std::fs::read_to_string(b)
+                            std::fs::read(b)
                                 .map_err(|e| format!("Cannot read {}: {e}", b.display()))?,
                         );
-                        if read::open_public(secret_text.as_bytes())
+                        if read::open_public(&secret_text)
                             .map_err(pgp_plain)?
                             .primary
                             .fpr
@@ -24443,18 +24424,30 @@ mod tests {
 
     #[test]
     fn a_backup_given_as_the_public_key_is_refused() {
+        use keyroost_pgpkey::cert::{create, export, Expiry, Identity};
         let p = std::path::Path::new("k.asc");
-        let e = public_for_expiry(
-            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n-----END PGP PRIVATE KEY BLOCK-----\n",
-            p,
-        )
-        .unwrap_err();
-        assert_eq!(
-            e,
-            "k.asc is a backup, not a public key: choose the public key file (NAME.pub.asc) \
-             here, and the backup under Sign with."
-        );
-        assert!(public_for_expiry("not a key", p).is_err());
+        let id = Identity {
+            name: "Ada".into(),
+            email: String::new(),
+        };
+        let now = 1_792_108_800;
+        let set = create(keyroost_pgpkey::keys::KeyType::Cv25519, &id, Expiry::Never, now).unwrap();
+        let out = export(&set, b"pw", now).unwrap();
+        // Armored or binary, a backup is refused here; a public key is read
+        // either way.
+        let binary = |armored: &str| keyroost_pgpkey::armor::decode(armored).unwrap().1;
+        for secret in [out.secret.as_bytes().to_vec(), binary(&out.secret)] {
+            assert_eq!(
+                public_for_expiry(&secret, p).unwrap_err(),
+                "k.asc is a backup, not a public key: choose the public key file (NAME.pub.asc) \
+                 here, and the backup under Sign with."
+            );
+        }
+        for public in [out.public.as_bytes().to_vec(), binary(&out.public)] {
+            let cert = public_for_expiry(&public, p).unwrap();
+            assert_eq!(cert.primary.fpr, set.parts[0].fingerprint());
+        }
+        assert!(public_for_expiry(b"not a key", p).is_err());
     }
 
     #[test]
