@@ -7692,10 +7692,8 @@ impl App {
             Box::new(move |app: &mut App| match result {
                 Ok(devices) => {
                     app.devices_error = None;
-                    // Windows only needs `devices` mutable for the additive FIDO pass
-                    // below; off-Windows the original binding flows through unchanged
-                    // (a plain `let mut` here would be an unused-mut warning).
-                    #[cfg(windows)]
+                    // Mutable for the Windows FIDO pass below and for keeping the
+                    // open Molto2's serial and name.
                     let mut devices = devices;
                     // Windows non-admin: the FIDO2 capability is read from the HID
                     // usage page 0xF1D0, which a non-elevated process can't open
@@ -7791,7 +7789,6 @@ impl App {
                             if devices.len() == 1 { "" } else { "s" }
                         ),
                     );
-                    let mut devices = devices;
                     keep_open_token_identity(
                         &app.devices,
                         &mut devices,
