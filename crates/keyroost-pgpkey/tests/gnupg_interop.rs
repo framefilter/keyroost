@@ -93,6 +93,20 @@ fn gpg(home: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     child.wait_with_output().unwrap()
 }
 
+/// Run `gpg --edit-key fpr` with `commands`. Both arrive on stdin: gpg
+/// reads the passphrase line first (`--passphrase-fd 0`), then the
+/// commands (`--command-fd 0`).
+fn gpg_edit(home: &Path, fpr: &str, commands: &str) -> Output {
+    let mut input = PASS.to_vec();
+    input.push(b'\n');
+    input.extend_from_slice(commands.as_bytes());
+    gpg(
+        home,
+        &["--command-fd", "0", "--edit-key", fpr],
+        Some(&input),
+    )
+}
+
 fn ok(o: &Output, what: &str) -> String {
     assert!(
         o.status.success(),
@@ -124,6 +138,7 @@ struct ColonKey {
     usage: String,
     expires: String,
     validity: String,
+    created: String,
 }
 
 fn colon_keys(out: &str) -> Vec<ColonKey> {
@@ -141,6 +156,7 @@ fn colon_keys(out: &str) -> Vec<ColonKey> {
                     usage: usage.into_iter().collect(),
                     expires: f[6].into(),
                     validity: f[1].into(),
+                    created: f[5].into(),
                 });
                 pending = true;
             }
@@ -393,11 +409,20 @@ fn gpg_made_key_loads(tag: &str, primary: &str, enc: &str, auth: &str, t: KeyTyp
             "quick-add-key",
         );
     }
+    // An expiry set and then cleared: the newest self-signature has no
+    // expiry subpacket, which means never.
+    for when in ["1y", "never"] {
+        ok(
+            &gpg(h, &["--quick-set-expire", &fpr, when], Some(PASS)),
+            "quick-set-expire",
+        );
+    }
     let o = ok(
         &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
         "list",
     );
     let gkeys = colon_keys(&o);
+    assert_eq!(gkeys[0].expires, "", "{o}");
     assert_eq!(gkeys.len(), 3, "{o}");
     let armored = ok(
         &gpg(h, &["--armor", "--export-secret-keys", &fpr], Some(PASS)),
@@ -440,10 +465,208 @@ fn gpg_made_key_loads(tag: &str, primary: &str, enc: &str, auth: &str, t: KeyTyp
         &gpg(h, &["--armor", "--export-secret-subkeys", &fpr], Some(PASS)),
         "export-secret-subkeys",
     );
-    assert!(matches!(
-        read::open(subs.as_bytes(), Some(PASS)),
-        Err(Error::NoSecretPart)
+    let subs = read::open(subs.as_bytes(), Some(PASS)).unwrap();
+    assert!(!subs.primary_secret);
+    assert_eq!(hex(&subs.primary_fpr), fpr);
+    let slots: Vec<_> = subs.keys.iter().map(|k| k.slot).collect();
+    // gpg's primary here signs; without its secret the Sign slot stays
+    // empty rather than falling to a subkey that cannot sign.
+    assert_eq!(slots, [Some(Slot::Decrypt), Some(Slot::Auth)], "{tag}");
+    assert!(
+        subs.notes[0].contains("has no secret part"),
+        "{:?}",
+        subs.notes
+    );
+}
+
+/// A key set shaped the way careful gpg users keep theirs: certify-only
+/// primary; separate sign, encrypt and auth subkeys; a second user ID;
+/// expiry changed on the primary and then on every subkey; three
+/// encryption subkeys of which the newest is revoked; and a designated
+/// revoker (a newer 0x1F signature with neither flags nor expiry).
+#[test]
+fn gpg_certify_only_key_with_history_loads() {
+    if !have_gpg() {
+        return;
+    }
+    let home = Home::new("hist");
+    let h = &home.0;
+    let uid = "T <t@example.org>";
+    let pass = Some(PASS);
+    ok(
+        &gpg(
+            h,
+            &["--quick-gen-key", uid, "ed25519", "cert", "never"],
+            pass,
+        ),
+        "quick-gen-key",
+    );
+    let fpr = colon_keys(&ok(
+        &gpg(h, &["--with-colons", "--list-secret-keys", uid], None),
+        "list",
+    ))
+    .remove(0)
+    .fpr;
+    let add = |algo: &str, usage: &str| {
+        ok(
+            &gpg(h, &["--quick-add-key", &fpr, algo, usage, "never"], pass),
+            "quick-add-key",
+        );
+    };
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(1100));
+    add("ed25519", "sign");
+    add("cv25519", "encr");
+    add("ed25519", "auth");
+    pause();
+    add("cv25519", "encr");
+    pause();
+    add("cv25519", "encr");
+    ok(
+        &gpg(h, &["--quick-add-uid", &fpr, "T2 <t2@example.org>"], pass),
+        "quick-add-uid",
+    );
+    ok(
+        &gpg(h, &["--quick-set-expire", &fpr, "1y"], pass),
+        "set-expire",
+    );
+    ok(
+        &gpg(h, &["--quick-set-expire", &fpr, "2y", "*"], pass),
+        "set-expire subkeys",
+    );
+    let gkeys = colon_keys(&ok(
+        &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
+        "list",
     ));
+    assert_eq!(gkeys.len(), 6);
+    let newest_enc = gkeys[5].fpr.clone();
+    ok(
+        &gpg_edit(
+            h,
+            &fpr,
+            &format!("key {newest_enc}\nrevkey\ny\n0\n\ny\nsave\n"),
+        ),
+        "revkey",
+    );
+    pause();
+    ok(
+        &gpg(
+            h,
+            &[
+                "--quick-gen-key",
+                "R <r@example.org>",
+                "ed25519",
+                "cert",
+                "never",
+            ],
+            pass,
+        ),
+        "revoker key",
+    );
+    let revoker = colon_keys(&ok(
+        &gpg(h, &["--with-colons", "--list-keys", "r@example.org"], None),
+        "list revoker",
+    ))
+    .remove(0)
+    .fpr;
+    ok(
+        &gpg_edit(h, &fpr, &format!("addrevoker\n{revoker}\ny\nsave\n")),
+        "addrevoker",
+    );
+
+    let o = ok(
+        &gpg(h, &["--with-colons", "--list-secret-keys", &fpr], None),
+        "list",
+    );
+    assert!(o.lines().any(|l| l.starts_with("rvk:")), "{o}");
+    let gkeys = colon_keys(&o);
+    let usage: Vec<&str> = gkeys.iter().map(|k| k.usage.as_str()).collect();
+    assert_eq!(usage, ["c", "s", "e", "a", "e", "e"], "{o}");
+    assert_eq!(gkeys[5].validity, "r", "{o}");
+    // What gpg itself encrypts to.
+    let data = home.write("m.txt", b"x\n");
+    let msg = home.file("m.gpg");
+    let msg = msg.to_str().unwrap();
+    ok(
+        &gpg(
+            h,
+            &[
+                "--trust-model",
+                "always",
+                "-r",
+                &fpr,
+                "-o",
+                msg,
+                "--encrypt",
+                &data,
+            ],
+            None,
+        ),
+        "encrypt",
+    );
+    // Lists the recipient key ids without decrypting.
+    let listed = gpg(
+        h,
+        &["--list-only", "--status-fd", "1", "--decrypt", msg],
+        None,
+    );
+    let st = String::from_utf8_lossy(&listed.stdout);
+    let enc_to = st
+        .lines()
+        .find_map(|l| l.strip_prefix("[GNUPG:] ENC_TO "))
+        .and_then(|l| l.split(' ').next())
+        .unwrap()
+        .to_string();
+    assert_eq!(enc_to, gkeys[4].fpr[24..], "gpg picks the newest valid one");
+
+    let armored = ok(
+        &gpg(h, &["--armor", "--export-secret-keys", &fpr], pass),
+        "export-secret-keys",
+    );
+    let loaded = read::open(armored.as_bytes(), pass).unwrap();
+    assert!(loaded.primary_secret);
+    // In the file's order, which is gpg's; compare as a set.
+    let mut uids = loaded.user_ids.clone();
+    uids.sort();
+    assert_eq!(uids, [uid, "T2 <t2@example.org>"]);
+    let created: u64 = gkeys[0].created.parse().unwrap();
+    let expires: u64 = gkeys[0].expires.parse().unwrap();
+    assert_eq!(loaded.expiry.map(u64::from), Some(expires - created));
+    assert_eq!(loaded.keys.len(), 5, "revoked subkey skipped");
+    assert_eq!(loaded.notes.len(), 1, "{:?}", loaded.notes);
+    assert!(loaded.notes[0].contains("revoked"), "{:?}", loaded.notes);
+    let slot_of = |f: &str| {
+        loaded
+            .keys
+            .iter()
+            .find(|k| hex(&k.fpr) == f)
+            .map(|k| k.slot)
+            .unwrap()
+    };
+    assert_eq!(slot_of(&gkeys[0].fpr), None, "certify-only primary");
+    assert_eq!(slot_of(&gkeys[1].fpr), Some(Slot::Sign));
+    assert_eq!(slot_of(&gkeys[2].fpr), None, "older encryption subkey");
+    assert_eq!(slot_of(&gkeys[3].fpr), Some(Slot::Auth));
+    assert_eq!(slot_of(&gkeys[4].fpr), Some(Slot::Decrypt));
+
+    // Subkeys only: the certify-only primary has no secret part; the
+    // rest loads and fills the same slots.
+    let subs = ok(
+        &gpg(h, &["--armor", "--export-secret-subkeys", &fpr], pass),
+        "export-secret-subkeys",
+    );
+    let subs = read::open(subs.as_bytes(), pass).unwrap();
+    assert!(!subs.primary_secret);
+    assert_eq!(subs.keys.len(), 4);
+    let slots: Vec<_> = subs.keys.iter().map(|k| k.slot).collect();
+    assert_eq!(
+        slots,
+        [
+            Some(Slot::Sign),
+            None,
+            Some(Slot::Auth),
+            Some(Slot::Decrypt)
+        ]
+    );
 }
 
 #[test]

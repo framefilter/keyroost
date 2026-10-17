@@ -38,6 +38,9 @@ pub struct Loaded {
     pub keys: Vec<LoadedKey>,
     pub expiry: Option<u32>,
     pub primary_fpr: [u8; 20],
+    /// Whether the file holds the primary key's secret part (not the
+    /// case for `gpg --export-secret-subkeys` output).
+    pub primary_secret: bool,
     pub notes: Vec<String>,
 }
 
@@ -95,15 +98,8 @@ pub(crate) fn open_at(data: &[u8], pass: Option<&[u8]>, now: u32) -> Result<Load
         return Err(Error::PublicOnly);
     }
     let pfpr = cert.primary.fpr;
-    let newest = cert
-        .uids
-        .iter()
-        .flat_map(|(_, sigs)| sigs.iter().filter(|s| (0x10..=0x13).contains(&s.typ)))
-        .chain(cert.primary.sigs.iter().filter(|s| s.typ == 0x1F))
-        .filter(|s| s.by(&pfpr))
-        .max_by_key(|s| s.created)
-        .ok_or(Error::Malformed("no self-signature"))?;
-    let expiry = newest.expiry.filter(|&e| e != 0);
+    let info = primary_info(&cert, &pfpr)?;
+    let expiry = info.expiry;
 
     let mut notes = Vec::new();
     if cert
@@ -120,9 +116,11 @@ pub(crate) fn open_at(data: &[u8], pass: Option<&[u8]>, now: u32) -> Result<Load
         }
     }
 
-    let mut chosen: Vec<(&Key, u8)> = vec![(
+    // (key, flags, newest self-signature or binding time)
+    let mut chosen: Vec<(&Key, u8, u32)> = vec![(
         &cert.primary,
-        newest.flags.unwrap_or(FLAG_CERTIFY | FLAG_SIGN),
+        info.flags.unwrap_or(FLAG_CERTIFY | FLAG_SIGN),
+        info.time,
     )];
     for sub in &cert.subkeys {
         let id = key_id_hex(&sub.fpr);
@@ -161,46 +159,162 @@ pub(crate) fn open_at(data: &[u8], pass: Option<&[u8]>, now: u32) -> Result<Load
         } else {
             FLAG_SIGN
         };
-        chosen.push((sub, bind.flags.unwrap_or(fallback)));
+        chosen.push((sub, bind.flags.unwrap_or(fallback), bind.created));
     }
 
-    let mut taken = [false; 3];
+    let mut primary_secret = true;
     let mut keys = Vec::with_capacity(chosen.len());
-    for (key, flags) in chosen {
+    // Per loaded key: (usable flags, key creation time, signature time).
+    let mut rank = Vec::with_capacity(chosen.len());
+    for (n, (key, flags, sig_time)) in chosen.into_iter().enumerate() {
         let mut r = Reader::new(&key.body[key.pub_len..]);
-        let secret = s2k::unprotect(&mut r, pass)?;
+        let secret = match s2k::unprotect(&mut r, pass) {
+            Ok(secret) => secret,
+            Err(Error::NoSecretPart) => {
+                let what = if n == 0 {
+                    primary_secret = false;
+                    format!("The primary key {}", key_id_hex(&key.fpr))
+                } else {
+                    format!("Subkey {}", key_id_hex(&key.fpr))
+                };
+                notes.push(format!("{what} has no secret part in this file."));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let part = KeyPart::from_secret(key.algo, &key.body[..key.pub_len], &secret)?;
         if part.fingerprint() != key.fpr {
             return Err(Error::Malformed("key does not match its public part"));
         }
-        let usable = flags & capabilities(key.algo);
-        let slot = [
-            (Slot::Sign, FLAG_SIGN),
-            (Slot::Decrypt, FLAG_ENCRYPT),
-            (Slot::Auth, FLAG_AUTH),
-        ]
-        .into_iter()
-        .enumerate()
-        .find(|&(i, (_, f))| usable & f != 0 && !taken[i])
-        .map(|(i, (slot, _))| {
-            taken[i] = true;
-            slot
-        });
+        rank.push((flags & capabilities(key.algo), key.created, sig_time));
         keys.push(LoadedKey {
-            slot,
+            slot: None,
             key_type: key_type(&part),
             part,
             flags,
             fpr: key.fpr,
         });
     }
+    if keys.is_empty() {
+        return Err(Error::NoSecretPart);
+    }
+    assign_slots(&mut keys, &rank);
 
     Ok(Loaded {
-        user_ids: cert.uids.into_iter().map(|(u, _)| u).collect(),
+        user_ids: info.user_ids,
         keys,
         expiry,
         primary_fpr: pfpr,
+        primary_secret,
         notes,
+    })
+}
+
+/// Give each card slot one key. For a slot, the candidates are the loaded
+/// (valid, non-revoked, non-expired, with a secret part) keys whose flags,
+/// limited to what their algorithm can do, include the slot's usage. A key
+/// for that one usage only beats a multi-purpose key; among equals the
+/// newest key wins (latest key creation time, as gpg picks its encryption
+/// subkey, then the latest binding or self-signature, then the earlier key
+/// in the file). A key fills at most one slot; slots are filled in the
+/// order Sign, Decrypt, Auth.
+fn assign_slots(keys: &mut [LoadedKey], rank: &[(u8, u32, u32)]) {
+    for (slot, usage) in [
+        (Slot::Sign, FLAG_SIGN),
+        (Slot::Decrypt, FLAG_ENCRYPT),
+        (Slot::Auth, FLAG_AUTH),
+    ] {
+        let best = (0..keys.len())
+            .filter(|&i| keys[i].slot.is_none() && rank[i].0 & usage != 0)
+            .max_by_key(|&i| {
+                let (usable, created, sig_time) = rank[i];
+                (
+                    usable & !usage == 0,
+                    created,
+                    sig_time,
+                    std::cmp::Reverse(i),
+                )
+            });
+        if let Some(i) = best {
+            keys[i].slot = Some(slot);
+        }
+    }
+}
+
+/// What the primary key's self-signatures say.
+struct PrimaryInfo {
+    flags: Option<u8>,
+    /// Seconds after creation; `None` for never.
+    expiry: Option<u32>,
+    /// Creation time of the self-signature the fields came from.
+    time: u32,
+    /// User IDs with a valid, unrevoked self-certification.
+    user_ids: Vec<String>,
+}
+
+/// Resolve the primary's flags and expiry. A user ID's newest
+/// self-certification (0x10–0x13) is what counts for that user ID, and a
+/// user ID revoked (0x30) at or after it is dropped. Of the remaining
+/// user IDs the one flagged primary (subpacket 25) wins, else the one
+/// certified last; its self-certification gives flags and expiry, where a
+/// missing expiry means never (that is how `gpg --quick-set-expire never`
+/// writes it). Only a field that self-certification lacks, or when there is
+/// no user ID certification at all, comes from the newest direct-key
+/// signature (0x1F) that carries it: GnuPG's designated-revoker
+/// signatures, for one, are 0x1F without flags or expiry.
+fn primary_info(cert: &Cert, pfpr: &[u8; 20]) -> Result<PrimaryInfo> {
+    fn newest<'s>(sigs: &'s [Sig], pfpr: &[u8; 20], typ: fn(u8) -> bool) -> Option<&'s Sig> {
+        sigs.iter()
+            .filter(|s| typ(s.typ) && s.by(pfpr))
+            .max_by_key(|s| s.created)
+    }
+    let mut live: Vec<(&str, &Sig)> = Vec::new();
+    for (uid, sigs) in &cert.uids {
+        let Some(c) = newest(sigs, pfpr, |t| (0x10..=0x13).contains(&t)) else {
+            continue;
+        };
+        let revoked = newest(sigs, pfpr, |t| t == 0x30).is_some_and(|r| r.created >= c.created);
+        if !revoked {
+            live.push((uid, c));
+        }
+    }
+    let chosen = live
+        .iter()
+        .filter(|(_, s)| s.primary_uid)
+        .max_by_key(|(_, s)| s.created)
+        .or_else(|| live.iter().max_by_key(|(_, s)| s.created))
+        .map(|&(_, s)| s);
+    let direct: Vec<&Sig> = cert
+        .primary
+        .sigs
+        .iter()
+        .filter(|s| s.typ == 0x1F && s.by(pfpr))
+        .collect();
+    let direct_with = |f: fn(&Sig) -> Option<u32>| {
+        direct
+            .iter()
+            .filter(|s| f(s).is_some())
+            .max_by_key(|s| s.created)
+            .and_then(|s| f(s))
+    };
+    let time = match (chosen, direct.iter().map(|s| s.created).max()) {
+        (Some(c), _) => c.created,
+        (None, Some(t)) => t,
+        (None, None) => return Err(Error::Malformed("no self-signature")),
+    };
+    let flags = chosen
+        .and_then(|s| s.flags)
+        .or_else(|| direct_with(|s| s.flags.map(u32::from)).map(|f| f as u8));
+    let expiry = match chosen {
+        Some(c) if c.expiry.is_some() => c.expiry,
+        _ => direct_with(|s| s.expiry),
+    }
+    .filter(|&e| e != 0);
+    Ok(PrimaryInfo {
+        flags,
+        expiry,
+        time,
+        user_ids: live.iter().map(|(u, _)| (*u).to_string()).collect(),
     })
 }
 
@@ -264,6 +378,8 @@ struct Sig {
     created: u32,
     expiry: Option<u32>,
     flags: Option<u8>,
+    /// Primary user ID flag (subpacket 25), hashed.
+    primary_uid: bool,
     issuer_fpr: Option<[u8; 20]>,
     issuer_id: Option<[u8; 8]>,
 }
@@ -319,6 +435,7 @@ fn subpackets(data: &[u8], sig: &mut Sig, hashed: bool) -> Result<()> {
             (2, true) => sig.created = be32(v).ok_or(Error::Malformed("bad signature time"))?,
             (9, true) => sig.expiry = Some(be32(v).ok_or(Error::Malformed("bad key expiry"))?),
             (27, true) => sig.flags = Some(v.first().copied().unwrap_or(0)),
+            (25, true) => sig.primary_uid = v.first().is_some_and(|&b| b != 0),
             (33, _) => {
                 if let [4, rest @ ..] = v {
                     sig.issuer_fpr = <[u8; 20]>::try_from(rest).ok();
@@ -765,17 +882,36 @@ mod tests {
     }
 
     #[test]
-    fn gnu_dummy_primary_says_the_secret_is_missing() {
+    fn gnu_dummy_keys_are_noted_and_all_dummy_fails() {
         let (set, text) = make(KeyType::Cv25519, Expiry::default());
         let (_, bin) = armor::decode(&text).unwrap();
-        let pub_len = set.parts[0].public_body().len();
-        let dummy = rebuild(&bin, |i, _, b| {
+        let dummy = |b: &mut Vec<u8>, len: usize| {
+            b.truncate(len);
+            b.extend_from_slice(&[254, 0, 101, 0, b'G', b'N', b'U', 1]);
+        };
+        let lens: Vec<usize> = set.parts.iter().map(|p| p.public_body().len()).collect();
+        let no_primary = rebuild(&bin, |i, _, b| {
             if i == 0 {
-                b.truncate(pub_len);
-                b.extend_from_slice(&[254, 0, 101, 0, b'G', b'N', b'U', 1]);
+                dummy(b, lens[0]);
             }
         });
-        let err = open(&dummy, Some(b"pw")).err().unwrap();
+        let got = open_at(&no_primary, Some(b"pw"), NOW).unwrap();
+        assert!(!got.primary_secret);
+        assert_eq!(got.primary_fpr, set.parts[0].fingerprint());
+        let slots: Vec<_> = got.keys.iter().map(|k| k.slot).collect();
+        assert_eq!(slots, [Some(Slot::Decrypt), Some(Slot::Auth)]);
+        assert_eq!(got.notes.len(), 1);
+        assert!(got.notes[0].contains("has no secret part in this file"));
+        let full = open_at(text.as_bytes(), Some(b"pw"), NOW).unwrap();
+        assert!(full.primary_secret);
+
+        let none = rebuild(&bin, |i, _, b| match i {
+            0 => dummy(b, lens[0]),
+            3 => dummy(b, lens[1]),
+            5 => dummy(b, lens[2]),
+            _ => {}
+        });
+        let err = open(&none, Some(b"pw")).err().unwrap();
         assert!(matches!(err, Error::NoSecretPart), "{err:?}");
         assert_eq!(
             err.to_string(),
@@ -783,11 +919,167 @@ mod tests {
         );
         let stub = rebuild(&bin, |i, _, b| {
             if i == 0 {
-                b.truncate(pub_len);
+                b.truncate(lens[0]);
                 b.extend_from_slice(&[254, 0, 101, 0, b'G', b'N', b'U', 2, 0]);
             }
         });
         assert!(matches!(open(&stub, Some(b"pw")), Err(Error::CardStubs)));
+    }
+
+    /// A v4 signature body with the given hashed subpackets and no MPIs
+    /// (the reader does not verify signatures).
+    fn fake_sig(typ: u8, hashed: &[&[u8]]) -> Vec<u8> {
+        let h: Vec<u8> = hashed.concat();
+        let mut v = vec![4, typ, 22, 8];
+        v.extend_from_slice(&(h.len() as u16).to_be_bytes());
+        v.extend_from_slice(&h);
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v
+    }
+
+    fn sp(typ: u8, data: &[u8]) -> Vec<u8> {
+        let mut v = vec![data.len() as u8 + 1, typ];
+        v.extend_from_slice(data);
+        v
+    }
+
+    /// Re-emit `bin`'s packets, inserting `extra` after packet `after`.
+    fn insert_after(bin: &[u8], after: usize, extra: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, p) in parse_packets(bin).unwrap().iter().enumerate() {
+            write_packet(&mut out, p.tag, p.body);
+            if i == after {
+                for (tag, body) in extra {
+                    write_packet(&mut out, *tag, body);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn newer_direct_key_sig_without_flags_does_not_override_the_uid_cert() {
+        // A certify-only primary (flags 01 in its uid self-cert), then a
+        // newer 0x1F like GnuPG's addrevoker writes: no flags, no expiry.
+        let (set, text) = make(KeyType::Cv25519, Expiry::default());
+        let (_, bin) = armor::decode(&text).unwrap();
+        let certify_only = rebuild(&bin, |i, _, b| {
+            if i == 2 {
+                let at = b.windows(3).position(|w| w == [2, 27, 0x03]).unwrap();
+                b[at + 2] = 0x01;
+            }
+        });
+        let direct = fake_sig(0x1F, &[&sp(2, &(NOW + 100).to_be_bytes())]);
+        let with_direct = insert_after(&certify_only, 0, &[(2, direct)]);
+        let got = open_at(&with_direct, Some(b"pw"), NOW).unwrap();
+        assert_eq!(got.expiry, set.expiry);
+        assert_eq!(got.keys[0].flags, 0x01);
+        let slots: Vec<_> = got.keys.iter().map(|k| k.slot).collect();
+        assert_eq!(slots, [None, Some(Slot::Decrypt), Some(Slot::Auth)]);
+
+        // Only a 0x1F carrying flags/expiry, no uid cert at all: used.
+        let direct = fake_sig(
+            0x1F,
+            &[
+                &sp(2, &NOW.to_be_bytes()),
+                &sp(9, &777u32.to_be_bytes()),
+                &sp(27, &[0x03]),
+            ],
+        );
+        let mut only_direct = Vec::new();
+        for (i, p) in parse_packets(&bin).unwrap().iter().enumerate() {
+            match i {
+                0 => {
+                    write_packet(&mut only_direct, p.tag, p.body);
+                    write_packet(&mut only_direct, 2, &direct);
+                }
+                2 => {}
+                _ => write_packet(&mut only_direct, p.tag, p.body),
+            }
+        }
+        let got = open_at(&only_direct, Some(b"pw"), NOW).unwrap();
+        assert_eq!(got.expiry, Some(777));
+        assert_eq!(got.keys[0].slot, Some(Slot::Sign));
+    }
+
+    #[test]
+    fn primary_user_id_wins_and_revoked_user_ids_drop_out() {
+        let (set, text) = make(KeyType::Cv25519, Expiry::default());
+        let (_, bin) = armor::decode(&text).unwrap();
+        let pk = parse_packets(&bin).unwrap();
+        // An older, primary-flagged user ID with its own expiry.
+        let flagged = fake_sig(
+            0x13,
+            &[
+                &sp(2, &(NOW - 10).to_be_bytes()),
+                &sp(9, &4242u32.to_be_bytes()),
+                &sp(27, &[0x03]),
+                &sp(25, &[1]),
+            ],
+        );
+        // A revoked user ID: its (copied) self-cert, then a newer 0x30.
+        let revoked = fake_sig(0x30, &[&sp(2, &(NOW + 100).to_be_bytes())]);
+        let extra = [
+            (13, b"Primary <p@example.org>".to_vec()),
+            (2, flagged),
+            (13, b"Old <old@example.org>".to_vec()),
+            (2, pk[2].body.to_vec()),
+            (2, revoked),
+        ];
+        let got = open_at(&insert_after(&bin, 2, &extra), Some(b"pw"), NOW).unwrap();
+        assert_eq!(
+            got.user_ids,
+            ["Ada <ada@example.org>", "Primary <p@example.org>"]
+        );
+        assert_eq!(got.expiry, Some(4242));
+        assert_ne!(set.expiry, Some(4242));
+    }
+
+    #[test]
+    fn slot_rule_prefers_single_purpose_then_newest() {
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            for part in crate::keys::generate(KeyType::Cv25519, NOW).unwrap() {
+                keys.push(LoadedKey {
+                    slot: None,
+                    fpr: part.fingerprint(),
+                    part,
+                    flags: 0,
+                    key_type: None,
+                });
+            }
+        }
+        // 0: sign+auth (newest); 1: encrypt, old; 2: auth only, old;
+        // 3: encrypt, newer; 4: encrypt, same time as 3; 5: sign, oldest.
+        let rank = [
+            (FLAG_SIGN | FLAG_AUTH, 300, 300),
+            (FLAG_ENCRYPT, 100, 100),
+            (FLAG_AUTH, 100, 100),
+            (FLAG_ENCRYPT, 200, 200),
+            (FLAG_ENCRYPT, 200, 200),
+            (FLAG_SIGN, 50, 50),
+        ];
+        assign_slots(&mut keys, &rank);
+        let slots: Vec<_> = keys.iter().map(|k| k.slot).collect();
+        assert_eq!(
+            slots,
+            [
+                None,
+                None,
+                Some(Slot::Auth),
+                Some(Slot::Decrypt),
+                None,
+                Some(Slot::Sign)
+            ]
+        );
+        // Without the single-purpose sign key, the multi-purpose one signs
+        // and the auth-only key still authenticates.
+        for k in &mut keys {
+            k.slot = None;
+        }
+        assign_slots(&mut keys[..5], &rank[..5]);
+        assert_eq!(keys[0].slot, Some(Slot::Sign));
+        assert_eq!(keys[2].slot, Some(Slot::Auth));
     }
 
     #[test]
