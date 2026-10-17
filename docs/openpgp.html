@@ -75,8 +75,10 @@
       <li><strong>Encryption key</strong> — decrypt messages and files addressed to you.</li>
       <li><strong>Authentication key</strong> — commonly used for SSH login.</li>
     </ul>
-    <p>Because the private keys never leave the card, a compromised laptop can ask the card
-      to sign or decrypt while it's present, but can't walk away with the keys themselves.</p>
+    <p>The card does the signing and decrypting itself, so a compromised laptop can ask the
+      card to sign or decrypt while it's present, but can't read the keys out of it. A key
+      generated on the card never leaves it; a key made on the computer with a backup, or
+      imported from a file, also exists in that file, so keep the file safe.</p>
   </section>
 
   <section class="kr-section">
@@ -130,7 +132,8 @@
     <p><strong>Key types.</strong> RSA-2048, RSA-3072, RSA-4096, NIST P-256, P-384, P-521,
       secp256k1 and Curve 25519 (Ed25519 for signing and authentication, X25519 for
       decryption). The default is Curve 25519 when the card lists it (or does not publish a
-      list), otherwise RSA-3072. Brainpool curves can be generated on the card but not made
+      list), otherwise RSA-3072 when the card lists it, otherwise the first type the card
+      lists; types the card doesn't list are not offered. Brainpool curves can be generated on the card but not made
       with a backup.</p>
     <p><strong>Restore a backup.</strong> If the card is lost, broken or reset, or you want a
       spare, <strong>Restore a backup&hellip;</strong> loads the keys from <code>NAME.asc</code>
@@ -165,13 +168,15 @@ keyroostctl openpgp key import --in alice.asc          # restore onto a card</co
       card are unchanged; only the public key's date moves. When you create keys, the choices
       are <strong>Never</strong>, <strong>1</strong>, <strong>2</strong>, <strong>3</strong>
       (the default, as in GnuPG 2.4) or <strong>5</strong> years, or a date picked from the
-      calendar or typed as <code>YYYY-MM-DD</code>. A date means the key works through that
-      whole day.</p>
+      calendar or typed as <code>YYYY-MM-DD</code>. A date means the key works through the end
+      of that day in UTC; GnuPG shows local time, so if you are ahead of UTC it may show the
+      next day.</p>
     <p><strong>Renewing.</strong> Open <strong>Change expiry date&hellip;</strong> and choose
       how to sign the change: with the card (needs the user PIN) or with the backup (needs its
       passphrase, so the card need not be present; the backup file is updated too). Choosing <strong>Never</strong> removes the
       date. Afterwards, share the updated public key again (send, publish or re-import it) so
-      others see the new date. With GnuPG alone, <code>gpg --quick-set-expire FINGERPRINT 3y</code>
+      others see the new date. keyroost reads the public key and the backup armored or binary
+      (as GnuPG exports them) and writes them back armored. With GnuPG alone, <code>gpg --quick-set-expire FINGERPRINT 3y</code>
       does the same job.</p>
 <pre><code>keyroostctl openpgp key expiry --set 2y --public alice.pub.asc                    # signed by the card
 keyroostctl openpgp key expiry --set never --public alice.pub.asc --backup alice.asc    # signed with the backup</code></pre>

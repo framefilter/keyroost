@@ -3,11 +3,13 @@
 [advisories]
 ignore = [
     # Marvin Attack: timing side-channel in RSA PKCS#1 v1.5 *decryption*
-    # (`rsa` crate, no fixed release). keyroost-rsakey uses the crate only
-    # for host-side key generation and PKCS#1/PKCS#8 serialization during
-    # OpenPGP import — it never decrypts attacker-supplied ciphertexts, so
-    # the vulnerable code path is unreachable. Revisit when a fixed `rsa`
-    # version ships.
+    # (`rsa` crate, no fixed release). Nothing in the workspace decrypts
+    # with RSA on the host: keyroost-rsakey only parses PKCS#1/PKCS#8 key
+    # files for OpenPGP import; keyroost-pgpkey generates RSA keys and signs
+    # its own key-set signatures (PKCS#1 v1.5 signing, not decryption);
+    # keyroost-pivtest only verifies results against a public key. The
+    # vulnerable decryption path is never reached, with attacker-supplied
+    # ciphertext or otherwise. Revisit when a fixed `rsa` version ships.
     "RUSTSEC-2023-0071",
     # quick-xml 0.39 quadratic-time duplicate-attribute check (0194) and
     # unbounded NsReader namespace allocation (0195). quick-xml enters the

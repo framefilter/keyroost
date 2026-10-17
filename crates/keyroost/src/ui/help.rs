@@ -80,7 +80,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "pgp" => &Help {
             title: "OpenPGP",
-            body: "Turns the key into a smart card for encrypting & signing email and files (and for SSH). The private keys live on the card and never touch your computer's disk.",
+            body: "Turns the key into a smart card for encrypting & signing email and files (and for SSH). The card signs and decrypts itself, so the keys can't be read out of it. A key generated on the card never leaves it; keys made with a backup, or imported from a file, also exist in that file.",
             slug: "/openpgp",
         },
         "pgp-keys" => &Help {
@@ -100,7 +100,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "pgp-expiry" => &Help {
             title: "Change expiry date",
-            body: "Moves the expiry date of your public key. Choose Never, 1, 2, 3 or 5 years, or a date; a date works through that whole day. Sign the change with this card (user PIN) or with the backup (its passphrase), then share the updated public key file again so others see the new date. The keys themselves stay the same.",
+            body: "Moves the expiry date of your public key. Choose Never, 1, 2, 3 or 5 years, or a date; a date works through the end of that day in UTC (GnuPG shows local time, so it may show the next day if you're ahead of UTC). Sign the change with this card (user PIN) or with the backup (its passphrase), then share the updated public key file again so others see the new date. The keys themselves stay the same.",
             slug: "/openpgp#expiry",
         },
         "pgp-card-details" => &Help {

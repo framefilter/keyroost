@@ -284,11 +284,20 @@ keyroostctl openpgp url set https://example.com/alice.asc          # where your 
       makes all three keys on this computer and writes three files before it touches the card:
       <code>alice.asc</code> (the backup, protected by a passphrase you choose),
       <code>alice.pub.asc</code> (the public key to share) and <code>alice.rev.asc</code> (a
-      revocation certificate). Keep the backup and the revocation certificate offline. The
-      type is <code>ed25519</code> when the card lists it, <code>rsa3072</code> otherwise
-      (<code>--algorithm</code> picks another); keys expire after three years unless
-      <code>--expires</code> says otherwise. <code>key expiry</code> signs the new date with the
-      card, or with <code>--backup alice.asc</code> on this computer. More in
+      revocation certificate). Keep the backup and the revocation certificate offline.
+      <code>--algorithm</code> takes <code>rsa2048</code>, <code>rsa3072</code>,
+      <code>rsa4096</code>, <code>nistp256</code>, <code>nistp384</code>,
+      <code>nistp521</code>, <code>secp256k1</code> or <code>ed25519</code> (Ed25519 for
+      signing and logging in, X25519 for decrypting). Without it the type is
+      <code>ed25519</code> when the card lists it (or publishes no list), else
+      <code>rsa3072</code> when listed, else the first type the card lists; a type the card
+      doesn't list is refused before any key is made. Keys expire after three years unless
+      <code>--expires</code> says otherwise (<code>never</code>, <code>1y</code>,
+      <code>2y</code>, <code>3y</code>, <code>5y</code> or <code>YYYY-MM-DD</code>; a date
+      works through the end of that day in UTC, so GnuPG, which shows local time, may show
+      the next day if you are ahead of UTC). <code>key expiry</code> signs the new date with
+      the card, or with <code>--backup alice.asc</code> on this computer; it reads armored or
+      binary files and writes them back armored. More in
       <a href="openpgp.html">OpenPGP</a>.</p>
   </section>
 

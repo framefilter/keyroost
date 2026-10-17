@@ -53,10 +53,13 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   secret before committing it.
 - **OpenPGP card (v3.4)** — read status; generate keys on-card in any algorithm
   the card accepts (RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
-  secp256k1, brainpool) for the signature, encryption, or authentication slot,
-  or import an RSA-2048 key (host keygen or a PKCS#1/PKCS#8 PEM/DER file) —
-  each writes the v4 fingerprint and a generation timestamp so GnuPG recognizes
-  the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a client/SSH
+  secp256k1, brainpool) for the signature, encryption, or authentication slot;
+  create all three keys on the computer with a passphrase-protected,
+  GnuPG-compatible backup (RSA 2048/3072/4096, NIST P-256/384/521, secp256k1,
+  Curve 25519), restore a backup or a `gpg --export-secret-keys` file onto a
+  card, and change a key's expiry date; or import an RSA key (2048-4096 bits)
+  from a PKCS#1/PKCS#8 PEM/DER file — each writes the v4 fingerprint and a
+  generation timestamp so GnuPG recognizes the key; sign (SHA-256 or SHA-1); decrypt; authenticate (a client/SSH
   signature with the Authentication key via INTERNAL AUTHENTICATE); set
   cardholder name / URL; change the user / admin PIN and unblock a locked PIN;
   factory-reset the applet.
@@ -980,7 +983,8 @@ old script.
 | `keyroost-token2prog` | Pure-Rust Token2 single-profile programmable-token wire protocol (SM4 seed/MAC, fixed device key, config TLV); reuses `keyroost-proto` | `zeroize` |
 | `keyroost-keyring` | Friendly-name registry (`keys.json`, salted fingerprints) | `serde`, `serde_json`, `getrandom` (the per-computer salt); in-tree SHA-256 from `keyroost-proto` |
 | `keyroost-resolve` | Shared key-identity resolution (USB + CCID serials, topology match) and naming (names on the key and on this computer) | none (in-tree only, including `keyroost-ctap`) |
-| `keyroost-rsakey` | Host-side RSA-2048 keygen + PKCS#1/PKCS#8 (PEM/DER) loading | `rsa`, `rand`, `zeroize` |
+| `keyroost-rsakey` | Host-side RSA key loading (PKCS#1/PKCS#8, PEM/DER, 2048-4096 bits) for OpenPGP import | `rsa`, `zeroize` |
+| `keyroost-pgpkey` | Host-side OpenPGP key sets: key generation, GnuPG-compatible passphrase-protected backups, reading backups and GnuPG exports, expiry changes; restore onto a card behind the `card` feature | `rsa`, `p256`, `p384`, `p521`, `k256`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `aes`, `rand_core`, `zeroize`; in-tree `keyroost-transport` (behind `card`) |
 | `keyroost-import` | `otpauth://` + Aegis / 2FAS / otpauth-list parsers, file classification, and the per-key import plan and write loop | `zeroize`; `serde`/`serde_json` (behind `bulk`); `scrypt`, `aes-gcm`, `base64` (behind `encrypted`, which implies `bulk`) |
 | `keyroost-qr` | QR 2FA import from PNG/JPEG screenshots and Google Authenticator export batches — always built in; the GUI's *live screen* capture is behind the `qr` feature (on in the release archives and the AppImage, off in the Flatpak) | `rqrr`, `png`, `jpeg-decoder`, `zeroize` |
 | `keyroost-winwebauthn` | Windows-only helper for the non-admin FIDO2 path: detect a FIDO key via the HID access-denied signal, open Windows' security-key settings, and relaunch elevated; inert on non-Windows | `windows-sys` (Windows only) |
