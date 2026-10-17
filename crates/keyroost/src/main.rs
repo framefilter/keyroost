@@ -18202,7 +18202,9 @@ impl App {
         body: impl FnOnce(&mut egui::Ui),
     ) -> (bool, Option<egui::Response>) {
         let mut help_resp = None;
-        let mut closed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        // Esc closes an open calendar popup first, not the dialog around it.
+        let mut closed =
+            ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ui::date::calendar_showing(ctx);
         egui::Window::new(id)
             .collapsible(false)
             .resizable(false)

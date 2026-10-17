@@ -1,10 +1,7 @@
 //! Calendar-date model and typed expiry entry for OpenPGP key creation and
 //! "Change expiry date…".
 
-// The calendar helpers wait for the calendar popup.
-#![allow(dead_code)]
-
-use super::theme::{f_reg, Palette};
+use super::theme::{button, f_reg, f_sb, BtnKind, Palette};
 use keyroost_pgpkey::cert::{civil_from_days, days_from_civil, Expiry};
 
 const MONTHS: [&str; 12] = [
@@ -141,6 +138,19 @@ impl Date {
         }
     }
 
+    fn day_number(&self) -> i64 {
+        days_from_civil(self.y, self.m, self.d)
+    }
+
+    /// "October 2026".
+    pub fn month_title(&self) -> String {
+        format!(
+            "{} {}",
+            MONTHS[usize::from(self.m.clamp(1, 12)) - 1],
+            self.y
+        )
+    }
+
     pub fn is_after(&self, o: &Date) -> bool {
         (self.y, self.m, self.d) > (o.y, o.m, o.d)
     }
@@ -251,13 +261,22 @@ pub fn expiry_row(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, today
                 ui.selectable_value(&mut input.choice, ExpiryChoice::Date, "Pick a date\u{2026}");
             });
         if input.choice == ExpiryChoice::Date {
-            ui.add(
+            let edit = ui.add(
                 egui::TextEdit::singleline(&mut input.text)
                     .hint_text("YYYY-MM-DD")
                     .desired_width(110.0)
                     .font(f_reg(13.0)),
             );
-            // Task 13 adds `calendar_button(ui, p, input, today)` here.
+            // Typing a real date moves the calendar to that month.
+            if edit.changed() {
+                if let Some(d) = Date::parse(&input.text) {
+                    input.month = d.first_of_month();
+                }
+            }
+            calendar_button(ui, p, input, today);
+        } else {
+            input.calendar_open = false;
+            set_calendar_showing(ui.ctx(), false);
         }
     });
     match input.resolve(today) {
@@ -273,6 +292,174 @@ pub fn expiry_row(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, today
             ui.label(egui::RichText::new(line).font(f_reg(12.0)).color(p.txt2));
         }
     }
+}
+
+/// The 42 days (six Monday-first weeks) a month's calendar page shows,
+/// beginning on the Monday on or before the 1st.
+pub fn month_grid(month: Date) -> [Date; 42] {
+    let first = month.first_of_month();
+    let start = first.day_number() - i64::from(first.weekday());
+    std::array::from_fn(|i| {
+        let (y, m, d) = civil_from_days(start + i as i64);
+        Date { y, m, d }
+    })
+}
+
+fn showing_id() -> egui::Id {
+    egui::Id::new("expiry_calendar_showing")
+}
+
+fn set_calendar_showing(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(showing_id(), on));
+}
+
+/// Whether a calendar popup was open last frame. The dialog around it uses
+/// this to leave Esc to the calendar instead of closing itself too.
+pub fn calendar_showing(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(showing_id()))
+        .unwrap_or(false)
+}
+
+/// A "Calendar" button and, while open, a month popup under it. Picking a
+/// day writes it into `input.text`; days before `today` can't be picked.
+pub fn calendar_button(ui: &mut egui::Ui, p: &Palette, input: &mut ExpiryInput, today: Date) {
+    let btn = button(ui, p, BtnKind::Default, "Calendar");
+    if btn.clicked() {
+        input.calendar_open = !input.calendar_open;
+        if input.calendar_open {
+            if let Some(d) = Date::parse(&input.text) {
+                input.month = d.first_of_month();
+            }
+        }
+    }
+    if !input.calendar_open {
+        set_calendar_showing(ui.ctx(), false);
+        return;
+    }
+    let selected = Date::parse(&input.text);
+    let mut open = input.calendar_open;
+    let mut picked = None;
+    let mut month = input.month;
+    let max_bottom = ui.ctx().content_rect().bottom();
+    egui::Popup::from_response(&btn)
+        .open_bool(&mut open)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .frame(
+            egui::Frame::popup(ui.style())
+                .fill(p.pop)
+                .stroke(egui::Stroke::new(1.0, p.line)),
+        )
+        .show(|ui| {
+            // Keep the page on screen: at a large text size in a short
+            // window it scrolls instead of running off the bottom.
+            let max_h = (max_bottom - ui.next_widget_position().y - 12.0).max(160.0);
+            ui.set_max_height(max_h);
+            egui::ScrollArea::vertical()
+                .max_height(max_h)
+                .show(ui, |ui| {
+                    let w = ui
+                        .painter()
+                        .layout_no_wrap("00".into(), f_reg(13.0), p.txt)
+                        .size();
+                    let cell = egui::vec2(w.x + 12.0, w.y + 4.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("\u{2039}").font(f_sb(18.0)),
+                            ))
+                            .clicked()
+                        {
+                            month = month.prev_month();
+                        }
+                        let title = month.month_title();
+                        let room = cell.x * 7.0 + 12.0 - 2.0 * (cell.y + 6.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(room.max(60.0), cell.y),
+                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                            |ui| {
+                                ui.label(egui::RichText::new(title).font(f_sb(13.0)).color(p.txt));
+                            },
+                        );
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("\u{203A}").font(f_sb(18.0)),
+                            ))
+                            .clicked()
+                        {
+                            month = month.next_month();
+                        }
+                    });
+                    ui.add_space(2.0);
+                    egui::Grid::new("calendar_grid")
+                        .spacing(egui::vec2(2.0, 2.0))
+                        .show(ui, |ui| {
+                            for name in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] {
+                                let (r, _) = ui.allocate_exact_size(cell, egui::Sense::hover());
+                                ui.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    name,
+                                    f_reg(12.0),
+                                    p.txt3,
+                                );
+                            }
+                            ui.end_row();
+                            for (i, day) in month_grid(month).iter().enumerate() {
+                                let in_month = day.m == month.m;
+                                let past = today.is_after(day);
+                                let sense = if past {
+                                    egui::Sense::hover()
+                                } else {
+                                    egui::Sense::click()
+                                };
+                                let (r, resp) = ui.allocate_exact_size(cell, sense);
+                                let is_sel = selected == Some(*day);
+                                if is_sel {
+                                    ui.painter().rect_filled(r, 4.0, p.accent);
+                                } else if resp.hovered() && !past {
+                                    ui.painter().rect_filled(r, 4.0, p.accent_soft());
+                                }
+                                if *day == today {
+                                    ui.painter().rect_stroke(
+                                        r,
+                                        4.0,
+                                        egui::Stroke::new(1.5, p.accent),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                let col = if is_sel {
+                                    p.accent_ink
+                                } else if past || !in_month {
+                                    p.txt3
+                                } else {
+                                    p.txt
+                                };
+                                ui.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    day.d.to_string(),
+                                    f_reg(13.0),
+                                    col,
+                                );
+                                if !past && resp.clicked() {
+                                    picked = Some(*day);
+                                }
+                                if i % 7 == 6 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+        });
+    input.month = month;
+    input.calendar_open = open;
+    if let Some(d) = picked {
+        input.text = d.iso();
+        input.month = d.first_of_month();
+        input.calendar_open = false;
+    }
+    set_calendar_showing(ui.ctx(), input.calendar_open);
 }
 
 #[cfg(test)]
@@ -311,6 +498,18 @@ mod tests {
         assert_eq!(dt(2026, 1, 15).prev_month(), dt(2025, 12, 1));
         assert!(dt(2026, 10, 17).is_after(&dt(2026, 10, 16)));
         assert!(!dt(2026, 10, 16).is_after(&dt(2026, 10, 16)));
+    }
+
+    #[test]
+    fn month_grid_is_six_monday_first_weeks() {
+        let g = month_grid(dt(2026, 10, 1));
+        assert_eq!(g.len(), 42);
+        assert_eq!(g[0], dt(2026, 9, 28));
+        assert_eq!(g[0].weekday(), 0);
+        assert!(g.contains(&dt(2026, 10, 31)));
+        assert_eq!(g[41], dt(2026, 11, 8));
+        // A month starting on Monday begins its own grid.
+        assert_eq!(month_grid(dt(2026, 6, 15))[0], dt(2026, 6, 1));
     }
 
     #[test]
