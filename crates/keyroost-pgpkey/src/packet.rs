@@ -37,16 +37,23 @@ pub fn write_packet(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
 /// Encode big-endian bytes as an MPI: leading zeros stripped, 2-byte bit
 /// count, then the value. All-zero input gives a zero-bit MPI.
 pub fn mpi(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + bytes.len());
+    push_mpi(&mut out, bytes);
+    out
+}
+
+/// Append `bytes` as an MPI to `out` (same encoding as [`mpi`]) without an
+/// intermediate buffer, so secret values can go straight into a
+/// pre-sized `Zeroizing` vector.
+pub fn push_mpi(out: &mut Vec<u8>, bytes: &[u8]) {
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
     let v = &bytes[start..];
     let bits = match v.first() {
         Some(&first) => (v.len() - 1) * 8 + (8 - first.leading_zeros() as usize),
         None => 0,
     };
-    let mut out = Vec::with_capacity(2 + v.len());
     out.extend_from_slice(&(bits as u16).to_be_bytes());
     out.extend_from_slice(v);
-    out
 }
 
 /// Bounds-checked cursor over a byte slice. No method panics.
