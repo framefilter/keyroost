@@ -244,26 +244,32 @@ fn our_export_works_in_gpg(t: KeyType) {
     // Encrypt to the decryption subkey and decrypt.
     let msg = home.file("data.gpg");
     let msg = msg.to_str().unwrap();
-    let o = ok(
-        &gpg(
-            h,
-            &[
-                "--trust-model",
-                "always",
-                "--yes",
-                "--status-fd",
-                "1",
-                "-r",
-                &fprs[0],
-                "-o",
-                msg,
-                "--encrypt",
-                &data,
-            ],
-            None,
-        ),
-        "encrypt",
+    let enc = gpg(
+        h,
+        &[
+            "--trust-model",
+            "always",
+            "--yes",
+            "--status-fd",
+            "1",
+            "-r",
+            &fprs[0],
+            "-o",
+            msg,
+            "--encrypt",
+            &data,
+        ],
+        None,
     );
+    // Some GnuPG builds sign with secp256k1 but can't encrypt to it.
+    if t == KeyType::Secp256k1
+        && !enc.status.success()
+        && String::from_utf8_lossy(&enc.stderr).contains("Unknown algorithm")
+    {
+        eprintln!("this gpg can't encrypt to secp256k1; skipping encrypt/decrypt");
+        return;
+    }
+    let o = ok(&enc, "encrypt");
     assert!(o.contains("END_ENCRYPTION"), "{t:?}: {o}");
     let plain = home.file("plain.txt");
     let plain_s = plain.to_str().unwrap();
