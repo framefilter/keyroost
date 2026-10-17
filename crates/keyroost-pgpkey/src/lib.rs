@@ -10,6 +10,7 @@ pub mod armor;
 pub mod keys;
 pub mod packet;
 pub mod s2k;
+pub mod sig;
 
 /// Everything this crate can report. The `Display` text is written for end
 /// users, one line each.
