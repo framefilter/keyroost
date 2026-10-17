@@ -4,18 +4,18 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenPGP card — sign, encrypt &amp; authenticate — keyroost</title>
-<meta name="description" content="What the OpenPGP card is, the three on-card keys (sign / encrypt / authenticate), generating vs importing keys, and what keyroost can do over PC/SC.">
+<meta name="description" content="What the OpenPGP card is, the three on-card keys (sign / encrypt / authenticate), generating, backing up and importing keys, and what keyroost can do over PC/SC.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="keyroost">
 <meta property="og:title" content="OpenPGP card — sign, encrypt &amp; authenticate — keyroost">
-<meta property="og:description" content="What the OpenPGP card is, the three on-card keys (sign / encrypt / authenticate), generating vs importing keys, and what keyroost can do over PC/SC.">
+<meta property="og:description" content="What the OpenPGP card is, the three on-card keys (sign / encrypt / authenticate), generating, backing up and importing keys, and what keyroost can do over PC/SC.">
 <meta property="og:url" content="https://framefilter.github.io/keyroost/openpgp.html">
 <meta property="og:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="OpenPGP card — sign, encrypt &amp; authenticate — keyroost">
-<meta name="twitter:description" content="What the OpenPGP card is, the three on-card keys (sign / encrypt / authenticate), generating vs importing keys, and what keyroost can do over PC/SC.">
+<meta name="twitter:description" content="What the OpenPGP card is, the three on-card keys (sign / encrypt / authenticate), generating, backing up and importing keys, and what keyroost can do over PC/SC.">
 <meta name="twitter:image" content="https://framefilter.github.io/keyroost/assets/og-cover.png">
 
 <link rel="icon" type="image/png" href="assets/keyroost-logo.png">
@@ -63,8 +63,8 @@
 
   <figure class="kr-shot">
     <img src="assets/screenshots/openpgp.webp" width="1640" height="938" loading="lazy"
-         alt="keyroost screenshot — The OpenPGP card tab: card details, PINs, and on-card key generation or import.">
-    <figcaption>The OpenPGP card tab: card details, PINs, and on-card key generation or import.</figcaption>
+         alt="keyroost screenshot — The OpenPGP card tab: card details, PINs, and on-card key generation, backups and import.">
+    <figcaption>The OpenPGP card tab: card details, PINs, and on-card key generation, backups and import.</figcaption>
   </figure>
   <section class="kr-section">
     <h2>What it is</h2>
@@ -81,19 +81,121 @@
 
   <section class="kr-section">
     <span id="keys"></span>
-    <h2>Generate on-card vs. import</h2>
+    <h2>Three ways to put keys on the card</h2>
     <ul>
-      <li><strong>Generate on-card</strong> — the key is born inside the device and is never
-        exportable. Best for new keys; nothing to leak.</li>
-      <li><strong>Import an existing key</strong> — load a key you already use. Convenient,
-        but the private key existed off-card first, so its earlier exposure still counts.</li>
+      <li><strong>Generate on the card</strong> &mdash; the key is born inside the device and
+        no copy can exist anywhere. Nothing to leak, but if the card is lost, broken or reset,
+        the key is gone for good. That matters most for the decryption key: without it you
+        can no longer read messages that were encrypted to you.</li>
+      <li><strong>Create keys with a backup</strong> &mdash; keyroost makes all three keys on
+        your computer, saves them to a file that opens only with a passphrase you choose, loads
+        them onto the card, and then forgets them. Keep the file offline (a USB stick in a
+        drawer works), and you can load the same keys onto a spare card later. This is the
+        recommended choice for most people. <a href="#backup">Details &darr;</a></li>
+      <li><strong>Import a file</strong> &mdash; load a key you made somewhere else, for
+        example with GnuPG: an RSA key file (PEM or DER, 2048, 3072 or 4096 bits) or the
+        matching key from an OpenPGP file. The key existed outside the card first, so keep
+        that in mind.</li>
     </ul>
+    <p>In the app, open the <strong>OpenPGP</strong> tab, then the <strong>OpenPGP card</strong>
+      card. The <strong>Keys</strong> row has <strong>Create keys with a backup&hellip;</strong>,
+      <strong>Restore a backup&hellip;</strong> and <strong>Change expiry date&hellip;</strong>;
+      each key's own tab (Signature, Decryption, Authentication) offers <strong>Generate
+      on-card</strong> and <strong>Import from a file</strong>. Writing a key replaces
+      whatever was in that slot, and needs the admin PIN.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">PINs</div>
       <p>The card uses a user PIN (day-to-day) and an admin PIN (management), each with its
         own retry counter that locks the function after too many wrong tries.
         <a href="fido2.html#pin">How key PINs work →</a></p>
     </div>
+  </section>
+
+  <section class="kr-section">
+    <span id="backup"></span>
+    <h2>Keys with a backup</h2>
+    <p><strong>Create keys with a backup</strong> asks for a name, an email address (optional),
+      a key type, an expiry date and a passphrase, then creates the signature, decryption and
+      authentication keys together and writes three files next to each other:</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <thead><tr><th>File</th><th>What it is</th><th>What to do with it</th></tr></thead>
+      <tbody>
+        <tr><td><code>NAME.asc</code></td><td>The backup: your secret keys, protected by the passphrase. GnuPG can read it.</td><td>Keep it offline, with the passphrase stored separately. Anyone with both can act as you.</td></tr>
+        <tr><td><code>NAME.pub.asc</code></td><td>Your public key.</td><td>Share it freely: send it to correspondents, put it on your website, or import it into GnuPG.</td></tr>
+        <tr><td><code>NAME.rev.asc</code></td><td>A revocation certificate: a signed statement that the key should no longer be trusted.</td><td>Keep it offline. Import it into GnuPG and publish it only if the key is lost or stolen.</td></tr>
+      </tbody>
+    </table></div>
+    <p>keyroost never overwrites an existing file; if one with that name is already there, it
+      stops and names it.</p>
+    <p><strong>Key types.</strong> RSA-2048, RSA-3072, RSA-4096, NIST P-256, P-384, P-521,
+      secp256k1 and Curve 25519 (Ed25519 for signing and authentication, X25519 for
+      decryption). The default is Curve 25519 when the card lists it (or does not publish a
+      list), otherwise RSA-3072. Brainpool curves can be generated on the card but not made
+      with a backup.</p>
+    <p><strong>Restore a backup.</strong> If the card is lost, broken or reset, or you want a
+      spare, <strong>Restore a backup&hellip;</strong> loads the keys from <code>NAME.asc</code>
+      &mdash; or from a file exported by GnuPG with
+      <code>gpg --export-secret-keys --armor</code> &mdash; onto a card. You choose which of
+      the keys to load; each replaces the key in its slot. It needs the backup's passphrase
+      and the card's admin PIN. A wrong passphrase or an unreadable file is reported in one
+      line and nothing on the card changes. If the card does not accept a key type in a slot,
+      keyroost says so, and a backup already written stays where it is.</p>
+    <h3>Using it with GnuPG</h3>
+<pre><code>gpg --import NAME.pub.asc     # your public key
+gpg --card-status             # links the card's keys to it</code></pre>
+    <p>Alternatively, on an offline machine you trust, <code>gpg --import NAME.asc</code>
+      (it asks for the passphrase) to hold the secret keys in GnuPG itself.</p>
+    <h3>From the command line</h3>
+<pre><code>keyroostctl openpgp key import --generate --backup alice --name "Alice Example" --email alice@example.com --algorithm ed25519 --expires 3y
+keyroostctl openpgp key import --in alice.asc          # restore onto a card</code></pre>
+    <p class="kr-muted">The key-type values and prompts are listed on the
+      <a href="cli.html#openpgp">Command line</a> page. The old &ldquo;Generate &amp; import&rdquo;
+      choice, which made a key on the computer and discarded it after loading, has been removed:
+      it left no way to recover the key, so use <em>Create keys with a backup</em> or
+      <em>Generate on-card</em> instead.</p>
+  </section>
+
+  <section class="kr-section">
+    <span id="expiry"></span>
+    <h2>Expiry date</h2>
+    <p>An OpenPGP key carries an expiry date in its public key. After that date, other people's
+      software stops encrypting to it and treats its signatures as expired. The keys on the
+      card are unchanged; only the public key's date moves. When you create keys, the choices
+      are <strong>Never</strong>, <strong>1</strong>, <strong>2</strong>, <strong>3</strong>
+      (the default, as in GnuPG 2.4) or <strong>5</strong> years, or a date picked from the
+      calendar or typed as <code>YYYY-MM-DD</code>. A date means the key works through that
+      whole day.</p>
+    <p><strong>Renewing.</strong> Open <strong>Change expiry date&hellip;</strong> and choose
+      how to sign the change: with the card (needs the user PIN) or with the backup (needs its
+      passphrase, so the card need not be present; the backup file is updated too). Choosing <strong>Never</strong> removes the
+      date. Afterwards, share the updated public key again (send, publish or re-import it) so
+      others see the new date. With GnuPG alone, <code>gpg --quick-set-expire FINGERPRINT 3y</code>
+      does the same job.</p>
+<pre><code>keyroostctl openpgp key expiry --set 2y --public alice.pub.asc                    # signed by the card
+keyroostctl openpgp key expiry --set never --public alice.pub.asc --backup alice.asc    # signed with the backup</code></pre>
+  </section>
+
+  <section class="kr-section">
+    <span id="support"></span>
+    <h2>Which keys support it</h2>
+    <p>Importing keys, which backups and restores rely on, uses the OpenPGP card's standard
+      key-import command. What each device accepts depends on its model and firmware. Cards
+      that publish a list of accepted key types show it in keyroost; others are simply tried
+      and report an error if they cannot take a type. From the vendors' own documentation:</p>
+    <div class="kr-table-wrap"><table class="kr-table">
+      <thead><tr><th>Device</th><th>Key types listed by the vendor</th><th>Source</th></tr></thead>
+      <tbody>
+        <tr><td>Token2 PIN+ / T2F2, Release 3</td><td>RSA-2048; NIST P-256/384/521; secp256k1</td><td><a href="https://www.token2.com/site/page/pin-firmware-feature-support-matrix-openpgp-fido2-otp-and-piv-across-releases">Token2 support matrix</a></td></tr>
+        <tr><td>Token2, Release 3.1 and later</td><td>Adds RSA-3072/4096 and Curve 25519</td><td><a href="https://www.token2.com/site/page/pin-firmware-feature-support-matrix-openpgp-fido2-otp-and-piv-across-releases">Token2 support matrix</a></td></tr>
+        <tr><td>YubiKey 5, firmware 5.2.3 and later</td><td>RSA-2048/3072/4096; NIST P-256/384/521; secp256k1; Brainpool; Curve 25519</td><td><a href="https://developers.yubico.com/PGP/YubiKey_5.2.3_Enhancements_to_OpenPGP_3.4.html">Yubico</a></td></tr>
+        <tr><td>Nitrokey 3</td><td>RSA-2048/3072/4096; NIST P-256/384/521; secp256k1 (firmware 1.8.2 and later); Brainpool; Curve 25519</td><td><a href="https://github.com/Nitrokey/opcard-rs">opcard-rs</a></td></tr>
+        <tr><td>CanoKey</td><td>RSA-2048/3072/4096; NIST P-256/384/521; secp256k1; Curve 25519</td><td><a href="https://docs.canokeys.org/userguide/openpgp/">CanoKey docs</a></td></tr>
+        <tr><td>Nitrokey Start</td><td>RSA up to 4096; ECC: P-256, secp256k1, Ed25519, X25519</td><td><a href="https://docs.nitrokey.com/start/faq">Nitrokey FAQ</a></td></tr>
+      </tbody>
+    </table></div>
+    <p class="kr-muted">Vendors differ in which limits they document, and firmware changes
+      them, so check your card's own list in keyroost. If a card refuses a type, keyroost names
+      the type and the slot.</p>
   </section>
 
   <section class="kr-section">
@@ -105,8 +207,7 @@
         a PIN without changing anything; <strong>generate</strong> keys on-card in any
         algorithm the card accepts — RSA 2048/3072/4096, Ed25519, X25519, NIST P-256/384/521,
         secp256k1, brainpool — the choice offered from the card's own algorithm list
-        (<code>keyroostctl openpgp key algorithms</code>), or <strong>import</strong> an RSA-2048
-        key by host keygen or from a PKCS#1/PKCS#8 PEM/DER file, for the sign, decrypt, or
+        (<code>keyroostctl openpgp key algorithms</code>), or <strong>import</strong> keys &mdash; an RSA key file (PKCS#1/PKCS#8 PEM/DER, 2048 to 4096 bits) or a backup (see <a href="#backup">Keys with a backup</a>) &mdash; for the sign, decrypt, or
         <strong>auth</strong> slot (<code>--slot decrypt</code>, <code>--slot auth</code>);
         <strong>sign</strong> (SHA-256 or
         SHA-1), <strong>decrypt</strong>, and <strong>authenticate</strong> (client/SSH
@@ -132,10 +233,9 @@ keyroostctl openpgp key generate --slot sign --algorithm ed25519 --yes --admin-p
       import</code> take the admin PIN as <code>--admin-pin</code>, and <code>pin
       unblock</code> takes <code>--admin-pin</code> and <code>--new-pin</code>.</p>
     <p class="kr-muted">The card byte layer is a pure-Rust, in-tree implementation of the
-      OpenPGP Card spec (APDU + BER-TLV); RSA keygen/parsing is the one scoped host-side
-      dependency. Host-side import of ECC keys and local signature verification are not
-      offered; they would need new cryptographic dependencies, which this project adds only
-      deliberately.</p>
+      OpenPGP Card spec (APDU + BER-TLV); the host-side key generation, backup reading and
+      writing, and key-file parsing use a small set of vetted cryptographic libraries. Local
+      signature verification is not offered.</p>
   </section>
 
   <section class="kr-section kr-res-section">
