@@ -143,12 +143,18 @@ pub enum Material {
     },
     /// ECDH. Weierstrass curves as for [`Material::Ecdsa`]; for X25519 `d` is
     /// the 32-byte RFC 7748 (little-endian) scalar and `point` the 32-byte
-    /// u-coordinate (no `0x40` prefix).
+    /// u-coordinate (no `0x40` prefix). `kdf` is the public body's KDF
+    /// field as stored (`03 01 <hash> <cipher>`): keyroost writes
+    /// [`ecdh_kdf_params`], but a key read from a file keeps its own
+    /// (GnuPG picks AES-256 for P-384, for one), because the fingerprint
+    /// hashes it.
     Ecdh {
         #[zeroize(skip)]
         curve: Curve,
         d: Vec<u8>,
         point: Vec<u8>,
+        #[zeroize(skip)]
+        kdf: [u8; 4],
     },
     /// Ed25519: the 32-byte seed and the 32-byte public key.
     EdDsa { seed: [u8; 32], point: [u8; 32] },
@@ -335,7 +341,12 @@ fn weierstrass(curve: Curve, ecdh: bool) -> Result<Material> {
     let point = ec_point(curve, &d)?;
     let d = d.to_vec();
     Ok(if ecdh {
-        Material::Ecdh { curve, d, point }
+        Material::Ecdh {
+            curve,
+            d,
+            point,
+            kdf: ecdh_kdf_params(curve),
+        }
     } else {
         Material::Ecdsa { curve, d, point }
     })
@@ -372,6 +383,7 @@ fn x25519_generate() -> Material {
         curve: Curve::X25519,
         d: d.to_vec(),
         point,
+        kdf: ecdh_kdf_params(Curve::X25519),
     }
 }
 
@@ -444,9 +456,11 @@ impl KeyPart {
                 push_mpi(&mut v, e);
             }
             Material::Ecdsa { curve, point, .. } => ecc(&mut v, *curve, point),
-            Material::Ecdh { curve, point, .. } => {
+            Material::Ecdh {
+                curve, point, kdf, ..
+            } => {
                 ecc(&mut v, *curve, point);
-                v.extend_from_slice(&ecdh_kdf_params(*curve));
+                v.extend_from_slice(kdf);
             }
             Material::EdDsa { point, .. } => ecc(&mut v, Curve::Ed25519, point),
         }
@@ -537,20 +551,15 @@ impl KeyPart {
                 let curve = Curve::from_oid(r.take(oid_len)?).ok_or(Error::Unsupported("curve"))?;
                 let point = r.mpi()?;
                 let kind = EccKind::from_id(algo).ok_or(Error::Unsupported("algorithm"))?;
-                ecc_material(kind, curve, point, s.mpi()?)?
+                let kdf = if kind == EccKind::Ecdh {
+                    read_kdf(&mut r)?
+                } else {
+                    [0; 4]
+                };
+                ecc_material(kind, curve, point, s.mpi()?, kdf)?
             }
             _ => return Err(Error::Unsupported("public-key algorithm")),
         };
-        if algo == ALGO_ECDH {
-            let Material::Ecdh { curve, .. } = &material else {
-                return Err(mismatch());
-            };
-            if r.rest()? != ecdh_kdf_params(*curve) {
-                return Err(Error::Unsupported(
-                    "ECDH KDF parameters other than the defaults",
-                ));
-            }
-        }
         if !r.is_empty() || !s.is_empty() {
             return Err(Error::Malformed("extra data after the key"));
         }
@@ -583,6 +592,7 @@ impl KeyPart {
                 curve: Curve::X25519,
                 d,
                 point,
+                ..
             } => CardKey::Ecc {
                 scalar: reversed32(d).to_vec(),
                 point: point.clone(),
@@ -596,9 +606,29 @@ impl KeyPart {
     }
 }
 
+/// Read the ECDH KDF field (RFC 6637 §9): length 3, reserved 0x01, hash
+/// id, cipher id. Any hash and cipher ids are kept as given.
+fn read_kdf(r: &mut Reader) -> Result<[u8; 4]> {
+    if r.u8()? != 3 {
+        return Err(Error::Unsupported("ECDH KDF field of unexpected length"));
+    }
+    if r.u8()? != 0x01 {
+        return Err(Error::Unsupported("ECDH KDF field version"));
+    }
+    let (hash, cipher) = (r.u8()?, r.u8()?);
+    Ok([0x03, 0x01, hash, cipher])
+}
+
 /// ECC material from a public point (as the packet carries it) and the
 /// secret MPI value, checking that the two belong together.
-fn ecc_material(kind: EccKind, curve: Curve, point: &[u8], secret: &[u8]) -> Result<Material> {
+/// `kdf` is the ECDH KDF field from the body (unused for ECDSA/EdDSA).
+fn ecc_material(
+    kind: EccKind,
+    curve: Curve,
+    point: &[u8],
+    secret: &[u8],
+    kdf: [u8; 4],
+) -> Result<Material> {
     let bare25519 = || match point {
         [0x40, rest @ ..] if rest.len() == 32 => Ok(rest),
         _ => Err(Error::Malformed("bad Curve 25519 point")),
@@ -631,6 +661,7 @@ fn ecc_material(kind: EccKind, curve: Curve, point: &[u8], secret: &[u8]) -> Res
                 curve,
                 d: d.to_vec(),
                 point: got.to_vec(),
+                kdf,
             })
         }
         (
@@ -648,6 +679,7 @@ fn ecc_material(kind: EccKind, curve: Curve, point: &[u8], secret: &[u8]) -> Res
                     curve,
                     d,
                     point: got,
+                    kdf,
                 }
             } else {
                 Material::Ecdsa {
@@ -669,9 +701,56 @@ mod tests {
     use super::*;
     use keyroost_openpgp::{Curve, EccKind, KeyCrt};
 
+    /// RSA-3072/4096 keygen is slow; the `#[ignore]` test covers them.
+    fn slow_rsa(t: KeyType) -> bool {
+        matches!(t, KeyType::Rsa3072 | KeyType::Rsa4096)
+    }
+
+    #[test]
+    fn gnupg_p384_ecdh_kdf_params_are_kept() {
+        // GnuPG writes SHA-384 / AES-256 (03 01 09 09) for P-384 ECDH, where
+        // ecdh_kdf_params gives AES-192. The file's bytes must survive.
+        let parts = generate(KeyType::NistP384, 1_700_000_000).unwrap();
+        let ours = &parts[1];
+        let mut body = ours.public_body();
+        let n = body.len();
+        assert_eq!(body[n - 4..], [0x03, 0x01, 0x09, 0x08]);
+        body[n - 1] = 0x09;
+        let back = KeyPart::from_secret(ours.algo_id(), &body, &ours.secret_mpis()).unwrap();
+        assert!(matches!(
+            back.material,
+            Material::Ecdh {
+                kdf: [0x03, 0x01, 0x09, 0x09],
+                ..
+            }
+        ));
+        assert_eq!(back.public_body(), body);
+        let mut h = vec![0x99];
+        h.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        h.extend_from_slice(&body);
+        assert_eq!(back.fingerprint(), keyroost_proto::sha1::sha1(&h));
+        assert_ne!(back.fingerprint(), ours.fingerprint());
+    }
+
+    #[test]
+    fn ecdh_kdf_field_with_trailing_or_bad_length_is_refused() {
+        let parts = generate(KeyType::NistP256, 1).unwrap();
+        let p = &parts[1];
+        let mut extra = p.public_body();
+        extra.push(0);
+        assert!(matches!(
+            KeyPart::from_secret(p.algo_id(), &extra, &p.secret_mpis()),
+            Err(Error::Malformed("extra data after the key"))
+        ));
+        let mut bad = p.public_body();
+        let n = bad.len();
+        bad[n - 4] = 4;
+        assert!(KeyPart::from_secret(p.algo_id(), &bad, &p.secret_mpis()).is_err());
+    }
+
     #[test]
     fn fingerprints_agree_with_keyroost_openpgp_for_every_type() {
-        for t in KeyType::ALL {
+        for t in KeyType::ALL.into_iter().filter(|t| !slow_rsa(*t)) {
             let parts = generate(t, 1_700_000_000).unwrap();
             for (i, crt) in [KeyCrt::Sign, KeyCrt::Decrypt, KeyCrt::Auth]
                 .into_iter()
@@ -711,7 +790,7 @@ mod tests {
 
     #[test]
     fn secret_mpis_round_trip_for_every_type() {
-        for t in KeyType::ALL {
+        for t in KeyType::ALL.into_iter().filter(|t| !slow_rsa(*t)) {
             for p in generate(t, 1).unwrap() {
                 let body = p.public_body();
                 let back = KeyPart::from_secret(p.algo_id(), &body, &p.secret_mpis()).unwrap();
