@@ -3427,7 +3427,7 @@ fn main() -> eframe::Result<()> {
             .with_title("keyroost"),
         ..Default::default()
     };
-    eframe::run_native(
+    let started = eframe::run_native(
         "keyroost",
         options,
         Box::new(|cc| {
@@ -3489,7 +3489,41 @@ fn main() -> eframe::Result<()> {
             };
             Ok(Box::new(app))
         }),
-    )
+    );
+    if let Err(e) = &started {
+        report_start_failure(e);
+    }
+    started
+}
+
+/// Say why the window never opened. A release build on Windows has no
+/// console, so without a dialog the app would just vanish.
+fn report_start_failure(e: &eframe::Error) {
+    let graphics = matches!(
+        e,
+        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
+    );
+    let text = if graphics {
+        format!(
+            "keyroost couldn't open its window because this computer's graphics \
+             don't provide OpenGL 2.0 or newer. This is common in virtual machines \
+             without 3D acceleration and in some remote-desktop sessions; turning \
+             on 3D acceleration or updating the graphics driver usually fixes it. \
+             The command-line tool, keyroostctl, works without it.\n\nDetails: {e}"
+        )
+    } else {
+        format!("keyroost couldn't open its window.\n\nDetails: {e}")
+    };
+    eprintln!("{text}");
+    #[cfg(windows)]
+    {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("keyroost")
+            .set_description(&text)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
 }
 
 #[derive(Default)]

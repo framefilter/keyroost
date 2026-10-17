@@ -1170,7 +1170,21 @@ fn reader_devtree_keys(names: &[std::ffi::CString]) -> Vec<Option<UsbDeviceKey>>
     }
 }
 
-/// One `KEYROOST_PROBE_DEBUG` line on stderr, in the shared trace grammar.
+static PROBE_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the `--debug` trace of [`probe_readers`] on or off for this process:
+/// each reader seen and the status word of every applet SELECT, on stderr.
+/// Setting `KEYROOST_PROBE_DEBUG` in the environment also turns it on.
+pub fn set_probe_trace(on: bool) {
+    PROBE_TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn probe_trace_on() -> bool {
+    PROBE_TRACE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("KEYROOST_PROBE_DEBUG").is_some()
+}
+
+/// One reader-probe trace line on stderr, in the shared trace grammar.
 fn probe_note(body: &str) {
     eprintln!("{}", format_line(Dir::Note, "probe", body));
 }
@@ -1249,7 +1263,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             yubikey_serial: None,
             usb_device: tree_key,
         };
-        let trace = std::env::var_os("KEYROOST_PROBE_DEBUG").is_some();
+        let trace = probe_trace_on();
         if trace {
             probe_note(&format!("reader seen: {}", probe.reader_name));
         }
