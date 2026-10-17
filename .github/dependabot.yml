@@ -63,6 +63,11 @@ updates:
       # at once and fails to build. Move it with the p256 stack.
       - dependency-name: p384
         versions: ['>=0.14']
+      # k256 (keyroost-pgpkey's secp256k1 keys) is the same elliptic-curve
+      # 0.13 generation and shares p256's re-exported `ToEncodedPoint` there,
+      # so it moves with the p256 stack too.
+      - dependency-name: k256
+        versions: ['>=0.14']
       # The dalek crypto crates (keyroost-pivtest's Ed25519 / X25519 host-side
       # verification) are held at 2.x deliberately, not for a build conflict:
       # the 3.0 line pulls curve25519-dalek 5.0, a brand-new major, and gains
