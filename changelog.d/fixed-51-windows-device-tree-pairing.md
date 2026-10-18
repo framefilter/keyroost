@@ -5,4 +5,5 @@
   Under `--debug`, `keyroostctl list` prints what Windows reported for each
   key (`devtree` lines). Library users: `usb_bus` / `usb_address` on
   `HidDevice`, `ReaderProbe` and `YubiKeyCcid` are replaced by one
-  `usb_device` field. ([#51])
+  `usb_device` field. Keys are also named properly there: "YubiKey" rather
+  than "YubiKey 0", and "Solo 2" rather than "0". ([#51])

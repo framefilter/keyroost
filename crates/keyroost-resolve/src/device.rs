@@ -236,6 +236,21 @@ fn clean_model(raw: &str, vendor: &str) -> String {
     }
 }
 
+/// The model label for a PC/SC reader row. Windows names a reader
+/// `<device name> <n>` (`SoloKeys CCID/ICCD Interface 0`) where pcsc-lite
+/// ends in two two-digit groups (`... 00 00`), so on Windows the trailing
+/// reader number goes first. Only there: a macOS reader name can end in a
+/// real model number (`Nitrokey 3`).
+fn reader_model(reader_name: &str, vendor: &str, windows: bool) -> String {
+    let name = match reader_name.rsplit_once(' ') {
+        Some((head, n)) if windows && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            head
+        }
+        _ => reader_name,
+    };
+    clean_model(name, vendor)
+}
+
 /// How a HID node came to own its reader (traced under `--debug`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchStep {
@@ -702,7 +717,7 @@ pub fn correlate_with(
         } else {
             card_vendor(p.openpgp_manufacturer, &p.reader_name)
         };
-        let model = clean_model(&p.reader_name, &vendor);
+        let model = reader_model(&p.reader_name, &vendor, cfg!(windows));
         devices.push(Device {
             id,
             name: None,
@@ -816,6 +831,19 @@ pub fn correlate_with(
             }
             dev.hid_path = Some(hid.path.clone());
             dev.transport = "USB · PC/SC + FIDO HID".into();
+            // Windows' reader name can carry no model at all (`SoloKeys
+            // CCID/ICCD Interface 0` for a Solo 2), leaving only the vendor;
+            // the HID product string names it then (`Solo 2 Security Key`
+            // -> `Solo 2`, as pcsc-lite's reader name gives it).
+            if dev.model == dev.vendor {
+                let hid_model = clean_model(&hid.product_name, &dev.vendor);
+                let hid_model = hid_model
+                    .strip_suffix(" Security Key")
+                    .unwrap_or(&hid_model);
+                if !hid_model.is_empty() && hid_model != dev.vendor {
+                    dev.model = hid_model.to_string();
+                }
+            }
             if dev.serial.is_empty() {
                 dev.serial = serial.clone();
             } else if keyroost_keyring::canonical_serial(&serial)
@@ -2100,6 +2128,79 @@ mod tests {
             "YubiKey"
         );
         assert_eq!(clean_model("Nitrokey 3", "Nitrokey"), "3");
+    }
+
+    #[test]
+    fn reader_row_without_a_model_takes_the_hid_product_name() {
+        // Windows names a Solo 2's reader `SoloKeys CCID/ICCD Interface 0`:
+        // nothing but the vendor survives, so the matched HID side names it.
+        let mut h = hid(0x1209, 0xbeee, "/dev/hidraw3", None, Some(3), Some(7));
+        h.product_name = "Solo 2 Security Key".into();
+        let p = probe(
+            "SoloKeys CCID/ICCD Interface",
+            false,
+            true,
+            false,
+            false,
+            None,
+            Some(3),
+            Some(7),
+        );
+        let devs = correlate(&[h.clone()], &[p], &Keyring::default());
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].model, "Solo 2");
+        // A reader name that has a model keeps it.
+        h.product_name = "Something Else".into();
+        let p = probe(
+            "SoloKeys Solo 2 [CCID/ICCD Interface] 01 00",
+            false,
+            true,
+            false,
+            false,
+            None,
+            Some(3),
+            Some(7),
+        );
+        let devs = correlate(&[h], &[p], &Keyring::default());
+        assert_eq!(devs[0].model, "Solo 2");
+    }
+
+    #[test]
+    fn reader_model_drops_the_windows_reader_number() {
+        // Reader names as Windows writes them (#51 VM test).
+        assert_eq!(
+            reader_model("Yubico YubiKey OTP+FIDO+CCID 0", "Yubico", true),
+            "YubiKey"
+        );
+        assert_eq!(
+            reader_model("Yubico YubiKey OTP+FIDO+CCID 1", "Yubico", true),
+            "YubiKey"
+        );
+        assert_eq!(
+            reader_model("SoloKeys CCID/ICCD Interface 0", "SoloKeys", true),
+            "SoloKeys"
+        );
+        // The Windows index is a counter, not a single digit.
+        assert_eq!(
+            reader_model("Yubico YubiKey OTP+FIDO+CCID 10", "Yubico", true),
+            "YubiKey"
+        );
+        // pcsc-lite (Linux): `NN NN` port groups.
+        assert_eq!(
+            reader_model("Yubico YubiKey OTP+FIDO+CCID 01 00", "Yubico", false),
+            "YubiKey"
+        );
+        // macOS: the USB product string, with ` 01` on a second identical
+        // reader. A trailing number there can be the model's own.
+        assert_eq!(
+            reader_model("Yubico YubiKey OTP+FIDO+CCID", "Yubico", false),
+            "YubiKey"
+        );
+        assert_eq!(
+            reader_model("Yubico YubiKey OTP+FIDO+CCID 01", "Yubico", false),
+            "YubiKey"
+        );
+        assert_eq!(reader_model("Nitrokey 3", "Nitrokey", false), "3");
     }
 
     #[test]
