@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod hid_watch;
 mod import_flow;
 mod otp_pane;
 #[cfg(unix)]
@@ -3473,6 +3474,17 @@ fn main() -> eframe::Result<()> {
                         egui_ctx.request_repaint();
                     })
                 };
+                // Same for FIDO-only keys, which have no reader for the watcher
+                // above to see: flag the same bit when a FIDO HID device comes or
+                // goes, so the same rescan (with the same hold-offs) runs.
+                let hid_watch = {
+                    let dirty = devices_dirty.clone();
+                    let egui_ctx = cc.egui_ctx.clone();
+                    hid_watch::HidWatcher::spawn(move || {
+                        dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        egui_ctx.request_repaint();
+                    })
+                };
                 let app = App {
                     mode,
                     accent_idx,
@@ -3494,6 +3506,7 @@ fn main() -> eframe::Result<()> {
                     egui_ctx: Some(cc.egui_ctx.clone()),
                     devices_dirty,
                     reader_watch: Some(reader_watch),
+                    hid_watch,
                     mds: ui::mds::MdsDb::load_bundled(),
                     apdu_trace,
                     ..Default::default()
@@ -3766,8 +3779,8 @@ struct App {
     busy_jobs: u32,
     /// Human-readable description of what the worker is currently doing.
     busy_label: Option<String>,
-    /// Set by the reader watcher on a PC/SC hotplug; consumed in `update()` to
-    /// trigger a re-enumeration. Shared with the watcher thread.
+    /// Set by the reader or FIDO HID watcher on a hotplug; consumed in `update()` to
+    /// trigger a re-enumeration. Shared with the watcher threads.
     devices_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// While `Some`, a FIDO reset is armed and waiting for the key to be
     /// unplugged and plugged back in (see [`ResetArm`]).
@@ -3817,6 +3830,11 @@ struct App {
     /// Held only to keep the thread alive; dropped on app exit.
     #[allow(dead_code)]
     reader_watch: Option<keyroost_transport::ReaderWatcher>,
+    /// Background FIDO HID hotplug watcher (keys with no smart-card reader).
+    /// `None` in tests / without a HID backend / if it can't start. Held only
+    /// to keep the thread alive; dropped on app exit.
+    #[allow(dead_code)]
+    hid_watch: Option<hid_watch::HidWatcher>,
     /// Result channel of the in-flight bulk-import stage (QR decode, vault
     /// decrypt, export parse). `Some` while one is running — these can take
     /// seconds (scrypt: minutes at the caps) and run on their own thread so
@@ -13295,7 +13313,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
-        // Reader hotplug: the watcher set this flag (and woke us). Start a
+        // Reader or FIDO HID hotplug: a watcher set this flag (and woke us). Start a
         // rescan burst (suppressed while a reset is armed, so its job can't
         // steal the worker slot).
         if self.reset_arm.is_none()
