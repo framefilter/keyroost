@@ -833,6 +833,11 @@ struct OathRow {
     /// The TOTP period the name implies (its `period/` prefix, else 30): the
     /// code is computed with it and the countdown ring runs on it.
     period: u32,
+    /// The card wouldn't give this TOTP code without a touch (the first read
+    /// timed out waiting for one). Like HOTP, its code is read only on
+    /// request: re-reading it every time window would make the key wait for a
+    /// touch each time, holding back every other row's fresh code meanwhile.
+    touch: bool,
 }
 
 impl OathRow {
@@ -850,6 +855,7 @@ impl OathRow {
             code,
             hotp,
             period,
+            touch: false,
         }
     }
 }
@@ -6318,8 +6324,12 @@ impl App {
 
     /// Off-thread helper: list credentials and compute each current TOTP. Also
     /// returns how many undecodable entries the card holds (partial listing).
+    /// TOTP codes named in `touch` (rows already known to need a touch, see
+    /// [`OathRow::touch`]) are not computed; a code that fails to compute
+    /// marks its row as needing a touch.
     fn oath_list_rows(
         session: &mut keyroost_transport::OathSession,
+        touch: &[String],
     ) -> Result<(Vec<OathRow>, usize), TransportError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6335,12 +6345,16 @@ impl App {
             // the card out of the server's look-ahead window. The row shows a
             // "Read code" button instead.
             let mut row = OathRow::new(c.name, None, hotp);
-            if !hotp {
-                // A touch-required credential blocks until touched; fine off-thread.
+            if !hotp && touch.contains(&row.name) {
+                row.touch = true;
+            } else if !hotp {
+                // A touch-required credential blocks until touched (or the
+                // card gives up); fine off-thread, but only on this first read.
                 row.code = session
                     .calculate_totp(&row.name, now, row.period)
                     .ok()
                     .map(|otp| otp.code);
+                row.touch = row.code.is_none();
             }
             rows.push(row);
         }
@@ -6350,25 +6364,47 @@ impl App {
         Ok((rows, listing.skipped))
     }
 
-    /// Compute one HOTP code on explicit request and patch it into the row.
-    /// Deliberately not part of the listing: each computation advances the
-    /// card's counter.
-    fn read_hotp_code(&mut self, name: &str) {
+    /// Compute one code on explicit request and patch it into the row: an
+    /// HOTP code (not part of the listing: each computation advances the
+    /// card's counter) or a TOTP code that needs a touch (see
+    /// [`OathRow::touch`]; the job waits until the key is touched).
+    fn read_code_on_request(&mut self, name: &str) {
         self.oath.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             self.oath.error = Some("no OATH key selected".into());
             return;
         };
         let cred = name.to_owned();
+        // HOTP, or the TOTP period to compute with.
+        let totp_period = self
+            .oath
+            .creds
+            .iter()
+            .find(|r| r.name == cred && !r.hotp)
+            .map(|r| r.period);
         // The listing already consumed (wiped) password_input, so this read
         // sends the retained accepted password — an empty string here could
         // never unlock a protected applet and re-locked the pane every time.
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
-        self.spawn_job("Reading code\u{2026}", move || {
+        let label = if totp_period.is_some() {
+            "Touch your key to read the code\u{2026}"
+        } else {
+            "Reading code\u{2026}"
+        };
+        self.spawn_job(label, move || {
             let result = (|| -> Result<String, TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
-                Ok(session.calculate_hotp(&cred)?.code)
+                match totp_period {
+                    Some(period) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        Ok(session.calculate_totp(&cred, now, period)?.code)
+                    }
+                    None => Ok(session.calculate_hotp(&cred)?.code),
+                }
             })();
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -6470,6 +6506,17 @@ impl App {
         }
     }
 
+    /// Names of the shown TOTP rows whose codes need a touch, for the next
+    /// listing to leave alone (see [`OathRow::touch`]).
+    fn oath_touch_names(&self) -> Vec<String> {
+        self.oath
+            .creds
+            .iter()
+            .filter(|r| r.touch)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
     /// List credentials on the selected key, computing each current TOTP. Unlocks
     /// first with the entered password when the applet is protected.
     fn load_oath_creds(&mut self) {
@@ -6480,9 +6527,10 @@ impl App {
         };
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
+        let touch = self.oath_touch_names();
         self.spawn_job("Reading OATH codes\u{2026}", move || {
             let result = Self::oath_open_unlock(&name, &password)
-                .and_then(|mut session| Self::oath_list_rows(&mut session));
+                .and_then(|mut session| Self::oath_list_rows(&mut session, &touch));
             Box::new(move |app: &mut App| {
                 // Discard if the user switched devices while the read (which
                 // can block on a touch) was in flight — device B's pane must
@@ -6521,6 +6569,12 @@ impl App {
         };
         let require_touch = self.oath.add.require_touch;
         let password = oath_effective_password(&self.oath);
+        // A new touch account joins the rows left alone, so the listing after
+        // the add doesn't wait for a touch either.
+        let mut touch = self.oath_touch_names();
+        if require_touch {
+            touch.push(cred_name.clone());
+        }
         // The form stays open showing the spinner; it is wiped/closed on the
         // modal's Done (success) or Cancel/✕/Esc. Do not reset it here.
         let for_device = self.selected_device.clone();
@@ -6544,7 +6598,7 @@ impl App {
                     );
                     if refused.is_some() {
                         // Nothing sent; the list is refreshed as usual.
-                        return Self::oath_list_rows(&mut session);
+                        return Self::oath_list_rows(&mut session, &touch);
                     }
                 }
                 session.put(&keyroost_oath::PutParams {
@@ -6556,7 +6610,7 @@ impl App {
                     require_touch,
                     imf: 0,
                 })?;
-                Self::oath_list_rows(&mut session)
+                Self::oath_list_rows(&mut session, &touch)
             })();
             Box::new(move |app: &mut App| {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -6579,11 +6633,12 @@ impl App {
         let cred_name = name.to_owned();
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
+        let touch = self.oath_touch_names();
         self.spawn_job("Deleting credential\u{2026}", move || {
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 session.delete(&cred_name)?;
-                Self::oath_list_rows(&mut session)
+                Self::oath_list_rows(&mut session, &touch)
             })();
             Box::new(move |app: &mut App| {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -21189,7 +21244,7 @@ impl App {
             }
         }
         if let Some(name) = read {
-            self.read_hotp_code(&name);
+            self.read_code_on_request(&name);
         }
 
         // Danger card at the bottom of the pane, mirroring the FIDO2 /
@@ -24413,18 +24468,19 @@ fn oath_row(
                 }
                 ui.add_space(8.0);
             }
-            if hotp && code.is_none() {
-                // No code yet: reading one advances the card's counter, so it
-                // happens only on request. (No copy icon either — there's
-                // nothing to copy.) The compact overview card doesn't handle
-                // the click, so it gets a passive label instead of a button.
+            if (hotp || row.touch) && code.is_none() {
+                // No code yet: reading one advances the card's counter (HOTP)
+                // or waits for a touch, so it happens only on request. (No
+                // copy icon either — there's nothing to copy.) The compact
+                // overview card doesn't handle the click, so it gets a passive
+                // label instead of a button.
                 if with_delete {
                     if theme::button(ui, p, BtnKind::Ghost, "Read code").clicked() {
                         read = true;
                     }
                 } else {
                     ui.label(
-                        egui::RichText::new("on demand")
+                        egui::RichText::new(if hotp { "on demand" } else { "touch" })
                             .font(theme::f_reg(13.0))
                             .color(p.txt3),
                     );
@@ -28938,6 +28994,28 @@ mod tests {
         assert_eq!(app.oath.creds[1].code.as_deref(), Some("222222"));
     }
 
+    /// TOTP rows that needed a touch stay marked across a listing, and only
+    /// they are handed to the next listing to leave alone, so the per-window
+    /// re-read never waits for a touch.
+    #[test]
+    fn oath_touch_rows_are_left_to_on_request_reads() {
+        let mut app = App::default();
+        let mut touch = OathRow::new("Example:touchy".into(), None, false);
+        touch.touch = true;
+        let rows = vec![
+            OathRow::new("Example:alice".into(), Some("222222".into()), false),
+            touch,
+            OathRow::new("Example:bob".into(), None, true),
+        ];
+        App::apply_oath_rows(
+            &mut app,
+            Ok((rows, 0)),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        assert!(app.oath.creds[1].touch);
+        assert_eq!(app.oath_touch_names(), vec!["Example:touchy".to_string()]);
+    }
+
     /// The HOTP-read regression: a successful listing consumes the typed
     /// password but retains the accepted copy, so a later on-demand HOTP
     /// read can still unlock the protected applet.
@@ -28958,7 +29036,7 @@ mod tests {
             Some("hunter2"),
             "the accepted password is retained for on-demand reads"
         );
-        // …which is exactly what read_hotp_code will now pick up:
+        // …which is exactly what read_code_on_request will now pick up:
         assert_eq!(&*oath_effective_password(&app.oath), "hunter2");
     }
 
