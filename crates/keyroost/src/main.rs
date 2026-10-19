@@ -3875,6 +3875,10 @@ struct App {
     piv_tried: bool,
     /// Same guard for the OTP pane's auto-read.
     otp_tried: bool,
+    /// A Refresh click is waiting for its rescan: when the scan lands with the
+    /// same key still selected, the open tab is read again (see
+    /// [`App::user_refresh`]).
+    reread_after_scan: bool,
     /// True while the Molto2 factory-reset confirmation is showing.
     molto_reset_confirm: bool,
     /// True while the per-slot seed-delete confirmation card is showing.
@@ -8966,6 +8970,41 @@ impl App {
         self.next_scan_at = None; // first scan is due immediately
     }
 
+    /// What every Refresh button does, wherever it sits: rescan for keys,
+    /// then read the open tab of the selected key again — so a change made
+    /// outside the app (an account added with `keyroostctl`, say) shows up
+    /// whichever Refresh was clicked. The re-read waits for the scan, since
+    /// the worker takes one job at a time.
+    fn user_refresh(&mut self) {
+        self.schedule_scan_burst();
+        self.reread_after_scan = true;
+    }
+
+    /// Read the open tab of the selected key again, as its pane does on first
+    /// showing. Leaves unlocked sessions alone (a password-locked OATH applet
+    /// waits for its password); a Molto2 re-reads its slot list through its
+    /// open session, as "Refresh slots" does.
+    fn reread_open_tab(&mut self) {
+        if self
+            .selected_device()
+            .is_some_and(|d| d.kind == DeviceKind::Token)
+        {
+            self.resweep_slot_meta(LogKind::User);
+            return;
+        }
+        match self.cap_tab {
+            CapTab::Oath => {
+                if !self.oath.locked {
+                    self.load_oath_creds();
+                }
+            }
+            CapTab::Piv => self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass),
+            CapTab::Pgp => self.load_openpgp_status(),
+            CapTab::Otp => self.refresh_otp(),
+            CapTab::Fido2 | CapTab::Overview => self.fetch_selected_info(),
+        }
+    }
+
     fn refresh_devices(&mut self) {
         self.scanned = true;
         self.spawn_job("Scanning for devices\u{2026}", move || {
@@ -9088,11 +9127,16 @@ impl App {
                     // everything on the next successful scan for no reason).
                     app.piv_session_state
                         .retain(|id, _| app.devices.iter().any(|d| &d.id == id));
+                    // A different selection reads its tabs afresh anyway.
+                    let reread = std::mem::take(&mut app.reread_after_scan);
                     if changed {
                         app.on_device_selected(previous);
+                    } else if reread && app.selected_device.is_some() {
+                        app.reread_open_tab();
                     }
                 }
                 Err(e) => {
+                    app.reread_after_scan = false;
                     app.log_global(
                         Severity::Warn,
                         LogKind::Background,
@@ -14457,7 +14501,7 @@ impl App {
                         |ui| {
                             // Right-to-left: Refresh is the rightmost item.
                             if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
-                                self.schedule_scan_burst();
+                                self.user_refresh();
                             }
                             if !fit.links_in_menu {
                                 ui.add_space(TOPBAR_GAP);
@@ -15052,7 +15096,7 @@ impl App {
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
-                    app.schedule_scan_burst();
+                    app.user_refresh();
                 }
             },
         );
@@ -15177,7 +15221,7 @@ impl App {
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
-            self.schedule_scan_burst();
+            self.user_refresh();
         }
         if self.devices.is_empty() {
             return ev;
@@ -21110,7 +21154,7 @@ impl App {
                     }));
                 }
             }
-            Some(2) => self.load_oath_creds(),
+            Some(2) => self.user_refresh(),
             _ => {}
         }
         ui.add_space(12.0);
@@ -23366,7 +23410,7 @@ impl App {
             self.piv.selected_slot = slot;
         }
         if do_refresh {
-            self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass);
+            self.user_refresh();
         }
         // The three buttons open the centered credential modal; the modal itself
         // (rendered once per frame) runs the actual op. Opening wipes any stale
@@ -29014,6 +29058,16 @@ mod tests {
         );
         assert!(app.oath.creds[1].touch);
         assert_eq!(app.oath_touch_names(), vec!["Example:touchy".to_string()]);
+    }
+
+    /// Every Refresh button rescans and then re-reads the open tab: the click
+    /// queues the scan burst and marks the re-read for when the scan lands.
+    #[test]
+    fn refresh_rescans_and_queues_a_reread_of_the_open_tab() {
+        let mut app = App::default();
+        app.user_refresh();
+        assert_eq!(app.pending_scans, 4);
+        assert!(app.reread_after_scan);
     }
 
     /// The HOTP-read regression: a successful listing consumes the typed

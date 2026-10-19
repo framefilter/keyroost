@@ -516,6 +516,14 @@ impl App {
         });
     }
 
+    /// Read the pane again from scratch: forget the transport and serial the
+    /// last read settled on, then list. The pane's part of a Refresh.
+    pub(crate) fn refresh_otp(&mut self) {
+        self.otp.active = None;
+        self.otp.serial = None;
+        self.load_otp_entries();
+    }
+
     /// List entries on the selected key over the chosen transport.
     pub(crate) fn load_otp_entries(&mut self) {
         self.otp.error = None;
@@ -1673,9 +1681,7 @@ impl App {
                 }
                 ui.add_space(6.0);
                 if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                    self.otp.active = None;
-                    self.otp.serial = None;
-                    self.load_otp_entries();
+                    self.user_refresh();
                 }
             });
         });
