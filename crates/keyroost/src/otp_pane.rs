@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use keyroost_transport::{OtpTransportError, Token2OtpSession};
 
 use crate::ui::theme::{self, BtnKind, Palette};
-use crate::{now_secs_f64, wipe, App};
+use crate::{wipe, App};
 
 /// Which transport the OTP pane should use. Mirrors the CLI `--transport` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1950,8 +1950,7 @@ impl App {
         });
 
         if let Some(code) = copy {
-            ui.ctx().copy_text(code.clone());
-            self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
+            self.copy_secret(ui.ctx(), code);
         }
         if let Some((a, acct)) = delete {
             self.otp.confirm_delete = Some((a, acct));

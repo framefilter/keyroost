@@ -591,7 +591,9 @@ setup. The CLI has no build script.)
 > session without XWayland clipboard sync it can't see the contents and fails
 > open (nothing is cleared) rather than clobbering whatever you copied since.
 > GNOME and KDE sync the two clipboards, so the clear works there; on other
-> compositors treat the auto-clear as best-effort.
+> compositors treat the auto-clear as best-effort. Copied codes are also marked
+> to stay out of clipboard history on macOS, Windows and X11; a native Wayland
+> window copies them unmarked.
 
 > **Forcing X11 (`KEYROOST_X11=1`):** the GUI runs natively on Wayland by
 > default. The egui/eframe 0.35 bump fixed a Wayland/KDE input bug where text

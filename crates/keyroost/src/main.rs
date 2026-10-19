@@ -41,6 +41,80 @@ use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 /// the workspace version, so it can never drift from the release.
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
+/// How long the app keeps an unlocked FIDO session, a retained OATH password
+/// or OTP PIN, and displayed codes without any pointer or keyboard input
+/// before locking them (see `App::idle_lock`). The lock message names the
+/// duration too.
+const IDLE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Whether an egui input event is the user doing something (pointer,
+/// keyboard, touch, scroll), as opposed to window bookkeeping such as focus
+/// changes or screenshots. Only these postpone the inactivity lock.
+fn is_user_activity(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Paste(_)
+            | egui::Event::Text(_)
+            | egui::Event::Key { .. }
+            | egui::Event::PointerMoved(_)
+            | egui::Event::MouseMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::Rotate(_)
+            | egui::Event::Ime(_)
+            | egui::Event::Touch { .. }
+            | egui::Event::MouseWheel { .. }
+    )
+}
+
+/// Put a secret on the system clipboard through `slot`'s arboard handle
+/// (created on first use), with the platform's "keep this out of clipboard
+/// history" marker: `org.nspasteboard.ConcealedType` on macOS, the
+/// clipboard-history and cloud-clipboard exclusions on Windows, and the
+/// `x-kde-passwordManagerHint` type on X11. Returns `false` when it couldn't,
+/// and the caller copies the plain way instead.
+fn copy_concealed(slot: &mut Option<arboard::Clipboard>, text: &str) -> bool {
+    // A native Wayland window's clipboard is egui's own Wayland one. arboard
+    // is built X11-only here (its Wayland backend would be a new
+    // dependency), so a copy through it could land only in XWayland's
+    // clipboard, which not every compositor syncs. Leave Wayland to egui.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return false;
+    }
+    if slot.is_none() {
+        *slot = arboard::Clipboard::new().ok();
+    }
+    let Some(clipboard) = slot.as_mut() else {
+        return false;
+    };
+    let set = clipboard.set();
+    #[cfg(target_os = "macos")]
+    let set = {
+        use arboard::SetExtApple;
+        set.exclude_from_history()
+    };
+    #[cfg(windows)]
+    let set = {
+        use arboard::SetExtWindows;
+        set.exclude_from_history().exclude_from_cloud()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let set = {
+        use arboard::SetExtLinux;
+        set.exclude_from_history()
+    };
+    if set.text(text).is_ok() {
+        true
+    } else {
+        // A broken handle (e.g. the X server went away) is rebuilt next time.
+        *slot = None;
+        false
+    }
+}
+
 /// How the selected FIDO key is reached: over USB-HID (a `hidraw` path) or over
 /// a PC/SC reader (NFC or contact, by reader name).
 #[derive(Debug, Clone)]
@@ -3668,6 +3742,15 @@ struct App {
     /// clipboard-manager history forever. Cleared conditionally: only if the
     /// clipboard still holds that exact code.
     clipboard_clear_at: Option<(String, f64)>,
+    /// The clipboard handle secrets are copied through (see
+    /// [`App::copy_secret`]), created on first use. Kept alive rather than
+    /// made per copy: on X11 the copying app serves the clipboard's contents,
+    /// so a dropped handle could take the copied code with it.
+    secret_clipboard: Option<arboard::Clipboard>,
+    /// When the user last gave the window input (or an operation last ran);
+    /// drives the inactivity lock (see [`IDLE_LOCK_AFTER`]). `None` until the
+    /// first frame.
+    last_activity: Option<std::time::Instant>,
     /// True once the first automatic device scan has been kicked off.
     scanned: bool,
     /// Sidebar filter text (filters the visible device list by vendor/model).
@@ -5134,6 +5217,90 @@ impl App {
         self.security_keys.session = None;
         self.security_keys.session_device = None;
         wipe(&mut self.security_keys.pin_input);
+    }
+
+    /// Whether the app holds anything [`Self::idle_lock`] would clear: an
+    /// unlocked FIDO session (with its PIN), a retained OATH password or OTP
+    /// PIN, or displayed OATH / OTP codes.
+    fn holds_unlocked_secrets(&self) -> bool {
+        self.security_keys.session.is_some()
+            || self.oath.unlocked_password.is_some()
+            || self.oath.creds.iter().any(|r| r.code.is_some())
+            || self.otp.pin.is_some()
+            || self.otp.rows.iter().any(|r| r.code.is_some())
+    }
+
+    /// The inactivity check, run once per frame. `user_input` is whether this
+    /// frame carried pointer / keyboard input. A running operation (a worker
+    /// job — including a touch or fingerprint wait — an import stage, or an
+    /// armed reset) counts as activity, so nothing is locked out from under
+    /// it and the idle clock restarts when it ends. Returns how long until
+    /// the next check is due, or `None` when nothing is held.
+    fn idle_lock_tick(
+        &mut self,
+        now: std::time::Instant,
+        user_input: bool,
+    ) -> Option<std::time::Duration> {
+        let operating = self.busy() || self.import_busy() || self.reset_arm.is_some();
+        if user_input || operating || self.last_activity.is_none() {
+            self.last_activity = Some(now);
+        }
+        if !self.holds_unlocked_secrets() {
+            return None;
+        }
+        let idle = now.saturating_duration_since(self.last_activity.unwrap_or(now));
+        if idle < IDLE_LOCK_AFTER {
+            return Some(IDLE_LOCK_AFTER - idle);
+        }
+        self.idle_lock();
+        None
+    }
+
+    /// Lock what [`Self::holds_unlocked_secrets`] reports, after
+    /// [`IDLE_LOCK_AFTER`] without input: the FIDO session through the same
+    /// path as the Lock button, the retained OATH password and OTP PIN (a
+    /// protected applet goes back to its unlock prompt, as after a rejected
+    /// password), and every displayed code. Local only — no device I/O.
+    fn idle_lock(&mut self) {
+        let msg = "Locked after 5 minutes of inactivity \u{2014} unlock again to continue.";
+        if self.security_keys.session.is_some() {
+            self.lock_session();
+            self.security_keys.error = Some(msg.into());
+        }
+        if let Some(password) = self.oath.unlocked_password.take() {
+            if !password.is_empty() {
+                self.oath.creds.clear();
+                self.oath.locked = true;
+            }
+        }
+        for row in &mut self.oath.creds {
+            if let Some(mut code) = row.code.take() {
+                wipe(&mut code);
+            }
+        }
+        if self.otp.pin.take().is_some() {
+            self.otp.pin_required = true;
+            self.otp.rows.clear();
+            self.otp.info = Some(msg.into());
+        }
+        for row in &mut self.otp.rows {
+            if let Some(mut code) = row.code.take() {
+                wipe(&mut code);
+            }
+        }
+        self.log(Severity::Info, msg.to_string());
+    }
+
+    /// Copy a secret (an OTP / OATH code, a generated management key) to the
+    /// clipboard, marked for exclusion from clipboard history where the
+    /// platform has a marker, and schedule the 45 s conditional auto-clear.
+    /// Falls back to egui's own clipboard path when the marked copy can't be
+    /// made, so copying never silently stops working.
+    fn copy_secret(&mut self, ctx: &egui::Context, text: String) {
+        if !copy_concealed(&mut self.secret_clipboard, &text) {
+            ctx.copy_text(text.clone());
+        }
+        self.clipboard_clear_at = Some((text, now_secs_f64() + 45.0));
     }
 
     /// Resolve a failed unlocked-session operation. When the underlying CTAP
@@ -9823,8 +9990,7 @@ impl App {
         let hex = hex_lower(&key);
         wipe(&mut self.piv.new_mgmt_key_input);
         self.piv.new_mgmt_key_input.push_str(&hex);
-        ctx.copy_text(hex.clone());
-        self.clipboard_clear_at = Some((hex, now_secs_f64() + 45.0));
+        self.copy_secret(ctx, hex);
         self.secret_reveal.insert("piv-new-mgmt-key", true);
     }
 
@@ -13210,10 +13376,15 @@ impl eframe::App for App {
         // already in the tree via eframe's clipboard integration; if the
         // clipboard can't be read (e.g. some Wayland setups), fail open and
         // clear nothing rather than risk destroying foreign content.
+        // The read and the clear go through the same long-lived handle the
+        // secret was copied with (`copy_secret`) when there is one.
         if let Some((ref code, t)) = self.clipboard_clear_at {
             let now = now_secs_f64();
             if now >= t {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
+                if self.secret_clipboard.is_none() {
+                    self.secret_clipboard = arboard::Clipboard::new().ok();
+                }
+                if let Some(cb) = self.secret_clipboard.as_mut() {
                     if cb.get_text().is_ok_and(|current| current == *code) {
                         let _ = cb.clear();
                     }
@@ -13346,6 +13517,14 @@ impl eframe::App for App {
             if self.pending_scans > 0 && !renaming {
                 ctx.request_repaint_after(std::time::Duration::from_millis(500));
             }
+        }
+
+        // Inactivity lock: after IDLE_LOCK_AFTER without input, drop the
+        // unlocked FIDO session, retained OATH password / OTP PIN and shown
+        // codes. The timer wakes the frame loop even when nothing else draws.
+        let user_input = ctx.input(|i| i.events.iter().any(is_user_activity));
+        if let Some(next) = self.idle_lock_tick(std::time::Instant::now(), user_input) {
+            ctx.request_repaint_after(next);
         }
 
         self.top_bar(root_ui, &p);
@@ -15993,9 +16172,8 @@ impl App {
                             );
                         }
                         if let Some((name, code)) = copy {
-                            ui.ctx().copy_text(code.clone());
                             self.copied = Some((name, now_secs_f64() + 1.2));
-                            self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
+                            self.copy_secret(ui.ctx(), code);
                         }
                     } else {
                         ui.label(
@@ -20861,9 +21039,8 @@ impl App {
             }
         });
         if let Some((name, code)) = copy {
-            ui.ctx().copy_text(code.clone());
             self.copied = Some((name, now_secs_f64() + 1.2));
-            self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
+            self.copy_secret(ui.ctx(), code);
         }
         if let Some(name) = delete {
             if let Some(dev) = self.selected_device.clone() {
@@ -28363,6 +28540,128 @@ mod tests {
             cancel.load(std::sync::atomic::Ordering::Relaxed),
             "an in-flight enroll must be told to cancel"
         );
+    }
+
+    fn otp_row(code: Option<&str>) -> otp_pane::OtpRow {
+        otp_pane::OtpRow {
+            app_name: "Example".into(),
+            account_name: "alice".into(),
+            type_str: "TOTP",
+            algo_str: "SHA1",
+            button_required: false,
+            code: code.map(str::to_owned),
+            period: 30,
+        }
+    }
+
+    /// Nothing held: the inactivity check schedules nothing and locks nothing.
+    #[test]
+    fn idle_lock_is_idle_when_nothing_is_unlocked() {
+        let mut app = App::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.idle_lock_tick(t0, false), None);
+        assert_eq!(app.idle_lock_tick(t0 + IDLE_LOCK_AFTER * 2, false), None);
+    }
+
+    /// A protected OATH applet's password and codes are dropped after the
+    /// timeout and the pane returns to its unlock prompt; until then the
+    /// check asks to be woken when the timeout would fall due.
+    #[test]
+    fn idle_lock_relocks_a_protected_oath_applet() {
+        let mut app = App::default();
+        app.oath.unlocked_password = Some(zeroize::Zeroizing::new("hunter2".into()));
+        app.oath.loaded = true;
+        app.oath.creds = vec![OathRow::new(
+            "Example:alice".into(),
+            Some("123456".into()),
+            false,
+        )];
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.idle_lock_tick(t0, false), Some(IDLE_LOCK_AFTER));
+        let almost = t0 + IDLE_LOCK_AFTER - std::time::Duration::from_secs(1);
+        assert_eq!(
+            app.idle_lock_tick(almost, false),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert!(app.oath.unlocked_password.is_some(), "not yet");
+
+        assert_eq!(app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false), None);
+        assert!(app.oath.unlocked_password.is_none());
+        assert!(app.oath.creds.is_empty());
+        assert!(app.oath.locked, "back to the unlock prompt");
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// An unprotected applet keeps its list (nothing to re-enter), but the
+    /// shown codes are cleared and the pane is not put behind a prompt.
+    #[test]
+    fn idle_lock_clears_codes_of_an_unprotected_oath_applet() {
+        let mut app = App::default();
+        app.oath.unlocked_password = Some(zeroize::Zeroizing::new(String::new()));
+        app.oath.loaded = true;
+        app.oath.creds = vec![OathRow::new(
+            "Example:alice".into(),
+            Some("123456".into()),
+            false,
+        )];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert_eq!(app.oath.creds.len(), 1);
+        assert_eq!(app.oath.creds[0].code, None);
+        assert!(!app.oath.locked);
+    }
+
+    /// Input restarts the clock; so does a running operation, so a long
+    /// touch / fingerprint wait is never locked out from under, and the
+    /// full timeout runs again from when it ends.
+    #[test]
+    fn idle_lock_waits_for_input_and_operations() {
+        let mut app = App::default();
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        let t1 = t0 + IDLE_LOCK_AFTER - std::time::Duration::from_secs(1);
+        assert_eq!(app.idle_lock_tick(t1, true), Some(IDLE_LOCK_AFTER));
+
+        app.busy_jobs = 1;
+        let t2 = t1 + IDLE_LOCK_AFTER * 3;
+        assert_eq!(app.idle_lock_tick(t2, false), Some(IDLE_LOCK_AFTER));
+        assert!(app.otp.rows[0].code.is_some(), "never mid-operation");
+        app.busy_jobs = 0;
+        assert_eq!(
+            app.idle_lock_tick(t2 + std::time::Duration::from_secs(1), false),
+            Some(IDLE_LOCK_AFTER - std::time::Duration::from_secs(1))
+        );
+
+        assert_eq!(app.idle_lock_tick(t2 + IDLE_LOCK_AFTER, false), None);
+        assert_eq!(app.otp.rows[0].code, None);
+    }
+
+    /// A cached OTP PIN is dropped and the pane goes back to its PIN prompt.
+    #[test]
+    fn idle_lock_drops_a_cached_otp_pin() {
+        let mut app = App::default();
+        app.otp.pin = Some(zeroize::Zeroizing::new("1234".into()));
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert!(app.otp.pin.is_none());
+        assert!(app.otp.pin_required);
+        assert!(app.otp.rows.is_empty());
+    }
+
+    /// Only real pointer / keyboard input postpones the lock — not window
+    /// bookkeeping like a focus change.
+    #[test]
+    fn user_activity_excludes_window_bookkeeping() {
+        assert!(is_user_activity(&egui::Event::Text("a".into())));
+        assert!(is_user_activity(&egui::Event::PointerMoved(egui::pos2(
+            1.0, 2.0
+        ))));
+        assert!(!is_user_activity(&egui::Event::WindowFocused(true)));
+        assert!(!is_user_activity(&egui::Event::PointerGone));
     }
 
     /// The HOTP-read regression: a successful listing consumes the typed

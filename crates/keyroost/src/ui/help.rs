@@ -50,7 +50,7 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "unlock" => &Help {
             title: "Unlocking the key",
-            body: "Enter the key's PIN to unlock it for this session. Unlocking gives access to managing passkeys, fingerprints, and security settings; it stays unlocked until you lock it again or unplug the key. The PIN never leaves the device.",
+            body: "Enter the key's PIN to unlock it for this session. Unlocking gives access to managing passkeys, fingerprints, and security settings; it stays unlocked until you lock it again, unplug the key, or leave the app untouched for 5 minutes. The PIN never leaves the device.",
             slug: "",
         },
         "oath" => &Help {
