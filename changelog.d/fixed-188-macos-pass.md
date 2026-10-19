@@ -7,4 +7,4 @@
   are now noticed where the system doesn't announce new readers (as on
   macOS). The macOS builds now state their minimum: macOS 11 (Big Sur) or
   newer. The PIV page records that macOS's built-in PIV support read a
-  compressed certificate. ([#152])
+  compressed certificate. ([#188])
