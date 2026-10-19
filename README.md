@@ -560,7 +560,8 @@ sudo systemctl enable --now pcscd
 (For the **CLI only** you can drop the `libxkbcommon`/`wayland`/`xcb`/`mesa`
 packages — those are just for the GUI.) macOS and Windows have PC/SC built in,
 and the FIDO HID backend uses `hidapi` (IOKit / hid.dll) automatically — no extra
-packages. macOS/Windows are tier-2 (best-effort, not yet hardware-verified).
+packages. Linux gets the most hands-on testing; macOS and Windows trail it but
+are now tested on real keys regularly too.
 
 (Building the **GUI on Windows** compiles a small build script that embeds the
 app icon and version info into `keyroost.exe`; it needs a resource compiler —
