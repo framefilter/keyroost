@@ -21,6 +21,9 @@
 //!   short-lived PC/SC context, which does not touch the reader's state, so it
 //!   is safe on a Molto2 (which must never be connected to during a scan).
 //!
+//! It also reads a USB device node's product string from the same metadata
+//! ([`usb_product_name`]), for naming a key whose reader name carries no model.
+//!
 //! Every failure yields `None` ("no evidence"), never an error. On non-Windows
 //! targets every entry point is inert.
 
@@ -63,6 +66,24 @@ pub fn reader_chains(readers: &[&CStr]) -> Vec<Option<Vec<String>>> {
     }
 }
 
+/// The USB product string (`iProduct`) the device behind a USB device
+/// instance ID reported to Windows, as the device tree keeps it
+/// (`DEVPKEY_Device_BusReportedDeviceDesc`). Read from PnP metadata only, so
+/// it works without admin, where a FIDO HID interface can't be opened to ask.
+/// `None` on any error, and always `None` off Windows.
+#[must_use]
+pub fn usb_product_name(instance_id: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        sys::usb_product_name(instance_id)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = instance_id;
+        None
+    }
+}
+
 #[cfg(windows)]
 #[allow(non_snake_case)]
 mod sys {
@@ -70,11 +91,12 @@ mod sys {
     use std::ptr;
 
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Get_Device_IDW, CM_Get_Device_Interface_PropertyW, CM_Get_Parent, CM_Locate_DevNodeW,
-        CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS, MAX_DEVICE_ID_LEN,
+        CM_Get_DevNode_PropertyW, CM_Get_Device_IDW, CM_Get_Device_Interface_PropertyW,
+        CM_Get_Parent, CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS, MAX_DEVICE_ID_LEN,
     };
     use windows_sys::Win32::Devices::Properties::{
-        DEVPKEY_Device_InstanceId, DEVPROPTYPE, DEVPROP_TYPE_STRING,
+        DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_InstanceId, DEVPROPTYPE,
+        DEVPROP_TYPE_STRING,
     };
     use windows_sys::Win32::Security::Credentials::{
         SCardEstablishContext, SCardGetReaderDeviceInstanceIdA, SCardReleaseContext,
@@ -115,18 +137,53 @@ mod sys {
         wide_to_string(&buf)
     }
 
+    /// The devnode handle for instance ID `id`, or `None` if it isn't present.
+    fn locate(id: &str) -> Option<u32> {
+        let wid = to_wide(id);
+        let mut devinst: u32 = 0;
+        // SAFETY: `wid` is a NUL-terminated UTF-16 string that outlives the
+        // call; `devinst` is a valid out-pointer.
+        let cr =
+            unsafe { CM_Locate_DevNodeW(&mut devinst, wid.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) };
+        (cr == CR_SUCCESS).then_some(devinst)
+    }
+
+    /// UTF-16 buffer length (in u16s) for a USB product string: a USB string
+    /// descriptor holds at most 126 characters.
+    const PRODUCT_BUF_CHARS: usize = 256;
+
+    pub(super) fn usb_product_name(id: &str) -> Option<String> {
+        let devinst = locate(id)?;
+        let mut buf = vec![0u16; PRODUCT_BUF_CHARS];
+        let mut size_bytes: u32 = (buf.len() * 2) as u32;
+        let mut ty: DEVPROPTYPE = 0;
+        // SAFETY: `devinst` came from CM_Locate_DevNodeW; the property key is
+        // a static; `ty` and `size_bytes` are valid out-pointers; `buf` is
+        // writable for `size_bytes` bytes (its exact byte length).
+        let cr = unsafe {
+            CM_Get_DevNode_PropertyW(
+                devinst,
+                &DEVPKEY_Device_BusReportedDeviceDesc,
+                &mut ty,
+                buf.as_mut_ptr().cast::<u8>(),
+                &mut size_bytes,
+                0,
+            )
+        };
+        if cr != CR_SUCCESS || ty != DEVPROP_TYPE_STRING {
+            return None;
+        }
+        let chars = (size_bytes as usize / 2).min(buf.len());
+        wide_to_string(&buf[..chars])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     /// `id` followed by its ancestors' instance IDs, at most
     /// [`MAX_CHAIN_LEN`] entries. Reaching the top of the tree (no parent)
     /// ends the chain; any other failure yields `None`.
     fn chain_from_instance_id(id: &str) -> Option<Vec<String>> {
-        let wid = to_wide(id);
-        let mut cur: u32 = 0;
-        // SAFETY: `wid` is a NUL-terminated UTF-16 string that outlives the
-        // call; `cur` is a valid out-pointer.
-        let cr = unsafe { CM_Locate_DevNodeW(&mut cur, wid.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) };
-        if cr != CR_SUCCESS {
-            return None;
-        }
+        let mut cur = locate(id)?;
         let mut chain = vec![id.to_string()];
         while chain.len() < MAX_CHAIN_LEN {
             let mut parent: u32 = 0;
@@ -234,5 +291,6 @@ mod tests {
         let b = c"TOKEN2 FIDO2 Security Key(0024) 0";
         assert_eq!(reader_chains(&[a, b]), vec![None, None]);
         assert!(reader_chains(&[]).is_empty());
+        assert!(usb_product_name(r"USB\VID_1209&PID_BEEE\0123").is_none());
     }
 }

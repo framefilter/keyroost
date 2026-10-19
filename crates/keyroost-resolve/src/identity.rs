@@ -549,6 +549,7 @@ mod tests {
             prog_serial: None,
             yubikey_serial: yk.map(str::to_owned),
             usb_device: keyroost_hid::UsbDeviceKey::from_bus_addr(bus, addr),
+            usb_product: None,
         }
     }
     #[test]

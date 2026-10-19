@@ -236,6 +236,15 @@ fn clean_model(raw: &str, vendor: &str) -> String {
     }
 }
 
+/// A model label from a USB product string, for a reader row whose name gave
+/// only the vendor: `Solo 2 Security Key` -> `Solo 2`, as pcsc-lite's reader
+/// name has it. `None` when nothing beyond the vendor is left.
+fn product_model(product: &str, vendor: &str) -> Option<String> {
+    let model = clean_model(product, vendor);
+    let model = model.strip_suffix("Security Key").unwrap_or(&model).trim();
+    (!model.is_empty() && model != vendor).then(|| model.to_string())
+}
+
 /// The model label for a PC/SC reader row. Windows names a reader
 /// `<device name> <n>` (`SoloKeys CCID/ICCD Interface 0`) where pcsc-lite
 /// ends in two two-digit groups (`... 00 00`), so on Windows the trailing
@@ -717,7 +726,19 @@ pub fn correlate_with(
         } else {
             card_vendor(p.openpgp_manufacturer, &p.reader_name)
         };
-        let model = reader_model(&p.reader_name, &vendor, cfg!(windows));
+        let mut model = reader_model(&p.reader_name, &vendor, cfg!(windows));
+        // Windows' reader name can carry no model at all (`SoloKeys
+        // CCID/ICCD Interface 0` for a Solo 2), leaving only the vendor; the
+        // USB product string from the device tree names it then.
+        if model == vendor {
+            if let Some(m) = p
+                .usb_product
+                .as_deref()
+                .and_then(|prod| product_model(prod, &vendor))
+            {
+                model = m;
+            }
+        }
         devices.push(Device {
             id,
             name: None,
@@ -831,17 +852,11 @@ pub fn correlate_with(
             }
             dev.hid_path = Some(hid.path.clone());
             dev.transport = "USB · PC/SC + FIDO HID".into();
-            // Windows' reader name can carry no model at all (`SoloKeys
-            // CCID/ICCD Interface 0` for a Solo 2), leaving only the vendor;
-            // the HID product string names it then (`Solo 2 Security Key`
-            // -> `Solo 2`, as pcsc-lite's reader name gives it).
+            // A reader row still named only by its vendor (no USB product
+            // string from the device tree either) takes the HID product name.
             if dev.model == dev.vendor {
-                let hid_model = clean_model(&hid.product_name, &dev.vendor);
-                let hid_model = hid_model
-                    .strip_suffix(" Security Key")
-                    .unwrap_or(&hid_model);
-                if !hid_model.is_empty() && hid_model != dev.vendor {
-                    dev.model = hid_model.to_string();
+                if let Some(m) = product_model(&hid.product_name, &dev.vendor) {
+                    dev.model = m;
                 }
             }
             if dev.serial.is_empty() {
@@ -1565,6 +1580,7 @@ mod tests {
             prog_serial: None,
             yubikey_serial: yk_serial.map(str::to_owned),
             usb_device: UsbDeviceKey::from_bus_addr(bus, addr),
+            usb_product: None,
         }
     }
 
@@ -2163,6 +2179,29 @@ mod tests {
         );
         let devs = correlate(&[h], &[p], &Keyring::default());
         assert_eq!(devs[0].model, "Solo 2");
+    }
+
+    #[test]
+    fn reader_row_without_a_model_takes_the_device_tree_product_name() {
+        // Non-admin Windows: no HID side at all, but the device tree still
+        // gives the reader's USB product string.
+        let mut p = probe(
+            "SoloKeys CCID/ICCD Interface",
+            false,
+            true,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        p.usb_product = Some("Solo 2 Security Key".into());
+        let devs = correlate(&[], &[p.clone()], &Keyring::default());
+        assert_eq!(devs[0].model, "Solo 2");
+        // A product string that says no more than the vendor changes nothing.
+        p.usb_product = Some("SoloKeys Security Key".into());
+        let devs = correlate(&[], &[p], &Keyring::default());
+        assert_eq!(devs[0].model, "SoloKeys");
     }
 
     #[test]

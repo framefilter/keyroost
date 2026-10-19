@@ -1068,7 +1068,7 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
 
     let tree = reader_devtree_keys(&names);
     let mut out = Vec::with_capacity(names.len());
-    for (name, tree_key) in names.into_iter().zip(tree) {
+    for (name, (tree_key, _)) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
         let (mut usb_device, mut serial) = (tree_key, None);
         if let Ok(card) = ctx.connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY) {
@@ -1141,13 +1141,20 @@ pub struct ReaderProbe {
     /// devnode from the Windows device tree (read without connecting, so for a
     /// Molto2 too). Compare with [`keyroost_hid::same_usb_device`].
     pub usb_device: Option<UsbDeviceKey>,
+    /// The USB product string of the reader's device, when it is known
+    /// without connecting: from the Windows device tree, for naming a key
+    /// whose Windows reader name has no model in it (a Solo 2's is
+    /// `SoloKeys CCID/ICCD Interface 0`). `None` elsewhere, where the reader
+    /// name already carries the product.
+    pub usb_product: Option<String>,
 }
 
 /// Each reader's USB device evidence that needs no card connection, parallel
-/// to `names`: on Windows the reader's USB device devnode, read from the device
-/// tree on one short-lived PC/SC context (traced under `--debug`); `None`
-/// everywhere else, where the evidence comes from `CHANNEL_ID` instead.
-fn reader_devtree_keys(names: &[std::ffi::CString]) -> Vec<Option<UsbDeviceKey>> {
+/// to `names`: on Windows the reader's USB device devnode and that device's
+/// USB product string, read from the device tree on one short-lived PC/SC
+/// context (traced under `--debug`); `None` everywhere else, where the
+/// evidence comes from `CHANNEL_ID` instead.
+fn reader_devtree_keys(names: &[std::ffi::CString]) -> Vec<(Option<UsbDeviceKey>, Option<String>)> {
     #[cfg(windows)]
     {
         let refs: Vec<&std::ffi::CStr> = names.iter().map(|n| n.as_c_str()).collect();
@@ -1156,17 +1163,22 @@ fn reader_devtree_keys(names: &[std::ffi::CString]) -> Vec<Option<UsbDeviceKey>>
             .iter()
             .zip(keyroost_windevtree::reader_chains(&refs))
             .map(|(name, chain)| {
-                keyroost_hid::devtree::win_node_from_chain(
+                let key = keyroost_hid::devtree::win_node_from_chain(
                     &format!("reader '{}'", name.to_string_lossy()),
                     chain.as_deref(),
                     trace,
-                )
+                );
+                let product = chain
+                    .as_deref()
+                    .and_then(keyroost_hid::devtree::usb_device_node)
+                    .and_then(|node| keyroost_windevtree::usb_product_name(&node));
+                (key, product)
             })
             .collect()
     }
     #[cfg(not(windows))]
     {
-        vec![None; names.len()]
+        vec![(None, None); names.len()]
     }
 }
 
@@ -1213,7 +1225,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
 
     let tree = reader_devtree_keys(&names);
     let mut out = Vec::with_capacity(names.len());
-    for (name, tree_key) in names.into_iter().zip(tree) {
+    for (name, (tree_key, usb_product)) in names.into_iter().zip(tree) {
         let reader_name = name.to_string_lossy().into_owned();
         // Lowercased copy for the YubiKey-hint check below, taken before
         // `reader_name` is moved into a `ReaderProbe`.
@@ -1244,6 +1256,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 prog_serial: None,
                 yubikey_serial: None,
                 usb_device: tree_key,
+                usb_product,
             });
             continue;
         }
@@ -1262,6 +1275,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             prog_serial: None,
             yubikey_serial: None,
             usb_device: tree_key,
+            usb_product,
         };
         let trace = probe_trace_on();
         if trace {

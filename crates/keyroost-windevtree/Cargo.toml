@@ -19,7 +19,7 @@ unsafe_code = "allow"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",                          # DEVPROPKEY
-    "Win32_Devices_DeviceAndDriverInstallation", # CM_Locate_DevNodeW, CM_Get_Parent, CM_Get_Device_IDW
-    "Win32_Devices_Properties",                  # CM_Get_Device_Interface_PropertyW, DEVPKEY_Device_InstanceId
+    "Win32_Devices_DeviceAndDriverInstallation", # CM_Locate_DevNodeW, CM_Get_Parent, CM_Get_Device_IDW, CM_Get_DevNode_PropertyW
+    "Win32_Devices_Properties",                  # DEVPKEY_Device_InstanceId, DEVPKEY_Device_BusReportedDeviceDesc
     "Win32_Security_Credentials",                # SCardEstablishContext, SCardGetReaderDeviceInstanceIdA
 ] }
