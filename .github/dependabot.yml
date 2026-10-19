@@ -1,18 +1,30 @@
 # Keeps the SHA-pinned actions in .github/workflows fresh: Dependabot
 # understands `uses: owner/repo@<sha> # vX.Y.Z` lines and PRs bumps with the
 # comment updated, so pinning doesn't mean freezing.
+#
+# Every section sets `rebase-strategy: disabled`: by default Dependabot
+# rebases its open PRs whenever main moves, and each rebase reruns the whole
+# CI. Comment `@dependabot rebase` on a PR when it is about to be merged.
+# All three sections run monthly, which Dependabot schedules on the 1st, so
+# the month's PRs arrive together.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    rebase-strategy: disabled
+    # One PR for the month's action bumps instead of one per action.
+    groups:
+      actions:
+        patterns: ["*"]
   # Surfaces RustSec-relevant dependency bumps as PRs. Grouped so routine
   # transitive churn (the eframe/wgpu tree) arrives as one reviewable PR.
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: monthly
+    rebase-strategy: disabled
     groups:
       cargo-minor:
         update-types: [minor, patch]
@@ -92,6 +104,11 @@ updates:
       # stay the one eframe 0.35's egui-wgpu uses, so it moves with eframe.
       - dependency-name: wgpu
         versions: ['>=30']
+      # proptest 1.12 raised its minimum Rust to 1.88, past the workspace's
+      # 1.85 MSRV; the MSRV job builds tests, so it can't move until the MSRV
+      # does. Test-only: nothing that ships depends on it.
+      - dependency-name: proptest
+        versions: ['>=1.12']
   # Keeps the flake.lock inputs (nixpkgs, flake-parts) fresh for the Nix
   # packaging added in #109. Grouped so all input bumps arrive as one
   # reviewable PR, like the cargo tree above.
@@ -99,6 +116,7 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    rebase-strategy: disabled
     groups:
       flake-inputs:
         patterns: ["*"]
