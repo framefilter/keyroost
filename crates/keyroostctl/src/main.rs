@@ -696,8 +696,8 @@ const OVERWRITE_HELP: &str =
 const AUTO_COMPRESSED_NOTE: &str = "the certificate did not fit on the card \
     uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
     software reads compressed certificates, including the built-in smart-card support \
-    of Windows and macOS in community tests; one too large to store uncompressed has \
-    not been tried on macOS yet.";
+    of Windows and macOS in community tests, though on macOS not yet with a certificate \
+    this large.";
 
 /// The success line's addition for a compressed certificate: how many bytes
 /// the card holds. Empty for an uncompressed one.
@@ -6517,9 +6517,6 @@ fn prog_seed(
     )))
 }
 
-/// Environment diagnosis: each check prints one ✓/✗/– line with the fix
-/// inline. Never touches card state and always exits 0 — it's a flashlight,
-/// not a gate.
 /// What `doctor` adds after "permission denied" on a FIDO HID device. Only
 /// Linux's hidraw nodes are gated by udev rules; elsewhere access is the OS's
 /// department and the bare error says enough.
@@ -6528,6 +6525,9 @@ const HID_PERMISSION_HINT: &str = " — install the udev rules (see README) and 
 #[cfg(not(target_os = "linux"))]
 const HID_PERMISSION_HINT: &str = "";
 
+/// Environment diagnosis: each check prints one ✓/✗/– line with the fix
+/// inline. Never touches card state and always exits 0 — it's a flashlight,
+/// not a gate.
 fn run_doctor() {
     println!("keyroost doctor — environment check\n");
 
@@ -22742,7 +22742,10 @@ mod cli_tests {
         assert!(note.contains("stored compressed"), "{note}");
         assert!(note.contains("Windows"), "{note}");
         assert!(note.contains("macOS"), "{note}");
-        assert!(note.contains("not been tried"), "{note}");
+        assert!(
+            note.contains("not yet with a certificate this large"),
+            "{note}"
+        );
         assert!(!note.to_lowercase().contains("unsupported"), "{note}");
     }
 

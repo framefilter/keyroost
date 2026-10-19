@@ -276,9 +276,8 @@ keyroostctl piv cert generate --slot 9a --subject "CN=Alice" --no-compress</code
         (when built with compression support), OpenSC (when built with zlib), the YubiKey
         Minidriver 5.0 and later, and the Yubico .NET SDK 1.13.1 and later. Windows' built-in
         PIV smart-card driver read one in a community test on Windows 11 (#152), and so did
-        macOS's built-in PIV support in a community test on macOS, which read the same
-        certificate stored uncompressed too. A certificate too large to fit uncompressed has
-        not been tried on macOS yet. A certificate that fits uncompressed is stored
+        macOS's built-in PIV support in another community test. A certificate too large to
+        fit uncompressed has not been tried on macOS yet. A certificate that fits uncompressed is stored
         uncompressed unless you ask otherwise.</p>
       <p>In that macOS test, macOS recognized the key as a smart card only once it had a
         CHUID and certificates in both slot 9A and slot 9D, and <code>sc_auth identities</code>

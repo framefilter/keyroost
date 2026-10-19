@@ -3101,8 +3101,8 @@ impl PivCertCompressionSel {
 const PIV_AUTO_COMPRESSED_NOTE: &str = "The certificate did not fit on the card \
     uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
     software reads compressed certificates, including the built-in smart-card support \
-    of Windows and macOS in community tests; one too large to store uncompressed has \
-    not been tried on macOS yet.";
+    of Windows and macOS in community tests, though on macOS not yet with a certificate \
+    this large.";
 
 /// The pane notice after a certificate was stored: `base`, the stored size
 /// when compressed, and the Automatic note when that is why it was.
@@ -26895,7 +26895,10 @@ mod tests {
         assert!(note.contains("did not fit"), "{note}");
         assert!(note.contains("Windows"), "{note}");
         assert!(note.contains("macOS"), "{note}");
-        assert!(note.contains("not been tried"), "{note}");
+        assert!(
+            note.contains("not yet with a certificate this large"),
+            "{note}"
+        );
         assert!(!note.to_lowercase().contains("unsupported"), "{note}");
     }
 
