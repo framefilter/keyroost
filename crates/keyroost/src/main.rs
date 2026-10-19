@@ -43,17 +43,35 @@ const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// How long the app keeps an unlocked FIDO session, a retained OATH password
 /// or OTP PIN, and displayed codes without a click, key press or scroll
-/// before locking them (see `App::idle_lock`). The lock messages below name
-/// the duration too.
+/// before locking them (see `App::idle_lock`). The lock messages below take
+/// their wording from it, so they can't name a different duration.
 const IDLE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// [`IDLE_LOCK_AFTER`] in words: "5 minutes", "1 minute", or "75 seconds"
+/// when it isn't a whole number of minutes.
+fn idle_lock_span() -> String {
+    let secs = IDLE_LOCK_AFTER.as_secs();
+    let (n, unit) = if secs.is_multiple_of(60) {
+        (secs / 60, "minute")
+    } else {
+        (secs, "second")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
 
 /// Shown where the idle lock dropped something the user has to unlock again:
 /// the FIDO session, a password-protected OATH applet, the OTP PIN.
-const IDLE_LOCKED_MSG: &str =
-    "Locked after 5 minutes of inactivity \u{2014} unlock again to continue.";
+fn idle_locked_msg() -> String {
+    format!(
+        "Locked after {} of inactivity \u{2014} unlock again to continue.",
+        idle_lock_span()
+    )
+}
 
 /// Shown where the idle lock only hid codes that need no unlock to show again.
-const IDLE_HIDDEN_MSG: &str = "Codes hidden after 5 minutes of inactivity.";
+fn idle_hidden_msg() -> String {
+    format!("Codes hidden after {} of inactivity.", idle_lock_span())
+}
 
 /// Whether an egui input event is the user doing something deliberate
 /// (clicking, typing, scrolling, touching), as opposed to window bookkeeping
@@ -5298,7 +5316,7 @@ impl App {
     fn idle_lock(&mut self) {
         if self.security_keys.session.is_some() {
             self.lock_session();
-            self.security_keys.error = Some(IDLE_LOCKED_MSG.into());
+            self.security_keys.error = Some(idle_locked_msg());
         }
 
         let oath_codes = self.oath.creds.iter().any(|r| r.code.is_some());
@@ -5315,13 +5333,13 @@ impl App {
         if protected {
             self.oath.creds.clear();
             self.oath.locked = true;
-            self.oath.notice = Some(IDLE_LOCKED_MSG.into());
+            self.oath.notice = Some(idle_locked_msg());
         } else if oath_codes {
             // Nothing to unlock: the pane offers to read the codes again
             // (and the Overview goes back to "Open Authenticator…").
             self.oath.creds.clear();
             self.oath.loaded = false;
-            self.oath.notice = Some(IDLE_HIDDEN_MSG.into());
+            self.oath.notice = Some(idle_hidden_msg());
         }
 
         let otp_codes =
@@ -5337,13 +5355,13 @@ impl App {
         if self.otp.pin.take().is_some() {
             self.otp.pin_required = true;
             self.otp.rows.clear();
-            self.otp.info = Some(IDLE_LOCKED_MSG.into());
+            self.otp.info = Some(idle_locked_msg());
         } else if otp_codes {
-            self.otp.info = Some(format!("{IDLE_HIDDEN_MSG} Refresh to show them again."));
+            self.otp.info = Some(format!("{} Refresh to show them again.", idle_hidden_msg()));
         }
         self.log(
             Severity::Info,
-            "Locked after 5 minutes of inactivity.".to_string(),
+            format!("Locked after {} of inactivity.", idle_lock_span()),
         );
     }
 
@@ -28712,7 +28730,7 @@ mod tests {
         assert!(app.oath.unlocked_password.is_none());
         assert!(app.oath.creds.is_empty());
         assert!(app.oath.locked, "back to the unlock prompt");
-        assert_eq!(app.oath.notice.as_deref(), Some(IDLE_LOCKED_MSG));
+        assert_eq!(app.oath.notice.as_deref(), Some(idle_locked_msg().as_str()));
         assert!(!app.holds_unlocked_secrets());
     }
 
@@ -28735,7 +28753,7 @@ mod tests {
         assert!(app.oath.creds.is_empty());
         assert!(!app.oath.loaded, "the Overview stops showing rows");
         assert!(!app.oath.locked);
-        assert_eq!(app.oath.notice.as_deref(), Some(IDLE_HIDDEN_MSG));
+        assert_eq!(app.oath.notice.as_deref(), Some(idle_hidden_msg().as_str()));
         assert!(!app.holds_unlocked_secrets());
     }
 
@@ -28765,6 +28783,21 @@ mod tests {
             None
         );
         assert_eq!(app.otp.rows[0].code, None);
+    }
+
+    /// The lock messages name the duration the lock actually uses.
+    #[test]
+    fn idle_lock_messages_name_the_lock_duration() {
+        assert_eq!(IDLE_LOCK_AFTER.as_secs(), 5 * 60);
+        assert_eq!(idle_lock_span(), "5 minutes");
+        assert_eq!(
+            idle_locked_msg(),
+            "Locked after 5 minutes of inactivity \u{2014} unlock again to continue."
+        );
+        assert_eq!(
+            idle_hidden_msg(),
+            "Codes hidden after 5 minutes of inactivity."
+        );
     }
 
     /// The panes re-read their codes every time window, each a short job.
@@ -28828,7 +28861,7 @@ mod tests {
             .otp
             .info
             .as_deref()
-            .is_some_and(|m| m.starts_with(IDLE_HIDDEN_MSG)));
+            .is_some_and(|m| m.starts_with(&idle_hidden_msg())));
         assert!(!app.holds_unlocked_secrets());
     }
 
@@ -28856,7 +28889,7 @@ mod tests {
         assert!(app.otp.pin.is_none());
         assert!(app.otp.pin_required);
         assert!(app.otp.rows.is_empty());
-        assert_eq!(app.otp.info.as_deref(), Some(IDLE_LOCKED_MSG));
+        assert_eq!(app.otp.info.as_deref(), Some(idle_locked_msg().as_str()));
     }
 
     /// Only deliberate input postpones the lock: not window bookkeeping like
@@ -28885,7 +28918,7 @@ mod tests {
     #[test]
     fn oath_listing_clears_the_notice_and_keeps_hotp_codes() {
         let mut app = App::default();
-        app.oath.notice = Some(IDLE_HIDDEN_MSG.into());
+        app.oath.notice = Some(idle_hidden_msg());
         app.oath.creds = vec![OathRow::new(
             "Example:bob".into(),
             Some("111111".into()),
