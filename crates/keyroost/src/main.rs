@@ -13723,8 +13723,10 @@ impl eframe::App for App {
             || self
                 .selected_device()
                 .is_some_and(|d| d.kind == DeviceKind::Token);
+        // Once a second is enough for second-resolution countdowns, and halves the
+        // redraw cost where the GPU is missing and drawing falls back to software.
         if animating {
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 }
