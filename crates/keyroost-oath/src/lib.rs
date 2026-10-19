@@ -319,7 +319,9 @@ pub const MIN_HMAC_KEY_LEN: usize = 14;
 /// Build a `PUT` APDU to provision a credential.
 ///
 /// Data layout: `NAME(0x71) || KEY(0x73) [|| PROPERTY(0x78) ][|| IMF(0x7A)]`.
-/// The KEY value is `[ (type<<4)|algo, digits, secret... ]`.
+/// The KEY value is `[ (type<<4)|algo, digits, secret... ]`. PROPERTY is the
+/// one field without a length byte: the tag is followed directly by the
+/// property byte.
 ///
 /// # Errors
 /// Returns [`BuildError`] when the name, the encoded key, or the composed
@@ -348,12 +350,8 @@ pub fn put(params: &PutParams<'_>) -> Result<Vec<u8>, BuildError> {
     try_push_tlv(&mut data, Tag::Key, "key", &key)?;
 
     if params.require_touch {
-        try_push_tlv(
-            &mut data,
-            Tag::Property,
-            "property",
-            &[PROPERTY_REQUIRE_TOUCH],
-        )?;
+        // Tag and value only, no length: cards reject `78 01 02` with 6A80.
+        data.extend_from_slice(&[Tag::Property as u8, PROPERTY_REQUIRE_TOUCH]);
     }
     if params.imf != 0 {
         try_push_tlv(&mut data, Tag::Imf, "imf", &params.imf.to_be_bytes())?;
@@ -1026,9 +1024,9 @@ mod tests {
 
     #[test]
     fn put_boundary_at_exact_short_apdu_limit() {
-        // Body = NAME(2+100) + KEY(2+2+140) + PROPERTY(2+1) + IMF(2+4) = 255:
+        // Body = NAME(2+101) + KEY(2+2+140) + PROPERTY(1+1) + IMF(2+4) = 255:
         // must encode, with Lc = 255. One more name byte: typed error.
-        let name_at: &'static str = Box::leak("n".repeat(100).into_boxed_str());
+        let name_at: &'static str = Box::leak("n".repeat(101).into_boxed_str());
         let mut at = params_with(name_at, 140);
         at.require_touch = true;
         at.imf = 1;
@@ -1036,7 +1034,7 @@ mod tests {
         assert_eq!(apdu[4], 255);
 
         let mut over = at;
-        let name_over: &'static str = Box::leak("n".repeat(101).into_boxed_str());
+        let name_over: &'static str = Box::leak("n".repeat(102).into_boxed_str());
         over.name = name_over;
         assert_eq!(put(&over), Err(BuildError::BodyTooLong { len: 256 }));
     }
@@ -1158,14 +1156,16 @@ mod tests {
         let apdu = put(&params).unwrap();
         // Expected bytes changed with client-side key padding (see
         // put_bytes_fixed_vector): the 1-byte secret pads to 14 key bytes.
+        // PROPERTY carries no length byte: YubiKey 5.7 rejects `78 01 02`
+        // with 6A80 and accepts `78 02`.
         let expected = vec![
             0x00, 0x01, 0x00, 0x00,
-            // Lc: NAME(71 01 78)=3 + KEY(73 10 …)=18 + PROP(78 01 02)=3 + IMF(7A 04 00000001)=6 = 30 = 0x1E
-            0x1E, 0x71, 0x01, 0x78, // NAME "x"
+            // Lc: NAME(71 01 78)=3 + KEY(73 10 …)=18 + PROP(78 02)=2 + IMF(7A 04 00000001)=6 = 29 = 0x1D
+            0x1D, 0x71, 0x01, 0x78, // NAME "x"
             0x73, 0x10, 0x12, 0x08, 0xAA, // KEY: prefix 0x10|0x02=0x12, digits 8
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, // zero pad to MIN_HMAC_KEY_LEN
-            0x78, 0x01, 0x02, // PROPERTY require-touch
+            0x78, 0x02, // PROPERTY require-touch (tag + value, no length)
             0x7A, 0x04, 0x00, 0x00, 0x00, 0x01, // IMF = 1
         ];
         assert_eq!(apdu, expected);
