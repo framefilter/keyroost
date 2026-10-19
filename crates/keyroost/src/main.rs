@@ -5242,18 +5242,25 @@ impl App {
         user_input: bool,
     ) -> Option<std::time::Duration> {
         let operating = self.busy() || self.import_busy() || self.reset_arm.is_some();
-        if user_input || operating || self.last_activity.is_none() {
+        let held = self.holds_unlocked_secrets();
+        // Judge the time idle before this frame's input counts. Where the
+        // platform stops drawing a minimized window, the timer's frame never
+        // comes; the first frame back can carry the pointer moving onto the
+        // window, and counting that first would restart the clock and show
+        // the secrets again.
+        let idle = self.last_activity.map(|t| now.saturating_duration_since(t));
+        if held && !operating && idle.is_some_and(|d| d >= IDLE_LOCK_AFTER) {
+            self.idle_lock();
+            return None;
+        }
+        if user_input || operating || idle.is_none() {
             self.last_activity = Some(now);
         }
-        if !self.holds_unlocked_secrets() {
+        if !held {
             return None;
         }
         let idle = now.saturating_duration_since(self.last_activity.unwrap_or(now));
-        if idle < IDLE_LOCK_AFTER {
-            return Some(IDLE_LOCK_AFTER - idle);
-        }
-        self.idle_lock();
-        None
+        Some(IDLE_LOCK_AFTER.saturating_sub(idle))
     }
 
     /// Lock what [`Self::holds_unlocked_secrets`] reports, after
@@ -28635,6 +28642,18 @@ mod tests {
         );
 
         assert_eq!(app.idle_lock_tick(t2 + IDLE_LOCK_AFTER, false), None);
+        assert_eq!(app.otp.rows[0].code, None);
+    }
+
+    /// A window whose frames stopped while minimized locks on the first
+    /// frame back, even when that frame carries the pointer moving onto it.
+    #[test]
+    fn idle_lock_fires_before_input_on_the_first_frame_back() {
+        let mut app = App::default();
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        assert_eq!(app.idle_lock_tick(t0 + IDLE_LOCK_AFTER * 4, true), None);
         assert_eq!(app.otp.rows[0].code, None);
     }
 
