@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod import_flow;
 mod otp_pane;
+#[cfg(unix)]
+mod private_tmp;
 #[cfg(feature = "qr")]
 mod qrscan;
 #[cfg(feature = "qr")]
@@ -3098,8 +3100,9 @@ impl PivCertCompressionSel {
 /// the same note the CLI prints.
 const PIV_AUTO_COMPRESSED_NOTE: &str = "The certificate did not fit on the card \
     uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
-    software reads compressed certificates, including Windows' built-in smart-card \
-    driver in a community test; macOS's built-in PIV support has not been verified.";
+    software reads compressed certificates, including the built-in smart-card support \
+    of Windows and macOS in community tests; one too large to store uncompressed has \
+    not been tried on macOS yet.";
 
 /// The pane notice after a certificate was stored: `base`, the stored size
 /// when compressed, and the Automatic note when that is why it was.
@@ -26892,7 +26895,7 @@ mod tests {
         assert!(note.contains("did not fit"), "{note}");
         assert!(note.contains("Windows"), "{note}");
         assert!(note.contains("macOS"), "{note}");
-        assert!(note.contains("not been verified"), "{note}");
+        assert!(note.contains("not been tried"), "{note}");
         assert!(!note.to_lowercase().contains("unsupported"), "{note}");
     }
 

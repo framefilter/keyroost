@@ -291,6 +291,16 @@ impl CtapHidDevice {
         Ok((dev, init))
     }
 
+    /// Check that the device at `path` can be opened for CTAP I/O exactly the
+    /// way [`Self::open`] opens it, without sending it anything; the handle is
+    /// closed again before returning. `path` is what `keyroost_hid::enumerate`
+    /// reports: a hidraw node on Linux, hidapi's platform path elsewhere. On
+    /// the Linux hidraw backend a permission problem surfaces as
+    /// [`HidTransportError::Io`] with [`io::ErrorKind::PermissionDenied`].
+    pub fn check_access(path: &Path) -> Result<(), HidTransportError> {
+        Self::open_io(path).map(drop)
+    }
+
     /// Install a cooperative-cancel flag. When set to `true` from another
     /// thread, an in-progress transaction waiting on KEEPALIVE frames returns
     /// [`HidTransportError::Cancelled`] at the next keep-alive (≈ every 100 ms),

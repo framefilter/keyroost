@@ -1453,7 +1453,10 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
 /// or removed, so a GUI can re-enumerate on hotplug instead of only on a manual
 /// refresh. Built on the `\\?PnP?\Notification` pseudo-reader, which reports
 /// reader insertions/removals (not card events) without ever connecting to a
-/// card — so it never disturbs a held [`Session`].
+/// card — so it never disturbs a held [`Session`]. Where the PC/SC service
+/// doesn't support that pseudo-reader, it falls back to re-listing reader
+/// names every 1.5 s and firing when the set changes (still without
+/// connecting to anything).
 ///
 /// Best-effort: if the PC/SC service is unavailable the thread idles and retries,
 /// and the app simply falls back to manual rescans. The watcher stops and joins
@@ -1502,10 +1505,15 @@ impl ReaderWatcher {
                                 }
                                 states[0].sync_current_state();
                                 // Some platforms don't support PnP notification
-                                // and report the pseudo-reader as unknown; avoid
-                                // spinning if so.
+                                // and report the pseudo-reader as unknown or
+                                // ignored (seen on macOS). Waiting on it again
+                                // would never report a reader plugged in later,
+                                // so poll the reader list instead. Returns on
+                                // stop, or on an error worth re-establishing
+                                // the context for.
                                 if st.intersects(State::UNKNOWN | State::IGNORE) {
-                                    std::thread::sleep(Duration::from_secs(2));
+                                    poll_reader_names(&ctx, &stop_thread, &on_change);
+                                    break;
                                 }
                             }
                             Err(PcscError::Timeout) => {}
@@ -1535,6 +1543,63 @@ impl Drop for ReaderWatcher {
             let _ = h.join();
         }
     }
+}
+
+/// [`ReaderWatcher`]'s fallback where PnP notification is unsupported: list the
+/// reader names every [`READER_POLL_INTERVAL`] and call `on_change` when the
+/// set differs from the last one seen. Listing names never connects to a
+/// reader or card, so a Molto2 is never touched (or held) by the poll. Returns
+/// when `stop` is set or listing fails with anything but "no readers", so the
+/// caller can re-establish the context.
+fn poll_reader_names(ctx: &Context, stop: &std::sync::atomic::AtomicBool, on_change: &dyn Fn()) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    // Sleep in short slices so a dropped watcher joins promptly.
+    const SLICE: Duration = Duration::from_millis(250);
+
+    let Ok(mut last) = reader_names(ctx) else {
+        return;
+    };
+    while !stop.load(Ordering::Relaxed) {
+        let mut slept = Duration::ZERO;
+        while slept < READER_POLL_INTERVAL && !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(SLICE);
+            slept += SLICE;
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(now) = reader_names(ctx) else {
+            return;
+        };
+        if reader_set_changed(&last, &now) {
+            on_change();
+            last = now;
+        }
+    }
+}
+
+/// How often [`poll_reader_names`] re-lists readers.
+const READER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The current reader names; "no readers available" is an empty list, not an
+/// error.
+fn reader_names(ctx: &Context) -> Result<Vec<String>, PcscError> {
+    let mut buf = [0u8; 4096];
+    match ctx.list_readers(&mut buf) {
+        Ok(names) => Ok(names.map(|r| r.to_string_lossy().into_owned()).collect()),
+        Err(PcscError::NoReadersAvailable) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether two reader-name lists name a different set of readers. Order and
+/// duplicates don't matter: a reordered listing is not a hotplug event.
+fn reader_set_changed(last: &[String], now: &[String]) -> bool {
+    use std::collections::BTreeSet;
+    let a: BTreeSet<&str> = last.iter().map(String::as_str).collect();
+    let b: BTreeSet<&str> = now.iter().map(String::as_str).collect();
+    a != b
 }
 
 /// Decode a reader's PC/SC `CHANNEL_ID` into its USB bus/address. For USB
@@ -1984,6 +2049,50 @@ pub(crate) fn transmit_applet(
             }
             Continuation::Done => return Ok((acc, u16::from_be_bytes([sw[0], sw[1]]))),
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_poll_tests {
+    use super::reader_set_changed;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn same_readers_is_no_change() {
+        assert!(!reader_set_changed(&names(&[]), &names(&[])));
+        assert!(!reader_set_changed(
+            &names(&["Yubico YubiKey 00 00"]),
+            &names(&["Yubico YubiKey 00 00"])
+        ));
+    }
+
+    #[test]
+    fn reordered_listing_is_no_change() {
+        assert!(!reader_set_changed(
+            &names(&["A 00 00", "B 01 00"]),
+            &names(&["B 01 00", "A 00 00"])
+        ));
+    }
+
+    #[test]
+    fn added_or_removed_reader_is_a_change() {
+        assert!(reader_set_changed(&names(&[]), &names(&["A 00 00"])));
+        assert!(reader_set_changed(&names(&["A 00 00"]), &names(&[])));
+        assert!(reader_set_changed(
+            &names(&["A 00 00"]),
+            &names(&["A 00 00", "B 01 00"])
+        ));
+    }
+
+    #[test]
+    fn swapped_reader_with_same_count_is_a_change() {
+        assert!(reader_set_changed(
+            &names(&["A 00 00"]),
+            &names(&["B 00 00"])
+        ));
     }
 }
 

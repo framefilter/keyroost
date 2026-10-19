@@ -70,7 +70,10 @@ impl From<io::Error> for HidError {
 /// Metadata for a single connected HID device.
 #[derive(Debug, Clone)]
 pub struct HidDevice {
-    /// `/dev/hidraw*` path the device is exposed under.
+    /// Where the device is opened: the `/dev/hidraw*` node on Linux, hidapi's
+    /// platform path string on macOS / Windows (and on Linux under the
+    /// `hidapi-backend` feature). Not necessarily a filesystem path, so open
+    /// it the way `keyroost-ctap` does rather than through `std::fs`.
     pub path: PathBuf,
     /// USB / Bluetooth vendor ID.
     pub vendor_id: u16,

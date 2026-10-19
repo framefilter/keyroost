@@ -381,7 +381,7 @@ No toolchain needed. Download from the
 | Platform | Asset |
 |---|---|
 | Linux x86_64 | `keyroost-vX.Y.Z-linux-x86_64.tar.gz` |
-| macOS (Apple Silicon + Intel) | `keyroost-vX.Y.Z-macos-universal2.tar.gz` |
+| macOS 11 (Big Sur) or newer, Apple Silicon + Intel | `keyroost-vX.Y.Z-macos-universal2.tar.gz` |
 | Windows x86_64 | `keyroost-vX.Y.Z-windows-x86_64.zip` |
 | Windows x86_64, **code-signed** | `keyroost-vX.Y.Z-windows-x86_64-signed.zip` |
 | macOS installer, **code-signed** | `keyroost-vX.Y.Z-macos-universal2-signed.pkg` |

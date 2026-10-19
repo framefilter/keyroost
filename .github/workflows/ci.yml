@@ -53,6 +53,10 @@ jobs:
   test:
     name: clippy + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Build the macOS job against the same minimum macOS the release binaries
+    # target (release.yml); ignored on the other platforms.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
@@ -109,10 +113,11 @@ jobs:
 
       # The `qr` screen-capture backend is cfg-gated per OS, and the matrix build
       # above uses default features — so the Windows GDI path (hand-rolled Win32
-      # FFI in keyroost-screengrab) is otherwise compiled only by release.yml at
-      # tag time. Compile + lint it here so that FFI can't rot between releases.
-      - name: Clippy — qr screen-capture backend (Windows)
-        if: runner.os == 'Windows'
+      # FFI in keyroost-screengrab) and the macOS `screencapture` path are
+      # otherwise compiled only by release.yml at tag time. Compile + lint them
+      # here so they can't rot between releases.
+      - name: Clippy — qr screen-capture backend (Windows, macOS)
+        if: runner.os == 'Windows' || runner.os == 'macOS'
         run: cargo clippy -p keyroost --features qr --all-targets --locked -- -D warnings
 
   # Enforce the declared MSRV so an accidental use of a newer language/library

@@ -108,7 +108,12 @@ mod linux {
         let mut out = vec![0u8; px * 4];
         match bpp {
             4 => {
-                for (o, s) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                for (o, s) in out
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src.as_chunks::<4>().0)
+                {
                     o[0] = s[2]; // R
                     o[1] = s[1]; // G
                     o[2] = s[0]; // B
@@ -116,7 +121,12 @@ mod linux {
                 }
             }
             3 => {
-                for (o, s) in out.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                for (o, s) in out
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src.as_chunks::<3>().0)
+                {
                     o[0] = s[2];
                     o[1] = s[1];
                     o[2] = s[0];
@@ -209,13 +219,27 @@ mod linux {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::Capture;
+    use crate::private_tmp::PrivateTempDir;
+
+    /// How many output names to hand `screencapture`. It writes one file per
+    /// display, in display order, and ignores names beyond the display count,
+    /// so this is the most displays one scan covers.
+    const MAX_DISPLAYS: usize = 8;
 
     pub fn capture() -> Result<Vec<Capture>, String> {
+        // The screenshots may contain a 2FA QR (a seed), so they go in a
+        // fresh owner-only directory that is removed, files and all, when
+        // `dir` drops — on success, on a read error, on a non-zero exit and
+        // when screencapture can't even be started.
+        let dir = PrivateTempDir::new("keyroost-screengrab")
+            .map_err(|e| format!("cannot create a private folder for the capture: {e}"))?;
+        let files: Vec<std::path::PathBuf> = (1..=MAX_DISPLAYS)
+            .map(|i| dir.path().join(format!("screen-{i}.png")))
+            .collect();
         // `-x` silences the shutter sound; `-t png` picks the format.
-        let path = std::env::temp_dir().join("keyroost-screengrab.png");
         let status = std::process::Command::new("/usr/sbin/screencapture")
             .args(["-x", "-t", "png"])
-            .arg(&path)
+            .args(&files)
             .status()
             .map_err(|e| format!("could not run screencapture: {e}"))?;
         if !status.success() {
@@ -224,13 +248,16 @@ mod macos {
                     .into(),
             );
         }
-        // Remove the on-disk capture (it may contain a 2FA QR / secrets) before
-        // returning on either the success or the read-error path, so a failed
-        // read doesn't leave the screenshot behind.
-        let read_result = std::fs::read(&path);
-        let _ = std::fs::remove_file(&path);
-        let bytes = read_result.map_err(|e| format!("cannot read the capture: {e}"))?;
-        Ok(vec![Capture::Png(bytes)])
+        // One file per display; names past the display count stay absent.
+        let mut captures = Vec::new();
+        for file in &files {
+            match std::fs::read(file) {
+                Ok(bytes) => captures.push(Capture::Png(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot read the capture: {e}")),
+            }
+        }
+        Ok(captures)
     }
 }
 

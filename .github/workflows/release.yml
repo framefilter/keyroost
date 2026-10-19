@@ -81,7 +81,13 @@ jobs:
           toolchain: stable
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
+      # Pin the oldest macOS the binaries run on, for both arches: without it
+      # rustc's per-arch defaults apply (10.12 on Intel, 11.0 on Apple
+      # Silicon), and nothing has ever been run on 10.x. macOS 11 (Big Sur) is
+      # the floor the README states.
       - name: Build release binaries (both arches)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           cargo build --release --locked --target aarch64-apple-darwin -p keyroostctl -p keyroost --features keyroost/qr
           cargo build --release --locked --target x86_64-apple-darwin  -p keyroostctl -p keyroost --features keyroost/qr

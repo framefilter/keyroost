@@ -695,8 +695,9 @@ const OVERWRITE_HELP: &str =
 /// compressed. The GUI shows the same note.
 const AUTO_COMPRESSED_NOTE: &str = "the certificate did not fit on the card \
     uncompressed, so it was stored compressed (the PIV standard's gzip form). Most PIV \
-    software reads compressed certificates, including Windows' built-in smart-card \
-    driver in a community test; macOS's built-in PIV support has not been verified.";
+    software reads compressed certificates, including the built-in smart-card support \
+    of Windows and macOS in community tests; one too large to store uncompressed has \
+    not been tried on macOS yet.";
 
 /// The success line's addition for a compressed certificate: how many bytes
 /// the card holds. Empty for an uncompressed one.
@@ -6519,6 +6520,14 @@ fn prog_seed(
 /// Environment diagnosis: each check prints one ✓/✗/– line with the fix
 /// inline. Never touches card state and always exits 0 — it's a flashlight,
 /// not a gate.
+/// What `doctor` adds after "permission denied" on a FIDO HID device. Only
+/// Linux's hidraw nodes are gated by udev rules; elsewhere access is the OS's
+/// department and the bare error says enough.
+#[cfg(target_os = "linux")]
+const HID_PERMISSION_HINT: &str = " — install the udev rules (see README) and re-plug the key";
+#[cfg(not(target_os = "linux"))]
+const HID_PERMISSION_HINT: &str = "";
+
 fn run_doctor() {
     println!("keyroost doctor — environment check\n");
 
@@ -6566,24 +6575,25 @@ fn run_doctor() {
                     }
                 } else {
                     for d in fido {
-                        // RW open is exactly what CTAP needs; this is the
-                        // udev-rules litmus test.
-                        match std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(&d.path)
-                        {
-                            Ok(_) => println!(
+                        // Open the device exactly the way `fido info` and every
+                        // other CTAP command does (the hidraw node on Linux,
+                        // hidapi's platform path elsewhere), sending nothing.
+                        // On Linux a permission error here is the udev-rules
+                        // litmus test.
+                        match keyroost_ctap::hid::CtapHidDevice::check_access(&d.path) {
+                            Ok(()) => println!(
                                 "✓ {} ({}) is accessible",
                                 sanitize_terminal(&d.product_name),
                                 d.path.display()
                             ),
-                            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            Err(keyroost_ctap::hid::HidTransportError::Io(e))
+                                if e.kind() == std::io::ErrorKind::PermissionDenied =>
+                            {
                                 println!(
-                                    "✗ {} ({}) permission denied — install the udev rules \
-                                     (see README) and re-plug the key",
+                                    "✗ {} ({}) permission denied{}",
                                     sanitize_terminal(&d.product_name),
-                                    d.path.display()
+                                    d.path.display(),
+                                    HID_PERMISSION_HINT
                                 );
                             }
                             Err(e) => println!(
@@ -22732,7 +22742,7 @@ mod cli_tests {
         assert!(note.contains("stored compressed"), "{note}");
         assert!(note.contains("Windows"), "{note}");
         assert!(note.contains("macOS"), "{note}");
-        assert!(note.contains("not been verified"), "{note}");
+        assert!(note.contains("not been tried"), "{note}");
         assert!(!note.to_lowercase().contains("unsupported"), "{note}");
     }
 
