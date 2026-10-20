@@ -3905,6 +3905,9 @@ struct App {
     /// same key still selected, the open tab is read again (see
     /// [`App::user_refresh`]).
     reread_after_scan: bool,
+    /// The key that was selected when it was unplugged, until it comes back
+    /// (and is selected again) or the user selects another key.
+    lost_selection: Option<LostKey>,
     /// True while the Molto2 factory-reset confirmation is showing.
     molto_reset_confirm: bool,
     /// True while the per-slot seed-delete confirmation card is showing.
@@ -9160,14 +9163,16 @@ impl App {
                             }
                         }
                     }
-                    // Keep the current selection if that device is still present;
-                    // otherwise fall back to the first device.
-                    let keep = app
-                        .selected_device
-                        .as_ref()
-                        .filter(|id| devices.iter().any(|d| &d.id == *id))
-                        .cloned();
-                    let next = keep.or_else(|| devices.first().map(|d| d.id.clone()));
+                    // Keep the current selection if that device is still
+                    // present; otherwise fall back to the first device, and
+                    // select the unplugged key again when it comes back.
+                    let (next, lost) = reconcile_selection(
+                        app.selected_device.as_ref(),
+                        app.lost_selection.as_ref(),
+                        &app.devices,
+                        &devices,
+                    );
+                    app.lost_selection = lost;
                     let changed = next != app.selected_device;
                     let previous = app.selected_device.clone();
                     app.selected_device = next;
@@ -9252,6 +9257,15 @@ impl App {
     /// list could never recover on its own.
     fn apply_device_scan_failure(app: &mut App, error: String) {
         app.devices_error = Some(error);
+        // Remember the selected key (unless one already is), so the next
+        // good scan selects it again.
+        if app.lost_selection.is_none() {
+            app.lost_selection = app
+                .selected_device
+                .as_ref()
+                .and_then(|id| app.devices.iter().find(|d| &d.id == id))
+                .map(LostKey::of);
+        }
         app.devices.clear();
         if let Some(previous) = app.selected_device.take() {
             // Same teardown as any other selection change. With nothing
@@ -9260,8 +9274,11 @@ impl App {
         }
     }
 
-    /// Select a device by id (no-op if already selected).
+    /// Select a device by id (no-op if already selected). The user's pick:
+    /// a key remembered while unplugged is no longer selected again when it
+    /// comes back.
     fn select_device(&mut self, id: DeviceId) {
+        self.lost_selection = None;
         if self.selected_device.as_deref() == Some(id.as_str()) {
             return;
         }
@@ -11886,6 +11903,88 @@ fn matches_filter(d: &Device, q: &str) -> bool {
     d.vendor.to_ascii_lowercase().contains(&q)
         || d.model.to_ascii_lowercase().contains(&q)
         || d.title().to_ascii_lowercase().contains(&q)
+}
+
+/// The selected key, remembered when it is unplugged so it can be selected
+/// again when it comes back ([`reconcile_selection`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LostKey {
+    id: DeviceId,
+    kind: DeviceKind,
+    serial: String,
+    /// The name stored on the key, when the scan read one.
+    on_key_name: Option<String>,
+}
+
+impl LostKey {
+    fn of(d: &Device) -> Self {
+        LostKey {
+            id: d.id.clone(),
+            kind: d.kind,
+            serial: d.serial.clone(),
+            on_key_name: match &d.naming.on_key {
+                keyroost_resolve::KeyLabel::Present(n) => Some(n.clone()),
+                _ => None,
+            },
+        }
+    }
+
+    /// The row among `devices` that is this key again, on hard evidence
+    /// only: the same id, else the same serial, else the same name stored on
+    /// the key, each counting only when it picks exactly one row. A key with
+    /// neither a stable id, a serial nor a stored name isn't recognized.
+    fn find(&self, devices: &[Device]) -> Option<DeviceId> {
+        if devices.iter().any(|d| d.id == self.id) {
+            return Some(self.id.clone());
+        }
+        let only = |m: Vec<&Device>| match m.as_slice() {
+            [one] => Some(one.id.clone()),
+            _ => None,
+        };
+        if !self.serial.is_empty() {
+            let by_serial = devices
+                .iter()
+                .filter(|d| d.kind == self.kind && d.serial == self.serial)
+                .collect();
+            if let Some(id) = only(by_serial) {
+                return Some(id);
+            }
+        }
+        let name = self.on_key_name.as_deref()?;
+        only(
+            devices
+                .iter()
+                .filter(|d| {
+                    d.kind == self.kind
+                        && matches!(&d.naming.on_key,
+                            keyroost_resolve::KeyLabel::Present(n) if n == name)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The selection after a scan moved from `old` to `new` rows, and the key
+/// to remember: a remembered key that is back is selected again (and
+/// forgotten); else the current selection stays if present; else the first
+/// row. A selected key that just went away is remembered, unless one is
+/// already: then the current selection was a stand-in, not a choice.
+fn reconcile_selection(
+    current: Option<&DeviceId>,
+    lost: Option<&LostKey>,
+    old: &[Device],
+    new: &[Device],
+) -> (Option<DeviceId>, Option<LostKey>) {
+    if let Some(back) = lost.and_then(|l| l.find(new)) {
+        return (Some(back), None);
+    }
+    if let Some(cur) = current.filter(|c| new.iter().any(|d| &d.id == *c)) {
+        return (Some(cur.clone()), lost.cloned());
+    }
+    let lost = lost
+        .cloned()
+        .or_else(|| current.and_then(|c| old.iter().find(|d| &d.id == c).map(LostKey::of)));
+    (new.first().map(|d| d.id.clone()), lost)
 }
 
 /// Advisory shown when two or more connected keys report the same serial.
@@ -29191,6 +29290,114 @@ mod tests {
         };
         app.on_device_selected(None);
         assert!(!app.pgp_tried);
+    }
+
+    fn sel_key(id: &str, serial: &str, on_key: Option<&str>) -> Device {
+        Device {
+            id: id.into(),
+            name: None,
+            vendor: "Vendor".into(),
+            model: "Model".into(),
+            serial: serial.into(),
+            transport: "USB".into(),
+            firmware: String::new(),
+            caps: Caps::FIDO2,
+            unverified: Caps::default(),
+            kind: DeviceKind::Key,
+            hid_path: None,
+            reader: None,
+            hid_serial: None,
+            naming: keyroost_resolve::Naming {
+                on_key: on_key.map_or(keyroost_resolve::KeyLabel::NotRead, |n| {
+                    keyroost_resolve::KeyLabel::Present(n.into())
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The selected key is unplugged: selection falls back to another key,
+    /// and when the key comes back it is selected again.
+    #[test]
+    fn a_replugged_key_is_selected_again() {
+        let a = sel_key("serial:A", "A", None);
+        let b = sel_key("serial:B", "B", None);
+        let both = vec![a.clone(), b.clone()];
+        let only_b = vec![b.clone()];
+        let a_id: DeviceId = "serial:A".into();
+
+        // A goes away: B is selected for now, A is remembered.
+        let (next, lost) = reconcile_selection(Some(&a_id), None, &both, &only_b);
+        assert_eq!(next.as_deref(), Some("serial:B"));
+        let lost = lost.expect("A remembered");
+        assert_eq!(lost.id, a_id);
+
+        // A comes back: it's selected again and nothing stays remembered.
+        let (next, lost) =
+            reconcile_selection(Some(&"serial:B".into()), Some(&lost), &only_b, &both);
+        assert_eq!(next.as_deref(), Some("serial:A"));
+        assert!(lost.is_none());
+    }
+
+    /// A key whose id changes on replug (no serial: the id is its HID path)
+    /// is recognized by the name stored on it, and only when that name picks
+    /// one key.
+    #[test]
+    fn a_replugged_key_without_serial_is_found_by_its_on_key_name() {
+        let before = sel_key("hid:/dev/hidraw3", "", Some("Work"));
+        let lost = LostKey::of(&before);
+        let back = sel_key("hid:/dev/hidraw9", "", Some("Work"));
+        let other = sel_key("serial:B", "B", None);
+        assert_eq!(
+            lost.find(&[other.clone(), back.clone()]).as_deref(),
+            Some("hid:/dev/hidraw9")
+        );
+        // Two keys carrying the same name: not hard evidence, no pick.
+        let twin = sel_key("hid:/dev/hidraw10", "", Some("Work"));
+        assert_eq!(lost.find(&[back, twin]), None);
+        // No serial and no name: nothing to recognize it by.
+        let bare = LostKey::of(&sel_key("hid:/dev/hidraw3", "", None));
+        assert_eq!(bare.find(&[sel_key("hid:/dev/hidraw9", "", None)]), None);
+    }
+
+    /// A failed scan (no device list at all) clears the selection; the key
+    /// is remembered, so the next good scan selects it again.
+    #[test]
+    fn a_failed_scan_remembers_the_selected_key() {
+        let a = sel_key("serial:A", "A", None);
+        let mut app = App {
+            devices: vec![a.clone(), sel_key("serial:B", "B", None)],
+            selected_device: Some("serial:A".into()),
+            ..Default::default()
+        };
+        App::apply_device_scan_failure(&mut app, "reader gone".into());
+        assert!(app.selected_device.is_none());
+        assert_eq!(app.lost_selection, Some(LostKey::of(&a)));
+    }
+
+    /// Picking another key yourself while the selected one is away means
+    /// keeping that pick: clicking a key forgets the lost one.
+    #[test]
+    fn choosing_another_key_forgets_the_lost_one() {
+        let mut app = App {
+            lost_selection: Some(LostKey::of(&sel_key("serial:A", "A", None))),
+            ..Default::default()
+        };
+        app.select_device("serial:B".into());
+        assert!(app.lost_selection.is_none());
+    }
+
+    /// While a key is remembered, another auto-selected key going away too
+    /// doesn't replace it.
+    #[test]
+    fn the_first_lost_key_is_kept() {
+        let a = LostKey::of(&sel_key("serial:A", "A", None));
+        let b = sel_key("serial:B", "B", None);
+        let c = sel_key("serial:C", "C", None);
+        let (next, lost) =
+            reconcile_selection(Some(&"serial:B".into()), Some(&a), &[b, c.clone()], &[c]);
+        assert_eq!(next.as_deref(), Some("serial:C"));
+        assert_eq!(lost.map(|l| l.id).as_deref(), Some("serial:A"));
     }
 
     /// Every Refresh button rescans and then re-reads the open tab: the click
