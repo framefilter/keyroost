@@ -75,11 +75,7 @@ workflow during bring-up is:
    `docs/PROTOCOL.md` and edits the offset / framing in
    `crates/keyroost-proto/src/commands.rs` (response parsing and command
    construction both live there).
-3. `cargo build --release` and retry. The binary is exposed on PATH via a
-   symlink (`~/.local/bin/keyroostctl -> target/release/keyroostctl`), so a
-   rebuild is live immediately — no copy step. (`~/bin` is intentionally not
-   used; on systems where `~/.cargo/bin` and `~/.local/bin` are already on
-   PATH, the symlink needs no further setup.)
+3. `cargo build --release` and retry.
 
 ## Known soft spots — most likely places for first-contact bugs
 
