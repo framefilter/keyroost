@@ -9397,7 +9397,10 @@ impl App {
         match dev.kind {
             DeviceKind::Token => self.open_molto(),
             DeviceKind::ProgToken => self.open_prog(),
-            DeviceKind::Key if dev.caps.has(Caps::FIDO2) => self.fetch_selected_info(),
+            // A U2F-only interface has no CTAP2 info to read.
+            DeviceKind::Key if dev.caps.has(Caps::FIDO2) && !dev.caps.has(Caps::U2F_ONLY) => {
+                self.fetch_selected_info()
+            }
             DeviceKind::Key => {}
         }
     }
@@ -16352,7 +16355,27 @@ impl App {
     fn overview(&mut self, ui: &mut egui::Ui, p: &Palette, dev: &Device) {
         ui.vertical(|ui| {
             self.mds_card(ui, p, dev);
-            if dev.caps.has(Caps::FIDO2) {
+            if dev.caps.has(Caps::U2F_ONLY) {
+                theme::card_frame(p).show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Sign-in (U2F)")
+                            .font(theme::f_sb(14.5))
+                            .color(p.txt),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "This key's FIDO side uses U2F: it signs in as a second \
+                             factor on sites that support security keys. U2F has no \
+                             PIN, passkeys or settings, so there's nothing to manage \
+                             here.",
+                        )
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt2),
+                    );
+                });
+                ui.add_space(14.0);
+            } else if dev.caps.has(Caps::FIDO2) {
                 theme::card_frame(p).show(ui, |ui| {
                     if self.card_head(ui, p, "Passkeys & sign-in (FIDO2)", "fido2") {
                         self.cap_tab = CapTab::Fido2;

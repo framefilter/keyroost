@@ -32,6 +32,32 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Whether the FIDO interface at `path` speaks CBOR (CTAP2), from the
+/// capability byte of its CTAPHID INIT answer; `false` means U2F (CTAP1)
+/// only. INIT is the only command sent. `None` when the interface can't be
+/// opened or doesn't answer.
+pub fn ctaphid_speaks_cbor(path: &Path, debug: bool) -> Option<bool> {
+    let shown = path.display().to_string();
+    match keyroost_ctap::CtapHidDevice::open(path) {
+        Ok((_, init)) => {
+            trace::line(debug, || {
+                format_line(
+                    Dir::Note,
+                    "identity",
+                    &format!("{shown} ctaphid init caps=0x{:02x}", init.capabilities),
+                )
+            });
+            Some(init.supports_cbor())
+        }
+        Err(e) => {
+            trace::line(debug, || {
+                format_line(Dir::Note, "identity", &format!("{shown} open failed: {e}"))
+            });
+            None
+        }
+    }
+}
+
 /// Send one CTAPHID vendor command on a fresh channel and return the reply.
 pub fn ctaphid_vendor_read(path: &Path, cmd: u8, payload: &[u8], debug: bool) -> Option<Vec<u8>> {
     let shown = path.display().to_string();

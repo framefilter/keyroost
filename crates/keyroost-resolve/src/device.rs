@@ -25,6 +25,12 @@ impl Caps {
     pub const TOTP: Caps = Caps(1 << 4); // Molto2 programmable token
     pub const OTP: Caps = Caps(1 << 5); // Token2 FIDO key on-device OTP applet
     pub const PROG: Caps = Caps(1 << 6); // Token2 single-profile programmable token
+    /// Not an applet: narrows [`Caps::FIDO2`] to a FIDO interface that speaks
+    /// only U2F (CTAP1), from the key's own CTAPHID INIT answer (no CBOR
+    /// capability). `FIDO2` stays set, since the interface is there for
+    /// pairing and selection; what needs CTAP2 (the badge, the FIDO2 tab, the
+    /// FIDO2 reset step) checks this bit.
+    pub const U2F_ONLY: Caps = Caps(1 << 7);
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
@@ -139,8 +145,13 @@ impl Device {
             return vec![("TOTP token", CapState::Present)];
         }
         let mut v = Vec::new();
+        let fido = if self.caps.has(Caps::U2F_ONLY) {
+            "U2F"
+        } else {
+            "FIDO2"
+        };
         for (c, label) in [
-            (Caps::FIDO2, "FIDO2"),
+            (Caps::FIDO2, fido),
             (Caps::OATH, "OATH"),
             (Caps::PGP, "PGP"),
             (Caps::PIV, "PIV"),
@@ -974,7 +985,9 @@ fn apply_test_switch(_opts: &mut MatchOptions) {}
 
 /// Correlate a live snapshot: plan identity reads for what topology
 /// leaves unmatched, perform them (read-only, traced under `debug`),
-/// then correlate. Linux with topology sends no identity traffic.
+/// then correlate. Linux with topology sends no identity reads. Each FIDO
+/// interface is also asked once per plug-in whether it speaks only U2F (a
+/// CTAPHID INIT, nothing else), to mark it [`Caps::U2F_ONLY`].
 pub fn correlate_live(
     hids: &[HidDevice],
     probes: &[ReaderProbe],
@@ -996,7 +1009,9 @@ pub fn correlate_live(
     let registry = crate::identity::IDENTITY_READERS;
     let plan = crate::identity::plan_identity_reads(h, p, registry);
     let ids = crate::identity::read_identities(&plan, h, p, registry, debug);
-    correlate_with(h, p, keyring, &ids, &opts)
+    let mut devices = correlate_with(h, p, keyring, &ids, &opts);
+    mark_u2f_only(&mut devices, &u2f_only_paths(hids, true, debug));
+    devices
 }
 
 /// Options for [`enumerate_with`].
@@ -1360,13 +1375,72 @@ pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let probes = keyroost_transport::probe_readers().unwrap_or_default();
     let (keyring, may_save) = load_keyring_for_scan(opts.debug);
     if opts.skip_identity_reads {
-        return Ok(correlate(&hids, &probes, &keyring));
+        // A quick re-check scan uses U2F answers already known; it asks no key.
+        let mut devices = correlate(&hids, &probes, &keyring);
+        mark_u2f_only(&mut devices, &u2f_only_paths(&hids, false, opts.debug));
+        return Ok(devices);
     }
     let mut devices = correlate_live(&hids, &probes, &keyring, opts.debug);
     if !opts.skip_key_names {
         name_from_keys(&mut devices, &keyring, may_save, opts.debug);
     }
     Ok(devices)
+}
+
+/// Each FIDO interface's answer to "do you speak only U2F?", by plug-in: its
+/// path, USB position and IDs. A replug (new position, or a reused path with
+/// a different key) asks again. `None` is "couldn't ask" (Windows without
+/// administrator rights, a key that didn't answer) and is kept too, so an
+/// unanswering key doesn't cost every scan the open timeout.
+type U2fCache = Vec<((PathBuf, Option<UsbDeviceKey>, u16, u16), Option<bool>)>;
+static U2F_ONLY_CACHE: std::sync::Mutex<U2fCache> = std::sync::Mutex::new(Vec::new());
+
+/// The FIDO interfaces among `hids` that speak only U2F, from each key's
+/// CTAPHID INIT answer (asked at most once per plug-in, and only when
+/// `may_ask`). One open of the interface; nothing is sent beyond INIT.
+fn u2f_only_paths(
+    hids: &[HidDevice],
+    may_ask: bool,
+    debug: bool,
+) -> std::collections::HashSet<PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(mut cache) = U2F_ONLY_CACHE.lock() else {
+        return out;
+    };
+    // Forget interfaces that are gone, so the cache can't grow without end.
+    cache.retain(|(k, _)| hids.iter().any(|h| h.path == k.0));
+    for h in hids {
+        let key = (
+            h.path.clone(),
+            h.usb_device.clone(),
+            h.vendor_id,
+            h.product_id,
+        );
+        let answer = match cache.iter().find(|(k, _)| *k == key) {
+            Some((_, a)) => *a,
+            None if may_ask => {
+                let a = keyroost_transport::identity::ctaphid_speaks_cbor(&h.path, debug)
+                    .map(|cbor| !cbor);
+                cache.push((key, a));
+                a
+            }
+            None => None,
+        };
+        if answer == Some(true) {
+            out.insert(h.path.clone());
+        }
+    }
+    out
+}
+
+/// Mark the rows whose FIDO interface is in `u2f_only` with
+/// [`Caps::U2F_ONLY`].
+pub fn mark_u2f_only(devices: &mut [Device], u2f_only: &std::collections::HashSet<PathBuf>) {
+    for d in devices.iter_mut() {
+        if d.caps.has(Caps::FIDO2) && d.hid_path.as_ref().is_some_and(|p| u2f_only.contains(p)) {
+            d.caps.insert(Caps::U2F_ONLY);
+        }
+    }
 }
 
 /// Build the unified device list. Blocking: enumerates FIDO HID nodes and probes
@@ -1445,7 +1519,8 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     if caps.has(Caps::PIV) {
         steps.push(ResetStep::Piv);
     }
-    if caps.has(Caps::FIDO2) {
+    // U2F has no reset command: a U2F-only interface has no FIDO2 step.
+    if caps.has(Caps::FIDO2) && !caps.has(Caps::U2F_ONLY) {
         steps.push(ResetStep::Fido);
     }
     steps
@@ -3416,6 +3491,29 @@ mod tests {
             &Keyring::default(),
         );
         assert!(devs.iter().any(|d| d.kind == DeviceKind::Token));
+    }
+
+    /// A FIDO interface that speaks only U2F (its CTAPHID INIT answer has no
+    /// CBOR bit, like a YubiKey NEO) badges "U2F", not "FIDO2", and has no
+    /// FIDO2 reset step (U2F has no reset command). It still counts as a FIDO
+    /// interface for pairing and selection.
+    #[test]
+    fn u2f_only_keys_badge_u2f() {
+        let hids = [hid(0x1050, 0x0116, "/dev/hidraw3", None, Some(1), Some(2))];
+        let mut devs = correlate(&hids, &[], &Keyring::default());
+        let mut u2f = std::collections::HashSet::new();
+        u2f.insert(PathBuf::from("/dev/hidraw3"));
+        mark_u2f_only(&mut devs, &u2f);
+        let key = &devs[0];
+        assert!(key.caps.has(Caps::FIDO2), "still a FIDO interface");
+        assert!(key.caps.has(Caps::U2F_ONLY));
+        assert_eq!(key.cap_badges(), vec!["U2F"]);
+        assert!(!factory_reset_plan(key.caps).contains(&ResetStep::Fido));
+
+        // Any other FIDO key keeps its FIDO2 badge.
+        let mut other = correlate(&hids, &[], &Keyring::default());
+        mark_u2f_only(&mut other, &std::collections::HashSet::new());
+        assert_eq!(other[0].cap_badges(), vec!["FIDO2"]);
     }
 }
 

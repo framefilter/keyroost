@@ -60,7 +60,9 @@ impl DeviceView for Device {
             return Vec::new();
         }
         let mut v = vec![CapTab::Overview];
-        if self.caps.has(Caps::FIDO2) {
+        // A U2F-only interface has nothing to manage (no PIN, passkeys or
+        // settings over U2F), so no FIDO2 tab.
+        if self.caps.has(Caps::FIDO2) && !self.caps.has(Caps::U2F_ONLY) {
             v.push(CapTab::Fido2);
         }
         if self.caps.has(Caps::OATH) {
@@ -263,6 +265,17 @@ mod tests {
     }
 
     use NameStoreChoice::{Computer, Key};
+
+    /// A U2F-only FIDO interface has no FIDO2 tab: there's no PIN, passkey
+    /// list or setting to manage over U2F.
+    #[test]
+    fn u2f_only_key_has_no_fido2_tab() {
+        let mut d = dev(true, true, KeyLabel::default());
+        assert!(d.tabs().contains(&CapTab::Fido2));
+        d.caps.insert(Caps::U2F_ONLY);
+        assert!(!d.tabs().contains(&CapTab::Fido2));
+        assert!(d.tabs().contains(&CapTab::Overview));
+    }
 
     #[test]
     fn store_choices_fido_with_large_blob_offers_both() {
