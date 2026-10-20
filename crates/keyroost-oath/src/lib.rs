@@ -872,6 +872,87 @@ pub fn parse_calculate(buf: &[u8]) -> Result<OtpCode, ParseError> {
     parse_truncated_response(value)
 }
 
+/// What a `CALCULATE_ALL` response says about one credential.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalculateAllResult {
+    /// The code for the challenge that was sent (a 30-second TOTP window).
+    Code(OtpCode),
+    /// The credential requires a touch (`TOUCH`, `0x7C`), so the card left it
+    /// out; it has to be computed with its own `CALCULATE`, which waits for
+    /// the touch.
+    Touch,
+    /// A counter-based credential (`NO_RESPONSE`, `0x77`): the card leaves it
+    /// out because computing it would advance the counter.
+    Hotp,
+}
+
+/// One credential from a `CALCULATE_ALL` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalculateAllEntry {
+    /// Credential name (UTF-8).
+    pub name: String,
+    /// What the card returned for it.
+    pub result: CalculateAllResult,
+}
+
+/// A decoded `CALCULATE_ALL` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalculateAll {
+    /// The entries that decoded cleanly, in card order.
+    pub entries: Vec<CalculateAllEntry>,
+    /// Entries skipped because they could not be decoded (a name with no
+    /// result after it, a non-UTF-8 name, a malformed code, or a result with
+    /// no name before it). Same meaning as [`Listing::skipped`].
+    pub skipped: usize,
+}
+
+/// Parse a `CALCULATE_ALL` response (truncated form).
+///
+/// The response is a sequence of pairs: a `NAME` (`0x71`) TLV, then one of
+/// `TRUNCATED_RESPONSE` (`0x76`), `TOUCH` (`0x7C`) or `NO_RESPONSE` (`0x77`).
+/// An undecodable pair is skipped and counted rather than failing the whole
+/// response, as [`parse_list`] does: one bad entry must not hide the rest. A
+/// full `RESPONSE` (`0x75`) is never requested, so it counts as undecodable.
+pub fn parse_calculate_all(buf: &[u8]) -> Result<CalculateAll, ParseError> {
+    let tlvs = parse_tlvs(buf)?;
+    let mut entries = Vec::new();
+    let mut skipped = 0usize;
+    let mut i = 0;
+    while i < tlvs.len() {
+        let tlv = &tlvs[i];
+        if tlv.tag != Tag::Name.code() {
+            // A result with no name before it.
+            skipped += 1;
+            i += 1;
+            continue;
+        }
+        let Some(next) = tlvs.get(i + 1).filter(|t| t.tag != Tag::Name.code()) else {
+            // A name with no result after it.
+            skipped += 1;
+            i += 1;
+            continue;
+        };
+        i += 2;
+        let result = match next.tag {
+            t if t == Tag::TruncatedResponse.code() => parse_truncated_response(next.value)
+                .ok()
+                .map(CalculateAllResult::Code),
+            t if t == Tag::Touch.code() => Some(CalculateAllResult::Touch),
+            t if t == Tag::NoResponse.code() => Some(CalculateAllResult::Hotp),
+            _ => None,
+        };
+        match (core::str::from_utf8(tlv.value), result) {
+            (Ok(name), Some(result)) => entries.push(CalculateAllEntry {
+                name: name.to_owned(),
+                result,
+            }),
+            _ => skipped += 1,
+        }
+    }
+    Ok(CalculateAll { entries, skipped })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1378,97 @@ mod tests {
         let otp = parse_calculate(&buf).unwrap();
         assert_eq!(otp.code, "755224");
         assert_eq!(otp.digits, 6);
+    }
+
+    #[test]
+    fn calculate_all_bytes() {
+        let challenge = [0, 0, 0, 0, 0x03, 0x5A, 0x6B, 0x7C];
+        assert_eq!(
+            calculate_all(&challenge),
+            vec![0x00, 0xA4, 0x00, 0x01, 0x0A, 0x74, 0x08, 0, 0, 0, 0, 0x03, 0x5A, 0x6B, 0x7C]
+        );
+    }
+
+    /// NAME(71) followed by its result TLV, as CALCULATE ALL lays them out.
+    fn calc_all_entry(name: &[u8], result: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x71, name.len() as u8];
+        v.extend_from_slice(name);
+        v.extend_from_slice(result);
+        v
+    }
+
+    #[test]
+    fn parse_calculate_all_reads_codes_touch_and_hotp() {
+        let mut buf = calc_all_entry(b"GitHub:a", &[0x76, 0x05, 0x06, 0x4C, 0x93, 0xCF, 0x18]);
+        buf.extend(calc_all_entry(b"Bank:b", &[0x7C, 0x01, 0x06]));
+        buf.extend(calc_all_entry(b"VPN:c", &[0x77, 0x01, 0x08]));
+        let all = parse_calculate_all(&buf).unwrap();
+        assert_eq!(all.skipped, 0);
+        assert_eq!(
+            all.entries,
+            vec![
+                CalculateAllEntry {
+                    name: "GitHub:a".into(),
+                    result: CalculateAllResult::Code(OtpCode {
+                        digits: 6,
+                        code: "755224".into()
+                    }),
+                },
+                CalculateAllEntry {
+                    name: "Bank:b".into(),
+                    result: CalculateAllResult::Touch,
+                },
+                CalculateAllEntry {
+                    name: "VPN:c".into(),
+                    result: CalculateAllResult::Hotp,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_calculate_all_empty_key() {
+        let all = parse_calculate_all(&[]).unwrap();
+        assert!(all.entries.is_empty());
+        assert_eq!(all.skipped, 0);
+    }
+
+    #[test]
+    fn parse_calculate_all_skips_undecodable_entries() {
+        // A name the card sent with no result after it, a non-UTF-8 name, a
+        // malformed code, and a full (untruncated) response this crate never
+        // asks for: each is counted, and the good entry around them survives.
+        let mut buf = calc_all_entry(b"orphan", &[]);
+        buf.extend(calc_all_entry(&[0xFF, 0xFE], &[0x7C, 0x01, 0x06]));
+        buf.extend(calc_all_entry(b"bad", &[0x76, 0x02, 0x06, 0x00]));
+        buf.extend(calc_all_entry(b"full", &[0x75, 0x02, 0x06, 0x00]));
+        buf.extend(calc_all_entry(b"ok", &[0x77, 0x01, 0x06]));
+        let all = parse_calculate_all(&buf).unwrap();
+        assert_eq!(all.skipped, 4);
+        assert_eq!(
+            all.entries,
+            vec![CalculateAllEntry {
+                name: "ok".into(),
+                result: CalculateAllResult::Hotp,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_calculate_all_ignores_a_result_without_a_name() {
+        let mut buf = vec![0x7C, 0x01, 0x06];
+        buf.extend(calc_all_entry(b"ok", &[0x7C, 0x01, 0x06]));
+        let all = parse_calculate_all(&buf).unwrap();
+        assert_eq!(all.skipped, 1);
+        assert_eq!(all.entries.len(), 1);
+    }
+
+    #[test]
+    fn parse_calculate_all_rejects_a_truncated_buffer() {
+        assert_eq!(
+            parse_calculate_all(&[0x71, 0x05, b'a']),
+            Err(ParseError::Truncated)
+        );
     }
 
     #[test]

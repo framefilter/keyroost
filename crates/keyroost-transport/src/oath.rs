@@ -245,6 +245,19 @@ impl OathSession {
         oath::parse_calculate(&data).map_err(TransportError::OathParse)
     }
 
+    /// Compute every 30-second TOTP at `unix_time` in one `CALCULATE ALL`.
+    /// The card flags touch-required and HOTP credentials instead of
+    /// computing them, so this never waits for a touch. A credential with a
+    /// different period (a `period/` name) comes back computed for the
+    /// 30-second window, which is wrong for it: compute those one by one with
+    /// [`Self::calculate_totp`].
+    pub fn calculate_all(&mut self, unix_time: u64) -> Result<oath::CalculateAll, TransportError> {
+        let challenge = oath::totp_challenge(unix_time, 30);
+        let (data, sw) = self.transmit_full(&oath::calculate_all(&challenge))?;
+        ok_or_apdu("oath calculate all", sw)?;
+        oath::parse_calculate_all(&data).map_err(TransportError::OathParse)
+    }
+
     /// Compute the next HOTP for `name`. The card advances its own internal
     /// counter, so no challenge is supplied. A touch-required credential blocks
     /// until the user touches the key.

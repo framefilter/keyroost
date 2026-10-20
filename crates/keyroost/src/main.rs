@@ -6340,8 +6340,37 @@ impl App {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let listing = session.list()?;
+        // One CALCULATE ALL answers every 30-second code and flags the touch
+        // accounts without waiting for a touch. A key that refuses it gets
+        // the one-by-one reads instead.
+        let all = session.calculate_all(now).ok();
+        let rows =
+            Self::oath_rows_from(listing.credentials, all.as_ref(), touch, |name, period| {
+                session
+                    .calculate_totp(name, now, period)
+                    .ok()
+                    .map(|otp| otp.code)
+            });
+        Ok((rows, listing.skipped))
+    }
+
+    /// The Authenticator rows for `creds` (the LIST answer), filled from
+    /// `all` (the CALCULATE ALL answer, when the card gave one). `read_one`
+    /// computes a single TOTP code for a name and period; it's used only
+    /// where `all` can't answer: a non-30-second account (CALCULATE ALL
+    /// computes for the 30-second window), an account missing from `all`, or
+    /// every account when there is no `all`. Accounts in `touch` (known to
+    /// need one) are never read that way, and a read that gives nothing back
+    /// marks its row as needing a touch.
+    fn oath_rows_from(
+        creds: Vec<keyroost_oath::CredentialInfo>,
+        all: Option<&keyroost_oath::CalculateAll>,
+        touch: &[String],
+        mut read_one: impl FnMut(&str, u32) -> Option<String>,
+    ) -> Vec<OathRow> {
+        use keyroost_oath::CalculateAllResult;
         let mut rows = Vec::new();
-        for c in listing.credentials {
+        for c in creds {
             let hotp = matches!(c.oath_type, keyroost_oath::OathType::Hotp);
             // HOTP codes are never computed during a listing: the card
             // advances the credential's counter on every CALCULATE (the time
@@ -6349,23 +6378,36 @@ impl App {
             // the card out of the server's look-ahead window. The row shows a
             // "Read code" button instead.
             let mut row = OathRow::new(c.name, None, hotp);
-            if !hotp && touch.contains(&row.name) {
-                row.touch = true;
-            } else if !hotp {
-                // A touch-required credential blocks until touched (or the
-                // card gives up); fine off-thread, but only on this first read.
-                row.code = session
-                    .calculate_totp(&row.name, now, row.period)
-                    .ok()
-                    .map(|otp| otp.code);
-                row.touch = row.code.is_none();
+            if !hotp {
+                let answer = all
+                    .and_then(|a| a.entries.iter().find(|e| e.name == row.name))
+                    .map(|e| &e.result);
+                match answer {
+                    Some(CalculateAllResult::Touch) => row.touch = true,
+                    Some(CalculateAllResult::Code(otp)) if row.period == 30 => {
+                        row.code = Some(otp.code.clone());
+                    }
+                    // Computed by the card without a touch, but for the
+                    // 30-second window: read it again with its own period.
+                    Some(CalculateAllResult::Code(_)) => {
+                        row.code = read_one(&row.name, row.period);
+                    }
+                    _ if touch.contains(&row.name) => row.touch = true,
+                    // A touch-required credential blocks until touched (or
+                    // the card gives up); fine off-thread, and only when the
+                    // card didn't say up front.
+                    _ => {
+                        row.code = read_one(&row.name, row.period);
+                        row.touch = row.code.is_none();
+                    }
+                }
             }
             rows.push(row);
         }
         // Group without headers: live TOTP codes first, on-demand HOTP rows
         // after (stable — card order preserved within each group).
         rows.sort_by_key(|r| r.hotp);
-        Ok((rows, listing.skipped))
+        rows
     }
 
     /// Compute one code on explicit request and patch it into the row: an
@@ -29058,6 +29100,101 @@ mod tests {
         );
         assert!(app.oath.creds[1].touch);
         assert_eq!(app.oath_touch_names(), vec!["Example:touchy".to_string()]);
+    }
+
+    fn oath_cred(name: &str, hotp: bool) -> keyroost_oath::CredentialInfo {
+        keyroost_oath::CredentialInfo {
+            name: name.into(),
+            oath_type: if hotp {
+                keyroost_oath::OathType::Hotp
+            } else {
+                keyroost_oath::OathType::Totp
+            },
+            algorithm: keyroost_oath::Algorithm::Sha1,
+        }
+    }
+
+    fn calc_all(
+        entries: &[(&str, keyroost_oath::CalculateAllResult)],
+    ) -> keyroost_oath::CalculateAll {
+        keyroost_oath::CalculateAll {
+            entries: entries
+                .iter()
+                .map(|(n, r)| keyroost_oath::CalculateAllEntry {
+                    name: (*n).into(),
+                    result: r.clone(),
+                })
+                .collect(),
+            skipped: 0,
+        }
+    }
+
+    fn code(c: &str) -> keyroost_oath::CalculateAllResult {
+        keyroost_oath::CalculateAllResult::Code(keyroost_oath::OtpCode {
+            digits: 6,
+            code: c.into(),
+        })
+    }
+
+    /// With CALCULATE ALL the card answers every 30-second code at once and
+    /// flags touch accounts itself, so nothing waits for a touch. Only a
+    /// non-30-second account (its code came back for the wrong window) and an
+    /// account missing from the answer are read one by one.
+    #[test]
+    fn oath_rows_use_calculate_all() {
+        use keyroost_oath::CalculateAllResult::{Hotp, Touch};
+        let creds = vec![
+            oath_cred("A:totp", false),
+            oath_cred("B:touch", false),
+            oath_cred("60/C:minute", false),
+            oath_cred("D:hotp", true),
+            oath_cred("E:missing", false),
+        ];
+        let all = calc_all(&[
+            ("A:totp", code("111111")),
+            ("B:touch", Touch),
+            ("60/C:minute", code("999999")),
+            ("D:hotp", Hotp),
+        ]);
+        let mut reads = Vec::new();
+        let rows = App::oath_rows_from(creds, Some(&all), &[], |name, period| {
+            reads.push((name.to_owned(), period));
+            Some(format!("{period:06}"))
+        });
+        assert_eq!(
+            reads,
+            vec![("60/C:minute".to_owned(), 60), ("E:missing".to_owned(), 30)]
+        );
+        let by = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        assert_eq!(by("A:totp").code.as_deref(), Some("111111"));
+        assert!(by("B:touch").touch && by("B:touch").code.is_none());
+        assert_eq!(by("60/C:minute").code.as_deref(), Some("000060"));
+        assert!(by("D:hotp").hotp && by("D:hotp").code.is_none());
+        assert_eq!(by("E:missing").code.as_deref(), Some("000030"));
+        assert!(rows.last().unwrap().hotp, "HOTP rows sort last");
+    }
+
+    /// A key that refuses CALCULATE ALL gets the one-by-one reads, skipping
+    /// the accounts already known to need a touch.
+    #[test]
+    fn oath_rows_fall_back_without_calculate_all() {
+        let creds = vec![
+            oath_cred("A:totp", false),
+            oath_cred("B:touch", false),
+            oath_cred("C:slow", false),
+        ];
+        let mut reads = Vec::new();
+        let rows = App::oath_rows_from(creds, None, &["B:touch".to_owned()], |name, _| {
+            reads.push(name.to_owned());
+            (name == "A:totp").then(|| "222222".to_owned())
+        });
+        assert_eq!(reads, vec!["A:totp".to_owned(), "C:slow".to_owned()]);
+        assert_eq!(rows[0].code.as_deref(), Some("222222"));
+        assert!(rows[1].touch, "known touch account is not read");
+        assert!(
+            rows[2].touch,
+            "a read that gives nothing back is a touch account"
+        );
     }
 
     /// Every Refresh button rescans and then re-reads the open tab: the click
