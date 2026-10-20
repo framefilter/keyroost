@@ -79,6 +79,18 @@ Being worked on right now — check with whoever holds it before starting.
   `docs/DEVICE-RESEARCH.md` ("Identity matching across interfaces"). (S, then
   close #51 if the test passes)
 
+- **Same answer on every key when an account doesn't exist.** Deleting an
+  Authenticator account that isn't on the key gets different answers from
+  different firmware: a YubiKey refuses with `SW=6984`, which keyroost shows
+  as a bare status word, while a Solo 2 answers success, so keyroost reports
+  `Deleted OATH credential "…"` for a name that was never there (both
+  hardware-checked). Find one approach that gives the same result on every
+  key family, for example checking the account list first and saying "no
+  account named …" before sending anything, and apply it to every command
+  that names an existing account (`oath delete`, `oath rename`, `oath code`)
+  in the CLI and the app. Check how other OATH applets (Nitrokey, Token2)
+  answer before settling it. (S–M)
+
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
   the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
   RSA keygen, the ~30s reset re-insert window, PC/SC enumeration) and a static
