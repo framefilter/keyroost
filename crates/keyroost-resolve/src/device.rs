@@ -1403,13 +1403,27 @@ fn u2f_only_paths(
     may_ask: bool,
     debug: bool,
 ) -> std::collections::HashSet<PathBuf> {
-    let mut out = std::collections::HashSet::new();
     let Ok(mut cache) = U2F_ONLY_CACHE.lock() else {
-        return out;
+        return std::collections::HashSet::new();
     };
+    u2f_only_from(&mut cache, hids, may_ask, |path| {
+        keyroost_transport::identity::ctaphid_speaks_cbor(path, debug).map(|cbor| !cbor)
+    })
+}
+
+/// [`u2f_only_paths`] against `cache`, with `ask` as the question to a
+/// key (`Some(true)`: U2F only). Only FIDO interfaces are asked: on macOS
+/// and Windows `hids` holds every HID device, keyboards and mice too.
+fn u2f_only_from(
+    cache: &mut U2fCache,
+    hids: &[HidDevice],
+    may_ask: bool,
+    mut ask: impl FnMut(&std::path::Path) -> Option<bool>,
+) -> std::collections::HashSet<PathBuf> {
+    let mut out = std::collections::HashSet::new();
     // Forget interfaces that are gone, so the cache can't grow without end.
     cache.retain(|(k, _)| hids.iter().any(|h| h.path == k.0));
-    for h in hids {
+    for h in hids.iter().filter(|h| h.is_fido()) {
         let key = (
             h.path.clone(),
             h.usb_device.clone(),
@@ -1419,8 +1433,7 @@ fn u2f_only_paths(
         let answer = match cache.iter().find(|(k, _)| *k == key) {
             Some((_, a)) => *a,
             None if may_ask => {
-                let a = keyroost_transport::identity::ctaphid_speaks_cbor(&h.path, debug)
-                    .map(|cbor| !cbor);
+                let a = ask(&h.path);
                 cache.push((key, a));
                 a
             }
@@ -3491,6 +3504,34 @@ mod tests {
             &Keyring::default(),
         );
         assert!(devs.iter().any(|d| d.kind == DeviceKind::Token));
+    }
+
+    /// Only FIDO interfaces are ever asked: the HID list on macOS and Windows
+    /// holds every HID device (keyboards, mice), and an INIT must never be
+    /// sent to those. Each interface is asked once per plug-in, and a scan
+    /// that may not ask uses only earlier answers.
+    #[test]
+    fn u2f_check_asks_fido_interfaces_only_and_once() {
+        let fido = hid(0x1050, 0x0116, "/dev/hidraw3", None, Some(1), Some(2));
+        let mut keyboard = hid(0x05ac, 0x0250, "/dev/hidraw0", None, Some(1), Some(1));
+        keyboard.usage_page = 0x0001;
+        keyboard.usage = 0x0006;
+        let hids = [keyboard, fido];
+        let mut cache = U2fCache::new();
+        let mut asked = Vec::new();
+        let found = u2f_only_from(&mut cache, &hids, true, |p| {
+            asked.push(p.to_path_buf());
+            Some(true) // the INIT answer has no CBOR bit: U2F only
+        });
+        assert_eq!(asked, vec![PathBuf::from("/dev/hidraw3")]);
+        assert!(found.contains(&PathBuf::from("/dev/hidraw3")));
+        // Known now: not asked again, and the answer still counts.
+        let found = u2f_only_from(&mut cache, &hids, true, |_| panic!("asked twice"));
+        assert!(found.contains(&PathBuf::from("/dev/hidraw3")));
+        // A scan that may not ask never does.
+        let mut empty = U2fCache::new();
+        let found = u2f_only_from(&mut empty, &hids, false, |_| panic!("asked"));
+        assert!(found.is_empty());
     }
 
     /// A FIDO interface that speaks only U2F (its CTAPHID INIT answer has no
