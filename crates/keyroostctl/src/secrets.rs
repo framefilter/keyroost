@@ -487,7 +487,14 @@ impl<I: SecretIo> Secrets<I> {
                         spec.label
                     )
                 })?;
-            let trimmed = Zeroizing::new(strip_line_ending(&line).to_owned());
+            let mut text = strip_line_ending(&line);
+            if n == 1 {
+                // Windows PowerShell 5.1 with a UTF-8 `$OutputEncoding`
+                // starts what it pipes in with a byte-order mark: an
+                // encoding artifact of the stream, not part of the secret.
+                text = text.strip_prefix('\u{feff}').unwrap_or(text);
+            }
+            let trimmed = Zeroizing::new(text.to_owned());
             return finish(spec, trimmed, Origin::Stdin(n));
         }
         // `--X stdin` at a terminal, or no flag with a terminal present.
@@ -700,6 +707,27 @@ mod tests {
         assert_eq!(&*s.read(&PIN, Source::NONE).unwrap(), "3333");
         assert_eq!(s.io.prompts, vec!["PIN: ".to_string()]);
         assert_eq!(s.io.lines_read, 0, "the prompt never reads stdin");
+    }
+
+    /// Windows PowerShell 5.1 with a UTF-8 `$OutputEncoding` starts what it
+    /// pipes into a program with a byte-order mark and ends each line with
+    /// CRLF: `"SEED" | keyroostctl oath add x --seed stdin`. The mark is an
+    /// encoding artifact at the start of the stream, not part of the secret.
+    #[test]
+    fn a_byte_order_mark_at_the_start_of_stdin_is_dropped() {
+        let mut s = sec(FakeIo::piped(&["\u{feff}JBSWY3DPEHPK3PXP\r\n"]));
+        assert_eq!(
+            &*s.read(&SEED, Source::new(None, true)).unwrap(),
+            "JBSWY3DPEHPK3PXP"
+        );
+        // Also for a PIN, kept exactly otherwise.
+        let mut s = sec(FakeIo::piped(&["\u{feff}1234\r\n", "\u{feff}5678\n"]));
+        assert_eq!(&*s.read(&PIN, Source::new(None, true)).unwrap(), "1234");
+        // Only the start of the stream carries one; a later line is exact.
+        assert_eq!(
+            &*s.read(&NEW_PIN, Source::new(None, true)).unwrap(),
+            "\u{feff}5678"
+        );
     }
 
     #[test]
