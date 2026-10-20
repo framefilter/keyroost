@@ -318,6 +318,22 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       `bash packaging/appimage/verify-appimage-signature.sh keyroost-x86_64.AppImage`
       prints `OK` with the fingerprint in SECURITY.md (AppImageUpdate's
       `validate-x86_64.AppImage` must print the same fingerprint).
+- [ ] **AppImage catalog (appimage.github.io): ask its bot to re-test.**
+      The catalog doesn't pick up a new release by itself. Once the AppImage
+      is attached to the Release (step 3), the maintainer comments `/retest`
+      on the newest keyroost pull request in the catalog. Each `/retest`
+      opens a new "Re-test keyroost" PR and locks the one it was posted on,
+      so the number changes every release (v0.13.0: #9258, which opened
+      #10011). Find the current one, newest first:
+      `gh pr list --repo AppImage/appimage.github.io --state all --search "keyroost in:title" --limit 1`
+      then:
+      `gh pr comment <number> --repo AppImage/appimage.github.io --body "/retest"`
+      The bot only acts on comments from a catalog maintainer, the PR
+      author, or the account the AppImage comes from, so the comment is
+      posted from the keyroost maintainer's account. The re-test PR merges
+      within minutes when the test passes, and the catalog then shows the
+      new version, description and metainfo screenshot. If the test fails,
+      the re-test PR says why.
 - [ ] Close/comment the issues the release fixes (drafts usually prepared
       during the work); announcement if any.
 - [ ] Out-of-band corrections later (metadata fixes, asset re-attach): use the
