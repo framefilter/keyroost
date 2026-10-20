@@ -175,6 +175,8 @@ pub fn vendor_name(vid: u16) -> &'static str {
         0x20a0 => "Nitrokey",
         0x1209 => "SoloKeys",
         0x096e => "Feitian",
+        // eWBM in the USB-IF list; its keys now sell as TrustKey (#195).
+        0x311f => "TrustKey",
         0x2581 => "Kanokey",
         0x349e => "Token2",
         0x1e0d => "OpenSK",
@@ -2248,8 +2250,10 @@ mod tests {
         assert_eq!(vendor_name(0x1209), "SoloKeys");
         assert_eq!(vendor_name(0x349e), "Token2");
         assert_eq!(vendor_name(0xffff), "Security key");
-        // 0x311F is not Feitian's (re #195: a TrustKey key was named Feitian).
-        assert_eq!(vendor_name(0x311f), "Security key");
+        // 0x311F is eWBM's in the USB-IF list, now selling as TrustKey;
+        // it was filed under Feitian by mistake (re #195).
+        assert_eq!(vendor_name(0x311f), "TrustKey");
+        assert_eq!(clean_model("TrustKey B210H", "TrustKey"), "B210H");
     }
 
     #[test]
