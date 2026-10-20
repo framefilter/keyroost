@@ -307,7 +307,7 @@ pub const MOLTO_SLOTS_UNREAD: &str = "Slot use is read when the Molto2 is unlock
 
 /// Shown for an unlocked Molto2 whose slot sweep failed.
 pub const MOLTO_SLOTS_FAILED: &str =
-    "Slot use couldn't be read; click Refresh slots in the Molto2 view.";
+    "Slot use couldn't be read; select the Molto2 and click Refresh.";
 
 /// Shown for an OATH destination with no smart-card reader.
 pub const NO_SMART_CARD: &str = "This key has no smart-card interface to reach its OATH codes.";

@@ -1679,10 +1679,6 @@ impl App {
                         ));
                     }
                 }
-                ui.add_space(6.0);
-                if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                    self.user_refresh();
-                }
             });
         });
         // Transport + serial on their own line, so neither collides with the

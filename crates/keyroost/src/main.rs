@@ -500,6 +500,9 @@ struct SecurityKeysState {
     /// tab, so a failed read doesn't retry every frame. Reset when the selected
     /// device changes so a different key loads fresh.
     lb_autoloaded: bool,
+    /// The same guard for the fingerprint list, read on first showing the
+    /// Fingerprints tab of an unlocked key.
+    fp_autoloaded: bool,
     /// SSH certificates extracted by "Save certificate…", parked between the
     /// background decrypt job and the save dialog resolving, keyed by the
     /// request id its `FileTarget::SshCertSave` carries. A map rather than a
@@ -522,6 +525,27 @@ enum FidoSubview {
     Fingerprints,
     Settings,
     LargeBlobs,
+}
+
+/// What Refresh re-reads for the open tab and section ([`App::reread_choice`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reread {
+    /// A Molto2's slot list, through its open session.
+    MoltoSlots,
+    Oath,
+    Piv,
+    Pgp,
+    Otp,
+    /// The FIDO2 passkey list (unlocked key).
+    Passkeys,
+    /// The FIDO2 fingerprint list (unlocked key).
+    Fingerprints,
+    /// The FIDO2 large-blob storage.
+    LargeBlobs,
+    /// The FIDO2 key's info (PIN state, options).
+    FidoInfo,
+    /// Nothing to read (a password-locked Authenticator).
+    Nothing,
 }
 
 /// A pending `authenticatorConfig` action in the Advanced view. The action is
@@ -3875,6 +3899,8 @@ struct App {
     piv_tried: bool,
     /// Same guard for the OTP pane's auto-read.
     otp_tried: bool,
+    /// Same guard for the OpenPGP pane's auto-read.
+    pgp_tried: bool,
     /// A Refresh click is waiting for its rescan: when the scan lands with the
     /// same key still selected, the open tab is read again (see
     /// [`App::user_refresh`]).
@@ -5015,7 +5041,7 @@ impl App {
     /// Re-read all 100 public blocks and replace the slot list. Recovers the
     /// metadata display when a write found no existing list to patch (the
     /// open-time sweep had failed, leaving `slot_meta` `None`). `kind` should
-    /// be `User` when this runs because the user clicked "Refresh slots", and
+    /// be `User` when this runs because the user clicked Refresh, and
     /// `Background` for every other caller — a write's own fallback re-sweep,
     /// or any future automatic trigger — so the activity log renders each the
     /// way it actually happened.
@@ -7344,6 +7370,7 @@ impl App {
                     }
                     ResetStep::OpenPgp => {
                         app.openpgp = OpenPgpState::default();
+                        app.pgp_tried = false;
                     }
                     // Fires regardless of which mechanism `PivSession::
                     // factory_reset` actually ran (device-wide or PIV-only) --
@@ -9022,28 +9049,50 @@ impl App {
         self.reread_after_scan = true;
     }
 
-    /// Read the open tab of the selected key again, as its pane does on first
-    /// showing. Leaves unlocked sessions alone (a password-locked OATH applet
-    /// waits for its password); a Molto2 re-reads its slot list through its
-    /// open session, as "Refresh slots" does.
-    fn reread_open_tab(&mut self) {
+    /// What Refresh re-reads for the open tab and section of the selected
+    /// key: the same read the pane makes when it first shows. Refresh is the
+    /// app's only reload button, so this covers every section that used to
+    /// have its own.
+    fn reread_choice(&self) -> Reread {
         if self
             .selected_device()
             .is_some_and(|d| d.kind == DeviceKind::Token)
         {
-            self.resweep_slot_meta(LogKind::User);
-            return;
+            return Reread::MoltoSlots;
         }
         match self.cap_tab {
-            CapTab::Oath => {
-                if !self.oath.locked {
-                    self.load_oath_creds();
-                }
-            }
-            CapTab::Piv => self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass),
-            CapTab::Pgp => self.load_openpgp_status(),
-            CapTab::Otp => self.refresh_otp(),
-            CapTab::Fido2 | CapTab::Overview => self.fetch_selected_info(),
+            // A password-locked applet waits for its password.
+            CapTab::Oath if self.oath.locked => Reread::Nothing,
+            CapTab::Oath => Reread::Oath,
+            CapTab::Piv => Reread::Piv,
+            CapTab::Pgp => Reread::Pgp,
+            CapTab::Otp => Reread::Otp,
+            CapTab::Fido2 => match self.security_keys.subview {
+                FidoSubview::LargeBlobs => Reread::LargeBlobs,
+                // Both lists need an unlocked key; locked, the key's info
+                // (its PIN state) is what there is to read.
+                FidoSubview::Passkeys if self.fido_session().is_some() => Reread::Passkeys,
+                FidoSubview::Fingerprints if self.fido_session().is_some() => Reread::Fingerprints,
+                _ => Reread::FidoInfo,
+            },
+            CapTab::Overview => Reread::FidoInfo,
+        }
+    }
+
+    /// Read the open tab of the selected key again (see
+    /// [`Self::reread_choice`]). Leaves unlocked sessions alone.
+    fn reread_open_tab(&mut self) {
+        match self.reread_choice() {
+            Reread::MoltoSlots => self.resweep_slot_meta(LogKind::User),
+            Reread::Oath => self.load_oath_creds(),
+            Reread::Piv => self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass),
+            Reread::Pgp => self.load_openpgp_status(),
+            Reread::Otp => self.refresh_otp(),
+            Reread::Passkeys => self.refresh_credentials(),
+            Reread::Fingerprints => self.refresh_fingerprints(),
+            Reread::LargeBlobs => self.load_large_blobs(),
+            Reread::FidoInfo => self.fetch_selected_info(),
+            Reread::Nothing => {}
         }
     }
 
@@ -9267,6 +9316,7 @@ impl App {
         // over (KEY-012). A running enroll worker is told to cancel; it
         // aborts at the next KEEPALIVE.
         self.security_keys.fingerprints = None;
+        self.security_keys.fp_autoloaded = false;
         self.security_keys.fp_new_name.clear();
         self.security_keys.fp_confirm_delete = None;
         self.security_keys.fp_rename = None;
@@ -9330,6 +9380,7 @@ impl App {
         self.oath_tried = false;
         self.piv_tried = false;
         self.otp_tried = false;
+        self.pgp_tried = false;
         self.otp = OtpState::default();
         self.molto_reset_confirm = false;
         self.molto_delete_confirm = false;
@@ -13075,33 +13126,6 @@ fn paint_eye_icon(ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
     ui.painter().circle_filled(center, 2.2, color);
 }
 
-/// Circular arrow — refresh / rescan. Clockwise, with a filled arrowhead at the
-/// leading end (egui's y-down space makes increasing angle clockwise).
-fn paint_refresh_icon(ui: &egui::Ui, center: egui::Pos2, r: f32, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.4, color);
-    let (a0, a1) = (0.5_f32, 5.6_f32);
-    let n = 24;
-    let pts: Vec<egui::Pos2> = (0..=n)
-        .map(|i| {
-            let a = a0 + (a1 - a0) * (i as f32 / n as f32);
-            center + r * egui::vec2(a.cos(), a.sin())
-        })
-        .collect();
-    ui.painter().add(egui::Shape::line(pts, stroke));
-    // Filled arrowhead at the leading (clockwise) end, pointing along the motion.
-    let end = center + r * egui::vec2(a1.cos(), a1.sin());
-    let tangent = egui::vec2(-a1.sin(), a1.cos());
-    let radial = egui::vec2(a1.cos(), a1.sin());
-    let tip = end + tangent * 3.5;
-    let b1 = end + radial * 2.6 - tangent * 0.8;
-    let b2 = end - radial * 2.6 - tangent * 0.8;
-    ui.painter().add(egui::Shape::convex_polygon(
-        vec![tip, b1, b2],
-        color,
-        egui::Stroke::NONE,
-    ));
-}
-
 /// Two stacked sheets — copy.
 /// Format a Unix timestamp (seconds) as a human-readable UTC string
 /// `YYYY-MM-DD HH:MM:SS UTC`. Self-contained civil-date conversion (Howard
@@ -15129,17 +15153,6 @@ impl App {
                     }
                     ui.add_space(4.0);
                 }
-                let (rrect, rresp) =
-                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                paint_sidebar_button(ui, p, rrect, &rresp);
-                paint_refresh_icon(ui, rrect.center(), 6.5, p.txt2);
-                if rresp
-                    .on_hover_text("Rescan")
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    app.user_refresh();
-                }
             },
         );
         // "Keep open": in the overlay, and on the docked list while it is
@@ -15253,17 +15266,6 @@ impl App {
             .clicked()
         {
             ev.toggle = true;
-        }
-        ui.add_space(2.0);
-        let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
-        paint_sidebar_button(ui, p, r, &resp);
-        paint_refresh_icon(ui, r.center(), 6.5, p.txt2);
-        if resp
-            .on_hover_text("Rescan")
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            self.user_refresh();
         }
         if self.devices.is_empty() {
             return ev;
@@ -15692,10 +15694,6 @@ impl App {
                     });
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
-                        if theme::button(ui, p, BtnKind::Primary, "Scan for devices").clicked() {
-                            self.schedule_scan_burst();
-                        }
-                        ui.add_space(8.0);
                         ui.hyperlink_to(
                             egui::RichText::new("Supported devices \u{2197}").font(theme::f_sb(12.5)).color(p.accent),
                             ui::help::learn_url("/devices"),
@@ -16491,7 +16489,7 @@ impl App {
                         });
                     } else {
                         ui.label(
-                            egui::RichText::new("Open OpenPGP and Read status to view key slots.")
+                            egui::RichText::new("Open OpenPGP to view key slots.")
                                 .font(theme::f_reg(13.0))
                                 .color(p.txt3),
                         );
@@ -17131,7 +17129,6 @@ impl App {
         // --- Passkeys panel: only when unlocked and the Passkeys tab is active. ---
         if unlocked && subview == FidoSubview::Passkeys {
             ui.add_space(14.0);
-            let mut reload = false;
             let mut delete: Option<Vec<u8>> = None;
             // Collected in the credential loop (below), applied after the card so
             // the extract job isn't dispatched while `self` is borrowed by the
@@ -17151,11 +17148,7 @@ impl App {
                         ui.add_space(6.0);
                         app.help_dot(ui, p, "passkeys");
                     },
-                    |_, ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
-                            reload = true;
-                        }
-                    },
+                    |_, _| {},
                 );
                 ui.add_space(8.0);
                 let session_info = self.security_keys.session.as_ref().map(|s| {
@@ -17310,9 +17303,6 @@ impl App {
                     });
                 }
             });
-            if reload {
-                self.refresh_credentials();
-            }
             if let Some(id) = delete {
                 self.delete_credential(id);
             }
@@ -17340,9 +17330,17 @@ impl App {
             && self.security_keys.session.is_some()
             && self.bio_cmd_code().is_some()
         {
+            // Read the list on first showing, like Storage; Refresh reads it
+            // again. Waits out a running job rather than spending the try.
+            if self.security_keys.fingerprints.is_none()
+                && !self.security_keys.fp_autoloaded
+                && !self.busy()
+            {
+                self.security_keys.fp_autoloaded = true;
+                self.refresh_fingerprints();
+            }
             ui.add_space(14.0);
             let mut do_enroll = false;
-            let mut do_refresh_fp = false;
             let mut fp_rename_commit: Option<(Vec<u8>, String)> = None;
             theme::card_frame(p).show(ui, |ui| {
                 self.adaptive_row(
@@ -17356,11 +17354,7 @@ impl App {
                         ui.add_space(6.0);
                         app.help_dot(ui, p, "fingerprint");
                     },
-                    |_, ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Reload").clicked() {
-                            do_refresh_fp = true;
-                        }
-                    },
+                    |_, _| {},
                 );
                 ui.add_space(8.0);
 
@@ -17374,7 +17368,7 @@ impl App {
                     match &self.security_keys.fingerprints {
                         None => {
                             ui.label(
-                                egui::RichText::new("Click Reload to read enrolled fingerprints.")
+                                egui::RichText::new("Reading enrolled fingerprints\u{2026}")
                                     .font(theme::f_reg(13.0))
                                     .color(p.txt3),
                             );
@@ -17475,9 +17469,6 @@ impl App {
 
                 // --- Delete confirmation ("Are you sure?") ---
             });
-            if do_refresh_fp {
-                self.refresh_fingerprints();
-            }
             if do_enroll {
                 self.enroll_fingerprint();
             }
@@ -17964,15 +17955,14 @@ impl App {
         ui.add_space(14.0);
 
         // Auto-load the array the first time this tab is shown, so entries
-        // appear without a manual Load click. The flag stops a failed read from
-        // retrying every frame; Reload remains available to refresh on demand.
+        // appear on their own. The flag stops a failed read from retrying every
+        // frame; the top bar's Refresh reads it again.
         if !self.security_keys.lb_autoloaded && self.security_keys.large_blobs.is_none() {
             self.security_keys.lb_autoloaded = true;
             self.load_large_blobs();
         }
 
-        // Header + Load/Reload control.
-        let mut do_load = false;
+        // Header + Add control.
         self.adaptive_row(
             ui,
             |app, ui| {
@@ -17985,15 +17975,6 @@ impl App {
                 app.help_dot(ui, p, "large_blobs");
             },
             |app, ui| {
-                let label = if app.security_keys.large_blobs.is_some() {
-                    "Reload"
-                } else {
-                    "Load"
-                };
-                if theme::button(ui, p, BtnKind::Ghost, label).clicked() {
-                    do_load = true;
-                }
-                ui.add_space(8.0);
                 let add_label = if app.security_keys.lb_show_add {
                     "Close"
                 } else {
@@ -18077,10 +18058,6 @@ impl App {
                     .font(theme::f_reg(12.0))
                     .color(p.txt2),
             );
-        }
-
-        if do_load {
-            self.load_large_blobs();
         }
 
         // Add-a-note composer — only when the user clicked Add. Requires an
@@ -20172,14 +20149,11 @@ impl App {
                                         .desired_width(chuid_guid_field_width(ui.ctx())),
                                 );
                                 ui.add_space(6.0);
-                                let (rrect, rresp) = ui.allocate_exact_size(
-                                    egui::vec2(22.0, 22.0),
-                                    egui::Sense::click(),
-                                );
-                                paint_refresh_icon(ui, rrect.center(), 7.0, p.txt2);
-                                if rresp
+                                // Not a Refresh (that word is kept for the top
+                                // bar's): a new random value, made on this
+                                // computer without reading the key.
+                                if theme::button(ui, p, BtnKind::Ghost, "New GUID")
                                     .on_hover_text("Generate a new random GUID")
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                                     .clicked()
                                 {
                                     self.piv_refresh_chuid_guid();
@@ -21177,7 +21151,6 @@ impl App {
             &[
                 HeadButton::new("+ Add credential", BtnKind::Primary),
                 HeadButton::new("Import file\u{2026}", BtnKind::Default),
-                HeadButton::new("Refresh", BtnKind::Default),
             ],
             "oath_more_menu",
         );
@@ -21196,7 +21169,6 @@ impl App {
                     }));
                 }
             }
-            Some(2) => self.user_refresh(),
             _ => {}
         }
         ui.add_space(12.0);
@@ -21382,10 +21354,16 @@ impl App {
 
     /// OpenPGP tab — read-only status + the existing management section.
     fn cap_pgp(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // Read the card when the tab first shows, like PIV: once per
+        // selection, so a failed read doesn't retry every frame. Refresh
+        // reads it again. The read needs no PIN or touch.
+        if !self.pgp_tried && !self.busy() {
+            self.pgp_tried = true;
+            self.load_openpgp_status();
+        }
         // Intents collected inside the UI closures and applied afterwards, so a
         // submit method's `&mut self` never overlaps a card's borrow. (Mirrors
         // the PIV pane.) `open_modal` carries the chosen credential flow.
-        let mut do_refresh = false;
         let mut open_modal: Option<OpenPgpCredKind> = None;
         let mut browse_import_key = false;
         // The key the user clicked in the sub-tab strip this frame (applied
@@ -21396,8 +21374,8 @@ impl App {
 
         let note = |ui: &mut egui::Ui, t: &str| card_note(ui, p, t);
 
-        // --- OpenPGP card status card (full-width, FIDO2 shape): title + help
-        // left, Read status right, applet-wide status body, then the applet-wide
+        // --- OpenPGP card status card (full-width, FIDO2 shape): title + help,
+        // applet-wide status body, then the applet-wide
         // admin (Card details, PINs) folded in as setting-rows.
         theme::card_frame(p).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -21412,11 +21390,7 @@ impl App {
                     ui.add_space(6.0);
                     app.help_dot(ui, p, "pgp");
                 },
-                |_, ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Read status").clicked() {
-                        do_refresh = true;
-                    }
-                },
+                |_, _| {},
             );
             ui.add_space(8.0);
             if let Some(err) = &self.openpgp.error {
@@ -21456,7 +21430,7 @@ impl App {
                 );
             } else if self.openpgp.error.is_none() {
                 ui.label(
-                    egui::RichText::new("Click Read status to read this card (no PIN or touch).")
+                    egui::RichText::new("Reading the card\u{2026}")
                         .font(theme::f_reg(13.0))
                         .color(p.txt3),
                 );
@@ -21593,7 +21567,7 @@ impl App {
                     )
                 }
             }
-            None => "Read status to see this key.".to_string(),
+            None => "Not read yet.".to_string(),
         };
 
         // --- Key sub-tab strip ----------------------------------------------
@@ -21748,9 +21722,6 @@ impl App {
             self.openpgp.selected_key = key;
             self.openpgp.gen_alg = OpenPgpKeyAlgSel::CardDefault;
         }
-        if do_refresh {
-            self.load_openpgp_status();
-        }
         if browse_import_key {
             self.spawn_file_dialog(
                 FileTarget::OpenpgpImport,
@@ -21795,7 +21766,6 @@ impl App {
         }
         // Intents collected inside the UI closures and applied afterwards, so a
         // submit method's `&mut self` never overlaps a card's borrow.
-        let mut do_refresh = false;
         let mut open_change_pin = false;
         let mut open_change_puk = false;
         let mut open_unblock = false;
@@ -21947,11 +21917,7 @@ impl App {
                         ui.add_space(6.0);
                         app.help_dot(ui, p, "piv");
                     },
-                    |_, ui| {
-                        if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                            do_refresh = true;
-                        }
-                    },
+                    |_, _| {},
                 );
                 ui.add_space(8.0);
                 if let Some(err) = &self.piv.error {
@@ -23451,9 +23417,6 @@ impl App {
         if let Some(slot) = clicked_slot {
             self.piv.selected_slot = slot;
         }
-        if do_refresh {
-            self.user_refresh();
-        }
         // The three buttons open the centered credential modal; the modal itself
         // (rendered once per frame) runs the actual op. Opening wipes any stale
         // fields first so a fresh dialog starts blank.
@@ -23774,13 +23737,6 @@ impl App {
                     );
                     ui.add_space(12.0);
                     ui.horizontal_wrapped(|ui| {
-                        // Re-read every slot's public block on demand — keyless,
-                        // so it works without authenticating. Covers a factory
-                        // reset (which clears the list) and a failed open-sweep.
-                        if theme::button(ui, p, BtnKind::Default, "Refresh slots").clicked() {
-                            self.resweep_slot_meta(LogKind::User);
-                        }
-                        ui.add_space(6.0);
                         if theme::button(ui, p, BtnKind::Default, "Sync time on all").clicked() {
                             self.sync_time_all();
                         }
@@ -29195,6 +29151,46 @@ mod tests {
             rows[2].touch,
             "a read that gives nothing back is a touch account"
         );
+    }
+
+    /// Refresh is the only reload button, so it re-reads whatever section is
+    /// open: the FIDO2 sub-tab's own list, not just the key's info.
+    #[test]
+    fn refresh_rereads_the_open_section() {
+        let mut app = App {
+            cap_tab: CapTab::Fido2,
+            ..Default::default()
+        };
+        app.security_keys.subview = FidoSubview::LargeBlobs;
+        assert_eq!(app.reread_choice(), Reread::LargeBlobs);
+        // Passkeys and fingerprints need an unlocked key; locked, Refresh
+        // reads the key's info (PIN state) instead.
+        app.security_keys.subview = FidoSubview::Passkeys;
+        assert_eq!(app.reread_choice(), Reread::FidoInfo);
+        app.security_keys.subview = FidoSubview::Fingerprints;
+        assert_eq!(app.reread_choice(), Reread::FidoInfo);
+        app.security_keys.subview = FidoSubview::Settings;
+        assert_eq!(app.reread_choice(), Reread::FidoInfo);
+        app.cap_tab = CapTab::Pgp;
+        assert_eq!(app.reread_choice(), Reread::Pgp);
+        // A password-locked Authenticator waits for its password.
+        app.cap_tab = CapTab::Oath;
+        app.oath.locked = true;
+        assert_eq!(app.reread_choice(), Reread::Nothing);
+        app.oath.locked = false;
+        assert_eq!(app.reread_choice(), Reread::Oath);
+    }
+
+    /// OpenPGP reads the card when its tab first shows, like PIV, once per
+    /// selection (a failed read doesn't retry every frame).
+    #[test]
+    fn openpgp_auto_read_resets_per_selection() {
+        let mut app = App {
+            pgp_tried: true,
+            ..Default::default()
+        };
+        app.on_device_selected(None);
+        assert!(!app.pgp_tried);
     }
 
     /// Every Refresh button rescans and then re-reads the open tab: the click
