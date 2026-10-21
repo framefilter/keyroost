@@ -23,7 +23,7 @@ const NAMES: usize = 4000;
 
 #[test]
 fn broken_pipe_exits_without_panicking() {
-    let dir = std::env::temp_dir().join(format!("keyroost-broken-pipe-{}", std::process::id()));
+    let dir = common::TempDir::new("broken-pipe");
     std::fs::create_dir_all(dir.join("keyroost")).unwrap();
     let names: Vec<String> = (0..NAMES)
         .map(|i| format!("broken-pipe-test-key-{i:05}-with-some-padding"))
@@ -68,7 +68,6 @@ fn broken_pipe_exits_without_panicking() {
     }
 
     let output = child.wait_with_output().expect("wait for child");
-    let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(

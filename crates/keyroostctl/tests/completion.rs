@@ -3,22 +3,12 @@
 mod common;
 use common::ConfigIn;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Gives every `complete` call its own config directory, so tests running
-/// in parallel never share or delete each other's keys.json.
-static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-
 /// Runs the dynamic completer (fish flavor) for `words` against a keys.json
 /// holding two saved names, and returns its stdout. The file is deliberately
 /// in the old version 1 format (plain serials): completion loads it, which
 /// converts it in its temp directory, and must still offer both names.
 fn complete(words: &[&str]) -> String {
-    let dir = std::env::temp_dir().join(format!(
-        "keyroost-completion-{}-{}",
-        std::process::id(),
-        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = common::TempDir::new("completion");
     std::fs::create_dir_all(dir.join("keyroost")).unwrap();
     std::fs::write(
         dir.join("keyroost/keys.json"),
@@ -32,7 +22,6 @@ fn complete(words: &[&str]) -> String {
         .args(words)
         .output()
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "{out:?}");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

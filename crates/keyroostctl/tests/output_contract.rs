@@ -4,21 +4,11 @@ mod common;
 use common::ConfigIn;
 
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Per-call counter so concurrent `run` calls in one test binary never share
-/// a config dir.
-static RUN_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// Run keyroostctl with no PC/SC service, an empty config dir and stdin
 /// not a terminal. Returns (exit code, stdout, stderr).
 pub fn run(args: &[&str]) -> (i32, String, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "kr-out-{}-{}",
-        std::process::id(),
-        RUN_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::TempDir::new("out");
     let out = common::keyroostctl()
         .args(args)
         .config_in(&dir)
@@ -105,8 +95,7 @@ fn list_json_is_one_object_with_keys() {
 
 #[test]
 fn an_existing_output_file_is_refused_before_any_key() {
-    let dir = std::env::temp_dir().join(format!("kr-out-exists-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::TempDir::new("out-exists");
     let f = dir.join("exists.out");
     std::fs::write(&f, b"keep me").unwrap();
     let f = f.to_str().unwrap();
@@ -202,7 +191,6 @@ fn an_existing_output_file_is_refused_before_any_key() {
     }
     assert_eq!(std::fs::read(dir.join("exists.out")).unwrap(), b"keep me");
     assert!(!dir.join("fresh.out").exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A directory can't be written as an output file: refused before any key
@@ -210,7 +198,7 @@ fn an_existing_output_file_is_refused_before_any_key() {
 /// refuse a symbolic link up front, before the PIN or the card is used.
 #[test]
 fn an_output_that_cannot_be_replaced_is_refused_before_any_key() {
-    let dir = std::env::temp_dir().join(format!("kr-out-dir-{}", std::process::id()));
+    let dir = common::TempDir::new("out-dir");
     let sub = dir.join("a-dir");
     std::fs::create_dir_all(&sub).unwrap();
     let d = sub.to_str().unwrap();
@@ -274,7 +262,6 @@ fn an_output_that_cannot_be_replaced_is_refused_before_any_key() {
         }
         assert_eq!(std::fs::read(&input).unwrap(), b"data");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The Solo 2 name cap needs the key's vendor, so it runs after the key is
@@ -290,12 +277,10 @@ fn oath_add_long_name_without_a_key_fails_on_the_key() {
     assert!(!err.contains("Solo 2 stores names"), "{err}");
 }
 
-/// A fresh directory under the temp dir for one test's input files.
-fn input_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("kr-import-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh directory under the temp dir for one test's input files,
+/// removed when the test ends.
+fn input_dir(tag: &str) -> common::TempDir {
+    common::TempDir::new(&format!("import-{tag}"))
 }
 
 const PLAIN_AEGIS: &str = r#"{"version":1,"header":{"slots":null,"params":null},"db":{"version":2,"entries":[{"type":"totp","name":"alice","issuer":"Example","info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"period":30}}]}}"#;
@@ -341,7 +326,6 @@ fn oath_import_reads_the_file_before_any_key() {
     }
     let (_, _, err) = run(&["oath", "import", "--in", plain.to_str().unwrap()]);
     assert!(err.contains("no key with OATH is connected"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -401,5 +385,4 @@ fn molto_import_points_binary_key_material_elsewhere() {
     ]);
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("keyroost can't import this file"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

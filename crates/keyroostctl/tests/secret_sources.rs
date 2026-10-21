@@ -223,10 +223,8 @@ fn dummy(prefix: &str) -> &'static str {
 
 /// A fresh working directory holding the files the table's rows name, so a
 /// command that reads its input file first gets past it to the secrets.
-fn fixture_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("keyroost-secret-sources-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn fixture_dir() -> common::TempDir {
+    let dir = common::TempDir::new("secret-sources");
     for (name, body) in [
         ("message.txt", &b"keyroost test message\n"[..]),
         // A plain Aegis export: the import rows need no file password.
@@ -315,7 +313,6 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `openpgp key import --in` loads and checks the key file before any key
@@ -323,9 +320,7 @@ fn every_required_secret_refuses_without_a_source_and_names_real_flags() {
 /// before the question and the admin PIN.
 #[test]
 fn import_key_checks_the_key_file_before_selecting_a_key() {
-    let dir = std::env::temp_dir().join(format!("keyroost-import-key-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::TempDir::new("import-key");
     let junk = dir.join("not-a-key.bin");
     std::fs::write(&junk, b"this is not a key\n").unwrap();
     let missing = dir.join("missing.bin");
@@ -351,7 +346,6 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
             "{path:?}: a key was selected before the file was checked: {err}"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One literal value per secret flag (and a few shapes of it): each is

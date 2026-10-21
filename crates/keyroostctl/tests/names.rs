@@ -4,19 +4,11 @@ mod common;
 use common::ConfigIn;
 
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
 /// Run keyroostctl with `args` in a fresh config directory: (exit code,
 /// stdout, stderr).
 fn run(args: &[&str]) -> (i32, String, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "keyroost-names-{}-{}",
-        std::process::id(),
-        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::TempDir::new("names");
     let out = common::keyroostctl()
         .args(args)
         .stdin(Stdio::null())
@@ -25,7 +17,6 @@ fn run(args: &[&str]) -> (i32, String, String) {
         .env("PCSCLITE_CSOCK_NAME", "/nonexistent/keyroost-test-no-pcsc")
         .output()
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),

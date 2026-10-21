@@ -6,8 +6,7 @@ use common::ConfigIn;
 use std::process::Stdio;
 
 fn run(args: &[&str]) -> (i32, String, String) {
-    let dir = std::env::temp_dir().join(format!("kr-retired-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::TempDir::new("retired");
     let out = common::keyroostctl()
         .args(args)
         .config_in(&dir)
