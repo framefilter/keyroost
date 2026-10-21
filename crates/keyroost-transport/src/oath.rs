@@ -302,12 +302,7 @@ impl OathSession {
     /// Transmit one APDU and reassemble a response the card splits across `61xx`
     /// continuations (`SEND_REMAINING`), returning `(payload, sw)`.
     fn transmit_full(&mut self, apdu: &[u8]) -> Result<(Vec<u8>, u16), TransportError> {
-        // PUT (01) carries the raw TOTP/HOTP seed; SET CODE (03) carries the
-        // password-equivalent access key. VALIDATE (A3) carries HMACs over
-        // known challenges in both directions — an offline brute-force oracle
-        // for the password — so its response chunks are redacted too.
-        let cmd_sensitive = matches!(apdu.get(1), Some(0x01) | Some(0x03) | Some(0xA3));
-        let resp_sensitive = apdu.get(1) == Some(&0xA3);
+        let (cmd_sensitive, resp_sensitive) = trace_sensitivity(apdu);
         const IO: crate::AppletIo = crate::AppletIo {
             label: "oath",
             more_data_sw: oath::SW_MORE_DATA,
@@ -356,6 +351,26 @@ fn ok_or_apdu(label: &'static str, sw: u16) -> Result<(), TransportError> {
     }
 }
 
+/// Which halves of an OATH exchange `--debug` must hide: `(command body,
+/// response body)`. Traces get pasted into public issues, so anything that
+/// names an account (it tells which services someone uses), carries a code,
+/// or carries a secret is hidden; the status word always stays.
+///
+/// Commands: PUT (01) holds the seed, SET CODE (03) the password-equivalent
+/// access key, VALIDATE (A3) HMACs over known challenges (an offline
+/// brute-force oracle for the password); DELETE (02), RENAME (05) and
+/// CALCULATE (A2) name an account. Responses: LIST (A1) and CALCULATE ALL
+/// (A4 with P1 = 0) list account names, CALCULATE ALL and CALCULATE carry
+/// codes, VALIDATE the card's HMAC. SELECT shares INS A4 (P1 = 04); its
+/// answer (version, salt, challenge) stays visible for bug reports.
+fn trace_sensitivity(apdu: &[u8]) -> (bool, bool) {
+    let ins = apdu.get(1).copied();
+    let select = ins == Some(0xA4) && apdu.get(2) == Some(&0x04);
+    let cmd = matches!(ins, Some(0x01 | 0x02 | 0x03 | 0x05 | 0xA2 | 0xA3));
+    let resp = !select && matches!(ins, Some(0xA1..=0xA4));
+    (cmd, resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +381,57 @@ mod tests {
         assert_eq!(version_of(&[]), None);
         assert_eq!(version_of(&[5, 7]), None);
         assert_eq!(version_of(&[5, 7, 1, 0]), None);
+    }
+
+    /// `--debug` traces are pasted into public issues: whatever names an
+    /// account (which services someone uses) or carries a code or secret is
+    /// hidden, in both directions. Status words stay visible (the dump keeps
+    /// them), and so does the SELECT exchange, whose version is what a bug
+    /// report needs. SELECT and CALCULATE ALL share INS 0xA4; P1 tells them
+    /// apart.
+    #[test]
+    fn traces_hide_account_names_codes_and_secrets() {
+        let ch = [0u8; 8];
+        let key = [0u8; 16];
+        let params = oath::PutParams {
+            name: "GitHub:alice",
+            secret: &[1u8; 20],
+            oath_type: oath::OathType::Totp,
+            algorithm: oath::Algorithm::Sha1,
+            digits: 6,
+            require_touch: false,
+            imf: 0,
+        };
+        let cases: [(&str, Vec<u8>, bool, bool); 11] = [
+            ("select", oath::select(), false, false),
+            ("reset", oath::reset(), false, false),
+            ("list", oath::list(), false, true),
+            (
+                "calculate",
+                oath::calculate("GitHub:alice", &ch).unwrap(),
+                true,
+                true,
+            ),
+            (
+                "calculate hotp",
+                oath::calculate_hotp("GitHub:alice").unwrap(),
+                true,
+                true,
+            ),
+            ("calculate all", oath::calculate_all(&ch), false, true),
+            ("delete", oath::delete("GitHub:alice").unwrap(), true, false),
+            (
+                "rename",
+                oath::rename("GitHub:alice", "GitHub:bob").unwrap(),
+                true,
+                false,
+            ),
+            ("put", oath::put(&params).unwrap(), true, false),
+            ("set code", oath::set_code(&key, &ch), true, false),
+            ("validate", oath::validate(&key, &ch, &ch), true, true),
+        ];
+        for (what, apdu, cmd, resp) in cases {
+            assert_eq!(trace_sensitivity(&apdu), (cmd, resp), "{what}");
+        }
     }
 }

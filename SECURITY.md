@@ -52,7 +52,9 @@ What keyroost defends against:
   owner-only files, fsynced, never over an existing file or a symlink, and
   removed again if the write fails. `--debug` traces
   redact secret-bearing command bodies on every applet — Molto2 secure
-  writes, OATH `PUT`/`SET CODE`/`VALIDATE`, OpenPGP key import and decipher,
+  writes, OATH `PUT`/`SET CODE`/`VALIDATE` and every exchange that names an
+  account or carries a code (`LIST`, `CALCULATE`, `CALCULATE ALL`, `DELETE`,
+  `RENAME`), OpenPGP key import and decipher,
   PIV `GENERAL AUTHENTICATE`, the Token2 OTP seed writes and code reads, and
   CTAP CBOR exchanges, in both directions where a response is as revealing
   as the request. Secret-typed memory is zeroized on drop where Rust
