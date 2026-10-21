@@ -6,6 +6,11 @@ fuzz_target!(|data: &[u8]| {
     // Dropped-file classification sees raw bytes, text or not.
     let _ = keyroost_import::classify::classify(data, None);
     let _ = keyroost_import::classify::classify(data, Some("dropped.der"));
+    // Byte-order-mark handling and UTF-16 decoding run on every file first;
+    // what they produce is classified the same way.
+    if let Ok(text) = keyroost_import::text::to_utf8(data) {
+        let _ = keyroost_import::classify::classify(&text, None);
+    }
     if let Ok(s) = std::str::from_utf8(data) {
         let _ = keyroost_import::parse_bulk_any(s);
         let _ = keyroost_import::aegis::is_encrypted(s);

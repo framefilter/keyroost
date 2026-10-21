@@ -63,6 +63,13 @@ pub fn open_file(
     if bytes.len() > MAX_FILE_BYTES {
         return Err(too_large());
     }
+    // Text written by Windows tools: a UTF-8 byte-order mark is skipped and
+    // UTF-16 with a mark is converted (a wipe-on-drop copy), so every
+    // reader below sees plain UTF-8. Anything else, images included, passes
+    // through as it is.
+    let text = keyroost_import::text::to_utf8(bytes)
+        .map_err(|_| OpenError::Unreadable(keyroost_import::text::DAMAGED_UTF16.to_owned()))?;
+    let bytes: &[u8] = &text;
     let format = match classify(bytes, file_name) {
         FileKind::Authenticator(format) => format,
         FileKind::KeyMaterial(kind) => return Ok(Opened::KeyMaterial(kind)),
@@ -291,6 +298,48 @@ mod tests {
             open_file(&big, None, None),
             Ok(Opened::Entries(_))
         ));
+    }
+
+    /// Files written by Windows tools: a UTF-8 byte-order mark in front
+    /// (PowerShell 5.1's `Out-File -Encoding utf8`, "UTF-8 with BOM"), or
+    /// UTF-16 with a mark (PowerShell 5.1's `>`). Every export kind reads
+    /// the same as without the mark, all of its entries included.
+    #[test]
+    fn open_file_reads_exports_with_a_byte_order_mark_or_in_utf16() {
+        let aegis = r#"{"db":{"entries":[{"type":"hotp","name":"a","issuer":"X","info":{"secret":"JBSWY3DP","counter":2}}]}}"#;
+        let twofas = r#"{"services":[{"name":"X","secret":"JBSWY3DP","otp":{}}]}"#;
+        let list = "otpauth://totp/A?secret=JBSWY3DP\r\notpauth://totp/B?secret=GEZDGNBV\r\n";
+        let utf8_bom = |t: &str| [&[0xEF, 0xBB, 0xBF][..], t.as_bytes()].concat();
+        let utf16le = |t: &str| {
+            let mut v = vec![0xFF, 0xFE];
+            t.encode_utf16()
+                .for_each(|u| v.extend_from_slice(&u.to_le_bytes()));
+            v
+        };
+        for (text, want, n) in [
+            (aegis, Format::Aegis, 1),
+            (twofas, Format::TwoFas, 1),
+            (list, Format::OtpauthList, 2),
+        ] {
+            for bytes in [utf8_bom(text), utf16le(text)] {
+                match open_file(&bytes, None, None) {
+                    Ok(Opened::Entries(f)) => {
+                        assert_eq!(f.format, want);
+                        assert_eq!(f.usable(), n, "{want:?}: every entry, the first too");
+                    }
+                    other => panic!("{want:?}: got {other:?}"),
+                }
+            }
+        }
+        // A UTF-16 mark on a file that doesn't decode is said plainly.
+        let mut damaged = utf16le(list);
+        damaged.push(0x41);
+        match open_file(&damaged, None, None) {
+            Err(OpenError::Unreadable(m)) => {
+                assert_eq!(m, keyroost_import::text::DAMAGED_UTF16)
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 
     #[test]
