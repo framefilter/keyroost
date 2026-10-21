@@ -175,8 +175,7 @@ Planned hardware support, not yet shipped:
   apply, but it exposes no smart-card interface (no OATH / OpenPGP / PIV) and its
   firmware reports a fixed, non-unique serial that needs placeholder handling
   before it's first-class
-  ([#37](https://github.com/framefilter/keyroost/issues/37)). Test hardware
-  ordered; support lands once it arrives.
+  ([#37](https://github.com/framefilter/keyroost/issues/37)).
 
 Want a different key supported? Open an issue requesting it — hardware-support
 requests are tracked here and added to this roadmap.

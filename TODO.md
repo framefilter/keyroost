@@ -114,7 +114,7 @@ Being worked on right now — check with whoever holds it before starting.
 
 - **OnlyKey recognition
   ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
-  number detection on hardware keys") — blocked on hardware** (units ordered).
+  number detection on hardware keys") — needs testing on an OnlyKey.**
   Teach `keyroost-resolve` to recognize `1d50:60fc` / product `ONLYKEY`, label it
   "OnlyKey", and treat serial `1000000000` as a non-unique placeholder (fall
   back to the hidraw path). Today OnlyKey appears only in the GUI AAGUID table.

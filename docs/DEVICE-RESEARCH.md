@@ -10,8 +10,8 @@ Hardware in play (all on hand): Token2 Molto2 (`349e:0300`), YubiKey 5
 Nothing here is "incoming" any more — the Solo 2 carried the first successful
 FIDO F1–F5 run (`docs/BRINGUP.md`), and the two-YubiKey case is what the
 correlation work was verified against. Token2 PIN+ / FIDO2+ coverage
-comes from the vendor rather than this bench. No OnlyKey is on this bench — see the identity
-note below; it is the interesting case.
+comes from the vendor rather than this bench, and the OnlyKey facts from the
+vendor and device surveys — see the identity note below; it is the interesting case.
 
 - **Thread A — Device identity** (for local "friendly names"). Narrow, technical,
   has a privacy gate.
