@@ -340,6 +340,13 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       dispatch republish — `packaging/LINUX-BUNDLES.md` "Out-of-band runs".
       A republish builds from the dispatched ref into the tag's release and
       is version-guarded against tree/tag mismatch.
+- [ ] **Clean up build output (last step).** Cargo never deletes old build
+      output, so a release cycle leaves tens of GB behind. Once the signed
+      builds are attached and the winget run is done (step 5), remove the
+      debug and fuzz builds plus any one-off check builds made for this
+      release: `rm -rf target/debug fuzz/target`, and any extra target
+      folders made for semver, cross-checks or repros. Leave
+      `target/release`; the next release's checks build on top of it.
 
 
 ## 7. When a release is bad

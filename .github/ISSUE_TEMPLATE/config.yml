@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/framefilter/keyroost/security/advisories/new
+    about: Please report security problems privately here, not in a public issue.
+  - name: Ask a question
+    url: https://github.com/framefilter/keyroost/discussions/categories/q-a
+    about: Not sure it's a bug, or need help getting started? Ask in Discussions.
+  - name: Guides and how-tos
+    url: https://framefilter.github.io/keyroost/
+    about: Step-by-step guides for FIDO2, authenticator codes, PIV, OpenPGP and more.

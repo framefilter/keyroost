@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest something keyroost could do, or do better.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! For a big or open-ended idea that would benefit from discussion first, [Ideas in Discussions](https://github.com/framefilter/keyroost/discussions/categories/ideas) may be a better place.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What would you like to do?
+      description: The task or problem, in your own words. What are you trying to get done, and what gets in the way today?
+      placeholder: "I have several keys and want to see which one holds a given account without opening each key."
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could it work?
+      description: Optional. Describe what you picture. A sketch or a screenshot from another tool is welcome.
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where would you use it?
+      options:
+        - In the app (the keyroost window)
+        - On the command line (keyroostctl)
+        - Both, or no preference
+
+  - type: input
+    id: keys
+    attributes:
+      label: Which key(s) is this for?
+      description: Optional. Make and model, if the idea is about a particular key.
+      placeholder: "Token2 PIN+ Release 3"
+
+  - type: textarea
+    id: others
+    attributes:
+      label: Does another tool already do this?
+      description: Optional. If another app does this well (the key maker's own app, for example), tell us which one and how it does it.

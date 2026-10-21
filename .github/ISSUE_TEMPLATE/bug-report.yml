@@ -1,0 +1,136 @@
+name: Bug report
+description: Something in keyroost or keyroostctl doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this! A few details up front save a lot of back-and-forth.
+
+        **Found a security problem?** Please don't post it here. [Report it privately](https://github.com/framefilter/keyroost/security/advisories/new) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: |
+        What you did, step by step, what you expected, and what you saw instead. Copy any error message exactly.
+        Screenshots help a lot for problems in the app. Drag them into this box.
+      placeholder: |
+        1. Plugged in my key and opened the FIDO2 tab
+        2. Clicked "Change PIN"
+        3. Expected the PIN dialog, but got "unexpected status word 0x6A80"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: keyroost version
+      description: |
+        The app shows it next to its name at the top of the window (or at the bottom of the menu). On the command line, run `keyroostctl --version`.
+        If an earlier version worked, please say which one.
+      placeholder: "0.14.0 (worked in 0.13.0)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install keyroost?
+      options:
+        - Flatpak
+        - AppImage
+        - Homebrew
+        - AUR (Arch Linux)
+        - winget
+        - Download from the Releases page (.zip or .tar.gz)
+        - Signed build from the Releases page (Windows .zip or macOS .pkg)
+        - Token2 Companion Rust Edition (Token2's build)
+        - Nix
+        - cargo install, or built from source
+        - Other, or not sure
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: The version too, please. On Linux, also the desktop and whether it's Wayland or X11, if you know.
+      placeholder: "Windows 11 24H2 / macOS 15.4 / Fedora 44, KDE Plasma, Wayland"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it happen?
+      options:
+        - In the app (the keyroost window)
+        - On the command line (keyroostctl)
+        - Both
+    validations:
+      required: true
+
+  - type: input
+    id: key
+    attributes:
+      label: Which key?
+      description: |
+        Make and model as printed on the key or its box, and the firmware version if you know it.
+        If you use a card reader, its make and model too. If you have several keys plugged in, list them all.
+      placeholder: "YubiKey 5C NFC, firmware 5.7.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: connection
+    attributes:
+      label: How is the key connected?
+      options:
+        - Plugged straight into the computer (USB)
+        - Through a USB hub, dock or extension cable
+        - Held on an NFC reader
+        - In a contact card reader (smart card in a slot)
+        - Not sure
+
+  - type: dropdown
+    id: windows-admin
+    attributes:
+      label: Windows only. Did you run keyroost as administrator?
+      description: Windows only lets programs running as administrator talk to FIDO2 keys directly (passkeys, FIDO PIN), so this often changes what you see.
+      options:
+        - "Yes"
+        - "No"
+        - Tried both, same result
+        - Tried both, different results (please describe above)
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Before you paste any output
+        The `--debug` trace and the app's APDU trace hide PINs, passwords and secret seeds (you'll see "redacted" in their place). Still, please check what you paste:
+        - **Never** post a PIN, password, PUK, management key or seed. If you copy the command line too, make sure none is in it.
+        - **Fine to blank out** (replace with `XXXX`): serial numbers (`serial=…` and the `[identity]` lines), names you gave your keys (`name=…`), your username in file paths, and the long device paths on Windows.
+        - **Please leave as is:** the key's model, its AAGUID (the same for every key of that model), and the hex lines and status words such as `SW=6A80`. They're what we need.
+        - **Keep private:** lists of your accounts and passkeys (`oath list`, `oath code`, `otp list`, `fido credential list`). Don't paste them unless we ask. In keyroost 0.14 and earlier, the authenticator-code (OATH) trace also shows your account names in hex. PIV or OpenPGP output can show the name or email on your certificate or card.
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output from keyroostctl or the app's Activity log
+      description: |
+        **Command line:** run these and paste everything the terminal shows:
+        `keyroostctl list`
+        `keyroostctl doctor` (if the key isn't found at all)
+        `keyroostctl --debug <the command that failed>`, for example `keyroostctl --debug fido info`
+        On Windows, run them from an administrator terminal for anything FIDO2. With the Flatpak, start each one with `flatpak run --command=keyroostctl io.github.framefilter.keyroost` instead of `keyroostctl`.
+
+        **App only (for example the AppImage):** open the Activity log, tick "APDU trace", repeat what went wrong, then press Copy and paste here.
+      render: shell
+
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Problems using a key on a phone are outside keyroost, which runs on Windows, macOS and Linux desktops. More help: the [guides](https://framefilter.github.io/keyroost/) and the [command line troubleshooting notes](https://framefilter.github.io/keyroost/cli.html#troubleshooting).

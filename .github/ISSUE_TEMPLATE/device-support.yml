@@ -1,0 +1,77 @@
+name: Support for a key or device
+description: A key or card reader isn't recognized, shows the wrong name, or is missing a feature it has.
+labels: ["device support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        keyroost works with keys through open standards (FIDO2, OATH, OpenPGP card, PIV), so many keys work without anything special. Use this form when a key isn't recognized, shows up under the wrong name, or a feature the key has isn't offered.
+        The [supported devices page](https://framefilter.github.io/keyroost/devices.html) lists what has been checked so far. If something that used to work has stopped working, please use the bug report instead.
+
+  - type: input
+    id: model
+    attributes:
+      label: Key make and model
+      description: As printed on the key or its box. Add a link to the maker's product page if you have one.
+      placeholder: "TrustKey B210H"
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      description: If you know it. `keyroostctl fido info` shows it for many keys.
+      placeholder: "5.7.4"
+
+  - type: checkboxes
+    id: features
+    attributes:
+      label: What can the key do, according to its maker?
+      description: Tick what applies. It's fine to leave this empty if you're not sure.
+      options:
+        - label: FIDO2 / passkeys
+        - label: Authenticator codes (OATH TOTP/HOTP)
+        - label: OpenPGP
+        - label: PIV (smart-card certificates)
+        - label: Maker's own OTP feature
+        - label: Fingerprint reader
+        - label: NFC
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What happens in keyroost today?
+      description: For example, the key doesn't appear, it shows another brand's name, a tab is missing, or you get an error. Screenshots help.
+    validations:
+      required: true
+
+  - type: input
+    id: version-os
+    attributes:
+      label: keyroost version and operating system
+      description: The app shows its version next to its name at the top of the window. On the command line, run `keyroostctl --version`.
+      placeholder: "0.14.0 on Windows 11"
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output of keyroostctl list and keyroostctl fido info
+      description: |
+        These only read from the key and change nothing on it. They show the key's USB ID and what it reports about itself, which is what we need to add it.
+        `keyroostctl list`
+        `keyroostctl fido info`
+        On Windows, please run them twice: once in a normal terminal and once in a terminal opened with "Run as administrator".
+        If your question is about PIV or OpenPGP, add `keyroostctl piv info` or `keyroostctl openpgp info`.
+        Feel free to replace serial numbers and names you gave your keys with `XXXX`. Please leave the AAGUID: it's the same for every key of that model. Never post a PIN.
+      render: shell
+
+  - type: checkboxes
+    id: testing
+    attributes:
+      label: Can you help test?
+      description: Often nobody on the project has this key, so a fix can only be checked by someone who does.
+      options:
+        - label: I can try a test build before it's released.
