@@ -5116,33 +5116,14 @@ impl App {
                 }
                 match outcome {
                     Ok((init, info)) => {
-                        // Surface the key's firmware on the hero (e.g. "fw 5.7.4")
-                        // when we have an InitResponse (USB-HID); PC/SC has none.
+                        // The firmware (from the InitResponse, USB-HID only;
+                        // PC/SC has none) and the AAGUID's model go on the
+                        // hero via apply_key_details below.
                         if let Some(init) = init {
-                            let fw = format!(
-                                "{}.{}.{}",
-                                init.device_major, init.device_minor, init.device_build
-                            );
-                            if let Some(id) = for_device.clone() {
-                                if let Some(dev) = app.devices.iter_mut().find(|d| d.id == id) {
-                                    dev.firmware = fw;
-                                }
-                            }
                             app.security_keys.init = Some(init);
                         }
                         match info {
                             Some(Ok(info)) => {
-                                // Refine the model from the AAGUID (e.g. "YubiKey" ->
-                                // "YubiKey 5 Series with NFC") on the read device.
-                                if let Some(model) = ui::aaguid::model_for_aaguid(&info.aaguid) {
-                                    if let Some(id) = for_device {
-                                        if let Some(dev) =
-                                            app.devices.iter_mut().find(|d| d.id == id)
-                                        {
-                                            dev.model = model.to_string();
-                                        }
-                                    }
-                                }
                                 app.security_keys.info = Some(info);
                             }
                             Some(Err(e)) => {
@@ -5160,11 +5141,40 @@ impl App {
                                 );
                             }
                         }
+                        app.apply_key_details();
                     }
                     Err(e) => app.security_keys.error = Some(e),
                 }
             })
         });
+    }
+
+    /// Put what the selected key's info says on its row: the firmware from
+    /// the CTAPHID INIT ("fw 5.7.4") and the model its AAGUID names
+    /// ("YubiKey" -> "YubiKey 5 Series with NFC"). Called when the info is
+    /// read and after every scan, which rebuilds the rows from scratch.
+    fn apply_key_details(&mut self) {
+        let Some(id) = self.selected_device.clone() else {
+            return;
+        };
+        let fw = self
+            .security_keys
+            .init
+            .as_ref()
+            .map(|i| format!("{}.{}.{}", i.device_major, i.device_minor, i.device_build));
+        let model = self
+            .security_keys
+            .info
+            .as_ref()
+            .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid));
+        if let Some(dev) = self.devices.iter_mut().find(|d| d.id == id) {
+            if let Some(fw) = fw {
+                dev.firmware = fw;
+            }
+            if let Some(model) = model {
+                dev.model = model.to_string();
+            }
+        }
     }
 
     /// Open the selected hidraw, run the PIN exchange, and populate the
@@ -9230,6 +9240,10 @@ impl App {
                     } else if reread && app.selected_device.is_some() {
                         app.reread_open_tab();
                     }
+                    // The rows are new: put the selected key's details back.
+                    // After the selection handling, so a new selection (whose
+                    // info was just cleared) never gets the old key's.
+                    app.apply_key_details();
                 }
                 Err(e) => {
                     app.reread_after_scan = false;
@@ -29337,6 +29351,46 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    /// The key's model from its AAGUID and its firmware are read once per
+    /// selection, but every scan rebuilds the rows from scratch: they're put
+    /// back on the rebuilt row, so a rescan (Refresh, a replug) doesn't turn
+    /// "YubiKey 5 Series with NFC · fw 5.7.4" back into "YubiKey".
+    #[test]
+    fn key_details_survive_a_rescan() {
+        let mut app = App {
+            selected_device: Some("serial:37806840".into()),
+            devices: vec![sel_key("serial:37806840", "37806840", None)],
+            ..Default::default()
+        };
+        app.security_keys.init = Some(keyroost_ctap::InitResponse {
+            channel_id: 1,
+            protocol_version: 2,
+            device_major: 5,
+            device_minor: 7,
+            device_build: 4,
+            capabilities: 0x05,
+        });
+        app.security_keys.info = Some(AuthenticatorInfo {
+            // A YubiKey 5 Series with NFC.
+            aaguid: [
+                0xfa, 0x2b, 0x99, 0xdc, 0x9e, 0x39, 0x42, 0x57, 0x8f, 0x92, 0x4a, 0x30, 0xd2, 0x3c,
+                0x41, 0x18,
+            ],
+            ..Default::default()
+        });
+        app.apply_key_details();
+        let check = |app: &App| {
+            let d = &app.devices[0];
+            assert_eq!(d.model, "YubiKey 5 Series with NFC");
+            assert_eq!(d.firmware, "5.7.4");
+        };
+        check(&app);
+        // A rescan's rebuilt row gets them back.
+        app.devices = vec![sel_key("serial:37806840", "37806840", None)];
+        app.apply_key_details();
+        check(&app);
     }
 
     /// The selected key is unplugged: selection falls back to another key,
