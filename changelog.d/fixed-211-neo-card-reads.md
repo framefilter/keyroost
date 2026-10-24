@@ -6,4 +6,4 @@
   for the card to come back and opens the session once more, before sending
   anything that could change the key. It also no longer asks a YubiKey NEO
   for its serial number over the FIDO connection, a question it does not
-  answer.
+  answer. ([#211])

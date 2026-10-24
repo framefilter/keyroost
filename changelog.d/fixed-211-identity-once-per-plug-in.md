@@ -4,3 +4,4 @@
   YubiKey NEO) was asked again and again, and debug logs filled with the
   same two lines. keyroost now keeps the answer for as long as the key stays
   plugged in, wherever that can't be mistaken for a different key.
+  ([#211])
