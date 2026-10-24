@@ -609,7 +609,7 @@ const CTAP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// firmware 2.1.x the FIDO interface answers the report-framed request with a
 /// CTAPHID error frame, which that path misread as status word `0x0105`
 /// (#155), while `0x41` reaches the applet.
-pub struct CtapOtpTransport {
+pub(crate) struct CtapOtpTransport {
     dev: keyroost_ctap::CtapHidDevice,
     /// Shared with the device's keepalive hook, which runs inside `transact`.
     prompt: std::sync::Arc<CtapPrompt>,
@@ -630,7 +630,7 @@ impl CtapOtpTransport {
     /// command `0x41` with the read-only `GET_ECDH_PUBKEY`. `None` when it
     /// doesn't (a key without the command answers a CTAPHID error), so the
     /// caller falls back to [`HidOtpTransport`].
-    pub fn open_probed(path: &Path, debug: bool) -> Option<Self> {
+    pub(crate) fn open_probed(path: &Path, debug: bool) -> Option<Self> {
         let note = |what: String| {
             crate::trace::line(debug, || {
                 format_line(Dir::Note, &otp_label("CTAPHID"), &what)
@@ -1154,7 +1154,7 @@ const NO_PIN_FEATURE_ANSWERS: [u16; 5] = [
 
 impl Token2OtpSession {
     /// Open the OTP applet, trying USB-HID first and falling back to PC/SC.
-    /// Over USB-HID, CTAPHID command `0x41` ([`CtapOtpTransport`]) is tried
+    /// Over USB-HID, CTAPHID command `0x41` (`CtapOtpTransport`) is tried
     /// before the report-framed [`HidOtpTransport`].
     ///
     /// HID enumerating successfully is not the same as the OTP applet being
