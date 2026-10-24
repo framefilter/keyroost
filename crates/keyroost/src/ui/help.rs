@@ -25,7 +25,8 @@ pub struct Help {
 ///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-backup, pgp-restore,
 ///   pgp-expiry, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate,
-///   piv-import-export, piv-delete, piv-test, piv-admin, piv-move, piv-retired
+///   piv-import-key, piv-import-export, piv-delete, piv-test, piv-admin, piv-move,
+///   piv-retired
 pub fn help(topic: &str) -> Option<&'static Help> {
     Some(match topic {
         "device" => &Help {
@@ -122,6 +123,11 @@ pub fn help(topic: &str) -> Option<&'static Help> {
             title: "Create a certificate",
             body: "A self-signed certificate is stored straight into the slot and is ready to use. A CSR is a request file you send to a certificate authority so they can issue one for you. Either way the signing happens on the card, so it needs the PIN; for a CSR, keyroost first asks where to save the request file. Key usage is optional: left at Undefined, no key usage extension is written. It starts out set to the PIV standard's value for the slot (Undefined where the standard defines none), and you can select multiple usages.",
             slug: "/piv#certificate",
+        },
+        "piv-import-key" => &Help {
+            title: "Import a key from a file",
+            body: "Loads a private key and its certificate from a .p12 or .pfx file into this slot. keyroost opens the file with its password first and checks this key can take it before asking for the management key. If the slot already holds a key, it's replaced for good. The PIN is checked before anything is written, then the slot is tested. Authority certificates in the file aren't written to the card; you can save them to a file. An imported key can't be attested as generated on this key.",
+            slug: "/piv#import",
         },
         "piv-import-export" => &Help {
             title: "Import or export a certificate",

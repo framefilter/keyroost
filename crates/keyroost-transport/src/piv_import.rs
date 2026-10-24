@@ -118,8 +118,12 @@ impl fmt::Display for ImportRefusal {
 
 impl std::error::Error for ImportRefusal {}
 
-/// The common name of a certificate's subject, else the whole subject.
-fn subject_name(der: &[u8]) -> String {
+/// The common name of a certificate's subject, else the whole subject, else
+/// `(unreadable subject)`: how an entry's or an authority certificate's
+/// owner is named. The text comes from the file: a caller sanitizes it
+/// before showing it.
+#[must_use]
+pub fn certificate_name(der: &[u8]) -> String {
     use keyroost_piv::x509_parse::{parse_subject_dn, DnAttr};
     match parse_subject_dn(der) {
         Ok(dn) => dn
@@ -127,8 +131,45 @@ fn subject_name(der: &[u8]) -> String {
             .iter()
             .find(|(attr, v)| *attr == DnAttr::CommonName && !v.is_empty())
             .map_or_else(|| dn.to_string(), |(_, v)| v.clone()),
-        Err(_) => "unreadable subject".to_string(),
+        Err(_) => "(unreadable subject)".to_string(),
     }
+}
+
+/// A PKCS#12 reading error as a plain sentence, the same in the CLI and the
+/// app.
+#[must_use]
+pub fn file_error_message(e: keyroost_p12::P12Error) -> String {
+    use keyroost_p12::P12Error;
+    match e {
+        P12Error::WrongPassword => "Wrong password for this file.".to_string(),
+        P12Error::NoKey => "The file has no private key to import.".to_string(),
+        P12Error::Malformed(what) => {
+            format!("This isn't a .p12/.pfx file keyroost can read ({what}).")
+        }
+        P12Error::Unsupported("PBMAC1") => "This file uses a newer integrity check (PBMAC1) \
+            that keyroost can't read yet. Export it again with the default or the legacy \
+            PKCS#12 settings."
+            .to_string(),
+        P12Error::Unsupported("file has no integrity check") => "This file has no integrity \
+            check and holds an unencrypted key, so keyroost won't import it. Export it again \
+            with a password."
+            .to_string(),
+        P12Error::Unsupported(what) => {
+            format!("This file uses something keyroost can't import yet: {what}.")
+        }
+        e => format!("This file can't be imported: {e}."),
+    }
+}
+
+/// The file's authority certificates as PEM, one after another, for saving
+/// next to an import.
+#[must_use]
+pub fn authorities_pem(contents: &Contents) -> String {
+    contents
+        .authorities
+        .iter()
+        .map(|der| keyroost_piv::x509::pem_certificate(der))
+        .collect()
 }
 
 /// How an entry is shown when there is a choice to make: the file's own
@@ -143,7 +184,7 @@ fn entry_label(index: usize, entry: &Entry) -> String {
     };
     let cert = entry.certificate.as_deref().map_or_else(
         || "no certificate".to_string(),
-        |der| format!("certificate: {}", subject_name(der)),
+        |der| format!("certificate: {}", certificate_name(der)),
     );
     format!("{name} ({}; {cert})", entry.key.alg().label())
 }

@@ -24,6 +24,9 @@ keyroost-token2prog = { path = "../keyroost-token2prog", version = "0.14.0" }
 keyroost-token2otp = { path = "../keyroost-token2otp", version = "0.14.0" }
 keyroost-piv = { path = "../keyroost-piv", version = "0.14.0" }
 keyroost-pivtest = { path = "../keyroost-pivtest", version = "0.14.0" }
+# PKCS#12 (.p12/.pfx) reading for "Import key from file" (#174); shared with
+# keyroostctl through keyroost-transport's piv_import flow.
+keyroost-p12 = { path = "../keyroost-p12", version = "0.14.0" }
 keyroost-hid = { path = "../keyroost-hid", version = "0.14.0" }
 keyroost-ctap = { path = "../keyroost-ctap", version = "0.14.0" }
 keyroost-keyring = { path = "../keyroost-keyring", version = "0.14.0" }

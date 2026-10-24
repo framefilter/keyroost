@@ -2137,6 +2137,7 @@ dependencies = [
  "keyroost-import",
  "keyroost-keyring",
  "keyroost-oath",
+ "keyroost-p12",
  "keyroost-pgpkey",
  "keyroost-piv",
  "keyroost-pivtest",

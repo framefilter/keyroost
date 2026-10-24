@@ -2768,6 +2768,11 @@ enum PivCredKind {
     ChangePuk,
     UnblockPin,
     GenerateKey,
+    /// Import a private key and its certificate from a .p12/.pfx file
+    /// (#174): the file's password opens it first, so what this key can't
+    /// take is refused before the management key is asked for. Its PIN field
+    /// (`sign_pin`) is checked before any write and runs the self-test after.
+    ImportKey,
     ImportCert,
     SelfSign,
     RequestCsr,
@@ -2792,6 +2797,7 @@ impl PivCredKind {
             PivCredKind::ChangePuk => "Change PUK",
             PivCredKind::UnblockPin => "Unblock PIN",
             PivCredKind::GenerateKey => "Generate key",
+            PivCredKind::ImportKey => "Import key from file",
             PivCredKind::ImportCert => "Import certificate",
             PivCredKind::SelfSign => "Self-signed certificate",
             PivCredKind::RequestCsr => "Sign certificate request",
@@ -2809,6 +2815,7 @@ impl PivCredKind {
     fn submit_label(self) -> &'static str {
         match self {
             PivCredKind::GenerateKey => "Generate",
+            PivCredKind::ImportKey => "Import",
             PivCredKind::ImportCert => "Import",
             PivCredKind::SelfSign => "Create",
             PivCredKind::RequestCsr => "Sign & save",
@@ -2830,6 +2837,7 @@ impl PivCredKind {
             PivCredKind::ChangePuk => "Changing PUK\u{2026}",
             PivCredKind::UnblockPin => "Unblocking PIN\u{2026}",
             PivCredKind::GenerateKey => "Generating key\u{2026}",
+            PivCredKind::ImportKey => "Importing key\u{2026}",
             PivCredKind::ImportCert => "Importing certificate\u{2026}",
             PivCredKind::SelfSign => "Creating certificate\u{2026}",
             PivCredKind::RequestCsr => "Signing request\u{2026}",
@@ -2848,6 +2856,7 @@ impl PivCredKind {
         matches!(
             self,
             PivCredKind::GenerateKey
+                | PivCredKind::ImportKey
                 | PivCredKind::ImportCert
                 | PivCredKind::SelfSign
                 | PivCredKind::SetRetries
@@ -2859,14 +2868,18 @@ impl PivCredKind {
         )
     }
     /// True for a flow that already collects a PIN of its own further down in
-    /// the modal — `SelfSign`'s signing PIN, `SetRetries`' current PIN — for a
+    /// the modal — `SelfSign`'s signing PIN, `SetRetries`' current PIN,
+    /// `ImportKey`'s PIN for the check and self-test — for a
     /// reason unrelated to management auth. PIV has exactly one application
     /// PIN, so when `use_pin` is set on one of these,
     /// `piv_modal_mgmt_field` doesn't render a second PIN box asking for the
     /// same value twice: the dedicated field's PIN is reused directly for
     /// management auth too, in [`App::piv_current_mgmt_auth`].
     fn shares_pin_field(self) -> bool {
-        matches!(self, PivCredKind::SelfSign | PivCredKind::SetRetries)
+        matches!(
+            self,
+            PivCredKind::SelfSign | PivCredKind::SetRetries | PivCredKind::ImportKey
+        )
     }
 }
 
@@ -2894,6 +2907,50 @@ impl PivCredModal {
             result: None,
             detail: None,
         }
+    }
+}
+
+/// The "Import key from file" dialog's own state (#174): the picked
+/// .p12/.pfx file, its password, what it opened to, and the choices made for
+/// it. Replaced with a fresh one whenever the PIV dialog closes, which drops
+/// the decrypted file; the password is wiped as soon as the file is open.
+#[derive(Default)]
+struct PivKeyImport {
+    /// The file picked before the dialog opened.
+    path: String,
+    /// The file's password, wiped once the file is open (and on drop).
+    password: String,
+    /// The file is being opened on the worker.
+    opening: bool,
+    /// What the file holds, once open. Shared with the import job, which
+    /// takes a clone; the keys wipe themselves when the last one drops.
+    contents: Option<std::sync::Arc<keyroost_p12::Contents>>,
+    /// Why the file didn't open (wrong password, not a PKCS#12 file, …).
+    open_error: Option<String>,
+    /// The picked key, 0-based (the dropdown's index).
+    entry: usize,
+    /// Where to save the file's authority certificates; empty: don't.
+    chain_out: String,
+}
+
+impl Drop for PivKeyImport {
+    fn drop(&mut self) {
+        wipe(&mut self.password);
+    }
+}
+
+impl PivKeyImport {
+    /// The entry dropdown's choices, made safe to show (the labels come
+    /// from the file), when the open file holds several keys; `None` when
+    /// it isn't open or holds one, so there is nothing to pick.
+    fn entry_choices(&self) -> Option<Vec<String>> {
+        let contents = self.contents.as_ref()?;
+        (contents.entries.len() > 1).then(|| {
+            keyroost_transport::piv_import::entry_labels(contents)
+                .iter()
+                .map(|label| sanitize_title(label))
+                .collect()
+        })
     }
 }
 
@@ -3096,6 +3153,9 @@ struct PivState {
     /// Chosen destination slot for the Move-key flow (empty until the user picks
     /// one in the modal's destination combo). Reset when the modal closes.
     move_dest: Option<keyroost_piv::Slot>,
+    /// The "Import key from file" dialog's file, password and choices.
+    /// Reset when the modal closes.
+    key_import: PivKeyImport,
     /// Lazily-read occupancy of the 20 retired slots (`slot -> has_key`), cached
     /// so expanding the section only probes the card once. `None` until read;
     /// invalidated after a move so the section re-reads on its next expand.
@@ -3173,6 +3233,7 @@ impl Default for PivState {
             inflight: false,
             cred_modal: None,
             move_dest: None,
+            key_import: PivKeyImport::default(),
             retired_occupancy: None,
         }
     }
@@ -3300,6 +3361,154 @@ fn piv_cert_error_hint(e: &TransportError, choice: PivCertCompressionSel) -> Opt
             Some(" (set Compression to Automatic or Always)")
         }
         _ => None,
+    }
+}
+
+/// Why a key with this applet fingerprint and version can't import into
+/// `slot` at all (#174), before any file is picked: its import command
+/// doesn't take the slot (the Nitrokey takes 9A only), or keyroost's list
+/// marks every key type unsupported for import. `None` when it may; what
+/// the file holds is checked once it is open (`plan_import`).
+fn piv_import_key_block(
+    fp: keyroost_piv::fingerprint::AppletFingerprint,
+    ver: Option<&[u8]>,
+    fw: Option<&[u8]>,
+    slot: keyroost_piv::Slot,
+) -> Option<String> {
+    use keyroost_piv::compat::{self, FeatureGate, PivExtension};
+    let none_importable = keyroost_piv::KeyAlg::ALL.into_iter().all(|alg| {
+        compat::resolve(PivExtension::ImportKey(alg), fp, ver, fw) == FeatureGate::Unsupported
+    });
+    if none_importable {
+        return Some("This device can't import keys.".to_string());
+    }
+    (!compat::import_slot_allowed(fp, slot))
+        .then(|| keyroost_transport::piv_import::ImportRefusal::SlotNotSupported(slot).to_string())
+}
+
+/// Read and open a .p12/.pfx file, in the words the CLI uses for a file it
+/// can't open. An empty password is one (files saved with it exist).
+fn open_key_file(path: &std::path::Path, password: &str) -> Result<keyroost_p12::Contents, String> {
+    let bytes = zeroize::Zeroizing::new(
+        std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?,
+    );
+    keyroost_p12::open(&bytes, Some(password))
+        .map_err(keyroost_transport::piv_import::file_error_message)
+}
+
+/// Whether an import put the new key on the card: it succeeded, or only its
+/// self-test failed.
+fn piv_key_import_wrote_key(
+    outcome: &Result<
+        keyroost_transport::piv_import::ImportReport,
+        keyroost_transport::piv_import::ImportFailure,
+    >,
+) -> bool {
+    use keyroost_transport::piv_import::ImportFailure;
+    matches!(
+        outcome,
+        Ok(_) | Err(ImportFailure::SelfTestNotRun { .. } | ImportFailure::SelfTestFailed(_))
+    )
+}
+
+/// After the key is on the card: save the file's authority certificates to
+/// `chain_out` as PEM, or name the ones left out. `None` when the file has
+/// none. Names come from the file, so they are made safe to show.
+fn piv_key_import_authorities(
+    contents: &keyroost_p12::Contents,
+    chain_out: Option<&std::path::Path>,
+) -> Option<String> {
+    let n = contents.authorities.len();
+    let certs = if n == 1 {
+        "authority certificate"
+    } else {
+        "authority certificates"
+    };
+    Some(match (n, chain_out) {
+        (0, _) => return None,
+        (_, Some(path)) => {
+            let pem = keyroost_transport::piv_import::authorities_pem(contents);
+            match std::fs::write(path, pem.as_bytes()) {
+                Ok(()) => format!("Saved {n} {certs} to {}.", path.display()),
+                Err(e) => format!(
+                    "The key is imported, but the {certs} couldn't be saved to {}: {e}.",
+                    path.display()
+                ),
+            }
+        }
+        (_, None) => {
+            let names: Vec<String> = contents
+                .authorities
+                .iter()
+                .map(|der| sanitize_title(&keyroost_transport::piv_import::certificate_name(der)))
+                .collect();
+            format!(
+                "Skipped {n} {certs}: {} (not written to the card).",
+                names.join(", ")
+            )
+        }
+    })
+}
+
+/// The import dialog's result text (#174): `Ok(detail)` when the key is on
+/// the card and its self-test passed (what was stored, the authority
+/// certificates, then the self-test, one line each), else `Err(message)`:
+/// the shared failure text, which says what the slot holds, then the same
+/// lines where the key was written.
+fn piv_key_import_text(
+    outcome: &Result<
+        keyroost_transport::piv_import::ImportReport,
+        keyroost_transport::piv_import::ImportFailure,
+    >,
+    authorities: Option<&str>,
+    alg: keyroost_piv::KeyAlg,
+    slot: keyroost_piv::Slot,
+    compression: PivCertCompressionSel,
+) -> Result<String, String> {
+    use keyroost_transport::piv_import::ImportFailure;
+    let mut lines = Vec::new();
+    if let Ok(report) = outcome {
+        match &report.cert {
+            Some(stored) => {
+                lines.push(format!(
+                    "The {} key and its certificate are in {}.",
+                    alg.label(),
+                    slot.label()
+                ));
+                lines.extend(piv_cert_stored_detail(
+                    stored.compressed,
+                    stored.stored_len,
+                    stored.auto_compressed,
+                ));
+            }
+            None => lines.push(format!(
+                "The {} key is in {}. The file has no certificate for it, so the slot now \
+                 has none.",
+                alg.label(),
+                slot.label()
+            )),
+        }
+    }
+    lines.extend(authorities.map(str::to_owned));
+    if let Ok(report) | Err(ImportFailure::SelfTestFailed(report)) = outcome {
+        lines.push(keyroost_pivtest::format_report(&report.self_test));
+    }
+    match outcome {
+        Ok(_) => Ok(lines.join("\n")),
+        Err(e) => {
+            let mut message = e.to_string();
+            // As `piv_cert_error_hint`: under Never, a certificate that
+            // didn't fit may fit compressed.
+            if let ImportFailure::CertificateNotStored { error, .. } = e {
+                if piv_cert_error_hint(error, compression).is_some() {
+                    message.push_str(" Set Compression to Automatic or Always.");
+                }
+            }
+            Err(std::iter::once(message)
+                .chain(lines)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
     }
 }
 
@@ -4078,6 +4287,11 @@ enum FileTarget {
     PivCsr,
     /// PIV "Import certificate" source file (`piv.cert_path`).
     PivCert,
+    /// PIV "Import key from file" source .p12/.pfx (`piv.key_import.path`).
+    PivKeyFile,
+    /// PIV "Import key from file": where to save the file's authority
+    /// certificates (`piv.key_import.chain_out`).
+    PivKeyChainOut,
     /// PIV "Export certificate" destination (`piv.export_path`).
     PivExport,
     /// Storage tab "Export…" destination for a large-blob entry. Carries the
@@ -4213,6 +4427,24 @@ impl App {
                                 self.piv_cred_modal_close();
                                 self.piv.cred_modal =
                                     Some(PivCredModal::new(PivCredKind::ImportCert));
+                            }
+                            FileTarget::PivKeyFile => {
+                                self.piv_cred_modal_close();
+                                self.piv.key_import.path = text;
+                                self.piv.cred_modal =
+                                    Some(PivCredModal::new(PivCredKind::ImportKey));
+                            }
+                            // Only for the dialog that asked: one closed in
+                            // the meantime has nothing to save next to.
+                            FileTarget::PivKeyChainOut => {
+                                if self
+                                    .piv
+                                    .cred_modal
+                                    .as_ref()
+                                    .is_some_and(|m| m.kind == PivCredKind::ImportKey)
+                                {
+                                    self.piv.key_import.chain_out = text;
+                                }
                             }
                             FileTarget::PivExport => {
                                 self.piv.export_path = text;
@@ -10073,9 +10305,9 @@ impl App {
         if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
             let pin = if kind.shares_pin_field() {
                 match kind {
-                    PivCredKind::SelfSign => &self.piv.sign_pin,
+                    PivCredKind::SelfSign | PivCredKind::ImportKey => &self.piv.sign_pin,
                     PivCredKind::SetRetries => &self.piv.retries_pin_auth,
-                    _ => unreachable!("shares_pin_field() covers exactly these two kinds"),
+                    _ => unreachable!("shares_pin_field() covers exactly these three kinds"),
                 }
             } else {
                 &self.piv.mgmt_key_input
@@ -10271,6 +10503,249 @@ impl App {
                 wipe(&mut app.piv.mgmt_key_input);
                 let result = app.store_and_unwrap_piv_cert_write(for_device, result);
                 Self::apply_piv_cert_write(app, result, "Certificate imported", choice);
+            })
+        });
+    }
+
+    /// Why "Import key from file" can't run on the selected key and slot
+    /// before any file is picked (#174), or `None` when it may. The same
+    /// table `plan_import` consults, so the dimmed button and a later refusal
+    /// agree.
+    fn piv_import_key_blocked(&self) -> Option<String> {
+        let (fp, ver, fw) = self.piv.status.as_ref().map_or(
+            (
+                keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                None,
+                None,
+            ),
+            |s| {
+                (
+                    s.applet_fingerprint,
+                    s.version.as_deref(),
+                    s.version_firmware.as_deref(),
+                )
+            },
+        );
+        piv_import_key_block(fp, ver, fw, self.piv.selected_slot.to_slot())
+    }
+
+    /// The open file checked against the selected key and slot, with the
+    /// dialog's entry and PIN/touch policies (`plan_import`, no card I/O):
+    /// `None` until the file is open, else `Some(Err(refusal))` for what
+    /// this key can't take, shown before the management key is asked for.
+    fn piv_key_import_preflight(
+        &self,
+    ) -> Option<Result<(), keyroost_transport::piv_import::ImportRefusal>> {
+        let contents = self.piv.key_import.contents.as_ref()?;
+        let (fp, ver, fw) = self.piv.status.as_ref().map_or(
+            (
+                keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                None,
+                None,
+            ),
+            |s| {
+                (
+                    s.applet_fingerprint,
+                    s.version.as_deref(),
+                    s.version_firmware.as_deref(),
+                )
+            },
+        );
+        Some(
+            keyroost_transport::piv_import::plan_import(
+                contents,
+                Some(self.piv.key_import.entry + 1),
+                self.piv.selected_slot.to_slot(),
+                fp,
+                ver,
+                fw,
+                self.piv.gen_pin_policy,
+                self.piv.gen_touch_policy,
+            )
+            .map(|_| ()),
+        )
+    }
+
+    /// Open the picked .p12/.pfx file with the typed password, on the
+    /// worker (the password's key derivation takes a moment). Needs no card.
+    /// The password is wiped once the file is read, whatever the outcome; a
+    /// click the busy worker drops keeps it for the next try.
+    fn piv_open_key_file(&mut self) {
+        let path = std::path::PathBuf::from(self.piv.key_import.path.trim());
+        let password = zeroize::Zeroizing::new(self.piv.key_import.password.clone());
+        let for_path = self.piv.key_import.path.clone();
+        self.piv.key_import.opening = true;
+        self.piv.key_import.open_error = None;
+        let queued = self.spawn_job("Opening the file\u{2026}", move || {
+            let result = open_key_file(&path, &password);
+            Box::new(move |app: &mut App| {
+                let ki = &mut app.piv.key_import;
+                // The dialog was closed, or another file picked, meanwhile.
+                if ki.path != for_path {
+                    return;
+                }
+                ki.opening = false;
+                wipe(&mut ki.password);
+                match result {
+                    Ok(contents) => {
+                        ki.contents = Some(std::sync::Arc::new(contents));
+                        ki.entry = 0;
+                        ki.open_error = None;
+                    }
+                    Err(e) => {
+                        ki.contents = None;
+                        ki.open_error = Some(e);
+                    }
+                }
+            })
+        });
+        if !queued {
+            self.piv.key_import.opening = false;
+        }
+    }
+
+    /// Import the open file's chosen key (and certificate) into the selected
+    /// slot (#174), through the flow `keyroostctl piv key import` uses:
+    /// planned again on the card, then the management key, then
+    /// `run_import` (PIN check before any write, certificate, key,
+    /// self-test). The authority certificates are saved once the key is on
+    /// the card, if a place was picked.
+    fn piv_import_key(&mut self) {
+        let Some(name) = self.selected_oath_reader() else {
+            return;
+        };
+        let Some(contents) = self.piv.key_import.contents.clone() else {
+            self.piv.error = Some("Open the file first.".into());
+            return;
+        };
+        if self.piv.sign_pin.is_empty() {
+            self.piv.error = Some("Enter the PIN; it's checked before the import.".into());
+            return;
+        }
+        let mgmt = match self.piv_current_mgmt_auth(PivCredKind::ImportKey) {
+            Ok(a) => a,
+            Err(e) => {
+                self.piv.error = Some(e);
+                return;
+            }
+        };
+        let slot = self.piv.selected_slot.to_slot();
+        let entry = self.piv.key_import.entry;
+        let Some(alg) = contents.entries.get(entry).map(|e| e.key.alg()) else {
+            self.piv.error = Some("Pick a key from the file.".into());
+            return;
+        };
+        let (pin_policy, touch_policy) = (self.piv.gen_pin_policy, self.piv.gen_touch_policy);
+        let compression = self.piv.cert_compression;
+        let pin = zeroize::Zeroizing::new(self.piv.sign_pin.clone());
+        let chain_out = Some(self.piv.key_import.chain_out.trim())
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from);
+        self.piv.notice = None;
+        let for_device = self.selected_device.clone();
+        let cached_state = self.piv_cached_piv_session_state();
+        self.spawn_piv_job("Importing key\u{2026} (touch if it blinks)", move || {
+            use keyroost_transport::piv_import;
+            let result = keyroost_transport::PivSession::with_cached_transaction(
+                &name,
+                cached_state,
+                |s| -> Result<_, TransportError> {
+                    // Planned again on this session: the same answer unless
+                    // the key was swapped meanwhile, and then nothing is
+                    // written.
+                    let outcome = match piv_import::plan_import_on(
+                        s,
+                        &contents,
+                        Some(entry + 1),
+                        slot,
+                        pin_policy,
+                        touch_policy,
+                    ) {
+                        Err(r) => Err(piv_import::ImportFailure::Refused(r)),
+                        Ok(plan) => {
+                            piv_authenticate(s, &mgmt)?;
+                            piv_import::run_import(
+                                s,
+                                &plan,
+                                compression.to_compression(),
+                                Some(pin.as_bytes()),
+                            )
+                        }
+                    };
+                    // A failed re-read must not hide what the import did.
+                    let status = s.status().ok();
+                    Ok((outcome, status, s.state()))
+                },
+            );
+            let authorities = match &result {
+                Ok((outcome, _, _)) if piv_key_import_wrote_key(outcome) => {
+                    piv_key_import_authorities(&contents, chain_out.as_deref())
+                }
+                _ => None,
+            };
+            Box::new(move |app: &mut App| {
+                wipe(&mut app.piv.mgmt_key_input);
+                wipe(&mut app.piv.sign_pin);
+                match result {
+                    Err(e) => {
+                        let message = format!("{e} Nothing was written.");
+                        app.log(Severity::Err, message.clone());
+                        app.piv.notice = None;
+                        app.piv.error = Some(message);
+                        Self::apply_piv_cred_result(app);
+                    }
+                    Ok((outcome, status, state)) => {
+                        app.store_piv_session_state(for_device.clone(), state);
+                        let current = completion_still_valid(
+                            for_device.as_ref(),
+                            app.selected_device.as_ref(),
+                        );
+                        if let (Some(status), true) = (status, current) {
+                            app.piv.status = Some(status);
+                        }
+                        let text = piv_key_import_text(
+                            &outcome,
+                            authorities.as_deref(),
+                            alg,
+                            slot,
+                            compression,
+                        );
+                        match &text {
+                            Ok(_) => {
+                                app.log(
+                                    Severity::Ok,
+                                    format!("imported {} key into {}", alg.label(), slot.label()),
+                                );
+                                app.piv.error = None;
+                                app.piv.notice = Some(format!(
+                                    "Imported {} key into {}.",
+                                    alg.label(),
+                                    slot.label()
+                                ));
+                            }
+                            Err(e) => {
+                                app.log(Severity::Err, e.clone());
+                                app.piv.notice = None;
+                                app.piv.error = Some(e.clone());
+                            }
+                        }
+                        // Anything past the pre-write checks may have
+                        // changed the slot: re-read it.
+                        if !matches!(
+                            outcome,
+                            Err(keyroost_transport::piv_import::ImportFailure::Refused(_)
+                                | keyroost_transport::piv_import::ImportFailure::PinNotVerified(_))
+                        ) && current
+                        {
+                            app.load_piv_status(LogKind::Background);
+                            app.piv.retired_occupancy = None;
+                        }
+                        Self::apply_piv_cred_result(app);
+                        if let (Ok(detail), Some(m)) = (text, app.piv.cred_modal.as_mut()) {
+                            m.detail = Some(detail).filter(|d| !d.is_empty());
+                        }
+                    }
+                }
             })
         });
     }
@@ -12095,6 +12570,7 @@ fn piv_cred_mismatch(piv: &PivState, kind: PivCredKind) -> Option<&'static str> 
         // their inputs are validated by the op's own client-side guards.
         PivCredKind::UnblockPin
         | PivCredKind::GenerateKey
+        | PivCredKind::ImportKey
         | PivCredKind::ImportCert
         | PivCredKind::SelfSign
         | PivCredKind::RequestCsr
@@ -12123,6 +12599,7 @@ fn piv_cred_success(kind: PivCredKind) -> &'static str {
         PivCredKind::ChangePuk => "PUK changed",
         PivCredKind::UnblockPin => "PIN unblocked and reset",
         PivCredKind::GenerateKey => "Key generated",
+        PivCredKind::ImportKey => "Key imported",
         PivCredKind::ImportCert => "Certificate imported",
         PivCredKind::SelfSign => "Certificate created",
         PivCredKind::RequestCsr => "Request signed and saved",
@@ -19344,6 +19821,7 @@ impl App {
                 | PivCredKind::ChangeMgmtKey
                 | PivCredKind::SelfSign
                 | PivCredKind::SetRetries
+                | PivCredKind::ImportKey
         ) {
             chuid_label_width(ui.ctx())
         } else {
@@ -19376,6 +19854,399 @@ impl App {
         );
         self.secret_reveal
             .insert("piv-mgmt-key-input", mgmt_key_rev);
+    }
+
+    /// The PIN and touch policy rows of the Generate key and Import key
+    /// dialogs (`gen_pin_policy` / `gen_touch_policy`), gated by this key's
+    /// support for each policy and the values its firmware refuses.
+    fn piv_modal_policy_fields(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // PIN/touch policy (tags 0xAA/0xAB on GENERATE ASYMMETRIC KEYPAIR
+        // and IMPORT ASYMMETRIC KEY) are Yubico extensions, not SP 800-73-4
+        // — gated the same three-way way (`keyroost_piv::compat`) Move/Delete
+        // key are elsewhere in this pane, just resolved locally here since
+        // this modal doesn't share those rows' gate locals. `default` needs
+        // neither extension and is unaffected either way.
+        use keyroost_piv::compat::{FeatureGate, PivExtension};
+        let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
+            (
+                keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                None,
+                None,
+            ),
+            |s| {
+                (
+                    s.applet_fingerprint,
+                    s.version.as_deref(),
+                    s.version_firmware.as_deref(),
+                )
+            },
+        );
+        let pin_policy_gate =
+            self.piv_gate(PivExtension::SlotPinPolicy, piv_fp, piv_ver, piv_fw_ver);
+        let touch_policy_gate =
+            self.piv_gate(PivExtension::SlotTouchPolicy, piv_fp, piv_ver, piv_fw_ver);
+        // Narrower than the two gates above: a device can
+        // support the extension in general yet reject one
+        // specific value (e.g. YubiKey firmware 4.0-4.2
+        // supports touch policy but not `cached`).
+        let policy_quirks = keyroost_piv::compat::resolve_quirks(piv_fp, piv_ver, piv_fw_ver);
+        let pin_once_blocked =
+            policy_quirks.contains(&keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported);
+        let touch_cached_blocked = policy_quirks
+            .contains(&keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported);
+        let pin_policy_unverified_hint = format!(
+            "{} {}",
+            PivExtension::SlotPinPolicy.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let pin_policy_blocked_hint = format!(
+            "{} {}",
+            PivExtension::SlotPinPolicy.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        let touch_policy_unverified_hint = format!(
+            "{} {}",
+            PivExtension::SlotTouchPolicy.requirement(),
+            FeatureGate::UNVERIFIED_SUFFIX
+        );
+        let touch_policy_blocked_hint = format!(
+            "{} {}",
+            PivExtension::SlotTouchPolicy.requirement(),
+            FeatureGate::INCOMPATIBLE_SUFFIX
+        );
+        // `Unsupported` blocks the whole combo (matching
+        // Move/Delete key's own treatment) rather than
+        // just the one value the quirks above narrow —
+        // there's nothing to offer once the extension
+        // itself is known absent, so force the selection
+        // back to `default` rather than leave a stale
+        // non-default value the combo can no longer show
+        // as selectable.
+        if matches!(pin_policy_gate, FeatureGate::Unsupported) {
+            self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
+        }
+        if matches!(touch_policy_gate, FeatureGate::Unsupported) {
+            self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
+        }
+        let pin_policy_options: Vec<keyroost_piv::PinPolicy> = keyroost_piv::PinPolicy::ALL
+            .iter()
+            .copied()
+            .filter(|&opt| !(pin_once_blocked && opt == keyroost_piv::PinPolicy::Once))
+            .collect();
+        let touch_policy_options: Vec<keyroost_piv::TouchPolicy> = keyroost_piv::TouchPolicy::ALL
+            .iter()
+            .copied()
+            .filter(|&opt| !(touch_cached_blocked && opt == keyroost_piv::TouchPolicy::Cached))
+            .collect();
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Pin Policy")
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            );
+            if matches!(pin_policy_gate, FeatureGate::Unverified) {
+                ui.add_space(4.0);
+                theme::warn_marker(ui, p).on_hover_text(pin_policy_unverified_hint.as_str());
+            }
+            ui.add_space(8.0);
+            ui.add_enabled_ui(!matches!(pin_policy_gate, FeatureGate::Unsupported), |ui| {
+                piv_policy_combo(
+                    ui,
+                    "piv-gen-pin-policy",
+                    &mut self.piv.gen_pin_policy,
+                    &pin_policy_options,
+                );
+            })
+            .response
+            .on_disabled_hover_text(pin_policy_blocked_hint.as_str());
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Touch Policy")
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            );
+            if matches!(touch_policy_gate, FeatureGate::Unverified) {
+                ui.add_space(4.0);
+                theme::warn_marker(ui, p).on_hover_text(touch_policy_unverified_hint.as_str());
+            }
+            ui.add_space(8.0);
+            ui.add_enabled_ui(
+                !matches!(touch_policy_gate, FeatureGate::Unsupported),
+                |ui| {
+                    piv_policy_combo(
+                        ui,
+                        "piv-gen-touch-policy",
+                        &mut self.piv.gen_touch_policy,
+                        &touch_policy_options,
+                    );
+                },
+            )
+            .response
+            .on_disabled_hover_text(touch_policy_blocked_hint.as_str());
+        });
+        if piv_policy_caveat_hint_needed(pin_policy_gate, touch_policy_gate) {
+            card_note(
+                ui,
+                p,
+                "Policy other than `default` requires YubiKey or compatible \
+                 token.",
+            );
+        }
+    }
+
+    /// The "Import key from file" dialog's fields (#174), top to bottom: the
+    /// file, its password and Open (until it opens); then the key to import
+    /// (a dropdown when the file holds several), what this key can't take
+    /// (stopping there, before any secret is asked for), the replace warning,
+    /// PIN/touch policy, compression, the authority certificates, the PIN
+    /// and the management key. Returns whether Import may run.
+    fn piv_import_key_fields(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        occupancy: PivOccupancy,
+        slot_has_cert: bool,
+    ) -> bool {
+        let label_w = chuid_label_width(ui.ctx());
+        card_note(ui, p, &format!("Reading {}", self.piv.key_import.path));
+        ui.add_space(4.0);
+        if self.piv.key_import.contents.is_none() {
+            let mut rev = self
+                .secret_reveal
+                .get("piv-key-file-password")
+                .copied()
+                .unwrap_or(false);
+            piv_secret_field(
+                ui,
+                p,
+                "File password",
+                &mut self.piv.key_import.password,
+                &mut rev,
+                "the file's password",
+                label_w,
+                200.0,
+            );
+            self.secret_reveal.insert("piv-key-file-password", rev);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(label_w + 8.0);
+                if self.piv.key_import.opening {
+                    ui.add(egui::Spinner::new());
+                    ui.label(
+                        egui::RichText::new("Opening the file\u{2026}")
+                            .font(theme::f_reg(12.5))
+                            .color(p.txt2),
+                    );
+                } else if theme::button(ui, p, BtnKind::Default, "Open file").clicked() {
+                    self.piv_open_key_file();
+                }
+            });
+            if let Some(e) = &self.piv.key_import.open_error {
+                ui.add_space(6.0);
+                ui.colored_label(p.err, e);
+            }
+            card_note(
+                ui,
+                p,
+                "The password opens the file here, so keyroost can check this key can take it \
+                 before asking for the management key.",
+            );
+            return false;
+        }
+
+        // The key to import.
+        let labels = self
+            .piv
+            .key_import
+            .contents
+            .as_ref()
+            .map(|c| keyroost_transport::piv_import::entry_labels(c))
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [label_w, 22.0],
+                egui::Label::new(
+                    egui::RichText::new("Key")
+                        .font(theme::f_reg(13.0))
+                        .color(p.txt2),
+                ),
+            );
+            match self.piv.key_import.entry_choices() {
+                Some(choices) => {
+                    let entry = &mut self.piv.key_import.entry;
+                    let shown = choices.get(*entry).cloned().unwrap_or_default();
+                    egui::ComboBox::from_id_salt("piv-key-import-entry")
+                        .truncate()
+                        .width(240.0)
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for (i, choice) in choices.iter().enumerate() {
+                                stable_selectable_value(ui, entry, i, choice.as_str());
+                            }
+                        });
+                }
+                None => {
+                    let only = labels
+                        .first()
+                        .map(|l| sanitize_title(l))
+                        .unwrap_or_default();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(only)
+                                .font(theme::f_reg(13.0))
+                                .color(p.txt),
+                        )
+                        .truncate(),
+                    );
+                }
+            }
+        });
+
+        // What this key can't take, before any secret is asked for. A
+        // refused policy keeps the policy rows, so it can be changed back.
+        if let Some(Err(refusal)) = self.piv_key_import_preflight() {
+            use keyroost_transport::piv_import::ImportRefusal;
+            ui.add_space(6.0);
+            if matches!(
+                refusal,
+                ImportRefusal::PinPolicyNotSupported
+                    | ImportRefusal::TouchPolicyNotSupported
+                    | ImportRefusal::PinPolicyOnceNotSupported
+                    | ImportRefusal::TouchPolicyCachedNotSupported
+            ) {
+                self.piv_modal_policy_fields(ui, p);
+                ui.add_space(6.0);
+            }
+            ui.colored_label(p.err, refusal.to_string());
+            return false;
+        }
+        // Support keyroost's list has no entry for: a hint, not a block.
+        let alg = self
+            .piv
+            .key_import
+            .contents
+            .as_ref()
+            .and_then(|c| c.entries.get(self.piv.key_import.entry))
+            .map(|e| e.key.alg());
+        if let (Some(alg), Some(status)) = (alg, self.piv.status.as_ref()) {
+            use keyroost_piv::compat::{FeatureGate, PivExtension};
+            let gate = keyroost_piv::compat::resolve(
+                PivExtension::ImportKey(alg),
+                status.applet_fingerprint,
+                status.version.as_deref(),
+                status.version_firmware.as_deref(),
+            );
+            if gate == FeatureGate::Unverified {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    theme::warn_marker(ui, p);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            PivExtension::ImportKey(alg).requirement(),
+                            FeatureGate::UNVERIFIED_SUFFIX
+                        ))
+                        .font(theme::f_reg(12.0))
+                        .color(p.warn),
+                    );
+                });
+            }
+        }
+        ui.add_space(6.0);
+        // Replacing a key is for good; the slot's certificate goes with it.
+        if let Some(warning) =
+            piv_replace_warning(occupancy, &self.piv.selected_slot.to_slot().label())
+        {
+            ui.colored_label(p.err, egui::RichText::new(warning).font(theme::f_sb(12.5)));
+        }
+        if slot_has_cert {
+            card_note(ui, p, "The slot's certificate is replaced too.");
+        }
+        ui.add_space(6.0);
+        self.piv_modal_policy_fields(ui, p);
+        self.piv_modal_compression_field(ui, p, label_w);
+
+        // Authority certificates are never written to the card; they can be
+        // saved next to the import.
+        let authorities = self
+            .piv
+            .key_import
+            .contents
+            .as_ref()
+            .map_or(0, |c| c.authorities.len());
+        if authorities > 0 {
+            ui.add_space(6.0);
+            card_note(
+                ui,
+                p,
+                &if authorities == 1 {
+                    "The file also has 1 authority certificate; it isn't written to the card."
+                        .to_string()
+                } else {
+                    format!(
+                        "The file also has {authorities} authority certificates; they aren't \
+                         written to the card."
+                    )
+                },
+            );
+            ui.horizontal(|ui| {
+                if theme::button(
+                    ui,
+                    p,
+                    BtnKind::Ghost,
+                    "Save authority certificates to\u{2026}",
+                )
+                .clicked()
+                {
+                    self.spawn_file_dialog(
+                        FileTarget::PivKeyChainOut,
+                        true,
+                        &[
+                            ("Certificates (PEM)", &["pem", "crt"]),
+                            ("All files", &["*"]),
+                        ],
+                        Some("authorities.pem"),
+                    );
+                }
+            });
+            if !self.piv.key_import.chain_out.trim().is_empty() {
+                card_note(
+                    ui,
+                    p,
+                    &format!("Saving them to {}", self.piv.key_import.chain_out),
+                );
+            }
+        }
+
+        ui.add_space(8.0);
+        let mut pin_rev = self
+            .secret_reveal
+            .get("piv-sign-pin")
+            .copied()
+            .unwrap_or(false);
+        piv_pin_field(ui, p, "PIN", &mut self.piv.sign_pin, &mut pin_rev, label_w);
+        self.secret_reveal.insert("piv-sign-pin", pin_rev);
+        self.piv_modal_mgmt_field(ui, p, PivCredKind::ImportKey);
+        card_note(
+            ui,
+            p,
+            if self.piv.mgmt_auth_mode == PivMgmtAuthMode::Pin {
+                "The PIN unlocks management, is checked before anything is written, and \
+                 tests the slot afterwards."
+            } else {
+                "The management key authorizes the import. The PIN is checked before anything \
+                 is written, and tests the slot afterwards."
+            },
+        );
+        card_note(
+            ui,
+            p,
+            "An imported key can't be attested as generated on this key.",
+        );
+        true
     }
 
     /// The Compression row of the Import certificate and Self-signed
@@ -19452,6 +20323,11 @@ impl App {
         // as empty may hold a key); the "Overwrite key" relabel stays for a
         // known key only.
         let selected_occupancy = self.piv_occupancy(self.piv.selected_slot.to_slot());
+        // Import key: whether the slot has a certificate the import replaces,
+        // and (set by its fields below) whether the file is open and this key
+        // can take it, which enables Import.
+        let selected_has_cert = self.piv_selected_test_target().1;
+        let mut import_ready = true;
 
         // Move-key flow: precompute the source slot and the eligible destination
         // slots (empty, non-source) before the modal borrows `self` mutably. A
@@ -19491,6 +20367,9 @@ impl App {
         // little breathing room before the edge.
         let width = if kind == PivCredKind::NewChuid {
             chuid_label_width(ctx) + 8.0 + chuid_guid_field_width(ctx) + 6.0 + 22.0 + 12.0
+        } else if kind == PivCredKind::ImportKey {
+            // A file label in the entry dropdown is wider than one word.
+            380.0
         } else {
             300.0
         };
@@ -19669,166 +20548,15 @@ impl App {
                             card_note(ui, p, "Authorizes overwriting the slot with a fresh key.");
                             ui.add_space(8.0);
 
-                            // PIN/touch policy (tags 0xAA/0xAB on GENERATE
-                            // ASYMMETRIC KEYPAIR) are Yubico extensions, not SP
-                            // 800-73-4 — gated the same three-way way
-                            // (`keyroost_piv::compat`) Move/Delete key are
-                            // elsewhere in this pane, just resolved locally
-                            // here since this modal doesn't share those rows'
-                            // gate locals. `default` needs neither extension
-                            // and is unaffected either way.
-                            use keyroost_piv::compat::{FeatureGate, PivExtension};
-                            let (piv_fp, piv_ver, piv_fw_ver) = self.piv.status.as_ref().map_or(
-                                (
-                                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
-                                    None,
-                                    None,
-                                ),
-                                |s| {
-                                    (
-                                        s.applet_fingerprint,
-                                        s.version.as_deref(),
-                                        s.version_firmware.as_deref(),
-                                    )
-                                },
+                            self.piv_modal_policy_fields(ui, p);
+                        }
+                        PivCredKind::ImportKey => {
+                            import_ready = self.piv_import_key_fields(
+                                ui,
+                                p,
+                                selected_occupancy,
+                                selected_has_cert,
                             );
-                            let pin_policy_gate = self.piv_gate(
-                                PivExtension::SlotPinPolicy,
-                                piv_fp,
-                                piv_ver,
-                                piv_fw_ver,
-                            );
-                            let touch_policy_gate = self.piv_gate(
-                                PivExtension::SlotTouchPolicy,
-                                piv_fp,
-                                piv_ver,
-                                piv_fw_ver,
-                            );
-                            // Narrower than the two gates above: a device can
-                            // support the extension in general yet reject one
-                            // specific value (e.g. YubiKey firmware 4.0-4.2
-                            // supports touch policy but not `cached`).
-                            let policy_quirks =
-                                keyroost_piv::compat::resolve_quirks(piv_fp, piv_ver, piv_fw_ver);
-                            let pin_once_blocked = policy_quirks.contains(
-                                &keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
-                            );
-                            let touch_cached_blocked = policy_quirks.contains(
-                                &keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
-                            );
-                            let pin_policy_unverified_hint = format!(
-                                "{} {}",
-                                PivExtension::SlotPinPolicy.requirement(),
-                                FeatureGate::UNVERIFIED_SUFFIX
-                            );
-                            let pin_policy_blocked_hint = format!(
-                                "{} {}",
-                                PivExtension::SlotPinPolicy.requirement(),
-                                FeatureGate::INCOMPATIBLE_SUFFIX
-                            );
-                            let touch_policy_unverified_hint = format!(
-                                "{} {}",
-                                PivExtension::SlotTouchPolicy.requirement(),
-                                FeatureGate::UNVERIFIED_SUFFIX
-                            );
-                            let touch_policy_blocked_hint = format!(
-                                "{} {}",
-                                PivExtension::SlotTouchPolicy.requirement(),
-                                FeatureGate::INCOMPATIBLE_SUFFIX
-                            );
-                            // `Unsupported` blocks the whole combo (matching
-                            // Move/Delete key's own treatment) rather than
-                            // just the one value the quirks above narrow —
-                            // there's nothing to offer once the extension
-                            // itself is known absent, so force the selection
-                            // back to `default` rather than leave a stale
-                            // non-default value the combo can no longer show
-                            // as selectable.
-                            if matches!(pin_policy_gate, FeatureGate::Unsupported) {
-                                self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
-                            }
-                            if matches!(touch_policy_gate, FeatureGate::Unsupported) {
-                                self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
-                            }
-                            let pin_policy_options: Vec<keyroost_piv::PinPolicy> =
-                                keyroost_piv::PinPolicy::ALL
-                                    .iter()
-                                    .copied()
-                                    .filter(|&opt| {
-                                        !(pin_once_blocked && opt == keyroost_piv::PinPolicy::Once)
-                                    })
-                                    .collect();
-                            let touch_policy_options: Vec<keyroost_piv::TouchPolicy> =
-                                keyroost_piv::TouchPolicy::ALL
-                                    .iter()
-                                    .copied()
-                                    .filter(|&opt| {
-                                        !(touch_cached_blocked
-                                            && opt == keyroost_piv::TouchPolicy::Cached)
-                                    })
-                                    .collect();
-
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Pin Policy")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt2),
-                                );
-                                if matches!(pin_policy_gate, FeatureGate::Unverified) {
-                                    ui.add_space(4.0);
-                                    theme::warn_marker(ui, p)
-                                        .on_hover_text(pin_policy_unverified_hint.as_str());
-                                }
-                                ui.add_space(8.0);
-                                ui.add_enabled_ui(
-                                    !matches!(pin_policy_gate, FeatureGate::Unsupported),
-                                    |ui| {
-                                        piv_policy_combo(
-                                            ui,
-                                            "piv-gen-pin-policy",
-                                            &mut self.piv.gen_pin_policy,
-                                            &pin_policy_options,
-                                        );
-                                    },
-                                )
-                                .response
-                                .on_disabled_hover_text(pin_policy_blocked_hint.as_str());
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Touch Policy")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt2),
-                                );
-                                if matches!(touch_policy_gate, FeatureGate::Unverified) {
-                                    ui.add_space(4.0);
-                                    theme::warn_marker(ui, p)
-                                        .on_hover_text(touch_policy_unverified_hint.as_str());
-                                }
-                                ui.add_space(8.0);
-                                ui.add_enabled_ui(
-                                    !matches!(touch_policy_gate, FeatureGate::Unsupported),
-                                    |ui| {
-                                        piv_policy_combo(
-                                            ui,
-                                            "piv-gen-touch-policy",
-                                            &mut self.piv.gen_touch_policy,
-                                            &touch_policy_options,
-                                        );
-                                    },
-                                )
-                                .response
-                                .on_disabled_hover_text(touch_policy_blocked_hint.as_str());
-                            });
-                            if piv_policy_caveat_hint_needed(pin_policy_gate, touch_policy_gate) {
-                                card_note(
-                                    ui,
-                                    p,
-                                    "Policy other than `default` requires YubiKey or compatible \
-                                     token.",
-                                );
-                            }
                         }
                         PivCredKind::ImportCert => {
                             card_note(ui, p, &format!("Reading {}", self.piv.cert_path));
@@ -20369,12 +21097,21 @@ impl App {
                             // Relabel Generate as a conscious "Overwrite key"
                             // when the target slot is occupied; the op itself is
                             // unchanged.
-                            let submit = if kind == PivCredKind::GenerateKey && selected_occupied {
+                            let submit = if matches!(
+                                kind,
+                                PivCredKind::GenerateKey | PivCredKind::ImportKey
+                            ) && selected_occupied
+                            {
                                 "Overwrite key"
                             } else {
                                 kind.submit_label()
                             };
-                            if theme::button(ui, p, BtnKind::Primary, submit).clicked()
+                            if !import_ready {
+                                // Import key: the file isn't open yet, or
+                                // this key can't take it (the dialog says
+                                // why).
+                                theme::button_disabled(ui, p, submit);
+                            } else if theme::button(ui, p, BtnKind::Primary, submit).clicked()
                                 && mismatch.is_none()
                             {
                                 want_submit = true;
@@ -20412,6 +21149,7 @@ impl App {
                 PivCredKind::ChangePuk => self.piv_change_puk(),
                 PivCredKind::UnblockPin => self.piv_unblock_pin(),
                 PivCredKind::GenerateKey => self.piv_generate_key(),
+                PivCredKind::ImportKey => self.piv_import_key(),
                 PivCredKind::ImportCert => self.piv_import_cert(),
                 PivCredKind::SelfSign => self.piv_self_sign(),
                 PivCredKind::RequestCsr => self.piv_request_csr(),
@@ -20460,6 +21198,8 @@ impl App {
         self.piv.mgmt_auth_mode = PivMgmtAuthMode::default();
         self.piv.new_mgmt_allow_pin_unlock = false;
         self.piv.move_dest = None;
+        // Wipes the file password and drops the decrypted file.
+        self.piv.key_import = PivKeyImport::default();
         self.piv.gen_pin_policy = keyroost_piv::PinPolicy::Default;
         self.piv.gen_touch_policy = keyroost_piv::TouchPolicy::Default;
         self.piv.cert_compression = PivCertCompressionSel::Auto;
@@ -21924,6 +22664,7 @@ impl App {
         let mut open_change_puk = false;
         let mut open_unblock = false;
         let mut open_generate = false;
+        let mut open_import_key = false;
         let mut open_import = false;
         let mut go_export = false;
         let mut open_self_sign = false;
@@ -22564,6 +23305,27 @@ impl App {
                 .find_map(|&(a, gate)| (a == alg).then_some(gate))
                 .unwrap_or(FeatureGate::Unverified)
         };
+        // "Import key from file" (#174): dimmed with the reason when this key
+        // can't import into the selected slot at all; flagged when keyroost's
+        // list has no entry for importing some key types here. Read straight
+        // from the table, as `plan_import` does.
+        let import_key_blocked = self.piv_import_key_blocked();
+        let unverified_import_algs: Vec<&str> = keyroost_piv::KeyAlg::ALL
+            .into_iter()
+            .filter(|&alg| {
+                keyroost_piv::compat::resolve(
+                    PivExtension::ImportKey(alg),
+                    piv_fp,
+                    piv_ver,
+                    piv_fw_ver,
+                ) == FeatureGate::Unverified
+            })
+            .map(keyroost_piv::KeyAlg::label)
+            .collect();
+        let import_key_unverified_hint = format!(
+            "No entry for this key in keyroost's list: {}.",
+            unverified_import_algs.join(", ")
+        );
         // Explanations for the non-standard slot operations when the
         // fingerprint known-support table can't clear them — built from the shared
         // vocabulary in `keyroost_piv::compat` so this pane and the CLI say the
@@ -22894,6 +23656,41 @@ impl App {
                         });
                     });
                 }
+
+                ui.add_space(12.0);
+                // --- Import key: a .p12/.pfx file's key and certificate into
+                // this slot. Opens a file picker, then the dialog that reads
+                // the file and asks for the secrets (see `drain_file_dialogs`).
+                self.adaptive_row(
+                    ui,
+                    |app, ui| {
+                        ui.label(
+                            egui::RichText::new("Import key")
+                                .font(theme::f_sb(13.5))
+                                .color(p.txt),
+                        );
+                        ui.add_space(6.0);
+                        app.help_dot(ui, p, "piv-import-key");
+                        if import_key_blocked.is_none() && !unverified_import_algs.is_empty() {
+                            ui.add_space(4.0);
+                            theme::warn_marker(ui, p)
+                                .on_hover_text(import_key_unverified_hint.as_str());
+                        }
+                    },
+                    |_, ui| match &import_key_blocked {
+                        Some(why) => {
+                            theme::button_disabled(ui, p, "Import key from file\u{2026}")
+                                .on_hover_text(why.as_str());
+                        }
+                        None => {
+                            if theme::button(ui, p, BtnKind::Default, "Import key from file\u{2026}")
+                                .clicked()
+                            {
+                                open_import_key = true;
+                            }
+                        }
+                    },
+                );
 
                 ui.add_space(12.0);
                 // --- Certificate: title row carries both issue actions
@@ -23597,6 +24394,14 @@ impl App {
         // Import / Export / CSR ask for the file first; the picked path is
         // routed by `drain_file_dialogs`, which then opens the secret modal
         // (import, CSR) or runs the write straight away (export).
+        if open_import_key {
+            self.spawn_file_dialog(
+                FileTarget::PivKeyFile,
+                false,
+                &[("PKCS#12 files", &["p12", "pfx"]), ("All files", &["*"])],
+                None,
+            );
+        }
         if open_import {
             self.spawn_file_dialog(
                 FileTarget::PivCert,
@@ -27661,6 +28466,7 @@ mod tests {
     #[test]
     fn piv_cred_kind_mgmt_key_mapping() {
         assert!(PivCredKind::GenerateKey.needs_mgmt_key());
+        assert!(PivCredKind::ImportKey.needs_mgmt_key());
         assert!(PivCredKind::ImportCert.needs_mgmt_key());
         assert!(PivCredKind::SelfSign.needs_mgmt_key());
         assert!(PivCredKind::SetRetries.needs_mgmt_key());
@@ -27684,6 +28490,7 @@ mod tests {
     fn piv_cred_kind_gated_strings_are_present() {
         let kinds = [
             PivCredKind::GenerateKey,
+            PivCredKind::ImportKey,
             PivCredKind::ImportCert,
             PivCredKind::SelfSign,
             PivCredKind::RequestCsr,
@@ -28317,11 +29124,212 @@ mod tests {
         }
     }
 
-    /// `PivCredKind::shares_pin_field` covers exactly `SelfSign`/`SetRetries` —
-    /// every other management-gated flow gets its own PIN box (or none) from
-    /// `piv_modal_mgmt_field`, not a reused one.
+    /// A test .p12 file from `keyroost-p12`'s fixtures (throwaway keys).
+    fn p12_fixture(name: &str) -> String {
+        format!(
+            "{}/../keyroost-p12/tests/fixtures/{name}.p12",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    /// The Nitrokey imports into slot 9A only: "Import key from file" is
+    /// dimmed on 9C with the shared refusal, and open on 9A. A YubiKey takes
+    /// 9C.
     #[test]
-    fn shares_pin_field_covers_exactly_self_sign_and_set_retries() {
+    fn import_key_action_disabled_on_nitrokey_slot_9c() {
+        use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
+        let mut app = App::default();
+        let mut status =
+            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::NitroKey), None);
+        status.version_firmware = Some(vec![1, 9, 1]);
+        app.piv.status = Some(status);
+        app.piv.selected_slot = PivSlotSel::Sign;
+        let refusal = keyroost_transport::piv_import::ImportRefusal::SlotNotSupported(
+            keyroost_piv::Slot::Signature,
+        )
+        .to_string();
+        assert_eq!(app.piv_import_key_blocked(), Some(refusal));
+        app.piv.selected_slot = PivSlotSel::Auth;
+        assert_eq!(app.piv_import_key_blocked(), None);
+
+        app.piv.status = Some(piv_status_with(
+            AppletFingerprint::YubiKey,
+            Some(vec![5, 7, 1]),
+        ));
+        app.piv.selected_slot = PivSlotSel::Sign;
+        assert_eq!(app.piv_import_key_blocked(), None);
+    }
+
+    /// Opening a file with two keys offers both in the dropdown (labels as
+    /// the CLI lists them) and wipes the password; a file with one key
+    /// offers no dropdown.
+    #[test]
+    fn import_key_entry_dropdown_appears_for_two_entries() {
+        let mut app = App::default();
+        app.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportKey));
+        app.piv.key_import.path = p12_fixture("two-entries");
+        app.piv.key_import.password = "keyroost-test".into();
+        app.piv_open_key_file();
+        let ki = &app.piv.key_import;
+        assert_eq!(ki.open_error, None);
+        assert!(
+            ki.password.is_empty(),
+            "password wiped once the file is open"
+        );
+        assert_eq!(
+            ki.entry_choices(),
+            Some(vec![
+                "first (RSA-2048; certificate: rsa2048)".to_string(),
+                "second (ECC P-256; certificate: second)".to_string(),
+            ])
+        );
+        assert_eq!(ki.entry, 0);
+
+        // One key: nothing to pick.
+        app.piv_cred_modal_close();
+        app.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportKey));
+        app.piv.key_import.path = p12_fixture("rsa2048-chain");
+        app.piv.key_import.password = "keyroost-test".into();
+        app.piv_open_key_file();
+        assert!(app.piv.key_import.contents.is_some());
+        assert_eq!(app.piv.key_import.entry_choices(), None);
+
+        // A wrong password says so and opens nothing.
+        app.piv_cred_modal_close();
+        app.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportKey));
+        app.piv.key_import.path = p12_fixture("two-entries");
+        app.piv.key_import.password = "nope".into();
+        app.piv_open_key_file();
+        assert!(app.piv.key_import.contents.is_none());
+        assert_eq!(
+            app.piv.key_import.open_error.as_deref(),
+            Some("Wrong password for this file.")
+        );
+    }
+
+    /// A file key this key can't take is refused in the dialog once the file
+    /// is open, before any secret: the Nitrokey imports RSA only, so the
+    /// second (P-256) key of `two-entries` is refused in 9A, the first isn't.
+    #[test]
+    fn import_key_preflight_refuses_a_key_type_after_open() {
+        use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
+        let mut app = App::default();
+        let mut status =
+            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::NitroKey), None);
+        status.version_firmware = Some(vec![1, 9, 1]);
+        app.piv.status = Some(status);
+        app.piv.selected_slot = PivSlotSel::Auth;
+        app.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportKey));
+        assert_eq!(app.piv_key_import_preflight(), None, "nothing open yet");
+        app.piv.key_import.path = p12_fixture("two-entries");
+        app.piv.key_import.password = "keyroost-test".into();
+        app.piv_open_key_file();
+        assert_eq!(app.piv_key_import_preflight(), Some(Ok(())));
+        app.piv.key_import.entry = 1;
+        let refusal = keyroost_transport::piv_import::ImportRefusal::KeyTypeNotSupported(
+            keyroost_piv::KeyAlg::EccP256,
+        );
+        assert_eq!(app.piv_key_import_preflight(), Some(Err(refusal)));
+    }
+
+    /// The result text: a key-only import says the slot now has no
+    /// certificate, then the self-test; authority certificates are named
+    /// when skipped and written as PEM when a place was picked.
+    #[test]
+    fn import_key_result_names_certificates_and_self_test() {
+        use keyroost_pivtest::{Outcome, SelfTest};
+        use keyroost_transport::piv_import::{ImportFailure, ImportReport};
+        let slot = keyroost_piv::Slot::Authentication;
+        let report = || ImportReport {
+            slot,
+            cert: None,
+            self_test: vec![(SelfTest::Sign, Outcome::Passed)],
+        };
+        let text = piv_key_import_text(
+            &Ok(report()),
+            Some("Skipped 1 authority certificate: CA (not written to the card)."),
+            keyroost_piv::KeyAlg::EccP256,
+            slot,
+            PivCertCompressionSel::Auto,
+        )
+        .unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains("no certificate for it"), "{text}");
+        assert!(lines[1].starts_with("Skipped 1 authority"), "{text}");
+        assert_eq!(
+            lines[2],
+            keyroost_pivtest::format_report(&report().self_test)
+        );
+
+        let mut failed = report();
+        failed.self_test = vec![(SelfTest::Sign, Outcome::Failed("bad signature".into()))];
+        let e = piv_key_import_text(
+            &Err(ImportFailure::SelfTestFailed(failed)),
+            None,
+            keyroost_piv::KeyAlg::EccP256,
+            slot,
+            PivCertCompressionSel::Auto,
+        )
+        .unwrap_err();
+        assert!(e.starts_with("The new key is on the card"), "{e}");
+
+        let path = format!(
+            "{}/../keyroost-p12/tests/fixtures/rsa2048-chain.p12",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let contents = open_key_file(std::path::Path::new(&path), "keyroost-test").unwrap();
+        let skipped = piv_key_import_authorities(&contents, None).unwrap();
+        assert_eq!(
+            skipped,
+            "Skipped 2 authority certificates: inter, ca (not written to the card)."
+        );
+        let dir = std::env::temp_dir().join(format!("keyroost-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("authorities.crt");
+        let saved = piv_key_import_authorities(&contents, Some(&out)).unwrap();
+        assert!(
+            saved.starts_with("Saved 2 authority certificates to "),
+            "{saved}"
+        );
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            written,
+            keyroost_transport::piv_import::authorities_pem(&contents)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Closing the import dialog wipes the file password, the PIN and the
+    /// management key, and drops the decrypted file and the choices.
+    #[test]
+    fn import_key_modal_wipes_passwords_on_close() {
+        let mut app = App::default();
+        app.piv.cred_modal = Some(PivCredModal::new(PivCredKind::ImportKey));
+        app.piv.key_import.path = p12_fixture("two-entries");
+        app.piv.key_import.password = "keyroost-test".into();
+        app.piv_open_key_file();
+        assert!(app.piv.key_import.contents.is_some());
+        app.piv.key_import.entry = 1;
+        app.piv.key_import.chain_out = "authorities.crt".into();
+        app.piv.key_import.password = "typed again".into();
+        app.piv.sign_pin = "123456".into();
+        app.piv.mgmt_key_input = "010203040506070801020304050607080102030405060708".into();
+        app.piv_cred_modal_close();
+        assert!(app.piv.cred_modal.is_none());
+        let ki = &app.piv.key_import;
+        assert!(ki.password.is_empty());
+        assert!(ki.contents.is_none());
+        assert!(ki.path.is_empty() && ki.chain_out.is_empty());
+        assert_eq!(ki.entry, 0);
+        assert!(app.piv.sign_pin.is_empty());
+        assert!(app.piv.mgmt_key_input.is_empty());
+    }
+
+    /// `PivCredKind::shares_pin_field` covers exactly `SelfSign`/`SetRetries`/
+    /// `ImportKey` — every other management-gated flow gets its own PIN box
+    /// (or none) from `piv_modal_mgmt_field`, not a reused one.
+    #[test]
+    fn shares_pin_field_covers_exactly_the_flows_with_a_pin_row() {
         for kind in [
             PivCredKind::ChangePin,
             PivCredKind::ChangePuk,
@@ -28339,6 +29347,7 @@ mod tests {
         }
         assert!(PivCredKind::SelfSign.shares_pin_field());
         assert!(PivCredKind::SetRetries.shares_pin_field());
+        assert!(PivCredKind::ImportKey.shares_pin_field());
     }
 
     /// `apply_piv_cred_result` mirrors the pane outcome into the open modal:

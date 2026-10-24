@@ -11401,31 +11401,8 @@ const P12_FILE_PASSWORD: Spec = Spec::current("file password", "file-password").
 /// Open a PKCS#12 file with its password, in the words `piv key import`
 /// shows.
 fn open_p12(bytes: &[u8], password: &str) -> Result<keyroost_p12::Contents, String> {
-    keyroost_p12::open(bytes, Some(password)).map_err(p12_error_message)
-}
-
-/// A PKCS#12 reading error as a plain sentence.
-fn p12_error_message(e: keyroost_p12::P12Error) -> String {
-    use keyroost_p12::P12Error;
-    match e {
-        P12Error::WrongPassword => "Wrong password for this file.".to_string(),
-        P12Error::NoKey => "The file has no private key to import.".to_string(),
-        P12Error::Malformed(what) => {
-            format!("This isn't a .p12/.pfx file keyroost can read ({what}).")
-        }
-        P12Error::Unsupported("PBMAC1") => "This file uses a newer integrity check (PBMAC1) \
-            that keyroost can't read yet. Export it again with the default or the legacy \
-            PKCS#12 settings."
-            .to_string(),
-        P12Error::Unsupported("file has no integrity check") => "This file has no integrity \
-            check and holds an unencrypted key, so keyroost won't import it. Export it again \
-            with a password."
-            .to_string(),
-        P12Error::Unsupported(what) => {
-            format!("This file uses something keyroost can't import yet: {what}.")
-        }
-        e => format!("This file can't be imported: {e}."),
-    }
+    keyroost_p12::open(bytes, Some(password))
+        .map_err(keyroost_transport::piv_import::file_error_message)
 }
 
 /// One line per entry of a PKCS#12 file, numbered from 1 as `--entry` takes
@@ -11590,30 +11567,10 @@ fn key_import_error(
     }
 }
 
-/// The common name of a certificate's subject, else the whole subject, for
-/// naming an authority certificate. Made safe to print.
+/// How an authority certificate is named
+/// ([`keyroost_transport::piv_import::certificate_name`]), made safe to print.
 fn certificate_name(der: &[u8]) -> String {
-    use keyroost_piv::x509_parse::{parse_subject_dn, DnAttr};
-    match parse_subject_dn(der) {
-        Ok(dn) => {
-            let cn = dn
-                .rdns
-                .iter()
-                .find(|(attr, v)| *attr == DnAttr::CommonName && !v.is_empty())
-                .map(|(_, v)| v.clone());
-            sanitize_terminal(&cn.unwrap_or_else(|| dn.to_string()))
-        }
-        Err(_) => "(unreadable subject)".to_string(),
-    }
-}
-
-/// The authority certificates of a file as PEM, one after another.
-fn authorities_pem(contents: &keyroost_p12::Contents) -> String {
-    contents
-        .authorities
-        .iter()
-        .map(|der| keyroost_piv::x509::pem_certificate(der))
-        .collect()
+    sanitize_terminal(&keyroost_transport::piv_import::certificate_name(der))
 }
 
 /// After an import: save the file's authority certificates to `--chain-out`,
@@ -11635,8 +11592,11 @@ fn save_or_list_authorities(
             sanitize_terminal(&path.display().to_string())
         )),
         Some(path) => {
-            mode.write(path, authorities_pem(contents).as_bytes())
-                .map_err(|e| crate::prompt::write_error(path, &e, Some("the key is imported")))?;
+            mode.write(
+                path,
+                keyroost_transport::piv_import::authorities_pem(contents).as_bytes(),
+            )
+            .map_err(|e| crate::prompt::write_error(path, &e, Some("the key is imported")))?;
             output::status(&format!(
                 "Saved {n} {certs} to {}.",
                 sanitize_terminal(&path.display().to_string())
@@ -21689,17 +21649,21 @@ mod cli_tests {
         assert!(!e.contains("not a valid PKCS#12 file"), "{e}");
         use keyroost_p12::P12Error;
         assert_eq!(
-            p12_error_message(P12Error::Unsupported("PBMAC1")),
+            keyroost_transport::piv_import::file_error_message(P12Error::Unsupported("PBMAC1")),
             "This file uses a newer integrity check (PBMAC1) that keyroost can't read yet. \
              Export it again with the default or the legacy PKCS#12 settings."
         );
         assert_eq!(
-            p12_error_message(P12Error::Unsupported("file has no integrity check")),
+            keyroost_transport::piv_import::file_error_message(P12Error::Unsupported(
+                "file has no integrity check"
+            )),
             "This file has no integrity check and holds an unencrypted key, so keyroost \
              won't import it. Export it again with a password."
         );
         assert_eq!(
-            p12_error_message(P12Error::Unsupported("multi-prime RSA")),
+            keyroost_transport::piv_import::file_error_message(P12Error::Unsupported(
+                "multi-prime RSA"
+            )),
             "This file uses something keyroost can't import yet: multi-prime RSA."
         );
         // A real file without a MAC takes the same path.
@@ -21749,7 +21713,7 @@ mod cli_tests {
     fn piv_key_import_chain_out_is_pem_per_authority() {
         let contents = open_p12(P12_CHAIN, P12_PASSWORD).unwrap();
         assert!(!contents.authorities.is_empty());
-        let pem = authorities_pem(&contents);
+        let pem = keyroost_transport::piv_import::authorities_pem(&contents);
         assert_eq!(
             pem.matches("-----BEGIN CERTIFICATE-----").count(),
             contents.authorities.len()
