@@ -712,9 +712,10 @@ impl CtapOtpTransport {
                     note(format!("probe answered sw={sw:#06x}; trying report frames"));
                     true
                 }
+                // A reply too short to carry a status word isn't an answer.
                 Err(e) => {
                     note(format!("probe failed: {e}; trying report frames"));
-                    true
+                    false
                 }
             },
             Err(e) => {
