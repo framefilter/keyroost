@@ -26,9 +26,9 @@ mod data;
 use core::fmt;
 
 use data::{ec_scalar, DECRYPT_PLAINTEXT, SHA512_DIGESTINFO_PREFIX, TEST_INPUT};
-// `elliptic_curve` is shared by p256, p384, and p521; one import covers all three curves.
 pub use keyroost_piv::{KeyAlg, PublicKey};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+// `elliptic_curve` is shared by p256, p384, and p521; one import covers all three curves.
+use p256::elliptic_curve::sec1::ToSec1Point;
 
 /// One private-key operation a PIV slot can be tested against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,11 +281,7 @@ fn prepare_key_agree(alg: KeyAlg, pubkey: &PublicKey) -> Result<Challenge, TestE
                 .map_err(|_| TestError::BadPublicKey("derived P-256 scalar out of range"))?;
             let secret = p256::ecdh::diffie_hellman(their.to_nonzero_scalar(), our.as_affine());
             (
-                their
-                    .public_key()
-                    .to_encoded_point(false)
-                    .as_bytes()
-                    .to_vec(),
+                their.public_key().to_sec1_point(false).as_bytes().to_vec(),
                 secret.raw_secret_bytes().to_vec(),
             )
         }
@@ -296,22 +292,11 @@ fn prepare_key_agree(alg: KeyAlg, pubkey: &PublicKey) -> Result<Challenge, TestE
                 .map_err(|_| TestError::BadPublicKey("derived P-384 scalar out of range"))?;
             let secret = p384::ecdh::diffie_hellman(their.to_nonzero_scalar(), our.as_affine());
             (
-                their
-                    .public_key()
-                    .to_encoded_point(false)
-                    .as_bytes()
-                    .to_vec(),
+                their.public_key().to_sec1_point(false).as_bytes().to_vec(),
                 secret.raw_secret_bytes().to_vec(),
             )
         }
         KeyAlg::EccP521 => {
-            // p521 is on a newer major `elliptic-curve` than p256/p384 (no
-            // 0.13-series release of it exists), so its SEC1-encoding trait
-            // is `ToSec1Point`/`to_sec1_point`, not the `ToEncodedPoint`/
-            // `to_encoded_point` the top-of-file import covers for the other
-            // two curves — imported locally rather than at module scope so
-            // it doesn't collide with (or get mistaken for) that one.
-            use p521::elliptic_curve::sec1::ToSec1Point;
             let our = p521::PublicKey::from_sec1_bytes(point)
                 .map_err(|_| TestError::BadPublicKey("malformed P-521 public point"))?;
             let their = p521::SecretKey::from_slice(&ec_scalar::<66>(true))

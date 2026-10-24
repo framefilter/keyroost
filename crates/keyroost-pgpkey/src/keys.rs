@@ -269,63 +269,53 @@ fn reversed32(v: &[u8]) -> Zeroizing<[u8; 32]> {
 
 /// SEC1 uncompressed public point for the Weierstrass scalar `d`.
 fn ec_point(curve: Curve, d: &[u8]) -> Result<Vec<u8>> {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    // p256, p384, k256 and p521 share one `elliptic-curve`, so this import
+    // covers all four curves.
+    use p256::elliptic_curve::sec1::ToSec1Point;
     Ok(match curve {
         Curve::NistP256 => p256::SecretKey::from_slice(d)
             .map_err(|_| mismatch())?
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec(),
         Curve::NistP384 => p384::SecretKey::from_slice(d)
             .map_err(|_| mismatch())?
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec(),
         Curve::Secp256k1 => k256::SecretKey::from_slice(d)
             .map_err(|_| mismatch())?
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec(),
-        Curve::NistP521 => {
-            use p521::elliptic_curve::sec1::ToSec1Point;
-            p521::SecretKey::from_slice(d)
-                .map_err(|_| mismatch())?
-                .public_key()
-                .to_sec1_point(false)
-                .as_bytes()
-                .to_vec()
-        }
+        Curve::NistP521 => p521::SecretKey::from_slice(d)
+            .map_err(|_| mismatch())?
+            .public_key()
+            .to_sec1_point(false)
+            .as_bytes()
+            .to_vec(),
         _ => return Err(Error::Unsupported("curve")),
     })
 }
 
 /// A fresh random private scalar on a Weierstrass curve, field-length bytes.
 fn ec_random(curve: Curve) -> Result<Zeroizing<Vec<u8>>> {
+    use p256::elliptic_curve::Generate;
     fn take(mut b: impl AsMut<[u8]>) -> Zeroizing<Vec<u8>> {
         let v = Zeroizing::new(b.as_mut().to_vec());
         b.as_mut().zeroize();
         v
     }
     Ok(match curve {
-        Curve::NistP256 => take(p256::SecretKey::random(&mut OsRng).to_bytes()),
-        Curve::NistP384 => take(p384::SecretKey::random(&mut OsRng).to_bytes()),
-        Curve::Secp256k1 => take(k256::SecretKey::random(&mut OsRng).to_bytes()),
-        Curve::NistP521 => {
-            // p521 0.14 takes a newer rand_core than the rest of the
-            // workspace; rejection-sample a 521-bit value instead. The order
-            // is just below 2^521, so few draws are rejected.
-            loop {
-                let mut buf = Zeroizing::new([0u8; 66]);
-                OsRng.fill_bytes(&mut buf[..]);
-                buf[0] &= 0x01;
-                if p521::SecretKey::from_slice(&buf[..]).is_ok() {
-                    break Zeroizing::new(buf.to_vec());
-                }
-            }
-        }
+        // The curve crates are on a newer rand_core than `OsRng` here, so
+        // they draw from the OS RNG themselves (their `getrandom` feature).
+        Curve::NistP256 => take(p256::SecretKey::generate().to_bytes()),
+        Curve::NistP384 => take(p384::SecretKey::generate().to_bytes()),
+        Curve::Secp256k1 => take(k256::SecretKey::generate().to_bytes()),
+        Curve::NistP521 => take(p521::SecretKey::generate().to_bytes()),
         _ => return Err(Error::Unsupported("curve")),
     })
 }

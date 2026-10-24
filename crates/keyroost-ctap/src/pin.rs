@@ -22,8 +22,9 @@ use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::Aes256;
 use hmac::{Hmac, Mac};
 use p256::ecdh::EphemeralSecret;
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::{AffinePoint, EncodedPoint, PublicKey};
+use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
+use p256::elliptic_curve::Generate;
+use p256::{AffinePoint, PublicKey, Sec1Point};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 
@@ -68,7 +69,7 @@ impl EphemeralKey {
     /// Generate a fresh P-256 keypair backed by the OS RNG.
     pub fn generate() -> Self {
         Self {
-            secret: EphemeralSecret::random(&mut OsRng),
+            secret: EphemeralSecret::generate(),
         }
     }
 
@@ -76,7 +77,7 @@ impl EphemeralKey {
     /// in the COSE_Key map the authenticator expects.
     pub fn public_xy(&self) -> ([u8; 32], [u8; 32]) {
         let pk: PublicKey = self.secret.public_key();
-        let point = pk.to_encoded_point(false);
+        let point = pk.to_sec1_point(false);
         let mut x = [0u8; 32];
         let mut y = [0u8; 32];
         x.copy_from_slice(point.x().expect("uncompressed point has x"));
@@ -115,8 +116,8 @@ impl EphemeralKey {
     }
 
     fn raw_ecdh(&self, peer_x: &[u8; 32], peer_y: &[u8; 32]) -> Result<[u8; 32], PinError> {
-        let encoded = EncodedPoint::from_affine_coordinates(peer_x.into(), peer_y.into(), false);
-        let affine: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded).into();
+        let encoded = Sec1Point::from_affine_coordinates(peer_x.into(), peer_y.into(), false);
+        let affine: Option<AffinePoint> = AffinePoint::from_sec1_point(&encoded).into();
         let affine = affine.ok_or(PinError::InvalidPublicKey)?;
         let peer = PublicKey::from_affine(affine).map_err(|_| PinError::InvalidPublicKey)?;
         let shared = self.secret.diffie_hellman(&peer);

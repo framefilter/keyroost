@@ -108,11 +108,7 @@ fn sign_round_trips_rsa() {
 fn key_agree_round_trips_p256() {
     let card = p256::SecretKey::from_slice(&card_scalar::<32>()).unwrap();
     let pubkey = PublicKey::Ecc {
-        point: card
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec(),
+        point: card.public_key().to_sec1_point(false).as_bytes().to_vec(),
     };
     let ch = prepare(SelfTest::KeyAgree, KeyAlg::EccP256, &pubkey).unwrap();
     let their = p256::PublicKey::from_sec1_bytes(&ch.card_input).unwrap();
@@ -127,11 +123,7 @@ fn key_agree_round_trips_p256() {
 fn key_agree_round_trips_p384() {
     let card = p384::SecretKey::from_slice(&card_scalar::<48>()).unwrap();
     let pubkey = PublicKey::Ecc {
-        point: card
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec(),
+        point: card.public_key().to_sec1_point(false).as_bytes().to_vec(),
     };
     let ch = prepare(SelfTest::KeyAgree, KeyAlg::EccP384, &pubkey).unwrap();
     let their = p384::PublicKey::from_sec1_bytes(&ch.card_input).unwrap();
@@ -143,9 +135,6 @@ fn key_agree_round_trips_p384() {
 
 #[test]
 fn key_agree_round_trips_p521() {
-    // See `prepare_key_agree`'s `KeyAlg::EccP521` arm on why this needs its
-    // own SEC1-encoding trait import.
-    use p521::elliptic_curve::sec1::ToSec1Point;
     let card = p521::SecretKey::from_slice(&card_scalar::<66>()).unwrap();
     let pubkey = PublicKey::Ecc {
         point: card.public_key().to_sec1_point(false).as_bytes().to_vec(),
@@ -182,11 +171,7 @@ fn sign_round_trips_p256() {
     use p256::ecdsa::signature::hazmat::PrehashSigner;
     let sk = p256::ecdsa::SigningKey::from_slice(&card_scalar::<32>()).unwrap();
     let pubkey = PublicKey::Ecc {
-        point: sk
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec(),
+        point: sk.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
     };
     let ch = prepare(SelfTest::Sign, KeyAlg::EccP256, &pubkey).unwrap();
     let sig: p256::ecdsa::Signature = sk.sign_prehash(&ch.card_input).unwrap();
@@ -205,11 +190,7 @@ fn sign_round_trips_p384() {
     use p384::ecdsa::signature::hazmat::PrehashSigner;
     let sk = p384::ecdsa::SigningKey::from_slice(&card_scalar::<48>()).unwrap();
     let pubkey = PublicKey::Ecc {
-        point: sk
-            .verifying_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec(),
+        point: sk.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
     };
     let ch = prepare(SelfTest::Sign, KeyAlg::EccP384, &pubkey).unwrap();
     let sig: p384::ecdsa::Signature = sk.sign_prehash(&ch.card_input).unwrap();
@@ -312,11 +293,7 @@ fn run_p256_covers_key_agree_and_sign_skips_decrypt() {
     let secret = p256::SecretKey::from_slice(&card_scalar::<32>()).unwrap();
     let sk = p256::ecdsa::SigningKey::from_slice(&card_scalar::<32>()).unwrap();
     let pubkey = PublicKey::Ecc {
-        point: secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec(),
+        point: secret.public_key().to_sec1_point(false).as_bytes().to_vec(),
     };
     let results = run(
         KeyAlg::EccP256,

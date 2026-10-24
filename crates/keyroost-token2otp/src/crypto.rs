@@ -18,8 +18,9 @@ use aes::Aes256;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::{EncodedPoint, PublicKey, SecretKey};
+use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
+use p256::elliptic_curve::Generate;
+use p256::{PublicKey, Sec1Point, SecretKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -98,12 +99,12 @@ pub fn encrypt_seed_payload(
     let mut sec1 = [0u8; 65];
     sec1[0] = 0x04;
     sec1[1..].copy_from_slice(device_pub_xy);
-    let device_point = EncodedPoint::from_bytes(sec1).map_err(|_| EncryptError::BadDevicePubkey)?;
-    let device_pub = Option::<PublicKey>::from(PublicKey::from_encoded_point(&device_point))
+    let device_point = Sec1Point::from_bytes(sec1).map_err(|_| EncryptError::BadDevicePubkey)?;
+    let device_pub = Option::<PublicKey>::from(PublicKey::from_sec1_point(&device_point))
         .ok_or(EncryptError::BadDevicePubkey)?;
 
     // Fresh ephemeral host keypair (spec §7: per-command).
-    let host_secret = SecretKey::random(&mut OsRng);
+    let host_secret = SecretKey::generate();
     let host_pub = host_secret.public_key();
 
     // shared X coordinate -> SHA-256 -> 32-byte AES-256 key.
@@ -111,7 +112,7 @@ pub fn encrypt_seed_payload(
     let session_key = Zeroizing::new({
         let mut h = Sha256::new();
         h.update(shared.raw_secret_bytes());
-        h.finalize()
+        <[u8; 32]>::from(h.finalize())
     });
 
     // AES-256-CBC + PKCS#7 over the cleartext.
@@ -122,13 +123,13 @@ pub fn encrypt_seed_payload(
     work.extend_from_slice(cleartext);
     work.resize(cleartext.len() + pad_room, 0);
     let ct_len = cleartext.len();
-    let ciphertext = Aes256CbcEnc::new(session_key.as_slice().into(), iv.into())
+    let ciphertext = Aes256CbcEnc::new((&*session_key).into(), iv.into())
         .encrypt_padded_mut::<Pkcs7>(&mut work, ct_len)
         .expect("buffer sized for PKCS7 padding above")
         .to_vec();
 
     // Host pubkey as raw X || Y (strip the 0x04 SEC1 tag) per spec §7.1.
-    let host_point = host_pub.to_encoded_point(false);
+    let host_point = host_pub.to_sec1_point(false);
     let host_xy = &host_point.as_bytes()[1..];
 
     let mut blob = Vec::with_capacity(64 + ciphertext.len());
@@ -164,9 +165,9 @@ mod tests {
     fn blob_shape_and_block_alignment() {
         // Stand in for the device with a known keypair so we can validate shape
         // and that the ciphertext is a whole number of AES blocks.
-        let device_secret = SecretKey::random(&mut OsRng);
+        let device_secret = SecretKey::generate();
         let device_xy = {
-            let pt = device_secret.public_key().to_encoded_point(false);
+            let pt = device_secret.public_key().to_sec1_point(false);
             pt.as_bytes()[1..].to_vec()
         };
         // 23-byte cleartext (spec §10.2) -> PKCS7 pads to 32 -> two AES blocks.
@@ -184,10 +185,10 @@ mod tests {
         use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
         type Dec = cbc::Decryptor<aes::Aes256>;
 
-        let device_secret = SecretKey::random(&mut OsRng);
+        let device_secret = SecretKey::generate();
         let device_pub = device_secret.public_key();
         let device_xy = {
-            let pt = device_pub.to_encoded_point(false);
+            let pt = device_pub.to_sec1_point(false);
             pt.as_bytes()[1..].to_vec()
         };
 
@@ -251,8 +252,8 @@ pub fn derive_session_keys(
     let mut sec1 = [0u8; 65];
     sec1[0] = 0x04;
     sec1[1..].copy_from_slice(device_agreement_xy);
-    let dev_point = EncodedPoint::from_bytes(sec1).map_err(|_| EncryptError::BadDevicePubkey)?;
-    let dev_pub = Option::<PublicKey>::from(PublicKey::from_encoded_point(&dev_point))
+    let dev_point = Sec1Point::from_bytes(sec1).map_err(|_| EncryptError::BadDevicePubkey)?;
+    let dev_pub = Option::<PublicKey>::from(PublicKey::from_sec1_point(&dev_point))
         .ok_or(EncryptError::BadDevicePubkey)?;
 
     let shared = diffie_hellman(host_secret.to_nonzero_scalar(), dev_pub.as_affine());
@@ -288,8 +289,8 @@ pub struct HostAgreement {
 impl HostAgreement {
     /// Generate a fresh ephemeral P-256 keypair for one session.
     pub fn new() -> Self {
-        let secret = SecretKey::random(&mut OsRng);
-        let point = secret.public_key().to_encoded_point(false);
+        let secret = SecretKey::generate();
+        let point = secret.public_key().to_sec1_point(false);
         let mut public_xy = [0u8; 64];
         public_xy.copy_from_slice(&point.as_bytes()[1..]);
         Self { secret, public_xy }
@@ -665,7 +666,7 @@ mod pin_crypto_tests {
     fn fixed_pair() -> (SecretKey, Vec<u8>) {
         let host = SecretKey::from_slice(&HOST_SCALAR).expect("valid P-256 scalar");
         let device = SecretKey::from_slice(&DEVICE_SCALAR).expect("valid P-256 scalar");
-        let pt = device.public_key().to_encoded_point(false);
+        let pt = device.public_key().to_sec1_point(false);
         (host, pt.as_bytes()[1..].to_vec())
     }
 
@@ -710,7 +711,7 @@ mod pin_crypto_tests {
         // host's public half; if the two disagree, nothing decrypts on-device.
         let (host, device_xy) = fixed_pair();
         let device = SecretKey::from_slice(&DEVICE_SCALAR).unwrap();
-        let host_pt = host.public_key().to_encoded_point(false);
+        let host_pt = host.public_key().to_sec1_point(false);
         let host_xy = &host_pt.as_bytes()[1..];
 
         let from_host = derive_session_keys(&host, &device_xy).unwrap();
