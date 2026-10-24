@@ -5142,7 +5142,8 @@ impl<'tx> PivSession<'tx> {
     /// Whether `slot` holds a private key, via GET METADATA. Works for retired
     /// slots too — it just reads whatever key reference `slot` maps to. This is
     /// the on-demand occupancy check (not part of [`status`]'s snapshot, which
-    /// stays 4 GET DATA calls rather than 24 by never touching retired slots).
+    /// stays at 4 GET DATA calls and up to 4 cached GET METADATA reads, rather
+    /// than 24 of each, by never touching retired slots).
     ///
     /// Derives occupancy from `Self::cached_slot_key` — cache-preferring,
     /// same as `status_detailed`'s own use, since this backs a UI dimming
