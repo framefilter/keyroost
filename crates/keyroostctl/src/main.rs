@@ -8785,7 +8785,16 @@ fn run_otp(
             otp_precheck(&dev, sel.transport, debug, OtpFeature::OnDevice)?;
             crate::prompt::confirm_on(&dev, *yes, "erase every OTP entry")?;
             let mut session = open_otp_on(&dev, sel.transport, debug)?;
-            eprintln!("touch your key to confirm the erase\u{2026}");
+            // One prompt for the one touch. Over USB the key says when it is
+            // waiting, so the prompt waits for that; a reader gives no such
+            // sign, so there it comes up front.
+            if session.is_pcsc() {
+                eprintln!("touch your key to confirm the erase\u{2026}");
+            } else {
+                session.set_button_prompt(Box::new(|| {
+                    eprintln!("touch your key to confirm the erase\u{2026}");
+                }));
+            }
             session.erase_all()?;
             println!("Erased all OTP entries.");
         }
