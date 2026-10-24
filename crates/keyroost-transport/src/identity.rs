@@ -1,9 +1,11 @@
 //! Read-only identity reads used to match a key's FIDO-HID node to its
 //! smart-card reader when USB topology is unavailable (#51). Every function
-//! sends only reads, returns `None` on any failure (a key that doesn't
+//! sends only reads, answers "nothing" on any failure (a key that doesn't
 //! answer is simply not matched by identity), and traces each exchange
 //! through [`crate::trace`] so it shows in `--debug` output and in the
-//! GUI's activity capture.
+//! GUI's activity capture. HID reads say which kind of nothing it was
+//! ([`KeyAnswer`]), so a caller can remember a key's own "no" and ask again
+//! after a failure.
 
 use std::path::Path;
 use std::time::Duration;
@@ -27,6 +29,57 @@ pub const SOLO2_UUID_APDU: [u8; 4] = [0x00, 0x62, 0x00, 0x00];
 
 /// An identity read is a nicety: give up quickly rather than stall a scan.
 const IDENTITY_HID_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// What a key said to one HID identity read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyAnswer<T> {
+    /// The key answered with this.
+    Reply(T),
+    /// The key answered, but without what was asked: an error it returned
+    /// itself (`ERR_INVALID_CMD`: it doesn't support the command) or a
+    /// refusing status word. Asking again gets the same answer.
+    Declined,
+    /// No answer: the device didn't open, timed out, was busy, or I/O
+    /// failed. Worth asking again later.
+    NoAnswer,
+}
+
+impl<T> KeyAnswer<T> {
+    /// The reply, if the key gave one.
+    pub fn reply(self) -> Option<T> {
+        match self {
+            Self::Reply(t) => Some(t),
+            Self::Declined | Self::NoAnswer => None,
+        }
+    }
+
+    /// Read a reply with `f`; a reply `f` can't use is the key answering
+    /// without what was asked.
+    pub fn and_then<U>(self, f: impl FnOnce(T) -> Option<U>) -> KeyAnswer<U> {
+        match self {
+            Self::Reply(t) => f(t).map_or(KeyAnswer::Declined, KeyAnswer::Reply),
+            Self::Declined => KeyAnswer::Declined,
+            Self::NoAnswer => KeyAnswer::NoAnswer,
+        }
+    }
+}
+
+/// A failed CTAPHID exchange as a [`KeyAnswer`]: an error code the key
+/// returned is its answer, except the ones that only say "not now" (busy,
+/// locked to another channel, message timeout).
+fn ctaphid_error_answer<T>(e: &keyroost_ctap::hid::HidTransportError) -> KeyAnswer<T> {
+    use keyroost_ctap::hid::{
+        HidTransportError, CTAPHID_ERR_CHANNEL_BUSY, CTAPHID_ERR_LOCK_REQUIRED,
+        CTAPHID_ERR_MSG_TIMEOUT,
+    };
+    match e {
+        HidTransportError::DeviceError(
+            CTAPHID_ERR_CHANNEL_BUSY | CTAPHID_ERR_LOCK_REQUIRED | CTAPHID_ERR_MSG_TIMEOUT,
+        ) => KeyAnswer::NoAnswer,
+        HidTransportError::DeviceError(_) => KeyAnswer::Declined,
+        _ => KeyAnswer::NoAnswer,
+    }
+}
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -59,7 +112,12 @@ pub fn ctaphid_speaks_cbor(path: &Path, debug: bool) -> Option<bool> {
 }
 
 /// Send one CTAPHID vendor command on a fresh channel and return the reply.
-pub fn ctaphid_vendor_read(path: &Path, cmd: u8, payload: &[u8], debug: bool) -> Option<Vec<u8>> {
+pub fn ctaphid_vendor_read(
+    path: &Path,
+    cmd: u8,
+    payload: &[u8],
+    debug: bool,
+) -> KeyAnswer<Vec<u8>> {
     let shown = path.display().to_string();
     trace::line(debug, || {
         format_line(
@@ -74,7 +132,7 @@ pub fn ctaphid_vendor_read(path: &Path, cmd: u8, payload: &[u8], debug: bool) ->
             trace::line(debug, || {
                 format_line(Dir::Note, "identity", &format!("{shown} open failed: {e}"))
             });
-            return None;
+            return KeyAnswer::NoAnswer;
         }
     };
     dev.set_timeout(IDENTITY_HID_TIMEOUT);
@@ -87,7 +145,7 @@ pub fn ctaphid_vendor_read(path: &Path, cmd: u8, payload: &[u8], debug: bool) ->
                     &format!("{shown} ctaphid {}", hex(&resp)),
                 )
             });
-            Some(resp)
+            KeyAnswer::Reply(resp)
         }
         Err(e) => {
             trace::line(debug, || {
@@ -97,7 +155,7 @@ pub fn ctaphid_vendor_read(path: &Path, cmd: u8, payload: &[u8], debug: bool) ->
                     &format!("{shown} ctaphid failed: {e}"),
                 )
             });
-            None
+            ctaphid_error_answer(&e)
         }
     }
 }
@@ -225,12 +283,49 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_hid_paths_answer_none_and_are_traced() {
+    fn a_key_returned_error_is_its_answer_but_not_now_errors_are_not() {
+        use keyroost_ctap::hid::{HidTransportError as E, *};
+        let answer = |e: E| ctaphid_error_answer::<()>(&e);
+        assert_eq!(
+            answer(E::DeviceError(CTAPHID_ERR_INVALID_CMD)),
+            KeyAnswer::Declined
+        );
+        assert_eq!(
+            answer(E::DeviceError(CTAPHID_ERR_OTHER)),
+            KeyAnswer::Declined
+        );
+        for busy in [
+            CTAPHID_ERR_CHANNEL_BUSY,
+            CTAPHID_ERR_LOCK_REQUIRED,
+            CTAPHID_ERR_MSG_TIMEOUT,
+        ] {
+            assert_eq!(answer(E::DeviceError(busy)), KeyAnswer::NoAnswer);
+        }
+        assert_eq!(answer(E::Timeout), KeyAnswer::NoAnswer);
+        assert_eq!(answer(E::Backend("gone".into())), KeyAnswer::NoAnswer);
+    }
+
+    #[test]
+    fn a_reply_that_cant_be_read_is_declined() {
+        let reply = KeyAnswer::Reply(vec![1u8]);
+        assert_eq!(
+            reply.clone().and_then(|r| r.first().copied()),
+            KeyAnswer::Reply(1)
+        );
+        assert_eq!(reply.and_then(|_| None::<u8>), KeyAnswer::Declined);
+        assert_eq!(
+            KeyAnswer::<Vec<u8>>::NoAnswer.and_then(|r| r.first().copied()),
+            KeyAnswer::NoAnswer
+        );
+    }
+
+    #[test]
+    fn unreachable_hid_paths_get_no_answer_and_are_traced() {
         let p = std::path::Path::new("/nonexistent/keyroost-identity-test");
         crate::trace::begin();
         assert_eq!(
             ctaphid_vendor_read(p, YUBICO_CTAPHID_READ_CONFIG, &[0x00], false),
-            None
+            KeyAnswer::NoAnswer
         );
         let lines = crate::trace::take().unwrap();
         assert!(
@@ -239,6 +334,6 @@ mod tests {
                 .any(|l| l.starts_with("> identity ") && l.contains("cmd=0xc2")),
             "{lines:?}"
         );
-        assert_eq!(token2_serial_reply_hid(p, false), None);
+        assert_eq!(token2_serial_reply_hid(p, false), KeyAnswer::NoAnswer);
     }
 }

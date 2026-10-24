@@ -985,7 +985,9 @@ fn apply_test_switch(_opts: &mut MatchOptions) {}
 
 /// Correlate a live snapshot: plan identity reads for what topology
 /// leaves unmatched, perform them (read-only, traced under `debug`),
-/// then correlate. Linux with topology sends no identity reads. Each FIDO
+/// then correlate. Linux with topology sends no identity reads, and a HID
+/// interface that already answered is not asked again until it is
+/// replugged (reader-side reads are sent every scan). Each FIDO
 /// interface is also asked once per plug-in whether it speaks only U2F (a
 /// CTAPHID INIT, nothing else), to mark it [`Caps::U2F_ONLY`].
 pub fn correlate_live(
@@ -1008,7 +1010,7 @@ pub fn correlate_live(
     };
     let registry = crate::identity::IDENTITY_READERS;
     let plan = crate::identity::plan_identity_reads(h, p, registry);
-    let ids = crate::identity::read_identities(&plan, h, p, registry, debug);
+    let ids = crate::identity::read_identities_once(&plan, h, p, registry, debug);
     let mut devices = correlate_with(h, p, keyring, &ids, &opts);
     mark_u2f_only(&mut devices, &u2f_only_paths(hids, true, debug));
     devices

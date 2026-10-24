@@ -11,9 +11,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use keyroost_hid::HidDevice;
+use keyroost_hid::{HidDevice, UsbDeviceKey};
 use keyroost_proto::trace::{format_line, Dir};
 use keyroost_transport::ReaderProbe;
+
+pub use keyroost_transport::identity::KeyAnswer;
 
 /// Which encoding an identity came from. Values are comparable only
 /// within one scheme.
@@ -143,7 +145,9 @@ pub trait IdentityReader: Sync {
     fn claims_hid(&self, h: &HidDevice) -> bool;
     /// Whether this reader is worth asking (label-grade: the read is the evidence).
     fn claims_reader(&self, p: &ReaderProbe) -> bool;
-    fn read_hid(&self, h: &HidDevice, debug: bool) -> Option<CanonicalId>;
+    /// The HID side's identity. [`KeyAnswer::Declined`] when the key
+    /// answered without one; that answer is kept for the plug-in.
+    fn read_hid(&self, h: &HidDevice, debug: bool) -> KeyAnswer<CanonicalId>;
     fn read_ccid(&self, p: &ReaderProbe, debug: bool) -> Option<CanonicalId>;
 }
 
@@ -164,11 +168,11 @@ impl IdentityReader for YubicoIdentity {
             && (p.yubikey_serial.is_some()
                 || p.reader_name.to_ascii_lowercase().contains("yubikey"))
     }
-    fn read_hid(&self, h: &HidDevice, debug: bool) -> Option<CanonicalId> {
+    fn read_hid(&self, h: &HidDevice, debug: bool) -> KeyAnswer<CanonicalId> {
         use keyroost_transport::identity::{ctaphid_vendor_read, YUBICO_CTAPHID_READ_CONFIG};
         // Payload = config page 0, as yubikit sends it.
-        let reply = ctaphid_vendor_read(&h.path, YUBICO_CTAPHID_READ_CONFIG, &[0x00], debug)?;
-        yubico_from_read_config(&reply)
+        ctaphid_vendor_read(&h.path, YUBICO_CTAPHID_READ_CONFIG, &[0x00], debug)
+            .and_then(|r| yubico_from_read_config(&r))
     }
     fn read_ccid(&self, p: &ReaderProbe, _debug: bool) -> Option<CanonicalId> {
         // Already read during the probe — no extra traffic.
@@ -191,15 +195,13 @@ impl IdentityReader for Solo2Identity {
             && p.yubikey_serial.is_none()
             && (p.has_fido || p.has_oath || p.has_piv || p.has_openpgp)
     }
-    fn read_hid(&self, h: &HidDevice, debug: bool) -> Option<CanonicalId> {
+    fn read_hid(&self, h: &HidDevice, debug: bool) -> KeyAnswer<CanonicalId> {
         use keyroost_transport::identity::{ctaphid_vendor_read, SOLO2_CTAPHID_UUID};
-        h.serial_number
-            .as_deref()
-            .and_then(solo2_from_iserial)
-            .or_else(|| {
-                ctaphid_vendor_read(&h.path, SOLO2_CTAPHID_UUID, &[], debug)
-                    .and_then(|r| solo2_from_uuid_bytes(&r))
-            })
+        match h.serial_number.as_deref().and_then(solo2_from_iserial) {
+            Some(id) => KeyAnswer::Reply(id),
+            None => ctaphid_vendor_read(&h.path, SOLO2_CTAPHID_UUID, &[], debug)
+                .and_then(|r| solo2_from_uuid_bytes(&r)),
+        }
     }
     fn read_ccid(&self, p: &ReaderProbe, debug: bool) -> Option<CanonicalId> {
         use keyroost_transport::identity::{ccid_applet_read, SOLO2_ADMIN_AID, SOLO2_UUID_APDU};
@@ -228,7 +230,7 @@ impl IdentityReader for Token2Identity {
     fn claims_reader(&self, p: &ReaderProbe) -> bool {
         !p.is_molto2 && !p.is_prog && p.yubikey_serial.is_none() && (p.has_fido || p.has_otp)
     }
-    fn read_hid(&self, h: &HidDevice, debug: bool) -> Option<CanonicalId> {
+    fn read_hid(&self, h: &HidDevice, debug: bool) -> KeyAnswer<CanonicalId> {
         keyroost_transport::identity::token2_serial_reply_hid(&h.path, debug)
             .and_then(|r| token2_from_fido_reply(&r))
     }
@@ -352,29 +354,66 @@ pub fn read_identities(
     registry: &[&dyn IdentityReader],
     debug: bool,
 ) -> Identities {
-    let mut ids = Identities::default();
-    for (v, path) in &plan.hid {
-        let Some(h) = hids.iter().find(|h| &h.path == path) else {
-            continue;
-        };
-        let id = registry[*v].read_hid(h, debug);
+    read_identities_with(&mut HidIdCache::new(), plan, hids, probes, registry, debug)
+}
+
+/// Each HID identity answer, by plug-in: the interface's path, USB position
+/// and IDs, and the identity reader's index in the registry. A replug gets
+/// a new path (or position) and is asked again. `None` is "the key answered
+/// without an identity" (e.g. a YubiKey NEO refusing READ CONFIG with
+/// `ERR_INVALID_CMD`). Only the key's own answers are kept, never a failure
+/// to reach it, so a key that was briefly busy is asked again next scan.
+type HidIdCache = Vec<(
+    (PathBuf, Option<UsbDeviceKey>, u16, u16, usize),
+    Option<CanonicalId>,
+)>;
+static HID_ID_CACHE: std::sync::Mutex<HidIdCache> = std::sync::Mutex::new(Vec::new());
+
+/// [`read_identities`], asking each HID interface at most once per plug-in
+/// across scans. Reader-side reads are sent every time.
+pub(crate) fn read_identities_once(
+    plan: &IdentityPlan,
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    registry: &[&dyn IdentityReader],
+    debug: bool,
+) -> Identities {
+    match HID_ID_CACHE.lock() {
+        Ok(mut cache) => read_identities_with(&mut cache, plan, hids, probes, registry, debug),
+        Err(_) => read_identities(plan, hids, probes, registry, debug),
+    }
+}
+
+fn read_identities_with(
+    cache: &mut HidIdCache,
+    plan: &IdentityPlan,
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    registry: &[&dyn IdentityReader],
+    debug: bool,
+) -> Identities {
+    let hid = hid_identities_from(cache, plan, hids, |v, h| {
+        let id = registry[v].read_hid(h, debug);
         if debug {
-            let shown = id
-                .as_ref()
-                .map_or_else(|| "no answer".to_string(), ToString::to_string);
+            let shown = match &id {
+                KeyAnswer::Reply(id) => id.to_string(),
+                KeyAnswer::Declined | KeyAnswer::NoAnswer => "no answer".to_string(),
+            };
             eprintln!(
                 "{}",
                 format_line(
                     Dir::Note,
                     "identity",
-                    &format!("{} {}: {shown}", registry[*v].vendor(), path.display()),
+                    &format!("{} {}: {shown}", registry[v].vendor(), h.path.display()),
                 )
             );
         }
-        if let Some(id) = id {
-            ids.hid.insert(path.clone(), id);
-        }
-    }
+        id
+    });
+    let mut ids = Identities {
+        hid,
+        ..Identities::default()
+    };
     for (v, name) in &plan.ccid {
         let Some(p) = probes.iter().find(|p| &p.reader_name == name) else {
             continue;
@@ -398,6 +437,48 @@ pub fn read_identities(
         }
     }
     ids
+}
+
+/// The planned HID identities: from `cache` where this plug-in was already
+/// answered, from `ask(registry index, interface)` otherwise. A cache hit
+/// sends nothing. Entries for interfaces no longer present are dropped.
+fn hid_identities_from(
+    cache: &mut HidIdCache,
+    plan: &IdentityPlan,
+    hids: &[HidDevice],
+    mut ask: impl FnMut(usize, &HidDevice) -> KeyAnswer<CanonicalId>,
+) -> HashMap<PathBuf, CanonicalId> {
+    // Forget interfaces that are gone, so the cache can't grow without end.
+    cache.retain(|(k, _)| hids.iter().any(|h| h.path == k.0));
+    let mut out = HashMap::new();
+    for (v, path) in &plan.hid {
+        let Some(h) = hids.iter().find(|h| &h.path == path) else {
+            continue;
+        };
+        let key = (
+            h.path.clone(),
+            h.usb_device.clone(),
+            h.vendor_id,
+            h.product_id,
+            *v,
+        );
+        let id = match cache.iter().find(|(k, _)| *k == key) {
+            Some((_, id)) => id.clone(),
+            None => {
+                let id = match ask(*v, h) {
+                    KeyAnswer::Reply(id) => Some(id),
+                    KeyAnswer::Declined => None,
+                    KeyAnswer::NoAnswer => continue,
+                };
+                cache.push((key, id.clone()));
+                id
+            }
+        };
+        if let Some(id) = id {
+            out.insert(path.clone(), id);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -711,9 +792,9 @@ mod tests {
         fn claims_reader(&self, _: &ReaderProbe) -> bool {
             true
         }
-        fn read_hid(&self, h: &HidDevice, _: bool) -> Option<CanonicalId> {
+        fn read_hid(&self, h: &HidDevice, _: bool) -> KeyAnswer<CanonicalId> {
             self.0.lock().unwrap().push(h.path.display().to_string());
-            yubico_from_serial_str("5")
+            yubico_from_serial_str("5").map_or(KeyAnswer::NoAnswer, KeyAnswer::Reply)
         }
         fn read_ccid(&self, p: &ReaderProbe, _: bool) -> Option<CanonicalId> {
             self.0.lock().unwrap().push(p.reader_name.clone());
@@ -741,5 +822,95 @@ mod tests {
         );
         assert_eq!(ids.hid.len(), 1);
         assert!(ids.reader.is_empty());
+    }
+
+    fn hid_plan(reads: &[(usize, &str)]) -> IdentityPlan {
+        IdentityPlan {
+            hid: reads.iter().map(|(v, p)| (*v, PathBuf::from(p))).collect(),
+            ccid: Vec::new(),
+        }
+    }
+
+    /// Each HID interface is asked once per plug-in and identity reader:
+    /// the next scan of the same plug-in uses the earlier answer.
+    #[test]
+    fn hid_identity_is_asked_once_per_plug_in() {
+        let hids = [hid(0x1050, 0x0116, "/dev/a", None, None, None)];
+        let plan = hid_plan(&[(0, "/dev/a"), (1, "/dev/a")]);
+        let mut cache = HidIdCache::new();
+        let mut asked = Vec::new();
+        let ids = hid_identities_from(&mut cache, &plan, &hids, |v, h| {
+            asked.push((v, h.path.clone()));
+            match v {
+                0 => KeyAnswer::Reply(yubico_from_serial_str("5").unwrap()),
+                _ => KeyAnswer::Declined,
+            }
+        });
+        assert_eq!(
+            asked,
+            vec![(0, "/dev/a".into()), (1, "/dev/a".into())],
+            "each reader asks"
+        );
+        let again = hid_identities_from(&mut cache, &plan, &hids, |_, _| panic!("asked twice"));
+        assert_eq!(again, ids);
+        assert_eq!(again[&PathBuf::from("/dev/a")].value, "5");
+    }
+
+    /// A key that answered without an identity (a YubiKey NEO answers READ
+    /// CONFIG with ERR_INVALID_CMD) is not asked again on the next scan.
+    #[test]
+    fn a_key_that_answered_without_an_identity_is_not_asked_again() {
+        let hids = [hid(0x1050, 0x0116, "/dev/a", None, None, None)];
+        let plan = hid_plan(&[(0, "/dev/a")]);
+        let mut cache = HidIdCache::new();
+        let ids = hid_identities_from(&mut cache, &plan, &hids, |_, _| KeyAnswer::Declined);
+        assert!(ids.is_empty());
+        let ids = hid_identities_from(&mut cache, &plan, &hids, |_, _| panic!("asked twice"));
+        assert!(ids.is_empty());
+    }
+
+    /// A replug shows up under a new path (a new registry entry on macOS)
+    /// and is asked again; the unplugged interface leaves the cache.
+    #[test]
+    fn a_replugged_key_is_asked_again_and_the_old_plug_in_is_forgotten() {
+        let mut cache = HidIdCache::new();
+        let before = [hid(0x1050, 0x0116, "/dev/a", None, None, None)];
+        hid_identities_from(&mut cache, &hid_plan(&[(0, "/dev/a")]), &before, |_, _| {
+            KeyAnswer::Declined
+        });
+        assert_eq!(cache.len(), 1);
+        let after = [hid(0x1050, 0x0116, "/dev/b", None, None, None)];
+        let mut asked = Vec::new();
+        hid_identities_from(&mut cache, &hid_plan(&[(0, "/dev/b")]), &after, |_, h| {
+            asked.push(h.path.clone());
+            KeyAnswer::Declined
+        });
+        assert_eq!(asked, vec![PathBuf::from("/dev/b")]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].0 .0, PathBuf::from("/dev/b"));
+        // Unplugged with nothing in its place: nothing is kept.
+        hid_identities_from(&mut cache, &IdentityPlan::default(), &[], |_, _| {
+            panic!("asked")
+        });
+        assert!(cache.is_empty());
+    }
+
+    /// A key that couldn't be reached (open failed, timed out, busy) is not
+    /// remembered: the next scan asks it again.
+    #[test]
+    fn a_key_that_did_not_answer_is_asked_again() {
+        let hids = [hid(0x1050, 0x0116, "/dev/a", None, None, None)];
+        let plan = hid_plan(&[(0, "/dev/a")]);
+        let mut cache = HidIdCache::new();
+        let ids = hid_identities_from(&mut cache, &plan, &hids, |_, _| KeyAnswer::NoAnswer);
+        assert!(ids.is_empty());
+        assert!(cache.is_empty());
+        let mut asked = 0;
+        let ids = hid_identities_from(&mut cache, &plan, &hids, |_, _| {
+            asked += 1;
+            KeyAnswer::Reply(yubico_from_serial_str("5").unwrap())
+        });
+        assert_eq!(asked, 1);
+        assert_eq!(ids[&PathBuf::from("/dev/a")].value, "5");
     }
 }

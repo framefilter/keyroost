@@ -31,7 +31,7 @@ pub use device::{
 };
 pub use identity::{
     plan_identity_reads, read_identities, CanonicalId, IdScheme, Identities, IdentityPlan,
-    IdentityReader, IDENTITY_READERS,
+    IdentityReader, KeyAnswer, IDENTITY_READERS,
 };
 pub use names::{
     apply_names, apply_updates, clear_key_names, name_held_elsewhere, row_serials, serial_tail,

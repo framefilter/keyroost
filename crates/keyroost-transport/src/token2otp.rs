@@ -481,17 +481,24 @@ impl HidOtpTransport {
 }
 
 /// The §6.10 GET_INFO serial reply over USB-HID, raw (`D1 len …`), for
-/// identity matching (#51). Read-only, short timeout, `None` on any failure.
-pub fn token2_serial_reply_hid(path: &Path, debug: bool) -> Option<Vec<u8>> {
+/// identity matching (#51). Read-only, short timeout. A status word other
+/// than `9000` is the key declining; any transport failure is no answer.
+pub fn token2_serial_reply_hid(path: &Path, debug: bool) -> crate::identity::KeyAnswer<Vec<u8>> {
+    use crate::identity::KeyAnswer;
+    let answer = |r: Result<(Vec<u8>, u16), OtpTransportError>| match r {
+        Ok((data, 0x9000)) => KeyAnswer::Reply(data),
+        Ok(_) => KeyAnswer::Declined,
+        Err(_) => KeyAnswer::NoAnswer,
+    };
     if let Some(mut t) = CtapOtpTransport::open_probed(path, debug) {
-        let (data, sw) = t.transmit(&t2::read_serial_request(), false).ok()?;
-        return (sw == 0x9000).then_some(data);
+        return answer(t.transmit(&t2::read_serial_request(), false));
     }
-    let mut t = HidOtpTransport::open_path(path).ok()?;
+    let Ok(mut t) = HidOtpTransport::open_path(path) else {
+        return KeyAnswer::NoAnswer;
+    };
     t.set_debug(debug);
     t.timeout = Duration::from_millis(1500);
-    let (data, sw) = t.transmit(&t2::read_serial_request(), false).ok()?;
-    (sw == 0x9000).then_some(data)
+    answer(t.transmit(&t2::read_serial_request(), false))
 }
 
 impl OtpTransport for HidOtpTransport {
