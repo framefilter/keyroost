@@ -95,6 +95,16 @@ openssl x509 -in second.crt -outform DER -out "$here/two-entries.crt2.der"
 PYTHONDONTWRITEBYTECODE=1 python3 "$here/p12tool.py" indefinite "$here/rsa2048-modern.p12" "$here/ber-indefinite.p12"
 der rsa2048 ber-indefinite
 
+# Fully BER: indefinite lengths at every level and chunked OCTET STRINGs
+# throughout (what some Windows and Java exporters write); MAC recomputed.
+PYTHONDONTWRITEBYTECODE=1 python3 "$here/p12tool.py" full "$PW" "$here/rsa2048-modern.p12" "$here/ber-full.p12"
+der rsa2048 ber-full
+
+# No MAC: one with a shrouded key, one with a plaintext key bag.
+export_p12 macless-shrouded rsa2048 -nomac;               der rsa2048 macless-shrouded
+export_p12 macless-plain-key rsa2048 -nomac -keypbe NONE; der rsa2048 macless-plain-key
+
 # Sanity: OpenSSL itself opens the re-encoded files.
 openssl pkcs12 -in "$here/ber-indefinite.p12" -passin "pass:$PW" -noout
 openssl pkcs12 -in "$here/two-entries.p12" -passin "pass:$PW" -noout
+openssl pkcs12 -in "$here/ber-full.p12" -passin "pass:$PW" -noout

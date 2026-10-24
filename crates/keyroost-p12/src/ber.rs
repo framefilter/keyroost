@@ -149,7 +149,9 @@ fn read_at(input: &[u8], depth: usize) -> Result<(Tlv<'_>, &[u8]), P12Error> {
         .get(e.total..)
         .ok_or_else(|| bad("truncated element"))?;
     let value = if e.tag == 0x24 {
-        let mut out = Vec::new();
+        // The joined value is no longer than the content; sizing it up front
+        // keeps reallocation from leaving copies of key material behind.
+        let mut out = Vec::with_capacity(content.len());
         flatten_octets(content, depth, &mut out)?;
         Cow::Owned(out)
     } else {

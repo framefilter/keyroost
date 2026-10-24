@@ -31,6 +31,11 @@ const AES256_CBC: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a
 
 const TAG_INTEGER: u8 = 0x02;
 const TAG_OCTET_STRING: u8 = 0x04;
+
+/// An OCTET STRING, primitive or BER-constructed (already joined by the reader).
+fn is_octets(t: &Tlv<'_>) -> bool {
+    t.tag == TAG_OCTET_STRING || t.tag == 0x24
+}
 const TAG_OID: u8 = 0x06;
 const TAG_SEQUENCE: u8 = 0x30;
 
@@ -132,7 +137,7 @@ fn decrypt_legacy(
     }
     let kids = children(&params.value)?;
     let (salt, iter) = match kids.as_slice() {
-        [salt, iter] if salt.tag == TAG_OCTET_STRING => (salt, iter),
+        [salt, iter] if is_octets(salt) => (salt, iter),
         _ => return Err(bad("PBE parameters are not (salt, iterations)")),
     };
     let iterations = check_iterations(small_uint(iter)?)?;
@@ -183,7 +188,7 @@ fn decrypt_pbes2(
         _ => return Err(P12Error::Unsupported("PBES2 cipher")),
     };
     let iv = match enc.params {
-        Some(t) if t.tag == TAG_OCTET_STRING && t.value.len() == 16 => &t.value,
+        Some(t) if is_octets(t) && t.value.len() == 16 => &t.value,
         _ => return Err(bad("PBES2 cipher IV is not 16 bytes")),
     };
 
@@ -201,7 +206,7 @@ fn decrypt_pbes2(
     let mut fields = kp_kids.iter();
     let salt = fields
         .next()
-        .filter(|t| t.tag == TAG_OCTET_STRING)
+        .filter(|t| is_octets(t))
         .ok_or_else(|| bad("PBKDF2 salt missing"))?;
     let iterations = check_iterations(small_uint(
         fields

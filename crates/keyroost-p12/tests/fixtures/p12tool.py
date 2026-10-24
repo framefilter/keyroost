@@ -3,6 +3,8 @@
 
   p12tool.py indefinite IN OUT          re-wrap IN in BER indefinite lengths
   p12tool.py merge PASSWORD OUT A B     join the entries of A and B (same password)
+  p12tool.py full PASSWORD IN OUT       indefinite lengths everywhere, chunked
+                                        OCTET STRINGs, MAC recomputed
 
 Both modes keep the MAC valid: `indefinite` leaves the MAC'd bytes untouched,
 `merge` recomputes the MAC with the PKCS#12 key derivation (RFC 7292 B.2).
@@ -88,10 +90,8 @@ def indefinite(src, dst):
     open(dst, "wb").write(b"\x30\x80" + parts[0][2] + ci + parts[2][2] + b"\x00\x00")
 
 
-def merge(password, dst, a, b):
-    ia, ma, _ = parse(a)
-    ib, _, _ = parse(b)
-    safe = der(0x30, b"".join(c[2] for c in children(read(ia)[1])) + b"".join(c[2] for c in children(read(ib)[1])))
+def remac(password, ma, safe):
+    """MacData for `safe` with the algorithm, salt and iterations of `ma`."""
     digest_info, salt, iters = ma
     alg_id = children(digest_info[1])[0]
     name = {bytes.fromhex("608648016503040201"): "sha256", bytes.fromhex("2b0e03021a"): "sha1"}[
@@ -100,8 +100,51 @@ def merge(password, dst, a, b):
     count = int.from_bytes(iters[1], "big")
     key = kdf(name, bmp(password), salt[1], 3, count, hashlib.new(name).digest_size)
     digest = hmac.new(key, safe, name).digest()
+    return der(0x30, der(0x30, alg_id[2] + der(0x04, digest)) + der(0x04, salt[1]) + der(0x02, iters[1]))
+
+
+def chunked(data, tag_prefix=b"\x24\x80"):
+    """A constructed OCTET STRING (indefinite length) of small chunks."""
+    return tag_prefix + b"".join(der(0x04, data[i:i + 7]) for i in range(0, len(data), 7)) + b"\x00\x00"
+
+
+def ber(buf):
+    """Re-encode DER elements with indefinite lengths; octet strings chunked."""
+    out = b""
+    for tag, val, raw in children(buf):
+        if tag & 0x20:
+            out += bytes([tag, 0x80]) + ber(val) + b"\x00\x00"
+        elif tag == 0x04:
+            out += chunked(val)
+        elif tag == 0x80:           # implicit [0] OCTET STRING (encrypted content)
+            out += chunked(val, b"\xa0\x80")
+        else:
+            out += raw
+    return out
+
+
+def full(password, src, dst):
+    inner, ma, parts = parse(src)
+    infos = []
+    for tag, val, raw in children(read(inner)[1]):
+        oid, wrapper = children(val)
+        if oid[1] == bytes.fromhex("2a864886f70d010701"):          # data
+            sc = read(wrapper[1])[1]                                 # OCTET STRING content
+            infos.append(b"\x30\x80" + oid[2] + b"\xa0\x80" + chunked(ber(sc)) + b"\x00\x00" * 2)
+        else:
+            infos.append(ber(raw))
+    safe = b"\x30\x80" + b"".join(infos) + b"\x00\x00"
+    ci = b"\x30\x80" + children(parts[1][1])[0][2] + b"\xa0\x80" + chunked(safe) + b"\x00\x00" * 2
+    mac = ber(remac(password, ma, safe))
+    open(dst, "wb").write(b"\x30\x80" + parts[0][2] + ci + mac + b"\x00\x00")
+
+
+def merge(password, dst, a, b):
+    ia, ma, _ = parse(a)
+    ib, _, _ = parse(b)
+    safe = der(0x30, b"".join(c[2] for c in children(read(ia)[1])) + b"".join(c[2] for c in children(read(ib)[1])))
+    mac = remac(password, ma, safe)
     ci = der(0x30, bytes.fromhex("06092a864886f70d010701") + der(0xA0, der(0x04, safe)))
-    mac = der(0x30, der(0x30, alg_id[2] + der(0x04, digest)) + der(0x04, salt[1]) + der(0x02, iters[1]))
     open(dst, "wb").write(der(0x30, b"\x02\x01\x03" + ci + mac))
 
 
@@ -110,5 +153,7 @@ if __name__ == "__main__":
         indefinite(sys.argv[2], sys.argv[3])
     elif sys.argv[1] == "merge":
         merge(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    elif sys.argv[1] == "full":
+        full(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
         sys.exit("unknown mode")

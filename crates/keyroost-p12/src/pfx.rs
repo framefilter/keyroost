@@ -32,6 +32,7 @@ pub(crate) struct RawBag {
 
 const TAG_INTEGER: u8 = 0x02;
 const TAG_OCTET_STRING: u8 = 0x04;
+const TAG_OCTET_STRING_CONSTRUCTED: u8 = 0x24;
 const TAG_OID: u8 = 0x06;
 const TAG_BMP_STRING: u8 = 0x1E;
 const TAG_SEQUENCE: u8 = 0x30;
@@ -63,6 +64,20 @@ const MAX_ITERATIONS: u64 = 10_000_000;
 
 fn bad(what: &'static str) -> P12Error {
     P12Error::Malformed(what)
+}
+
+/// An OCTET STRING, primitive or BER-constructed (`read_tlv` has already
+/// joined the segments of a constructed one into `value`).
+fn is_octets(t: &Tlv<'_>) -> bool {
+    t.tag == TAG_OCTET_STRING || t.tag == TAG_OCTET_STRING_CONSTRUCTED
+}
+
+fn expect_octets(t: &Tlv<'_>, what: &'static str) -> Result<(), P12Error> {
+    if is_octets(t) {
+        Ok(())
+    } else {
+        Err(bad(what))
+    }
 }
 
 fn expect(t: &Tlv<'_>, tag: u8, what: &'static str) -> Result<(), P12Error> {
@@ -124,7 +139,9 @@ fn explicit_content<'a>(wrapper: &'a Tlv<'a>) -> Result<Tlv<'a>, P12Error> {
 /// The MAC is checked first (a mismatch is `WrongPassword`). With no password,
 /// or an empty one, both the "no password" and the "empty string" encodings
 /// are tried, as other PKCS#12 tools do. A file without a MAC is accepted and
-/// relies on the padding check of its encrypted parts.
+/// relies on the padding check of its encrypted parts, but only if every key
+/// comes from an encrypted container. Without a MAC nothing vouches for a
+/// plaintext key bag (it could have been swapped), so such a file is refused.
 pub(crate) fn read_bags(der: &[u8], password: Option<&str>) -> Result<Vec<RawBag>, P12Error> {
     let (pfx, _) = read_tlv(der)?;
     expect(&pfx, TAG_SEQUENCE, "PFX is not a SEQUENCE")?;
@@ -146,9 +163,7 @@ pub(crate) fn read_bags(der: &[u8], password: Option<&str>) -> Result<Vec<RawBag
         return Err(P12Error::Unsupported("PKCS#12 with public-key integrity"));
     }
     let octets = explicit_content(wrapper)?;
-    if octets.tag != TAG_OCTET_STRING && octets.tag != 0x24 {
-        return Err(bad("PFX content is not an OCTET STRING"));
-    }
+    expect_octets(&octets, "PFX content is not an OCTET STRING")?;
     let auth_safe: &[u8] = &octets.value;
 
     let mac = mac_data.map(parse_mac).transpose()?;
@@ -164,7 +179,7 @@ pub(crate) fn read_bags(der: &[u8], password: Option<&str>) -> Result<Vec<RawBag
                 continue;
             }
         }
-        match walk_auth_safe(auth_safe, pw) {
+        match walk_auth_safe(auth_safe, pw, mac.is_some()) {
             Err(P12Error::WrongPassword) if !last => continue,
             other => return other,
         }
@@ -232,12 +247,8 @@ fn parse_mac(mac_data: &Tlv<'_>) -> Result<Mac, P12Error> {
         o if o == SHA256_OID => Hash::Sha256,
         _ => return Err(P12Error::Unsupported("MAC algorithm")),
     };
-    expect(
-        digest,
-        TAG_OCTET_STRING,
-        "MAC digest is not an OCTET STRING",
-    )?;
-    expect(salt, TAG_OCTET_STRING, "MAC salt is not an OCTET STRING")?;
+    expect_octets(digest, "MAC digest is not an OCTET STRING")?;
+    expect_octets(salt, "MAC salt is not an OCTET STRING")?;
     if iterations == 0 {
         return Err(bad("zero MAC iteration count"));
     }
@@ -254,7 +265,11 @@ fn parse_mac(mac_data: &Tlv<'_>) -> Result<Mac, P12Error> {
 
 /// AuthenticatedSafe: a SEQUENCE of ContentInfo, each a `data` or
 /// `encryptedData` holding a SafeContents.
-fn walk_auth_safe(auth_safe: &[u8], password: Option<&str>) -> Result<Vec<RawBag>, P12Error> {
+fn walk_auth_safe(
+    auth_safe: &[u8],
+    password: Option<&str>,
+    plain_keys_ok: bool,
+) -> Result<Vec<RawBag>, P12Error> {
     let (seq, _) = read_tlv(auth_safe)?;
     expect(&seq, TAG_SEQUENCE, "AuthenticatedSafe is not a SEQUENCE")?;
     let mut bags = Vec::new();
@@ -267,13 +282,11 @@ fn walk_auth_safe(auth_safe: &[u8], password: Option<&str>) -> Result<Vec<RawBag
         expect(oid, TAG_OID, "ContentInfo has no type OID")?;
         let content = explicit_content(wrapper)?;
         if *oid.value == *DATA_OID {
-            if content.tag != TAG_OCTET_STRING && content.tag != 0x24 {
-                return Err(bad("data content is not an OCTET STRING"));
-            }
-            safe_contents(&content.value, password, &mut bags)?;
+            expect_octets(&content, "data content is not an OCTET STRING")?;
+            safe_contents(&content.value, password, plain_keys_ok, &mut bags)?;
         } else if *oid.value == *ENCRYPTED_DATA_OID {
             let plain = decrypt_encrypted_data(&content, password)?;
-            safe_contents(&plain, password, &mut bags)?;
+            safe_contents(&plain, password, true, &mut bags)?;
         } else {
             return Err(P12Error::Unsupported("AuthenticatedSafe content type"));
         }
@@ -312,7 +325,7 @@ fn implicit_octets(t: &Tlv<'_>) -> Result<Vec<u8>, P12Error> {
         TAG_CONTEXT_0 => {
             let mut out = Vec::new();
             for seg in children(&t.value)? {
-                expect(&seg, TAG_OCTET_STRING, "chunk is not an OCTET STRING")?;
+                expect_octets(&seg, "chunk is not an OCTET STRING")?;
                 out.extend_from_slice(&seg.value);
             }
             Ok(out)
@@ -325,12 +338,13 @@ fn implicit_octets(t: &Tlv<'_>) -> Result<Vec<u8>, P12Error> {
 fn safe_contents(
     data: &[u8],
     password: Option<&str>,
+    plain_keys_ok: bool,
     bags: &mut Vec<RawBag>,
 ) -> Result<(), P12Error> {
     let (seq, _) = read_tlv(data)?;
     expect(&seq, TAG_SEQUENCE, "SafeContents is not a SEQUENCE")?;
     for bag in children(&seq.value)? {
-        if let Some(raw) = safe_bag(&bag, password)? {
+        if let Some(raw) = safe_bag(&bag, password, plain_keys_ok)? {
             bags.push(raw);
         }
     }
@@ -339,7 +353,11 @@ fn safe_contents(
 
 /// SafeBag ::= SEQUENCE { bagId, [0] bagValue, SET attributes OPTIONAL }.
 /// Bag kinds other than keys and X.509 certificates are skipped.
-fn safe_bag(bag: &Tlv<'_>, password: Option<&str>) -> Result<Option<RawBag>, P12Error> {
+fn safe_bag(
+    bag: &Tlv<'_>,
+    password: Option<&str>,
+    plain_keys_ok: bool,
+) -> Result<Option<RawBag>, P12Error> {
     expect(bag, TAG_SEQUENCE, "SafeBag is not a SEQUENCE")?;
     let kids = children(&bag.value)?;
     let (id, wrapper, attrs) = match kids.as_slice() {
@@ -350,6 +368,9 @@ fn safe_bag(bag: &Tlv<'_>, password: Option<&str>) -> Result<Option<RawBag>, P12
     expect(id, TAG_OID, "SafeBag has no type OID")?;
     let value = explicit_content(wrapper)?;
     let (kind, bytes) = if *id.value == *KEY_BAG_OID {
+        if !plain_keys_ok {
+            return Err(P12Error::Unsupported("file has no integrity check"));
+        }
         expect(&value, TAG_SEQUENCE, "key bag is not a SEQUENCE")?;
         (BagKind::Key, encode(&value))
     } else if *id.value == *SHROUDED_KEY_BAG_OID {
@@ -358,11 +379,7 @@ fn safe_bag(bag: &Tlv<'_>, password: Option<&str>) -> Result<Option<RawBag>, P12
         let [alg, cipher] = parts.as_slice() else {
             return Err(bad("EncryptedPrivateKeyInfo is not (algorithm, data)"));
         };
-        expect(
-            cipher,
-            TAG_OCTET_STRING,
-            "encrypted key is not an OCTET STRING",
-        )?;
+        expect_octets(cipher, "encrypted key is not an OCTET STRING")?;
         (BagKind::Key, pbe::decrypt(alg, &cipher.value, password)?)
     } else if *id.value == *CERT_BAG_OID {
         expect(&value, TAG_SEQUENCE, "cert bag is not a SEQUENCE")?;
@@ -374,11 +391,7 @@ fn safe_bag(bag: &Tlv<'_>, password: Option<&str>) -> Result<Option<RawBag>, P12
             return Ok(None);
         }
         let cert = explicit_content(cert_wrapper)?;
-        expect(
-            &cert,
-            TAG_OCTET_STRING,
-            "certificate is not an OCTET STRING",
-        )?;
+        expect_octets(&cert, "certificate is not an OCTET STRING")?;
         (BagKind::Certificate, Zeroizing::new(cert.value.to_vec()))
     } else {
         return Ok(None);
@@ -397,7 +410,7 @@ fn safe_bag(bag: &Tlv<'_>, password: Option<&str>) -> Result<Option<RawBag>, P12
             expect(avals, TAG_SET, "attribute values are not a SET")?;
             let vals = children(&avals.value)?;
             let Some(first) = vals.first() else { continue };
-            if *aid.value == *LOCAL_KEY_ID_OID && first.tag == TAG_OCTET_STRING {
+            if *aid.value == *LOCAL_KEY_ID_OID && is_octets(first) {
                 local_key_id = Some(first.value.to_vec());
             } else if *aid.value == *FRIENDLY_NAME_OID && first.tag == TAG_BMP_STRING {
                 friendly_name = bmp_to_string(&first.value);
@@ -481,6 +494,16 @@ mod tests {
     same_as_der!(x25519_modern, "x25519-modern");
     same_as_der!(rsa_e3, "rsa-e3");
     same_as_der!(ber_fixture_opens, "ber-indefinite");
+    same_as_der!(fully_ber_fixture_opens, "ber-full");
+    same_as_der!(macless_file_with_shrouded_key_opens, "macless-shrouded");
+
+    #[test]
+    fn macless_file_with_plain_key_is_refused() {
+        assert_eq!(
+            read_bags(fx!("macless-plain-key.p12"), PW).err(),
+            Some(P12Error::Unsupported("file has no integrity check"))
+        );
+    }
 
     #[test]
     fn chain_has_leaf_and_two_more_certificates() {
