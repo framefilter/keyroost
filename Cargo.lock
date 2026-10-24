@@ -2374,6 +2374,7 @@ dependencies = [
  "keyroost-openpgp",
  "keyroost-p12",
  "keyroost-piv",
+ "keyroost-pivtest",
  "keyroost-proto",
  "keyroost-token2otp",
  "keyroost-token2prog",

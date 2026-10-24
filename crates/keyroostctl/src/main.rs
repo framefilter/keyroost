@@ -10494,32 +10494,15 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         return Err(format!("no self-test applies to a {} key", alg.label()).into());
                     }
 
-                    if let Some(pin) = &pin {
-                        s.verify_pin(pin.as_bytes())?;
-                    }
                     eprintln!(
                         "\u{2192} Testing {} ({}) on the card (touch if it blinks)\u{2026}",
                         piv_slot.label(),
                         alg.label()
                     );
-
-                    let mut ran = 0usize;
-                    let results = keyroost_pivtest::run(alg, &pubkey, |op, input| {
-                        // PIN-per-use slots (9c) drop the verified state after each
-                        // GENERAL AUTHENTICATE — re-verify before every op past the
-                        // first that actually runs.
-                        if let (Some(pin), true) = (&pin, ran > 0) {
-                            s.verify_pin(pin.as_bytes())?;
-                        }
-                        ran += 1;
-                        if op.is_key_agreement() {
-                            s.key_agree(piv_slot, alg, input)
-                        } else if op == keyroost_pivtest::SelfTest::Decrypt {
-                            s.decrypt(piv_slot, alg, input)
-                        } else {
-                            s.sign(piv_slot, alg, input)
-                        }
-                    });
+                    // Verifies the PIN (if given) before the first op, and again
+                    // before each later one for PIN-per-use slots (9c).
+                    let results =
+                        s.self_test(piv_slot, alg, &pubkey, pin.as_ref().map(|p| p.as_bytes()))?;
 
                     let all_ok = !results.iter().any(|(_, r)| r.is_failure());
                     if json_output() {

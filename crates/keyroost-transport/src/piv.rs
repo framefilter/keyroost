@@ -2773,7 +2773,7 @@ impl<'tx> PivSession<'tx> {
     /// function's `Trussed`/`NitroKey` entry is gated by it. Cached via
     /// `Self::identity`, so this costs no extra round trip once the
     /// fingerprint has already been probed this session.
-    fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
+    pub(crate) fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
         let SessionIdentity {
             fingerprint,
             version_firmware,
@@ -4253,6 +4253,96 @@ impl<'tx> PivSession<'tx> {
             .remember(slot.key_ref(), Some((alg, key)));
     }
 
+    /// Import the private key `key` into `slot` (IMPORT ASYMMETRIC KEY, a
+    /// Yubico extension other applets share), with `pin_policy` /
+    /// `touch_policy` (each sent only when not `Default`). `layout` is the
+    /// form the applet takes ([`keyroost_piv::compat::import_layout`]); parts
+    /// of the other form are refused before anything is sent, as are values
+    /// too long for their field ([`TransportError::PivImportKeyBody`]).
+    /// Requires prior management-key auth.
+    ///
+    /// Sent as one APDU (extended length when the key needs it), or chained
+    /// on a T=0 link and whenever the card won't take the extended APDU, as
+    /// for a certificate. The key bytes never appear in a `--debug` trace.
+    /// Unlike [`Self::generate_key`] this leaves the slot's certificate alone
+    /// (the PKCS#12 import writes the matching one first); it evicts the
+    /// slot's cached policy and public key the same way, then reads the
+    /// policy back.
+    pub fn import_key(
+        &mut self,
+        slot: Slot,
+        key: &piv::ImportKey<'_>,
+        pin_policy: PinPolicy,
+        touch_policy: TouchPolicy,
+        layout: piv::ImportLayout,
+    ) -> Result<(), TransportError> {
+        let body = import_key_body_for(key, pin_policy, touch_policy, layout)?;
+        self.write_import_key(slot, key.alg_id, &body)
+    }
+
+    /// Send an IMPORT ASYMMETRIC KEY `body` ([`keyroost_piv::import_key_body`])
+    /// for `slot` with P1 `alg_id` — [`Self::import_key`] after its checks.
+    pub(crate) fn write_import_key(
+        &mut self,
+        slot: Slot,
+        alg_id: u8,
+        body: &[u8],
+    ) -> Result<(), TransportError> {
+        let sent = self.transmit_long(
+            "piv import key",
+            &piv::import_key(slot, alg_id, body),
+            || piv::import_key_chained(slot, alg_id, body, CHAIN_CHUNK),
+        );
+        // Whatever was cached for the slot describes the old key. Evict even
+        // when the exchange failed: a lost answer may hide an accepted key.
+        // Both caches go before `slot_policy` reads back, for the reason
+        // `generate_key` gives.
+        self.state.policy_cache.evict(slot.key_ref());
+        self.state.pubkey_cache.evict(slot.key_ref());
+        let (_, sw) = sent?;
+        ok_or_write("piv import key", sw)?;
+        let _ = self.slot_policy(slot);
+        Ok(())
+    }
+
+    /// Run the slot self-test ([`keyroost_pivtest::run`]) on `slot`, which
+    /// holds an `alg` key whose public key is `pubkey`: decrypt, key agreement
+    /// and sign, as far as the algorithm does them, each reply checked on the
+    /// host against `pubkey`.
+    ///
+    /// With `pin`, the PIN is verified once before the first operation, so a
+    /// wrong PIN fails here (costing one retry) before anything is tested, and
+    /// again before every later one: PIN-per-use slots (9C) drop the verified
+    /// state after each GENERAL AUTHENTICATE. Without it the operations run as
+    /// the slot's PIN policy allows. A card error during an operation is that
+    /// operation's [`keyroost_pivtest::Outcome::Failed`]; `Err` means nothing
+    /// was tested.
+    pub fn self_test(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        pubkey: &PublicKey,
+        pin: Option<&[u8]>,
+    ) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, TransportError> {
+        if let Some(pin) = pin {
+            self.verify_pin(pin)?;
+        }
+        let mut ran = 0usize;
+        Ok(keyroost_pivtest::run(alg, pubkey, |op, input| {
+            if let (Some(pin), true) = (pin, ran > 0) {
+                self.verify_pin(pin)?;
+            }
+            ran += 1;
+            if op.is_key_agreement() {
+                self.key_agree(slot, alg, input)
+            } else if op == keyroost_pivtest::SelfTest::Decrypt {
+                self.decrypt(slot, alg, input)
+            } else {
+                self.sign(slot, alg, input)
+            }
+        }))
+    }
+
     /// Import a DER-encoded X.509 certificate into `slot`, stored compressed
     /// or not as `compression` says. Requires prior management-key auth.
     ///
@@ -4302,6 +4392,20 @@ impl<'tx> PivSession<'tx> {
         compression: CertCompression,
     ) -> Result<CertImport, TransportError> {
         self.reject_certificate_key_mismatch(slot, der)?;
+        self.store_certificate_unchecked(slot, der, compression)
+    }
+
+    /// [`Self::import_certificate`] without its key-match guard: store `der`
+    /// in `slot` (compressed as `compression` says, with the same read-back
+    /// after a compressed write). For the PKCS#12 import, whose certificate
+    /// belongs to the key about to be written, not to the slot's current one
+    /// the guard compares against.
+    pub(crate) fn store_certificate_unchecked(
+        &mut self,
+        slot: Slot,
+        der: &[u8],
+        compression: CertCompression,
+    ) -> Result<CertImport, TransportError> {
         let done = store_certificate(slot, der, compression, |info, payload| {
             let sw = self.put_cert_object(slot, &piv::encode_certificate(payload, info))?;
             cert_write_result(slot, der.len(), sw)
@@ -4347,62 +4451,68 @@ impl<'tx> PivSession<'tx> {
     /// KB). A mid-chain `6700` / `6A84` comes back as that status word.
     fn put_cert_object(&mut self, slot: Slot, value: &[u8]) -> Result<u16, TransportError> {
         let tag = slot.cert_object_tag();
-        let apdu = piv::put_data(&tag, value);
-        let sw = if self.chain_upfront() {
+        chained_cert_sw(self.transmit_long(
+            "piv import certificate",
+            &piv::put_data(&tag, value),
+            || piv::put_data_chained(&tag, value, CHAIN_CHUNK),
+        ))
+    }
+
+    /// Send a command whose data may not fit one short APDU: `single` (one
+    /// extended-length APDU when the data needs it), or the `chained` ISO
+    /// 7816-4 sequence. Chains up front on a T=0 link or when forced; chains
+    /// as a fallback when an extended `single` fails at the PC/SC layer or the
+    /// card answers it with anything but `9000`. A short-form `single` is
+    /// never retried. Returns the final exchange; [`Self::transmit_chain`]
+    /// turns a refused intermediate link into [`TransportError::Apdu`].
+    fn transmit_long<C: AsRef<[u8]>>(
+        &mut self,
+        label: &'static str,
+        single: &[u8],
+        chained: impl FnOnce() -> Vec<C>,
+    ) -> Result<(Vec<u8>, u16), TransportError> {
+        if self.chain_upfront() {
             trace::line(self.traced, || {
                 format_line(
                     Dir::Note,
-                    "piv import certificate",
+                    label,
                     &format!("command chaining up front ({})", self.chain_reason()),
                 )
             });
-            chained_cert_sw(self.transmit_chain(
-                "piv import certificate",
-                &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
-            ))?
-        } else {
-            let extended = uses_extended_length(&apdu);
-            let direct = self.transmit_full(&apdu);
-            if retry_chained_after(&direct, extended) {
-                if let Err(e) = &direct {
-                    trace::line(self.traced, || {
-                        format_line(
-                            Dir::Note,
-                            "piv import certificate",
-                            &format!(
-                                "extended length failed at the PC/SC \
-                             layer ({e}); retrying with command chaining"
-                            ),
-                        )
-                    });
-                }
-                chained_cert_sw(self.transmit_chain(
-                    "piv import certificate",
-                    &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
-                ))?
-            } else {
-                let (_, sw) = direct?;
-                if sw == piv::SW_OK || !extended {
-                    sw
-                } else {
-                    trace::line(self.traced, || {
-                        format_line(
-                            Dir::Note,
-                            "piv import certificate",
-                            &format!(
-                                "extended length rejected (SW={sw:04X}); \
-                             retrying with command chaining"
-                            ),
-                        )
-                    });
-                    chained_cert_sw(self.transmit_chain(
-                        "piv import certificate",
-                        &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
-                    ))?
-                }
+            return self.transmit_chain(label, &chained());
+        }
+        let extended = uses_extended_length(single);
+        let direct = self.transmit_full(single);
+        if retry_chained_after(&direct, extended) {
+            if let Err(e) = &direct {
+                trace::line(self.traced, || {
+                    format_line(
+                        Dir::Note,
+                        label,
+                        &format!(
+                            "extended length failed at the PC/SC \
+                         layer ({e}); retrying with command chaining"
+                        ),
+                    )
+                });
             }
-        };
-        Ok(sw)
+            return self.transmit_chain(label, &chained());
+        }
+        let (data, sw) = direct?;
+        if sw == piv::SW_OK || !extended {
+            return Ok((data, sw));
+        }
+        trace::line(self.traced, || {
+            format_line(
+                Dir::Note,
+                label,
+                &format!(
+                    "extended length rejected (SW={sw:04X}); \
+                 retrying with command chaining"
+                ),
+            )
+        });
+        self.transmit_chain(label, &chained())
     }
 
     /// [`Self::import_certificate`]'s pre-flight key check — see that
@@ -5803,14 +5913,14 @@ impl<'tx> PivSession<'tx> {
     /// [`OpenPgpSession::transmit_chain`](crate::OpenPgpSession), added here
     /// for the same reason: extended-length rejection ([`Self::sign`],
     /// [`Self::import_certificate`]).
-    fn transmit_chain(
+    fn transmit_chain<C: AsRef<[u8]>>(
         &mut self,
         label: &'static str,
-        chunks: &[Vec<u8>],
+        chunks: &[C],
     ) -> Result<(Vec<u8>, u16), TransportError> {
         let last = chunks.len().saturating_sub(1);
         for (i, chunk) in chunks.iter().enumerate() {
-            let (data, sw) = self.transmit_full(chunk)?;
+            let (data, sw) = self.transmit_full(chunk.as_ref())?;
             if i == last {
                 return Ok((data, sw));
             }
@@ -5826,6 +5936,31 @@ impl<'tx> PivSession<'tx> {
         }
         Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
     }
+}
+
+/// The IMPORT ASYMMETRIC KEY body for `key`, refused when its parts are not
+/// the form `layout` takes (RSA CRT parts for Yubico, primes and exponent for
+/// the Nitrokey layout; EC and 25519 keys are the same in both) or don't fit
+/// their fields. Pure, so [`PivSession::import_key`]'s checks are tested
+/// without a card.
+pub(crate) fn import_key_body_for(
+    key: &piv::ImportKey<'_>,
+    pin_policy: PinPolicy,
+    touch_policy: TouchPolicy,
+    layout: piv::ImportLayout,
+) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    use piv::{ImportLayout, ImportParts};
+    let fits = match key.parts {
+        ImportParts::RsaCrt { .. } => layout == ImportLayout::Yubico,
+        ImportParts::RsaPrimes { .. } => layout == ImportLayout::NitrokeyRsa,
+        ImportParts::Ec { .. } | ImportParts::Ed25519 { .. } | ImportParts::X25519 { .. } => true,
+    };
+    if !fits {
+        return Err(TransportError::PivImportKeyBody(
+            piv::ImportBodyError::PartsMismatch,
+        ));
+    }
+    piv::import_key_body(key, pin_policy, touch_policy).map_err(TransportError::PivImportKeyBody)
 }
 
 /// Whether a direct (single-APDU) certificate PUT DATA that came back as
@@ -5864,7 +5999,7 @@ fn chained_cert_sw(result: Result<(Vec<u8>, u16), TransportError>) -> Result<u16
 /// compressed length, if any, is filled in by [`store_certificate`]),
 /// `6A84` (not enough memory) → [`TransportError::PivCardFull`], anything
 /// else as any PIV write ([`ok_or_write`]).
-fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportError> {
+pub(crate) fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportError> {
     match sw {
         piv::SW_WRONG_LENGTH => Err(TransportError::PivCertTooLarge {
             slot,
@@ -5883,7 +6018,7 @@ fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportErr
 /// every other error is returned as is. A refused compressed write reports
 /// the compressed length too. Pure apart from `put`, so the decision is
 /// unit-tested without a card.
-fn store_certificate(
+pub(crate) fn store_certificate(
     slot: Slot,
     der: &[u8],
     compression: CertCompression,
@@ -5945,8 +6080,9 @@ fn check_readback(
 /// `exmode = -254`, one byte short of the short-form `Lc` ceiling).
 const CHAIN_CHUNK: usize = 254;
 
-/// Whether `apdu` — built by [`piv::general_auth_sign`] or [`piv::put_data`],
-/// whose data field is never empty — used extended-length encoding. Both
+/// Whether `apdu` — built by [`piv::general_auth_sign`], [`piv::put_data`]
+/// or [`piv::import_key`], whose data field is never empty — used
+/// extended-length encoding. Both
 /// always emit a non-zero short-form `Lc` for a body that fits in one byte,
 /// so byte 4 being the `0x00` extended-length marker is unambiguous.
 fn uses_extended_length(apdu: &[u8]) -> bool {
@@ -6033,7 +6169,9 @@ fn reset_route(
 /// (CLA INS P1 P2 Lc) stays visible either way. VERIFY (`0x20`), CHANGE
 /// REFERENCE DATA (`0x24`), RESET RETRY COUNTER (`0x2C`) carry PINs/PUKs;
 /// GENERAL AUTHENTICATE (`0x87`) carries the decrypted witness/challenge;
-/// SET MANAGEMENT KEY (`0xFF`) carries the raw new key. The same VERIFY
+/// SET MANAGEMENT KEY (`0xFF`) carries the raw new key; IMPORT ASYMMETRIC
+/// KEY (`0xFE`) carries a private key, in every link of a chained import.
+/// The same VERIFY
 /// (`0x20`) INS covers HID Crescendo's ACA VERIFY PIN
 /// ([`PivSession::verify_pin_hid_crescendo_aca`]) too, just at a different
 /// P2 — see [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_PIN_REF`]. The
@@ -6063,7 +6201,13 @@ fn piv_cmd_sensitive(apdu: &[u8]) -> bool {
         (_, Some(0xD8)) => apdu.get(4) != Some(&0x04),
         (_, ins) => matches!(
             ins,
-            Some(0x20) | Some(0x24) | Some(0x2C) | Some(0x87) | Some(0xFF) | Some(0x82)
+            Some(0x20)
+                | Some(0x24)
+                | Some(0x2C)
+                | Some(0x87)
+                | Some(0xFF)
+                | Some(0xFE)
+                | Some(0x82)
         ),
     }
 }
@@ -7071,6 +7215,68 @@ mod tests {
             &keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key(KeyAlg::EccP256, 0x9C)
                 .unwrap()
         ));
+    }
+
+    #[test]
+    fn import_key_apdus_are_redacted_single_and_chained() {
+        let body = [0x06, 0x20, 0x5A, 0x5A, 0x5A, 0x5A];
+        let single = piv::import_key(Slot::Authentication, 0x11, &body);
+        assert!(piv_cmd_sensitive(&single));
+        let dump = crate::dump_cmd(&single, piv_cmd_sensitive(&single));
+        assert!(dump.contains("redacted"), "{dump}");
+        assert!(!dump.contains("5A 5A"), "{dump}");
+        // Every link of a chained import carries key bytes, the CLA-0x10
+        // continuation links as much as the last one.
+        let chained = piv::import_key_chained(Slot::Authentication, 0x07, &[0x5A; 600], 254);
+        assert!(chained.len() > 1);
+        for apdu in &chained {
+            assert!(piv_cmd_sensitive(apdu));
+        }
+    }
+
+    #[test]
+    fn import_key_body_must_fit_the_layout() {
+        let crt = piv::ImportKey {
+            alg: KeyAlg::Rsa2048,
+            alg_id: KeyAlg::Rsa2048.id(),
+            parts: piv::ImportParts::RsaCrt {
+                p: &[1],
+                q: &[2],
+                dp: &[3],
+                dq: &[4],
+                qinv: &[5],
+            },
+        };
+        let primes = piv::ImportKey {
+            parts: piv::ImportParts::RsaPrimes {
+                p: &[1],
+                q: &[2],
+                e: &[1, 0, 1],
+            },
+            ..crt
+        };
+        let body =
+            |k, layout| import_key_body_for(k, PinPolicy::Default, TouchPolicy::Default, layout);
+        assert!(body(&crt, piv::ImportLayout::Yubico).is_ok());
+        assert!(body(&primes, piv::ImportLayout::NitrokeyRsa).is_ok());
+        for (k, layout) in [
+            (&crt, piv::ImportLayout::NitrokeyRsa),
+            (&primes, piv::ImportLayout::Yubico),
+        ] {
+            assert!(matches!(
+                body(k, layout),
+                Err(TransportError::PivImportKeyBody(
+                    piv::ImportBodyError::PartsMismatch
+                ))
+            ));
+        }
+        let ec = piv::ImportKey {
+            alg: KeyAlg::EccP256,
+            alg_id: KeyAlg::EccP256.id(),
+            parts: piv::ImportParts::Ec { scalar: &[7; 32] },
+        };
+        assert!(body(&ec, piv::ImportLayout::NitrokeyRsa).is_ok());
+        assert!(body(&ec, piv::ImportLayout::Yubico).is_ok());
     }
 
     #[test]

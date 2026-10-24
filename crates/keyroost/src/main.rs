@@ -12187,31 +12187,11 @@ fn run_piv_self_test(
                 return Err(format!("no self-test applies to a {} key", alg.label()));
             }
 
-            // Verify once up front so a wrong PIN fails the whole run (one
-            // retry, not one per op). PIN-per-use slots (9C) drop the
-            // verified state after each GENERAL AUTHENTICATE, so the per-op
-            // closure re-verifies before every op after the first that
-            // actually runs.
-            let has_pin = !pin.is_empty();
-            if has_pin {
-                s.verify_pin(pin).map_err(|e| e.to_string())?;
-            }
-            let mut ran = 0usize;
-            let results =
-                keyroost_pivtest::run(alg, &pubkey, |op, input| -> Result<Vec<u8>, String> {
-                    if has_pin && ran > 0 {
-                        s.verify_pin(pin).map_err(|e| e.to_string())?;
-                    }
-                    ran += 1;
-                    if op.is_key_agreement() {
-                        s.key_agree(slot, alg, input)
-                    } else if op == keyroost_pivtest::SelfTest::Decrypt {
-                        s.decrypt(slot, alg, input)
-                    } else {
-                        s.sign(slot, alg, input)
-                    }
-                    .map_err(|e| e.to_string())
-                });
+            // A wrong PIN fails the whole run before any op (one retry, not
+            // one per op); PIN-per-use slots (9C) are re-verified per op.
+            let results = s
+                .self_test(slot, alg, &pubkey, (!pin.is_empty()).then_some(pin))
+                .map_err(|e| e.to_string())?;
             Ok((results, s.state()))
         })();
         Ok::<_, TransportError>(inner)

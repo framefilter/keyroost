@@ -334,6 +334,10 @@ pub enum TransportError {
         slot_algorithm: keyroost_piv::KeyAlg,
         certificate_algorithm: keyroost_piv::KeyAlg,
     },
+    /// `PivSession::import_key` refused a private key before sending it: its
+    /// parts are not in the form the applet's layout takes, or a value is too
+    /// long for its field.
+    PivImportKeyBody(keyroost_piv::ImportBodyError),
     /// An RSA-only operation (RSA key import) found the slot already holds an
     /// ECC key instead. `slot` is the CLI's `--slot` value (`sign` / `decrypt`
     /// / `auth`); `label` is the ECC algorithm's display label.
@@ -718,6 +722,9 @@ impl fmt::Display for TransportError {
                 slot_algorithm.label(),
                 certificate_algorithm.label()
             ),
+            TransportError::PivImportKeyBody(e) => {
+                write!(f, "the key can't be sent to the card: {e}")
+            }
         }
     }
 }
@@ -738,6 +745,7 @@ impl std::error::Error for TransportError {
             | TransportError::PivResetManagementAuthFailed(e)
             | TransportError::PivDeleteKeyHidCrescendoGenericFailed(e) => Some(e.as_ref()),
             TransportError::X509(e) => Some(e),
+            TransportError::PivImportKeyBody(e) => Some(e),
             _ => None,
         }
     }
